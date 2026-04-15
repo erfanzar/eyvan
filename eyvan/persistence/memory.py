@@ -1,0 +1,18 @@
+"""Serializable in-memory repository for development and focused tests."""
+
+from __future__ import annotations
+
+from eyvan.persistence.state import StateRepository, StateSession
+
+
+class InMemorySession(StateSession):
+    """Transaction-local in-memory state snapshot."""
+
+
+class InMemoryRepository(StateRepository):
+    """Copy-on-write in-memory repository with serializable transactions and event waits."""
+
+    session_type = InMemorySession
+
+
+__all__ = ("InMemoryRepository", "InMemorySession")

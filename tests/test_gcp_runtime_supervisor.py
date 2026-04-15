@@ -1,0 +1,644 @@
+"""Tests for private local API-and-agent supervision of native GCP runtime profiles."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from eyvan.agent.models import AgentCapabilities
+from eyvan.client.endpoint import ControlPlaneEndpoint
+from eyvan.gcp_runtime_profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
+from eyvan.gcp_runtime_supervisor import (
+    DEFAULT_LOCAL_GCP_AGENT_URL,
+    GcpNativeRuntimeSupervisor,
+    GcpRuntimeError,
+    GcpRuntimeProfileNotPreparedError,
+    LocalAgentCommand,
+    LocalAgentConfigurationError,
+    LocalAgentResult,
+    LocalAgentState,
+    LocalAgentSupervisor,
+)
+from eyvan.local_daemon import (
+    LocalDaemonPaths,
+    LocalDaemonRecord,
+    LocalDaemonResult,
+    LocalDaemonState,
+    LocalDaemonTarget,
+    write_owner_only_record,
+)
+
+_DEFAULT_WHEEL_URI = f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'a' * 64}/eyvan-0.1.0-py3-none-any.whl"
+
+
+def _capabilities() -> AgentCapabilities:
+    """Return the authenticated native GCP capability contract expected by the supervisor."""
+
+    return AgentCapabilities(
+        provider="gcp",
+        executor="eyvan-native",
+        accelerator_types=("tpu",),
+        capacity_classes=("spot",),
+        supports_checkpoint=True,
+        supports_callables=True,
+        supports_exec=True,
+        max_gang_replicas=1,
+        resource_enforcement="none",
+    )
+
+
+def _profile(*, wheel_uri: str | None = _DEFAULT_WHEEL_URI) -> GcpNativeRuntimeProfile:
+    """Build one valid in-memory profile without exposing its random persisted secrets."""
+
+    return GcpNativeRuntimeProfile(
+        project_id="eyvan-project",
+        artifact_root_uri="gs://eyvan-artifacts/eyvan",
+        agent_shared_secret="agent-secret-abcdefghijklmnopqrstuvwxyz",
+        native_worker_root_secret="worker-secret-abcdefghijklmnopqrstuvwxyz",
+        native_worker_wheel_uri=wheel_uri,
+    )
+
+
+@dataclass
+class FakeProcess:
+    """Minimal deterministic local process used by agent supervision tests."""
+
+    pid: int = 9123
+    exit_code: int | None = None
+    terminated: bool = False
+    killed: bool = False
+
+    def poll(self) -> int | None:
+        """Return the configured process exit state."""
+
+        return self.exit_code
+
+    def terminate(self) -> None:
+        """Record a graceful stop."""
+
+        self.terminated = True
+        self.exit_code = 0
+
+    def kill(self) -> None:
+        """Record a forced stop."""
+
+        self.killed = True
+        self.exit_code = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Return the current process exit code."""
+
+        del timeout
+        return self.exit_code if self.exit_code is not None else 0
+
+
+@dataclass
+class FakeAgentLauncher:
+    """Capture local-agent commands without spawning an operating-system process."""
+
+    process: FakeProcess = field(default_factory=FakeProcess)
+    commands: list[LocalAgentCommand] = field(default_factory=list)
+
+    def start(self, command: LocalAgentCommand) -> FakeProcess:
+        """Record one launch request and return the deterministic process handle."""
+
+        self.commands.append(command)
+        return self.process
+
+
+@dataclass
+class AgentProcessLiveness:
+    """Return ordered liveness observations without probing real operating-system PIDs."""
+
+    values: list[bool]
+    pids: list[int] = field(default_factory=list)
+
+    def __call__(self, pid: int) -> bool:
+        """Record one liveness observation and return its configured result."""
+
+        self.pids.append(pid)
+        if not self.values:
+            raise AssertionError("cell-agent supervisor performed an unexpected PID liveness check")
+        return self.values.pop(0)
+
+
+@dataclass
+class AgentProcessTerminator:
+    """Record graceful termination requests without signaling a real process."""
+
+    pids: list[int] = field(default_factory=list)
+
+    def __call__(self, pid: int) -> None:
+        """Record one requested termination."""
+
+        self.pids.append(pid)
+
+
+@dataclass
+class AgentProcessKiller:
+    """Record forced agent termination requests without signalling a real process."""
+
+    pids: list[int] = field(default_factory=list)
+
+    def __call__(self, pid: int) -> None:
+        """Record one forced termination."""
+
+        self.pids.append(pid)
+
+
+@dataclass
+class AdvancingClock:
+    """Advance deterministic supervisor time without blocking a test."""
+
+    value: float = 0.0
+
+    def __call__(self) -> float:
+        """Return the current deterministic timestamp."""
+
+        return self.value
+
+    def sleep(self, duration: float) -> None:
+        """Advance time by one requested sleep interval."""
+
+        self.value += duration
+
+
+@dataclass
+class CapabilityResponses:
+    """Return an ordered sequence of authenticated capability observations."""
+
+    values: list[AgentCapabilities | None]
+    requests: list[tuple[ControlPlaneEndpoint, str]] = field(default_factory=list)
+
+    def __call__(self, endpoint: ControlPlaneEndpoint, secret: str) -> AgentCapabilities | None:
+        """Record one authenticated probe and return its configured result."""
+
+        self.requests.append((endpoint, secret))
+        if not self.values:
+            raise AssertionError("unexpected cell-agent capability probe")
+        return self.values.pop(0)
+
+
+def test_agent_command_passes_only_the_private_profile_path_not_its_secrets(tmp_path: Path) -> None:
+    target = LocalDaemonTarget.from_endpoint(ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL))
+    assert target is not None
+    profile_path = tmp_path / "runtime.json"
+    command = LocalAgentCommand(target=target, log_path=tmp_path / "agent.log", runtime_profile_path=profile_path)
+
+    assert command.argv == (
+        sys.executable,
+        "-m",
+        "eyvan.agent.cli",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8090",
+        "--runtime-profile",
+        str(profile_path),
+        "--log-level",
+        "info",
+    )
+
+
+def test_agent_supervisor_starts_authenticated_matching_agent_and_persists_profile_identity(tmp_path: Path) -> None:
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    launcher = FakeAgentLauncher()
+    capabilities = _capabilities()
+    probe = CapabilityResponses([None, None, capabilities])
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    supervisor = LocalAgentSupervisor(paths=paths, launcher=launcher, capability_probe=probe)
+
+    result = supervisor.ensure(profile_path, profile)
+
+    target = LocalDaemonTarget.from_endpoint(ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL))
+    assert target is not None
+    assert result == LocalAgentResult(
+        endpoint=ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL),
+        state=LocalAgentState.STARTED,
+        pid=launcher.process.pid,
+        log_path=paths.agent_log_path(target),
+        capabilities=capabilities,
+    )
+    assert launcher.commands == [
+        LocalAgentCommand(
+            target=target,
+            log_path=paths.agent_log_path(target),
+            runtime_profile_path=profile_path,
+        )
+    ]
+    assert json.loads(paths.agent_record_path(target).read_text(encoding="utf-8")) == {
+        "endpoint": DEFAULT_LOCAL_GCP_AGENT_URL,
+        "pid": launcher.process.pid,
+        "runtime_profile_path": str(profile_path.resolve()),
+    }
+    assert all(secret == profile.agent_shared_secret for _, secret in probe.requests)
+
+
+def test_agent_supervisor_rejects_an_unowned_agent_that_accepts_the_secret(tmp_path: Path) -> None:
+    profile = _profile()
+    probe = CapabilityResponses([_capabilities()])
+    supervisor = LocalAgentSupervisor(
+        paths=LocalDaemonPaths(tmp_path / "eyvan"),
+        launcher=FakeAgentLauncher(),
+        capability_probe=probe,
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="not owned"):
+        supervisor.ensure(tmp_path / "runtime.json", profile)
+
+
+def test_agent_supervisor_preserves_normal_reuse_for_a_matching_owned_agent(tmp_path: Path) -> None:
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9130,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    launcher = FakeAgentLauncher()
+    capabilities = _capabilities()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        capability_probe=CapabilityResponses([capabilities]),
+        process_liveness=AgentProcessLiveness([True]),
+    )
+
+    result = supervisor.ensure(profile_path, profile)
+
+    assert result == LocalAgentResult(
+        endpoint=endpoint,
+        state=LocalAgentState.REUSED,
+        pid=9130,
+        log_path=paths.agent_log_path(target),
+        capabilities=capabilities,
+    )
+    assert launcher.commands == []
+
+
+def test_agent_supervisor_restart_replaces_only_a_verified_owned_agent(tmp_path: Path) -> None:
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9131,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    launcher = FakeAgentLauncher(process=FakeProcess(pid=9132))
+    capabilities = _capabilities()
+    liveness = AgentProcessLiveness([True, True, False])
+    terminator = AgentProcessTerminator()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        capability_probe=CapabilityResponses([capabilities]),
+        process_argument_reader=lambda pid: (
+            (
+                sys.executable,
+                "-m",
+                "eyvan.agent.cli",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8090",
+                "--runtime-profile",
+                str(profile_path.resolve()),
+                "--log-level",
+                "info",
+            )
+            if pid == 9131
+            else None
+        ),
+        process_liveness=liveness,
+        process_terminator=terminator,
+    )
+
+    result = supervisor.restart(profile_path, profile)
+
+    assert result == LocalAgentResult(
+        endpoint=endpoint,
+        state=LocalAgentState.STARTED,
+        pid=9132,
+        log_path=paths.agent_log_path(target),
+        capabilities=capabilities,
+    )
+    assert terminator.pids == [9131]
+    assert launcher.commands == [
+        LocalAgentCommand(
+            target=target,
+            log_path=paths.agent_log_path(target),
+            runtime_profile_path=profile_path.resolve(),
+        )
+    ]
+    assert json.loads(paths.agent_record_path(target).read_text(encoding="utf-8")) == {
+        "endpoint": endpoint.url,
+        "pid": 9132,
+        "runtime_profile_path": str(profile_path.resolve()),
+    }
+
+
+def test_agent_restart_forces_an_owned_agent_that_does_not_finish_gracefully(tmp_path: Path) -> None:
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9135,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    capabilities = _capabilities()
+    liveness = AgentProcessLiveness([True, True, True, True, False])
+    terminator = AgentProcessTerminator()
+    killer = AgentProcessKiller()
+    clock = AdvancingClock()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(process=FakeProcess(pid=9136)),
+        capability_probe=CapabilityResponses([capabilities]),
+        startup_timeout_s=1.0,
+        poll_interval_s=1.0,
+        clock=clock,
+        sleeper=clock.sleep,
+        process_argument_reader=lambda pid: (
+            (
+                sys.executable,
+                "-m",
+                "eyvan.agent.cli",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8090",
+                "--runtime-profile",
+                str(profile_path.resolve()),
+                "--log-level",
+                "info",
+            )
+            if pid == 9135
+            else None
+        ),
+        process_liveness=liveness,
+        process_terminator=terminator,
+        process_killer=killer,
+    )
+
+    result = supervisor.restart(profile_path, profile)
+
+    assert result.state is LocalAgentState.STARTED
+    assert terminator.pids == [9135]
+    assert killer.pids == [9135]
+
+
+def test_agent_supervisor_restart_refuses_an_unowned_agent_that_accepts_the_profile_secret(tmp_path: Path) -> None:
+    profile = _profile()
+    launcher = FakeAgentLauncher()
+    supervisor = LocalAgentSupervisor(
+        paths=LocalDaemonPaths(tmp_path / "eyvan"),
+        launcher=launcher,
+        capability_probe=CapabilityResponses([_capabilities()]),
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="not owned"):
+        supervisor.restart(tmp_path / "runtime.json", profile)
+
+    assert launcher.commands == []
+
+
+def test_agent_supervisor_restart_refuses_a_different_profile_without_signaling_it(tmp_path: Path) -> None:
+    requested_profile_path = tmp_path / "runtime" / "requested.json"
+    other_profile_path = tmp_path / "runtime" / "other.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9133,
+            runtime_profile_path=str(other_profile_path.resolve()),
+        ),
+    )
+    terminator = AgentProcessTerminator()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(),
+        capability_probe=CapabilityResponses([]),
+        process_liveness=AgentProcessLiveness([True]),
+        process_terminator=terminator,
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="different runtime profile"):
+        supervisor.restart(requested_profile_path, profile)
+
+    assert terminator.pids == []
+
+
+def test_agent_supervisor_restart_refuses_a_reused_pid_that_is_not_an_eyvan_agent(tmp_path: Path) -> None:
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9134,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    terminator = AgentProcessTerminator()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(),
+        capability_probe=CapabilityResponses([]),
+        process_argument_reader=lambda pid: (sys.executable, "-m", "unrelated.service") if pid == 9134 else None,
+        process_liveness=AgentProcessLiveness([True, True]),
+        process_terminator=terminator,
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="not the expected Eyvan cell-agent process"):
+        supervisor.restart(profile_path, profile)
+
+    assert terminator.pids == []
+
+
+@dataclass
+class FakeControlPlaneSupervisor:
+    """Record profile-aware API startup without starting a real local server."""
+
+    calls: list[tuple[ControlPlaneEndpoint, Path | None]] = field(default_factory=list)
+    stop_calls: list[tuple[LocalDaemonResult, Path]] = field(default_factory=list)
+
+    def ensure(
+        self,
+        endpoint: str | ControlPlaneEndpoint,
+        *,
+        runtime_profile_path: Path | None = None,
+    ) -> LocalDaemonResult:
+        """Return a deterministic started API result for the supplied profile path."""
+
+        configured_endpoint = ControlPlaneEndpoint.parse(endpoint)
+        self.calls.append((configured_endpoint, runtime_profile_path))
+        return LocalDaemonResult(
+            endpoint=configured_endpoint,
+            state=LocalDaemonState.STARTED,
+            pid=7001,
+            log_path=Path("/tmp/eyvan-control-plane.log"),
+        )
+
+    def stop_started(self, result: LocalDaemonResult, *, runtime_profile_path: Path) -> None:
+        """Record rollback of an API process started by this fake supervisor."""
+
+        self.stop_calls.append((result, runtime_profile_path))
+
+
+@dataclass
+class FakeCellAgentSupervisor:
+    """Record private profile handoff without starting a real cell-agent process."""
+
+    calls: list[tuple[Path, GcpNativeRuntimeProfile]] = field(default_factory=list)
+
+    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+        """Return a deterministic authenticated local-agent result."""
+
+        self.calls.append((profile_path, profile))
+        endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+        return LocalAgentResult(
+            endpoint=endpoint,
+            state=LocalAgentState.STARTED,
+            pid=7002,
+            log_path=Path("/tmp/eyvan-cell-agent.log"),
+            capabilities=_capabilities(),
+        )
+
+
+@dataclass
+class FailingCellAgentSupervisor:
+    """Fail deterministically after the control plane starts."""
+
+    calls: list[tuple[Path, GcpNativeRuntimeProfile]] = field(default_factory=list)
+
+    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+        """Record the handoff and simulate an authenticated agent startup failure."""
+
+        self.calls.append((profile_path, profile))
+        raise LocalAgentConfigurationError("the local cell agent rejected the selected runtime profile")
+
+
+def test_runtime_supervisor_loads_one_profile_for_both_private_processes(tmp_path: Path) -> None:
+    store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
+    profile = store.create(
+        project_id="eyvan-project",
+        artifact_root_uri="gs://eyvan-artifacts/eyvan",
+        native_worker_wheel_uri=(f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'b' * 64}/eyvan-0.1.0-py3-none-any.whl"),
+    )
+    control_plane = FakeControlPlaneSupervisor()
+    cell_agent = FakeCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=store,
+        control_plane=control_plane,
+        agent=cell_agent,
+    )
+
+    result = supervisor.ensure("http://127.0.0.1:19090")
+
+    assert result.profile == profile
+    assert control_plane.calls == [(ControlPlaneEndpoint.parse("http://127.0.0.1:19090"), store.path)]
+    assert cell_agent.calls == [(store.path, profile)]
+
+
+def test_runtime_supervisor_requires_a_staged_worker_wheel_before_starting_processes(tmp_path: Path) -> None:
+    store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
+    store.create(project_id="eyvan-project", artifact_root_uri="gs://eyvan-artifacts/eyvan")
+    control_plane = FakeControlPlaneSupervisor()
+    cell_agent = FakeCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=store,
+        control_plane=control_plane,
+        agent=cell_agent,
+    )
+
+    with pytest.raises(GcpRuntimeProfileNotPreparedError, match="eyvan runtime init"):
+        supervisor.ensure("http://127.0.0.1:19090")
+
+    assert control_plane.calls == []
+    assert cell_agent.calls == []
+
+
+@pytest.mark.parametrize("endpoint", ("http://localhost:19090", "https://example.com"))
+def test_runtime_supervisor_rejects_nonliteral_or_remote_endpoints_without_starting_processes(
+    tmp_path: Path,
+    endpoint: str,
+) -> None:
+    store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
+    store.create(
+        project_id="eyvan-project",
+        artifact_root_uri="gs://eyvan-artifacts/eyvan",
+        native_worker_wheel_uri=(f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'c' * 64}/eyvan-0.1.0-py3-none-any.whl"),
+    )
+    control_plane = FakeControlPlaneSupervisor()
+    cell_agent = FakeCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=store,
+        control_plane=control_plane,
+        agent=cell_agent,
+    )
+
+    with pytest.raises(GcpRuntimeError, match="literal HTTP loopback"):
+        supervisor.ensure(endpoint)
+
+    assert control_plane.calls == []
+    assert cell_agent.calls == []
+
+
+def test_runtime_supervisor_rolls_back_a_new_control_plane_when_agent_startup_fails(tmp_path: Path) -> None:
+    store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
+    profile = store.create(
+        project_id="eyvan-project",
+        artifact_root_uri="gs://eyvan-artifacts/eyvan",
+        native_worker_wheel_uri=(f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'d' * 64}/eyvan-0.1.0-py3-none-any.whl"),
+    )
+    control_plane = FakeControlPlaneSupervisor()
+    cell_agent = FailingCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=store,
+        control_plane=control_plane,
+        agent=cell_agent,
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="rejected"):
+        supervisor.ensure("http://127.0.0.1:19090")
+
+    assert cell_agent.calls == [(store.path, profile)]
+    assert len(control_plane.stop_calls) == 1
+    stopped, profile_path = control_plane.stop_calls[0]
+    assert stopped.state is LocalDaemonState.STARTED
+    assert profile_path == store.path

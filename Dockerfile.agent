@@ -1,0 +1,22 @@
+# Build with the repository root as context:
+# docker build -f libs/eyvan/Dockerfile.agent -t eyvan-agent:latest .
+FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.21 /uv /uvx /bin/
+
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+# Pinned dependency closure exported from the workspace uv.lock; refresh with:
+# uv export --package eyvan --no-dev --no-emit-workspace --locked -o libs/eyvan/requirements-docker.txt
+COPY libs/eyvan/requirements-docker.txt ./requirements-docker.txt
+RUN uv venv "$VIRTUAL_ENV" && \
+    uv pip install --require-hashes -r requirements-docker.txt
+COPY libs/eyvan/ ./
+RUN uv pip install --no-deps .
+
+EXPOSE 8090
+ENTRYPOINT ["eyvan-agent"]
+CMD ["--host", "0.0.0.0", "--port", "8090"]

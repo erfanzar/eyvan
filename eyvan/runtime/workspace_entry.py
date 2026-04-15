@@ -1,0 +1,117 @@
+"""Materialize a workspace bundle, then exec the workload's own command.
+
+The callable path has always been able to ship a working tree, because
+``callable_worker`` fetches and unpacks one before unpickling. A plain command
+had no equivalent, so ``eyvan run`` could only launch what was already baked
+into the host image -- which is why using your own code on an accelerator meant
+building a container.
+
+This is that missing half, and deliberately nothing more. It verifies, extracts,
+enters, and then ``exec``s. Replacing the process rather than spawning a child
+keeps the workload's PID the one systemd supervises, so signals, exit codes,
+cgroup accounting and ``process_status`` all continue to describe the real
+process -- a wrapper that stayed resident would break every one of those.
+
+Verification order matches :mod:`eyvan.runtime.callable_protocol` and matters for
+the same reason: the digest and signature are checked *before* anything is
+written to disk, because the extracted tree becomes the process working
+directory and can shadow whatever the workload resolves by name.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import os
+import sys
+import typing as tp
+import urllib.request
+from pathlib import Path
+
+DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
+
+
+def _fetch(uri: str, *, token: str | None) -> bytes:
+    """Return the bundle bytes for a local path or an HTTP(S) managed URL."""
+
+    if "://" not in uri or uri.startswith("file://"):
+        return Path(uri.removeprefix("file://")).read_bytes()
+    request = urllib.request.Request(uri)
+    if not uri.startswith(("http://", "https://")):
+        raise ValueError(f"unsupported workspace URI scheme: {uri}")
+    if token:
+        request.add_header("X-Eyvan-Artifact-Token", token)
+    with urllib.request.urlopen(request) as response:
+        return tp.cast(bytes, response.read())
+
+
+def materialize(
+    payload: bytes,
+    *,
+    sha256: str,
+    signature: str | None,
+    signing_key: bytes | None,
+    destination: Path,
+) -> Path:
+    """Verify and unpack a bundle, returning the directory it landed in."""
+
+    digest = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(digest, sha256):
+        raise ValueError("workspace bundle does not match its content-addressed digest")
+    if signing_key is not None:
+        expected = hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
+        if signature is None or not hmac.compare_digest(expected, signature):
+            raise ValueError("workspace bundle signature mismatch")
+    from eyvan.workspace import extract_workspace
+
+    extract_workspace(payload, destination)
+    return destination
+
+
+def main(argv: tp.Sequence[str] | None = None) -> int:
+    """Materialize the workspace named by the arguments, then exec the command."""
+
+    parser = argparse.ArgumentParser(prog="eyvan-workspace-entry")
+    parser.add_argument("--workspace-uri")
+    parser.add_argument("--workspace-uri-env")
+    parser.add_argument("--workspace-token-env")
+    parser.add_argument("--workspace-sha256", required=True)
+    parser.add_argument("--workspace-signature")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args(list(argv) if argv is not None else None)
+
+    command = [item for item in arguments.command if item != "--"]
+    if not command:
+        parser.error("a command to execute is required")
+
+    uri = arguments.workspace_uri
+    token: str | None = None
+    if arguments.workspace_uri_env:
+        uri = os.environ.get(arguments.workspace_uri_env)
+    if arguments.workspace_token_env:
+        token = os.environ.get(arguments.workspace_token_env)
+    if not uri:
+        parser.error("a workspace URI is required")
+
+    signing_key_value = os.environ.get("EYVAN_CALLABLE_SIGNING_KEY")
+    signing_key = signing_key_value.encode() if signing_key_value else None
+    destination = Path(os.environ.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / DEFAULT_WORKSPACE_DIRNAME))
+
+    workspace = materialize(
+        _fetch(uri, token=token),
+        sha256=arguments.workspace_sha256,
+        signature=arguments.workspace_signature,
+        signing_key=signing_key,
+        destination=destination,
+    )
+    os.chdir(workspace)
+    # `exec` rather than spawn: the workload must keep the PID systemd started,
+    # or signals, exit status and process introspection all describe a wrapper
+    # instead of the job.
+    os.execvp(command[0], command)
+    raise AssertionError("execvp returned")  # pragma: no cover - unreachable
+
+
+if __name__ == "__main__":  # pragma: no cover - module entrypoint
+    sys.exit(main())

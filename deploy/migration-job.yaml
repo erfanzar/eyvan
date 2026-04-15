@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eyvan-schema-migration
+  namespace: eyvan-system
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eyvan-control-plane
+      containers:
+        - name: migrate
+          image: eyvan:latest
+          imagePullPolicy: IfNotPresent
+          command: ["eyvan-migrate"]
+          env:
+            - name: EYVAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: database-url

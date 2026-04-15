@@ -1,0 +1,85 @@
+# Deploy one agent in each network/project boundary and replace the placeholder
+# values for the target cell fleet. Production ingress should enforce mTLS.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+  annotations:
+    iam.gke.io/gcp-service-account: eyvan-cell-agent@PROJECT_ID.iam.gserviceaccount.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eyvan-cell-agent
+  template:
+    metadata:
+      labels:
+        app: eyvan-cell-agent
+    spec:
+      serviceAccountName: eyvan-cell-agent
+      containers:
+        - name: agent
+          image: eyvan-agent:latest
+          command: ["eyvan-agent"]
+          args: ["--host", "0.0.0.0", "--port", "8090"]
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            - name: EYVAN_AGENT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-agent-secrets
+                  key: shared-secret
+            - name: EYVAN_NATIVE_WORKER_ROOT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-agent-secrets
+                  key: native-worker-root-secret
+            - name: EYVAN_FLEET_STATE_URI
+              value: gs://replace-with-state-bucket/eyvan/fleet-state.json
+            - name: EYVAN_CAPACITY_BACKEND
+              # Routes each desired cell to Compute Engine or Cloud TPU.
+              value: gcp
+            - name: EYVAN_EXECUTION_BACKEND
+              # Direct Eyvan worker daemon on each provisioned Compute VM.
+              value: eyvan-native
+            - name: EYVAN_NATIVE_WORKER_PACKAGE
+              # A pinned Eyvan wheel reachable by each worker VM.
+              value: gs://replace-with-artifact-bucket/eyvan/eyvan-0.1.0-py3-none-any.whl
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE
+              # Required for private-google-access workers: a zip of all dependency wheels.
+              value: gs://replace-with-artifact-bucket/eyvan/eyvan-wheelhouse.zip
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+spec:
+  selector:
+    app: eyvan-cell-agent
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
