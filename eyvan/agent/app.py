@@ -150,6 +150,12 @@ def create_agent_app(
     def capabilities() -> AgentCapabilities:
         return service.capabilities()
 
+    @app.get("/api/v1/cells", dependencies=[Depends(authenticate)])
+    def inventory() -> list[dict[str, str | int | None]]:
+        """List every cell this agent holds durable state for."""
+
+        return service.inventory()
+
     @app.get(
         "/api/v1/cells/{cell_id}",
         dependencies=[Depends(authenticate)],

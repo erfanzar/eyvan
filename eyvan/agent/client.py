@@ -159,6 +159,15 @@ class CellAgentClient:
         response = self._send("GET", "/api/v1/capabilities")
         return AgentCapabilities.model_validate_json(response.content)
 
+    def inventory(self) -> list[dict[str, object]]:
+        """Return every cell this agent holds durable state for."""
+
+        response = self._send("GET", "/api/v1/cells")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError("cell agent inventory must be a JSON array")
+        return payload
+
     def observe(self, cell_id: str) -> AgentObservation:
         response = self._send("GET", f"/api/v1/cells/{cell_id}")
         return AgentObservation.model_validate(response.json())

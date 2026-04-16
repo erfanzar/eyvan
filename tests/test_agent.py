@@ -971,3 +971,29 @@ def test_an_ordinary_400_is_not_mistaken_for_a_configuration_refusal() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         client.apply_capacity("cell-a", request)
     assert not issubclass(CellAgentInvalidConfigurationError, httpx.HTTPStatusError)
+
+
+def test_an_agent_can_be_asked_what_it_holds(tmp_path) -> None:
+    """Found live on 2026-08-01: capacity resurrected from a deleted fleet.
+
+    An agent's state document outlives the control plane that wrote it. A control
+    plane whose database is replaced leaves its cells behind with
+    ``desired_state: up``, and the agent keeps re-ensuring them -- a v5p-128
+    queued resource was being recreated days after its fleet was gone.
+
+    Every other route is keyed by ``cell_id``, so the only way to discover that
+    was to read the state document out of object storage by hand. An inventory
+    that cannot be enumerated cannot be reconciled.
+    """
+
+    agent, state = service(tmp_path)
+    state.mutate_or_create_record(
+        "ghost-cell",
+        lambda record: record.__dict__.update(desired_state="up", generation=3, project="p", zone="z"),
+    )
+
+    inventory = agent.inventory()
+
+    assert [entry["name"] for entry in inventory] == ["ghost-cell"]
+    assert inventory[0]["desired_state"] == "up"
+    assert inventory[0]["generation"] == 3

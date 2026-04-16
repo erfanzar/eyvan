@@ -13,7 +13,7 @@ import os
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -41,7 +41,11 @@ class _FakeDistributed:
         coordinator_address: str | None = None,
         num_processes: int | None = None,
         process_id: int | None = None,
+        initialization_timeout: int | None = None,
+        heartbeat_timeout_seconds: int | None = None,
     ) -> None:
+        self.initialization_timeout = initialization_timeout
+        self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.topology_at_initialize = {
             name: value
             for name, value in os.environ.items()
@@ -170,3 +174,70 @@ def test_gce_topology_overrides_are_scrubbed_before_jax_reads_them(
 
     assert distributed.initialize_calls, "JAX must actually have been initialized"
     assert distributed.topology_at_initialize == {}, "the scrub ran too late to matter"
+
+
+def test_the_heartbeat_deadline_survives_a_model_load(monkeypatch) -> None:
+    """JAX's 100-second default kills a host that is busy, not hung.
+
+    This module runs from ``sitecustomize``, so JAX is initialized at interpreter
+    startup and the workload's own work happens afterwards -- weight download,
+    conversion, first compile -- none of which heartbeats.
+
+    On 2026-08-01 an eSurge job on a two-host v5p-16 died with
+    "DEADLINE_EXCEEDED: the JAX distributed service detected fatal errors" while
+    one host was still loading a 0.6B model. Both ranks were killed and the
+    surviving message named neither the cause nor the host.
+    """
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.delenv("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", raising=False)
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert distributed.heartbeat_timeout_seconds == _multihost_site.DEFAULT_HEARTBEAT_TIMEOUT_S
+    assert distributed.heartbeat_timeout_seconds >= 600, "a cold model pull must not read as a dead host"
+
+
+def test_an_operator_can_lengthen_the_deadlines(monkeypatch) -> None:
+    """A larger model or a slower link is a setting, not a rebuild."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setenv("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", "1800")
+    monkeypatch.setenv("EYVAN_JAX_INIT_TIMEOUT_S", "1200")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert distributed.heartbeat_timeout_seconds == 1800
+    assert distributed.initialization_timeout == 1200
+
+
+def test_a_nonsense_deadline_is_refused_rather_than_silently_defaulted(monkeypatch) -> None:
+    """Ignoring it would hand back a default the operator thought they replaced."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setenv("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", "not-a-number")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    with pytest.raises(RuntimeError, match="integer"):
+        initialize_from_environment()
+
+
+def test_a_zero_deadline_is_refused(monkeypatch) -> None:
+    """Zero would mean "declare every host dead immediately"."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setenv("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", "0")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    with pytest.raises(RuntimeError, match="positive"):
+        initialize_from_environment()

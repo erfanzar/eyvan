@@ -31,6 +31,41 @@ def _scrub_gce_topology_overrides(environment: tp.MutableMapping[str, str]) -> N
     remove_gce_tpu_topology_overrides(environment)
 
 
+#: JAX declares a task dead if it misses this many seconds of heartbeats, and
+#: its own default is 100. That is far too short for the work that happens
+#: *after* initialization on a real ML host: this module runs from
+#: ``sitecustomize``, so JAX is initialized at interpreter startup and the user's
+#: code then downloads weights, converts them, and compiles -- none of which
+#: heartbeats. On 2026-08-01 an eSurge inference job on a two-host v5p-16 died
+#: with "DEADLINE_EXCEEDED: the JAX distributed service detected fatal errors"
+#: while one host was still loading a 0.6B model. Both ranks were killed, and
+#: the surviving message named neither the cause nor the host.
+#:
+#: Eyvan makes this call on the workload's behalf, so the default is Eyvan's to
+#: choose. Fifteen minutes accommodates a cold model pull and a first compile;
+#: a genuinely hung host is still detected, just not a busy one.
+DEFAULT_HEARTBEAT_TIMEOUT_S = 900
+
+#: Skew between hosts *reaching* initialization: image pull, container start,
+#: interpreter boot. JAX defaults to 300.
+DEFAULT_INITIALIZATION_TIMEOUT_S = 600
+
+
+def _timeout(name: str, default: int) -> int:
+    """Return a positive integer timeout from the environment, or the default."""
+
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer number of seconds") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
 def initialize_worker_runtime(environment: tp.MutableMapping[str, str] | None = None) -> None:
     """Prepare the environment and initialize JAX, in that order.
 
@@ -57,7 +92,11 @@ def initialize_from_environment() -> None:
         import jax
 
         if not jax.distributed.is_initialized():
-            jax.distributed.initialize(cluster_detection_method="gcetpu")
+            jax.distributed.initialize(
+                cluster_detection_method="gcetpu",
+                initialization_timeout=_timeout("EYVAN_JAX_INIT_TIMEOUT_S", DEFAULT_INITIALIZATION_TIMEOUT_S),
+                heartbeat_timeout_seconds=_timeout("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", DEFAULT_HEARTBEAT_TIMEOUT_S),
+            )
         return
     if detection_method != "explicit":
         raise RuntimeError(f"Eyvan does not support JAX cluster detection method {detection_method!r}")
@@ -81,7 +120,14 @@ def initialize_from_environment() -> None:
             num_processes=num_processes,
             process_id=rank,
             cluster_detection_method="deactivate",
+            initialization_timeout=_timeout("EYVAN_JAX_INIT_TIMEOUT_S", DEFAULT_INITIALIZATION_TIMEOUT_S),
+            heartbeat_timeout_seconds=_timeout("EYVAN_JAX_HEARTBEAT_TIMEOUT_S", DEFAULT_HEARTBEAT_TIMEOUT_S),
         )
 
 
-__all__ = ("initialize_from_environment", "initialize_worker_runtime")
+__all__ = (
+    "DEFAULT_HEARTBEAT_TIMEOUT_S",
+    "DEFAULT_INITIALIZATION_TIMEOUT_S",
+    "initialize_from_environment",
+    "initialize_worker_runtime",
+)

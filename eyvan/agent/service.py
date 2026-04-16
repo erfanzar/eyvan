@@ -212,6 +212,42 @@ class CellAgentService:
             resource_enforcement=capabilities.resource_enforcement,
         )
 
+    def inventory(self) -> list[dict[str, str | int | None]]:
+        """Return every cell this agent holds durable state for.
+
+        Every other route is keyed by ``cell_id``, so an agent's inventory was
+        unenumerable: the only way to see what it believed it owned was to read
+        its state document out of object storage by hand.
+
+        That matters because the document outlives the control plane that wrote
+        it. A control plane whose database is replaced leaves its cells behind
+        with ``desired_state: up``, and the agent faithfully keeps re-ensuring
+        them -- capacity nobody asked for, recreated indefinitely, invisible to
+        the control plane that would otherwise own it. Found on 2026-08-01: a
+        v5p-128 queued resource being resurrected from a fleet deleted days
+        earlier.
+
+        Read-only and deliberately narrow: identity, lifecycle and intent, so an
+        operator can diff it against a control plane. Nothing here can mutate.
+        """
+
+        return [
+            {
+                "name": record.name,
+                "state": str(record.state),
+                "desired_state": record.desired_state,
+                "generation": record.generation,
+                "project": record.project,
+                "zone": record.zone,
+                "accelerator_type": record.accelerator_type,
+                "qr_id": record.qr_id,
+            }
+            # Sorted here rather than relying on the storage layer: the local
+            # backend happens to write with sorted keys, but that is its choice
+            # and not a contract this method should inherit.
+            for record in sorted(self.state.load().values(), key=lambda item: item.name)
+        ]
+
     def observe(self, cell_id: str) -> AgentObservation:
         return self._observation(self._with_execution_readiness(self.capacity.observe(cell_id)))
 
