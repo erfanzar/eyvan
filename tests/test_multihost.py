@@ -241,3 +241,60 @@ def test_a_zero_deadline_is_refused(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="positive"):
         initialize_from_environment()
+
+
+def test_a_subprocess_does_not_rejoin_and_kill_the_cluster(monkeypatch) -> None:
+    """The cause of a v5p inference job dying with no host having died.
+
+    ``sitecustomize`` runs in every interpreter that inherits ``PYTHONPATH``, and
+    the workload environment carries both that path and ``EYVAN_JAX_MULTIHOST=1``.
+    Any Python subprocess -- ``gcloud`` is one -- therefore joined the
+    coordination service as a duplicate task carrying its parent's
+    ``JAX_PROCESS_ID``, then exited when its work was done. The service saw a
+    task die and tore down every rank: "another task died", no host dead.
+
+    Ray never hits this: it injects no sitecustomize, so user code initializes
+    once, itself.
+    """
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert len(distributed.initialize_calls) == 1
+    # A child inherits a copy of this environment; the marker must already be
+    # gone from it, or that child joins the cluster and its exit kills the job.
+    assert "EYVAN_JAX_MULTIHOST" not in os.environ
+
+
+def test_the_marker_is_consumed_even_for_explicit_detection(monkeypatch) -> None:
+    """Both detection paths spawn subprocesses; neither may leak the marker."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "explicit")
+    monkeypatch.setenv("JAX_COORDINATOR_ADDRESS", "10.0.0.1:8476")
+    monkeypatch.setenv("JAX_PROCESS_COUNT", "2")
+    monkeypatch.setenv("JAX_PROCESS_ID", "0")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert "EYVAN_JAX_MULTIHOST" not in os.environ
+
+
+def test_a_second_call_in_the_same_process_is_a_no_op(monkeypatch) -> None:
+    """Consuming the marker must not make a re-entrant call misbehave."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+    initialize_from_environment()
+
+    assert len(distributed.initialize_calls) == 1

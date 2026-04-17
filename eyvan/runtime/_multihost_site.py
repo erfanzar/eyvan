@@ -82,11 +82,42 @@ def initialize_worker_runtime(environment: tp.MutableMapping[str, str] | None = 
     initialize_from_environment()
 
 
+def _consume_multihost_marker() -> None:
+    """Stop this process's children from re-joining the JAX cluster.
+
+    ``sitecustomize`` runs in *every* Python interpreter that inherits
+    ``PYTHONPATH``, and the workload's environment carries both that path and
+    ``EYVAN_JAX_MULTIHOST=1``. So any Python subprocess the workload spawns --
+    and ``gcloud`` is itself a Python program -- would load this module, see the
+    marker, and call ``jax.distributed.initialize()`` carrying its *parent's*
+    ``JAX_PROCESS_ID``. It joins the coordination service as a duplicate task,
+    finishes its work, and exits. The service sees a task die and tears the
+    whole cluster down: every rank reports "another task died" and no host has
+    died at all.
+
+    Ray never hits this because it injects no ``sitecustomize``; user code calls
+    ``initialize()`` once, itself, at a time it chooses.
+
+    Removing the marker from ``os.environ`` after initializing is what breaks the
+    inheritance: this process is already joined, and every interpreter it starts
+    from here on sees no marker and returns immediately. The ``PYTHONPATH`` entry
+    is left alone deliberately -- staged sibling modules are still importable,
+    and without the marker this module is a no-op anyway.
+
+    Also removes the earlier symptom: a child with no JAX installed printed
+    "Error in sitecustomize ... ModuleNotFoundError: No module named 'jax'",
+    because the import is reached only past this guard.
+    """
+
+    os.environ.pop("EYVAN_JAX_MULTIHOST", None)
+
+
 def initialize_from_environment() -> None:
     """Initialize JAX from Eyvan's explicit multi-host environment."""
 
     if os.getenv("EYVAN_JAX_MULTIHOST") != "1":
         return
+    _consume_multihost_marker()
     detection_method = os.getenv("EYVAN_JAX_CLUSTER_DETECTION", "explicit")
     if detection_method == "gcetpu":
         import jax
