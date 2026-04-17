@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import typing as tp
 import uuid
 from dataclasses import dataclass
@@ -491,6 +492,7 @@ class GcpTpuCapacityDriver:
             current.metadata["execution_backend"] = self.execution_backend
             current.metadata["native_worker_secret_id"] = replacement.metadata["native_worker_secret_id"]
             current.metadata["native_worker_bootstrap_generation"] = replacement.provider_generation
+            current.metadata.pop("native_worker_bootstrap_key", None)
             _persist_native_worker_endpoint_mode(current, endpoint_mode)
 
         return self._persist_owned_cell(
@@ -654,6 +656,7 @@ class GcpTpuCapacityDriver:
             record.metadata["execution_backend"] = self.execution_backend
             record.metadata.pop("native_worker_secret_id", None)
             record.metadata.pop("native_worker_bootstrap_generation", None)
+            record.metadata.pop("native_worker_bootstrap_key", None)
             record.metadata.pop("native_worker_endpoint_mode", None)
         else:
             record.metadata.pop("native_worker_port", None)
@@ -663,6 +666,25 @@ class GcpTpuCapacityDriver:
             record.metadata.pop("native_runtime", None)
             record.metadata.pop("native_worker_endpoint_mode", None)
         record.metadata["tpu_config"] = persisted_config
+
+    def _bootstrap_key(self, record: FleetCellRecord) -> str:
+        """Return what must be unchanged for a host's bootstrap to still be current.
+
+        The provider generation alone is not enough. The staged worker wheel is
+        baked into the startup script at bootstrap time, and re-staging a wheel
+        does not change the generation -- so ``eyvan runtime init`` published new
+        code that reached no existing cell, and there was no way to tell from
+        the outside. Live on 2026-08-01 that meant TPU hosts ran a three-day-old
+        wheel for an entire day, and a "fix" that had been verified in the
+        package was simply not on the machine.
+
+        Including the package URI makes a re-stage invalidate the bootstrap, so
+        the next reconcile rewrites the script. The URI is content-addressed, so
+        identical code produces an identical key and nothing churns.
+        """
+
+        package = self.native_worker_package or ""
+        return f"{record.provider_generation}:{hashlib.sha256(package.encode()).hexdigest()[:16]}"
 
     def _finalize_provider_config(self, cell_id: str, context: MutationContext) -> None:
         """Finish any provider setup that must run outside durable-state CAS callbacks."""
@@ -674,8 +696,7 @@ class GcpTpuCapacityDriver:
             self._fence_missing_cell(cell_id, context, phase="native worker bootstrap could begin")
         if record.generation != context.generation or record.fencing_token != context.fencing_token:
             raise StaleMutationError(f"cell {cell_id!r} changed ownership before native TPU bootstrap")
-        completed_generation = record.metadata.get("native_worker_bootstrap_generation")
-        if completed_generation == record.provider_generation:
+        if record.metadata.get("native_worker_bootstrap_key") == self._bootstrap_key(record):
             return
         config = record.metadata.get("tpu_config")
         if not isinstance(config, dict):
@@ -705,6 +726,7 @@ class GcpTpuCapacityDriver:
             current.metadata["execution_backend"] = self.execution_backend
             current.metadata["native_worker_secret_id"] = record.metadata["native_worker_secret_id"]
             current.metadata["native_worker_bootstrap_generation"] = record.provider_generation
+            current.metadata["native_worker_bootstrap_key"] = self._bootstrap_key(record)
             _persist_native_worker_endpoint_mode(current, endpoint_mode)
 
         self._persist_owned_cell(
@@ -1109,6 +1131,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             record.metadata["execution_backend"] = self.execution_backend
             record.metadata.pop("native_worker_secret_id", None)
             record.metadata.pop("native_worker_bootstrap_generation", None)
+            record.metadata.pop("native_worker_bootstrap_key", None)
             record.metadata.pop("native_worker_endpoint_mode", None)
         else:
             record.metadata.pop("native_worker_port", None)
@@ -1128,8 +1151,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             self._fence_missing_cell(cell_id, context, phase="native worker bootstrap could begin")
         if record.generation != context.generation or record.fencing_token != context.fencing_token:
             raise StaleMutationError(f"cell {cell_id!r} changed ownership before native worker bootstrap")
-        completed_generation = record.metadata.get("native_worker_bootstrap_generation")
-        if completed_generation == record.provider_generation:
+        if record.metadata.get("native_worker_bootstrap_key") == self._bootstrap_key(record):
             return
         config = record.metadata.get("compute_config")
         if not isinstance(config, dict):
@@ -1159,6 +1181,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             current.metadata["execution_backend"] = self.execution_backend
             current.metadata["native_worker_secret_id"] = record.metadata["native_worker_secret_id"]
             current.metadata["native_worker_bootstrap_generation"] = record.provider_generation
+            current.metadata["native_worker_bootstrap_key"] = self._bootstrap_key(record)
             _persist_native_worker_endpoint_mode(current, endpoint_mode)
 
         self._persist_owned_cell(
@@ -1293,6 +1316,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             current.metadata["execution_backend"] = self.execution_backend
             current.metadata["native_worker_secret_id"] = replacement.metadata["native_worker_secret_id"]
             current.metadata["native_worker_bootstrap_generation"] = replacement.provider_generation
+            current.metadata.pop("native_worker_bootstrap_key", None)
             _persist_native_worker_endpoint_mode(current, endpoint_mode)
 
         return self._persist_owned_cell(

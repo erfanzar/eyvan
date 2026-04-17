@@ -776,3 +776,57 @@ def test_repeated_same_generation_reconciles_are_replays_not_fence_conflicts(tmp
     observations = [driver.reconcile("tpu-cell", context("reconcile:tpu-cell:1")) for _ in range(4)]
 
     assert [observation.state for observation in observations] == [CapacityStatus.WAITING] * 4
+
+
+def _native_driver(tmp_path, package: str) -> GcpTpuCapacityDriver:
+    return GcpTpuCapacityDriver(
+        FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        provider=FakeProvider(),
+        execution_backend="eyvan-native",
+        native_worker_package=package,
+        native_worker_shared_secret="native-worker-root-secret",
+        native_worker_secrets=FakeNativeWorkerSecrets(),
+    )
+
+
+def test_restaging_a_wheel_invalidates_the_host_bootstrap(tmp_path) -> None:
+    """The reason a verified fix twice failed to reach the machine.
+
+    The startup script bakes in the staged worker wheel, and the bootstrap was
+    treated as current whenever the *provider generation* was unchanged.
+    Re-staging a wheel does not change the generation, so ``eyvan runtime init``
+    published new code that reached no existing cell -- and nothing said so.
+    Live on 2026-08-01: TPU hosts ran a three-day-old wheel for a full day while
+    the package under test contained the fix.
+    """
+
+    record = FleetCellRecord(name="tpu-cell", project="project-a", zone="us-central2-b", provider_generation=1)
+
+    before = _native_driver(tmp_path, "gs://artifacts/eyvan/wheels/aaa/eyvan-0.1.0-py3-none-any.whl")
+    after = _native_driver(tmp_path, "gs://artifacts/eyvan/wheels/bbb/eyvan-0.1.0-py3-none-any.whl")
+
+    assert before._bootstrap_key(record) != after._bootstrap_key(record), (
+        "a re-staged wheel must invalidate the bootstrap, or the host keeps running old code"
+    )
+
+
+def test_an_unchanged_wheel_does_not_churn_the_bootstrap(tmp_path) -> None:
+    """The URI is content-addressed, so identical code must produce one key."""
+
+    record = FleetCellRecord(name="tpu-cell", project="project-a", zone="us-central2-b", provider_generation=1)
+    package = "gs://artifacts/eyvan/wheels/aaa/eyvan-0.1.0-py3-none-any.whl"
+
+    assert _native_driver(tmp_path, package)._bootstrap_key(record) == _native_driver(tmp_path, package)._bootstrap_key(
+        record
+    )
+
+
+def test_a_new_provider_generation_still_invalidates_it(tmp_path) -> None:
+    """Recreation must keep forcing a rebuild; the wheel is an addition, not a swap."""
+
+    package = "gs://artifacts/eyvan/wheels/aaa/eyvan-0.1.0-py3-none-any.whl"
+    driver = _native_driver(tmp_path, package)
+    first = FleetCellRecord(name="tpu-cell", project="p", zone="z", provider_generation=1)
+    second = FleetCellRecord(name="tpu-cell", project="p", zone="z", provider_generation=2)
+
+    assert driver._bootstrap_key(first) != driver._bootstrap_key(second)
