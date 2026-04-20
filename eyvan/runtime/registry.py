@@ -24,8 +24,33 @@ ExecutorFactory = tp.Callable[..., ExecutionDriver]
 logger = logging.getLogger(__name__)
 
 
-def _uses_gce_tpu_multislice(observation: CellObservation) -> bool:
-    """Return whether GCP provisioned this cell as one multi-node TPU QR."""
+def _uses_gce_tpu_cluster_detection(observation: CellObservation) -> bool:
+    """Return whether JAX should derive this cell's cluster from GCE metadata.
+
+    True for *any* GCE TPU, not only a multislice. The question that matters is
+    "can JAX discover this topology itself", and for a Cloud TPU it always can --
+    a single ``v5p-16`` is two hosts and is discovered exactly like a multislice.
+
+    Asking "is this multislice?" instead put single-slice multi-host TPUs on the
+    ``EXPLICIT`` path, where Eyvan supplies the coordinator address by reusing
+    the worker's *management* endpoint. That endpoint is the address the control
+    plane reaches the worker on, which for a public-routed cell is an external
+    IP -- so the hosts tried to coordinate over the public internet on port
+    12345, which no firewall rule permits. Every rank died in
+    ``RegisterTask`` with DEADLINE_EXCEEDED, having never joined, while the
+    hosts sat healthy on the same subnet with ``default-allow-internal``
+    covering everything they actually needed.
+
+    Two addresses were being conflated: the *management* endpoint (control plane
+    to worker, may have to be public) and the *coordination* address (host to
+    host, must be internal). GCE metadata gives JAX the second one directly.
+
+    Live on 2026-08-02: every ``pods=1`` inference run failed this way, while the
+    ``pods=2`` job succeeded -- because only multislice reached this branch.
+
+    ``EXPLICIT`` remains correct for multi-host backends that are not GCE TPUs,
+    where Eyvan genuinely does have to supply the addresses.
+    """
 
     raw_config = observation.metadata.get("tpu_config")
     if raw_config is None:
@@ -35,7 +60,7 @@ def _uses_gce_tpu_multislice(observation: CellObservation) -> bool:
     node_count = raw_config.get("node_count", 1)
     if isinstance(node_count, bool) or not isinstance(node_count, int) or node_count < 1:
         raise ValueError("eyvan-native execution observation has an invalid TPU node count")
-    return node_count > 1
+    return True
 
 
 @tp.runtime_checkable
@@ -323,9 +348,9 @@ class ExecutionDriverResolver:
                     allow_empty=True,
                 )
         token_fingerprint = hashlib.sha256(token.encode()).hexdigest()[:24] if token is not None else ""
-        gce_multislice = self.backend == "eyvan-native" and _uses_gce_tpu_multislice(observation)
+        gce_tpu_cluster = self.backend == "eyvan-native" and _uses_gce_tpu_cluster_detection(observation)
         endpoint_fingerprint = "\x1f".join(native_endpoints) if len(native_endpoints) > 1 else str(endpoint or "")
-        endpoint_fingerprint = f"{endpoint_fingerprint}\x1e{int(gce_multislice)}"
+        endpoint_fingerprint = f"{endpoint_fingerprint}\x1e{int(gce_tpu_cluster)}"
         key = (self.backend, cell_id, endpoint_fingerprint, token_fingerprint)
         with self._lock:
             driver = self._drivers.get(key)
@@ -341,7 +366,7 @@ class ExecutionDriverResolver:
                         native_endpoints,
                         secret=token,
                         jax_cluster_detection=(
-                            JaxClusterDetectionMode.GCE_TPU if gce_multislice else JaxClusterDetectionMode.EXPLICIT
+                            JaxClusterDetectionMode.GCE_TPU if gce_tpu_cluster else JaxClusterDetectionMode.EXPLICIT
                         ),
                     )
                 else:
