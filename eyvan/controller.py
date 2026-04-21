@@ -53,6 +53,7 @@ from eyvan.capacity_planning import (
     cell_execution_runtime_is_pending,
     cell_matches_pool,
     cell_requires_replacement,
+    next_pool_cell_index,
     pool_cell_id,
 )
 from eyvan.config import EyvanSettings
@@ -793,12 +794,16 @@ class EyvanController:
         cell_ids = {cell.id for cell in cells}
 
         for pool in sorted(pools, key=lambda item: item.id):
-            managed = sorted(cells_by_pool[pool.id], key=lambda item: item.id)
             plan = plans[pool.id]
             live = list(plan.live)
             matching_supply = list(plan.matching_supply)
             target = plan.target_worker_units
-            next_index = len(managed) + 1
+            # Monotonic, from every cell this pool has ever had -- including
+            # deleted ones, whose records are the evidence their index is spent.
+            # `len(managed) + 1` walked backwards on deletion and handed the same
+            # id out twice; the second holder then inherited the first's provider
+            # resource under that name.
+            next_index = next_pool_cell_index(pool, cells)
             for worker_count, autoscale_request_workload_id in zip(
                 plan.launch_worker_counts,
                 plan.launch_workload_ids,

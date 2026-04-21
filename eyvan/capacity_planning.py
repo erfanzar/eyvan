@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import typing as tp
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -81,6 +82,36 @@ def pool_cell_id(pool: CapacityPoolRecord, index: int) -> str:
     epoch = pool_cell_epoch(pool)
     suffix = f"-{epoch}-{index:04d}"
     return f"{pool_cell_prefix(pool)[: _CELL_ID_LIMIT - len(suffix)].rstrip('-')}{suffix}"
+
+
+def next_pool_cell_index(pool: CapacityPoolRecord, cells: tp.Iterable[CellRecord]) -> int:
+    """Return an index this pool has never used, given every cell it has ever had.
+
+    Deliberately monotonic rather than ``len(cells) + 1``. Counting live cells
+    walks the counter *backwards* whenever one is deleted, so a pool that has
+    churned hands the same id out twice -- and the second holder inherits
+    whatever the first left behind at the provider under that name.
+
+    Live on 2026-08-02: two cells shared index 0007, and the newer one found a
+    ``v5p-128`` queued resource created hours earlier wearing the name it had
+    just been given. Eyvan correctly refused to adopt a resource of the wrong
+    shape, then drained and retried -- forever, against an ACTIVE and billing
+    TPU it could never accept. The earlier ``research-*`` v5p-128 orphan was the
+    same mechanism in a different fleet.
+
+    Callers must pass *every* cell of the pool including deleted ones: a deleted
+    record is precisely the evidence that its index is spent.
+    """
+
+    highest = 0
+    prefix = f"{pool_cell_prefix(pool)}-{pool_cell_epoch(pool)}-"
+    for cell in cells:
+        if not cell.id.startswith(prefix):
+            continue
+        suffix = cell.id[len(prefix) :]
+        if suffix.isdigit():
+            highest = max(highest, int(suffix))
+    return highest + 1
 
 
 def cell_matches_pool(cell: CellRecord, pool: CapacityPoolRecord) -> bool:

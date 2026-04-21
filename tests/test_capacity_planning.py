@@ -12,6 +12,7 @@ from eyvan.persistence import InMemoryRepository
 from eyvan.service import ControlPlaneService
 from eyvan.service.models import (
     CapacityPoolRecord,
+    CellRecord,
     CellState,
     CommandExecution,
     Principal,
@@ -366,3 +367,87 @@ def test_the_counter_is_never_truncated_away() -> None:
     assert len(set(minted)) == len(indices), minted
     assert minted[0].endswith("-0001")
     assert minted[-1].endswith("-10000")
+
+
+def test_a_deleted_cell_never_gives_its_index_back() -> None:
+    """Found live on 2026-08-02, after it had burned Spot capacity all night.
+
+    The counter was ``len(live_cells) + 1``, so deleting a cell walked it
+    *backwards* and a churning pool handed the same id out twice. The second
+    holder then inherited whatever the first had left at the provider under that
+    name: a new cell 0007 found a ``v5p-128`` queued resource created hours
+    earlier wearing the name it had just been given.
+
+    Eyvan correctly refused to adopt a resource of the wrong shape -- and then
+    drained and retried forever against an ACTIVE, billing TPU it could never
+    accept. The earlier ``research-*`` v5p-128 orphan was the same mechanism.
+    """
+
+    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+
+    pool = multislice_tpu_pool()
+    first = CellRecord(
+        id=pool_cell_id(pool, 1),
+        provider="gcp",
+        provider_project="project-a",
+        region="us-east5",
+        zone="us-east5-a",
+        state=CellState.DELETED,
+        capacity=pool.capacity,
+        allocatable=pool.allocatable,
+        pool_id=pool.id,
+    )
+
+    assert next_pool_cell_index(pool, [first]) == 2, "a spent index must never be reissued"
+
+
+def test_the_index_advances_past_the_highest_ever_used() -> None:
+    """Gaps are fine; going backwards is not."""
+
+    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+
+    pool = multislice_tpu_pool()
+    cells = [
+        CellRecord(
+            id=pool_cell_id(pool, index),
+            provider="gcp",
+            provider_project="project-a",
+            region="us-east5",
+            zone="us-east5-a",
+            state=CellState.DELETED if index < 5 else CellState.READY,
+            capacity=pool.capacity,
+            allocatable=pool.allocatable,
+            pool_id=pool.id,
+        )
+        for index in (1, 5)
+    ]
+
+    assert next_pool_cell_index(pool, cells) == 6
+
+
+def test_a_pool_with_no_history_starts_at_one() -> None:
+    from eyvan.capacity_planning import next_pool_cell_index
+
+    assert next_pool_cell_index(multislice_tpu_pool(), []) == 1
+
+
+def test_another_pools_cells_do_not_advance_this_counter() -> None:
+    """Two pools sharing a prefix must not consume each other's indices."""
+
+    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+
+    pool = multislice_tpu_pool()
+    other = pool.model_copy(update={"id": f"{pool.id}-other"})
+    foreign = CellRecord(
+        id=pool_cell_id(other, 9),
+        provider="gcp",
+        provider_project="project-a",
+        region="us-east5",
+        zone="us-east5-a",
+        state=CellState.READY,
+        capacity=pool.capacity,
+        allocatable=pool.allocatable,
+        pool_id=other.id,
+    )
+
+    assert next_pool_cell_index(pool, [foreign]) == 1
