@@ -550,13 +550,54 @@ class GcloudTpuProvider:
         return "does not have permission to submit requests into this queue" in normalized
 
     @staticmethod
-    def _validate_qr(qr: QueuedResource, spec: QueuedResourceSpec) -> None:
+    def _exposes_ownership_fields(qr: QueuedResource) -> bool:
+        """Return whether the provider surfaced any ownership marks to compare.
+
+        Cloud TPU does not echo ``--labels`` or ``--metadata`` back through
+        ``queued-resources describe`` or ``tpu-vm describe`` for a provisioned
+        queued resource: the node comes back with ``labels: null`` and
+        ``metadata: {}`` even though the startup script from that same metadata
+        demonstrably ran. Verified against a live ACTIVE v5p-16 on 2026-08-02.
+
+        So "no ownership fields at all" is not evidence of a foreign resource --
+        it is the provider declining to answer, and it is the normal case here.
+        """
+
+        if is_json_object(qr.raw.get("labels")):
+            return True
+        tpu_value = qr.raw.get("tpu")
+        tpu = tpu_value if is_json_object(tpu_value) else {}
+        node_specs_value = tpu.get("nodeSpec")
+        node_specs = node_specs_value if isinstance(node_specs_value, list) else []
+        for spec_value in node_specs:
+            if is_json_object(spec_value):
+                node_value = spec_value.get("node")
+                if is_json_object(node_value) and is_json_object(node_value.get("labels")):
+                    return True
+        return False
+
+    @staticmethod
+    def _validate_qr(qr: QueuedResource, spec: QueuedResourceSpec, *, recorded_qr_id: str | None = None) -> None:
         expected_uid = spec.labels.get("eyvan-uid")
-        if not expected_uid or not GcloudTpuProvider._has_ownership_labels(
-            qr,
-            management_uid=expected_uid,
-            cell_id=spec.labels.get("eyvan-cell"),
-        ):
+        if not expected_uid:
+            raise GcloudError(f"queued resource {qr.qr_id!r} is not owned by this Eyvan cell")
+        if GcloudTpuProvider._exposes_ownership_fields(qr):
+            # The provider answered, so its answer is authoritative in both
+            # directions: a mismatch here is a genuinely foreign resource.
+            if not GcloudTpuProvider._has_ownership_labels(
+                qr,
+                management_uid=expected_uid,
+                cell_id=spec.labels.get("eyvan-cell"),
+            ):
+                raise GcloudError(f"queued resource {qr.qr_id!r} is not owned by this Eyvan cell")
+        elif recorded_qr_id != qr.qr_id:
+            # No marks to compare, so fall back to the only other authority:
+            # Eyvan minted this exact id under a fence and recorded it. Without
+            # this, an ACTIVE queued resource Eyvan created itself is declared
+            # foreign the moment it becomes usable -- capacity stranded and
+            # billing, with the workload stuck pending. Treating "the provider
+            # said nothing" as "this is someone else's" is the same
+            # unknown-is-not-a-value mistake as the rest of this class.
             raise GcloudError(f"queued resource {qr.qr_id!r} is not owned by this Eyvan cell")
         if qr.accelerator_type is not None and qr.accelerator_type != spec.accelerator_type:
             raise GcloudError(
@@ -790,7 +831,7 @@ class GcloudTpuProvider:
         qr_id = record.qr_id or record.next_qr_id()
         qr = self.describe_qr(qr_id, project=record.project, zone=record.zone)
         if qr is not None:
-            self._validate_qr(qr, spec)
+            self._validate_qr(qr, spec, recorded_qr_id=record.qr_id)
         if qr is None:
             # A same-named singleton TPU VM without a queued resource is not
             # ours to adopt. Multi-slice node names are generated from the QR
