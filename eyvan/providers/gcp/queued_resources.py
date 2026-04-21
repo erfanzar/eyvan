@@ -661,12 +661,23 @@ class GcloudTpuProvider:
         existing = self.describe_qr(qr_id, project=project, zone=zone)
         if existing is None:
             return
-        if (
-            not isinstance(management_uid, str)
-            or not management_uid
-            or not self._has_ownership_labels(existing, management_uid=management_uid)
-        ):
+        if not isinstance(management_uid, str) or not management_uid:
             raise GcloudError(f"refusing to delete queued resource {qr_id!r} without its Eyvan ownership UID")
+        if self._exposes_ownership_fields(existing):
+            # The provider answered; a mismatch means this is someone else's.
+            if not self._has_ownership_labels(existing, management_uid=management_uid):
+                raise GcloudError(f"refusing to delete queued resource {qr_id!r} without its Eyvan ownership UID")
+        # Otherwise the provider exposes nothing to compare, which for a
+        # *provisioned* Cloud TPU queued resource is always the case: labels and
+        # metadata are not echoed back once it is ACTIVE. Refusing then does not
+        # protect anything -- it guarantees a leak, because every TPU Eyvan
+        # creates becomes undeletable by Eyvan the moment it becomes usable.
+        #
+        # That is exactly how ACTIVE v5p-128 queued resources survived for days
+        # with nothing running on them: cells released while still WAITING went
+        # away cleanly, and every one that reached ACTIVE could never be
+        # reclaimed. The caller is deleting an id it recorded on its own fenced
+        # cell record, which is the remaining authority.
         args = (
             "compute",
             "tpus",
