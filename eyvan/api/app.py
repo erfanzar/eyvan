@@ -1196,6 +1196,16 @@ def create_app(
             metrics=request.metrics,
         )
 
+    # response_model=None: agent inventory entries are backend-shaped JSON.
+    @app.get("/api/v1/capacity/orphans", tags=["capacity"], response_model=None)
+    async def capacity_orphans(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[dict[str, str | int | None]]:
+        """List cells an agent still holds that no control-plane record claims."""
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        return await controller.capacity_orphans()
+
     @app.get(
         "/api/v1/workloads/{workload_id}/logs",
         response_class=PlainTextResponse,

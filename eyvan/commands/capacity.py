@@ -34,6 +34,39 @@ def capacity() -> None:
     """Inspect available capacity, pools, cells, and leases."""
 
 
+@capacity.command("orphans")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def capacity_orphans(session: CliSession, as_json: bool) -> None:
+    """List cells an agent still holds that this control plane does not claim.
+
+    A fleet-state document outlives the control plane that wrote it, so a
+    replaced database leaves its cells behind in the agent -- and any left
+    desired-up are re-ensured forever, provisioning capacity nobody asked for.
+    Before this, the only way to see them was reading the agent's state document
+    out of object storage by hand.
+
+    Reporting only. One agent can legitimately serve more than one control
+    plane, so an unrecognised record is not proven unowned; reclaiming it is an
+    operator decision, and this is the information that decision needs.
+    """
+
+    payload = session.client.request("GET", "/api/v1/capacity/orphans")
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return
+    if not payload:
+        click.echo("no orphaned cell records")
+        return
+    for entry in payload if isinstance(payload, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        click.echo(
+            f"{entry.get('name')}  state={entry.get('state')}  desired={entry.get('desired_state')}  "
+            f"qr={entry.get('qr_id')}  agent={entry.get('endpoint')}"
+        )
+
+
 @capacity.command("list")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")

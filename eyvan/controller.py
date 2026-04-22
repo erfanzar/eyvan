@@ -4720,6 +4720,45 @@ class EyvanController:
                 settled += 1
         return settled
 
+    async def capacity_orphans(self) -> list[dict[str, str | int | None]]:
+        """Return cells an agent still holds that no control-plane record claims.
+
+        A fleet-state document outlives the control plane that wrote it. When a
+        control plane's database is replaced, its cells are left behind in the
+        agent -- and any left ``desired_state: up`` are re-ensured forever, so
+        the agent keeps provisioning capacity nobody asked for, invisible to the
+        control plane that would otherwise own it.
+
+        Found on 2026-08-01: a ``v5p-128`` queued resource being recreated days
+        after its fleet was deleted, discoverable only by reading the agent's
+        state document out of object storage by hand.
+
+        Read-only, and deliberately not automatic. One agent can legitimately be
+        shared by more than one control plane, so a record this control plane
+        does not recognise is not necessarily unowned -- reclaiming it is an
+        operator decision, and this is the information that decision needs.
+        """
+
+        async with self.repository.transaction() as transaction:
+            cells = await transaction.list_cells()
+        known = {cell.id for cell in cells}
+        endpoints: dict[str, CellRecord] = {}
+        for cell in cells:
+            if cell.endpoint and cell.state is not CellState.DELETED:
+                endpoints.setdefault(cell.endpoint, cell)
+        orphans: list[dict[str, str | int | None]] = []
+        for endpoint, sample in sorted(endpoints.items()):
+            try:
+                inventory = await asyncio.to_thread(self._agent_factory(sample).inventory)
+            except Exception as exc:
+                logger.warning("cell agent %s inventory is unavailable: %s", endpoint, exc)
+                continue
+            for entry in inventory:
+                name = entry.get("name")
+                if isinstance(name, str) and name not in known:
+                    orphans.append({**entry, "endpoint": endpoint})
+        return orphans
+
     async def workload_logs(self, workload_id: str) -> str:
         """Read driver logs for an active or terminal workload attempt."""
 
