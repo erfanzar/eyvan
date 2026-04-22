@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Leader-only scheduling, outbox delivery, and cell observation loops."""
 
 from __future__ import annotations
@@ -38,7 +51,7 @@ from eyvan.agent.models import (
     WorkloadMutationRequest,
     WorkloadRequest,
 )
-from eyvan.artifact_transfers import ManagedArtifactAccess
+from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.capacity import (
     DEFINITIVE_CAPACITY_LOSS_STATUSES,
     PENDING_CAPACITY_STATUSES,
@@ -46,8 +59,8 @@ from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
     CapacityStatus,
 )
-from eyvan.capacity_logging import CapacityLifecycleEvent, CapacityLifecycleLogger, CapacityReplacementReason
-from eyvan.capacity_planning import (
+from eyvan.capacity.audit import CapacityLifecycleEvent, CapacityLifecycleLogger, CapacityReplacementReason
+from eyvan.capacity.planning import (
     CapacityPlanner,
     CapacitySimulation,
     cell_execution_runtime_is_pending,

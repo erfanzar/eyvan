@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Workload submission and lifecycle commands for the Eyvan CLI."""
 
 from __future__ import annotations
@@ -12,13 +25,13 @@ from pydantic import ValidationError
 
 from eyvan._json import JsonValue, is_json_object, model_json
 from eyvan.api.schemas import BatchSubmitRequest, DagNodeRequest, DagSubmitRequest, WorkloadSubmitRequest
+from eyvan.artifacts.managed import workspace_uri as managed_workspace_uri
 from eyvan.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.client.idempotency import IdempotencyKeyFactory
 from eyvan.client.requests import pool_workload_request
 from eyvan.commands.common import JsonRenderer, parse_environment, shell_command
 from eyvan.commands.state import CliSession, RunTarget, WorkloadScope
 from eyvan.job_receipt import JobSubmissionReceipt, JobTerminalOutput
-from eyvan.managed_artifacts import workspace_uri as managed_workspace_uri
 from eyvan.service.batch import DEFAULT_MAX_FAN_OUT
 from eyvan.service.models import (
     DEFAULT_MAX_RETRIES,

@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Private local supervision for Eyvan's native GCP API-and-agent runtime."""
 
 from __future__ import annotations
@@ -19,12 +32,7 @@ from eyvan._compat import StrEnum
 from eyvan.agent.client import CellAgentClient, CellAgentUnavailableError
 from eyvan.agent.models import AgentCapabilities
 from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.gcp_runtime_profile import (
-    GcpNativeRuntimeProfile,
-    GcpNativeRuntimeProfileError,
-    GcpNativeRuntimeProfileStore,
-)
-from eyvan.local_daemon import (
+from eyvan.local.daemon import (
     DEFAULT_LOCAL_CELL_AGENT_URL,
     Clock,
     LocalDaemonConfigurationError,
@@ -48,6 +56,11 @@ from eyvan.local_daemon import (
     stop_owned_process,
     stop_verified_process,
     write_owner_only_record,
+)
+from eyvan.providers.gcp.runtime.profile import (
+    GcpNativeRuntimeProfile,
+    GcpNativeRuntimeProfileError,
+    GcpNativeRuntimeProfileStore,
 )
 
 if tp.TYPE_CHECKING:

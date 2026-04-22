@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Behavioral tests for pure capacity planning over simulated pool demand."""
 
 from __future__ import annotations
@@ -6,7 +19,7 @@ import re
 
 import pytest
 
-from eyvan.capacity_planning import CapacityPlanner, CapacitySimulation, PoolDemand
+from eyvan.capacity.planning import CapacityPlanner, CapacitySimulation, PoolDemand
 from eyvan.controller import EyvanController
 from eyvan.persistence import InMemoryRepository
 from eyvan.service import ControlPlaneService
@@ -296,7 +309,7 @@ def test_cell_ids_do_not_repeat_across_control_plane_incarnations() -> None:
     forever without provisioning.
     """
 
-    from eyvan.capacity_planning import pool_cell_id
+    from eyvan.capacity.planning import pool_cell_id
 
     first = multislice_tpu_pool()
     # A control plane on an empty database re-creates the pool, which stamps a
@@ -309,7 +322,7 @@ def test_cell_ids_do_not_repeat_across_control_plane_incarnations() -> None:
 def test_re_applying_a_live_fleet_keeps_minting_into_one_namespace() -> None:
     """`eyvan up` bumps generation; that must not orphan the counter."""
 
-    from eyvan.capacity_planning import pool_cell_id
+    from eyvan.capacity.planning import pool_cell_id
 
     pool = multislice_tpu_pool()
     # What upsert_capacity_pool does on a re-apply: bump generation, clear
@@ -324,7 +337,7 @@ def test_re_applying_a_live_fleet_keeps_minting_into_one_namespace() -> None:
 def test_two_pools_sharing_a_prefix_get_different_namespaces() -> None:
     """Otherwise two fleets with the same node type collide on cell ids."""
 
-    from eyvan.capacity_planning import pool_cell_id
+    from eyvan.capacity.planning import pool_cell_id
 
     first = multislice_tpu_pool()
     other = first.model_copy(update={"id": f"{first.id}-other"})
@@ -335,7 +348,7 @@ def test_two_pools_sharing_a_prefix_get_different_namespaces() -> None:
 def test_a_minted_cell_id_fits_the_record_and_stays_provider_safe() -> None:
     """Cell ids are `max_length=96` and become GCP resource names."""
 
-    from eyvan.capacity_planning import pool_cell_id
+    from eyvan.capacity.planning import pool_cell_id
 
     pool = multislice_tpu_pool().model_copy(update={"fleet_name": "f" * 60, "node_type": "n" * 60})
 
@@ -356,7 +369,7 @@ def test_the_counter_is_never_truncated_away() -> None:
     is the only part it is safe to shorten.
     """
 
-    from eyvan.capacity_planning import pool_cell_id
+    from eyvan.capacity.planning import pool_cell_id
 
     pool = multislice_tpu_pool().model_copy(update={"fleet_name": "f" * 60, "node_type": "n" * 60})
     # max_cells is capped at 10_000, so this is the whole reachable range.
@@ -383,7 +396,7 @@ def test_a_deleted_cell_never_gives_its_index_back() -> None:
     accept. The earlier ``research-*`` v5p-128 orphan was the same mechanism.
     """
 
-    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+    from eyvan.capacity.planning import next_pool_cell_index, pool_cell_id
 
     pool = multislice_tpu_pool()
     first = CellRecord(
@@ -404,7 +417,7 @@ def test_a_deleted_cell_never_gives_its_index_back() -> None:
 def test_the_index_advances_past_the_highest_ever_used() -> None:
     """Gaps are fine; going backwards is not."""
 
-    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+    from eyvan.capacity.planning import next_pool_cell_index, pool_cell_id
 
     pool = multislice_tpu_pool()
     cells = [
@@ -426,7 +439,7 @@ def test_the_index_advances_past_the_highest_ever_used() -> None:
 
 
 def test_a_pool_with_no_history_starts_at_one() -> None:
-    from eyvan.capacity_planning import next_pool_cell_index
+    from eyvan.capacity.planning import next_pool_cell_index
 
     assert next_pool_cell_index(multislice_tpu_pool(), []) == 1
 
@@ -434,7 +447,7 @@ def test_a_pool_with_no_history_starts_at_one() -> None:
 def test_another_pools_cells_do_not_advance_this_counter() -> None:
     """Two pools sharing a prefix must not consume each other's indices."""
 
-    from eyvan.capacity_planning import next_pool_cell_index, pool_cell_id
+    from eyvan.capacity.planning import next_pool_cell_index, pool_cell_id
 
     pool = multislice_tpu_pool()
     other = pool.model_copy(update={"id": f"{pool.id}-other"})

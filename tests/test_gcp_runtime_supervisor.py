@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for private local API-and-agent supervision of native GCP runtime profiles."""
 
 from __future__ import annotations
@@ -11,8 +24,16 @@ import pytest
 
 from eyvan.agent.models import AgentCapabilities
 from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.gcp_runtime_profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
-from eyvan.gcp_runtime_supervisor import (
+from eyvan.local.daemon import (
+    LocalDaemonPaths,
+    LocalDaemonRecord,
+    LocalDaemonResult,
+    LocalDaemonState,
+    LocalDaemonTarget,
+    write_owner_only_record,
+)
+from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
+from eyvan.providers.gcp.runtime.supervisor import (
     DEFAULT_LOCAL_GCP_AGENT_URL,
     GcpNativeRuntimeSupervisor,
     GcpRuntimeError,
@@ -22,14 +43,6 @@ from eyvan.gcp_runtime_supervisor import (
     LocalAgentResult,
     LocalAgentState,
     LocalAgentSupervisor,
-)
-from eyvan.local_daemon import (
-    LocalDaemonPaths,
-    LocalDaemonRecord,
-    LocalDaemonResult,
-    LocalDaemonState,
-    LocalDaemonTarget,
-    write_owner_only_record,
 )
 
 _DEFAULT_WHEEL_URI = f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'a' * 64}/eyvan-0.1.0-py3-none-any.whl"

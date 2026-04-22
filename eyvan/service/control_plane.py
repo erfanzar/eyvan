@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Transactional application service for Eyvan control-plane operations."""
 
 from __future__ import annotations
@@ -13,17 +26,17 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 
 from eyvan._json import JsonObject, JsonValue, model_json
-from eyvan.capacity_planning import cell_matches_template, cell_provides_pool_supply
-from eyvan.core import costing
-from eyvan.core.domain import SchedulingResult
-from eyvan.managed_artifacts import (
+from eyvan.artifacts.managed import (
     ManagedArtifactKind,
     ManagedArtifactRef,
     ManagedArtifactStore,
     is_managed_uri,
     parse_managed_uri,
 )
-from eyvan.managed_artifacts import result_uri as managed_result_uri
+from eyvan.artifacts.managed import result_uri as managed_result_uri
+from eyvan.capacity.planning import cell_matches_template, cell_provides_pool_supply
+from eyvan.core import costing
+from eyvan.core.domain import SchedulingResult
 from eyvan.persistence.base import Repository, RepositorySession
 from eyvan.service.authz import Authorizer
 from eyvan.service.batch import (

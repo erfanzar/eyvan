@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -13,18 +26,18 @@ from eyvan._compat import UTC
 from eyvan._json import JsonObject, is_json_object
 from eyvan.agent.client import CellAgentBusyError, CellAgentClient, CellAgentStaleMutationError
 from eyvan.agent.models import AgentObservation, CapacityRequest, WorkloadMutationRequest, WorkloadObservation
-from eyvan.artifact_transfers import ManagedArtifactAccess
-from eyvan.config import EyvanSettings
-from eyvan.controller import EyvanController, LeaderPhase, StaleOutboxCommand
-from eyvan.core import InfeasibilityCode
-from eyvan.drivers.base import CapacityProviderFailureCode, CapacityStatus, ExecutionWorkloadStatus
-from eyvan.managed_artifacts import (
+from eyvan.artifacts.managed import (
     ArtifactAction,
     ArtifactTokenSigner,
     LocalManagedArtifactStore,
     callable_uri,
     result_uri,
 )
+from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.config import EyvanSettings
+from eyvan.controller import EyvanController, LeaderPhase, StaleOutboxCommand
+from eyvan.core import InfeasibilityCode
+from eyvan.drivers.base import CapacityProviderFailureCode, CapacityStatus, ExecutionWorkloadStatus
 from eyvan.persistence import InMemoryRepository
 from eyvan.service import ControlPlaneService
 from eyvan.service.callable_trust import CallableProjectTrustPolicy

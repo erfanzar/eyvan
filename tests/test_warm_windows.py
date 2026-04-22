@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Scheduled warm minimums.
 
 Scale-to-zero is correct overnight and wrong at 09:00, when every user pays the
@@ -121,7 +134,7 @@ def test_malformed_weekdays_are_rejected(days: tuple[int, ...]) -> None:
 def test_the_planner_uses_the_window_floor_when_it_scales(monkeypatch) -> None:
     """The floor has to reach the planner, not merely exist on the record."""
 
-    from eyvan.capacity_planning import CapacityPlanner, PoolDemand
+    from eyvan.capacity.planning import CapacityPlanner, PoolDemand
 
     pool = _pool(
         initialized_at=datetime(2026, 1, 1, tzinfo=UTC),

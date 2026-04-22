@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -23,13 +36,13 @@ from eyvan.api.app import (
 from eyvan.api.server_bind import LOOPBACK_APP_FACTORY, NETWORK_APP_FACTORY, ServerBindPolicy, ServerExposure
 from eyvan.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
+from eyvan.artifacts.managed import callable_uri
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.controller import EyvanController
-from eyvan.gcp_runtime_profile import GcpNativeRuntimeProfileStore
-from eyvan.local_auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredentialStore
-from eyvan.managed_artifacts import callable_uri
+from eyvan.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredentialStore
 from eyvan.persistence import InMemoryRepository
 from eyvan.platform import EyvanPlatformConfig, load_platform_config
+from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.service import ControlPlaneService
 from eyvan.service.models import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
 

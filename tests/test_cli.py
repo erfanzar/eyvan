@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
@@ -37,8 +50,8 @@ from eyvan.client.endpoint import ControlPlaneEndpoint
 from eyvan.config import EyvanSettings
 from eyvan.contexts import get_active_context
 from eyvan.drivers.base import CapacityProviderFailureCode
-from eyvan.local_auth import LocalDevelopmentCredentialStore
-from eyvan.local_daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.local.auth import LocalDevelopmentCredentialStore
+from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
 from eyvan.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.service.models import CapacityClass, CapacityPoolRecord, CellRecord, CellState
 
