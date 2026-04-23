@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Durable OCI workload execution for Eyvan-native workers.
 
 The Docker daemon owns a container outside the transient service cgroup, so a
@@ -14,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import time
 import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +59,25 @@ _CALLABLE_WORKER_MODULE = "eyvan.runtime.callable_worker"
 _SHELL_CONTROL_TOKENS = frozenset({"&", "&&", "|", "|&", ";", ";;", "(", ")"})
 _STANDALONE_REDIRECT = re.compile(r"\d*(>>?|<<?)|\d*>&\d*")
 _ACTIVE_CONTAINER_STATES = frozenset({"created", "paused", "restarting", "running", "removing"})
+
+# How long a container may take to leave the active states after ``docker stop``
+# returns. A ``--rm`` container is removed asynchronously by the daemon, and a
+# TPU workload's processes can sit in uninterruptible driver calls while they
+# release the accelerator, so the transition is not instantaneous.
+_CONTAINER_STOP_SETTLE_S = 30.0
+_CONTAINER_STOP_SETTLE_POLL_S = 0.5
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a non-negative seconds override, falling back on any bad value."""
+
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value >= 0.0 else default
+
+
 _HOST_ONLY_BASE_ENVIRONMENT = frozenset({"LOGNAME", "PATH", "PYTHONHOME", "SHELL", "USER", "VIRTUAL_ENV"})
 _HOST_DOCKER_HOME = "/root"
 _HOST_DOCKER_PATH = "/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -631,17 +664,46 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
                 raise RuntimeError(detail)
             raise RuntimeError("Docker remove returned successfully but the created native OCI container still exists")
         result = self._run(("docker", "stop", "--time", str(self._docker_stop_timeout_s), reference))
-        verify_outcome, verify_payload, verify_detail = self._observed_container(mutable_record)
-        if verify_outcome == "missing":
+        settled, verify_detail = self._container_settled_after_stop(mutable_record)
+        if settled:
             return
-        if verify_outcome == "present" and verify_payload is not None:
-            verify_state, _verify_state_error = _container_state(verify_payload)
-            if verify_state is not None and verify_state.name not in _ACTIVE_CONTAINER_STATES:
-                return
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or verify_detail or "docker stop failed"
             raise RuntimeError(detail)
         raise RuntimeError("Docker stop returned successfully but the native OCI container is still active")
+
+    def _container_settled_after_stop(self, record: JsonObject) -> tuple[bool, str]:
+        """Wait a bounded window for a stopped container to leave the active states.
+
+        ``docker stop`` returns once the daemon has signalled the container, not
+        once the container is gone, and Eyvan runs workload containers with
+        ``--rm``.  A stopping container therefore passes through ``removing``,
+        which ``_ACTIVE_CONTAINER_STATES`` counts as active -- so a single early
+        inspection reports a container that is shutting down normally as one
+        that refused to stop.
+
+        Reading that as a hard failure is not merely noisy: the caller marks the
+        durable record INDETERMINATE, and an INDETERMINATE record refuses every
+        later stop, so the workload can never be cancelled and its accelerator is
+        held until an operator intervenes.  Poll instead, and only report failure
+        when the container is still active after the window.
+        """
+
+        detail = ""
+        settle_s = _env_seconds("EYVAN_CONTAINER_STOP_SETTLE_S", _CONTAINER_STOP_SETTLE_S)
+        poll_s = _env_seconds("EYVAN_CONTAINER_STOP_POLL_S", _CONTAINER_STOP_SETTLE_POLL_S)
+        deadline = time.monotonic() + settle_s
+        while True:
+            outcome, payload, detail = self._observed_container(record)
+            if outcome == "missing":
+                return True, detail
+            if outcome == "present" and payload is not None:
+                state, _state_error = _container_state(payload)
+                if state is not None and state.name not in _ACTIVE_CONTAINER_STATES:
+                    return True, detail
+            if time.monotonic() >= deadline:
+                return False, detail
+            time.sleep(poll_s)
 
     def _remove_remaining_container(self, record: tp.Mapping[str, JsonValue]) -> None:
         mutable_record: JsonObject = dict(record)

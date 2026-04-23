@@ -1,8 +1,22 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """One-time local setup for Eyvan's native GCP runtime."""
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -21,15 +35,15 @@ from eyvan.autoscale import AutoscaleConfigCache, validate_gcp_project_id
 from eyvan.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
 from eyvan.commands.autoscale import autoscale_console, gcloud_default_project, is_interactive
 from eyvan.commands.state import CliSession
-from eyvan.gcp_runtime_bootstrap import GcpRuntimeBootstrap, GcpRuntimeBootstrapError, GcpRuntimePreflight
-from eyvan.gcp_runtime_profile import (
+from eyvan.local.daemon import LocalDaemonError, LocalDaemonResult, LocalDaemonSupervisor
+from eyvan.providers.gcp.runtime.bootstrap import GcpRuntimeBootstrap, GcpRuntimeBootstrapError, GcpRuntimePreflight
+from eyvan.providers.gcp.runtime.profile import (
     DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH,
     GcpNativeRuntimeProfile,
     GcpNativeRuntimeProfileError,
     GcpNativeRuntimeProfileStore,
 )
-from eyvan.gcp_runtime_supervisor import LocalAgentState, LocalAgentSupervisor
-from eyvan.local_daemon import LocalDaemonError, LocalDaemonResult, LocalDaemonSupervisor
+from eyvan.providers.gcp.runtime.supervisor import LocalAgentState, LocalAgentSupervisor
 
 _DEFAULT_BUILD_TIMEOUT_S = 300.0
 _VALIDATION_AGENT_SECRET = "a" * 32
@@ -202,6 +216,19 @@ class RuntimeInitializationResult:
         }
 
 
+def replacement_trusted_callable_projects() -> tuple[str, ...]:
+    """Return the callable trust the replacement control plane will start with.
+
+    The supervisor launches the new process with the *invoking* environment, so
+    this is read here rather than from the outgoing process -- a POSIX process
+    cannot recover another's environment, and inventing one would be worse than
+    reporting the one that will actually apply.
+    """
+
+    raw = os.getenv("EYVAN_TRUSTED_CALLABLE_PROJECTS", "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeRestartResult:
     """Non-secret result of restarting the local native GCP API-and-agent runtime."""
@@ -210,6 +237,26 @@ class RuntimeRestartResult:
     control_plane: LocalDaemonResult
     agent_endpoint: ControlPlaneEndpoint
     agent_state: LocalAgentState
+    trusted_callable_projects: tuple[str, ...] = ()
+
+    @property
+    def callable_trust_warning(self) -> str | None:
+        """Warn when the replacement will refuse the callables the operator submits.
+
+        ``EYVAN_TRUSTED_CALLABLE_PROJECTS`` is read once at control-plane start,
+        so restarting from a shell that does not export it silently narrows the
+        runtime: the restart reports success and the loss only surfaces later as
+        a 403 on the next callable submission, which names the workload rather
+        than the restart that caused it.
+        """
+
+        if self.trusted_callable_projects:
+            return None
+        return (
+            "EYVAN_TRUSTED_CALLABLE_PROJECTS is unset, so this control plane trusts callables only in the "
+            "default loopback project; submissions from any other org/project will be refused with 403. "
+            "Export it before restarting to keep the previous trust."
+        )
 
     def as_document(self) -> JsonObject:
         """Return automation-safe restart output without profile credentials."""
@@ -219,12 +266,14 @@ class RuntimeRestartResult:
                 "endpoint": self.agent_endpoint.url,
                 "state": self.agent_state.value,
             },
+            "callable_trust_warning": self.callable_trust_warning,
             "control_plane": {
                 "endpoint": self.control_plane.endpoint.url,
                 "pid": self.control_plane.pid,
                 "state": self.control_plane.state.value,
             },
             "endpoint": self.endpoint.url,
+            "trusted_callable_projects": list(self.trusted_callable_projects),
         }
 
 
@@ -370,7 +419,12 @@ def _render_runtime_restarted(console: Console, result: RuntimeRestartResult) ->
     table.add_column("State", style="white", overflow="fold")
     table.add_row("Control plane", result.control_plane.state.value)
     table.add_row("Cell agent", result.agent_state.value)
+    if result.trusted_callable_projects:
+        table.add_row("Trusted callables", ", ".join(result.trusted_callable_projects))
     console.print(Panel(table, title="[bold green]Native GCP runtime restarted[/]", border_style="green"))
+    warning = result.callable_trust_warning
+    if warning is not None:
+        console.print(Panel(warning, title="[bold yellow]Callable trust narrowed[/]", border_style="yellow"))
 
 
 def _initialize_native_runtime(
@@ -424,6 +478,7 @@ def _restart_native_runtime(
             ) from agent_error
         raise
     return RuntimeRestartResult(
+        trusted_callable_projects=replacement_trusted_callable_projects(),
         endpoint=endpoint,
         control_plane=control_plane,
         agent_endpoint=agent.endpoint,

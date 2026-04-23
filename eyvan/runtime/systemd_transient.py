@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Native systemd transient-service executor for single-host Eyvan cells.
 
 Each Eyvan submission receives its own deterministic transient service unit.
@@ -50,6 +63,28 @@ _COLLECTABLE_STATES = frozenset(
 )
 _DURABLE_STATES = _FINAL_STATES | {ExecutionWorkloadStatus.PENDING, ExecutionWorkloadStatus.RUNNING}
 _RECOVERABLE_CGROUP_INDETERMINATE = "cannot observe systemd workload cgroup before completion"
+
+# Indeterminacy that a later observation can genuinely resolve. INDETERMINATE is
+# otherwise latched as final, which is right when the record itself is unusable
+# but wrong when the runtime merely could not be reached at one instant: a stop
+# that failed leaves a workload whose unit is still observable, and latching then
+# makes the first transient failure permanent and strands the accelerator.
+_RECOVERABLE_INDETERMINATE_FIELD = "indeterminate_recoverable"
+
+
+def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
+    """Return whether a later observation may still resolve this indeterminacy.
+
+    Recorded as an explicit field rather than inferred from the message, because
+    ``stop`` rewrites ``message`` while leaving the status in place -- a text
+    comparison silently stops matching at exactly the moment it is needed.
+    """
+
+    if record.get(_RECOVERABLE_INDETERMINATE_FIELD) is True:
+        return True
+    return record.get("message") == _RECOVERABLE_CGROUP_INDETERMINATE
+
+
 _UNIT_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SYSTEMD_IDENTITY = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
@@ -640,20 +675,22 @@ class SystemdTransientServiceExecutor:
         previous = _known_persisted_status(record)
         record["status"] = status.value
         record["message"] = message
+        if status is not ExecutionWorkloadStatus.INDETERMINATE:
+            record.pop(_RECOVERABLE_INDETERMINATE_FIELD, None)
         if status is ExecutionWorkloadStatus.RUNNING and record.get("started_at") is None:
             record["started_at"] = _utcnow()
         if status in _FINAL_STATES and previous not in _FINAL_STATES:
             record["finished_at"] = _utcnow()
         record["updated_at"] = _utcnow()
 
-    def _mark_indeterminate(self, record: JsonObject, message: str) -> None:
+    def _mark_indeterminate(self, record: JsonObject, message: str, *, recoverable: bool = False) -> None:
         current_status = _known_persisted_status(record)
-        current_message = record.get("message")
         if current_status not in _FINAL_STATES or (
-            current_status is ExecutionWorkloadStatus.INDETERMINATE
-            and current_message == _RECOVERABLE_CGROUP_INDETERMINATE
+            current_status is ExecutionWorkloadStatus.INDETERMINATE and _is_recoverable_indeterminate(record)
         ):
             self._set_status(record, ExecutionWorkloadStatus.INDETERMINATE, message)
+            if recoverable:
+                record[_RECOVERABLE_INDETERMINATE_FIELD] = True
 
     def _collect_terminal_unit(self, record: JsonObject) -> None:
         """Ask systemd to release a unit after its terminal record is durable."""
@@ -1034,8 +1071,7 @@ class SystemdTransientServiceExecutor:
             # positive evidence that every workload process exited. Other
             # indeterminate outcomes remain terminal and fail closed.
             recoverable_cgroup_indeterminate = (
-                durable.status is ExecutionWorkloadStatus.INDETERMINATE
-                and durable.message == _RECOVERABLE_CGROUP_INDETERMINATE
+                durable.status is ExecutionWorkloadStatus.INDETERMINATE and _is_recoverable_indeterminate(record)
             )
             if self._is_final(durable.status) and not recoverable_cgroup_indeterminate:
                 self._collect_terminal_unit(record)
@@ -1103,8 +1139,14 @@ class SystemdTransientServiceExecutor:
                 raise RuntimeError(f"cannot safely stop ambiguous systemd execution {remote_id!r}") from exc
             if durable.status in _TERMINAL_STATES:
                 return
-            if durable.status is ExecutionWorkloadStatus.INDETERMINATE:
-                raise RuntimeError(f"cannot safely stop ambiguous systemd execution {remote_id!r}")
+            # What makes a stop unsafe is not knowing *what* to stop, so the unit
+            # name is the gate -- not the status.  An INDETERMINATE record with a
+            # known unit is the case where stopping is most necessary: the status
+            # is INDETERMINATE precisely because an earlier stop failed, and
+            # refusing here made that first failure permanent.  The workload could
+            # then never be cancelled and its accelerator was held until an
+            # operator intervened, which is how one v5p Multislice stayed leased
+            # to a container that had already exited.
             unit_name = record.get("unit_name")
             if not isinstance(unit_name, str) or not unit_name:
                 self._mark_indeterminate(record, "systemd execution record has no unit name")
@@ -1121,7 +1163,7 @@ class SystemdTransientServiceExecutor:
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to stop native runtime: {exc}")
+                    self._mark_indeterminate(current, f"failed to stop native runtime: {exc}", recoverable=True)
                     _atomic_write_json(record_path, current)
             raise RuntimeError(f"failed to stop native runtime for {remote_id!r}: {exc}") from exc
 
@@ -1132,9 +1174,22 @@ class SystemdTransientServiceExecutor:
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {exc}")
+                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {exc}", recoverable=True)
                     _atomic_write_json(record_path, current)
             raise RuntimeError(f"failed to finish native runtime stop for {remote_id!r}: {exc}") from exc
+
+        # Both stop stages have now succeeded, which is direct positive evidence
+        # about a workload whose record may still carry an INDETERMINATE latched
+        # by an *earlier* attempt -- including one written by a build that
+        # predates the recoverable flag. Let the verification below re-derive
+        # from systemd and Docker instead of being vetoed by that stale unknown,
+        # which is what kept a Multislice leased to an exited container.
+        with _file_lock(_record_lock_path(record_path)):
+            current = _load_json(record_path)
+            if current is not None and _known_persisted_status(current) is ExecutionWorkloadStatus.INDETERMINATE:
+                current[_RECOVERABLE_INDETERMINATE_FIELD] = True
+                _atomic_write_json(record_path, current)
+
         observed = self.status(remote_id)
         if observed.status is ExecutionWorkloadStatus.INDETERMINATE:
             raise RuntimeError(f"cannot safely verify that systemd execution {remote_id!r} stopped")

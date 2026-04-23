@@ -1,3 +1,16 @@
+# Copyright 2026 The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Focused coverage for one-time native GCP runtime CLI setup."""
 
 from __future__ import annotations
@@ -15,10 +28,10 @@ import eyvan.commands.runtime as runtime_commands
 from eyvan.agent.models import AgentCapabilities
 from eyvan.autoscale import AutoscaleConfigCache, AutoscaleDefaults
 from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.gcp_runtime_bootstrap import GcpRuntimeBootstrapStep, GcpRuntimePreflight, GcpRuntimePreflightError
-from eyvan.gcp_runtime_profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
-from eyvan.gcp_runtime_supervisor import LocalAgentResult, LocalAgentState
-from eyvan.local_daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.providers.gcp.runtime.bootstrap import GcpRuntimeBootstrapStep, GcpRuntimePreflight, GcpRuntimePreflightError
+from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
+from eyvan.providers.gcp.runtime.supervisor import LocalAgentResult, LocalAgentState
 
 
 def _profile(*, wheel_uri: str | None = None) -> GcpNativeRuntimeProfile:
@@ -344,6 +357,17 @@ def test_runtime_restart_uses_the_root_cli_url_and_emits_no_profile_credentials(
     payload = json.loads(invoked.output)
     assert payload == {
         "agent": {"endpoint": "http://127.0.0.1:8090", "state": "started"},
+        # The replacement inherits the invoking environment, so a restart from a
+        # shell without EYVAN_TRUSTED_CALLABLE_PROJECTS silently narrows what the
+        # control plane will accept. The document reports that, and still carries
+        # no profile credential.
+        "callable_trust_warning": runtime_commands.RuntimeRestartResult(
+            endpoint=endpoint,
+            control_plane=_restart_result(endpoint).control_plane,
+            agent_endpoint=ControlPlaneEndpoint.parse("http://127.0.0.1:8090"),
+            agent_state=runtime_commands.LocalAgentState.STARTED,
+        ).callable_trust_warning,
+        "trusted_callable_projects": [],
         "control_plane": {"endpoint": endpoint.url, "pid": 9001, "state": "started"},
         "endpoint": endpoint.url,
     }
