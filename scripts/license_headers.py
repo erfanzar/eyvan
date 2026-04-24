@@ -27,12 +27,12 @@ _BODY = (
 
 
 def _hash_header() -> str:
-    lines = [f"Copyright 2026 {OWNER}.", ""] + _BODY.split("\n")
+    lines = [f"Copyright 2026 {OWNER}.", "", *_BODY.split("\n")]
     return "\n".join(f"# {line}".rstrip() for line in lines) + "\n"
 
 
 def _block_header() -> str:
-    lines = [f"Copyright 2026 {OWNER}.", ""] + _BODY.split("\n")
+    lines = [f"Copyright 2026 {OWNER}.", "", *_BODY.split("\n")]
     return "/*\n" + "\n".join(f" * {line}".rstrip() for line in lines) + "\n */\n"
 
 
