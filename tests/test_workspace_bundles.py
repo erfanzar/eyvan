@@ -17,14 +17,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-import eyvan.client.sync as sync_module
-import eyvan.execution as execution_module
+import eyvan.sdk.client.sync as sync_module
+import eyvan.sdk.execution as execution_module
+from eyvan._internal.workspace import build_workspace
 from eyvan.artifacts import LocalArtifactStore
-from eyvan.client.callables import EyvanCallableSubmitter
-from eyvan.runtime.callable_protocol import execute_callable
-from eyvan.runtime.callables import dump_callable
-from eyvan.service.models import CallableExecution
-from eyvan.workspace import build_workspace
+from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.server.service.models import CallableExecution
+from eyvan.worker.runtime.callable_protocol import execute_callable
+from eyvan.worker.runtime.callables import dump_callable
 
 
 class _MemoryTransfer:

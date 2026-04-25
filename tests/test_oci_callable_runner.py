@@ -11,9 +11,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from eyvan.runtime.callables import dump_callable
-from eyvan.runtime.oci_callable_stager import OCI_CALLABLE_RUNNER_FILENAME, stage_oci_callable_runner
-from eyvan.runtime.results import load_result
+from eyvan.worker.runtime.callables import dump_callable
+from eyvan.worker.runtime.oci_callable_stager import OCI_CALLABLE_RUNNER_FILENAME, stage_oci_callable_runner
+from eyvan.worker.runtime.results import load_result
 
 
 def _install_fake_gcs_client(directory: Path) -> None:

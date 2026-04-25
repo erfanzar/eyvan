@@ -20,8 +20,8 @@ from __future__ import annotations
 import pytest
 
 from eyvan.capacity import CapacityStatus
-from eyvan.drivers.base import CellObservation
-from eyvan.runtime.registry import _uses_gce_tpu_cluster_detection
+from eyvan.capacity.drivers.base import CellObservation
+from eyvan.worker.runtime.registry import _uses_gce_tpu_cluster_detection
 
 
 def _observation(metadata: dict) -> CellObservation:

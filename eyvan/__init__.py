@@ -10,9 +10,11 @@ from __future__ import annotations
 import typing as tp
 
 if tp.TYPE_CHECKING:
-    from eyvan.client.jobs import CpuConfig, GpuConfig
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
     from eyvan.config import EyvanSettings
-    from eyvan.execution import (
+    from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
+    from eyvan.sdk.client.jobs import CpuConfig, GpuConfig
+    from eyvan.sdk.execution import (
         EyvanJob,
         EyvanJobError,
         EyvanPlacementError,
@@ -21,8 +23,6 @@ if tp.TYPE_CHECKING:
         execute,
         init,
     )
-    from eyvan.fleet_config import EyvanFleetConfig
-    from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
 
 __all__ = (
     "AsyncEyvanClient",
@@ -56,7 +56,7 @@ def _cache_export(name: str, value: _Export) -> _Export:
 def __getattr__(name: str):
     """Load public SDK exports only when callers request them.
 
-    Native worker subprocesses import ``eyvan.runtime.local_worker`` directly.
+    Native worker subprocesses import ``eyvan.worker.runtime.local_worker`` directly.
     Keeping the package root light prevents that critical path from importing
     the client, API, and their optional observability dependencies first.
     """
@@ -78,23 +78,23 @@ def __getattr__(name: str):
 
         return _cache_export(name, EyvanClient)
     if name == "EyvanFleetConfig":
-        from eyvan.fleet_config import EyvanFleetConfig
+        from eyvan.capacity.fleet_config import EyvanFleetConfig
 
         return _cache_export(name, EyvanFleetConfig)
     if name == "EyvanJob":
-        from eyvan.execution import EyvanJob
+        from eyvan.sdk.execution import EyvanJob
 
         return _cache_export(name, EyvanJob)
     if name == "EyvanJobError":
-        from eyvan.execution import EyvanJobError
+        from eyvan.sdk.execution import EyvanJobError
 
         return _cache_export(name, EyvanJobError)
     if name == "EyvanPlacementError":
-        from eyvan.execution import EyvanPlacementError
+        from eyvan.sdk.execution import EyvanPlacementError
 
         return _cache_export(name, EyvanPlacementError)
     if name == "EyvanUnavailableError":
-        from eyvan.execution import EyvanUnavailableError
+        from eyvan.sdk.execution import EyvanUnavailableError
 
         return _cache_export(name, EyvanUnavailableError)
     if name == "EyvanSettings":
@@ -102,23 +102,23 @@ def __getattr__(name: str):
 
         return _cache_export(name, EyvanSettings)
     if name == "TpuConfig":
-        from eyvan.execution import TpuConfig
+        from eyvan.sdk.execution import TpuConfig
 
         return _cache_export(name, TpuConfig)
     if name == "GpuConfig":
-        from eyvan.client.jobs import GpuConfig
+        from eyvan.sdk.client.jobs import GpuConfig
 
         return _cache_export(name, GpuConfig)
     if name == "CpuConfig":
-        from eyvan.client.jobs import CpuConfig
+        from eyvan.sdk.client.jobs import CpuConfig
 
         return _cache_export(name, CpuConfig)
     if name == "execute":
-        from eyvan.execution import execute
+        from eyvan.sdk.execution import execute
 
         return _cache_export(name, execute)
     if name == "init":
-        from eyvan.execution import init
+        from eyvan.sdk.execution import init
 
         return _cache_export(name, init)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

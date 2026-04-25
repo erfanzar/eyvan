@@ -14,8 +14,8 @@ a cell in the middle of provisioning, or requeue a live provision.
 
 from __future__ import annotations
 
-from eyvan.persistence import InMemoryRepository
-from eyvan.service.models import OutboxRecord, OutboxState
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service.models import OutboxRecord, OutboxState
 
 
 async def test_targeted_outbox_query_returns_only_the_requested_generation() -> None:

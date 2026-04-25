@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.drivers.base import ExecutionWorkloadStatus, MutationContext, StaleMutationError
-from eyvan.runtime.systemd_transient import (
+from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext, StaleMutationError
+from eyvan.worker.runtime.systemd_transient import (
     SystemdCommandResult,
     SystemdLogsUnavailableError,
     SystemdTransientServiceExecutor,

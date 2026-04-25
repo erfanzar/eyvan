@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from eyvan._compat import StrEnum
+from eyvan._internal.compat import StrEnum
 
 
 class CapacityStatus(StrEnum):

@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.controller import EyvanController
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.dag import DagError, DagNode, validate
-from eyvan.service.models import (
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.dag import DagError, DagNode, validate
+from eyvan.server.service.models import (
     CommandExecution,
     CoordinationKind,
     Principal,
@@ -240,7 +240,7 @@ async def test_a_fan_in_node_waits_for_every_branch() -> None:
 async def test_a_gated_node_is_invisible_to_the_scheduler() -> None:
     """The gate has to be the flag placement already respects, not a parallel one."""
 
-    from eyvan.service.scheduling import CoreSchedulingService
+    from eyvan.server.service.scheduling import CoreSchedulingService
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())

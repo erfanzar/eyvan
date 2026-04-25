@@ -27,18 +27,10 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.drivers.base import CellCapabilities
-from eyvan.persistence import InMemoryRepository
-from eyvan.runtime.log_records import (
-    LogPage,
-    LogRecord,
-    merge_pages,
-    parse_journal_json,
-    stream_for_priority,
-)
-from eyvan.runtime.registry import ExecCapableExecutionDriver, IntrospectableExecutionDriver
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan.capacity.drivers.base import CellCapabilities
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     CommandExecution,
     Principal,
     ResourceGang,
@@ -49,6 +41,14 @@ from eyvan.service.models import (
     WorkloadDefinition,
     WorkloadRecord,
 )
+from eyvan.worker.runtime.log_records import (
+    LogPage,
+    LogRecord,
+    merge_pages,
+    parse_journal_json,
+    stream_for_priority,
+)
+from eyvan.worker.runtime.registry import ExecCapableExecutionDriver, IntrospectableExecutionDriver
 
 
 def _principal() -> Principal:
@@ -208,7 +208,7 @@ async def test_reports_from_a_superseded_attempt_are_withheld_on_read() -> None:
 async def test_user_progress_rides_the_route_that_is_already_polled() -> None:
     """No new polling loop: the dashboard and callables client already poll this."""
 
-    from eyvan.service.workload_progress import WorkloadProgressResolver
+    from eyvan.server.service.workload_progress import WorkloadProgressResolver
 
     service, _workload = await _service_with_workload()
     await service.record_progress_report(workload_id="wl-1", rank=0, attempt=1, step=7, total=10, message="warming up")
@@ -289,7 +289,7 @@ def test_introspection_is_a_protocol_not_a_getattr_probe() -> None:
 def test_each_rank_gets_its_own_profile_destination() -> None:
     """Same reason ranks get their own checkpoint URI: writers would race."""
 
-    from eyvan.runtime.systemd_transient import _rank_profile_uri
+    from eyvan.worker.runtime.systemd_transient import _rank_profile_uri
 
     assert _rank_profile_uri("gs://acme/run", 0) == "gs://acme/run/profiles/rank-0"
     assert _rank_profile_uri("gs://acme/run", 3) == "gs://acme/run/profiles/rank-3"
@@ -298,7 +298,7 @@ def test_each_rank_gets_its_own_profile_destination() -> None:
 def test_profiles_are_written_beside_checkpoints_not_among_them() -> None:
     """A resume that read trace files as state would fail in a confusing way."""
 
-    from eyvan.runtime.systemd_transient import _rank_checkpoint_uri, _rank_profile_uri
+    from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri, _rank_profile_uri
 
     checkpoint = _rank_checkpoint_uri("gs://acme/run", 0)
     profile = _rank_profile_uri("gs://acme/run", 0)
@@ -310,7 +310,7 @@ def test_profiles_are_written_beside_checkpoints_not_among_them() -> None:
 def test_no_output_uri_means_no_profile_destination() -> None:
     """Empty, not a fabricated path: there is nowhere durable to write."""
 
-    from eyvan.runtime.systemd_transient import _rank_profile_uri
+    from eyvan.worker.runtime.systemd_transient import _rank_profile_uri
 
     assert _rank_profile_uri(None, 0) == ""
     assert _rank_profile_uri("", 0) == ""

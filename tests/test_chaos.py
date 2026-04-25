@@ -46,13 +46,13 @@ from datetime import timedelta
 import pytest
 
 from eyvan.capacity import CapacityStatus
-from eyvan.drivers.base import MutationContext, StaleMutationError
-from eyvan.drivers.manual import ManualCapacityDriver
-from eyvan.persistence import InMemoryRepository
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.service import ControlPlaneService
-from eyvan.service.errors import ConflictError
-from eyvan.service.models import (
+from eyvan.capacity.drivers.base import MutationContext, StaleMutationError
+from eyvan.capacity.drivers.manual import ManualCapacityDriver
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import ConflictError
+from eyvan.server.service.models import (
     CommandExecution,
     OutboxRecord,
     OutboxState,
@@ -278,7 +278,7 @@ async def test_losing_leadership_mid_cycle_leaves_no_half_applied_cycle() -> Non
     stop rather than finish on stale authority.
     """
 
-    from eyvan.controller import EyvanController, LeaderPhase
+    from eyvan.server.controller import EyvanController, LeaderPhase
 
     class LosesLeadershipAfter:
         def __init__(self, grants: int) -> None:
@@ -317,7 +317,7 @@ async def test_a_failover_between_cycles_does_not_double_settle_a_lease() -> Non
     charge the budget twice.
     """
 
-    from eyvan.service.models import BudgetRecord
+    from eyvan.server.service.models import BudgetRecord
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -362,10 +362,10 @@ async def test_a_provider_outage_does_not_discard_the_capacity_command() -> None
     control plane believes it asked for.
     """
 
-    from eyvan.agent.client import CellAgentCapacityProviderError
-    from eyvan.controller import EyvanController
-    from eyvan.drivers.base import CapacityProviderFailureCode
-    from eyvan.service.models import CellRecord, CellState
+    from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.service.models import CellRecord, CellState
+    from eyvan.worker.agent.client import CellAgentCapacityProviderError
 
     class OutageAgent:
         def apply_capacity(self, cell_id, request):
@@ -413,7 +413,7 @@ def test_a_foreign_fleet_document_is_refused_rather_than_overwritten(tmp_path) -
 
     import json
 
-    from eyvan.persistence.fleet import FleetStateSchemaError
+    from eyvan.server.persistence.fleet import FleetStateSchemaError
 
     path = tmp_path / "foreign.json"
     path.write_text(json.dumps({"some_other_tool": {"clusters": []}}), encoding="utf-8")
@@ -431,7 +431,7 @@ def test_a_malformed_generation_is_refused_rather_than_coerced(tmp_path) -> None
 
     import json
 
-    from eyvan.persistence.fleet import FleetStateSchemaError
+    from eyvan.server.persistence.fleet import FleetStateSchemaError
 
     path = tmp_path / "corrupt.json"
     path.write_text(
@@ -456,8 +456,8 @@ async def test_a_workload_whose_lease_vanished_is_settled_rather_than_stranded()
     One lost row would permanently shrink a tenant's effective quota.
     """
 
-    from eyvan.controller import EyvanController
-    from eyvan.service.models import CellRecord, CellState, LeaseRecord, LeaseState
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.service.models import CellRecord, CellState, LeaseRecord, LeaseState
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -526,7 +526,7 @@ async def test_a_recently_updated_workload_is_not_swept_as_an_orphan() -> None:
     the entire class of "a race made this look orphaned".
     """
 
-    from eyvan.controller import EyvanController
+    from eyvan.server.controller import EyvanController
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -553,8 +553,8 @@ async def test_a_recently_updated_workload_is_not_swept_as_an_orphan() -> None:
 async def test_a_healthy_workload_is_never_swept() -> None:
     """The sweep must not settle a workload whose rows all resolve."""
 
-    from eyvan.controller import EyvanController
-    from eyvan.service.models import CellRecord, CellState, LeaseRecord, LeaseState
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.service.models import CellRecord, CellState, LeaseRecord, LeaseState
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -629,10 +629,10 @@ async def test_an_unanswerable_agent_does_not_retire_queued_capacity() -> None:
     the cell record is left exactly as it was and the next tick asks again.
     """
 
-    from eyvan.agent.client import CellAgentUnavailableError
     from eyvan.capacity import CapacityStatus
-    from eyvan.controller import EyvanController
-    from eyvan.service.models import CellRecord, CellState
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.service.models import CellRecord, CellState
+    from eyvan.worker.agent.client import CellAgentUnavailableError
 
     class SilentAgent:
         def reconcile(self, cell_id, request):
@@ -697,10 +697,10 @@ async def test_a_rejected_fence_records_which_check_rejected_it() -> None:
     control plane had already been told.
     """
 
-    from eyvan.agent.client import CellAgentStaleMutationError
     from eyvan.capacity import CapacityStatus
-    from eyvan.controller import EyvanController
-    from eyvan.service.models import CellRecord, CellState
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.service.models import CellRecord, CellState
+    from eyvan.worker.agent.client import CellAgentStaleMutationError
 
     class TombstonedAgent:
         def reconcile(self, cell_id, request):

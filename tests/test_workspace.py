@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.workspace import (
+from eyvan._internal.workspace import (
     DEFAULT_WORKSPACE_EXCLUDES,
     WorkspaceError,
     build_workspace,
@@ -264,7 +264,7 @@ def test_a_member_that_resolves_outside_the_destination_is_rejected(tmp_path: Pa
     is the actual defence and must not be able to rot behind it.
     """
 
-    from eyvan.workspace import _safe_member_path
+    from eyvan._internal.workspace import _safe_member_path
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -302,7 +302,7 @@ def test_extract_will_not_write_through_a_hardlink_planted_in_the_destination(tm
     then truncate whatever the link points at, outside the workspace entirely.
     """
 
-    from eyvan.workspace import _create_exclusive
+    from eyvan._internal.workspace import _create_exclusive
 
     secret = tmp_path / "outside" / "credentials"
     secret.parent.mkdir()

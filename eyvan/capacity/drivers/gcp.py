@@ -1,0 +1,1530 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Fenced Eyvan capacity drivers for mixed Google Cloud fleets."""
+
+from __future__ import annotations
+
+import hashlib
+import typing as tp
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from threading import RLock
+
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+from eyvan.capacity import READY_CAPACITY_STATUSES, CapacityStatus
+from eyvan.capacity.drivers.base import (
+    CellCapabilities,
+    CellObservation,
+    MutationContext,
+    StaleMutationError,
+    canonical_execution_backend,
+)
+from eyvan.capacity.providers.gcp import (
+    ComputeProviderConfig,
+    GcloudComputeProvider,
+    GcloudDefaultComputeServiceAccountResolver,
+    GcloudNativeWorkerArtifactAccessStore,
+    GcloudNativeWorkerSecretStore,
+    GcloudTpuProvider,
+    GcsArtifactBucket,
+    NativeWorkerEndpointMode,
+    NativeWorkerPublicIngress,
+    ProviderObservation,
+    compute_instance_name,
+    endpoint_mode_from_metadata,
+    normalize_compute_config,
+)
+from eyvan.capacity.providers.gcp.queued_resources import TpuProviderConfig, normalize_tpu_config
+from eyvan.config import EyvanSettings
+from eyvan.server.persistence.fleet import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
+from eyvan.server.service.models import NativeContainerConfig, NativeRuntimeConfig
+
+
+class CapacityProvider(tp.Protocol):
+    """Provider operations required by a fenced GCP capacity driver."""
+
+    def ensure(self, record: FleetCellRecord) -> ProviderObservation: ...
+
+    def delete(
+        self,
+        resource_id: str,
+        *,
+        project: str,
+        zone: str,
+        management_uid: str | None = None,
+    ) -> None: ...
+
+
+class NativeWorkerSecretStore(tp.Protocol):
+    """Cell-scoped secret lifecycle required by native GCP workers."""
+
+    def ensure(
+        self,
+        *,
+        project: str,
+        management_uid: str,
+        value: str,
+        reader_service_account: str,
+    ) -> str: ...
+
+    def delete(self, *, project: str, management_uid: str) -> None: ...
+
+
+class NativeWorkerArtifactAccessStore(tp.Protocol):
+    """Bucket IAM lifecycle required by profile-owned native GCP workers."""
+
+    def ensure(
+        self,
+        *,
+        project: str,
+        artifact_bucket: GcsArtifactBucket,
+        reader_service_account: str,
+    ) -> None: ...
+
+
+class ServiceAccountResolver(tp.Protocol):
+    """Resolve the VM identity used when no service account is configured."""
+
+    def resolve(self, *, project: str) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedCapacityRequest:
+    """Validated request document plus its concrete provider configuration."""
+
+    document: JsonObject
+    runtime: NativeRuntimeConfig
+    tpu_config: TpuProviderConfig | None = None
+    compute_config: ComputeProviderConfig | None = None
+
+
+def _native_runtime_from_desired(desired: tp.Mapping[str, JsonValue]) -> NativeRuntimeConfig:
+    """Validate the typed runtime carried alongside provider creation options."""
+
+    value = desired.get("runtime")
+    if value is None:
+        return NativeRuntimeConfig()
+    return NativeRuntimeConfig.model_validate(value)
+
+
+def _native_runtime_from_record(record: FleetCellRecord) -> NativeRuntimeConfig:
+    """Load the runtime pinned to a persisted capacity incarnation."""
+
+    value = record.metadata.get("native_runtime")
+    if value is None:
+        return NativeRuntimeConfig()
+    if not is_json_object(value):
+        raise ValueError(f"cell {record.name!r} has an invalid persisted native runtime")
+    return NativeRuntimeConfig.model_validate(value)
+
+
+def _required_string(document: tp.Mapping[str, JsonValue], name: str) -> str:
+    value = document.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"capacity field {name!r} must be a non-empty string")
+    return value
+
+
+def _optional_string(document: tp.Mapping[str, JsonValue], name: str) -> str | None:
+    value = document.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"capacity field {name!r} must be a string when set")
+    return value
+
+
+def _management_uid(record: FleetCellRecord) -> str | None:
+    value = record.metadata.get("management_uid")
+    return value if isinstance(value, str) and value else None
+
+
+def _native_runtime_setup(runtime: NativeRuntimeConfig) -> str | None:
+    """Render declarative setup after Eyvan installs its native worker."""
+
+    if runtime.is_empty:
+        return None
+    from eyvan.worker.runtime.native_bootstrap import render_native_runtime_setup
+
+    return render_native_runtime_setup(runtime)
+
+
+def _persist_native_worker_endpoint_mode(record: FleetCellRecord, mode: NativeWorkerEndpointMode) -> None:
+    """Persist public routing only when the profile-managed ingress rule owns it."""
+
+    if mode is NativeWorkerEndpointMode.PROFILE_MANAGED_PUBLIC:
+        record.metadata["native_worker_endpoint_mode"] = mode.value
+    else:
+        record.metadata.pop("native_worker_endpoint_mode", None)
+
+
+class GcpTpuCapacityDriver:
+    """Reconcile GCP TPU queued resources behind Eyvan fences."""
+
+    provider_name = "gcp-tpu"
+    capacity_kind = "tpu"
+    accelerator_types = ("tpu",)
+    capacity_classes = ("spot", "on-demand", "reserved", "guaranteed")
+
+    def __init__(
+        self,
+        state: FleetStateStore | None = None,
+        *,
+        provider: CapacityProvider | None = None,
+        execution_backend: str | None = None,
+        native_worker_port: int | None = None,
+        native_worker_package: str | None = None,
+        native_worker_wheelhouse: str | None = None,
+        native_worker_state_dir: str | None = None,
+        native_worker_shared_secret: str | None = None,
+        native_worker_secrets: NativeWorkerSecretStore | None = None,
+        native_worker_service_account_resolver: ServiceAccountResolver | None = None,
+        native_worker_artifact_root_uri: str | None = None,
+        native_worker_artifact_access: NativeWorkerArtifactAccessStore | None = None,
+        native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
+    ):
+        settings = EyvanSettings.from_env()
+        self.state = state or FleetStateStore.from_uri(settings.fleet_state_uri)
+        self.provider: CapacityProvider = provider or GcloudTpuProvider()
+        self.execution_backend = canonical_execution_backend(execution_backend or settings.execution_backend)
+        self.native_worker_port = native_worker_port if native_worker_port is not None else settings.native_worker_port
+        self.native_worker_package = native_worker_package or settings.native_worker_package
+        self.native_worker_wheelhouse = native_worker_wheelhouse or settings.native_worker_wheelhouse
+        self.native_worker_state_dir = native_worker_state_dir or settings.native_worker_state_dir
+        self.native_worker_shared_secret = (
+            native_worker_shared_secret
+            if native_worker_shared_secret is not None
+            else settings.native_worker_root_secret
+        )
+        self.native_worker_secrets = native_worker_secrets or GcloudNativeWorkerSecretStore()
+        self.native_worker_service_account_resolver = (
+            native_worker_service_account_resolver or GcloudDefaultComputeServiceAccountResolver()
+        )
+        self.native_worker_artifact_bucket = (
+            GcsArtifactBucket.from_artifact_root_uri(native_worker_artifact_root_uri)
+            if native_worker_artifact_root_uri is not None
+            else None
+        )
+        self.native_worker_artifact_access = native_worker_artifact_access or GcloudNativeWorkerArtifactAccessStore()
+        self.native_worker_public_ingress = native_worker_public_ingress
+        self._mutation_lock = RLock()
+
+    def capabilities(self) -> CellCapabilities:
+        return CellCapabilities(
+            provider=self.provider_name,
+            executor=self.execution_backend,
+            accelerator_types=self.accelerator_types,
+            capacity_classes=self.capacity_classes,
+            supports_callables=True,
+            max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
+            # Stated rather than defaulted: an operator turns this on for a fleet
+            # they are willing to have diagnostics run on.
+            supports_exec=False,
+            resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
+        )
+
+    def observe(self, cell_id: str) -> CellObservation:
+        record = self.state.get(cell_id)
+        if record is None:
+            return CellObservation(
+                cell_id=cell_id,
+                state=CapacityStatus.ABSENT,
+                generation=0,
+                observed_at=datetime.now(UTC),
+            )
+        return self._observation(record)
+
+    @staticmethod
+    def _observation(record: FleetCellRecord, *, detail: str = "") -> CellObservation:
+        return CellObservation(
+            cell_id=record.name,
+            state=record.state,
+            generation=record.generation,
+            execution_endpoint=record.execution_endpoint,
+            detail=detail,
+            observed_at=datetime.now(UTC),
+            observed_tpu_vms=GcpTpuCapacityDriver._observed_tpu_vms(record),
+            metadata={
+                **record.metadata,
+                "project": record.project,
+                "zone": record.zone,
+                "accelerator_type": record.accelerator_type,
+                "capacity_class": record.capacity_class,
+                "capacity_backend": record.metadata.get("capacity_backend", "gcp-tpu"),
+                "resource_id": record.qr_id,
+                "qr_id": record.qr_id,
+                "desired_state": record.desired_state,
+                "provider_generation": record.provider_generation,
+                "head_ip": record.head_ip,
+            },
+        )
+
+    @staticmethod
+    def _observed_tpu_vms(record: FleetCellRecord) -> int | None:
+        """Return the exact VM count reported by GCP for a healthy TPU allocation."""
+
+        value = record.metadata.get("observed_tpu_vms")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    @staticmethod
+    def _accept_mutation(record: FleetCellRecord, context: MutationContext) -> bool:
+        if context.generation < record.generation:
+            raise StaleMutationError(
+                f"generation {context.generation} is older than cell {record.name!r} generation {record.generation}"
+            )
+        if (
+            context.generation == record.generation
+            and record.fencing_token is not None
+            and record.fencing_token != context.fencing_token
+        ):
+            raise StaleMutationError(f"fencing token does not own cell {record.name!r} generation {record.generation}")
+        return context.idempotency_key not in record.idempotency_keys
+
+    @staticmethod
+    def _stamp(record: FleetCellRecord, context: MutationContext) -> None:
+        record.generation = context.generation
+        record.fencing_token = context.fencing_token
+        record.idempotency_keys = [*record.idempotency_keys, context.idempotency_key][-64:]
+
+    def _persist_provider_observation(
+        self,
+        cell_id: str,
+        report: ProviderObservation,
+        context: MutationContext,
+        expected_record: FleetCellRecord,
+    ) -> CellObservation:
+        def mutate(record: FleetCellRecord) -> None:
+            if record.generation != context.generation or record.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {cell_id!r} changed ownership while its provider operation was running")
+            record.state = report.state
+            if report.head_ip is not None:
+                record.head_ip = report.head_ip
+            elif report.state not in READY_CAPACITY_STATUSES:
+                record.head_ip = None
+            if report.execution_endpoint is not None:
+                record.execution_endpoint = report.execution_endpoint
+            elif report.state not in READY_CAPACITY_STATUSES:
+                record.execution_endpoint = None
+            if report.worker_endpoints:
+                record.metadata["native_worker_endpoints"] = list(report.worker_endpoints)
+            elif report.state not in READY_CAPACITY_STATUSES:
+                record.metadata.pop("native_worker_endpoints", None)
+            if report.state in READY_CAPACITY_STATUSES and report.observed_tpu_vms is not None:
+                record.metadata["observed_tpu_vms"] = report.observed_tpu_vms
+            elif report.state not in READY_CAPACITY_STATUSES:
+                record.metadata.pop("observed_tpu_vms", None)
+            record.metadata.pop("recreate_intent", None)
+
+        record = self._persist_owned_cell(
+            cell_id,
+            context,
+            expected_record,
+            phase="provider observation could be persisted",
+            cleanup_capacity=True,
+            mutate=mutate,
+        )
+        return self._observation(record, detail=report.detail)
+
+    def _persist_owned_cell(
+        self,
+        cell_id: str,
+        context: MutationContext,
+        expected_record: FleetCellRecord,
+        *,
+        phase: str,
+        cleanup_capacity: bool,
+        mutate: tp.Callable[[FleetCellRecord], None],
+    ) -> FleetCellRecord:
+        """Persist an external operation only while its cell incarnation remains owned."""
+
+        try:
+            return self.state.mutate_record(cell_id, mutate, generation=context.generation)
+        except FleetCellNotRegisteredError:
+            self._fence_missing_cell(
+                cell_id,
+                context,
+                phase=phase,
+                expected_record=expected_record,
+                cleanup_capacity=cleanup_capacity,
+            )
+        except StaleFenceError as exc:
+            raise StaleMutationError(str(exc)) from exc
+
+    def _fence_missing_cell(
+        self,
+        cell_id: str,
+        context: MutationContext,
+        *,
+        phase: str,
+        expected_record: FleetCellRecord | None = None,
+        cleanup_capacity: bool = False,
+    ) -> tp.NoReturn:
+        """Fence a vanished cell generation and roll back only resources it still owns."""
+
+        try:
+            fenced = self.state.fence_missing_record(cell_id, context.generation, context.fencing_token)
+        except StaleFenceError as exc:
+            raise StaleMutationError(str(exc)) from exc
+        if not fenced:
+            raise StaleMutationError(f"cell {cell_id!r} no longer belongs to this generation before {phase}")
+        if expected_record is not None:
+            try:
+                if cleanup_capacity:
+                    self._delete_owned_capacity(expected_record)
+                self._release_auxiliary_resources(expected_record)
+            except Exception as exc:
+                raise StaleMutationError(
+                    f"cell {cell_id!r} was removed before {phase}; old generation was fenced but cleanup failed "
+                    f"with {type(exc).__name__}"
+                ) from exc
+        raise StaleMutationError(f"cell {cell_id!r} was removed before {phase}; old generation was fenced")
+
+    def _ensure_owned(
+        self,
+        cell_id: str,
+        context: MutationContext,
+        *,
+        recreate_terminal: bool = False,
+    ) -> CellObservation:
+        record = self.state.get(cell_id)
+        if record is None:
+            self._fence_missing_cell(cell_id, context, phase="capacity reconciliation could begin")
+        if record.desired_state != "up":
+            return self._observation(record, detail=f"capacity desired state is {record.desired_state}")
+        if recreate_terminal:
+            self._resume_recreate(record, context)
+            resumed_record = self.state.get(cell_id)
+            if resumed_record is None:
+                self._fence_missing_cell(
+                    cell_id,
+                    context,
+                    phase="capacity recreation could resume",
+                    expected_record=record,
+                    cleanup_capacity=True,
+                )
+            record = resumed_record
+        self._refresh_native_worker_public_ingress(record)
+        self._finalize_provider_config(cell_id, context)
+        finalized_record = self.state.get(cell_id)
+        if finalized_record is None:
+            self._fence_missing_cell(
+                cell_id,
+                context,
+                phase="native worker bootstrap could be persisted",
+                expected_record=record,
+            )
+        record = finalized_record
+        report = self.provider.ensure(record)
+        if recreate_terminal and report.state is CapacityStatus.NEEDS_RECREATE:
+            if record.state is not CapacityStatus.NEEDS_RECREATE:
+                return self._persist_provider_observation(cell_id, report, context, record)
+            record = self._plan_recreate(record, context)
+            self._delete_previous_capacity(record)
+            report = self.provider.ensure(record)
+        return self._persist_provider_observation(cell_id, report, context, record)
+
+    def _resume_recreate(self, record: FleetCellRecord, context: MutationContext) -> None:
+        intent = record.metadata.get("recreate_intent")
+        if not isinstance(intent, dict):
+            return
+        if record.generation != context.generation or record.fencing_token != context.fencing_token:
+            raise StaleMutationError(f"cell {record.name!r} recreate intent is owned by another generation")
+        self._delete_previous_capacity(record)
+
+    def _plan_recreate(self, record: FleetCellRecord, context: MutationContext) -> FleetCellRecord:
+        previous_qr_id = record.qr_id
+
+        def plan(current: FleetCellRecord) -> None:
+            if current.generation != context.generation or current.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {record.name!r} changed ownership before capacity recreation")
+            current.provider_generation += 1
+            current.qr_id = self._resource_id(current.name, current.provider_generation)
+            current.state = CapacityStatus.RECREATING
+            current.head_ip = None
+            current.execution_endpoint = None
+            current.metadata.pop("native_worker_endpoints", None)
+            current.metadata.pop("observed_tpu_vms", None)
+            current.metadata["recreate_intent"] = {
+                "previous_qr_id": previous_qr_id,
+                "target_qr_id": current.qr_id,
+                "cell_generation": context.generation,
+            }
+
+        replacement = self._persist_owned_cell(
+            record.name,
+            context,
+            record,
+            phase="capacity recreation could be planned",
+            cleanup_capacity=True,
+            mutate=plan,
+        )
+        if self.capacity_kind != "tpu" or self.execution_backend != "eyvan-native":
+            return replacement
+        config = replacement.metadata.get("tpu_config")
+        if not isinstance(config, dict):
+            raise ValueError("native TPU recreation requires a persisted provider configuration")
+        setup_script = replacement.metadata.get("native_worker_setup_script")
+        if setup_script is not None and not isinstance(setup_script, str):
+            raise ValueError("native TPU recreation has an invalid setup script")
+        runtime = _native_runtime_from_record(replacement)
+        refreshed = normalize_tpu_config(config)
+        endpoint_mode = self._configure_native_tpu_worker(
+            replacement,
+            refreshed,
+            before_start=setup_script,
+            runtime_setup=_native_runtime_setup(runtime),
+            runtime_env=runtime.env,
+            runtime_container=runtime.container,
+            container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+        )
+
+        def persist(current: FleetCellRecord) -> None:
+            if current.generation != context.generation or current.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {record.name!r} changed ownership before native TPU recreation")
+            if current.provider_generation != replacement.provider_generation:
+                raise StaleMutationError(
+                    f"cell {record.name!r} changed provider generation before native TPU recreation"
+                )
+            current.metadata["tpu_config"] = refreshed
+            current.metadata["native_worker_port"] = self.native_worker_port
+            current.metadata["execution_backend"] = self.execution_backend
+            current.metadata["native_worker_secret_id"] = replacement.metadata["native_worker_secret_id"]
+            current.metadata["native_worker_bootstrap_generation"] = replacement.provider_generation
+            current.metadata.pop("native_worker_bootstrap_key", None)
+            _persist_native_worker_endpoint_mode(current, endpoint_mode)
+
+        return self._persist_owned_cell(
+            replacement.name,
+            context,
+            replacement,
+            phase="native worker recreation could be persisted",
+            cleanup_capacity=True,
+            mutate=persist,
+        )
+
+    def _delete_previous_capacity(self, record: FleetCellRecord) -> None:
+        intent = record.metadata.get("recreate_intent")
+        if not isinstance(intent, dict):
+            return
+        previous_qr_id = intent.get("previous_qr_id")
+        if isinstance(previous_qr_id, str) and previous_qr_id and record.project and record.zone:
+            self.provider.delete(
+                previous_qr_id,
+                project=record.project,
+                zone=record.zone,
+                management_uid=_management_uid(record),
+            )
+
+    def _delete_owned_capacity(self, record: FleetCellRecord) -> None:
+        """Delete every resource named by a lost cell incarnation."""
+
+        if not record.project or not record.zone:
+            return
+        recreate_intent = record.metadata.get("recreate_intent")
+        previous_qr_id = recreate_intent.get("previous_qr_id") if isinstance(recreate_intent, dict) else None
+        resource_ids = {
+            resource_id for resource_id in (previous_qr_id, record.qr_id) if isinstance(resource_id, str) and resource_id
+        }
+        for resource_id in sorted(resource_ids):
+            self.provider.delete(
+                resource_id,
+                project=record.project,
+                zone=record.zone,
+                management_uid=_management_uid(record),
+            )
+
+    def reconcile(self, cell_id: str, context: MutationContext) -> CellObservation:
+        with self._mutation_lock, self.state.exclusive():
+
+            def claim(record: FleetCellRecord) -> None:
+                if self._accept_mutation(record, context):
+                    self._stamp(record, context)
+
+            try:
+                self.state.mutate_record(
+                    cell_id,
+                    claim,
+                    generation=context.generation,
+                )
+            except FleetCellNotRegisteredError:
+                return self.observe(cell_id)
+            except StaleFenceError as exc:
+                raise StaleMutationError(str(exc)) from exc
+            return self._ensure_owned(cell_id, context, recreate_terminal=True)
+
+    def apply_capacity(
+        self,
+        cell_id: str,
+        desired: tp.Mapping[str, JsonValue],
+        context: MutationContext,
+    ) -> CellObservation:
+        normalized = self._normalize_desired(desired)
+        document = normalized.document
+        project = _required_string(document, "project")
+        zone = _required_string(document, "zone")
+        accelerator_type = _required_string(document, "accelerator_type")
+        capacity_class_value = document.get("capacity_class", "spot")
+        if not isinstance(capacity_class_value, str):
+            raise ValueError("capacity field 'capacity_class' must be a string")
+        capacity_class = capacity_class_value.replace("_", "-")
+        if capacity_class not in self.capacity_classes:
+            raise ValueError(f"unsupported {self.provider_name} capacity class {capacity_class!r}")
+        executor_value = document.get("executor")
+        if executor_value is not None and not isinstance(executor_value, str):
+            raise ValueError("capacity field 'executor' must be a string when set")
+        requested_executor = canonical_execution_backend(executor_value or self.execution_backend)
+        if requested_executor != self.execution_backend:
+            raise ValueError(
+                f"cell requests executor {requested_executor!r}, but this agent provides {self.execution_backend!r}"
+            )
+        with self._mutation_lock, self.state.exclusive():
+
+            def mutate(record: FleetCellRecord) -> None:
+                if not self._accept_mutation(record, context):
+                    return
+                persisted_kind = record.metadata.get("capacity_kind")
+                if persisted_kind not in {None, self.capacity_kind}:
+                    raise ValueError(
+                        f"cell {cell_id!r} is already managed by {persisted_kind!r} capacity; delete it before changing"
+                    )
+                record.project = project
+                record.zone = zone
+                record.accelerator_type = accelerator_type
+                record.capacity_class = capacity_class
+                record.runtime_version = _optional_string(document, "runtime_version")
+                record.execution_endpoint = _optional_string(document, "execution_endpoint")
+                agent_endpoint = _optional_string(document, "agent_endpoint")
+                if agent_endpoint is not None:
+                    record.metadata["agent_endpoint"] = agent_endpoint
+                record.metadata["capacity_backend"] = self.provider_name
+                record.metadata["capacity_kind"] = self.capacity_kind
+                record.metadata.setdefault("management_uid", uuid.uuid4().hex)
+                if record.qr_id is None:
+                    record.provider_generation += 1
+                    record.qr_id = self._resource_id(cell_id, record.provider_generation)
+                self._persist_provider_config(record, normalized)
+                record.desired_state = "up"
+                self._stamp(record, context)
+
+            try:
+                self.state.mutate_or_create_record(cell_id, mutate, generation=context.generation)
+            except StaleFenceError as exc:
+                raise StaleMutationError(str(exc)) from exc
+            return self._ensure_owned(cell_id, context)
+
+    def _validate_normalized_document(self, document: JsonObject, runtime: NativeRuntimeConfig) -> None:
+        """Validate execution/runtime fields common to GCP capacity kinds."""
+
+        if not runtime.is_empty and self.execution_backend != "eyvan-native":
+            raise ValueError("native runtime configuration requires execution backend eyvan-native")
+        document["runtime"] = model_json(runtime)
+        backend_value = document.get("capacity_backend")
+        if backend_value is not None and not isinstance(backend_value, str):
+            raise ValueError("capacity field 'capacity_backend' must be a string when set")
+        requested_backend = (backend_value or self.provider_name).strip().lower().replace("_", "-")
+        if requested_backend not in {"gcp", self.provider_name}:
+            raise ValueError(f"{self.provider_name} driver cannot satisfy capacity backend {requested_backend!r}")
+
+    def _normalize_desired(self, desired: tp.Mapping[str, JsonValue]) -> NormalizedCapacityRequest:
+        document: JsonObject = dict(desired)
+        runtime = _native_runtime_from_desired(document)
+        if runtime.vm_image is not None:
+            raise ValueError("runtime.vm_image requires the gcp-compute capacity backend")
+        self._validate_normalized_document(document, runtime)
+        config = normalize_tpu_config(document)
+        document["runtime_version"] = config["runtime_version"]
+        return NormalizedCapacityRequest(document=document, runtime=runtime, tpu_config=config)
+
+    def _persist_provider_config(
+        self,
+        record: FleetCellRecord,
+        desired: NormalizedCapacityRequest,
+    ) -> None:
+        config = desired.tpu_config
+        if config is None:
+            raise ValueError("normalized TPU provider configuration is missing")
+        persisted_config = config.copy()
+        if self.execution_backend == "eyvan-native":
+            setup_script = persisted_config.get("startup_script")
+            if not desired.runtime.is_empty and setup_script is not None:
+                raise ValueError("use runtime.init_commands instead of provider_options.startup_script")
+            record.metadata["native_worker_setup_script"] = setup_script
+            record.metadata["native_runtime"] = model_json(desired.runtime)
+            record.metadata["native_worker_port"] = self.native_worker_port
+            record.metadata["execution_backend"] = self.execution_backend
+            record.metadata.pop("native_worker_secret_id", None)
+            record.metadata.pop("native_worker_bootstrap_generation", None)
+            record.metadata.pop("native_worker_bootstrap_key", None)
+            record.metadata.pop("native_worker_endpoint_mode", None)
+        else:
+            record.metadata.pop("native_worker_port", None)
+            record.metadata.pop("execution_backend", None)
+            record.metadata.pop("native_worker_secret_id", None)
+            record.metadata.pop("native_worker_setup_script", None)
+            record.metadata.pop("native_runtime", None)
+            record.metadata.pop("native_worker_endpoint_mode", None)
+        record.metadata["tpu_config"] = persisted_config
+
+    def _bootstrap_key(self, record: FleetCellRecord) -> str:
+        """Return what must be unchanged for a host's bootstrap to still be current.
+
+        The provider generation alone is not enough. The staged worker wheel is
+        baked into the startup script at bootstrap time, and re-staging a wheel
+        does not change the generation -- so ``eyvan runtime init`` published new
+        code that reached no existing cell, and there was no way to tell from
+        the outside. Live on 2026-08-01 that meant TPU hosts ran a three-day-old
+        wheel for an entire day, and a "fix" that had been verified in the
+        package was simply not on the machine.
+
+        Including the package URI makes a re-stage invalidate the bootstrap, so
+        the next reconcile rewrites the script. The URI is content-addressed, so
+        identical code produces an identical key and nothing churns.
+        """
+
+        package = self.native_worker_package or ""
+        return f"{record.provider_generation}:{hashlib.sha256(package.encode()).hexdigest()[:16]}"
+
+    def _finalize_provider_config(self, cell_id: str, context: MutationContext) -> None:
+        """Finish any provider setup that must run outside durable-state CAS callbacks."""
+
+        if self.capacity_kind != "tpu" or self.execution_backend != "eyvan-native":
+            return
+        record = self.state.get(cell_id)
+        if record is None:
+            self._fence_missing_cell(cell_id, context, phase="native worker bootstrap could begin")
+        if record.generation != context.generation or record.fencing_token != context.fencing_token:
+            raise StaleMutationError(f"cell {cell_id!r} changed ownership before native TPU bootstrap")
+        if record.metadata.get("native_worker_bootstrap_key") == self._bootstrap_key(record):
+            return
+        config = record.metadata.get("tpu_config")
+        if not isinstance(config, dict):
+            raise ValueError("native TPU bootstrap requires a persisted provider configuration")
+        setup_script = record.metadata.get("native_worker_setup_script")
+        if setup_script is not None and not isinstance(setup_script, str):
+            raise ValueError("native TPU bootstrap has an invalid setup script")
+        runtime = _native_runtime_from_record(record)
+        configured = normalize_tpu_config(config)
+        endpoint_mode = self._configure_native_tpu_worker(
+            record,
+            configured,
+            before_start=setup_script,
+            runtime_setup=_native_runtime_setup(runtime),
+            runtime_env=runtime.env,
+            runtime_container=runtime.container,
+            container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+        )
+
+        def persist(current: FleetCellRecord) -> None:
+            if current.generation != context.generation or current.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {cell_id!r} changed ownership before native TPU bootstrap")
+            if current.provider_generation != record.provider_generation:
+                raise StaleMutationError(f"cell {cell_id!r} changed provider generation before native TPU bootstrap")
+            current.metadata["tpu_config"] = configured
+            current.metadata["native_worker_port"] = self.native_worker_port
+            current.metadata["execution_backend"] = self.execution_backend
+            current.metadata["native_worker_secret_id"] = record.metadata["native_worker_secret_id"]
+            current.metadata["native_worker_bootstrap_generation"] = record.provider_generation
+            current.metadata["native_worker_bootstrap_key"] = self._bootstrap_key(record)
+            _persist_native_worker_endpoint_mode(current, endpoint_mode)
+
+        self._persist_owned_cell(
+            cell_id,
+            context,
+            record,
+            phase="native worker bootstrap could be persisted",
+            cleanup_capacity=False,
+            mutate=persist,
+        )
+
+    def _native_worker_service_account(
+        self,
+        record: FleetCellRecord,
+        config: TpuProviderConfig | ComputeProviderConfig,
+    ) -> str:
+        """Return an explicit override or GCP's default VM identity for secret access."""
+
+        configured = config.get("service_account")
+        if configured is not None:
+            if not isinstance(configured, str) or not configured.strip():
+                raise ValueError("native worker provider_options.service_account must be a non-empty string when set")
+            return configured
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError("native worker bootstrap requires a GCP project")
+        service_account = self.native_worker_service_account_resolver.resolve(project=record.project)
+        if not isinstance(service_account, str) or not service_account.strip():
+            raise ValueError("native worker default service-account resolver returned an empty identity")
+        return service_account
+
+    def _ensure_native_worker_artifact_access(
+        self,
+        record: FleetCellRecord,
+        service_account: str,
+    ) -> None:
+        """Grant the profile-owned worker identity narrow access to its GCS artifact bucket."""
+
+        artifact_bucket = self.native_worker_artifact_bucket
+        if artifact_bucket is None:
+            return
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError("native worker artifact access requires a GCP project")
+        self.native_worker_artifact_access.ensure(
+            project=record.project,
+            artifact_bucket=artifact_bucket,
+            reader_service_account=service_account,
+        )
+
+    def _configure_native_worker_public_ingress(
+        self,
+        record: FleetCellRecord,
+        config: TpuProviderConfig | ComputeProviderConfig,
+        *,
+        has_public_ip: bool,
+    ) -> NativeWorkerEndpointMode:
+        """Attach the profile-owned firewall tag before public worker creation."""
+
+        ingress = self.native_worker_public_ingress
+        if not has_public_ip or ingress is None:
+            return NativeWorkerEndpointMode.PRIVATE
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError("profile-managed native worker ingress requires a GCP project")
+        tag = ingress.ensure(
+            project=record.project,
+            network=config["network"],
+            port=self.native_worker_port,
+        )
+        if not isinstance(tag, str) or not tag or tag != tag.strip():
+            raise ValueError("profile-managed native worker ingress returned an invalid network tag")
+        if tag not in config["tags"]:
+            config["tags"] = [*config["tags"], tag]
+        return NativeWorkerEndpointMode.PROFILE_MANAGED_PUBLIC
+
+    def _refresh_native_worker_public_ingress(self, record: FleetCellRecord) -> None:
+        """Update the managed source /32 when the local public IPv4 changes."""
+
+        try:
+            endpoint_mode = endpoint_mode_from_metadata(record.metadata)
+        except ValueError as exc:
+            raise ValueError(f"cell {record.name!r} has an invalid native worker endpoint mode") from exc
+        if endpoint_mode is NativeWorkerEndpointMode.PRIVATE:
+            return
+        if self.execution_backend != "eyvan-native":
+            raise ValueError(f"cell {record.name!r} has profile-managed public routing without eyvan-native execution")
+        ingress = self.native_worker_public_ingress
+        if ingress is None:
+            raise ValueError(
+                f"cell {record.name!r} requires its profile-managed public ingress rule, "
+                "but this agent has no runtime profile"
+            )
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError(f"cell {record.name!r} requires a GCP project for profile-managed public ingress")
+        if self.capacity_kind == "tpu":
+            raw_config = record.metadata.get("tpu_config")
+            if not isinstance(raw_config, dict):
+                raise ValueError(f"cell {record.name!r} has no TPU provider configuration for public ingress")
+            config = normalize_tpu_config(raw_config)
+            if config["internal_ips"]:
+                raise ValueError(f"cell {record.name!r} marks a private TPU as profile-managed public")
+            network = config["network"]
+        else:
+            raw_config = record.metadata.get("compute_config")
+            if not isinstance(raw_config, dict):
+                raise ValueError(f"cell {record.name!r} has no Compute provider configuration for public ingress")
+            config = normalize_compute_config(raw_config)
+            if config["internal_ip_only"]:
+                raise ValueError(f"cell {record.name!r} marks a private Compute VM as profile-managed public")
+            network = config["network"]
+        ingress.ensure(project=record.project, network=network, port=self.native_worker_port)
+
+    def _configure_native_tpu_worker(
+        self,
+        record: FleetCellRecord,
+        config: TpuProviderConfig,
+        *,
+        before_start: str | None,
+        runtime_setup: str | None = None,
+        runtime_env: tp.Mapping[str, str] | None = None,
+        runtime_container: NativeContainerConfig | None = None,
+        container_artifact_mounts: tp.Sequence[str] = (),
+    ) -> NativeWorkerEndpointMode:
+        """Inject a shared native-worker bootstrap into every TPU VM in a queued resource."""
+
+        from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
+
+        if not isinstance(self.native_worker_shared_secret, str) or not self.native_worker_shared_secret.strip():
+            raise ValueError("eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_ROOT_SECRET")
+        if not isinstance(self.native_worker_package, str) or not self.native_worker_package.strip():
+            raise ValueError(
+                "eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_PACKAGE; "
+                "use a pinned gs:// wheel until Eyvan is released"
+            )
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError("native TPU bootstrap requires a GCP project")
+        management_uid = record.metadata.get("management_uid")
+        if not isinstance(management_uid, str) or not management_uid:
+            raise ValueError("native TPU bootstrap requires an Eyvan management UID")
+        service_account = self._native_worker_service_account(record, config)
+        egress = config.get("bootstrap_egress")
+        if not isinstance(egress, str) or not egress:
+            raise ValueError(
+                "eyvan-native TPU capacity requires provider_options.bootstrap_egress "
+                "(cloud-nat, private-google-access, or public-internet)"
+            )
+        if config.get("internal_ips", False) and egress == "public-internet":
+            raise ValueError("internal-only eyvan-native TPU capacity cannot use bootstrap_egress=public-internet")
+        endpoint_mode = self._configure_native_worker_public_ingress(
+            record,
+            config,
+            has_public_ip=not config["internal_ips"],
+        )
+        wheelhouse = None
+        if egress == "private-google-access":
+            if not self.native_worker_package.startswith("gs://"):
+                raise ValueError(
+                    "private-google-access native TPU bootstrap requires "
+                    "EYVAN_NATIVE_WORKER_PACKAGE to be a pinned gs:// wheel"
+                )
+            if not isinstance(self.native_worker_wheelhouse, str) or not self.native_worker_wheelhouse.strip():
+                raise ValueError(
+                    "private-google-access eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_WHEELHOUSE "
+                    "with every worker dependency wheel"
+                )
+            if not self.native_worker_wheelhouse.startswith("gs://"):
+                raise ValueError("EYVAN_NATIVE_WORKER_WHEELHOUSE must be a gs:// zip archive")
+            wheelhouse = self.native_worker_wheelhouse
+        scopes = list(config["scopes"])
+        cloud_platform_scope = "https://www.googleapis.com/auth/cloud-platform"
+        if cloud_platform_scope not in scopes:
+            scopes.append(cloud_platform_scope)
+        config["scopes"] = scopes
+        self._ensure_native_worker_artifact_access(record, service_account)
+        worker_token = derive_native_worker_token(
+            self.native_worker_shared_secret,
+            management_uid,
+            provider_generation=record.provider_generation,
+        )
+        if worker_token is None:
+            raise ValueError("eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_ROOT_SECRET")
+        secret_resource = self.native_worker_secrets.ensure(
+            project=record.project,
+            management_uid=management_uid,
+            value=worker_token,
+            reader_service_account=service_account,
+        )
+        config["startup_script"] = build_native_worker_startup_script(
+            package=self.native_worker_package,
+            port=self.native_worker_port,
+            state_dir=self.native_worker_state_dir,
+            worker_secret_resource=secret_resource,
+            wheelhouse=wheelhouse,
+            before_start=before_start,
+            runtime_setup=runtime_setup,
+            runtime_env=runtime_env,
+            runtime_container=runtime_container,
+            container_artifact_mounts=container_artifact_mounts,
+        )
+        record.metadata["native_worker_port"] = self.native_worker_port
+        record.metadata["execution_backend"] = self.execution_backend
+        record.metadata["native_worker_secret_id"] = secret_resource.rsplit("/versions/", 1)[0]
+        return endpoint_mode
+
+    @staticmethod
+    def _resource_id(cell_id: str, provider_generation: int) -> str:
+        return f"{cell_id}-r{provider_generation}"
+
+    def drain(self, cell_id: str, context: MutationContext) -> CellObservation:
+        with self._mutation_lock, self.state.exclusive():
+
+            def mutate(record: FleetCellRecord) -> None:
+                if not self._accept_mutation(record, context):
+                    return
+                record.desired_state = "down"
+                record.state = CapacityStatus.DRAINING
+                self._stamp(record, context)
+
+            try:
+                record = self.state.drain_record(cell_id, context.generation, context.fencing_token, mutate)
+            except StaleFenceError as exc:
+                raise StaleMutationError(str(exc)) from exc
+            if record is None:
+                return CellObservation(
+                    cell_id=cell_id,
+                    state=CapacityStatus.DRAINING,
+                    generation=context.generation,
+                    observed_at=datetime.now(UTC),
+                )
+            return self._observation(record)
+
+    def release(self, cell_id: str, context: MutationContext) -> CellObservation:
+        with self._mutation_lock, self.state.exclusive():
+            owned: dict[str, FleetCellRecord] = {}
+
+            def claim(record: FleetCellRecord) -> None:
+                if not self._accept_mutation(record, context):
+                    if (
+                        record.state is CapacityStatus.DELETING
+                        and record.generation == context.generation
+                        and record.fencing_token == context.fencing_token
+                    ):
+                        owned["record"] = record
+                        return
+                    # The idempotency key was already consumed by another mutation while
+                    # the record still names live capacity. _accept_mutation has already
+                    # validated the fence, so fall through and re-stamp the release
+                    # instead of silently leaking the provider resources.
+                record.desired_state = "down"
+                record.state = CapacityStatus.DELETING
+                self._stamp(record, context)
+                owned["record"] = record
+
+            try:
+                self.state.mutate_record(cell_id, claim, generation=context.generation)
+            except FleetCellNotRegisteredError:
+                pass
+            except StaleFenceError as exc:
+                tombstone = self.state.cell_tombstone(cell_id)
+                if (
+                    self.state.get(cell_id) is None
+                    and tombstone is not None
+                    and int(tombstone["generation"]) == context.generation
+                    and tombstone.get("fencing_token") == context.fencing_token
+                ):
+                    return self._released(cell_id, context.generation)
+                raise StaleMutationError(str(exc)) from exc
+
+            record = owned.get("record")
+            if record is not None:
+                self._delete_owned_capacity(record)
+                self._release_auxiliary_resources(record)
+
+            def still_owned(current: FleetCellRecord) -> bool:
+                return current.generation == context.generation and current.fencing_token == context.fencing_token
+
+            if record is None and self.state.get(cell_id) is not None:
+                return self.observe(cell_id)
+            try:
+                removed = self.state.tombstone_record(
+                    cell_id,
+                    context.generation,
+                    context.fencing_token,
+                    still_owned,
+                )
+            except StaleFenceError as exc:
+                raise StaleMutationError(str(exc)) from exc
+            if not removed:
+                raise StaleMutationError(f"cell {cell_id!r} changed ownership during release")
+            return self._released(cell_id, context.generation)
+
+    def _release_auxiliary_resources(self, record: FleetCellRecord) -> None:
+        """Release provider resources coupled to a cell after capacity deletion."""
+
+        if self.capacity_kind != "tpu" or self.execution_backend != "eyvan-native" or not record.project:
+            return
+        management_uid = record.metadata.get("management_uid")
+        if not isinstance(management_uid, str) or not management_uid:
+            raise ValueError("native TPU cleanup requires an Eyvan management UID")
+        self.native_worker_secrets.delete(project=record.project, management_uid=management_uid)
+
+    @staticmethod
+    def _released(cell_id: str, generation: int) -> CellObservation:
+        return CellObservation(
+            cell_id=cell_id,
+            state=CapacityStatus.RELEASED,
+            generation=generation,
+            observed_at=datetime.now(UTC),
+        )
+
+
+class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
+    """Reconcile CPU, GPU, and integrated TPU Compute instances behind Eyvan fences."""
+
+    provider_name = "gcp-compute"
+    capacity_kind = "compute"
+    accelerator_types = ("cpu", "gpu", "tpu")
+    capacity_classes = ("spot", "on-demand", "reserved")
+
+    def __init__(
+        self,
+        state: FleetStateStore | None = None,
+        *,
+        provider: CapacityProvider | None = None,
+        execution_backend: str | None = None,
+        native_worker_port: int | None = None,
+        native_worker_package: str | None = None,
+        native_worker_wheelhouse: str | None = None,
+        native_worker_state_dir: str | None = None,
+        native_worker_shared_secret: str | None = None,
+        native_worker_secrets: NativeWorkerSecretStore | None = None,
+        native_worker_service_account_resolver: ServiceAccountResolver | None = None,
+        native_worker_artifact_root_uri: str | None = None,
+        native_worker_artifact_access: NativeWorkerArtifactAccessStore | None = None,
+        native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
+    ):
+        super().__init__(
+            state,
+            provider=provider or GcloudComputeProvider(),
+            execution_backend=execution_backend,
+            native_worker_port=native_worker_port,
+            native_worker_package=native_worker_package,
+            native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_state_dir=native_worker_state_dir,
+            native_worker_shared_secret=native_worker_shared_secret,
+            native_worker_secrets=native_worker_secrets,
+            native_worker_service_account_resolver=native_worker_service_account_resolver,
+            native_worker_artifact_root_uri=native_worker_artifact_root_uri,
+            native_worker_artifact_access=native_worker_artifact_access,
+            native_worker_public_ingress=native_worker_public_ingress,
+        )
+        self.native_worker_secrets = native_worker_secrets or GcloudNativeWorkerSecretStore()
+
+    def _normalize_desired(self, desired: tp.Mapping[str, JsonValue]) -> NormalizedCapacityRequest:
+        runtime = _native_runtime_from_desired(desired)
+        document: JsonObject = dict(desired)
+        if runtime.vm_image is not None:
+            nested_values = [name for name in ("provider_config", "provider_options") if document.get(name) is not None]
+            if len(nested_values) > 1:
+                raise ValueError("set only one of provider_config or provider_options")
+            option_name = nested_values[0] if nested_values else "provider_options"
+            raw_options = document.get(option_name) or {}
+            if not is_json_object(raw_options):
+                raise ValueError("Compute provider options must be a mapping")
+            options: JsonObject = dict(raw_options)
+            configured_image = options.get("image")
+            if configured_image is not None and configured_image != runtime.vm_image:
+                raise ValueError("runtime.vm_image conflicts with Compute provider option 'image'")
+            if configured_image is None and any(key in options for key in ("image_family", "image_project")):
+                raise ValueError("runtime.vm_image conflicts with Compute image_family or image_project")
+            options["image"] = runtime.vm_image
+            document[option_name] = options
+        config = normalize_compute_config(document)
+        capacity_class_value = desired.get("capacity_class", "on-demand")
+        if not isinstance(capacity_class_value, str):
+            raise ValueError("capacity field 'capacity_class' must be a string")
+        capacity_class = capacity_class_value.replace("_", "-")
+        if capacity_class == "reserved" and config["reservation"] is None:
+            raise ValueError("reserved Compute capacity requires provider option 'reservation'")
+        accelerator_type = config["gpu_type"] or desired.get("accelerator_type") or config["tpu_type"]
+        if accelerator_type is not None and not isinstance(accelerator_type, str):
+            raise ValueError("capacity field 'accelerator_type' must be a string when set")
+        document["capacity_class"] = capacity_class
+        document["accelerator_type"] = accelerator_type or config["machine_type"]
+        self._validate_normalized_document(document, runtime)
+        return NormalizedCapacityRequest(document=document, runtime=runtime, compute_config=config)
+
+    def _persist_provider_config(
+        self,
+        record: FleetCellRecord,
+        desired: NormalizedCapacityRequest,
+    ) -> None:
+        config = desired.compute_config
+        if config is None:
+            raise ValueError("normalized Compute provider configuration is missing")
+        persisted_config = config.copy()
+        if self.execution_backend == "eyvan-native":
+            setup_script = persisted_config["startup_script"]
+            if not desired.runtime.is_empty and setup_script is not None:
+                raise ValueError("use runtime.init_commands instead of provider_options.startup_script")
+            record.metadata["native_worker_setup_script"] = setup_script
+            record.metadata["native_runtime"] = model_json(desired.runtime)
+            record.metadata["native_worker_port"] = self.native_worker_port
+            record.metadata["execution_backend"] = self.execution_backend
+            record.metadata.pop("native_worker_secret_id", None)
+            record.metadata.pop("native_worker_bootstrap_generation", None)
+            record.metadata.pop("native_worker_bootstrap_key", None)
+            record.metadata.pop("native_worker_endpoint_mode", None)
+        else:
+            record.metadata.pop("native_worker_port", None)
+            record.metadata.pop("execution_backend", None)
+            record.metadata.pop("native_worker_secret_id", None)
+            record.metadata.pop("native_worker_setup_script", None)
+            record.metadata.pop("native_runtime", None)
+            record.metadata.pop("native_worker_endpoint_mode", None)
+        record.runtime_version = None
+        record.metadata["compute_config"] = persisted_config
+
+    def _finalize_provider_config(self, cell_id: str, context: MutationContext) -> None:
+        if self.execution_backend != "eyvan-native":
+            return
+        record = self.state.get(cell_id)
+        if record is None:
+            self._fence_missing_cell(cell_id, context, phase="native worker bootstrap could begin")
+        if record.generation != context.generation or record.fencing_token != context.fencing_token:
+            raise StaleMutationError(f"cell {cell_id!r} changed ownership before native worker bootstrap")
+        if record.metadata.get("native_worker_bootstrap_key") == self._bootstrap_key(record):
+            return
+        config = record.metadata.get("compute_config")
+        if not isinstance(config, dict):
+            raise ValueError("native worker bootstrap requires a persisted Compute provider configuration")
+        setup_script = record.metadata.get("native_worker_setup_script")
+        if setup_script is not None and not isinstance(setup_script, str):
+            raise ValueError("native worker bootstrap has an invalid setup script")
+        runtime = _native_runtime_from_record(record)
+        configured = normalize_compute_config(config)
+        endpoint_mode = self._configure_native_worker(
+            record,
+            configured,
+            before_start=setup_script,
+            runtime_setup=_native_runtime_setup(runtime),
+            runtime_env=runtime.env,
+            runtime_container=runtime.container,
+            container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+        )
+
+        def persist(current: FleetCellRecord) -> None:
+            if current.generation != context.generation or current.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {cell_id!r} changed ownership before native worker bootstrap")
+            if current.provider_generation != record.provider_generation:
+                raise StaleMutationError(f"cell {cell_id!r} changed provider generation before native worker bootstrap")
+            current.metadata["compute_config"] = configured
+            current.metadata["native_worker_port"] = self.native_worker_port
+            current.metadata["execution_backend"] = self.execution_backend
+            current.metadata["native_worker_secret_id"] = record.metadata["native_worker_secret_id"]
+            current.metadata["native_worker_bootstrap_generation"] = record.provider_generation
+            current.metadata["native_worker_bootstrap_key"] = self._bootstrap_key(record)
+            _persist_native_worker_endpoint_mode(current, endpoint_mode)
+
+        self._persist_owned_cell(
+            cell_id,
+            context,
+            record,
+            phase="native worker bootstrap could be persisted",
+            cleanup_capacity=False,
+            mutate=persist,
+        )
+
+    def _configure_native_worker(
+        self,
+        record: FleetCellRecord,
+        config: ComputeProviderConfig,
+        *,
+        before_start: str | None,
+        runtime_setup: str | None = None,
+        runtime_env: tp.Mapping[str, str] | None = None,
+        runtime_container: NativeContainerConfig | None = None,
+        container_artifact_mounts: tp.Sequence[str] = (),
+    ) -> NativeWorkerEndpointMode:
+        """Inject a private worker bootstrap without writing its token to VM metadata."""
+
+        from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
+
+        if not isinstance(self.native_worker_shared_secret, str) or not self.native_worker_shared_secret.strip():
+            raise ValueError("eyvan-native Compute capacity requires EYVAN_NATIVE_WORKER_ROOT_SECRET")
+        if not isinstance(self.native_worker_package, str) or not self.native_worker_package.strip():
+            raise ValueError(
+                "eyvan-native Compute capacity requires EYVAN_NATIVE_WORKER_PACKAGE; "
+                "use a pinned gs:// wheel until Eyvan is released"
+            )
+        if not isinstance(record.project, str) or not record.project:
+            raise ValueError("native worker bootstrap requires a GCP project")
+        management_uid = record.metadata.get("management_uid")
+        if not isinstance(management_uid, str) or not management_uid:
+            raise ValueError("native worker bootstrap requires an Eyvan management UID")
+        service_account = self._native_worker_service_account(record, config)
+        egress = config.get("bootstrap_egress")
+        if not isinstance(egress, str) or not egress:
+            raise ValueError(
+                "eyvan-native Compute capacity requires provider_options.bootstrap_egress "
+                "(cloud-nat, private-google-access, or public-internet)"
+            )
+        if config.get("internal_ip_only", True) and egress == "public-internet":
+            raise ValueError("internal-only eyvan-native Compute capacity cannot use bootstrap_egress=public-internet")
+        endpoint_mode = self._configure_native_worker_public_ingress(
+            record,
+            config,
+            has_public_ip=not config["internal_ip_only"],
+        )
+        wheelhouse = None
+        if egress == "private-google-access":
+            if not self.native_worker_package.startswith("gs://"):
+                raise ValueError(
+                    "private-google-access native bootstrap requires "
+                    "EYVAN_NATIVE_WORKER_PACKAGE to be a pinned gs:// wheel"
+                )
+            if not isinstance(self.native_worker_wheelhouse, str) or not self.native_worker_wheelhouse.strip():
+                raise ValueError(
+                    "private-google-access eyvan-native Compute capacity requires EYVAN_NATIVE_WORKER_WHEELHOUSE "
+                    "with every worker dependency wheel"
+                )
+            if not self.native_worker_wheelhouse.startswith("gs://"):
+                raise ValueError("EYVAN_NATIVE_WORKER_WHEELHOUSE must be a gs:// zip archive")
+            wheelhouse = self.native_worker_wheelhouse
+
+        scopes = list(config["scopes"])
+        cloud_platform_scope = "https://www.googleapis.com/auth/cloud-platform"
+        if cloud_platform_scope not in scopes:
+            scopes.append(cloud_platform_scope)
+        config["scopes"] = scopes
+        self._ensure_native_worker_artifact_access(record, service_account)
+        worker_token = derive_native_worker_token(
+            self.native_worker_shared_secret,
+            management_uid,
+            provider_generation=record.provider_generation,
+        )
+        if worker_token is None:
+            raise ValueError("eyvan-native Compute capacity requires EYVAN_NATIVE_WORKER_ROOT_SECRET")
+        secret_resource = self.native_worker_secrets.ensure(
+            project=record.project,
+            management_uid=management_uid,
+            value=worker_token,
+            reader_service_account=service_account,
+        )
+        config["startup_script"] = build_native_worker_startup_script(
+            package=self.native_worker_package,
+            port=self.native_worker_port,
+            state_dir=self.native_worker_state_dir,
+            worker_secret_resource=secret_resource,
+            wheelhouse=wheelhouse,
+            before_start=before_start,
+            runtime_setup=runtime_setup,
+            runtime_env=runtime_env,
+            runtime_container=runtime_container,
+            container_artifact_mounts=container_artifact_mounts,
+        )
+        record.metadata["native_worker_port"] = self.native_worker_port
+        record.metadata["execution_backend"] = self.execution_backend
+        record.metadata["native_worker_secret_id"] = secret_resource.rsplit("/versions/", 1)[0]
+        return endpoint_mode
+
+    def _plan_recreate(self, record: FleetCellRecord, context: MutationContext) -> FleetCellRecord:
+        replacement = super()._plan_recreate(record, context)
+        if self.execution_backend != "eyvan-native":
+            return replacement
+        config = replacement.metadata.get("compute_config")
+        if not isinstance(config, dict):
+            raise ValueError("native worker recreation requires a persisted Compute provider configuration")
+        refreshed = normalize_compute_config(config)
+        setup_script = replacement.metadata.get("native_worker_setup_script")
+        if setup_script is not None and not isinstance(setup_script, str):
+            raise ValueError("native worker recreation has an invalid setup script")
+        runtime = _native_runtime_from_record(replacement)
+        endpoint_mode = self._configure_native_worker(
+            replacement,
+            refreshed,
+            before_start=setup_script,
+            runtime_setup=_native_runtime_setup(runtime),
+            runtime_env=runtime.env,
+            runtime_container=runtime.container,
+            container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+        )
+
+        def persist(current: FleetCellRecord) -> None:
+            if current.generation != context.generation or current.fencing_token != context.fencing_token:
+                raise StaleMutationError(f"cell {record.name!r} changed ownership before native worker recreation")
+            current.metadata["compute_config"] = refreshed
+            current.metadata["native_worker_port"] = self.native_worker_port
+            current.metadata["execution_backend"] = self.execution_backend
+            current.metadata["native_worker_secret_id"] = replacement.metadata["native_worker_secret_id"]
+            current.metadata["native_worker_bootstrap_generation"] = replacement.provider_generation
+            current.metadata.pop("native_worker_bootstrap_key", None)
+            _persist_native_worker_endpoint_mode(current, endpoint_mode)
+
+        return self._persist_owned_cell(
+            replacement.name,
+            context,
+            replacement,
+            phase="native worker recreation could be persisted",
+            cleanup_capacity=True,
+            mutate=persist,
+        )
+
+    def _release_auxiliary_resources(self, record: FleetCellRecord) -> None:
+        if self.execution_backend != "eyvan-native" or not record.project:
+            return
+        management_uid = record.metadata.get("management_uid")
+        if not isinstance(management_uid, str) or not management_uid:
+            raise ValueError("native worker cleanup requires an Eyvan management UID")
+        self.native_worker_secrets.delete(project=record.project, management_uid=management_uid)
+
+    @staticmethod
+    def _resource_id(cell_id: str, provider_generation: int) -> str:
+        return compute_instance_name(cell_id, provider_generation)
+
+
+class GcpCapacityDriver:
+    """Route a mixed GCP fleet to TPU or Compute capacity per desired cell."""
+
+    _MODE_ALIASES: tp.ClassVar[dict[str, str]] = {
+        "gcp": "auto",
+        "auto": "auto",
+        "gcp-tpu": "tpu",
+        "tpu": "tpu",
+        "gcp-compute": "compute",
+        "compute": "compute",
+    }
+
+    def __init__(
+        self,
+        state: FleetStateStore | None = None,
+        *,
+        tpu_provider: CapacityProvider | None = None,
+        compute_provider: CapacityProvider | None = None,
+        execution_backend: str | None = None,
+        native_worker_port: int | None = None,
+        native_worker_package: str | None = None,
+        native_worker_wheelhouse: str | None = None,
+        native_worker_state_dir: str | None = None,
+        native_worker_shared_secret: str | None = None,
+        native_worker_secrets: NativeWorkerSecretStore | None = None,
+        native_worker_service_account_resolver: ServiceAccountResolver | None = None,
+        native_worker_artifact_root_uri: str | None = None,
+        native_worker_artifact_access: NativeWorkerArtifactAccessStore | None = None,
+        native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
+        mode: str = "auto",
+    ) -> None:
+        settings = EyvanSettings.from_env()
+        self.state = state or FleetStateStore.from_uri(settings.fleet_state_uri)
+        normalized_mode = mode.strip().lower().replace("_", "-")
+        try:
+            self.mode = self._MODE_ALIASES[normalized_mode]
+        except KeyError:
+            choices = ", ".join(sorted(name for name in self._MODE_ALIASES if name.startswith("gcp")))
+            raise ValueError(f"unknown GCP capacity mode {mode!r}; available modes: {choices}") from None
+        selected_execution = execution_backend or settings.execution_backend
+        self.tpu = GcpTpuCapacityDriver(
+            self.state,
+            provider=tpu_provider,
+            execution_backend=selected_execution,
+            native_worker_port=native_worker_port,
+            native_worker_package=native_worker_package,
+            native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_state_dir=native_worker_state_dir,
+            native_worker_shared_secret=native_worker_shared_secret,
+            native_worker_secrets=native_worker_secrets,
+            native_worker_service_account_resolver=native_worker_service_account_resolver,
+            native_worker_artifact_root_uri=native_worker_artifact_root_uri,
+            native_worker_artifact_access=native_worker_artifact_access,
+            native_worker_public_ingress=native_worker_public_ingress,
+        )
+        self.compute = GcpComputeCapacityDriver(
+            self.state,
+            provider=compute_provider,
+            execution_backend=selected_execution,
+            native_worker_port=native_worker_port,
+            native_worker_package=native_worker_package,
+            native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_state_dir=native_worker_state_dir,
+            native_worker_shared_secret=native_worker_shared_secret,
+            native_worker_secrets=native_worker_secrets,
+            native_worker_service_account_resolver=native_worker_service_account_resolver,
+            native_worker_artifact_root_uri=native_worker_artifact_root_uri,
+            native_worker_artifact_access=native_worker_artifact_access,
+            native_worker_public_ingress=native_worker_public_ingress,
+        )
+        self.execution_backend = self.tpu.execution_backend
+
+    def capabilities(self) -> CellCapabilities:
+        if self.mode == "tpu":
+            return self.tpu.capabilities()
+        if self.mode == "compute":
+            return self.compute.capabilities()
+        return CellCapabilities(
+            provider="gcp",
+            executor=self.execution_backend,
+            accelerator_types=("cpu", "gpu", "tpu"),
+            capacity_classes=("spot", "on-demand", "reserved", "guaranteed"),
+            supports_callables=True,
+            max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
+            # Stated rather than defaulted: an operator turns this on for a fleet
+            # they are willing to have diagnostics run on.
+            supports_exec=False,
+            resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
+        )
+
+    @staticmethod
+    def _nested_options(desired: tp.Mapping[str, JsonValue]) -> JsonObject:
+        for key in ("provider_config", "provider_options"):
+            value = desired.get(key)
+            if is_json_object(value):
+                return value
+        return {}
+
+    def _desired_kind(self, desired: tp.Mapping[str, JsonValue]) -> str:
+        backend_value = desired.get("capacity_backend")
+        if backend_value is not None and not isinstance(backend_value, str):
+            raise ValueError("capacity field 'capacity_backend' must be a string when set")
+        requested_backend = (backend_value or "gcp").strip().lower().replace("_", "-")
+        if requested_backend in {"gcp-tpu", "tpu"}:
+            selected = "tpu"
+        elif requested_backend in {"gcp-compute", "compute"}:
+            selected = "compute"
+        elif requested_backend != "gcp":
+            raise ValueError(f"GCP driver cannot satisfy capacity backend {requested_backend!r}")
+        else:
+            kind_value = desired.get("capacity_kind") or desired.get("kind")
+            if kind_value is not None and not isinstance(kind_value, str):
+                raise ValueError("capacity field 'capacity_kind' must be a string when set")
+            requested_kind = (kind_value or "").strip().lower()
+            if requested_kind in {"cpu", "gpu", "compute"}:
+                selected = "compute"
+            elif requested_kind == "tpu":
+                selected = "tpu"
+            else:
+                options = self._nested_options(desired)
+                accelerator_value = desired.get("accelerator_type")
+                if accelerator_value is not None and not isinstance(accelerator_value, str):
+                    raise ValueError("capacity field 'accelerator_type' must be a string when set")
+                accelerator_type = (accelerator_value or "").lower()
+                compute_keys = (
+                    "machine_type",
+                    "gpu_type",
+                    "gpu_count",
+                    "tpu_type",
+                    "tpu_count",
+                    "image",
+                    "image_family",
+                )
+                selected = (
+                    "compute"
+                    if accelerator_type in {"cpu", "gpu"}
+                    or accelerator_type.startswith("nvidia-")
+                    or any(key in desired or key in options for key in compute_keys)
+                    else "tpu"
+                )
+        if self.mode != "auto" and selected != self.mode:
+            raise ValueError(f"gcp-{self.mode} agent cannot satisfy {selected!r} capacity")
+        return selected
+
+    def _record_kind(self, cell_id: str) -> str:
+        if self.mode != "auto":
+            return self.mode
+        record = self.state.get(cell_id)
+        if record is None:
+            return "tpu"
+        kind = record.metadata.get("capacity_kind")
+        if kind in {"tpu", "compute"}:
+            return str(kind)
+        if "compute_config" in record.metadata:
+            return "compute"
+        return "tpu"
+
+    def _driver(self, kind: str) -> GcpTpuCapacityDriver:
+        return self.compute if kind == "compute" else self.tpu
+
+    def observe(self, cell_id: str) -> CellObservation:
+        return self._driver(self._record_kind(cell_id)).observe(cell_id)
+
+    def reconcile(self, cell_id: str, context: MutationContext) -> CellObservation:
+        return self._driver(self._record_kind(cell_id)).reconcile(cell_id, context)
+
+    def apply_capacity(
+        self,
+        cell_id: str,
+        desired: tp.Mapping[str, JsonValue],
+        context: MutationContext,
+    ) -> CellObservation:
+        return self._driver(self._desired_kind(desired)).apply_capacity(cell_id, desired, context)
+
+    def drain(self, cell_id: str, context: MutationContext) -> CellObservation:
+        return self._driver(self._record_kind(cell_id)).drain(cell_id, context)
+
+    def release(self, cell_id: str, context: MutationContext) -> CellObservation:
+        return self._driver(self._record_kind(cell_id)).release(cell_id, context)
+
+
+__all__ = ("GcpCapacityDriver", "GcpComputeCapacityDriver", "GcpTpuCapacityDriver")

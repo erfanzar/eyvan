@@ -7,13 +7,13 @@
 
 from __future__ import annotations
 
-from eyvan.agent.service import CellAgentService
-from eyvan.client.endpoint import ControlPlaneEndpoint
+from eyvan.capacity.drivers.gcp import GcpCapacityDriver
+from eyvan.capacity.providers.gcp import GcloudNativeWorkerPublicIngress, GcsArtifactBucket
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
 from eyvan.config import EyvanSettings
-from eyvan.drivers.gcp import GcpCapacityDriver
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.providers.gcp import GcloudNativeWorkerPublicIngress, GcsArtifactBucket
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.worker.agent.service import CellAgentService
 
 
 def _profile(
@@ -114,7 +114,7 @@ def test_the_capabilities_probe_tolerates_an_agent_that_is_restarting() -> None:
 
     import httpx
 
-    from eyvan.providers.gcp.runtime.supervisor import HttpCellAgentCapabilitiesProbe
+    from eyvan.capacity.providers.gcp.runtime.supervisor import HttpCellAgentCapabilitiesProbe
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("[Errno 61] Connection refused", request=request)

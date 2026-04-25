@@ -13,13 +13,13 @@ from fastapi.testclient import TestClient
 from test_container_executor import FakeDockerSystemd  # reuse the stateful docker seam
 from test_systemd_transient import FakeSystemd  # reuse the stateful systemd seam
 
-from eyvan.drivers.base import MutationContext
-from eyvan.runtime.container import DockerContainerExecutor
-from eyvan.runtime.native_remote import NativeRemoteExecutor
-from eyvan.runtime.native_slice import NativeSliceExecutor
-from eyvan.runtime.native_worker import create_native_worker_app
-from eyvan.runtime.systemd_transient import SystemdTransientServiceExecutor
-from eyvan.service.models import NativeContainerConfig
+from eyvan.capacity.drivers.base import MutationContext
+from eyvan.server.service.models import NativeContainerConfig
+from eyvan.worker.runtime.container import DockerContainerExecutor
+from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.native_slice import NativeSliceExecutor
+from eyvan.worker.runtime.native_worker import create_native_worker_app
+from eyvan.worker.runtime.systemd_transient import SystemdTransientServiceExecutor
 
 
 def _context(key: str = "submit-1") -> MutationContext:
@@ -158,7 +158,7 @@ def test_slice_reports_every_rank_and_keeps_an_unreachable_one_in_place(tmp_path
 
 @pytest.mark.parametrize("raw", ("", "   ", "not-a-number"))
 def test_optional_int_never_invents_a_pid(raw: str) -> None:
-    from eyvan.runtime.systemd_transient import _optional_int
+    from eyvan.worker.runtime.systemd_transient import _optional_int
 
     assert _optional_int(raw) is None
 

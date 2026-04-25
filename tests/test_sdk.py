@@ -10,15 +10,13 @@ import json
 import httpx
 import pytest
 
-from eyvan.api.app import create_app
-from eyvan.api.schemas import WorkloadSubmitRequest
 from eyvan.artifacts import LocalArtifactStore
 from eyvan.config import EyvanSettings
-from eyvan.execution import CallableSubmission, TpuConfig
-from eyvan.runtime.callables import dump_callable
-from eyvan.runtime.results import dump_result
 from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
-from eyvan.service.models import (
+from eyvan.sdk.execution import CallableSubmission, TpuConfig
+from eyvan.server.api.app import create_app
+from eyvan.server.api.schemas import WorkloadSubmitRequest
+from eyvan.server.service.models import (
     CallableExecution,
     CapacityClass,
     CommandExecution,
@@ -26,6 +24,8 @@ from eyvan.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.worker.runtime.callables import dump_callable
+from eyvan.worker.runtime.results import dump_result
 
 
 def test_sync_sdk_runs_on_configured_node_type() -> None:

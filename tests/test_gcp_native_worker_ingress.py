@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from eyvan._json import JsonObject
-from eyvan.providers.gcp.native_worker_ingress import (
+from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.providers.gcp.native_worker_ingress import (
     FirewallNetworkReference,
     FirewallRuleConflictError,
     FirewallRuleSpec,

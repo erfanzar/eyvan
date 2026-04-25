@@ -15,7 +15,7 @@ import pytest
 import tomllib
 from alembic.script import ScriptDirectory
 
-import eyvan.migrate as migrate
+import eyvan.server.persistence.migrate as migrate
 
 EYVAN_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS_PATH = EYVAN_ROOT / "requirements-docker.txt"
@@ -80,7 +80,7 @@ def test_requirements_cover_every_mandatory_pyproject_dependency() -> None:
 
 def test_pyproject_registers_migrate_entrypoint() -> None:
     scripts = _pyproject()["project"]["scripts"]
-    assert scripts.get("eyvan-migrate") == "eyvan.migrate:main"
+    assert scripts.get("eyvan-migrate") == "eyvan.server.persistence.migrate:main"
 
 
 def test_alembic_config_points_at_packaged_migrations(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,18 +138,18 @@ def test_migration_job_uses_wheel_entrypoint() -> None:
 
 
 def test_lazy_create_app_reexport_matches_the_real_factory_signature() -> None:
-    """``eyvan.api.create_app`` must expose every parameter of the real factory.
+    """``eyvan.server.api.create_app`` must expose every parameter of the real factory.
 
-    The lazy re-export exists so ``import eyvan.api`` does not pull in FastAPI.
+    The lazy re-export exists so ``import eyvan.server.api`` does not pull in FastAPI.
     It re-declares the signature by hand, so any parameter added to
-    ``eyvan.api.app.create_app`` and not mirrored here becomes silently
+    ``eyvan.server.api.app.create_app`` and not mirrored here becomes silently
     unreachable through the public entry point.
     """
 
     import inspect
 
-    import eyvan.api as lazy_api
-    from eyvan.api.app import create_app as real_create_app
+    import eyvan.server.api as lazy_api
+    from eyvan.server.api.app import create_app as real_create_app
 
     lazy = inspect.signature(lazy_api.create_app)
     real = inspect.signature(real_create_app)

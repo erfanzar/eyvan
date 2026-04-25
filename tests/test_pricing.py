@@ -8,8 +8,8 @@ from decimal import Decimal
 
 import pytest
 
-from eyvan._compat import UTC
-from eyvan.pricing import PriceKey, PriceSample, PricingCatalog
+from eyvan._internal.compat import UTC
+from eyvan.domain.pricing import PriceKey, PriceSample, PricingCatalog
 
 
 def sample(key: PriceKey, price: str, *, age: int = 0) -> PriceSample:

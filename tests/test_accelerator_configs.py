@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.client.jobs import AcceleratorConfig, CpuConfig, GpuConfig, TpuConfig
-from eyvan.service.models import CapacityClass
+from eyvan.sdk.client.jobs import AcceleratorConfig, CpuConfig, GpuConfig, TpuConfig
+from eyvan.server.service.models import CapacityClass
 
 
 @pytest.mark.parametrize(
@@ -91,7 +91,7 @@ def test_retry_and_capacity_class_are_validated_identically(factory, kwargs) -> 
 def test_a_gpu_config_resolves_a_fleet_through_the_same_capacity_lookup() -> None:
     """The proof that GPU reuses the TPU path rather than forking it."""
 
-    from eyvan.execution import _resolve_fleet_from_tpu
+    from eyvan.sdk.execution import _resolve_fleet_from_tpu
 
     looked_up: list[tuple[str, CapacityClass]] = []
 
@@ -112,7 +112,7 @@ def test_a_gpu_config_resolves_a_fleet_through_the_same_capacity_lookup() -> Non
         project_id = "research"
         submitter = _Submitter()
 
-    import eyvan.execution as execution_module
+    import eyvan.sdk.execution as execution_module
 
     original = execution_module.EyvanCallableSubmitter
     execution_module.EyvanCallableSubmitter = _Submitter  # type: ignore[assignment]

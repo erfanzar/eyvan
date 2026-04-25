@@ -11,10 +11,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from eyvan._compat import StrEnum
-from eyvan.client_version import validate_minimum_client_version
-from eyvan.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan._internal.client_version import validate_minimum_client_version
+from eyvan._internal.compat import StrEnum
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.server.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
 
 
 def _csv(value: str) -> tuple[str, ...]:
@@ -42,7 +42,7 @@ class EyvanSettings:
     """Runtime settings shared by the API, scheduler, and cell agent."""
 
     database_url: str = "postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan"
-    # The in-memory backend is a loopback development default; eyvan.api.server_startup refuses to
+    # The in-memory backend is a loopback development default; eyvan.server.api.server_startup refuses to
     # start a network-bound server unless EYVAN_REPOSITORY_BACKEND=postgres is set explicitly.
     repository_backend: RepositoryBackend = RepositoryBackend.MEMORY
     local_state_path: Path = DEFAULT_LOCAL_CONTROL_PLANE_PATH
@@ -53,7 +53,7 @@ class EyvanSettings:
     oidc_audience: str = "eyvan"
     oidc_jwks_url: str | None = None
     dev_auth_enabled: bool = False
-    # Unset accepts every client. See eyvan.client_version for why the gate is one-sided.
+    # Unset accepts every client. See eyvan._internal.client_version for why the gate is one-sided.
     min_client_version: str | None = None
     trusted_callable_projects: tuple[str, ...] = ()
     artifact_store_uri: str = "~/.eyvan/managed-artifacts"

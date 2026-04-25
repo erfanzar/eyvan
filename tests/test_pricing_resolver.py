@@ -22,15 +22,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from eyvan.pricing import PriceKey
-from eyvan.service.models import (
+from eyvan.domain.pricing import PriceKey
+from eyvan.server.service.models import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,
     CellState,
     ResourceLimits,
 )
-from eyvan.service.pricing_resolver import (
+from eyvan.server.service.pricing_resolver import (
     accelerator_unit_price,
     audit_price_drift,
     catalog_from_pools,

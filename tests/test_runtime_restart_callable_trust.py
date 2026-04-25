@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.commands.runtime import (
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.commands.runtime import (
     LocalAgentState,
     RuntimeRestartResult,
     replacement_trusted_callable_projects,
 )
-from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
 
 
 def _result(projects: tuple[str, ...]) -> RuntimeRestartResult:

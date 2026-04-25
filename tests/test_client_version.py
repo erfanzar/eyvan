@@ -11,9 +11,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.api.app import create_app
-from eyvan.client.transport import AsyncApiTransport, SyncApiTransport
-from eyvan.client_version import (
+from eyvan._internal.client_version import (
     CLIENT_VERSION_HEADER,
     client_version,
     is_client_supported,
@@ -22,6 +20,8 @@ from eyvan.client_version import (
     validate_minimum_client_version,
 )
 from eyvan.config import EyvanSettings
+from eyvan.sdk.client.transport import AsyncApiTransport, SyncApiTransport
+from eyvan.server.api.app import create_app
 
 
 @pytest.mark.parametrize(

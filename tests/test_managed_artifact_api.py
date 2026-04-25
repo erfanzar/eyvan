@@ -12,12 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.api.app import create_app
 from eyvan.artifacts.managed import ArtifactAction, InvalidArtifactToken, callable_uri, result_uri
 from eyvan.config import EyvanSettings, RepositoryBackend
-from eyvan.persistence import InMemoryRepository
-from eyvan.runtime.results import dump_result
-from eyvan.service.models import CallableExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service.models import CallableExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
+from eyvan.worker.runtime.results import dump_result
 
 
 def _headers(*, org_id: str = "acme", project_id: str = "research") -> dict[str, str]:

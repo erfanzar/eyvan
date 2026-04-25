@@ -12,9 +12,9 @@ from datetime import datetime
 import httpx
 import pytest
 
-from eyvan._compat import UTC
-from eyvan._json import JsonObject
-from eyvan.providers.gcp.quota_usage import GcpQuotaUsageError, GcpTpuQuotaUsageDiscovery
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.providers.gcp.quota_usage import GcpQuotaUsageError, GcpTpuQuotaUsageDiscovery
 
 _METRIC = "tpu.googleapis.com/tpu-v5p-preemptible"
 

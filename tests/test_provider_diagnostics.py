@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.service.provider_diagnostics import safe_provider_diagnostic
+from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
 
 
 def test_safe_provider_diagnostic_extracts_gcloud_message_from_operation_transcript() -> None:

@@ -24,9 +24,9 @@ import typing as tp
 
 from click.testing import CliRunner
 
-import eyvan.cli as cli
-from eyvan.commands.state import CliSession
-from eyvan.contexts import DEFAULT_BASE_URL
+import eyvan.sdk.cli as cli
+from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.contexts import DEFAULT_BASE_URL
 
 RequestArguments = dict[str, tp.Any]
 

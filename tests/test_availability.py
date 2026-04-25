@@ -5,12 +5,12 @@
 
 from datetime import datetime, timedelta
 
-from eyvan._compat import UTC
-from eyvan.core import CapacityBelief, CapacityPoolKey, ProvisionOutcome
-from eyvan.core.availability import p95_latency
-from eyvan.service.models import CapacityBeliefState, CellRecord, CellState
-from eyvan.service.models import ResourceVector as ApiResourceVector
-from eyvan.service.scheduling import to_core_cell
+from eyvan._internal.compat import UTC
+from eyvan.domain import CapacityBelief, CapacityPoolKey, ProvisionOutcome
+from eyvan.domain.availability import p95_latency
+from eyvan.server.service.models import CapacityBeliefState, CellRecord, CellState
+from eyvan.server.service.models import ResourceVector as ApiResourceVector
+from eyvan.server.service.scheduling import to_core_cell
 
 
 def belief() -> CapacityBelief:

@@ -19,15 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from eyvan._json import JsonObject
-from eyvan.drivers.base import (
+from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.drivers.base import (
     CapacityStatus,
     CellObservation,
     ExecutionWorkloadStatus,
     MutationContext,
     StaleMutationError,
 )
-from eyvan.runtime import ConfiguredExecutionResolver, LocalProcessExecutor, local_process, local_worker
+from eyvan.worker.runtime import ConfiguredExecutionResolver, LocalProcessExecutor, local_process, local_worker
 
 
 def _context(*, key: str = "submit-1", generation: int = 1, token: str = "token-1") -> MutationContext:
@@ -84,13 +84,13 @@ def test_runtime_import_and_native_resolution_do_not_import_ray(tmp_path: Path) 
     code = "\n".join(
         (
             "import sys",
-            "from eyvan.drivers.base import CapacityStatus, CellObservation",
-            "from eyvan.runtime import ConfiguredExecutionResolver, LocalProcessExecutor",
-            "assert 'eyvan.runtime.ray_jobs' not in sys.modules",
+            "from eyvan.capacity.drivers.base import CapacityStatus, CellObservation",
+            "from eyvan.worker.runtime import ConfiguredExecutionResolver, LocalProcessExecutor",
+            "assert 'eyvan.worker.runtime.ray_jobs' not in sys.modules",
             f"resolver = ConfiguredExecutionResolver('native-local', state_dir={str(tmp_path)!r})",
             "driver = resolver.resolve('cell-a', CellObservation('cell-a', CapacityStatus.HEALTHY, 1))",
             "assert isinstance(driver, LocalProcessExecutor)",
-            "assert 'eyvan.runtime.ray_jobs' not in sys.modules",
+            "assert 'eyvan.worker.runtime.ray_jobs' not in sys.modules",
         )
     )
     subprocess.run((sys.executable, "-c", code), check=True)
@@ -108,14 +108,14 @@ def test_detached_local_worker_startup_does_not_import_the_control_plane() -> No
     code = "\n".join(
         (
             "import sys",
-            "import eyvan.runtime.local_worker",
+            "import eyvan.worker.runtime.local_worker",
             "forbidden = {",
-            "    'eyvan.api',",
-            "    'eyvan.drivers.gcp',",
-            "    'eyvan.persistence',",
-            "    'eyvan.runtime.native_worker',",
-            "    'eyvan.runtime.ray_jobs',",
-            "    'eyvan.runtime.systemd_transient',",
+            "    'eyvan.server.api',",
+            "    'eyvan.capacity.drivers.gcp',",
+            "    'eyvan.server.persistence',",
+            "    'eyvan.worker.runtime.native_worker',",
+            "    'eyvan.worker.runtime.ray_jobs',",
+            "    'eyvan.worker.runtime.systemd_transient',",
             "    'eyvan.sdk',",
             "}",
             "loaded = forbidden & set(sys.modules)",
@@ -145,9 +145,9 @@ def test_configured_resolver_caches_per_cell_and_lazily_constructs_ray(tmp_path:
         def health(self):
             return self.ready
 
-    fake_module = types.ModuleType("eyvan.runtime.ray_jobs")
+    fake_module = types.ModuleType("eyvan.worker.runtime.ray_jobs")
     fake_module.RayJobsExecutor = FakeRayJobsExecutor  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "eyvan.runtime.ray_jobs", fake_module)
+    monkeypatch.setitem(sys.modules, "eyvan.worker.runtime.ray_jobs", fake_module)
     ray = ConfiguredExecutionResolver("ray-jobs", state_dir=tmp_path, ray_jobs_port=9123)
     ray_observation = CellObservation(
         "cell-b",
@@ -175,9 +175,9 @@ def test_configured_resolver_formats_ipv6_fallback_and_rejects_non_ip_hosts(tmp_
         def __init__(self, dashboard_url: str):
             constructed.append(dashboard_url)
 
-    fake_module = types.ModuleType("eyvan.runtime.ray_jobs")
+    fake_module = types.ModuleType("eyvan.worker.runtime.ray_jobs")
     fake_module.__dict__["RayJobsExecutor"] = FakeRayJobsExecutor
-    monkeypatch.setitem(sys.modules, "eyvan.runtime.ray_jobs", fake_module)
+    monkeypatch.setitem(sys.modules, "eyvan.worker.runtime.ray_jobs", fake_module)
     resolver = ConfiguredExecutionResolver("ray-jobs", state_dir=tmp_path, ray_jobs_port=9123)
     ipv6 = CellObservation("cell-v6", CapacityStatus.HEALTHY, 1, metadata={"head_ip": "2001:0db8::1"})
 

@@ -16,10 +16,10 @@ import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from eyvan._json import JsonObject, model_json
-from eyvan.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
-from eyvan.persistence.sqlalchemy import CellRow, OutboxRow
-from eyvan.service.models import (
+from eyvan._internal.json_types import JsonObject, model_json
+from eyvan.server.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
+from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow
+from eyvan.server.service.models import (
     AuditEvent,
     BudgetRecord,
     CapacityPoolRecord,
@@ -130,7 +130,7 @@ def _quota_record(org_id: str, project_id: str | None, principal_id: str | None)
 
 
 def _migration_module():
-    return importlib.import_module("eyvan.persistence.migrations.versions.0004_query_indexes")
+    return importlib.import_module("eyvan.server.persistence.migrations.versions.0004_query_indexes")
 
 
 _EXPECTED_FILTER_COLUMNS: dict[str, tuple[tuple[str, int], ...]] = {
@@ -555,7 +555,7 @@ def test_the_orm_stamps_the_head_of_the_migration_chain() -> None:
 
     import pkgutil
 
-    import eyvan.persistence.migrations.versions as versions
+    import eyvan.server.persistence.migrations.versions as versions
 
     modules = [
         importlib.import_module(f"{versions.__name__}.{info.name}") for info in pkgutil.iter_modules(versions.__path__)

@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
-from eyvan._compat import StrEnum
+from eyvan._internal.compat import StrEnum
 
 _CALLABLE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

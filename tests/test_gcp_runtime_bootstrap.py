@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.providers.gcp.runtime.bootstrap import (
+from eyvan.capacity.providers.gcp.runtime.bootstrap import (
     GcpRuntimeBootstrap,
     GcpRuntimeBootstrapStep,
     GcpRuntimePreflightError,
     GcpRuntimeWheelBuildError,
     GcpRuntimeWheelStageError,
 )
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
 
 
 @dataclass

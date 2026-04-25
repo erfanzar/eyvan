@@ -22,8 +22,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from eyvan.runtime import _multihost_site
-from eyvan.runtime._multihost_site import initialize_worker_runtime as initialize_from_environment
+from eyvan.worker.runtime import _multihost_site
+from eyvan.worker.runtime._multihost_site import initialize_worker_runtime as initialize_from_environment
 
 
 class _FakeDistributed:

@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.local.daemon import (
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.server.local.daemon import (
     DEFAULT_LOCAL_MANAGED_ARTIFACTS_PATH,
     LocalDaemonCommand,
     LocalDaemonConfigurationError,
@@ -31,7 +31,7 @@ from eyvan.local.daemon import (
     SubprocessLocalDaemonLauncher,
     write_owner_only_record,
 )
-from eyvan.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
+from eyvan.server.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
 
 
 @dataclass
@@ -262,7 +262,7 @@ def test_supervisor_starts_literal_loopback_server_and_persists_owner_only_pid_r
     assert launcher.commands[0].argv == (
         sys.executable,
         "-m",
-        "eyvan.api.app",
+        "eyvan.server.api.app",
         "--host",
         "127.0.0.1",
         "--port",
@@ -316,7 +316,7 @@ def test_restart_replaces_a_verified_legacy_owned_daemon_with_the_runtime_profil
             (
                 sys.executable,
                 "-m",
-                "eyvan.api.app",
+                "eyvan.server.api.app",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -385,7 +385,7 @@ def test_restart_forces_an_owned_daemon_that_does_not_finish_gracefully(tmp_path
             (
                 sys.executable,
                 "-m",
-                "eyvan.api.app",
+                "eyvan.server.api.app",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -433,7 +433,7 @@ def test_stop_started_rolls_back_only_the_matching_profile_daemon(tmp_path: Path
             (
                 sys.executable,
                 "-m",
-                "eyvan.api.app",
+                "eyvan.server.api.app",
                 "--host",
                 "127.0.0.1",
                 "--port",

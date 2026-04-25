@@ -13,9 +13,9 @@ import typing as tp
 import httpx
 import pytest
 
-from eyvan._json import JsonObject, JsonValue, is_json_object
-from eyvan.drivers.base import ExecutionWorkloadStatus, MutationContext
-from eyvan.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
+from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
 
 
 def _context(*, key: str = "submit-1", generation: int = 1, token: str = "token-1") -> MutationContext:

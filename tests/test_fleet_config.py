@@ -11,9 +11,9 @@ import warnings
 import pytest
 from pydantic import ValidationError
 
-from eyvan._json import JsonObject, JsonValue, is_json_object
-from eyvan.api.schemas import FleetApplyRequest
-from eyvan.fleet_config import EyvanFleetConfig
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.server.api.schemas import FleetApplyRequest
 
 
 def _mixed_fleet() -> dict:

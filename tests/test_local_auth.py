@@ -14,11 +14,11 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from eyvan.api.auth import RequestAuthenticator
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.client.identity import resolve_control_plane_identity
 from eyvan.config import EyvanSettings
-from eyvan.local.auth import (
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.identity import resolve_control_plane_identity
+from eyvan.server.api.auth import RequestAuthenticator
+from eyvan.server.local.auth import (
     LOCAL_DEVELOPMENT_CREDENTIAL_HEADER,
     LocalDevelopmentCredential,
     LocalDevelopmentCredentialError,

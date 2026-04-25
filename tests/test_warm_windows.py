@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from eyvan.service.models import CapacityPoolRecord, ResourceLimits, WarmWindow
+from eyvan.server.service.models import CapacityPoolRecord, ResourceLimits, WarmWindow
 
 UTC = timezone.utc
 

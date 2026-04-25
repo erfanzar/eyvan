@@ -14,22 +14,22 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan._json import JsonObject, JsonValue, is_json_object
-from eyvan.agent.app import create_agent_app
-from eyvan.agent.client import CellAgentClient
-from eyvan.agent.models import (
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan.capacity.drivers.base import CapacityStatus, CellCapabilities, CellObservation, ExecutionWorkloadStatus
+from eyvan.config import EyvanSettings
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.worker.agent.app import create_agent_app
+from eyvan.worker.agent.client import CellAgentClient
+from eyvan.worker.agent.models import (
     GangWorkloadMember,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationModel,
     WorkloadRequest,
 )
-from eyvan.agent.service import CellAgentService, InvalidWorkloadRequestError
-from eyvan.config import EyvanSettings
-from eyvan.drivers.base import CapacityStatus, CellCapabilities, CellObservation, ExecutionWorkloadStatus
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.runtime.native_gang import NativeGangWorkloadResult
-from eyvan.runtime.registry import NativeGangCell
+from eyvan.worker.agent.service import CellAgentService, InvalidWorkloadRequestError
+from eyvan.worker.runtime.native_gang import NativeGangWorkloadResult
+from eyvan.worker.runtime.registry import NativeGangCell
 
 GangCallValue: tp.TypeAlias = JsonObject | str | None
 

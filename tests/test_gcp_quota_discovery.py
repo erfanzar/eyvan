@@ -12,10 +12,10 @@ from datetime import datetime
 
 import pytest
 
-from eyvan._compat import UTC
-from eyvan._json import JsonValue
-from eyvan.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
-from eyvan.providers.gcp.quota_usage import TpuQuotaUsage
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonValue
+from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
+from eyvan.capacity.providers.gcp.quota_usage import TpuQuotaUsage
 
 
 def _result(payload: JsonValue) -> subprocess.CompletedProcess[str]:

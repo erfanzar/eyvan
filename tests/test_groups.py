@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.controller import EyvanController
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.groups import GroupError, GroupRole, member_names, validate
-from eyvan.service.models import (
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.groups import GroupError, GroupRole, member_names, validate
+from eyvan.server.service.models import (
     CapacityClass,
     CellRecord,
     CellState,
@@ -41,7 +41,7 @@ from eyvan.service.models import (
     WorkloadDefinition,
     WorkloadState,
 )
-from eyvan.service.scheduling import CoreSchedulingService
+from eyvan.server.service.scheduling import CoreSchedulingService
 
 
 def _principal() -> Principal:

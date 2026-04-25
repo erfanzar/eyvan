@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from eyvan.artifacts.managed import result_uri as managed_result_uri
-from eyvan.runtime.callables import CallableArtifact
+from eyvan.worker.runtime.callables import CallableArtifact
 
 _RESULT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 

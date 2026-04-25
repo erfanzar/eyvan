@@ -12,13 +12,13 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.api.app import create_app
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.config import EyvanSettings
-from eyvan.drivers.base import CapacityProviderFailureCode
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     WORKER_COUNT_LABEL,
     AutoscaleBlockReason,
     CapacityClass,
@@ -40,7 +40,7 @@ from eyvan.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
-from eyvan.service.workload_progress import WorkloadProgressResolver
+from eyvan.server.service.workload_progress import WorkloadProgressResolver
 
 
 def _operator() -> Principal:

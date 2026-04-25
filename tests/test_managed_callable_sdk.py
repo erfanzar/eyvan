@@ -12,23 +12,21 @@ import httpx
 import pytest
 
 import eyvan
-import eyvan.client.identity as identity_module
-import eyvan.client.sync as sync_module
-import eyvan.client.transport as transport_module
-import eyvan.execution as execution_module
-from eyvan.agent.models import AgentCapabilities
+import eyvan.sdk.client.identity as identity_module
+import eyvan.sdk.client.sync as sync_module
+import eyvan.sdk.client.transport as transport_module
+import eyvan.sdk.execution as execution_module
+from eyvan._internal.client_version import CLIENT_VERSION_HEADER, client_version
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
-from eyvan.autoscale import AutoscaleConfigCache
-from eyvan.client.callables import EyvanCallableSubmitter
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.client.identity import ClientIdentity
-from eyvan.client_version import CLIENT_VERSION_HEADER, client_version
-from eyvan.contexts import EyvanContext, set_active_context
-from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
-from eyvan.providers.gcp.runtime.supervisor import GcpRuntimeResult, LocalAgentResult, LocalAgentState
-from eyvan.runtime.results import dump_result
-from eyvan.service.models import (
+from eyvan.capacity.autoscale import AutoscaleConfigCache
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.supervisor import GcpRuntimeResult, LocalAgentResult, LocalAgentState
+from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.contexts import EyvanContext, set_active_context
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.server.service.models import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityClass,
@@ -37,6 +35,8 @@ from eyvan.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.worker.agent.models import AgentCapabilities
+from eyvan.worker.runtime.results import dump_result
 
 
 @pytest.fixture(autouse=True)

@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from eyvan._json import JsonObject
+from eyvan._internal.json_types import JsonObject
 from eyvan.capacity import CapacityStatus
-from eyvan.persistence.fleet import (
+from eyvan.server.persistence.fleet import (
     ConflictError,
     FleetCellRecord,
     FleetLeaseBusyError,
@@ -364,7 +364,7 @@ def test_a_write_that_timed_out_without_landing_is_unavailable_not_a_conflict() 
     nothing about the cells the document describes.
     """
 
-    from eyvan.persistence.fleet import FleetStateUnavailableError
+    from eyvan.server.persistence.fleet import FleetStateUnavailableError
 
     class NeverLandsGcs:
         def __call__(self, args):
@@ -387,7 +387,7 @@ def test_a_write_that_timed_out_without_landing_is_unavailable_not_a_conflict() 
 def test_an_unreadable_store_does_not_claim_the_write_landed() -> None:
     """Guessing "it probably worked" would hand out a fence nobody holds."""
 
-    from eyvan.persistence.fleet import FleetStateUnavailableError
+    from eyvan.server.persistence.fleet import FleetStateUnavailableError
 
     class BlindGcs:
         def __call__(self, args):
@@ -417,7 +417,7 @@ def test_an_unreadable_body_is_not_an_empty_fleet() -> None:
     named it was plumbed through.
     """
 
-    from eyvan.persistence.fleet import FleetStateUnavailableError
+    from eyvan.server.persistence.fleet import FleetStateUnavailableError
 
     class ExistsButUnreadableGcs:
         def __call__(self, args):
@@ -435,7 +435,7 @@ def test_an_unreadable_body_is_not_an_empty_fleet() -> None:
 def test_a_body_that_reads_back_blank_is_refused() -> None:
     """A live object is never legitimately zero bytes; that is a truncated read."""
 
-    from eyvan.persistence.fleet import FleetStateUnavailableError
+    from eyvan.server.persistence.fleet import FleetStateUnavailableError
 
     class BlankBodyGcs:
         def __call__(self, args):
@@ -567,7 +567,7 @@ def test_a_transient_read_failure_is_retried_before_it_is_believed() -> None:
 def test_a_read_that_never_succeeds_still_refuses_to_invent_an_empty_fleet() -> None:
     """Retrying must not become guessing: exhausted attempts are still unknown."""
 
-    from eyvan.persistence.fleet import FleetStateUnavailableError
+    from eyvan.server.persistence.fleet import FleetStateUnavailableError
 
     class AlwaysFailingGcs:
         def __call__(self, args):

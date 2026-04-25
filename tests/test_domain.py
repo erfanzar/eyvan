@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from eyvan.core import (
+from eyvan.domain import (
     Budget,
     CapacityCell,
     CapacityClass,

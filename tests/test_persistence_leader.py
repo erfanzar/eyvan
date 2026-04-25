@@ -11,7 +11,7 @@ import typing as tp
 
 import pytest
 
-from eyvan.persistence.leader import PostgresAdvisoryLeader
+from eyvan.server.persistence.leader import PostgresAdvisoryLeader
 
 
 class FakeAsyncConnection:

@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.batch import BatchError, BatchRequest, expand
-from eyvan.service.control_plane import _capacity_apply_payload
-from eyvan.service.errors import ConflictError
-from eyvan.service.models import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.batch import BatchError, BatchRequest, expand
+from eyvan.server.service.control_plane import _capacity_apply_payload
+from eyvan.server.service.errors import ConflictError
+from eyvan.server.service.models import (
     CellRecord,
     CellState,
     CommandExecution,
@@ -162,7 +162,7 @@ def test_an_unreadable_cgroup_is_ambiguous_not_empty() -> None:
     be reported as a completed run.
     """
 
-    from eyvan.runtime.systemd_transient import _cgroup_has_processes, _cgroup_pids
+    from eyvan.worker.runtime.systemd_transient import _cgroup_has_processes, _cgroup_pids
 
     unreadable = "/system.slice/eyvan-does-not-exist.service"
 
@@ -181,7 +181,7 @@ def test_the_manual_driver_reads_hosts_from_the_payload_the_controller_sends() -
     through the controller regardless of how well it worked in isolation.
     """
 
-    from eyvan.drivers.manual import ManualCapacityDriver
+    from eyvan.capacity.drivers.manual import ManualCapacityDriver
 
     cell = CellRecord(
         id="cell-a",

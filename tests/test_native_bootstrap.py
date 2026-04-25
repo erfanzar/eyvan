@@ -15,11 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.drivers.base import CapacityStatus, CellObservation
-from eyvan.runtime import ConfiguredExecutionResolver, ExecutionRuntimeRegistry
-from eyvan.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
-from eyvan.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
-from eyvan.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.capacity.drivers.base import CapacityStatus, CellObservation
+from eyvan.server.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.worker.runtime import ConfiguredExecutionResolver, ExecutionRuntimeRegistry
+from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
+from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
 
 
 def test_compute_bootstrap_fetches_a_cell_scoped_token_from_secret_manager_and_runs_fleet_setup() -> None:
@@ -46,7 +46,7 @@ def test_compute_bootstrap_fetches_a_cell_scoped_token_from_secret_manager_and_r
     assert "eyvan-worker.whl" not in script
     assert "gcloud storage cp gs://artifacts/eyvan/wheelhouse.zip" in script
     assert "--no-index --find-links /var/lib/eyvan/bootstrap/wheels" in script
-    assert "eyvan.runtime.native_worker --host 0.0.0.0 --port 8123" in script
+    assert "eyvan.worker.runtime.native_worker --host 0.0.0.0 --port 8123" in script
     assert "--secret-file /run/eyvan-native/worker-secret" in script
     assert "--systemd-transient" in script
     assert "EYVAN_SYSTEMD_EXIT_TYPE_CGROUP" in script
@@ -69,9 +69,9 @@ def test_compute_bootstrap_fetches_a_cell_scoped_token_from_secret_manager_and_r
     assert "systemctl enable eyvan-native-worker.service" in script
     assert "systemctl restart eyvan-native-worker.service" in script
     assert "/opt/eyvan-native/multihost/sitecustomize.py" in script
-    assert "import eyvan.runtime._multihost_site as module" in script
+    assert "import eyvan.worker.runtime._multihost_site as module" in script
     assert "/opt/eyvan-native/multihost/eyvan_multihost.py" in script
-    assert "import eyvan.distributed_environment as module" in script
+    assert "import eyvan.worker.distributed_environment as module" in script
     assert "/opt/eyvan-native/multihost/eyvan_distributed_environment.py" in script
     # The generated sitecustomize delegates to one staged function rather than
     # re-implementing the scrub-then-initialize ordering inline. Ordering written
@@ -146,7 +146,7 @@ def test_compute_bootstrap_writes_the_declarative_runtime_environment_for_worklo
 
     assert "/etc/eyvan-native/workload-runtime.json" in script
     assert "--runtime-env-file /etc/eyvan-native/workload-runtime.json" in script
-    assert script.index("workload-runtime.json") < script.index("eyvan.runtime.native_worker --host 0.0.0.0")
+    assert script.index("workload-runtime.json") < script.index("eyvan.worker.runtime.native_worker --host 0.0.0.0")
 
 
 def test_compute_bootstrap_writes_a_typed_oci_runtime_for_the_native_worker() -> None:
@@ -176,7 +176,7 @@ def test_compute_bootstrap_writes_a_typed_oci_runtime_for_the_native_worker() ->
     }
     assert "--container-runtime-file /etc/eyvan-native/container-runtime.json" in script
     assert "docker version >/dev/null 2>&1" in script
-    assert script.index("container-runtime.json") < script.index("eyvan.runtime.native_worker --host 0.0.0.0")
+    assert script.index("container-runtime.json") < script.index("eyvan.worker.runtime.native_worker --host 0.0.0.0")
 
 
 def test_compute_bootstrap_rejects_container_artifacts_without_an_oci_runtime() -> None:
@@ -237,7 +237,7 @@ def test_native_resolver_derives_vm_endpoint_and_cell_token_without_importing_ra
         1,
         metadata={"head_ip": "10.20.0.7", "management_uid": "cell-uid", "provider_generation": 1},
     )
-    monkeypatch.delitem(sys.modules, "eyvan.runtime.ray_jobs", raising=False)
+    monkeypatch.delitem(sys.modules, "eyvan.worker.runtime.ray_jobs", raising=False)
     monkeypatch.delitem(sys.modules, "ray", raising=False)
 
     driver = resolver.resolve("cell-a", observation)
@@ -250,7 +250,7 @@ def test_native_resolver_derives_vm_endpoint_and_cell_token_without_importing_ra
             "token": derive_native_worker_token("agent-global-secret", "cell-uid", provider_generation=1),
         }
     ]
-    assert "eyvan.runtime.ray_jobs" not in sys.modules
+    assert "eyvan.worker.runtime.ray_jobs" not in sys.modules
     assert "ray" not in sys.modules
 
 
@@ -330,10 +330,10 @@ def test_native_worker_module_can_be_imported_without_ray() -> None:
     code = "\n".join(
         (
             "import sys",
-            "import eyvan.runtime.native_remote",
-            "import eyvan.runtime.native_worker",
+            "import eyvan.worker.runtime.native_remote",
+            "import eyvan.worker.runtime.native_worker",
             "assert 'ray' not in sys.modules",
-            "assert 'eyvan.runtime.ray_jobs' not in sys.modules",
+            "assert 'eyvan.worker.runtime.ray_jobs' not in sys.modules",
         )
     )
 
@@ -351,7 +351,7 @@ def test_a_rebuilt_wheel_replaces_the_installed_package() -> None:
     installs the package with ``pip install --upgrade <path>``, which
     short-circuits when that exact version is already present. The wheel *URI* is
     content-addressed; its filename and version are not. So a rebuilt wheel at an
-    unchanged version leaves the old ``eyvan.runtime._multihost_site`` staged as
+    unchanged version leaves the old ``eyvan.worker.runtime._multihost_site`` staged as
     ``eyvan_multihost.py`` underneath a freshly written sitecustomize that imports
     a symbol it does not have.
 

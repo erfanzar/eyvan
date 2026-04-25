@@ -9,15 +9,15 @@ import typing as tp
 
 import pytest
 
-from eyvan._json import JsonObject, is_json_object
-from eyvan.agent.service import CellAgentService
+from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan.capacity.drivers.base import CapacityStatus, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.gcp import GcpCapacityDriver, GcpComputeCapacityDriver, GcpTpuCapacityDriver
+from eyvan.capacity.providers.gcp import GcsArtifactBucket, ProviderObservation, compute_instance_name
+from eyvan.capacity.providers.gcp.queued_resources import GcloudError
 from eyvan.config import EyvanSettings
-from eyvan.drivers.base import CapacityStatus, MutationContext, StaleMutationError
-from eyvan.drivers.gcp import GcpCapacityDriver, GcpComputeCapacityDriver, GcpTpuCapacityDriver
-from eyvan.persistence.fleet import FleetCellRecord, FleetStateStore, LocalBackend
-from eyvan.providers.gcp import GcsArtifactBucket, ProviderObservation, compute_instance_name
-from eyvan.providers.gcp.queued_resources import GcloudError
-from eyvan.runtime.native_bootstrap import derive_native_worker_token
+from eyvan.server.persistence.fleet import FleetCellRecord, FleetStateStore, LocalBackend
+from eyvan.worker.agent.service import CellAgentService
+from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
 
 
 def metadata_object(record: FleetCellRecord, name: str) -> JsonObject:
@@ -251,7 +251,7 @@ def test_compute_native_worker_bootstrap_is_cell_scoped_and_uses_the_selected_wh
     assert record.metadata["native_worker_secret_id"] in script
     assert "gcloud storage cp gs://artifacts/eyvan/eyvan.whl /var/lib/eyvan/bootstrap/eyvan.whl" in script
     assert "/var/lib/eyvan/bootstrap/eyvan.whl" in script
-    assert "eyvan.runtime.native_worker --host 0.0.0.0 --port 8123" in script
+    assert "eyvan.worker.runtime.native_worker --host 0.0.0.0 --port 8123" in script
     assert secrets.ensured == [
         {
             "project": "project-a",

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.batch import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.batch import (
     BATCH_COUNT_ENV,
     BATCH_INDEX_ENV,
     BatchError,
@@ -19,8 +19,8 @@ from eyvan.service.batch import (
     child_idempotency_key,
     expand,
 )
-from eyvan.service.errors import ConflictError, InputError
-from eyvan.service.models import (
+from eyvan.server.service.errors import ConflictError, InputError
+from eyvan.server.service.models import (
     CommandExecution,
     Principal,
     ResourceGang,
@@ -207,7 +207,7 @@ async def test_the_parent_is_never_placed_so_a_batch_of_n_occupies_n_slices() ->
     it which shard it was.
     """
 
-    from eyvan.service.scheduling import CoreSchedulingService
+    from eyvan.server.service.scheduling import CoreSchedulingService
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
@@ -239,7 +239,7 @@ async def test_a_coordinator_settles_from_its_children(tmp_path) -> None:
     reports the array as still queued.
     """
 
-    from eyvan.controller import EyvanController
+    from eyvan.server.controller import EyvanController
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -276,7 +276,7 @@ async def test_a_coordinator_settles_from_its_children(tmp_path) -> None:
 async def test_one_failed_task_fails_the_array() -> None:
     """A partial array is not a result, so the aggregate is pessimistic."""
 
-    from eyvan.controller import EyvanController
+    from eyvan.server.controller import EyvanController
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -416,7 +416,7 @@ async def test_a_batch_parent_is_marked_a_coordinator_positively() -> None:
     of the flag would silently capture all of them.
     """
 
-    from eyvan.service.models import CoordinationKind
+    from eyvan.server.service.models import CoordinationKind
 
     service = ControlPlaneService(InMemoryRepository())
     parent, children = await service.submit_batch(
@@ -441,7 +441,7 @@ async def test_an_unschedulable_non_coordinator_is_never_settled_from_its_childr
     without ever running, from someone else's state.
     """
 
-    from eyvan.controller import EyvanController
+    from eyvan.server.controller import EyvanController
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -491,8 +491,8 @@ async def test_the_coordinator_scan_does_not_read_every_terminal_workload() -> N
         stored = await transaction.get_workload(children[0].id)
         await transaction.put_workload(stored.model_copy(update={"state": WorkloadState.SUCCEEDED}))
 
-    from eyvan.controller import EyvanController
-    from eyvan.persistence.memory import InMemoryRepository as _Repo
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository as _Repo
 
     requested_states: list[WorkloadState | None] = []
     original = type(repository).transaction

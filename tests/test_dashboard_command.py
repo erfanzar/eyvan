@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from click.testing import CliRunner
 
-from eyvan.cli import main
+from eyvan.sdk.cli import main
 
 
 def _env(output: str) -> dict[str, str]:

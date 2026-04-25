@@ -31,14 +31,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.api.app import create_app
 from eyvan.artifacts.managed import callable_uri, result_uri, workspace_uri
 from eyvan.config import EyvanSettings
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.service.errors import InputError, NotFoundError
-from eyvan.service.models import (
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import InputError, NotFoundError
+from eyvan.server.service.models import (
     ArtifactReferenceRecord,
     CallableExecution,
     CommandExecution,

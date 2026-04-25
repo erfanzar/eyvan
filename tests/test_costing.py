@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pytest
 
-from eyvan.core import costing
+from eyvan.domain import costing
 
 
 def test_repeated_addition_does_not_drift() -> None:

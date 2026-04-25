@@ -9,13 +9,12 @@ from datetime import timedelta
 
 import pytest
 
-from eyvan.agent.models import AgentObservation
-from eyvan.controller import EyvanController
-from eyvan.drivers.base import CapacityStatus
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.service.models import (
+from eyvan.capacity.drivers.base import CapacityStatus
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.models import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityPoolRecord,
@@ -30,7 +29,8 @@ from eyvan.service.models import (
     WorkerResourceScope,
     WorkloadDefinition,
 )
-from eyvan.service.scheduling import CoreSchedulingService
+from eyvan.server.service.scheduling import CoreSchedulingService
+from eyvan.worker.agent.models import AgentObservation
 
 
 def fleet_admin() -> Principal:

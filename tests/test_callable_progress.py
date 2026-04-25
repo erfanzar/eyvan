@@ -9,14 +9,13 @@ import httpx
 import pytest
 
 from eyvan.artifacts import LocalArtifactStore
-from eyvan.autoscale import AutoscaleConfigCache
-from eyvan.client.callables import EyvanCallableSubmitter
-from eyvan.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
-from eyvan.client.sync import EyvanClient
-from eyvan.client.transport import EyvanHTTPError
-from eyvan.drivers.base import CapacityProviderFailureCode
-from eyvan.runtime.callables import dump_callable
-from eyvan.service.models import (
+from eyvan.capacity.autoscale import AutoscaleConfigCache
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.sdk.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
+from eyvan.sdk.client.sync import EyvanClient
+from eyvan.sdk.client.transport import EyvanHTTPError
+from eyvan.server.service.models import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityClass,
@@ -34,6 +33,7 @@ from eyvan.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.worker.runtime.callables import dump_callable
 
 
 def _workload(
@@ -270,7 +270,7 @@ def test_callable_result_renders_scale_from_zero_and_provider_diagnostic_once(tm
             return httpx.Response(200, json=next(progress_updates).model_dump(mode="json"))
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
@@ -342,7 +342,7 @@ def test_callable_wait_caches_a_terminal_queue_denial_without_progress_polling(t
             raise AssertionError("a terminal queue-admission denial must not depend on progress polling")
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
@@ -407,7 +407,7 @@ def test_callable_result_preserves_queue_denial_when_local_cache_target_is_inval
             )
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     submitter = EyvanCallableSubmitter[None](
@@ -505,7 +505,7 @@ def test_callable_result_uses_the_durable_workload_fallback_when_progress_is_tem
             raise httpx.ConnectError("control plane restarted")
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     submitter = EyvanCallableSubmitter[None](client, store)
@@ -663,7 +663,7 @@ def test_callable_result_renders_nonterminal_states(
             return httpx.Response(200, json=next(progress_updates).model_dump(mode="json"))
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     submitter = EyvanCallableSubmitter[None](client, store)
@@ -719,7 +719,7 @@ def test_callable_progress_wait_short_circuits_progress_polling_on_a_terminal_ob
             raise AssertionError("a terminal workload observation must not poll the progress endpoint")
         raise AssertionError((request.method, request.url.path))
 
-    monkeypatch.setattr("eyvan.client.sync.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     submitter = EyvanCallableSubmitter[None](client, store)

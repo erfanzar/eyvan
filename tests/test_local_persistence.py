@@ -13,14 +13,14 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan._json import JsonObject, model_json
-from eyvan.api.app import create_app
-from eyvan.api.server_bind import ServerBindPolicy
+from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.artifacts.managed import ArtifactAction, result_uri
 from eyvan.config import EyvanSettings, RepositoryBackend
-from eyvan.persistence.local import LocalControlPlaneInUseError, LocalJsonRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan.server.api.app import create_app
+from eyvan.server.api.server_bind import ServerBindPolicy
+from eyvan.server.persistence.local import LocalControlPlaneInUseError, LocalJsonRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     CommandExecution,
     OutboxRecord,
     OutboxState,

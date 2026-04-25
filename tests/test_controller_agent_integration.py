@@ -10,17 +10,17 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.agent.app import create_agent_app
-from eyvan.agent.client import CellAgentClient
-from eyvan.agent.service import CellAgentService
+from eyvan.capacity.drivers.base import CapacityStatus, CellCapabilities, CellObservation
 from eyvan.config import EyvanSettings
-from eyvan.controller import EyvanController
-from eyvan.drivers.base import CapacityStatus, CellCapabilities, CellObservation
-from eyvan.persistence import InMemoryRepository
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import CellRecord, CellState, OutboxState, Principal, ResourceVector, Role, RoleGrant
-from eyvan.service.scheduling import CoreSchedulingService
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import CellRecord, CellState, OutboxState, Principal, ResourceVector, Role, RoleGrant
+from eyvan.server.service.scheduling import CoreSchedulingService
+from eyvan.worker.agent.app import create_agent_app
+from eyvan.worker.agent.client import CellAgentClient
+from eyvan.worker.agent.service import CellAgentService
 
 
 class _RecordingCapacity:

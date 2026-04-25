@@ -16,7 +16,7 @@ from types import ModuleType
 
 import pytest
 
-from eyvan.drivers.base import CapacityStatus, CellObservation, MutationContext
+from eyvan.capacity.drivers.base import CapacityStatus, CellObservation, MutationContext
 
 
 def _load_live_harness() -> ModuleType:

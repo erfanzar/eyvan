@@ -16,11 +16,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import eyvan.runtime.native_worker as native_worker
-from eyvan._json import JsonObject
-from eyvan.agent.models import MutationModel, WorkloadRequest
-from eyvan.agent.service import CellAgentService
-from eyvan.drivers.base import (
+import eyvan.worker.runtime.native_worker as native_worker
+from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.drivers.base import (
     CapacityStatus,
     CellCapabilities,
     CellObservation,
@@ -28,11 +26,13 @@ from eyvan.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.runtime.native_remote import NativeRemoteExecutor
-from eyvan.runtime.native_worker import create_native_worker_app
-from eyvan.runtime.systemd_transient import SystemdCommandResult, SystemdTransientServiceExecutor
-from eyvan.service.models import NativeContainerConfig
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.server.service.models import NativeContainerConfig
+from eyvan.worker.agent.models import MutationModel, WorkloadRequest
+from eyvan.worker.agent.service import CellAgentService
+from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.native_worker import create_native_worker_app
+from eyvan.worker.runtime.systemd_transient import SystemdCommandResult, SystemdTransientServiceExecutor
 
 
 def context(*, key: str = "submit-1", generation: int = 1, token: str = "token-1") -> MutationContext:
@@ -175,7 +175,7 @@ def test_native_worker_selects_systemd_transient_executor_only_when_requested(tm
 
 
 def test_native_worker_selects_the_typed_oci_executor(monkeypatch, tmp_path: Path) -> None:
-    import eyvan.runtime.container as container_runtime
+    import eyvan.worker.runtime.container as container_runtime
 
     created: list[dict] = []
 
@@ -472,7 +472,7 @@ def test_native_worker_main_warns_when_the_secret_file_cannot_be_removed(
 
     monkeypatch.setattr(Path, "unlink", guarded_unlink)
 
-    with caplog.at_level(logging.WARNING, logger="eyvan.runtime.native_worker"):
+    with caplog.at_level(logging.WARNING, logger="eyvan.worker.runtime.native_worker"):
         assert native_worker.main(("--secret-file", str(secret_path))) == 0
 
     assert created[0]["secret"] == "file-secret"

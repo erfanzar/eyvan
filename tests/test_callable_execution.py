@@ -15,8 +15,9 @@ import pytest
 
 import eyvan
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.execution import (
+from eyvan.sdk import EyvanCallableSubmitter
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.execution import (
     CallableSubmission,
     ExecutionContext,
     EyvanJob,
@@ -27,9 +28,14 @@ from eyvan.execution import (
     execute,
     init,
 )
-from eyvan.runtime.callables import CallableArtifact, dump_callable, load_callable
-from eyvan.sdk import EyvanCallableSubmitter
-from eyvan.service.models import CapacityClass, CommandExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
+from eyvan.server.service.models import (
+    CapacityClass,
+    CommandExecution,
+    WorkloadDefinition,
+    WorkloadRecord,
+    WorkloadState,
+)
+from eyvan.worker.runtime.callables import CallableArtifact, dump_callable, load_callable
 
 T = tp.TypeVar("T")
 
@@ -164,8 +170,8 @@ def test_init_rejects_caller_signing_keys_for_the_default_remote_submitter(
         del endpoint
         pytest.fail("a rejected signing key must not start the local control plane")
 
-    monkeypatch.setattr("eyvan.execution._context", None)
-    monkeypatch.setattr("eyvan.execution.ensure_loopback_control_plane", unexpected_daemon_start)
+    monkeypatch.setattr("eyvan.sdk.execution._context", None)
+    monkeypatch.setattr("eyvan.sdk.execution.ensure_loopback_control_plane", unexpected_daemon_start)
     environ = {
         "EYVAN_CONFIG_FILE": str(tmp_path / "no-context.json"),
         "EYVAN_FLEET": "research",
@@ -186,7 +192,7 @@ def test_init_allows_a_signing_key_for_an_explicit_custom_submitter(tmp_path, mo
     """Custom submitters own their transport and may implement their own signing protocol."""
 
     submitter = FakeSubmitter(result=None)
-    monkeypatch.setattr("eyvan.execution._context", None)
+    monkeypatch.setattr("eyvan.sdk.execution._context", None)
 
     context = init(
         artifact_store=LocalArtifactStore(tmp_path / "artifacts"),
@@ -207,9 +213,9 @@ def test_init_allows_a_signing_key_for_an_explicit_custom_submitter(tmp_path, mo
 def test_init_raises_a_runtime_error_when_the_default_client_is_unavailable(tmp_path, monkeypatch) -> None:
     """The default submitter path fails explicitly instead of tripping an assert."""
 
-    monkeypatch.setattr("eyvan.execution._context", None)
-    monkeypatch.setattr("eyvan.execution.ensure_loopback_control_plane", lambda _endpoint: None)
-    monkeypatch.setattr("eyvan.client.sync.EyvanClient", lambda **_kwargs: None)
+    monkeypatch.setattr("eyvan.sdk.execution._context", None)
+    monkeypatch.setattr("eyvan.sdk.execution.ensure_loopback_control_plane", lambda _endpoint: None)
+    monkeypatch.setattr("eyvan.sdk.client.sync.EyvanClient", lambda **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="requires the default SDK client"):
         init(
@@ -307,7 +313,7 @@ def test_multi_pod_is_serialized_and_forwarded_to_the_pool_submitter(tmp_path) -
 def test_decorator_uses_context_defaults_for_six_independent_pods(tmp_path, monkeypatch) -> None:
     store = LocalArtifactStore(tmp_path)
     submitter = FakeSubmitter(result=None)
-    monkeypatch.setattr("eyvan.execution._context", None)
+    monkeypatch.setattr("eyvan.sdk.execution._context", None)
     init(
         artifact_store=store,
         submitter=submitter,

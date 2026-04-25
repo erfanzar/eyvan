@@ -34,9 +34,9 @@ from pathlib import Path
 import pytest
 from test_container_executor import FakeDockerSystemd, _context, _executor, _record, _spec
 
-from eyvan.drivers.base import ExecutionWorkloadStatus
-from eyvan.runtime.container import DockerContainerExecutor
-from eyvan.runtime.systemd_transient import SystemdCommandResult
+from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+from eyvan.worker.runtime.container import DockerContainerExecutor
+from eyvan.worker.runtime.systemd_transient import SystemdCommandResult
 
 
 class SlowTeardownDocker(FakeDockerSystemd):
@@ -216,7 +216,7 @@ def test_the_executor_still_stops_a_container_that_exits_promptly(tmp_path: Path
 def test_a_malformed_settle_override_falls_back_to_the_default() -> None:
     """A bad env value must not disable the window or crash the stop path."""
 
-    from eyvan.runtime.container import _CONTAINER_STOP_SETTLE_S, _env_seconds
+    from eyvan.worker.runtime.container import _CONTAINER_STOP_SETTLE_S, _env_seconds
 
     assert _env_seconds("EYVAN_NONEXISTENT_SETTLE", _CONTAINER_STOP_SETTLE_S) == _CONTAINER_STOP_SETTLE_S
 
@@ -224,7 +224,7 @@ def test_a_malformed_settle_override_falls_back_to_the_default() -> None:
 def test_a_negative_settle_override_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """A negative window would make the poll loop meaningless."""
 
-    from eyvan.runtime.container import _env_seconds
+    from eyvan.worker.runtime.container import _env_seconds
 
     monkeypatch.setenv("EYVAN_CONTAINER_STOP_SETTLE_S", "-5")
 

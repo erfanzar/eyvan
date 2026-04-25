@@ -15,14 +15,14 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import eyvan.commands.workloads as workload_commands
-from eyvan._json import JsonObject, JsonValue
-from eyvan.autoscale import AutoscaleConfigCache
-from eyvan.client.identity import ClientIdentity
-from eyvan.commands.state import CliSession, ContextOverrides
-from eyvan.commands.workloads import workload
-from eyvan.contexts import EyvanContext, EyvanContextConfig, FileContextStore
-from eyvan.service.models import (
+import eyvan.sdk.commands.workloads as workload_commands
+from eyvan._internal.json_types import JsonObject, JsonValue
+from eyvan.capacity.autoscale import AutoscaleConfigCache
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.commands.workloads import workload
+from eyvan.sdk.contexts import EyvanContext, EyvanContextConfig, FileContextStore
+from eyvan.server.service.models import (
     AutoscaleBlockReason,
     CapacityClass,
     CommandExecution,

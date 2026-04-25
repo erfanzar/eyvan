@@ -12,10 +12,10 @@ import typing as tp
 import httpx
 import pytest
 
-from eyvan.client.identity import ClientIdentity
-from eyvan.commands.doctor import CheckStatus, DoctorCommandService, DoctorReport
-from eyvan.commands.state import CliSession, ContextOverrides
-from eyvan.contexts import EyvanContext, EyvanContextConfig
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.commands.doctor import CheckStatus, DoctorCommandService, DoctorReport
+from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.contexts import EyvanContext, EyvanContextConfig
 
 
 class _Store:
@@ -175,8 +175,8 @@ def test_a_control_plane_that_goes_away_mid_preflight_does_not_exit_zero() -> No
     declared everything fine.
     """
 
-    from eyvan.client.endpoint import ControlPlaneEndpoint
-    from eyvan.client.transport import EyvanUnavailableError
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.sdk.client.transport import EyvanUnavailableError
 
     def handler(path: str) -> tp.Any:
         if path.endswith("/health"):
@@ -354,7 +354,7 @@ def test_a_fleet_without_native_pools_needs_no_worker_route(monkeypatch) -> None
     network call is made to decide that.
     """
 
-    from eyvan.commands.doctor import DoctorCommandService
+    from eyvan.sdk.commands.doctor import DoctorCommandService
 
     def _never_called() -> str | None:
         raise AssertionError("a fleet with no native pools must not probe the network")
@@ -376,7 +376,7 @@ def test_an_unobservable_address_warns_rather_than_claiming_reachability(monkeyp
     would assert a route nobody checked.
     """
 
-    from eyvan.commands.doctor import DoctorCommandService
+    from eyvan.sdk.commands.doctor import DoctorCommandService
 
     monkeypatch.setattr(DoctorCommandService, "_observed_public_ipv4", staticmethod(lambda: None))
     session = _session(_pools_handler([{"id": "p", "executor": "eyvan-native", "enabled": True}]))
@@ -390,7 +390,7 @@ def test_an_unobservable_address_warns_rather_than_claiming_reachability(monkeyp
 def test_the_remedy_names_the_address_the_rule_must_allow(monkeypatch) -> None:
     """The whole point: an operator should not have to walk the chain by hand."""
 
-    from eyvan.commands.doctor import DoctorCommandService
+    from eyvan.sdk.commands.doctor import DoctorCommandService
 
     monkeypatch.setattr(DoctorCommandService, "_observed_public_ipv4", staticmethod(lambda: "203.0.113.7"))
     session = _session(_pools_handler([{"id": "p", "executor": "eyvan-native", "enabled": True}]))

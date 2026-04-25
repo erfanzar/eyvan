@@ -17,26 +17,26 @@ import pytest
 from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest
 
-import eyvan.api.app as app_module
-from eyvan.api.app import (
+import eyvan.server.api.app as app_module
+from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
+from eyvan.artifacts.managed import callable_uri
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.server.api.app import (
     UNMATCHED_ROUTE_LABEL,
     create_app,
     create_local_daemon_app,
     create_loopback_app,
     create_network_app,
 )
-from eyvan.api.server_bind import LOOPBACK_APP_FACTORY, NETWORK_APP_FACTORY, ServerBindPolicy, ServerExposure
-from eyvan.api.server_logging import ServerLogLevel, server_log_config
-from eyvan.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
-from eyvan.artifacts.managed import callable_uri
-from eyvan.config import EyvanSettings, RepositoryBackend
-from eyvan.controller import EyvanController
-from eyvan.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredentialStore
-from eyvan.persistence import InMemoryRepository
-from eyvan.platform import EyvanPlatformConfig, load_platform_config
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
+from eyvan.server.api.server_bind import LOOPBACK_APP_FACTORY, NETWORK_APP_FACTORY, ServerBindPolicy, ServerExposure
+from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
+from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
+from eyvan.server.controller import EyvanController
+from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredentialStore
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
 
 
 def _headers(role: str = "operator", *, project: str = "research") -> dict[str, str]:
@@ -904,15 +904,15 @@ import logging
 
 import uvicorn
 
-from eyvan.api.server_logging import ServerLogLevel, server_log_config
+from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 
 uvicorn.Config(
-    "eyvan.api.app:create_loopback_app",
+    "eyvan.server.api.app:create_loopback_app",
     factory=True,
     log_config=server_log_config(ServerLogLevel.INFO),
     log_level=ServerLogLevel.INFO.value,
 )
-logger = logging.getLogger("eyvan.controller")
+logger = logging.getLogger("eyvan.server.controller")
 logger.debug("hidden lifecycle debug")
 logger.info("visible lifecycle info")
 """

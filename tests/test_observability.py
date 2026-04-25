@@ -12,7 +12,7 @@ import sys
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
-from eyvan.observability import EyvanMetrics, trace_span
+from eyvan._internal.observability import EyvanMetrics, trace_span
 
 DECLARED_LABELS = {
     "eyvan_api_requests": {"operation", "result"},

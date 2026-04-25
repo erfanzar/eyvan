@@ -141,7 +141,7 @@ def test_from_env_reads_every_native_worker_setting_the_gcp_factory_consumes(
     its native workers, and no firewall tag for public ingress.
     """
 
-    from eyvan.drivers import registry as capacity_registry
+    from eyvan.capacity.drivers import registry as capacity_registry
 
     monkeypatch.setenv("EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI", "gs://eyvan-artifacts/native")
     monkeypatch.setenv("EYVAN_NATIVE_WORKER_PUBLIC_INGRESS_TAG", "eyvan-native-worker")

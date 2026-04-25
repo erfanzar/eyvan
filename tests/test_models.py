@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from eyvan._json import JsonObject, JsonValue, is_json_value
-from eyvan.api.schemas import BudgetPutRequest, QuotaPutRequest
-from eyvan.core import InfeasibilityCode
-from eyvan.service.models import (
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_value
+from eyvan.domain import InfeasibilityCode
+from eyvan.server.api.schemas import BudgetPutRequest, QuotaPutRequest
+from eyvan.server.service.models import (
     WORKER_COUNT_LABEL,
     BudgetRecord,
     CapacityPoolRecord,
@@ -36,7 +36,7 @@ from eyvan.service.models import (
     WorkloadState,
     utcnow,
 )
-from eyvan.service.scheduling import CoreSchedulingService, to_core_quota
+from eyvan.server.service.scheduling import CoreSchedulingService, to_core_quota
 
 
 def _legacy_multislice_cell(node_count: JsonValue = 2) -> JsonObject:

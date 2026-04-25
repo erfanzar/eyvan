@@ -24,14 +24,13 @@ import typing as tp
 
 import pytest
 
-from eyvan._json import JsonObject
+from eyvan._internal.json_types import JsonObject
 from eyvan.capacity import CapacityStatus
-from eyvan.drivers.base import CapacityProviderError, MutationContext, StaleMutationError
-from eyvan.drivers.kubernetes import MAX_WORKERS, KubernetesCapacityDriver
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.providers.kubernetes.api import JobStatus, capacity_state, interpret_job
-from eyvan.providers.kubernetes.kueue import foreign_workloads, inspect_cluster_queue
-from eyvan.providers.kubernetes.workers import (
+from eyvan.capacity.drivers.base import CapacityProviderError, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.kubernetes import MAX_WORKERS, KubernetesCapacityDriver
+from eyvan.capacity.providers.kubernetes.api import JobStatus, capacity_state, interpret_job
+from eyvan.capacity.providers.kubernetes.kueue import foreign_workloads, inspect_cluster_queue
+from eyvan.capacity.providers.kubernetes.workers import (
     CELL_LABEL,
     FENCE_ANNOTATION,
     GENERATION_LABEL,
@@ -43,6 +42,7 @@ from eyvan.providers.kubernetes.workers import (
     secret_manifest,
     worker_endpoints,
 )
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 
 _TOKEN = "fencing-token-abcdef"
 
@@ -552,7 +552,7 @@ def test_the_k8s_alias_is_accepted_as_the_same_backend(tmp_path) -> None:
 def test_a_provider_error_carries_its_retryability() -> None:
     """An unreachable API server is the ordinary state of a cluster during upgrade."""
 
-    from eyvan.drivers.base import CapacityProviderFailureCode
+    from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 
     unavailable = CapacityProviderError("down", code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE)
     misconfigured = CapacityProviderError("no namespace", code=CapacityProviderFailureCode.CONFIGURATION)

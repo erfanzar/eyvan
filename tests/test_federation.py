@@ -27,10 +27,10 @@ from datetime import timedelta
 
 import pytest
 
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.errors import InputError, NotFoundError
-from eyvan.service.federation import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import InputError, NotFoundError
+from eyvan.server.service.federation import (
     BudgetGrantRecord,
     GrantState,
     PlanePeerRecord,
@@ -38,7 +38,7 @@ from eyvan.service.federation import (
     issuable_amount,
     outstanding_total,
 )
-from eyvan.service.models import BudgetRecord, Principal, Role, RoleGrant, utcnow
+from eyvan.server.service.models import BudgetRecord, Principal, Role, RoleGrant, utcnow
 
 _HOME = "us-east5"
 _PEER = "europe-west4"

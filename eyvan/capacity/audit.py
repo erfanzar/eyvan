@@ -11,9 +11,9 @@ import json
 import logging
 from dataclasses import dataclass
 
-from eyvan._compat import StrEnum
+from eyvan._internal.compat import StrEnum
 from eyvan.capacity import DEFINITIVE_CAPACITY_LOSS_STATUSES, CapacityStatus
-from eyvan.service.models import CellRecord, CellState
+from eyvan.server.service.models import CellRecord, CellState
 
 
 class CapacityLifecycleEvent(StrEnum):

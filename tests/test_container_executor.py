@@ -12,14 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.drivers.base import ExecutionWorkloadStatus, MutationContext
-from eyvan.runtime.container import DockerContainerExecutor, docker_container_name
-from eyvan.runtime.oci_callable_stager import (
+from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
+from eyvan.server.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.worker.runtime.container import DockerContainerExecutor, docker_container_name
+from eyvan.worker.runtime.oci_callable_stager import (
     OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY,
     OCI_CALLABLE_RUNNER_FILENAME,
 )
-from eyvan.runtime.systemd_transient import SystemdCommandResult
-from eyvan.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.worker.runtime.systemd_transient import SystemdCommandResult
 
 
 def _context(*, key: str = "submit-1", generation: int = 1, token: str = "token-1") -> MutationContext:
@@ -298,7 +298,7 @@ def test_container_rewrites_a_controller_callable_to_the_staged_oci_runner(tmp_p
     daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
     executor = _executor(tmp_path, daemon)
     original_entrypoint = (
-        "python -m eyvan.runtime.callable_worker --uri gs://test-bucket/callables/invocation.pkl "
+        "python -m eyvan.worker.runtime.callable_worker --uri gs://test-bucket/callables/invocation.pkl "
         f"--sha256 {'a' * 64} --python 3.13 --format-version 1 --result-uri gs://test-bucket/results/invocation.bin"
     )
 
@@ -311,7 +311,7 @@ def test_container_rewrites_a_controller_callable_to_the_staged_oci_runner(tmp_p
         "python",
         f"{OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY}/{OCI_CALLABLE_RUNNER_FILENAME}",
     ]
-    assert "eyvan.runtime.callable_worker" not in parts
+    assert "eyvan.worker.runtime.callable_worker" not in parts
     assert parts[2:] == shlex.split(original_entrypoint)[3:]
 
 
@@ -337,7 +337,7 @@ def test_container_rewrites_noncanonical_callable_quoting_to_the_oci_runner(tmp_
     # Extra whitespace, a quoted interpreter path, and a quoted argument value
     # that contains shell-like characters must still match the single command.
     original_entrypoint = (
-        "'/opt/eyvan-native/venv/bin/python'  -m   eyvan.runtime.callable_worker "
+        "'/opt/eyvan-native/venv/bin/python'  -m   eyvan.worker.runtime.callable_worker "
         "--uri 'gs://test-bucket/callables/a>b.pkl' "
         f"--sha256 {'a' * 64} --python 3.13"
     )
@@ -350,17 +350,17 @@ def test_container_rewrites_noncanonical_callable_quoting_to_the_oci_runner(tmp_
     interpreter = "/opt/eyvan-native/venv/bin/python"
     runner_path = f"{OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY}/{OCI_CALLABLE_RUNNER_FILENAME}"
     assert parts[:2] == [interpreter, runner_path]
-    assert "eyvan.runtime.callable_worker" not in parts
+    assert "eyvan.worker.runtime.callable_worker" not in parts
     assert parts[2:] == shlex.split(original_entrypoint)[3:]
 
 
 @pytest.mark.parametrize(
     "original_entrypoint",
     [
-        "python -m eyvan.runtime.callable_worker --help && echo complete",
-        "python -m eyvan.runtime.callable_worker --help | tee log",
-        "python -m eyvan.runtime.callable_worker --help > out.txt",
-        "python -m eyvan.runtime.callable_worker --help 2> err.txt; echo done",
+        "python -m eyvan.worker.runtime.callable_worker --help && echo complete",
+        "python -m eyvan.worker.runtime.callable_worker --help | tee log",
+        "python -m eyvan.worker.runtime.callable_worker --help > out.txt",
+        "python -m eyvan.worker.runtime.callable_worker --help 2> err.txt; echo done",
     ],
 )
 def test_container_preserves_shell_composed_callable_entrypoints(tmp_path: Path, original_entrypoint: str) -> None:

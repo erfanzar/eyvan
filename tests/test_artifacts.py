@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
-from eyvan.runtime.callables import dump_callable
+from eyvan.worker.runtime.callables import dump_callable
 
 
 def _add(left: int, right: int = 1) -> int:

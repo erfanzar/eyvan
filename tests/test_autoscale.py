@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-import eyvan.autoscale.cache as autoscale_cache
-from eyvan._compat import UTC
-from eyvan._json import JsonObject, JsonValue
-from eyvan.autoscale import (
+import eyvan.capacity.autoscale.cache as autoscale_cache
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonObject, JsonValue
+from eyvan.capacity.autoscale import (
     DEFAULT_TPU_PROFILES,
     AutoscaleConfigCache,
     AutoscaleDefaults,
@@ -33,8 +33,8 @@ from eyvan.autoscale import (
     select_profiles,
     tpu_profile_from_accelerator_type,
 )
-from eyvan.fleet_config import EyvanFleetConfig
-from eyvan.service.models import CapacityClass
+from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.server.service.models import CapacityClass
 
 
 def _json_object(value: JsonValue) -> JsonObject:

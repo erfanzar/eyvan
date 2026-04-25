@@ -15,8 +15,8 @@ on-demand capacity is still protected.
 
 from __future__ import annotations
 
-from eyvan.core.domain import InfeasibilityCode
-from eyvan.service.models import (
+from eyvan.domain.models import InfeasibilityCode
+from eyvan.server.service.models import (
     CapacityClass,
     CellRecord,
     CellState,
@@ -27,7 +27,7 @@ from eyvan.service.models import (
     WorkloadDefinition,
     WorkloadRecord,
 )
-from eyvan.service.scheduling import CoreSchedulingService, _checkpoint
+from eyvan.server.service.scheduling import CoreSchedulingService, _checkpoint
 
 
 def _spec(
@@ -87,7 +87,7 @@ def test_a_higher_priority_workload_reclaims_non_checkpointable_spot_capacity() 
 
     from datetime import timedelta
 
-    from eyvan.service.models import LeaseRecord, ResourceHours, WorkloadState, utcnow
+    from eyvan.server.service.models import LeaseRecord, ResourceHours, WorkloadState, utcnow
 
     victim_spec = _spec(capacity_class=CapacityClass.SPOT, band=PriorityBand.BATCH)
     victim = _record("wl-victim", victim_spec, WorkloadState.RUNNING)

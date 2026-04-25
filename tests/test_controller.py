@@ -14,10 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from eyvan._compat import UTC
-from eyvan._json import JsonObject, is_json_object
-from eyvan.agent.client import CellAgentBusyError, CellAgentClient, CellAgentStaleMutationError
-from eyvan.agent.models import AgentObservation, CapacityRequest, WorkloadMutationRequest, WorkloadObservation
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.artifacts.managed import (
     ArtifactAction,
     ArtifactTokenSigner,
@@ -26,15 +24,15 @@ from eyvan.artifacts.managed import (
     result_uri,
 )
 from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, CapacityStatus, ExecutionWorkloadStatus
 from eyvan.config import EyvanSettings
-from eyvan.controller import EyvanController, LeaderPhase, StaleOutboxCommand
-from eyvan.core import InfeasibilityCode
-from eyvan.drivers.base import CapacityProviderFailureCode, CapacityStatus, ExecutionWorkloadStatus
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.service.errors import ConflictError
-from eyvan.service.models import (
+from eyvan.domain import InfeasibilityCode
+from eyvan.server.controller import EyvanController, LeaderPhase, StaleOutboxCommand
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import ConflictError
+from eyvan.server.service.models import (
     AutoscaleBlockReason,
     BudgetRecord,
     CallableExecution,
@@ -58,7 +56,9 @@ from eyvan.service.models import (
     WorkloadState,
     utcnow,
 )
-from eyvan.service.scheduling import CoreSchedulingService
+from eyvan.server.service.scheduling import CoreSchedulingService
+from eyvan.worker.agent.client import CellAgentBusyError, CellAgentClient, CellAgentStaleMutationError
+from eyvan.worker.agent.models import AgentObservation, CapacityRequest, WorkloadMutationRequest, WorkloadObservation
 
 
 def principal(role: Role) -> Principal:
@@ -918,7 +918,7 @@ async def test_capacity_apply_persists_requesting_while_agent_call_is_in_flight(
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
     agent = BlockingProvisioningAgent()
     controller = EyvanController(repository, service, agent_factory=lambda _cell: agent)
-    caplog.set_level(logging.INFO, logger="eyvan.controller")
+    caplog.set_level(logging.INFO, logger="eyvan.server.controller")
     await service.upsert_cell(
         principal(Role.FLEET_ADMIN),
         CellRecord(

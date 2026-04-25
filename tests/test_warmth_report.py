@@ -23,10 +23,10 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from eyvan._compat import UTC
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan._internal.compat import UTC
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,

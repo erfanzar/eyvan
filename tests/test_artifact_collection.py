@@ -40,12 +40,12 @@ from eyvan.artifacts.managed import (
     parse_managed_uri,
     workspace_uri,
 )
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.service.control_plane import DEFAULT_ARTIFACT_GRACE_PERIOD_S
-from eyvan.service.errors import InputError
-from eyvan.service.models import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.control_plane import DEFAULT_ARTIFACT_GRACE_PERIOD_S
+from eyvan.server.service.errors import InputError
+from eyvan.server.service.models import (
     CallableExecution,
     Principal,
     ResourceGang,

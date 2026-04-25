@@ -11,10 +11,10 @@ from datetime import timedelta
 import pytest
 
 from eyvan.artifacts.managed import result_uri
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.service.errors import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import (
     AuthorizationError,
     ConflictError,
     InputError,
@@ -22,7 +22,7 @@ from eyvan.service.errors import (
     NotFoundError,
     ServiceErrorCode,
 )
-from eyvan.service.models import (
+from eyvan.server.service.models import (
     WORKER_COUNT_LABEL,
     AutoscaleBlockReason,
     CallableExecution,
@@ -47,7 +47,7 @@ from eyvan.service.models import (
     WorkloadState,
     utcnow,
 )
-from eyvan.service.scheduling import CoreSchedulingService, to_core_cell
+from eyvan.server.service.scheduling import CoreSchedulingService, to_core_cell
 
 
 def _principal(role: Role, *, subject: str = "alice", project: str = "research") -> Principal:

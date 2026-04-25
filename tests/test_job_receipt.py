@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 
-from eyvan.job_receipt import JobLifecycleState, JobLifecycleUpdate, JobSubmissionReceipt, JobTerminalOutput
+from eyvan.sdk.job_receipt import JobLifecycleState, JobLifecycleUpdate, JobSubmissionReceipt, JobTerminalOutput
 
 
 def test_terminal_receipt_uses_a_compact_colored_panel_and_lifecycle_labels() -> None:

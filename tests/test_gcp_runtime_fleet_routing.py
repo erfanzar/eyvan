@@ -11,22 +11,22 @@ import typing as tp
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from eyvan._json import JsonObject, JsonValue
-from eyvan.agent.models import AgentCapabilities
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.client.identity import ClientIdentity
-from eyvan.commands.fleets import FleetCommandService
-from eyvan.commands.state import CliSession, ContextOverrides
-from eyvan.contexts import EyvanContextConfig, FileContextStore
-from eyvan.fleet_config import EyvanFleetConfig
-from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
-from eyvan.providers.gcp.runtime.supervisor import (
+from eyvan._internal.json_types import JsonObject, JsonValue
+from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.capacity.providers.gcp.runtime.supervisor import (
     GcpRuntimeResult,
     LocalAgentResult,
     LocalAgentState,
     requires_native_gcp_runtime,
 )
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.commands.fleets import FleetCommandService
+from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.contexts import EyvanContextConfig, FileContextStore
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.worker.agent.models import AgentCapabilities
 
 
 def _config(*, agent_endpoint: str | None = None) -> EyvanFleetConfig:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.providers.gcp.tpu_types import accelerator_generation, parse_tpu_accelerator_type
+from eyvan.capacity.providers.gcp.tpu_types import accelerator_generation, parse_tpu_accelerator_type
 
 
 def test_parser_returns_generation_and_public_slice_size_for_valid_types() -> None:
@@ -28,7 +28,7 @@ def test_parser_rejects_noncanonical_and_incomplete_accelerator_types() -> None:
 
 
 def _qr(raw: dict):
-    from eyvan.providers.gcp.queued_resources import GcpQueuedResourceState, QueuedResource
+    from eyvan.capacity.providers.gcp.queued_resources import GcpQueuedResourceState, QueuedResource
 
     return QueuedResource(
         qr_id=raw.get("name", "qr-1"),
@@ -40,7 +40,7 @@ def _qr(raw: dict):
 
 
 def _spec_labels(uid: str = "uid-1", cell: str = "cell-a"):
-    from eyvan.providers.gcp.queued_resources import QueuedResourceSpec
+    from eyvan.capacity.providers.gcp.queued_resources import QueuedResourceSpec
 
     return QueuedResourceSpec(
         name="cell-a",
@@ -67,7 +67,7 @@ def test_an_unlabelled_active_queued_resource_is_not_declared_foreign() -> None:
     authority.
     """
 
-    from eyvan.providers.gcp.queued_resources import GcloudTpuProvider
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
 
     bare = _qr({"name": "qr-1", "tpu": {"nodeSpec": [{"node": {"acceleratorType": "v5p-16"}}]}})
 
@@ -77,7 +77,7 @@ def test_an_unlabelled_active_queued_resource_is_not_declared_foreign() -> None:
 def test_an_unlabelled_queued_resource_we_never_recorded_is_still_refused() -> None:
     """The fallback is our own record, not "assume everything is ours"."""
 
-    from eyvan.providers.gcp.queued_resources import GcloudError, GcloudTpuProvider
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudError, GcloudTpuProvider
 
     bare = _qr({"name": "qr-1", "tpu": {"nodeSpec": [{"node": {}}]}})
 
@@ -88,7 +88,7 @@ def test_an_unlabelled_queued_resource_we_never_recorded_is_still_refused() -> N
 def test_a_labelled_foreign_queued_resource_is_still_refused() -> None:
     """When the provider does answer, its answer stays authoritative."""
 
-    from eyvan.providers.gcp.queued_resources import GcloudError, GcloudTpuProvider
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudError, GcloudTpuProvider
 
     foreign = _qr({"name": "qr-1", "labels": {"eyvan-uid": "someone-else", "eyvan-cell": "other"}})
 
@@ -99,7 +99,7 @@ def test_a_labelled_foreign_queued_resource_is_still_refused() -> None:
 def test_a_labelled_matching_queued_resource_is_accepted() -> None:
     """The path that already worked must keep working."""
 
-    from eyvan.providers.gcp.queued_resources import GcloudTpuProvider
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
 
     ours = _qr({"name": "qr-1", "labels": {"eyvan-uid": "uid-1", "eyvan-cell": "cell-a"}})
 
@@ -120,7 +120,7 @@ def test_an_active_queued_resource_can_still_be_released(monkeypatch) -> None:
 
     import subprocess
 
-    from eyvan.providers.gcp import queued_resources as module
+    from eyvan.capacity.providers.gcp import queued_resources as module
 
     provider = module.GcloudTpuProvider()
     bare = _qr({"name": "qr-1", "tpu": {"nodeSpec": [{"node": {"acceleratorType": "v5p-16"}}]}})
@@ -149,7 +149,7 @@ def test_an_active_queued_resource_can_still_be_released(monkeypatch) -> None:
 def test_a_labelled_foreign_queued_resource_is_never_deleted(monkeypatch) -> None:
     """When the provider does answer, a mismatch still blocks deletion."""
 
-    from eyvan.providers.gcp import queued_resources as module
+    from eyvan.capacity.providers.gcp import queued_resources as module
 
     provider = module.GcloudTpuProvider()
     foreign = _qr({"name": "qr-1", "labels": {"eyvan-uid": "someone-else"}})
@@ -165,7 +165,7 @@ def test_a_labelled_foreign_queued_resource_is_never_deleted(monkeypatch) -> Non
 def test_deleting_without_an_ownership_uid_is_still_refused(monkeypatch) -> None:
     """The caller must still assert which cell owns the resource."""
 
-    from eyvan.providers.gcp import queued_resources as module
+    from eyvan.capacity.providers.gcp import queued_resources as module
 
     provider = module.GcloudTpuProvider()
     bare = _qr({"name": "qr-1", "tpu": {"nodeSpec": [{"node": {}}]}})

@@ -14,14 +14,14 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
+from eyvan._internal.identifiers import stable_id
 from eyvan.capacity import (
     DEFINITIVE_CAPACITY_LOSS_STATUSES,
     EXECUTION_PENDING_CAPACITY_STATUSES,
     QUEUED_CAPACITY_STATUSES,
 )
-from eyvan.core import SchedulingResult
-from eyvan.identifiers import stable_id
-from eyvan.service.models import (
+from eyvan.domain import SchedulingResult
+from eyvan.server.service.models import (
     CapacityPoolRecord,
     CellRecord,
     CellState,
@@ -29,7 +29,7 @@ from eyvan.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
-from eyvan.service.state import ACTIVE_LEASE_STATES
+from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 #: ``CellRecord.id`` is ``max_length=96`` and a cell id becomes a provider
 #: resource name, so the minted form must fit whatever the widest counter is.

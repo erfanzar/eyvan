@@ -10,13 +10,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.api.app import create_app
 from eyvan.config import EyvanSettings
-from eyvan.core.domain import InfeasibilityCode
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.errors import AuthorizationError, NotFoundError
-from eyvan.service.models import (
+from eyvan.domain.models import InfeasibilityCode
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import AuthorizationError, NotFoundError
+from eyvan.server.service.models import (
     CellRecord,
     CellState,
     CommandExecution,
@@ -28,7 +28,7 @@ from eyvan.service.models import (
     WorkloadDefinition,
     WorkloadState,
 )
-from eyvan.service.scheduling import CoreSchedulingService
+from eyvan.server.service.scheduling import CoreSchedulingService
 
 
 def _principal(role: Role, *, subject: str = "alice", project: str = "research") -> Principal:

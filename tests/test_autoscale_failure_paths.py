@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import eyvan.cli as cli
-import eyvan.commands.autoscale as autoscale_commands
-from eyvan.autoscale import AutoscaleConfigCache, AutoscaleDefaults
-from eyvan.providers.gcp.quota_discovery import TpuQuotaAvailability
+import eyvan.sdk.cli as cli
+import eyvan.sdk.commands.autoscale as autoscale_commands
+from eyvan.capacity.autoscale import AutoscaleConfigCache, AutoscaleDefaults
+from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 
 
 class _NoEligiblePoolDiscovery:

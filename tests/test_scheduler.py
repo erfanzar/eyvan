@@ -9,7 +9,7 @@ from itertools import permutations
 import pytest
 from typing_extensions import TypedDict, Unpack
 
-from eyvan.core import (
+from eyvan.domain import (
     Budget,
     CapacityCell,
     CapacityClass,

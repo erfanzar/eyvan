@@ -45,9 +45,9 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from eyvan._json import model_json
-from eyvan.persistence.sqlalchemy import IdempotencyRow, SqlAlchemyRepository, create_schema
-from eyvan.service.models import (
+from eyvan._internal.json_types import model_json
+from eyvan.server.persistence.sqlalchemy import IdempotencyRow, SqlAlchemyRepository, create_schema
+from eyvan.server.service.models import (
     IdempotencyRecord,
     OutboxRecord,
     OutboxState,
@@ -234,8 +234,8 @@ async def test_one_unreadable_row_does_not_hide_every_other_workload(repository,
 
     from sqlalchemy import update
 
-    from eyvan.persistence.sqlalchemy import WorkloadRow
-    from eyvan.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.persistence.sqlalchemy import WorkloadRow
+    from eyvan.server.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
 
     def _workload(workload_id: str) -> WorkloadRecord:
         return WorkloadRecord(
@@ -270,8 +270,8 @@ async def test_a_corrupt_row_is_skipped_rather_than_guessed_at(repository) -> No
 
     from sqlalchemy import update
 
-    from eyvan.persistence.sqlalchemy import WorkloadRow
-    from eyvan.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.persistence.sqlalchemy import WorkloadRow
+    from eyvan.server.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
 
     async with repository.transaction() as transaction:
         await transaction.put_workload(
@@ -316,7 +316,7 @@ async def test_a_database_behind_this_build_refuses_to_open(tmp_path) -> None:
 
     from sqlalchemy import text
 
-    from eyvan.persistence.base import SchemaRevisionMismatch
+    from eyvan.server.persistence.base import SchemaRevisionMismatch
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'behind.db'}")
     await create_schema(engine)
@@ -340,7 +340,7 @@ async def test_a_database_ahead_of_this_build_also_refuses_to_open(tmp_path) -> 
 
     from sqlalchemy import text
 
-    from eyvan.persistence.base import SchemaRevisionMismatch
+    from eyvan.server.persistence.base import SchemaRevisionMismatch
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ahead.db'}")
     await create_schema(engine)

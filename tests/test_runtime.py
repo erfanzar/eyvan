@@ -19,20 +19,20 @@ from types import TracebackType
 
 import pytest
 
-from eyvan._compat import StrEnum
-from eyvan._json import JsonObject
-from eyvan.drivers.base import (
+from eyvan._internal.compat import StrEnum
+from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.drivers.base import (
     CapacityStatus,
     CellObservation,
     ExecutionWorkloadStatus,
     MutationContext,
     StaleMutationError,
 )
-from eyvan.runtime import callable_worker
-from eyvan.runtime.callable_worker import main as callable_worker_main
-from eyvan.runtime.callables import dump_callable, load_callable
-from eyvan.runtime.ray_jobs import RayJobsExecutor
-from eyvan.runtime.results import dump_result, load_result
+from eyvan.worker.runtime import callable_worker
+from eyvan.worker.runtime.callable_worker import main as callable_worker_main
+from eyvan.worker.runtime.callables import dump_callable, load_callable
+from eyvan.worker.runtime.ray_jobs import RayJobsExecutor
+from eyvan.worker.runtime.results import dump_result, load_result
 
 
 def _increment(value: int) -> int:
@@ -475,7 +475,7 @@ def test_ray_jobs_submission_wraps_every_gang_bundle_and_persists_fence() -> Non
         "EYVAN_PLACEMENT_STRATEGY": "STRICT_SPREAD",
     }
     command = shlex.split(request.entrypoint)
-    assert command[:5] == ["python", "-m", "eyvan.runtime.ray_jobs", "run-gang", command[4]]
+    assert command[:5] == ["python", "-m", "eyvan.worker.runtime.ray_jobs", "run-gang", command[4]]
     payload = json.loads(base64.urlsafe_b64decode(command[4]).decode())
     assert payload == {
         "entrypoint": "python train.py --steps 10",
@@ -550,7 +550,7 @@ def test_ray_jobs_adapter_import_does_not_import_optional_ray() -> None:
     code = "\n".join(
         (
             "import sys",
-            "import eyvan.runtime.ray_jobs",
+            "import eyvan.worker.runtime.ray_jobs",
             "assert 'ray' not in sys.modules",
         )
     )
@@ -690,8 +690,8 @@ def test_ray_jobs_rejects_empty_entrypoint() -> None:
 def test_resolver_raises_instead_of_asserting_when_worker_token_derivation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import eyvan.runtime.native_bootstrap as native_bootstrap
-    from eyvan.runtime.registry import ExecutionDriverResolver
+    import eyvan.worker.runtime.native_bootstrap as native_bootstrap
+    from eyvan.worker.runtime.registry import ExecutionDriverResolver
 
     monkeypatch.setattr(
         native_bootstrap,

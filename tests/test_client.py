@@ -9,13 +9,13 @@ import httpx
 import pytest
 
 import eyvan
-from eyvan.client import EyvanUnavailableError as ClientUnavailableError
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.client.idempotency import IdempotencyKeyFactory
-from eyvan.client.identity import local_development_subject, resolve_identity
-from eyvan.client.retry import RetryPolicy
-from eyvan.client.transport import AsyncApiTransport, EyvanHTTPError, EyvanUnavailableError, SyncApiTransport
-from eyvan.execution import EyvanUnavailableError as ExecutionUnavailableError
+from eyvan.sdk.client import EyvanUnavailableError as ClientUnavailableError
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
+from eyvan.sdk.client.identity import local_development_subject, resolve_identity
+from eyvan.sdk.client.retry import RetryPolicy
+from eyvan.sdk.client.transport import AsyncApiTransport, EyvanHTTPError, EyvanUnavailableError, SyncApiTransport
+from eyvan.sdk.execution import EyvanUnavailableError as ExecutionUnavailableError
 
 
 def test_endpoint_normalizes_only_absolute_http_urls() -> None:

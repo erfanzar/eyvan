@@ -12,26 +12,26 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from eyvan.agent.app import create_agent_app
-from eyvan.agent.client import (
-    CellAgentBusyError,
-    CellAgentCapacityProviderError,
-    CellAgentClient,
-    CellAgentStaleMutationError,
-    CellAgentUnsupportedCapabilityError,
-)
-from eyvan.agent.models import CapacityRequest, MutationModel, WorkloadMutationRequest, WorkloadRequest
-from eyvan.agent.service import CellAgentService
-from eyvan.config import EyvanSettings
-from eyvan.drivers.base import (
+from eyvan.capacity.drivers.base import (
     CapacityProviderFailureCode,
     CapacityStatus,
     CellCapabilities,
     CellObservation,
     StaleMutationError,
 )
-from eyvan.persistence.fleet import FleetLeaseBusyError, FleetStateStore, LocalBackend, StaleFenceError
-from eyvan.providers.gcp.queued_resources import GcloudError, GcloudQueueAdmissionDeniedError
+from eyvan.capacity.providers.gcp.queued_resources import GcloudError, GcloudQueueAdmissionDeniedError
+from eyvan.config import EyvanSettings
+from eyvan.server.persistence.fleet import FleetLeaseBusyError, FleetStateStore, LocalBackend, StaleFenceError
+from eyvan.worker.agent.app import create_agent_app
+from eyvan.worker.agent.client import (
+    CellAgentBusyError,
+    CellAgentCapacityProviderError,
+    CellAgentClient,
+    CellAgentStaleMutationError,
+    CellAgentUnsupportedCapabilityError,
+)
+from eyvan.worker.agent.models import CapacityRequest, MutationModel, WorkloadMutationRequest, WorkloadRequest
+from eyvan.worker.agent.service import CellAgentService
 
 
 def workload_request(generation: int, token: str) -> WorkloadRequest:
@@ -153,7 +153,7 @@ def test_an_unstructured_agent_500_is_distinguishable_from_a_provider_failure() 
     Multislice one transient DNS lookup after Google granted it.
     """
 
-    from eyvan.agent.client import CellAgentUnavailableError
+    from eyvan.worker.agent.client import CellAgentUnavailableError
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="fleet state backend is unreachable")
@@ -171,7 +171,7 @@ def test_an_unstructured_agent_500_is_distinguishable_from_a_provider_failure() 
 def test_a_structured_502_still_reports_the_provider_not_the_agent() -> None:
     """The 5xx rule must not swallow the one 5xx that *is* an answer."""
 
-    from eyvan.agent.client import CellAgentUnavailableError
+    from eyvan.worker.agent.client import CellAgentUnavailableError
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -194,7 +194,7 @@ def test_a_structured_502_still_reports_the_provider_not_the_agent() -> None:
 def test_a_deliberate_501_is_not_read_as_the_agent_being_broken() -> None:
     """Terminal-by-design, so it must not join the retried-forever class."""
 
-    from eyvan.agent.client import CellAgentUnavailableError, CellAgentUnsupportedCapabilityError
+    from eyvan.worker.agent.client import CellAgentUnavailableError, CellAgentUnsupportedCapabilityError
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(501, text="this backend cannot run checkpoint hooks")
@@ -817,10 +817,10 @@ async def test_an_unsupported_capability_settles_the_command_instead_of_retrying
     forever against an answer that cannot change.
     """
 
-    from eyvan.controller import EyvanController
-    from eyvan.persistence import InMemoryRepository
-    from eyvan.service import ControlPlaneService
-    from eyvan.service.models import (
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence import InMemoryRepository
+    from eyvan.server.service import ControlPlaneService
+    from eyvan.server.service.models import (
         CellRecord,
         OutboxState,
         Principal,
@@ -875,7 +875,7 @@ def test_a_dropped_connection_is_unavailable_not_a_provider_failure() -> None:
     arriving by a different door.
     """
 
-    from eyvan.agent.client import CellAgentUnavailableError
+    from eyvan.worker.agent.client import CellAgentUnavailableError
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
@@ -893,7 +893,7 @@ def test_a_dropped_connection_is_unavailable_not_a_provider_failure() -> None:
 def test_a_connect_timeout_is_also_unavailable() -> None:
     """A slow link is the common case on a laptop-hosted control plane."""
 
-    from eyvan.agent.client import CellAgentUnavailableError
+    from eyvan.worker.agent.client import CellAgentUnavailableError
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out", request=request)
@@ -915,7 +915,7 @@ def test_every_agent_call_goes_through_the_one_seam() -> None:
 
     import inspect
 
-    from eyvan.agent import client as module
+    from eyvan.worker.agent import client as module
 
     source = inspect.getsource(module.CellAgentClient)
     direct = [
@@ -940,7 +940,7 @@ def test_a_rejected_configuration_carries_the_agents_own_sentence() -> None:
     then thrown away.
     """
 
-    from eyvan.agent.client import CellAgentInvalidConfigurationError
+    from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 
     message = "internal-only eyvan-native Compute capacity cannot use bootstrap_egress=public-internet"
 
@@ -961,7 +961,7 @@ def test_a_rejected_configuration_carries_the_agents_own_sentence() -> None:
 def test_an_ordinary_400_is_not_mistaken_for_a_configuration_refusal() -> None:
     """Only the agent's typed code may claim terminality; a bare 400 may not."""
 
-    from eyvan.agent.client import CellAgentInvalidConfigurationError
+    from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"detail": "malformed request body"})

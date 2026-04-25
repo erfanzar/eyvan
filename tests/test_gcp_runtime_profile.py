@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.providers.gcp.runtime.profile import (
+from eyvan.capacity.providers.gcp.runtime.profile import (
     GCP_NATIVE_RUNTIME_PROFILE_SCHEMA,
     GCP_NATIVE_RUNTIME_PROFILE_VERSION,
     GcpNativeRuntimeProfile,

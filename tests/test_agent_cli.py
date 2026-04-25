@@ -13,8 +13,8 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from eyvan.agent.cli import _settings_for_runtime_profile, main
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.worker.agent.cli import _settings_for_runtime_profile, main
 
 
 def test_agent_cli_loads_native_gcp_settings_from_the_owner_profile(tmp_path: Path) -> None:
@@ -42,7 +42,7 @@ def _clear_agent_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_agent_factory(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
     """Capture the allow_unauthenticated flag the CLI hands to the app factory."""
 
-    import eyvan.agent.cli as cli
+    import eyvan.worker.agent.cli as cli
 
     allowed: list[bool] = []
 

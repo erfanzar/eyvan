@@ -19,8 +19,8 @@ from datetime import timedelta
 import pytest
 
 from eyvan.config import EyvanSettings
-from eyvan.persistence import InMemoryRepository
-from eyvan.service.models import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service.models import (
     AuditEvent,
     IdempotencyRecord,
     OutboxRecord,
@@ -169,7 +169,7 @@ async def test_pruning_the_local_backend_leaves_a_document_that_still_loads(tmp_
     the daemon most users actually run.
     """
 
-    from eyvan.persistence.local import LocalJsonRepository
+    from eyvan.server.persistence.local import LocalJsonRepository
 
     path = tmp_path / "control-plane.json"
     repository = LocalJsonRepository(path)
@@ -205,9 +205,9 @@ async def test_a_broken_retention_window_does_not_stop_the_others(tmp_path) -> N
     fix was still present on any backend where audit pruning failed.
     """
 
-    from eyvan.controller import EyvanController
-    from eyvan.persistence.state import StateSession
-    from eyvan.service import ControlPlaneService
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.state import StateSession
+    from eyvan.server.service import ControlPlaneService
 
     repository = InMemoryRepository()
     async with repository.transaction() as transaction:

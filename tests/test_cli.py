@@ -18,16 +18,14 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-import eyvan.cli as cli
-import eyvan.client.identity as identity_module
-import eyvan.client.transport as client_transport
-import eyvan.commands.autoscale as autoscale_commands
-import eyvan.commands.fleet_status as fleet_status_rendering
-import eyvan.commands.fleets as fleet_commands
-from eyvan._json import JsonObject, JsonValue, is_json_object, is_json_value
-from eyvan.api.app import create_app
-from eyvan.api.schemas import FleetApplyRequest, FleetStatusResponse, PoolWorkloadSubmitRequest, WorkloadSubmitRequest
-from eyvan.autoscale import (
+import eyvan.sdk.cli as cli
+import eyvan.sdk.client.identity as identity_module
+import eyvan.sdk.client.transport as client_transport
+import eyvan.sdk.commands.autoscale as autoscale_commands
+import eyvan.sdk.commands.fleet_status as fleet_status_rendering
+import eyvan.sdk.commands.fleets as fleet_commands
+from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, is_json_value
+from eyvan.capacity.autoscale import (
     DEFAULT_TPU_PROFILES,
     AutoscaleConfigCache,
     AutoscaleDefaults,
@@ -38,14 +36,21 @@ from eyvan.autoscale import (
     generate_zone_autoscale_config,
     tpu_profile_from_accelerator_type,
 )
-from eyvan.client.endpoint import ControlPlaneEndpoint
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.config import EyvanSettings
-from eyvan.contexts import get_active_context
-from eyvan.drivers.base import CapacityProviderFailureCode
-from eyvan.local.auth import LocalDevelopmentCredentialStore
-from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.providers.gcp.quota_discovery import TpuQuotaAvailability
-from eyvan.service.models import CapacityClass, CapacityPoolRecord, CellRecord, CellState
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.contexts import get_active_context
+from eyvan.server.api.app import create_app
+from eyvan.server.api.schemas import (
+    FleetApplyRequest,
+    FleetStatusResponse,
+    PoolWorkloadSubmitRequest,
+    WorkloadSubmitRequest,
+)
+from eyvan.server.local.auth import LocalDevelopmentCredentialStore
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.server.service.models import CapacityClass, CapacityPoolRecord, CellRecord, CellState
 
 QueryValue: tp.TypeAlias = str | int | float | bool | None
 
@@ -198,7 +203,7 @@ def _isolated_context_file(monkeypatch, tmp_path) -> None:
 
 def test_cli_help_imports_in_a_clean_process() -> None:
     result = subprocess.run(
-        [sys.executable, "-m", "eyvan.cli", "--help"],
+        [sys.executable, "-m", "eyvan.sdk.cli", "--help"],
         check=False,
         capture_output=True,
         text=True,
@@ -1428,7 +1433,7 @@ def test_status_keeps_the_server_response_when_local_denial_cache_is_invalid(mon
 
 
 def test_status_uses_the_active_context_autoscale_cache_directory(monkeypatch, tmp_path) -> None:
-    from eyvan.contexts import EyvanContext, set_active_context
+    from eyvan.sdk.contexts import EyvanContext, set_active_context
 
     pool = _fleet_status_pool()
     denied = pool.make_cell("dev-fleet-v6e-8-0001").model_copy(

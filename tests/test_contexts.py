@@ -10,7 +10,7 @@ import stat
 
 import pytest
 
-from eyvan.contexts import (
+from eyvan.sdk.contexts import (
     ContextConfigError,
     EyvanContext,
     FileContextStore,

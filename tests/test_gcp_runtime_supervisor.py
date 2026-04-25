@@ -14,18 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.agent.models import AgentCapabilities
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.local.daemon import (
-    LocalDaemonPaths,
-    LocalDaemonRecord,
-    LocalDaemonResult,
-    LocalDaemonState,
-    LocalDaemonTarget,
-    write_owner_only_record,
-)
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
-from eyvan.providers.gcp.runtime.supervisor import (
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.supervisor import (
     DEFAULT_LOCAL_GCP_AGENT_URL,
     GcpNativeRuntimeSupervisor,
     GcpRuntimeError,
@@ -36,6 +26,16 @@ from eyvan.providers.gcp.runtime.supervisor import (
     LocalAgentState,
     LocalAgentSupervisor,
 )
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.server.local.daemon import (
+    LocalDaemonPaths,
+    LocalDaemonRecord,
+    LocalDaemonResult,
+    LocalDaemonState,
+    LocalDaemonTarget,
+    write_owner_only_record,
+)
+from eyvan.worker.agent.models import AgentCapabilities
 
 _DEFAULT_WHEEL_URI = f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'a' * 64}/eyvan-0.1.0-py3-none-any.whl"
 
@@ -197,7 +197,7 @@ def test_agent_command_passes_only_the_private_profile_path_not_its_secrets(tmp_
     assert command.argv == (
         sys.executable,
         "-m",
-        "eyvan.agent.cli",
+        "eyvan.worker.agent.cli",
         "--host",
         "127.0.0.1",
         "--port",
@@ -320,7 +320,7 @@ def test_agent_supervisor_restart_replaces_only_a_verified_owned_agent(tmp_path:
             (
                 sys.executable,
                 "-m",
-                "eyvan.agent.cli",
+                "eyvan.worker.agent.cli",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -393,7 +393,7 @@ def test_agent_restart_forces_an_owned_agent_that_does_not_finish_gracefully(tmp
             (
                 sys.executable,
                 "-m",
-                "eyvan.agent.cli",
+                "eyvan.worker.agent.cli",
                 "--host",
                 "127.0.0.1",
                 "--port",

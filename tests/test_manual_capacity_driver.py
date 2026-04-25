@@ -10,11 +10,11 @@ from __future__ import annotations
 import pytest
 
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.drivers.base import MutationContext, StaleMutationError
+from eyvan.capacity.drivers.manual import ManualCapacityDriver
+from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS, CapacityBackendRegistry
 from eyvan.config import EyvanSettings
-from eyvan.drivers.base import MutationContext, StaleMutationError
-from eyvan.drivers.manual import ManualCapacityDriver
-from eyvan.drivers.registry import DEFAULT_CAPACITY_BACKENDS, CapacityBackendRegistry
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 
 
 def _context(key: str, generation: int = 1, token: str = "fence-1") -> MutationContext:

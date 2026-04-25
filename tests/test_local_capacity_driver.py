@@ -11,13 +11,13 @@ import time
 
 import pytest
 
-from eyvan._json import JsonValue
-from eyvan.agent.models import CapacityRequest, MutationModel, WorkloadRequest
-from eyvan.agent.service import CellAgentService
+from eyvan._internal.json_types import JsonValue
+from eyvan.capacity.drivers.base import CapacityStatus, ExecutionWorkloadStatus, MutationContext
+from eyvan.capacity.drivers.local import LocalCapacityDriver
 from eyvan.config import EyvanSettings
-from eyvan.drivers.base import CapacityStatus, ExecutionWorkloadStatus, MutationContext
-from eyvan.drivers.local import LocalCapacityDriver
-from eyvan.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
+from eyvan.worker.agent.models import CapacityRequest, MutationModel, WorkloadRequest
+from eyvan.worker.agent.service import CellAgentService
 
 
 def _context(key: str, generation: int = 1) -> MutationContext:

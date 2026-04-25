@@ -9,11 +9,11 @@ import typing as tp
 
 import pytest
 
-from eyvan._json import JsonObject, is_json_object
-from eyvan.drivers.base import CapacityStatus, MutationContext, StaleMutationError
-from eyvan.drivers.gcp import GcpTpuCapacityDriver
-from eyvan.persistence.fleet import FleetCellRecord, FleetStateStore, LocalBackend
-from eyvan.providers.gcp import ProviderObservation
+from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan.capacity.drivers.base import CapacityStatus, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.gcp import GcpTpuCapacityDriver
+from eyvan.capacity.providers.gcp import ProviderObservation
+from eyvan.server.persistence.fleet import FleetCellRecord, FleetStateStore, LocalBackend
 
 
 def metadata_object(record: FleetCellRecord, name: str) -> JsonObject:

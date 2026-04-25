@@ -29,11 +29,11 @@ import typing as tp
 
 import pytest
 
+from eyvan.capacity.drivers.base import capacity_backend_agent_family
 from eyvan.capacity.planning import cell_matches_template
-from eyvan.drivers.base import capacity_backend_agent_family
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,
@@ -169,7 +169,7 @@ async def test_a_capacity_command_is_addressed_to_its_own_cells_endpoint() -> No
 async def test_the_scheduler_never_sees_the_backend() -> None:
     """Backend-agnostic placement is why no controller-of-controllers is needed."""
 
-    from eyvan.service.scheduling import to_core_cell
+    from eyvan.server.service.scheduling import to_core_cell
 
     service = await _service()
     del service

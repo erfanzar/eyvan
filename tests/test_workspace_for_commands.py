@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.service.models import (
+from eyvan.server.service.models import (
     CallableExecution,
     CommandExecution,
     ResourceGang,

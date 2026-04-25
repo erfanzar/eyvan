@@ -14,17 +14,17 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from eyvan._json import JsonObject, JsonValue
-from eyvan.client.identity import ClientIdentity
-from eyvan.commands.operations import (
+from eyvan._internal.json_types import JsonObject, JsonValue
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.commands.operations import (
     delete_cell,
     drain_cell,
     force_finalize_preemption,
     list_cells,
     list_leases,
 )
-from eyvan.commands.state import CliSession, ContextOverrides
-from eyvan.contexts import EyvanContextConfig, FileContextStore
+from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.contexts import EyvanContextConfig, FileContextStore
 
 QueryValue: tp.TypeAlias = str | int | float | bool | None
 

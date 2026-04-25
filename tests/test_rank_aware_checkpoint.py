@@ -19,10 +19,10 @@ import httpx
 import pytest
 from test_systemd_transient import FakeSystemd
 
-from eyvan.drivers.base import MutationContext
-from eyvan.runtime.native_remote import NativeRemoteExecutor
-from eyvan.runtime.native_slice import NativeSliceExecutor
-from eyvan.runtime.systemd_transient import SystemdTransientServiceExecutor
+from eyvan.capacity.drivers.base import MutationContext
+from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.native_slice import NativeSliceExecutor
+from eyvan.worker.runtime.systemd_transient import SystemdTransientServiceExecutor
 
 
 def _context(key: str = "ckpt-1") -> MutationContext:
@@ -108,7 +108,7 @@ def test_each_rank_writes_to_a_distinct_checkpoint_destination(tmp_path) -> None
 def test_a_single_host_workload_keeps_an_unsuffixed_destination(tmp_path) -> None:
     """No rank means "not part of a slice", not "rank 0"."""
 
-    from eyvan.runtime.systemd_transient import _checkpoint_rank, _rank_checkpoint_uri
+    from eyvan.worker.runtime.systemd_transient import _checkpoint_rank, _rank_checkpoint_uri
 
     assert _checkpoint_rank({"WANDB_MODE": "offline"}) is None
     assert _rank_checkpoint_uri("gs://bucket/ckpt", None) == "gs://bucket/ckpt"

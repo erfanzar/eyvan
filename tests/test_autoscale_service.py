@@ -10,11 +10,16 @@ from datetime import datetime
 
 import pytest
 
-from eyvan._compat import UTC
-from eyvan._json import JsonObject, JsonValue
-from eyvan.autoscale import AutoscaleConfigCache, AutoscaleDefaults, AutoscaleGenerationService, AutoscaleSkipReason
-from eyvan.providers.gcp.quota_discovery import GcloudQuotaError, TpuQuotaAvailability
-from eyvan.service.models import CapacityClass
+from eyvan._internal.compat import UTC
+from eyvan._internal.json_types import JsonObject, JsonValue
+from eyvan.capacity.autoscale import (
+    AutoscaleConfigCache,
+    AutoscaleDefaults,
+    AutoscaleGenerationService,
+    AutoscaleSkipReason,
+)
+from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, TpuQuotaAvailability
+from eyvan.server.service.models import CapacityClass
 
 
 class FakeDiscovery:

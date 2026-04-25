@@ -15,15 +15,19 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import eyvan.cli as cli
-import eyvan.commands.runtime as runtime_commands
-from eyvan.agent.models import AgentCapabilities
-from eyvan.autoscale import AutoscaleConfigCache, AutoscaleDefaults
-from eyvan.client.endpoint import ControlPlaneEndpoint
-from eyvan.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.providers.gcp.runtime.bootstrap import GcpRuntimeBootstrapStep, GcpRuntimePreflight, GcpRuntimePreflightError
-from eyvan.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
-from eyvan.providers.gcp.runtime.supervisor import LocalAgentResult, LocalAgentState
+import eyvan.sdk.cli as cli
+import eyvan.sdk.commands.runtime as runtime_commands
+from eyvan.capacity.autoscale import AutoscaleConfigCache, AutoscaleDefaults
+from eyvan.capacity.providers.gcp.runtime.bootstrap import (
+    GcpRuntimeBootstrapStep,
+    GcpRuntimePreflight,
+    GcpRuntimePreflightError,
+)
+from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile, GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.supervisor import LocalAgentResult, LocalAgentState
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.worker.agent.models import AgentCapabilities
 
 
 def _profile(*, wheel_uri: str | None = None) -> GcpNativeRuntimeProfile:

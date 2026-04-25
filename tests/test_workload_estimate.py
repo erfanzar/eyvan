@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.persistence import InMemoryRepository
-from eyvan.service import ControlPlaneService
-from eyvan.service.models import (
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.models import (
     BudgetRecord,
     CapacityClass,
     CapacityPoolRecord,
