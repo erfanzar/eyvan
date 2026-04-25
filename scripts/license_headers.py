@@ -1,8 +1,14 @@
-"""Apply the Apache-2.0 header to every Eyvan source file.
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
-Runs as a pre-commit hook so new files cannot ship without a header, and is
-idempotent so it can be re-run over the tree at any time. Exits non-zero when
-it changed something, matching the convention of the formatting hooks.
+"""Apply the EasyDeL AGPL-3.0 SPDX header to every Eyvan source file.
+
+Matches the header spectrax uses, so every file in the stack carries the same
+notice. Runs as a pre-commit hook so a new file cannot ship without one, and is
+idempotent -- including over the Apache-2.0 block this replaced, which it
+rewrites rather than stacks on top of.
 """
 
 from __future__ import annotations
@@ -10,61 +16,85 @@ from __future__ import annotations
 import pathlib
 import sys
 
-OWNER = "The EasyDeL/Eyvan Author @erfanzar (Erfan Zare Chavoshi)"
-_BODY = (
-    'Licensed under the Apache License, Version 2.0 (the "License");\n'
-    "you may not use this file except in compliance with the License.\n"
-    "You may obtain a copy of the License at\n"
-    "\n"
-    "    https://www.apache.org/licenses/LICENSE-2.0\n"
-    "\n"
-    "Unless required by applicable law or agreed to in writing, software\n"
-    'distributed under the License is distributed on an "AS IS" BASIS,\n'
-    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
-    "See the License for the specific language governing permissions and\n"
-    "limitations under the License."
+HEADER_LINES = (
+    "Copyright (C) 2026 Erfan Zare Chavoshi",
+    "This file is part of EasyDeL.",
+    "",
+    "SPDX-License-Identifier: AGPL-3.0-or-later",
+)
+SPDX_MARKER = "SPDX-License-Identifier: AGPL-3.0-or-later"
+_LINE_COMMENT_SUFFIXES = frozenset({".ts", ".tsx", ".css"})
+# Header text this one supersedes. A file carrying it is rewritten, not appended
+# to, so the tree never accumulates two conflicting notices.
+_SUPERSEDED_MARKERS = (
+    "Licensed under the Apache License",
+    "Copyright 2026 The EasyDeL/Eyvan Author",
 )
 
 
-def _hash_header() -> str:
-    lines = [f"Copyright 2026 {OWNER}.", "", *_BODY.split("\n")]
-    return "\n".join(f"# {line}".rstrip() for line in lines) + "\n"
+def _comment_prefix(path: pathlib.Path) -> str:
+    return "//" if path.suffix in _LINE_COMMENT_SUFFIXES else "#"
 
 
-def _block_header() -> str:
-    lines = [f"Copyright 2026 {OWNER}.", "", *_BODY.split("\n")]
-    return "/*\n" + "\n".join(f" * {line}".rstrip() for line in lines) + "\n */\n"
+def header_for(path: pathlib.Path) -> str:
+    """Return the header block for one file's comment syntax."""
+
+    prefix = _comment_prefix(path)
+    return "\n".join(f"{prefix} {line}".rstrip() for line in HEADER_LINES) + "\n"
+
+
+def _leading_comment_block(text: str, prefix: str) -> tuple[str, str]:
+    """Split ``text`` into its leading comment block and the remainder."""
+
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith((prefix, "/*", " *", "*/")) or not line.strip():
+            index += 1
+            continue
+        break
+    # Trailing blank lines belong to the separator, not the block.
+    while index > 0 and not lines[index - 1].strip():
+        index -= 1
+    return "\n".join(lines[:index]), "\n".join(lines[index:]).lstrip("\n")
 
 
 def apply(path: pathlib.Path) -> bool:
-    """Prepend the header to ``path`` when absent. Returns True when changed."""
+    """Ensure ``path`` starts with the header. Returns True when changed."""
 
-    text = path.read_text(encoding="utf-8")
-    if "Licensed under the Apache License" in text.split("\n\n", 1)[0] or "Apache License" in text[:900]:
+    original = path.read_text(encoding="utf-8")
+    shebang, body = "", original
+    if original.startswith("#!"):
+        line, _, rest = original.partition("\n")
+        shebang, body = f"{line}\n", rest
+
+    prefix = _comment_prefix(path)
+    block, remainder = _leading_comment_block(body, prefix)
+    if any(marker in block for marker in _SUPERSEDED_MARKERS) or SPDX_MARKER in block:
+        body = remainder
+
+    updated = f"{shebang}{header_for(path)}\n{body.lstrip(chr(10))}"
+    if updated == original:
         return False
-    header = _block_header() if path.suffix in {".ts", ".tsx", ".css"} else _hash_header()
-    if text.startswith("#!"):
-        shebang, _, rest = text.partition("\n")
-        path.write_text(f"{shebang}\n{header}{rest.lstrip(chr(10))}", encoding="utf-8")
-    else:
-        path.write_text(header + text, encoding="utf-8")
+    path.write_text(updated, encoding="utf-8")
     return True
 
 
 def main(argv: list[str]) -> int:
     root = pathlib.Path(__file__).resolve().parent.parent
     if argv:
-        targets = [pathlib.Path(a) for a in argv]
+        targets = [pathlib.Path(argument) for argument in argv]
     else:
         targets = [
-            p
+            path
             for suffix in ("*.py", "*.ts", "*.tsx")
-            for p in root.rglob(suffix)
-            if "node_modules" not in p.parts and "dist" not in p.parts and ".venv" not in p.parts
+            for path in root.rglob(suffix)
+            if not {"node_modules", "dist", ".venv"} & set(path.parts)
         ]
-    changed = [p for p in targets if p.is_file() and apply(p)]
+    changed = [path for path in targets if path.is_file() and apply(path)]
     for path in changed:
-        print(f"added license header: {path}")
+        print(f"licensed: {path}")
     return 1 if changed else 0
 
 
