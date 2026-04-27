@@ -28,9 +28,7 @@ from __future__ import annotations
 import pytest
 
 from eyvan.capacity.drivers.base import CellCapabilities
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     CommandExecution,
     Principal,
     ResourceGang,
@@ -41,6 +39,8 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     WorkloadRecord,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 from eyvan.worker.runtime.log_records import (
     LogPage,
     LogRecord,

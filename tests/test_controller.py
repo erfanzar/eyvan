@@ -27,12 +27,7 @@ from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, CapacityStatus, ExecutionWorkloadStatus
 from eyvan.config import EyvanSettings
 from eyvan.domain import InfeasibilityCode
-from eyvan.server.controller import EyvanController, LeaderPhase, StaleOutboxCommand
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.errors import ConflictError
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     BudgetRecord,
     CallableExecution,
@@ -56,6 +51,11 @@ from eyvan.server.service.models import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.controller import EyvanController, LeaderPhase, StaleOutboxCommand
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.worker.agent.client import CellAgentBusyError, CellAgentClient, CellAgentStaleMutationError
 from eyvan.worker.agent.models import AgentObservation, CapacityRequest, WorkloadMutationRequest, WorkloadObservation

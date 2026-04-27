@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from eyvan.server.service.models import WorkloadDefinition
+from eyvan.records import WorkloadDefinition
 
 #: Ceiling on children created by one batch request. Deliberately conservative:
 #: this is accelerator capacity, and the cost of a mistake is measured in

@@ -14,6 +14,14 @@ from pydantic import ValidationError
 
 from eyvan.artifacts import ArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
+from eyvan.records import (
+    AutoscaleBlockReason,
+    CallableExecution,
+    WorkloadProgress,
+    WorkloadProgressPhase,
+    WorkloadRecord,
+    WorkloadState,
+)
 from eyvan.sdk.client.jobs import (
     CallableSubmission,
     EyvanJob,
@@ -31,14 +39,6 @@ from eyvan.sdk.job_receipt import (
     JobTerminalOutput,
 )
 from eyvan.server.api.schemas import NoMatchingCapacityPoolErrorResponse
-from eyvan.server.service.models import (
-    AutoscaleBlockReason,
-    CallableExecution,
-    WorkloadProgress,
-    WorkloadProgressPhase,
-    WorkloadRecord,
-    WorkloadState,
-)
 from eyvan.worker.runtime.results import load_result
 
 R = tp.TypeVar("R")

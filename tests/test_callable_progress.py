@@ -11,11 +11,7 @@ import pytest
 from eyvan.artifacts import LocalArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
-from eyvan.sdk.client.callables import EyvanCallableSubmitter
-from eyvan.sdk.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
-from eyvan.sdk.client.sync import EyvanClient
-from eyvan.sdk.client.transport import EyvanHTTPError
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityClass,
@@ -33,6 +29,10 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.sdk.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
+from eyvan.sdk.client.sync import EyvanClient
+from eyvan.sdk.client.transport import EyvanHTTPError
 from eyvan.worker.runtime.callables import dump_callable
 
 

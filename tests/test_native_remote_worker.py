@@ -26,8 +26,8 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.server.service.models import NativeContainerConfig
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
+from eyvan.records import NativeContainerConfig
 from eyvan.worker.agent.models import MutationModel, WorkloadRequest
 from eyvan.worker.agent.service import CellAgentService
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor

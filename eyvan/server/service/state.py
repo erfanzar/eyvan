@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from eyvan.server.service.models import LeaseState, WorkloadState
+from eyvan.records import LeaseState, WorkloadState
 
 
 class InvalidTransition(ValueError):

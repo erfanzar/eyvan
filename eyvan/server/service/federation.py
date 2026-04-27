@@ -38,7 +38,7 @@ from datetime import datetime
 from pydantic import Field, model_validator
 
 from eyvan._internal.compat import StrEnum
-from eyvan.server.service.models import EyvanModel, utcnow
+from eyvan.records import EyvanModel, utcnow
 
 
 class GrantState(StrEnum):

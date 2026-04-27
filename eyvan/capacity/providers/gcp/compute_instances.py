@@ -22,6 +22,7 @@ from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
 from eyvan.capacity.providers.gcp.queued_resources import (
     GcloudError,
@@ -30,7 +31,6 @@ from eyvan.capacity.providers.gcp.queued_resources import (
     Runner,
     decode_gcloud_object,
 )
-from eyvan.server.persistence.fleet import FleetCellRecord
 
 _DEFAULT_CPU_IMAGE = ("ubuntu-2404-lts-amd64", "ubuntu-os-cloud")
 _DEFAULT_GPU_IMAGE = ("ubuntu-accelerator-2404-amd64-with-nvidia-580", "ubuntu-os-accelerator-images")

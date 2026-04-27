@@ -27,7 +27,7 @@ from eyvan.capacity.autoscale.models import (
 from eyvan.capacity.autoscale.profiles import resolve_queued_tpu_profile
 from eyvan.capacity.providers.gcp.quota_discovery import GcpTpuQuotaDiscovery, TpuQuotaAvailability
 from eyvan.capacity.providers.gcp.tpu_zone_policy import documented_tpu_zone_exclusion
-from eyvan.server.service.models import CapacityClass
+from eyvan.records import CapacityClass
 
 _SKIP_REASON_ORDER = {reason: index for index, reason in enumerate(AutoscaleSkipReason)}
 

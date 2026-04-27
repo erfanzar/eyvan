@@ -23,7 +23,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from eyvan.domain.pricing import PriceKey
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,

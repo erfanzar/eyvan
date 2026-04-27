@@ -31,9 +31,7 @@ import pytest
 
 from eyvan.capacity.drivers.base import capacity_backend_agent_family
 from eyvan.capacity.planning import cell_matches_template
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,
@@ -43,6 +41,8 @@ from eyvan.server.service.models import (
     Role,
     RoleGrant,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 
 _GCP_AGENT = "http://gcp-agent:8080"
 _K8S_AGENT = "http://k8s-agent:8080"

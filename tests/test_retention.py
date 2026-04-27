@@ -19,14 +19,14 @@ from datetime import timedelta
 import pytest
 
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service.models import (
+from eyvan.records import (
     AuditEvent,
     IdempotencyRecord,
     OutboxRecord,
     OutboxState,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
 
 
 def _outbox(record_id: str, state: OutboxState, age_days: int) -> OutboxRecord:

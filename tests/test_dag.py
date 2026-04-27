@@ -14,11 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.server.controller import EyvanController
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.dag import DagError, DagNode, validate
-from eyvan.server.service.models import (
+from eyvan.records import (
     CommandExecution,
     CoordinationKind,
     Principal,
@@ -29,6 +25,10 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     WorkloadState,
 )
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.dag import DagError, DagNode, validate
 
 
 def _principal() -> Principal:

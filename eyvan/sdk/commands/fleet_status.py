@@ -16,8 +16,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState, ResourceLimits
 from eyvan.server.api.schemas import FleetStatusResponse
-from eyvan.server.service.models import CapacityClass, CapacityPoolRecord, CellRecord, CellState, ResourceLimits
 
 _ATTENTION_CELL_LIMIT = 12
 

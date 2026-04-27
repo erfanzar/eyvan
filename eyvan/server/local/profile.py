@@ -12,8 +12,7 @@ import secrets
 import stat
 from pathlib import Path
 
-DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
-DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH = Path("~/.eyvan/artifact-token.key")
+from eyvan.config import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
 
 
 class LocalProfileSecretError(RuntimeError):

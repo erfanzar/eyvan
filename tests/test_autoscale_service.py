@@ -19,7 +19,7 @@ from eyvan.capacity.autoscale import (
     AutoscaleSkipReason,
 )
 from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, TpuQuotaAvailability
-from eyvan.server.service.models import CapacityClass
+from eyvan.records import CapacityClass
 
 
 class FakeDiscovery:

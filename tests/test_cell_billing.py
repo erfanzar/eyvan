@@ -30,9 +30,7 @@ from datetime import timedelta
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     BILLABLE_CELL_STATES,
     CapacityClass,
     CellRecord,
@@ -47,6 +45,8 @@ from eyvan.server.service.models import (
     RoleGrant,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 
 
 def _admin() -> Principal:

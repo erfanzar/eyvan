@@ -32,7 +32,7 @@ import typing as tp
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from eyvan.server.service.models import LeaseRecord, WorkloadRecord
+from eyvan.records import LeaseRecord, WorkloadRecord
 
 #: How long a cell is assumed to still hold an asset after a job that used it
 #: last held the cell. Six hours is chosen against the failure it causes: too

@@ -21,7 +21,7 @@ from eyvan.capacity import (
     QUEUED_CAPACITY_STATUSES,
 )
 from eyvan.domain import SchedulingResult
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
     CellState,

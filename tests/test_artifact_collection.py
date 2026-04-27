@@ -40,12 +40,7 @@ from eyvan.artifacts.managed import (
     parse_managed_uri,
     workspace_uri,
 )
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.control_plane import DEFAULT_ARTIFACT_GRACE_PERIOD_S
-from eyvan.server.service.errors import InputError
-from eyvan.server.service.models import (
+from eyvan.records import (
     CallableExecution,
     Principal,
     ResourceGang,
@@ -55,6 +50,11 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.control_plane import DEFAULT_ARTIFACT_GRACE_PERIOD_S
+from eyvan.server.service.errors import InputError
 
 #: Content-addressed kinds verify the payload against its own URI on every write,
 #: so a test digest has to be the real hash of the bytes it names.

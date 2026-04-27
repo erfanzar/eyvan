@@ -33,9 +33,9 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import dataclass
 
+from eyvan.records import WorkloadDefinition
 from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 from eyvan.server.service.errors import InputError
-from eyvan.server.service.models import WorkloadDefinition
 
 #: Longest chain a DAG may declare. Deeper than any staged training pipeline needs
 #: and shallow enough that a release walk stays trivially bounded.

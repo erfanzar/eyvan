@@ -33,8 +33,8 @@ from eyvan.capacity.autoscale import (
 )
 from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
+from eyvan.records import CapacityClass
 from eyvan.sdk.commands.fleet_status import is_interactive_output
-from eyvan.server.service.models import CapacityClass
 
 _EGRESS_CHOICES: tuple[tuple[str, str, str], ...] = (
     ("1", "private-google-access", "Private Google APIs only"),

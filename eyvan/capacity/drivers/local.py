@@ -15,7 +15,7 @@ from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonValue
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CellCapabilities, CellObservation, MutationContext, StaleMutationError
-from eyvan.server.persistence.fleet import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
+from eyvan.capacity.fleet_state import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
 
 
 class LocalCapacityDriver:

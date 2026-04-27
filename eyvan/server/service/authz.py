@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
+from eyvan.records import Permission, Principal, Role
 from eyvan.server.service.errors import AuthorizationError
-from eyvan.server.service.models import Permission, Principal, Role
 
 _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.FLEET_ADMIN: frozenset(Permission),

@@ -22,6 +22,7 @@ from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
 from eyvan.artifacts.managed import callable_uri
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.records import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
 from eyvan.server.api.app import (
     UNMATCHED_ROUTE_LABEL,
     create_app,
@@ -36,7 +37,6 @@ from eyvan.server.controller import EyvanController
 from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredentialStore
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
 
 
 def _headers(role: str = "operator", *, project: str = "research") -> dict[str, str]:

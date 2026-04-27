@@ -27,7 +27,7 @@ from __future__ import annotations
 import pytest
 
 from eyvan.domain import CapacityClass as CoreCapacityClass
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityClass,
     CellRecord,
     CellState,
@@ -421,10 +421,10 @@ def test_reserved_capacity_needs_no_new_concept() -> None:
 async def test_a_denial_does_not_terminally_fail_a_workload_with_other_pools() -> None:
     """A denial says this shape in this zone is unavailable, not that the run is."""
 
+    from eyvan.records import AutoscaleBlockReason, CapacityPoolRecord
     from eyvan.server.controller import EyvanController
     from eyvan.server.persistence import InMemoryRepository
     from eyvan.server.service import ControlPlaneService
-    from eyvan.server.service.models import AutoscaleBlockReason, CapacityPoolRecord
 
     repository = InMemoryRepository()
     await repository.open()
@@ -478,10 +478,10 @@ async def test_a_denial_does_not_terminally_fail_a_workload_with_other_pools() -
 async def test_a_denial_still_fails_a_workload_with_nowhere_else_to_go() -> None:
     """The single-candidate case keeps its terminal failure; the change is additive."""
 
+    from eyvan.records import CapacityPoolRecord
     from eyvan.server.controller import EyvanController
     from eyvan.server.persistence import InMemoryRepository
     from eyvan.server.service import ControlPlaneService
-    from eyvan.server.service.models import CapacityPoolRecord
 
     repository = InMemoryRepository()
     await repository.open()
@@ -524,10 +524,10 @@ async def test_a_denial_still_fails_a_workload_with_nowhere_else_to_go() -> None
 async def test_a_disabled_alternative_pool_does_not_count() -> None:
     """A pool an operator turned off is not somewhere the run could still land."""
 
+    from eyvan.records import CapacityPoolRecord
     from eyvan.server.controller import EyvanController
     from eyvan.server.persistence import InMemoryRepository
     from eyvan.server.service import ControlPlaneService
-    from eyvan.server.service.models import CapacityPoolRecord
 
     repository = InMemoryRepository()
     await repository.open()

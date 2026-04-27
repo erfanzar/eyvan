@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_backend_agent_family
-from eyvan.server.service.models import (
+from eyvan.records import (
     CanonicalCapacityClass,
     CapacityClass,
     CapacityPoolRecord,

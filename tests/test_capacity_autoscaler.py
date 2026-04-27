@@ -10,11 +10,7 @@ from datetime import timedelta
 import pytest
 
 from eyvan.capacity.drivers.base import CapacityStatus
-from eyvan.server.controller import EyvanController
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityPoolRecord,
@@ -29,6 +25,10 @@ from eyvan.server.service.models import (
     WorkerResourceScope,
     WorkloadDefinition,
 )
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.worker.agent.models import AgentObservation
 

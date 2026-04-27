@@ -1,0 +1,598 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Operator-driven fleet, pool, and cell administration."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import typing as tp
+
+from eyvan.capacity import (
+    CapacityStatus,
+)
+from eyvan.capacity.audit import CapacityLifecycleEvent, CapacityReplacementReason
+from eyvan.capacity.planning import (
+    CapacityPlanner,
+    CapacitySimulation,
+    cell_matches_pool,
+    cell_requires_replacement,
+    next_pool_cell_index,
+    pool_cell_id,
+)
+from eyvan.domain import (
+    SchedulingResult,
+)
+from eyvan.records import (
+    CapacityPoolRecord,
+    CellRecord,
+    CellState,
+    Principal,
+    WorkloadState,
+    utcnow,
+)
+from eyvan.server.controller._support import (
+    CapacityApplySuperseded,
+    _replacement_reason,
+    logger,
+)
+from eyvan.server.persistence.base import RepositorySession
+from eyvan.server.service.errors import ConflictError, NotFoundError
+from eyvan.server.service.state import ACTIVE_LEASE_STATES
+
+
+class _ControllerFleets:
+    """Operator-driven fleet, pool, and cell administration.
+
+    A concern of :class:`~eyvan.server.controller.EyvanController`; not
+    instantiated on its own.
+    """
+
+    async def reconcile_if_leader(self) -> SchedulingResult | None:
+        """Run a manual reconciliation only on the elected scheduler replica.
+
+        Leadership is re-checked *before every phase*, not once at the top. A
+        full cycle spans many provider round trips, so a replica can lose the
+        advisory lock partway through; continuing would let two leaders mint
+        autoscaler cell ids from the same ``len(managed) + 1`` sequence and
+        collide. Losing leadership mid-cycle is a normal outcome, so it returns
+        ``None`` rather than raising.
+        """
+
+        if not await self.leader.acquire():
+            return None
+        async with self._leader_cycle_lock:
+            for phase in (
+                self.reconcile_unmanaged_capacity_recoveries_once,
+                self.reconcile_capacity_pools_once,
+                self._observe_cells_once,
+                self.quarantine_expired_leases_once,
+                self.observe_workloads_once,
+            ):
+                if not await self.leader.acquire():
+                    return None
+                await phase()
+            if not await self.leader.acquire():
+                return None
+            return await self.reconcile_once()
+
+    async def disable_fleet(
+        self,
+        principal: Principal,
+        fleet_name: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[list[CapacityPoolRecord], bool]:
+        """Persist fleet shutdown before any newly admitted capacity operation can start."""
+
+        async with self._fleet_capacity_gate(fleet_name).closing():
+            return await self.service.disable_fleet(principal, fleet_name, idempotency_key=idempotency_key)
+
+    async def apply_fleet(
+        self,
+        principal: Principal,
+        fleet_name: str,
+        pools: tp.Sequence[CapacityPoolRecord],
+        *,
+        idempotency_key: str,
+    ) -> tuple[list[CapacityPoolRecord], bool]:
+        """Apply one fleet after closing its capacity-operation admission gate."""
+
+        async with self._fleet_capacity_gate(fleet_name).closing():
+            return await self.service.apply_fleet(principal, fleet_name, pools, idempotency_key=idempotency_key)
+
+    async def upsert_capacity_pool(
+        self,
+        principal: Principal,
+        pool: CapacityPoolRecord,
+        *,
+        idempotency_key: str,
+    ) -> tuple[CapacityPoolRecord, bool]:
+        """Update one pool after closing its fleet's capacity-operation admission gate."""
+
+        async with self._fleet_capacity_gate(pool.fleet_name).closing():
+            return await self.service.upsert_capacity_pool(principal, pool, idempotency_key=idempotency_key)
+
+    async def disable_capacity_pool(
+        self,
+        principal: Principal,
+        pool_id: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[CapacityPoolRecord, bool]:
+        """Disable one pool after closing its fleet's capacity-operation admission gate."""
+
+        async with self.repository.transaction() as transaction:
+            pool = await transaction.get_capacity_pool(pool_id)
+        if pool is None:
+            return await self.service.disable_capacity_pool(principal, pool_id, idempotency_key=idempotency_key)
+        async with self._fleet_capacity_gate(pool.fleet_name).closing():
+            return await self.service.disable_capacity_pool(principal, pool_id, idempotency_key=idempotency_key)
+
+    async def drain_cell(
+        self,
+        principal: Principal,
+        cell_id: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[CellRecord, bool]:
+        """Persist a cell drain while serializing that cell's future capacity work."""
+
+        cell = await self.service.get_cell(principal, cell_id)
+        async with self._capacity_operation(cell):
+            return await self.service.drain_cell(principal, cell_id, idempotency_key=idempotency_key)
+
+    async def delete_cell(
+        self,
+        principal: Principal,
+        cell_id: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[CellRecord, bool]:
+        """Persist a cell release while serializing that cell's future capacity work."""
+
+        cell = await self.service.get_cell(principal, cell_id)
+        async with self._capacity_operation(cell):
+            return await self.service.delete_cell(principal, cell_id, idempotency_key=idempotency_key)
+
+    async def _autoscale_upsert_cell(
+        self,
+        pool: CapacityPoolRecord,
+        cell_id: str,
+        worker_count: int,
+        *,
+        autoscale_request_workload_id: str | None = None,
+        idempotency_key: str,
+    ) -> tuple[CellRecord | None, bool]:
+        """Upsert one planned cell only while its pool template remains current."""
+
+        async with self._fleet_capacity_gate(pool.fleet_name).mutation():
+            async with self.repository.transaction() as transaction:
+                current_pool = await transaction.get_capacity_pool(pool.id)
+            if current_pool is None or not current_pool.enabled or current_pool.generation != pool.generation:
+                return None, False
+            return await self.service.upsert_cell(
+                self._principal,
+                current_pool.make_cell(
+                    cell_id,
+                    worker_count=worker_count,
+                    autoscale_request_workload_id=autoscale_request_workload_id,
+                ),
+                idempotency_key=idempotency_key,
+            )
+
+    async def _autoscale_requeue_unprovisioned_cell(
+        self,
+        pool: CapacityPoolRecord,
+        cell: CellRecord,
+    ) -> tuple[CellRecord | None, bool]:
+        """Restore a current-template registering cell whose apply command was superseded."""
+
+        async with self._fleet_capacity_gate(pool.fleet_name).mutation():
+            async with self.repository.transaction() as transaction:
+                current_pool = await transaction.get_capacity_pool(pool.id)
+                current_cell = await transaction.get_cell(cell.id)
+            if (
+                current_pool is None
+                or not current_pool.enabled
+                or current_pool.generation != pool.generation
+                or current_cell is None
+                or current_cell.generation != cell.generation
+                or not cell_matches_pool(current_cell, current_pool)
+                or current_cell.state is not CellState.REGISTERING
+                or current_cell.provider_phase is not None
+            ):
+                return None, False
+            return await self.service.requeue_unprovisioned_cell(
+                self._principal,
+                current_cell.id,
+                expected_generation=current_cell.generation,
+            )
+
+    async def reconcile_once(self) -> SchedulingResult:
+        """Schedule one durable snapshot and commit its plans."""
+
+        started = time.perf_counter()
+        result = await self.service.schedule_once(self._principal)
+        if self.metrics is not None:
+            self.metrics.scheduler_duration.observe(time.perf_counter() - started)
+            for _ in result.placements:
+                self.metrics.scheduler_decisions.labels(outcome="placed", reason="ready_capacity").inc()
+            for _ in result.preemptions:
+                self.metrics.scheduler_decisions.labels(outcome="preempt", reason="priority").inc()
+            for failure in result.infeasibilities:
+                self.metrics.scheduler_decisions.labels(outcome="pending", reason=failure.code.value).inc()
+        for decision in result.placements:
+            if not await self.leader.acquire():
+                return result
+            await self._commit_placement(decision)
+        for plan in result.preemptions:
+            if not await self.leader.acquire():
+                return result
+            await self._commit_preemption(plan)
+        await self._record_infeasibilities(result)
+        return result
+
+    async def _release_inactive_autoscale_request_ownership(
+        self,
+        cells: list[CellRecord],
+    ) -> list[CellRecord]:
+        """Return source-attributed capacity to shared supply after its owner stops waiting.
+
+        A fresh autoscaled cell is reserved only while the workload that caused
+        it to be requested remains pending. Lease creation clears the
+        reservation atomically. This recovery path handles cancellation,
+        terminal failure, and deleted legacy workloads before a lease exists.
+        """
+
+        candidates = tuple(cell for cell in cells if cell.autoscale_request_workload_id is not None)
+        if not candidates:
+            return cells
+
+        released_by_id: dict[str, CellRecord] = {}
+        async with self.repository.transaction() as transaction:
+            for snapshot in candidates:
+                current = await transaction.get_cell(snapshot.id)
+                if (
+                    current is None
+                    or current.generation != snapshot.generation
+                    or current.autoscale_request_workload_id != snapshot.autoscale_request_workload_id
+                ):
+                    continue
+                owner_id = current.autoscale_request_workload_id
+                assert owner_id is not None
+                owner = await transaction.get_workload(owner_id)
+                if owner is not None and owner.state is WorkloadState.PENDING:
+                    continue
+                released = current.model_copy(
+                    update={
+                        "autoscale_request_workload_id": None,
+                        "updated_at": utcnow(),
+                    }
+                )
+                await transaction.put_cell(released)
+                released_by_id[released.id] = released
+                logger.info(
+                    "releasing autoscale reservation on cell %s because workload %s is no longer pending",
+                    released.id,
+                    owner_id,
+                )
+        return [released_by_id.get(cell.id, cell) for cell in cells]
+
+    async def reconcile_capacity_pools_once(self) -> dict[str, int]:
+        """Reconcile declarative pools against global submitted workload demand."""
+
+        if self.service.scheduler is None:
+            return {"launched": 0, "drained": 0, "deleted": 0}
+        async with self.repository.transaction() as transaction:
+            pools = await transaction.list_capacity_pools()
+            if not pools:
+                return {"launched": 0, "drained": 0, "deleted": 0}
+            workloads = await transaction.list_workloads()
+            cells = await transaction.list_cells()
+            leases = await transaction.list_leases()
+            budgets = await transaction.list_budgets()
+            quotas = await transaction.list_quotas()
+            policies = await transaction.list_policies()
+
+        cells = await self._release_inactive_autoscale_request_ownership(cells)
+        pools_by_id = {pool.id: pool for pool in pools}
+        now = utcnow()
+        refreshed_cells: list[CellRecord] = []
+        for cell in cells:
+            pool = pools_by_id.get(cell.pool_id or "")
+            if (
+                pool is not None
+                and pool.enabled
+                and not cell_requires_replacement(cell, pool)
+                and not cell_matches_pool(cell, pool)
+                and cell.state not in {CellState.DRAINING, CellState.DELETING, CellState.DELETED}
+            ):
+                try:
+                    updated, _ = await self._autoscale_upsert_cell(
+                        pool,
+                        cell.id,
+                        cell.worker_count,
+                        autoscale_request_workload_id=cell.autoscale_request_workload_id,
+                        idempotency_key=f"autoscale:update:{cell.id}:g{pool.generation}",
+                    )
+                    if updated is not None:
+                        cell = updated
+                except ConflictError as exc:
+                    logger.info("cell %s metadata update is waiting for active leases: %s", cell.id, exc)
+            if (
+                pool is not None
+                and pool.enabled
+                and cell_matches_pool(cell, pool)
+                and cell.state is CellState.REGISTERING
+                and cell.provider_phase is None
+            ):
+                try:
+                    repaired, _ = await self._autoscale_requeue_unprovisioned_cell(pool, cell)
+                    if repaired is not None:
+                        cell = repaired
+                except ConflictError as exc:
+                    logger.info("cell %s provisioning recovery became stale: %s", cell.id, exc)
+            refreshed_cells.append(cell)
+        cells = refreshed_cells
+        cells_by_pool: dict[str, list[CellRecord]] = {pool.id: [] for pool in pools}
+        for cell in cells:
+            pool_id = cell.pool_id
+            if pool_id is not None and pool_id in cells_by_pool:
+                cells_by_pool[pool_id].append(cell)
+
+        pool_records = tuple(pools)
+        simulation = CapacitySimulation.build(pool_records, tuple(cells), tuple(workloads), tuple(leases), now)
+        simulated = self.service.scheduler.schedule(
+            workloads,
+            simulation.cells,
+            leases=leases,
+            budgets=budgets,
+            quotas=quotas,
+            policies=policies,
+        )
+        demand_by_pool = simulation.demand(pool_records, tuple(leases), simulated)
+        planner = CapacityPlanner(pool_records, cells_by_pool, now)
+        plans = planner.plan(demand_by_pool)
+        await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)
+
+        launched = 0
+        drained = 0
+        deleted = 0
+        active_lease_cells = {lease.cell_id for lease in leases if lease.state in ACTIVE_LEASE_STATES}
+        cell_ids = {cell.id for cell in cells}
+
+        for pool in sorted(pools, key=lambda item: item.id):
+            plan = plans[pool.id]
+            live = list(plan.live)
+            matching_supply = list(plan.matching_supply)
+            target = plan.target_worker_units
+            # Monotonic, from every cell this pool has ever had -- including
+            # deleted ones, whose records are the evidence their index is spent.
+            # `len(managed) + 1` walked backwards on deletion and handed the same
+            # id out twice; the second holder then inherited the first's provider
+            # resource under that name.
+            next_index = next_pool_cell_index(pool, cells)
+            for worker_count, autoscale_request_workload_id in zip(
+                plan.launch_worker_counts,
+                plan.launch_workload_ids,
+                strict=True,
+            ):
+                # `pool_cell_id` carries a per-pool-record epoch. Without it the
+                # counter restarts at 0001 on a control plane with an empty
+                # database and collides with the agent's durable cell tombstones,
+                # which fence every apply forever.
+                cell_id = pool_cell_id(pool, next_index)
+                while cell_id in cell_ids:
+                    next_index += 1
+                    cell_id = pool_cell_id(pool, next_index)
+                created, replayed = await self._autoscale_upsert_cell(
+                    pool,
+                    cell_id,
+                    worker_count,
+                    autoscale_request_workload_id=autoscale_request_workload_id,
+                    idempotency_key=f"autoscale:create:{cell_id}:g{pool.generation}",
+                )
+                if created is None:
+                    continue
+                if not replayed:
+                    self._capacity_lifecycle.event(
+                        CapacityLifecycleEvent.PLANNED,
+                        created,
+                        reason=f"autoscaler launch for {worker_count} worker(s), target {target}",
+                    )
+                cell_ids.add(cell_id)
+                next_index += 1
+                launched += 1
+
+            if (
+                pool.enabled
+                and pool.initialized_at is None
+                and plan.supply_worker_units_after_launch >= pool.initial_target
+            ):
+                async with self.repository.transaction() as transaction:
+                    current = await transaction.get_capacity_pool(pool.id)
+                    if current is not None and current.generation == pool.generation and current.initialized_at is None:
+                        await transaction.put_capacity_pool(current.model_copy(update={"initialized_at": now}))
+
+            draining = [cell for cell in live if cell.state is CellState.DRAINING]
+            for cell in draining:
+                if cell.id in active_lease_cells:
+                    continue
+                await self.delete_cell(
+                    self._principal,
+                    cell.id,
+                    idempotency_key=f"autoscale:delete:{cell.id}:g{cell.generation + 1}",
+                )
+                deleted += 1
+
+            current_candidates = [
+                cell
+                for cell in matching_supply
+                if cell.state not in {CellState.DRAINING, CellState.DELETING} and cell.id not in active_lease_cells
+            ]
+            protected = set(plan.protected_cell_ids)
+
+            updates: list[CellRecord] = []
+            stale_candidates = [
+                cell
+                for cell in live
+                if cell not in matching_supply
+                and cell.state not in {CellState.DRAINING, CellState.DELETING}
+                and cell.id not in active_lease_cells
+            ]
+            ready_drain_budget = max(
+                sum(cell.worker_count for cell in live if cell.state is CellState.READY) - target,
+                0,
+            )
+            to_drain: list[CellRecord] = []
+            replacement_reasons: dict[str, CapacityReplacementReason] = {}
+            for cell in stale_candidates:
+                if pool.enabled and cell.state is CellState.READY:
+                    if cell.id in plan.forced_drain_cell_ids:
+                        pass
+                    elif ready_drain_budget > 0:
+                        ready_drain_budget = max(ready_drain_budget - cell.worker_count, 0)
+                    else:
+                        continue
+                to_drain.append(cell)
+                replacement_reasons[cell.id] = _replacement_reason(cell, pool)
+            idle_timeout_s = pool.idle_timeout_s if pool.enabled else 0
+            for cell in current_candidates:
+                if cell.id in plan.forced_drain_cell_ids:
+                    to_drain.append(cell)
+                    replacement_reasons[cell.id] = CapacityReplacementReason.SHARED_QUOTA_REBALANCE
+                    continue
+                if cell.id in protected:
+                    if cell.idle_since is not None:
+                        updates.append(cell.model_copy(update={"idle_since": None, "updated_at": now}))
+                    continue
+                idle_since = cell.idle_since or now
+                if cell.idle_since is None:
+                    updates.append(cell.model_copy(update={"idle_since": idle_since, "updated_at": now}))
+                if (now - idle_since).total_seconds() >= idle_timeout_s:
+                    to_drain.append(cell)
+            if updates:
+                async with self.repository.transaction() as transaction:
+                    for update in updates:
+                        current = await transaction.get_cell(update.id)
+                        if current is not None and current.generation == update.generation:
+                            await transaction.put_cell(update)
+            for cell in {candidate.id: candidate for candidate in to_drain}.values():
+                draining_cell, replayed = await self.drain_cell(
+                    self._principal,
+                    cell.id,
+                    idempotency_key=f"autoscale:drain:{cell.id}:g{cell.generation}",
+                )
+                if not replayed and cell.state is not CellState.READY:
+                    # This cell is being reclaimed without ever having delivered
+                    # capacity -- it exceeded queue_timeout_s or provisioning_timeout_s
+                    # and stopped counting as supply. Nothing else records that: the
+                    # observation paths key off the provider's reported state, and a
+                    # cell parked in WAITING keeps reporting a *pending* status, which
+                    # leaves its belief untouched. Without this the autoscaler never
+                    # learns which zone is empty and keeps choosing it first forever.
+                    # `replayed` makes it once per (cell, generation).
+                    await self._record_capacity_stockout(cell)
+                replacement_reason = replacement_reasons.get(cell.id)
+                if replacement_reason is not None and not replayed:
+                    self._capacity_lifecycle.event(
+                        CapacityLifecycleEvent.REPLACEMENT,
+                        draining_cell,
+                        previous=cell,
+                        reason=replacement_reason.value,
+                    )
+                drained += 1
+
+        return {"launched": launched, "drained": drained, "deleted": deleted}
+
+    async def reconcile_unmanaged_capacity_recoveries_once(self) -> int:
+        """Resume manual cells whose agent fence conflict survived a controller interruption."""
+
+        async with self.repository.transaction() as transaction:
+            candidates = [
+                cell
+                for cell in await transaction.list_cells()
+                if cell.pool_id is None
+                and cell.state is CellState.UNAVAILABLE
+                and cell.provider_phase is CapacityStatus.NEEDS_RECREATE
+            ]
+        recovered = 0
+        for cell in candidates:
+            try:
+                recreated, replayed = await self.service.recreate_cell(
+                    self._principal,
+                    cell.id,
+                    expected_generation=cell.generation,
+                    idempotency_key=f"agent-fence-recreate:{cell.id}:g{cell.generation}",
+                )
+            except (ConflictError, NotFoundError) as exc:
+                logger.debug("manual cell %s cannot yet recover from an agent fence conflict: %s", cell.id, exc)
+                continue
+            if not replayed:
+                self._capacity_lifecycle.transition(
+                    cell,
+                    recreated,
+                    reason="resuming manual cell after an agent fence conflict",
+                )
+                recovered += 1
+        return recovered
+
+    async def _require_current_pool_template(
+        self,
+        transaction: RepositorySession,
+        cell: CellRecord,
+    ) -> None:
+        """Reject capacity work whose managed pool was disabled, removed, or replaced."""
+
+        if cell.pool_id is None:
+            return
+        pool = await transaction.get_capacity_pool(cell.pool_id)
+        if pool is None:
+            raise CapacityApplySuperseded(f"cell {cell.id!r} belongs to a removed capacity pool")
+        if not pool.enabled:
+            raise CapacityApplySuperseded(f"cell {cell.id!r} belongs to disabled fleet {pool.fleet_name!r}")
+        if not cell_matches_pool(cell, pool):
+            raise CapacityApplySuperseded(f"cell {cell.id!r} no longer matches pool {pool.id!r}'s active template")
+
+    async def capacity_orphans(self) -> list[dict[str, str | int | None]]:
+        """Return cells an agent still holds that no control-plane record claims.
+
+        A fleet-state document outlives the control plane that wrote it. When a
+        control plane's database is replaced, its cells are left behind in the
+        agent -- and any left ``desired_state: up`` are re-ensured forever, so
+        the agent keeps provisioning capacity nobody asked for, invisible to the
+        control plane that would otherwise own it.
+
+        Found on 2026-08-01: a ``v5p-128`` queued resource being recreated days
+        after its fleet was deleted, discoverable only by reading the agent's
+        state document out of object storage by hand.
+
+        Read-only, and deliberately not automatic. One agent can legitimately be
+        shared by more than one control plane, so a record this control plane
+        does not recognise is not necessarily unowned -- reclaiming it is an
+        operator decision, and this is the information that decision needs.
+        """
+
+        async with self.repository.transaction() as transaction:
+            cells = await transaction.list_cells()
+        known = {cell.id for cell in cells}
+        endpoints: dict[str, CellRecord] = {}
+        for cell in cells:
+            if cell.endpoint and cell.state is not CellState.DELETED:
+                endpoints.setdefault(cell.endpoint, cell)
+        orphans: list[dict[str, str | int | None]] = []
+        for endpoint, sample in sorted(endpoints.items()):
+            try:
+                inventory = await asyncio.to_thread(self._agent_factory(sample).inventory)
+            except Exception as exc:
+                logger.warning("cell agent %s inventory is unavailable: %s", endpoint, exc)
+                continue
+            for entry in inventory:
+                name = entry.get("name")
+                if isinstance(name, str) and name not in known:
+                    orphans.append({**entry, "endpoint": endpoint})
+        return orphans

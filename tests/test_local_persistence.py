@@ -16,11 +16,7 @@ from fastapi.testclient import TestClient
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.artifacts.managed import ArtifactAction, result_uri
 from eyvan.config import EyvanSettings, RepositoryBackend
-from eyvan.server.api.app import create_app
-from eyvan.server.api.server_bind import ServerBindPolicy
-from eyvan.server.persistence.local import LocalControlPlaneInUseError, LocalJsonRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     CommandExecution,
     OutboxRecord,
     OutboxState,
@@ -30,6 +26,10 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     WorkloadRecord,
 )
+from eyvan.server.api.app import create_app
+from eyvan.server.api.server_bind import ServerBindPolicy
+from eyvan.server.persistence.local import LocalControlPlaneInUseError, LocalJsonRepository
+from eyvan.server.service import ControlPlaneService
 
 
 def _principal() -> Principal:

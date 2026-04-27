@@ -18,11 +18,7 @@ from click.testing import CliRunner
 import eyvan.sdk.commands.workloads as workload_commands
 from eyvan._internal.json_types import JsonObject, JsonValue
 from eyvan.capacity.autoscale import AutoscaleConfigCache
-from eyvan.sdk.client.identity import ClientIdentity
-from eyvan.sdk.commands.state import CliSession, ContextOverrides
-from eyvan.sdk.commands.workloads import workload
-from eyvan.sdk.contexts import EyvanContext, EyvanContextConfig, FileContextStore
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CapacityClass,
     CommandExecution,
@@ -33,6 +29,10 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.commands.workloads import workload
+from eyvan.sdk.contexts import EyvanContext, EyvanContextConfig, FileContextStore
 
 QueryValue: tp.TypeAlias = str | int | float | bool | None
 

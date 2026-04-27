@@ -15,10 +15,7 @@ from fastapi.testclient import TestClient
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.config import EyvanSettings
-from eyvan.server.api.app import create_app
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     WORKER_COUNT_LABEL,
     AutoscaleBlockReason,
     CapacityClass,
@@ -40,6 +37,9 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
 
 

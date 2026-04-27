@@ -12,11 +12,7 @@ import pytest
 
 from eyvan.artifacts import LocalArtifactStore
 from eyvan.config import EyvanSettings
-from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
-from eyvan.sdk.execution import CallableSubmission, TpuConfig
-from eyvan.server.api.app import create_app
-from eyvan.server.api.schemas import WorkloadSubmitRequest
-from eyvan.server.service.models import (
+from eyvan.records import (
     CallableExecution,
     CapacityClass,
     CommandExecution,
@@ -24,6 +20,10 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
+from eyvan.sdk.execution import CallableSubmission, TpuConfig
+from eyvan.server.api.app import create_app
+from eyvan.server.api.schemas import WorkloadSubmitRequest
 from eyvan.worker.runtime.callables import dump_callable
 from eyvan.worker.runtime.results import dump_result
 

@@ -49,6 +49,12 @@ from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CellCapabilities, CellObservation, MutationContext, StaleMutationError
+from eyvan.capacity.fleet_state import (
+    FleetCellNotRegisteredError,
+    FleetCellRecord,
+    FleetStateStore,
+    StaleFenceError,
+)
 from eyvan.capacity.providers.kubernetes.api import KubernetesApi, capacity_state, interpret_job
 from eyvan.capacity.providers.kubernetes.workers import (
     fence_fingerprint,
@@ -57,12 +63,6 @@ from eyvan.capacity.providers.kubernetes.workers import (
     object_name,
     secret_manifest,
     worker_endpoints,
-)
-from eyvan.server.persistence.fleet import (
-    FleetCellNotRegisteredError,
-    FleetCellRecord,
-    FleetStateStore,
-    StaleFenceError,
 )
 
 #: Most workers one Kubernetes cell may contain. A Job's parallelism is the

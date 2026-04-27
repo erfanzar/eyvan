@@ -19,6 +19,10 @@ gate exists to catch stale Eyvan SDKs rather than to mandate a client identity.
 
 from __future__ import annotations
 
+from importlib import metadata
+
+from eyvan._version import __version__ as _VERSION
+
 CLIENT_VERSION_HEADER = "X-Eyvan-Client-Version"
 
 _MAX_VERSION_SEGMENTS = 8
@@ -27,13 +31,17 @@ _MAX_VERSION_SEGMENTS = 8
 def client_version() -> str:
     """Return the running SDK version.
 
-    Imported lazily so this module stays importable from ``eyvan.sdk.client``
-    without creating a cycle through the lazily-exported package root.
+    Read from installed metadata rather than ``eyvan.__version__``: this
+    module is in the bottom layer, and importing the package root would point
+    a dependency edge back at every layer above it -- and would resolve
+    against a half-initialised package when the root is still importing.
     """
 
-    from eyvan import __version__
-
-    return __version__
+    try:
+        return metadata.version("eyvan")
+    except metadata.PackageNotFoundError:
+        # A source tree that was never installed still has a usable answer.
+        return _VERSION
 
 
 def parse_version(raw: str | None) -> tuple[int, ...] | None:

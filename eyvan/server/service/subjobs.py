@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import typing as tp
 
+from eyvan.records import WorkloadRecord
 from eyvan.server.service.errors import ConflictError, InputError
-from eyvan.server.service.models import WorkloadRecord
 
 #: Maximum tree depth walked in one traversal. Deep enough for launcher ->
 #: stage -> shard patterns, shallow enough that a malformed chain cannot make a

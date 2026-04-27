@@ -10,8 +10,7 @@ from __future__ import annotations
 import typing as tp
 from datetime import datetime
 
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
-from eyvan.server.service.models import (
+from eyvan.records import (
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -28,6 +27,7 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
 
 
 class TransientRepositoryError(RuntimeError):

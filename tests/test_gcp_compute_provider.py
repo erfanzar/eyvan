@@ -12,6 +12,7 @@ from dataclasses import replace
 import pytest
 
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.compute_instances import (
     ComputeInstanceSpec,
     GcloudComputeProvider,
@@ -24,7 +25,6 @@ from eyvan.capacity.providers.gcp.compute_instances import (
     normalize_compute_config,
 )
 from eyvan.capacity.providers.gcp.queued_resources import GcloudError
-from eyvan.server.persistence.fleet import FleetCellRecord
 
 UID = "0123456789abcdef0123456789abcdef"
 

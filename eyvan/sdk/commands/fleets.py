@@ -27,6 +27,7 @@ from eyvan.capacity.providers.gcp.runtime.supervisor import (
     has_gcp_native_runtime_profile,
     requires_native_gcp_runtime,
 )
+from eyvan.records import NativeRuntimeConfig
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.identity import resolve_control_plane_identity
@@ -35,7 +36,6 @@ from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import ContextConfigError
 from eyvan.server.api.schemas import CellUpsertRequest, FleetApplyRequest, FleetStatusResponse
 from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, ensure_loopback_control_plane
-from eyvan.server.service.models import NativeRuntimeConfig
 
 LoopbackControlPlanePreparer: tp.TypeAlias = tp.Callable[[str | ControlPlaneEndpoint], LocalDaemonResult]
 NativeGcpRuntimeProfileAvailability: tp.TypeAlias = tp.Callable[[], bool]

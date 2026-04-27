@@ -5,8 +5,8 @@
 
 """Persistence contracts and repository implementations."""
 
+from eyvan.capacity.fleet_state import FleetCellRecord, FleetStateStore, GcsBackend, LocalBackend
 from eyvan.server.persistence.base import Repository, RepositorySession
-from eyvan.server.persistence.fleet import FleetCellRecord, FleetStateStore, GcsBackend, LocalBackend
 from eyvan.server.persistence.leader import PostgresAdvisoryLeader
 from eyvan.server.persistence.local import (
     LocalControlPlaneError,

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 from eyvan.artifacts import StoredCallableArtifact
 from eyvan.domain.accelerators import sort_accelerator_types
-from eyvan.server.service.models import (
+from eyvan.records import (
     CALLABLE_SIGNING_KEY_ENV,
     DEFAULT_MAX_RETRIES,
     REMOTE_CALLABLE_SIGNATURE_ERROR,

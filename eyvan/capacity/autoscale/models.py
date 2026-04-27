@@ -18,7 +18,7 @@ from eyvan._internal.compat import UTC, StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue
 from eyvan.capacity.fleet_config import EyvanFleetConfig, validate_fleet_name
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
-from eyvan.server.service.models import CapacityClass
+from eyvan.records import CapacityClass
 
 _ZONE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-[a-z]$")
 _GCP_PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")

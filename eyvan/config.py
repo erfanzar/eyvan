@@ -14,7 +14,12 @@ from pathlib import Path
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
-from eyvan.server.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
+
+DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
+"""Where a loopback control plane keeps its durable document by default."""
+
+DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH = Path("~/.eyvan/artifact-token.key")
+"""Where a loopback control plane keeps its artifact-token signing key."""
 
 
 def _csv(value: str) -> tuple[str, ...]:

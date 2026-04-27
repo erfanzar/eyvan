@@ -26,11 +26,11 @@ import click
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import model_json
+from eyvan.records import CapacityClass, ResourceLimits
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.api.schemas import BudgetPutRequest, PolicyPutRequest, QuotaPutRequest
-from eyvan.server.service.models import CapacityClass, ResourceLimits
 
 
 def _service(session: CliSession) -> OperationsCommandService:

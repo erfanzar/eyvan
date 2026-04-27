@@ -28,8 +28,8 @@ from eyvan.capacity.drivers.base import (
     canonical_execution_backend,
 )
 from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS
+from eyvan.capacity.fleet_state import FleetStateStore, StaleFenceError
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetStateStore, StaleFenceError
 from eyvan.worker.agent.models import (
     AgentCapabilities,
     AgentObservation,

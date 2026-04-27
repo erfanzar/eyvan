@@ -9,6 +9,16 @@ from __future__ import annotations
 
 import pytest
 
+from eyvan.records import (
+    CommandExecution,
+    Principal,
+    ResourceGang,
+    ResourceVector,
+    Role,
+    RoleGrant,
+    WorkloadDefinition,
+    WorkloadState,
+)
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.batch import (
@@ -20,16 +30,6 @@ from eyvan.server.service.batch import (
     expand,
 )
 from eyvan.server.service.errors import ConflictError, InputError
-from eyvan.server.service.models import (
-    CommandExecution,
-    Principal,
-    ResourceGang,
-    ResourceVector,
-    Role,
-    RoleGrant,
-    WorkloadDefinition,
-    WorkloadState,
-)
 
 
 def _principal() -> Principal:
@@ -416,7 +416,7 @@ async def test_a_batch_parent_is_marked_a_coordinator_positively() -> None:
     of the flag would silently capture all of them.
     """
 
-    from eyvan.server.service.models import CoordinationKind
+    from eyvan.records import CoordinationKind
 
     service = ControlPlaneService(InMemoryRepository())
     parent, children = await service.submit_batch(

@@ -30,7 +30,7 @@ from eyvan.domain import (
     PriorityBand as CorePriorityBand,
 )
 from eyvan.domain.availability import p95_latency
-from eyvan.server.service.models import (
+from eyvan.records import (
     WORKER_COUNT_LABEL,
     BudgetRecord,
     CellRecord,
@@ -42,10 +42,10 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityClass as ApiCapacityClass,
 )
-from eyvan.server.service.models import (
+from eyvan.records import (
     ResourceVector as ApiResourceVector,
 )
 from eyvan.server.service.state import ACTIVE_LEASE_STATES

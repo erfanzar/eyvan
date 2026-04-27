@@ -26,7 +26,7 @@ from pathlib import Path
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
-from eyvan.server.service.models import (
+from eyvan.records import (
     NativeContainerConfig,
     NativeContainerMount,
     native_container_mount_targets_overlap,

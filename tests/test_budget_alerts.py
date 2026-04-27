@@ -32,10 +32,7 @@ from datetime import timedelta
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.errors import NotFoundError
-from eyvan.server.service.models import (
+from eyvan.records import (
     BudgetRecord,
     LeaseRecord,
     LeaseState,
@@ -46,6 +43,9 @@ from eyvan.server.service.models import (
     RoleGrant,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import NotFoundError
 
 
 def _admin() -> Principal:

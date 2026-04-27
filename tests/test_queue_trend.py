@@ -25,11 +25,11 @@ from itertools import pairwise
 
 import pytest
 
+from eyvan.records import AuditEvent, Principal, Role, RoleGrant, WorkloadState, utcnow
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.control_plane import _QUEUE_TREND_MAX_EVENTS
 from eyvan.server.service.errors import InputError
-from eyvan.server.service.models import AuditEvent, Principal, Role, RoleGrant, WorkloadState, utcnow
 
 
 def _principal() -> Principal:

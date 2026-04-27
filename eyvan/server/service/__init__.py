@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from eyvan.server.service.authz import Authorizer
-from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.models import (
+from eyvan.records import (
     AuditEvent,
     BudgetRecord,
     CallableExecution,
@@ -38,6 +36,8 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.server.service.authz import Authorizer
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
 from eyvan.server.service.scheduling import CoreSchedulingService, SchedulingService
 
 if tp.TYPE_CHECKING:

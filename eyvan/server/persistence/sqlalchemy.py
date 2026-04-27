@@ -36,9 +36,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql.elements import ColumnElement
 
 from eyvan._internal.json_types import JsonObject, model_json
-from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
-from eyvan.server.service.models import (
+from eyvan.records import (
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -56,6 +54,8 @@ from eyvan.server.service.models import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
 
 SCHEMA_REVISION = "0008_progress_reports"
 

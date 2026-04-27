@@ -16,8 +16,8 @@ from fastapi.testclient import TestClient
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import CapacityStatus, CellCapabilities, CellObservation, ExecutionWorkloadStatus
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 from eyvan.worker.agent.app import create_agent_app
 from eyvan.worker.agent.client import CellAgentClient
 from eyvan.worker.agent.models import (

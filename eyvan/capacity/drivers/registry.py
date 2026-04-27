@@ -26,8 +26,8 @@ import typing as tp
 from eyvan.capacity.drivers.base import CapacityDriver
 
 if tp.TYPE_CHECKING:
+    from eyvan.capacity.fleet_state import FleetStateStore
     from eyvan.config import EyvanSettings
-    from eyvan.server.persistence.fleet import FleetStateStore
 
 #: A factory receives the requested backend name so one factory can serve
 #: several aliases that differ only by mode (as the GCP driver does).

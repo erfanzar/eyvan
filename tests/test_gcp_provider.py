@@ -14,6 +14,7 @@ import pytest
 from eyvan._internal.json_types import JsonValue
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.queued_resources import (
     GcloudError,
     GcloudQueueAdmissionDeniedError,
@@ -21,7 +22,6 @@ from eyvan.capacity.providers.gcp.queued_resources import (
     QueuedResourceSpec,
     normalize_tpu_config,
 )
-from eyvan.server.persistence.fleet import FleetCellRecord
 
 UID = "0123456789abcdef0123456789abcdef"
 

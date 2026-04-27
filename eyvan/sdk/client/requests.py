@@ -12,10 +12,10 @@ import typing as tp
 from pydantic import BaseModel
 
 from eyvan._internal.json_types import JsonObject, model_json
+from eyvan.records import CallableExecution, CapacityClass, WorkloadState, WorkspaceRef
 from eyvan.sdk.client.jobs import reject_remote_callable_signature, reject_remote_callable_signing_environment
 from eyvan.sdk.client.types import QueryParams
 from eyvan.server.api.schemas import PoolCallableSubmitRequest, PoolWorkloadSubmitRequest
-from eyvan.server.service.models import CallableExecution, CapacityClass, WorkloadState, WorkspaceRef
 
 
 def pool_request_json(request: BaseModel) -> JsonObject:

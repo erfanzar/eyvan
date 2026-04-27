@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CapacityClass,
     CellRecord,

@@ -20,8 +20,8 @@ from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, is
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
+from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
-from eyvan.server.persistence.fleet import FleetCellRecord
 
 RUNTIME_VERSION_BY_FAMILY = {
     "v4": "tpu-ubuntu2204-base",

@@ -28,11 +28,11 @@ from pydantic import ValidationError
 
 from eyvan._internal.client_version import client_version
 from eyvan._internal.json_types import JsonValue, is_json_object
+from eyvan.records import CapacityPoolRecord, CellRecord
 from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
-from eyvan.server.service.models import CapacityPoolRecord, CellRecord
 from eyvan.server.service.pricing_resolver import audit_price_drift
 
 

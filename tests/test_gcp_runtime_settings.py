@@ -8,11 +8,11 @@
 from __future__ import annotations
 
 from eyvan.capacity.drivers.gcp import GcpCapacityDriver
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.capacity.providers.gcp import GcloudNativeWorkerPublicIngress, GcsArtifactBucket
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
 from eyvan.config import EyvanSettings
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 from eyvan.worker.agent.service import CellAgentService
 
 

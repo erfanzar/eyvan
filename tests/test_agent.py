@@ -19,9 +19,9 @@ from eyvan.capacity.drivers.base import (
     CellObservation,
     StaleMutationError,
 )
+from eyvan.capacity.fleet_state import FleetLeaseBusyError, FleetStateStore, LocalBackend, StaleFenceError
 from eyvan.capacity.providers.gcp.queued_resources import GcloudError, GcloudQueueAdmissionDeniedError
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetLeaseBusyError, FleetStateStore, LocalBackend, StaleFenceError
 from eyvan.worker.agent.app import create_agent_app
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
@@ -817,10 +817,7 @@ async def test_an_unsupported_capability_settles_the_command_instead_of_retrying
     forever against an answer that cannot change.
     """
 
-    from eyvan.server.controller import EyvanController
-    from eyvan.server.persistence import InMemoryRepository
-    from eyvan.server.service import ControlPlaneService
-    from eyvan.server.service.models import (
+    from eyvan.records import (
         CellRecord,
         OutboxState,
         Principal,
@@ -828,6 +825,9 @@ async def test_an_unsupported_capability_settles_the_command_instead_of_retrying
         Role,
         RoleGrant,
     )
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence import InMemoryRepository
+    from eyvan.server.service import ControlPlaneService
 
     class UnsupportedAgent:
         def apply_capacity(self, cell_id, request):

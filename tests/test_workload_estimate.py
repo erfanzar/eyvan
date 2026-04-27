@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     BudgetRecord,
     CapacityClass,
     CapacityPoolRecord,
@@ -35,6 +33,8 @@ from eyvan.server.service.models import (
     RoleGrant,
     WorkloadDefinition,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 
 
 def _principal() -> Principal:

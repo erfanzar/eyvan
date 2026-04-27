@@ -12,11 +12,7 @@ from fastapi.testclient import TestClient
 
 from eyvan.config import EyvanSettings
 from eyvan.domain.models import InfeasibilityCode
-from eyvan.server.api.app import create_app
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.errors import AuthorizationError, NotFoundError
-from eyvan.server.service.models import (
+from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
@@ -28,6 +24,10 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     WorkloadState,
 )
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import AuthorizationError, NotFoundError
 from eyvan.server.service.scheduling import CoreSchedulingService
 
 

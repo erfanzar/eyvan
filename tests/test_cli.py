@@ -39,6 +39,7 @@ from eyvan.capacity.autoscale import (
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.config import EyvanSettings
+from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import get_active_context
 from eyvan.server.api.app import create_app
@@ -50,7 +51,6 @@ from eyvan.server.api.schemas import (
 )
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.server.service.models import CapacityClass, CapacityPoolRecord, CellRecord, CellState
 
 QueryValue: tp.TypeAlias = str | int | float | bool | None
 

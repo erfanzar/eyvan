@@ -24,6 +24,7 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
     canonical_execution_backend,
 )
+from eyvan.capacity.fleet_state import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
 from eyvan.capacity.providers.gcp import (
     ComputeProviderConfig,
     GcloudComputeProvider,
@@ -41,8 +42,7 @@ from eyvan.capacity.providers.gcp import (
 )
 from eyvan.capacity.providers.gcp.queued_resources import TpuProviderConfig, normalize_tpu_config
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
-from eyvan.server.service.models import NativeContainerConfig, NativeRuntimeConfig
+from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 
 
 class CapacityProvider(tp.Protocol):

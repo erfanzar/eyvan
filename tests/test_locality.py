@@ -30,10 +30,7 @@ from datetime import timedelta
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.locality import DEFAULT_LOCALITY_TTL_S, build_index, preferred_cells_for
-from eyvan.server.service.models import (
+from eyvan.records import (
     CommandExecution,
     LeaseRecord,
     LeaseState,
@@ -46,6 +43,9 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.locality import DEFAULT_LOCALITY_TTL_S, build_index, preferred_cells_for
 
 _DATASET = "gs://acme/datasets/pile-v3"
 _MODEL = "gs://acme/checkpoints/llama-70b"

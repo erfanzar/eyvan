@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from eyvan.domain.pricing import PriceKey, PriceSample, PricingCatalog
-from eyvan.server.service.models import CapacityPoolRecord, CellRecord, utcnow
+from eyvan.records import CapacityPoolRecord, CellRecord, utcnow
 
 #: Resource dimension priced per accelerator. A TPU pool prices ``tpu`` and a GPU
 #: pool prices ``gpu``; CPU-only pools have no accelerator and are priced by their

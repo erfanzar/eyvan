@@ -12,10 +12,7 @@ import re
 import pytest
 
 from eyvan.capacity.planning import CapacityPlanner, CapacitySimulation, PoolDemand
-from eyvan.server.controller import EyvanController
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
     CellState,
@@ -29,6 +26,9 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     utcnow,
 )
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.scheduling import CoreSchedulingService
 
 

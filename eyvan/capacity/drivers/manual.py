@@ -34,7 +34,7 @@ from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CellCapabilities, CellObservation, MutationContext, StaleMutationError
-from eyvan.server.persistence.fleet import (
+from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
     FleetCellRecord,
     FleetStateStore,

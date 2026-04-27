@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
+from eyvan.records import CapacityClass
 from eyvan.sdk.client.jobs import AcceleratorConfig, CpuConfig, GpuConfig, TpuConfig
-from eyvan.server.service.models import CapacityClass
 
 
 @pytest.mark.parametrize(

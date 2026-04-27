@@ -1,0 +1,567 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Terminal release, billing, retention, and what capacity failures teach."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import timedelta
+
+from eyvan.capacity import (
+    CapacityStatus,
+)
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.domain import (
+    CapacityBelief,
+    CapacityPoolKey,
+    ProvisionOutcome,
+)
+from eyvan.records import (
+    AuditEvent,
+    AutoscaleBlockReason,
+    CapacityBeliefState,
+    CellRecord,
+    CellState,
+    GcpQueueAdmissionDenialTarget,
+    LeaseRecord,
+    LeaseState,
+    OutboxRecord,
+    WorkloadRecord,
+    WorkloadState,
+    utcnow,
+)
+from eyvan.server.controller._support import (
+    _LIVE_WORKLOAD_STATES,
+    StaleOutboxCommand,
+    _provider_phase_start,
+    logger,
+)
+from eyvan.server.persistence.base import RepositorySession
+from eyvan.server.service.errors import ConflictError, NotFoundError
+from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
+from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
+
+
+class _ControllerSettlement:
+    """Terminal release, billing, retention, and what capacity failures teach.
+
+    A concern of :class:`~eyvan.server.controller.EyvanController`; not
+    instantiated on its own.
+    """
+
+    async def _release_terminal(
+        self,
+        workload: WorkloadRecord,
+        lease: LeaseRecord,
+        target: WorkloadState,
+        action: str,
+        *,
+        failure_reason: str | None = None,
+    ) -> None:
+        if workload.lease_id != lease.id:
+            raise StaleOutboxCommand(f"lease {lease.id!r} no longer owns workload {workload.id!r}")
+        await self.service.settle_terminal_workload(
+            self._principal,
+            workload.id,
+            target,
+            action=action,
+            failure_reason=failure_reason,
+            expected_generation=workload.generation,
+            expected_lease_id=lease.id,
+            expected_state=workload.state,
+        )
+
+    async def _record_capacity_stockout(self, cell: CellRecord) -> None:
+        """Persist a STOCKOUT belief for a cell reclaimed before it ever became READY.
+
+        Guarded on the cell's generation so a concurrent recreate does not have its
+        fresh belief overwritten by this late write.
+        """
+
+        availability = self._observe_capacity_belief(cell, ProvisionOutcome.STOCKOUT)
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_cell(cell.id)
+            if current is None or current.generation != cell.generation:
+                return
+            await transaction.put_cell(current.model_copy(update={"availability": availability, "updated_at": utcnow()}))
+
+    @staticmethod
+    def _observe_capacity_belief(
+        cell: CellRecord,
+        outcome: ProvisionOutcome,
+        *,
+        latency_s: float | None = None,
+    ) -> CapacityBeliefState:
+        current = cell.availability
+        belief = CapacityBelief(
+            key=CapacityPoolKey(
+                provider=cell.provider,
+                project=cell.provider_project or "",
+                zone=cell.zone or cell.region,
+                accelerator_type=cell.accelerator_type or "unknown",
+                capacity_class=cell.capacity_class.value,
+            ),
+            success_evidence=current.success_evidence,
+            failure_evidence=current.failure_evidence,
+            provision_latencies_s=current.provision_latencies_s,
+            interruptions=current.interruptions,
+            successful_hours=current.successful_hours,
+            consecutive_failures=current.consecutive_failures,
+            cooldown_until=current.cooldown_until,
+            last_observed_at=current.last_observed_at,
+        ).observe(outcome, latency_s=latency_s)
+        return CapacityBeliefState(
+            success_evidence=belief.success_evidence,
+            failure_evidence=belief.failure_evidence,
+            provision_latencies_s=belief.provision_latencies_s,
+            interruptions=belief.interruptions,
+            successful_hours=belief.successful_hours,
+            consecutive_failures=belief.consecutive_failures,
+            cooldown_until=belief.cooldown_until,
+            last_observed_at=belief.last_observed_at,
+        )
+
+    async def _record_capacity_failure(
+        self,
+        command: OutboxRecord,
+        error: str,
+        *,
+        failure_code: CapacityProviderFailureCode | None,
+    ) -> None:
+        transition: tuple[CellRecord, CellRecord] | None = None
+        async with self.repository.transaction() as transaction:
+            cell = await transaction.get_cell(command.aggregate_id)
+            if cell is None or cell.generation != command.generation or cell.state is not CellState.REGISTERING:
+                return
+            lowered = error.lower()
+            if failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
+                outcome = ProvisionOutcome.PROVIDER_ERROR
+            elif "quota" in lowered:
+                outcome = ProvisionOutcome.QUOTA_ERROR
+            elif "stockout" in lowered or "capacity" in lowered:
+                outcome = ProvisionOutcome.STOCKOUT
+            else:
+                outcome = ProvisionOutcome.PROVIDER_ERROR
+            observed_at = utcnow()
+            unavailable_reason = failure_code.value if failure_code is not None else "provider_failure"
+            updated = cell.model_copy(
+                update={
+                    "state": CellState.UNAVAILABLE,
+                    "provider_phase": CapacityStatus.PROVIDER_ERROR,
+                    "provider_failure_code": failure_code,
+                    "provider_phase_started_at": _provider_phase_start(
+                        cell,
+                        CapacityStatus.PROVIDER_ERROR,
+                        observed_at,
+                    ),
+                    "unavailable_reason": unavailable_reason,
+                    "availability": self._observe_capacity_belief(cell, outcome),
+                    "updated_at": observed_at,
+                }
+            )
+            await transaction.put_cell(updated)
+            if failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
+                await self._fail_autoscale_workload_for_queue_admission_denial(transaction, updated, error)
+            transition = cell, updated
+        if transition is not None:
+            self._capacity_lifecycle.transition(*transition, reason=error)
+
+    @staticmethod
+    async def _has_alternative_pool(
+        transaction: RepositorySession,
+        workload: WorkloadRecord,
+        *,
+        denied_cell: CellRecord,
+    ) -> bool:
+        """Return whether another enabled pool could still host this workload.
+
+        Deliberately coarse: it asks whether an *enabled pool of a different
+        shape* exists that the workload's declared portfolio admits, not whether
+        that pool has capacity right now. Capacity is what the next reconcile
+        cycle decides, and predicting it here would duplicate the planner while
+        being wrong more often.
+        """
+
+        spec = workload.spec
+        classes = {entry.value for entry in spec.capacity_class_portfolio}
+        accelerators = set(spec.allowed_accelerator_types) | (
+            {spec.accelerator_type} if spec.accelerator_type else set()
+        )
+        regions = set(spec.allowed_regions) | ({spec.region} if spec.region else set())
+        for pool in await transaction.list_capacity_pools():
+            if not pool.enabled or pool.id == denied_cell.pool_id:
+                continue
+            if str(pool.capacity_class) not in classes:
+                continue
+            if accelerators and pool.accelerator_type not in accelerators:
+                continue
+            if regions and pool.region not in regions:
+                continue
+            return True
+        return False
+
+    async def _fail_autoscale_workload_for_queue_admission_denial(
+        self,
+        transaction: RepositorySession,
+        cell: CellRecord,
+        diagnostic: str,
+    ) -> None:
+        """Block the pending workload that owns a denied queue request.
+
+        **Terminal only when this pool was the last option.** A denial says this
+        *shape in this zone* is unavailable; with a portfolio the workload has
+        other admissible pools, and failing it outright discards a run the fleet
+        could still place. When another pool remains, the workload stays PENDING
+        with ``autoscale_block_reason`` set for explainability, and the ordinary
+        reconcile cycle tries the next-best pool -- which is machinery that
+        already ships, because ``cell_provides_pool_supply`` stops counting a
+        failed cell as supply and ``CapacitySimulation.build`` already generates a
+        candidate per admissible pool.
+        """
+
+        workload_id = cell.autoscale_request_workload_id
+        if workload_id is None:
+            return
+        workload = await transaction.get_workload(workload_id)
+        if workload is None or workload.state is not WorkloadState.PENDING:
+            return
+        failure_reason = safe_provider_diagnostic(diagnostic)
+        if await self._has_alternative_pool(transaction, workload, denied_cell=cell):
+            # Not terminal. Record why this attempt stalled so ``workload explain``
+            # can say "one pool refused, others remain" rather than going quiet.
+            await transaction.put_workload(
+                workload.model_copy(
+                    update={
+                        "autoscale_block_reason": AutoscaleBlockReason.QUEUE_ADMISSION_DENIED,
+                        "scheduling_reason": (f"{failure_reason}; other admissible pools remain, waiting to retry"),
+                        "updated_at": utcnow(),
+                    }
+                )
+            )
+            return
+        project = cell.provider_project
+        zone = cell.zone
+        accelerator_type = cell.accelerator_type
+        target = (
+            None
+            if cell.provider != "gcp" or project is None or zone is None or accelerator_type is None
+            else GcpQueueAdmissionDenialTarget(
+                provider_project=project,
+                zone=zone,
+                accelerator_type=accelerator_type,
+                capacity_class=cell.capacity_class,
+            )
+        )
+        await self.service._transition_workload(
+            transaction,
+            self._principal,
+            workload,
+            WorkloadState.FAILED,
+            "workload.queue_admission_denied",
+            updates={
+                "failure_reason": failure_reason,
+                "autoscale_block_reason": AutoscaleBlockReason.QUEUE_ADMISSION_DENIED,
+                "queue_admission_denial": target,
+                "scheduling_reason": None,
+            },
+        )
+
+    async def _record_cell_agent_fence_conflict(
+        self,
+        *,
+        cell_id: str,
+        generation: int,
+        diagnostic: str,
+    ) -> None:
+        """Mark a cell for replacement without treating an agent fence conflict as cloud failure."""
+
+        transition: tuple[CellRecord, CellRecord] | None = None
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_cell(cell_id)
+            if (
+                current is None
+                or current.generation != generation
+                or current.state not in {CellState.REGISTERING, CellState.READY, CellState.UNAVAILABLE}
+            ):
+                return
+            observed_at = utcnow()
+            updated = current.model_copy(
+                update={
+                    "state": CellState.UNAVAILABLE,
+                    "provider_phase": CapacityStatus.NEEDS_RECREATE,
+                    "provider_phase_started_at": _provider_phase_start(
+                        current,
+                        CapacityStatus.NEEDS_RECREATE,
+                        observed_at,
+                    ),
+                    "unavailable_reason": "agent_fence_conflict",
+                    "unavailable_detail": diagnostic[:2048],
+                    "availability": self._observe_capacity_belief(current, ProvisionOutcome.INTERRUPTED),
+                    "updated_at": observed_at,
+                }
+            )
+            await transaction.put_cell(updated)
+            transition = current, updated
+        if transition is not None:
+            self._capacity_lifecycle.transition(*transition, reason=diagnostic)
+        if transition is None:
+            return
+        _previous, unavailable = transition
+        if unavailable.pool_id is not None:
+            return
+        try:
+            recreated, replayed = await self.service.recreate_cell(
+                self._principal,
+                unavailable.id,
+                expected_generation=unavailable.generation,
+                idempotency_key=f"agent-fence-recreate:{unavailable.id}:g{unavailable.generation}",
+            )
+        except (ConflictError, NotFoundError) as exc:
+            logger.info(
+                "cell %s will wait for lease-safe recreation after an agent fence conflict: %s", unavailable.id, exc
+            )
+            return
+        if not replayed:
+            self._capacity_lifecycle.transition(
+                unavailable,
+                recreated,
+                reason="cell-agent fence conflict requested a fresh capacity generation",
+            )
+
+    async def accrue_cell_billing_once(self) -> int:
+        """Advance the fleet's cell billing clocks and return the cells charged.
+
+        Delegates the arithmetic to the service so the accrual runs in one
+        transaction with the lease read that decides which cells were idle -- a
+        lease released between the two reads would otherwise make a busy cell
+        look idle for the whole interval.
+        """
+
+        accrual = await self.service.accrue_cell_billing()
+        if accrual.idle_seconds > 0:
+            logger.debug(
+                "Accrued %.0fs across %d cells, %.0fs idle (%.4f idle cost)",
+                accrual.accrued_seconds,
+                accrual.cells,
+                accrual.idle_seconds,
+                accrual.idle_cost,
+            )
+        return accrual.cells
+
+    async def settle_orphaned_workloads_once(self) -> int:
+        """Settle a live workload whose lease or cell row no longer exists.
+
+        ``observe_workloads_once`` skips such a workload -- it cannot observe what it
+        cannot resolve -- so without this it stays RUNNING forever: never polled,
+        never settled, and counted against its project's quota, budget and fair share
+        while holding no capacity at all. One hand-repaired or lost row therefore
+        permanently shrinks a tenant's effective quota.
+
+        Guarded by a grace period rather than firing on the first miss. Nothing should
+        write a workload and its lease in separate transactions -- dispatch commits
+        both together -- but settling a workload is irreversible, so requiring the
+        condition to persist past the lease TTL costs one cycle and removes the whole
+        class of "a race made this look orphaned".
+        """
+
+        grace = timedelta(seconds=max(self.settings.lease_ttl_s, 1))
+        now = utcnow()
+        async with self.repository.transaction() as transaction:
+            live = [
+                workload
+                for workload in await transaction.list_workloads()
+                if workload.state in _LIVE_WORKLOAD_STATES and now - workload.updated_at > grace
+            ]
+            lease_ids = {lease.id for lease in await transaction.list_leases()}
+            cell_ids = {cell.id for cell in await transaction.list_cells()}
+            leases_by_id = {lease.id: lease for lease in await transaction.list_leases()}
+
+        orphans: list[tuple[WorkloadRecord, str]] = []
+        for workload in live:
+            members = self._workload_lease_ids(workload)
+            if not members:
+                continue
+            missing_leases = sorted(set(members) - lease_ids)
+            if missing_leases:
+                orphans.append((workload, f"lease {missing_leases[0]!r} no longer exists"))
+                continue
+            missing_cells = sorted(
+                {leases_by_id[lease_id].cell_id for lease_id in members} - cell_ids,
+            )
+            if missing_cells:
+                orphans.append((workload, f"cell {missing_cells[0]!r} no longer exists"))
+
+        settled = 0
+        for workload, reason in orphans:
+            try:
+                await self.service.settle_terminal_workload(
+                    self._principal,
+                    workload.id,
+                    WorkloadState.FAILED,
+                    action="workload.orphaned",
+                    failure_reason=f"workload is unobservable: {reason}",
+                    expected_generation=workload.generation,
+                    expected_state=workload.state,
+                    settle_without_leases=True,
+                )
+            except (ConflictError, NotFoundError) as exc:
+                # It recovered or moved on between the scan and the write; the next
+                # cycle re-evaluates from fresh state. Logged rather than silently
+                # skipped: a sweep that exists to clear stuck workloads must not be
+                # able to fail quietly at the one step that clears them.
+                logger.warning("orphan sweep could not settle workload %s: %s", workload.id, exc)
+                continue
+            settled += 1
+        return settled
+
+    async def quarantine_expired_leases_once(self) -> int:
+        """Fence expired leases without killing work or reallocating ambiguous capacity."""
+
+        now = utcnow()
+        changed = 0
+        async with self.repository.transaction() as transaction:
+            candidate_ids = [
+                lease.id
+                for lease in await transaction.list_leases()
+                if lease.state in {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING}
+                and lease.expires_at <= now
+            ]
+        for lease_id in candidate_ids:
+            async with self.repository.transaction() as transaction:
+                lease = await transaction.get_lease(lease_id)
+                if lease is None:
+                    continue
+                if lease.state not in {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING}:
+                    continue
+                if lease.expires_at > now:
+                    continue
+                await transaction.put_lease(
+                    lease.model_copy(update={"state": LeaseState.QUARANTINED, "updated_at": now})
+                )
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        org_id=lease.org_id,
+                        project_id=lease.project_id,
+                        entity_type="lease",
+                        entity_id=lease.id,
+                        action="lease.quarantined",
+                        previous_state=lease.state.value,
+                        new_state=LeaseState.QUARANTINED.value,
+                    )
+                )
+                changed += 1
+        return changed
+
+    async def settle_coordinator_workloads_once(self) -> int:
+        """Derive a batch parent's terminal state from its children.
+
+        A coordinator never holds a lease, so nothing else can ever settle it --
+        it would sit PENDING forever while all 500 of its tasks succeeded, and
+        every listing would report the array as still queued.
+
+        The mapping is deliberately pessimistic: one failed task fails the
+        array, because a partial array is not a result. A cancelled task without
+        any failure reports CANCELLED, which is what the cascade produced.
+        """
+
+        settled = 0
+        async with self.repository.transaction() as transaction:
+            # Filtered on the indexed state column rather than scanning every
+            # workload the fleet has ever run. This is a leader hot-path phase, and
+            # the terminal records it used to read back are the fastest-growing table
+            # in the system. Narrowing ``coordination_kind`` itself needs a typed
+            # column and is deferred to the coordination-columns migration; PENDING
+            # alone already removes the unbounded part.
+            candidate_ids = [
+                workload.id
+                for workload in await transaction.list_workloads(state=WorkloadState.PENDING)
+                if workload.coordination_kind is not None
+            ]
+        for workload_id in candidate_ids:
+            async with self.repository.transaction() as transaction:
+                parent = await transaction.get_workload(workload_id)
+                if parent is None or parent.coordination_kind is None or parent.state is not WorkloadState.PENDING:
+                    continue
+                children = await transaction.list_child_workloads(workload_id)
+                if not children or any(child.state not in TERMINAL_WORKLOAD_STATES for child in children):
+                    continue
+                states = {child.state for child in children}
+                if WorkloadState.FAILED in states:
+                    target = WorkloadState.FAILED
+                elif WorkloadState.CANCELLED in states:
+                    target = WorkloadState.CANCELLED
+                else:
+                    target = WorkloadState.SUCCEEDED
+                await transaction.put_workload(
+                    parent.model_copy(
+                        update={
+                            "state": target,
+                            "scheduling_reason": (
+                                f"{parent.coordination_kind.value} of {len(children)} members settled"
+                            ),
+                            "updated_at": utcnow(),
+                        }
+                    )
+                )
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        org_id=parent.org_id,
+                        project_id=parent.project_id,
+                        entity_type="workload",
+                        entity_id=parent.id,
+                        action="workload.batch_settled",
+                        previous_state=parent.state.value,
+                        new_state=target.value,
+                    )
+                )
+                settled += 1
+        return settled
+
+    async def prune_retained_state_once(self) -> dict[str, int]:
+        """Delete state past its retention window and report what was removed.
+
+        Runs leader-only and in bounded batches. A window of ``0`` disables
+        pruning for that table, preserving the historical behaviour where
+        nothing was ever deleted -- which also meant an idempotency key was
+        honored forever, so a caller reusing one months later silently replayed
+        the original response instead of acting.
+        """
+
+        now = utcnow()
+        windows = (
+            ("outbox", self.settings.outbox_retention_s, "prune_outbox"),
+            ("audit_events", self.settings.audit_retention_s, "prune_events"),
+            ("idempotency_keys", self.settings.idempotency_retention_s, "prune_idempotency"),
+        )
+        removed: dict[str, int] = {}
+        failures: list[str] = []
+        for name, retention_s, method in windows:
+            if retention_s <= 0:
+                continue
+            cutoff = now - timedelta(seconds=retention_s)
+            try:
+                async with self.repository.transaction() as transaction:
+                    prune = getattr(transaction, method)
+                    count = await prune(before=cutoff, limit=self.settings.retention_batch_limit)
+            except Exception as exc:  # one broken window must not mask the rest
+                # These windows are independent tables with independent hazards.
+                # Aborting the loop on the first failure is how a backend that
+                # could not prune audit events also stopped pruning idempotency
+                # keys -- so replays kept being honored forever, silently.
+                failures.append(f"{name}: {exc}")
+                logger.exception("retention pruning failed for %s", name)
+                continue
+            if count:
+                removed[name] = count
+        if removed:
+            logger.info("retention pruned %s", ", ".join(f"{name}={count}" for name, count in sorted(removed.items())))
+        if failures:
+            raise RuntimeError("retention pruning incomplete: " + "; ".join(failures))
+        return removed

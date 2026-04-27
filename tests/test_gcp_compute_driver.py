@@ -12,10 +12,10 @@ import pytest
 from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.capacity.drivers.base import CapacityStatus, MutationContext, StaleMutationError
 from eyvan.capacity.drivers.gcp import GcpCapacityDriver, GcpComputeCapacityDriver, GcpTpuCapacityDriver
+from eyvan.capacity.fleet_state import FleetCellRecord, FleetStateStore, LocalBackend
 from eyvan.capacity.providers.gcp import GcsArtifactBucket, ProviderObservation, compute_instance_name
 from eyvan.capacity.providers.gcp.queued_resources import GcloudError
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetCellRecord, FleetStateStore, LocalBackend
 from eyvan.worker.agent.service import CellAgentService
 from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
 

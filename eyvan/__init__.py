@@ -41,7 +41,7 @@ __all__ = (
     "execute",
     "init",
 )
-__version__ = "0.1.0"
+from eyvan._version import __version__
 
 _Export = tp.TypeVar("_Export")
 

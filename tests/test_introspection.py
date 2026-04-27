@@ -14,7 +14,7 @@ from test_container_executor import FakeDockerSystemd  # reuse the stateful dock
 from test_systemd_transient import FakeSystemd  # reuse the stateful systemd seam
 
 from eyvan.capacity.drivers.base import MutationContext
-from eyvan.server.service.models import NativeContainerConfig
+from eyvan.records import NativeContainerConfig
 from eyvan.worker.runtime.container import DockerContainerExecutor
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 from eyvan.worker.runtime.native_slice import NativeSliceExecutor

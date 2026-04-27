@@ -15,10 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.errors import ConflictError, NotFoundError
-from eyvan.server.service.models import (
+from eyvan.records import (
     CommandExecution,
     Principal,
     ResourceGang,
@@ -29,6 +26,9 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import ConflictError, NotFoundError
 from eyvan.server.service.subjobs import (
     MAX_JOB_TREE_DEPTH,
     JobTreeError,
@@ -288,9 +288,9 @@ async def test_a_tree_too_deep_to_walk_can_still_be_cancelled_alone() -> None:
     workload was permanently un-cancellable and held its lease forever.
     """
 
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadState
     from eyvan.server.persistence import InMemoryRepository
     from eyvan.server.service import ControlPlaneService
-    from eyvan.server.service.models import CommandExecution, WorkloadDefinition, WorkloadState
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)

@@ -15,12 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.batch import BatchError, BatchRequest, expand
-from eyvan.server.service.control_plane import _capacity_apply_payload
-from eyvan.server.service.errors import ConflictError
-from eyvan.server.service.models import (
+from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
@@ -32,6 +27,11 @@ from eyvan.server.service.models import (
     WorkloadDefinition,
     WorkloadState,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.batch import BatchError, BatchRequest, expand
+from eyvan.server.service.control_plane import _capacity_apply_payload
+from eyvan.server.service.errors import ConflictError
 
 
 def _principal() -> Principal:

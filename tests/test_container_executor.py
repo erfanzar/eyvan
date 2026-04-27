@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
-from eyvan.server.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.records import NativeContainerConfig, NativeContainerMount
 from eyvan.worker.runtime.container import DockerContainerExecutor, docker_container_name
 from eyvan.worker.runtime.oci_callable_stager import (
     OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY,

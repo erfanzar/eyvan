@@ -17,9 +17,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from eyvan._internal.json_types import JsonObject, model_json
-from eyvan.server.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
-from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow
-from eyvan.server.service.models import (
+from eyvan.records import (
     AuditEvent,
     BudgetRecord,
     CapacityPoolRecord,
@@ -37,6 +35,8 @@ from eyvan.server.service.models import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
+from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow
 
 
 def _legacy_multislice_cell() -> JsonObject:

@@ -34,7 +34,7 @@ from eyvan.capacity.autoscale.models import (
     QuotaSnapshot,
 )
 from eyvan.capacity.fleet_config import EyvanFleetConfig, NodeType, TpuNodeType
-from eyvan.server.service.models import CapacityClass
+from eyvan.records import CapacityClass
 
 GeneratedAutoscale = GeneratedAutoscaleConfig | GeneratedZoneAutoscaleConfig
 

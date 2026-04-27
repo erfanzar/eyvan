@@ -38,9 +38,9 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import dataclass
 
+from eyvan.records import WorkloadDefinition
 from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 from eyvan.server.service.errors import InputError
-from eyvan.server.service.models import WorkloadDefinition
 
 #: Most members one group may declare, counting every replica of every role. The
 #: gate evaluates all of them together on the leader's hot path, so the bound is

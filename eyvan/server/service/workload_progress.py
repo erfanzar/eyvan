@@ -11,9 +11,7 @@ from dataclasses import dataclass
 
 from eyvan.capacity import PENDING_CAPACITY_STATUSES, QUEUED_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
-from eyvan.server.persistence.base import Repository
-from eyvan.server.service.control_plane import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CapacityRetryProgress,
     CellRecord,
@@ -31,6 +29,8 @@ from eyvan.server.service.models import (
     WorkloadState,
     scale_resources,
 )
+from eyvan.server.persistence.base import Repository
+from eyvan.server.service.control_plane import ControlPlaneService
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 

@@ -48,6 +48,32 @@ from eyvan.artifacts.managed import (
 from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.records import (
+    ArtifactReferenceRecord,
+    ArtifactUsage,
+    AuditEvent,
+    BudgetRecord,
+    BudgetStatus,
+    CallableExecution,
+    CapacityClass,
+    CapacityPoolRecord,
+    CellBillingReport,
+    CellRecord,
+    LeaseRecord,
+    ManagedArtifactRecord,
+    Permission,
+    PolicyRecord,
+    Principal,
+    QueueTrend,
+    QuotaRecord,
+    UserProgressReport,
+    WarmthReport,
+    WorkloadEstimate,
+    WorkloadExplanation,
+    WorkloadProgress,
+    WorkloadRecord,
+    WorkloadState,
+)
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.server.api.auth import OIDCTokenVerifier, RequestAuthenticator, TokenVerifier, authenticated_principal
@@ -103,32 +129,6 @@ from eyvan.server.service.errors import (
     NotFoundError,
 )
 from eyvan.server.service.groups import GroupRole
-from eyvan.server.service.models import (
-    ArtifactReferenceRecord,
-    ArtifactUsage,
-    AuditEvent,
-    BudgetRecord,
-    BudgetStatus,
-    CallableExecution,
-    CapacityClass,
-    CapacityPoolRecord,
-    CellBillingReport,
-    CellRecord,
-    LeaseRecord,
-    ManagedArtifactRecord,
-    Permission,
-    PolicyRecord,
-    Principal,
-    QueueTrend,
-    QuotaRecord,
-    UserProgressReport,
-    WarmthReport,
-    WorkloadEstimate,
-    WorkloadExplanation,
-    WorkloadProgress,
-    WorkloadRecord,
-    WorkloadState,
-)
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
 

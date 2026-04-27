@@ -14,9 +14,9 @@ from fastapi.testclient import TestClient
 
 from eyvan.artifacts.managed import ArtifactAction, InvalidArtifactToken, callable_uri, result_uri
 from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.records import CallableExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
 from eyvan.server.api.app import create_app
 from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service.models import CallableExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
 from eyvan.worker.runtime.results import dump_result
 
 

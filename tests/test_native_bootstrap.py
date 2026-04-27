@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from eyvan.capacity.drivers.base import CapacityStatus, CellObservation
-from eyvan.server.service.models import NativeContainerConfig, NativeContainerMount
+from eyvan.records import NativeContainerConfig, NativeContainerMount
 from eyvan.worker.runtime import ConfiguredExecutionResolver, ExecutionRuntimeRegistry
 from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
 from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor

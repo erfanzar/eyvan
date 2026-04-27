@@ -24,9 +24,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from eyvan._internal.compat import UTC
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.models import (
+from eyvan.records import (
     CapacityClass,
     CapacityPoolRecord,
     CellRecord,
@@ -42,6 +40,8 @@ from eyvan.server.service.models import (
     WarmWindow,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
 
 #: A Wednesday, inside a weekday 08:00-18:00 window.
 _WORKDAY = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)

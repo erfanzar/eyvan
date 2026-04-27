@@ -34,7 +34,7 @@ from eyvan.capacity.autoscale import (
     tpu_profile_from_accelerator_type,
 )
 from eyvan.capacity.fleet_config import EyvanFleetConfig
-from eyvan.server.service.models import CapacityClass
+from eyvan.records import CapacityClass
 
 
 def _json_object(value: JsonValue) -> JsonObject:

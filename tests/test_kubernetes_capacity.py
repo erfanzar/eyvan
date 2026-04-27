@@ -28,6 +28,7 @@ from eyvan._internal.json_types import JsonObject
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, MutationContext, StaleMutationError
 from eyvan.capacity.drivers.kubernetes import MAX_WORKERS, KubernetesCapacityDriver
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.capacity.providers.kubernetes.api import JobStatus, capacity_state, interpret_job
 from eyvan.capacity.providers.kubernetes.kueue import foreign_workloads, inspect_cluster_queue
 from eyvan.capacity.providers.kubernetes.workers import (
@@ -42,7 +43,6 @@ from eyvan.capacity.providers.kubernetes.workers import (
     secret_manifest,
     worker_endpoints,
 )
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 
 _TOKEN = "fencing-token-abcdef"
 

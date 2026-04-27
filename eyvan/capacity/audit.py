@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity import DEFINITIVE_CAPACITY_LOSS_STATUSES, CapacityStatus
-from eyvan.server.service.models import CellRecord, CellState
+from eyvan.records import CellRecord, CellState
 
 
 class CapacityLifecycleEvent(StrEnum):

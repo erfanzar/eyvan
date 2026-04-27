@@ -15,6 +15,13 @@ import pytest
 
 import eyvan
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
+from eyvan.records import (
+    CapacityClass,
+    CommandExecution,
+    WorkloadDefinition,
+    WorkloadRecord,
+    WorkloadState,
+)
 from eyvan.sdk import EyvanCallableSubmitter
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.execution import (
@@ -27,13 +34,6 @@ from eyvan.sdk.execution import (
     TpuConfig,
     execute,
     init,
-)
-from eyvan.server.service.models import (
-    CapacityClass,
-    CommandExecution,
-    WorkloadDefinition,
-    WorkloadRecord,
-    WorkloadState,
 )
 from eyvan.worker.runtime.callables import CallableArtifact, dump_callable, load_callable
 

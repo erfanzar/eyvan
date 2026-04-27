@@ -12,8 +12,7 @@ import pytest
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_value
 from eyvan.domain import InfeasibilityCode
-from eyvan.server.api.schemas import BudgetPutRequest, QuotaPutRequest
-from eyvan.server.service.models import (
+from eyvan.records import (
     WORKER_COUNT_LABEL,
     BudgetRecord,
     CapacityPoolRecord,
@@ -36,6 +35,7 @@ from eyvan.server.service.models import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.api.schemas import BudgetPutRequest, QuotaPutRequest
 from eyvan.server.service.scheduling import CoreSchedulingService, to_core_quota
 
 

@@ -21,8 +21,8 @@ import eyvan.sdk.client.sync as sync_module
 import eyvan.sdk.execution as execution_module
 from eyvan._internal.workspace import build_workspace
 from eyvan.artifacts import LocalArtifactStore
+from eyvan.records import CallableExecution
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
-from eyvan.server.service.models import CallableExecution
 from eyvan.worker.runtime.callable_protocol import execute_callable
 from eyvan.worker.runtime.callables import dump_callable
 

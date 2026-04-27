@@ -13,10 +13,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from eyvan.server.api.server_startup import ServerControllerMode
-from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
-from eyvan.server.service.errors import ServiceErrorCode
-from eyvan.server.service.models import (
+from eyvan.records import (
     DEFAULT_MAX_RETRIES,
     BudgetRecord,
     CallableExecution,
@@ -34,6 +31,9 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkspaceRef,
 )
+from eyvan.server.api.server_startup import ServerControllerMode
+from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
+from eyvan.server.service.errors import ServiceErrorCode
 
 
 class ApiModel(BaseModel):

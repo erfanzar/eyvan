@@ -14,8 +14,8 @@ import pytest
 from eyvan._internal.json_types import JsonValue
 from eyvan.capacity.drivers.base import CapacityStatus, ExecutionWorkloadStatus, MutationContext
 from eyvan.capacity.drivers.local import LocalCapacityDriver
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.config import EyvanSettings
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
 from eyvan.worker.agent.models import CapacityRequest, MutationModel, WorkloadRequest
 from eyvan.worker.agent.service import CellAgentService
 

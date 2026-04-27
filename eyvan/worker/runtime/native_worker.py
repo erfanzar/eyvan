@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionDriver, ExecutionWorkloadReport, MutationContext, StaleMutationError
-from eyvan.server.service.models import NativeContainerConfig, NativeRuntimeConfig
+from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 from eyvan.worker.agent.models import (
     CheckpointRequest,
     MutationConflictCode,

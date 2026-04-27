@@ -33,12 +33,7 @@ from fastapi.testclient import TestClient
 
 from eyvan.artifacts.managed import callable_uri, result_uri, workspace_uri
 from eyvan.config import EyvanSettings
-from eyvan.server.api.app import create_app
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.errors import InputError, NotFoundError
-from eyvan.server.service.models import (
+from eyvan.records import (
     ArtifactReferenceRecord,
     CallableExecution,
     CommandExecution,
@@ -53,6 +48,11 @@ from eyvan.server.service.models import (
     WorkloadState,
     artifact_reference_id,
 )
+from eyvan.server.api.app import create_app
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import InputError, NotFoundError
 
 _DIGEST = "a" * 64
 _OTHER_DIGEST = "b" * 64

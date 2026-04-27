@@ -17,8 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan._internal.json_types import JsonValue
 from eyvan.config import EyvanSettings
+from eyvan.records import Principal, Role, RoleGrant
 from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredential
-from eyvan.server.service.models import Principal, Role, RoleGrant
 
 
 class _OIDCDiscovery(BaseModel):

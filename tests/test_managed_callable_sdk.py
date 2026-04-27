@@ -21,12 +21,7 @@ from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.capacity.providers.gcp.runtime.supervisor import GcpRuntimeResult, LocalAgentResult, LocalAgentState
-from eyvan.sdk.client.callables import EyvanCallableSubmitter
-from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
-from eyvan.sdk.client.identity import ClientIdentity
-from eyvan.sdk.contexts import EyvanContext, set_active_context
-from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
-from eyvan.server.service.models import (
+from eyvan.records import (
     AutoscaleBlockReason,
     CallableExecution,
     CapacityClass,
@@ -35,6 +30,11 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.contexts import EyvanContext, set_active_context
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
 from eyvan.worker.agent.models import AgentCapabilities
 from eyvan.worker.runtime.results import dump_result
 

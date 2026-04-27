@@ -15,17 +15,7 @@ import httpx
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.artifacts import StoredCallableArtifact
 from eyvan.artifacts.managed import ManagedArtifactKind, parse_managed_uri
-from eyvan.sdk.client.identity import ClientIdentity
-from eyvan.sdk.client.requests import (
-    pool_callable_request,
-    pool_request_json,
-    pool_workload_request,
-    workload_list_params,
-)
-from eyvan.sdk.client.transport import SyncApiTransport
-from eyvan.sdk.client.types import HeaderMap, QueryParams
-from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadSubmitRequest
-from eyvan.server.service.models import (
+from eyvan.records import (
     DEFAULT_MAX_RETRIES,
     AuditEvent,
     BudgetRecord,
@@ -38,6 +28,16 @@ from eyvan.server.service.models import (
     WorkloadRecord,
     WorkloadState,
 )
+from eyvan.sdk.client.identity import ClientIdentity
+from eyvan.sdk.client.requests import (
+    pool_callable_request,
+    pool_request_json,
+    pool_workload_request,
+    workload_list_params,
+)
+from eyvan.sdk.client.transport import SyncApiTransport
+from eyvan.sdk.client.types import HeaderMap, QueryParams
+from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.callables import CallableArtifact
 

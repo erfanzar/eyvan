@@ -46,13 +46,13 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from eyvan._internal.json_types import model_json
-from eyvan.server.persistence.sqlalchemy import IdempotencyRow, SqlAlchemyRepository, create_schema
-from eyvan.server.service.models import (
+from eyvan.records import (
     IdempotencyRecord,
     OutboxRecord,
     OutboxState,
     utcnow,
 )
+from eyvan.server.persistence.sqlalchemy import IdempotencyRow, SqlAlchemyRepository, create_schema
 
 
 @pytest.fixture
@@ -234,8 +234,8 @@ async def test_one_unreadable_row_does_not_hide_every_other_workload(repository,
 
     from sqlalchemy import update
 
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
     from eyvan.server.persistence.sqlalchemy import WorkloadRow
-    from eyvan.server.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
 
     def _workload(workload_id: str) -> WorkloadRecord:
         return WorkloadRecord(
@@ -270,8 +270,8 @@ async def test_a_corrupt_row_is_skipped_rather_than_guessed_at(repository) -> No
 
     from sqlalchemy import update
 
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
     from eyvan.server.persistence.sqlalchemy import WorkloadRow
-    from eyvan.server.service.models import CommandExecution, WorkloadDefinition, WorkloadRecord
 
     async with repository.transaction() as transaction:
         await transaction.put_workload(

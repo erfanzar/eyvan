@@ -17,7 +17,7 @@ import typing as tp
 from pathlib import PurePosixPath
 
 from eyvan._internal.json_types import JsonObject, model_json
-from eyvan.server.service.models import NativeContainerConfig, NativeRuntimeConfig
+from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WORKLOAD_RUNTIME_ENVIRONMENT = "/etc/eyvan-native/workload-runtime.json"

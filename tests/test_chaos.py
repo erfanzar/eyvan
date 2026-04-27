@@ -48,11 +48,8 @@ import pytest
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import MutationContext, StaleMutationError
 from eyvan.capacity.drivers.manual import ManualCapacityDriver
-from eyvan.server.persistence import InMemoryRepository
-from eyvan.server.persistence.fleet import FleetStateStore, LocalBackend
-from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.errors import ConflictError
-from eyvan.server.service.models import (
+from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
+from eyvan.records import (
     CommandExecution,
     OutboxRecord,
     OutboxState,
@@ -65,6 +62,9 @@ from eyvan.server.service.models import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.persistence import InMemoryRepository
+from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import ConflictError
 
 
 def _principal() -> Principal:
@@ -317,7 +317,7 @@ async def test_a_failover_between_cycles_does_not_double_settle_a_lease() -> Non
     charge the budget twice.
     """
 
-    from eyvan.server.service.models import BudgetRecord
+    from eyvan.records import BudgetRecord
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -363,8 +363,8 @@ async def test_a_provider_outage_does_not_discard_the_capacity_command() -> None
     """
 
     from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+    from eyvan.records import CellRecord, CellState
     from eyvan.server.controller import EyvanController
-    from eyvan.server.service.models import CellRecord, CellState
     from eyvan.worker.agent.client import CellAgentCapacityProviderError
 
     class OutageAgent:
@@ -413,7 +413,7 @@ def test_a_foreign_fleet_document_is_refused_rather_than_overwritten(tmp_path) -
 
     import json
 
-    from eyvan.server.persistence.fleet import FleetStateSchemaError
+    from eyvan.capacity.fleet_state import FleetStateSchemaError
 
     path = tmp_path / "foreign.json"
     path.write_text(json.dumps({"some_other_tool": {"clusters": []}}), encoding="utf-8")
@@ -431,7 +431,7 @@ def test_a_malformed_generation_is_refused_rather_than_coerced(tmp_path) -> None
 
     import json
 
-    from eyvan.server.persistence.fleet import FleetStateSchemaError
+    from eyvan.capacity.fleet_state import FleetStateSchemaError
 
     path = tmp_path / "corrupt.json"
     path.write_text(
@@ -456,8 +456,8 @@ async def test_a_workload_whose_lease_vanished_is_settled_rather_than_stranded()
     One lost row would permanently shrink a tenant's effective quota.
     """
 
+    from eyvan.records import CellRecord, CellState, LeaseRecord, LeaseState
     from eyvan.server.controller import EyvanController
-    from eyvan.server.service.models import CellRecord, CellState, LeaseRecord, LeaseState
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -553,8 +553,8 @@ async def test_a_recently_updated_workload_is_not_swept_as_an_orphan() -> None:
 async def test_a_healthy_workload_is_never_swept() -> None:
     """The sweep must not settle a workload whose rows all resolve."""
 
+    from eyvan.records import CellRecord, CellState, LeaseRecord, LeaseState
     from eyvan.server.controller import EyvanController
-    from eyvan.server.service.models import CellRecord, CellState, LeaseRecord, LeaseState
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -630,8 +630,8 @@ async def test_an_unanswerable_agent_does_not_retire_queued_capacity() -> None:
     """
 
     from eyvan.capacity import CapacityStatus
+    from eyvan.records import CellRecord, CellState
     from eyvan.server.controller import EyvanController
-    from eyvan.server.service.models import CellRecord, CellState
     from eyvan.worker.agent.client import CellAgentUnavailableError
 
     class SilentAgent:
@@ -698,8 +698,8 @@ async def test_a_rejected_fence_records_which_check_rejected_it() -> None:
     """
 
     from eyvan.capacity import CapacityStatus
+    from eyvan.records import CellRecord, CellState
     from eyvan.server.controller import EyvanController
-    from eyvan.server.service.models import CellRecord, CellState
     from eyvan.worker.agent.client import CellAgentStaleMutationError
 
     class TombstonedAgent:
