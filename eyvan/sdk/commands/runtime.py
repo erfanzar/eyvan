@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
+import eyvan
 from eyvan._internal.json_types import JsonObject
 from eyvan.capacity.autoscale import AutoscaleConfigCache, validate_gcp_project_id
 from eyvan.capacity.providers.gcp.runtime.bootstrap import (
@@ -139,7 +140,7 @@ class UvNativeWorkerWheelBuilder:
     ):
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
             raise ValueError("timeout_s must be a positive number")
-        self.package_root = (package_root or Path(__file__).resolve().parents[2]).resolve()
+        self.package_root = (package_root or _default_package_root()).resolve()
         self._runner = runner
         self.timeout_s = float(timeout_s)
         self._output_directory: Path | None = None
@@ -187,6 +188,21 @@ class UvNativeWorkerWheelBuilder:
         self._output_directory = None
         if output_directory is not None:
             shutil.rmtree(output_directory, ignore_errors=True)
+
+
+def _default_package_root() -> Path:
+    """Return the directory holding Eyvan's ``pyproject.toml``.
+
+    Anchored on the package rather than counted in parent hops: a hop encodes
+    how deep this module happens to sit, so regrouping the package silently
+    pointed ``uv build`` at a directory with no project file in it.
+    """
+
+    root = Path(eyvan.__file__).resolve().parent.parent
+    if (root / "pyproject.toml").is_file():
+        return root
+    # An installed wheel has no project file; the caller must supply the root.
+    return root
 
 
 @dataclass(frozen=True, slots=True)
