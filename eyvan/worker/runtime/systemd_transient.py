@@ -675,6 +675,18 @@ class SystemdTransientServiceExecutor:
             record["finished_at"] = _utcnow()
         record["updated_at"] = _utcnow()
 
+    def _indeterminacy_is_recoverable(self, record_path: Path) -> bool:
+        """Return whether this record's INDETERMINATE can still be resolved.
+
+        Reads the record rather than the observation, because recoverability is
+        a property of how the record was marked -- an earlier failed stop leaves
+        a workload whose unit is still observable and still stoppable.
+        """
+
+        with _file_lock(_record_lock_path(record_path)):
+            record = _load_json(record_path)
+        return record is not None and _is_recoverable_indeterminate(record)
+
     def _mark_indeterminate(self, record: JsonObject, message: str, *, recoverable: bool = False) -> None:
         current_status = _known_persisted_status(record)
         if current_status not in _FINAL_STATES or (
@@ -1218,9 +1230,23 @@ class SystemdTransientServiceExecutor:
                         self._validate_fence(remote_id, record, context)
                         self._retire_terminal_runtime(record)
                 return
-            if observed.status is ExecutionWorkloadStatus.INDETERMINATE:
+            if observed.status is ExecutionWorkloadStatus.INDETERMINATE and not self._indeterminacy_is_recoverable(
+                record_path
+            ):
                 raise RuntimeError(f"cannot safely retire ambiguous systemd execution {remote_id!r}")
-            self.stop(remote_id, context)
+            try:
+                self.stop(remote_id, context)
+            except Exception:
+                # A stop that fails now may well succeed on the next poll: a
+                # container can still be shutting down, and this loop already
+                # has a deadline. Aborting on the first failure would fail the
+                # supersession that called us, which is how one slow teardown
+                # permanently blocked the next generation of a workload from
+                # starting at all.
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(poll_s)
+                continue
             if time.monotonic() >= deadline:
                 break
             time.sleep(poll_s)
