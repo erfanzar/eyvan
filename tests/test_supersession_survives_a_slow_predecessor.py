@@ -110,7 +110,9 @@ def test_a_predecessor_that_never_dies_still_fails_the_retirement(tmp_path: Path
     executor = _executor(tmp_path, daemon)
     remote_id = executor.submit(_spec(), _context())
 
-    with pytest.raises(RuntimeError, match="before its timeout|ambiguous"):
+    # Specifically the deadline error: retirement kept trying and ran out of
+    # time, rather than giving up on the first failed stop.
+    with pytest.raises(RuntimeError, match="before its timeout"):
         executor.retire(remote_id, _context())
 
 

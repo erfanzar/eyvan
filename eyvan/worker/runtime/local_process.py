@@ -830,7 +830,13 @@ class LocalProcessExecutor:
             if status in _TERMINAL_STATES:
                 return
             if status is ExecutionWorkloadStatus.INDETERMINATE:
-                raise RuntimeError(f"cannot safely retire ambiguous native-local execution {remote_id!r}")
+                # Stop polling -- an INDETERMINATE record is not re-derived, so
+                # waiting cannot change it -- but fall through rather than
+                # raising here. Below is the SIGKILL that forces a workload of
+                # unknown state to terminal, and it is the recovery this very
+                # condition exists to trigger; raising first made it
+                # unreachable and left the successor unable to start.
+                break
             time.sleep(poll_s)
         current = _read_record(record_path)
         if current is not None and _owner_active(owner_path):
