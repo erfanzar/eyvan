@@ -130,7 +130,7 @@ def test_an_unrecoverably_ambiguous_record_is_still_refused(tmp_path: Path) -> N
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["status"] = ExecutionWorkloadStatus.INDETERMINATE.value
     record["message"] = "systemd execution record has no unit name"
-    record.pop("indeterminate_recoverable", None)
+    record["indeterminate_unrecoverable"] = True
     record_path.write_text(json.dumps(record), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="ambiguous systemd execution"):

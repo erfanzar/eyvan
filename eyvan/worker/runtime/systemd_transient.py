@@ -61,20 +61,27 @@ _RECOVERABLE_CGROUP_INDETERMINATE = "cannot observe systemd workload cgroup befo
 # but wrong when the runtime merely could not be reached at one instant: a stop
 # that failed leaves a workload whose unit is still observable, and latching then
 # makes the first transient failure permanent and strands the accelerator.
-_RECOVERABLE_INDETERMINATE_FIELD = "indeterminate_recoverable"
+_UNRECOVERABLE_INDETERMINATE_FIELD = "indeterminate_unrecoverable"
 
 
 def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
     """Return whether a later observation may still resolve this indeterminacy.
 
+    Recoverable is the default. The line is between "the thing is gone" and "I
+    could not look just now": a vanished unit or an unreadable record can never
+    be resolved by another observation, but a failed inspection or a failed stop
+    says nothing about the workload and must not latch -- latching it is what
+    turns one transient error into a stranded accelerator.
+
     Recorded as an explicit field rather than inferred from the message, because
     ``stop`` rewrites ``message`` while leaving the status in place -- a text
-    comparison silently stops matching at exactly the moment it is needed.
+    comparison silently stops matching at exactly the moment it is needed. The
+    *unrecoverable* case is the one stored, so records written before this
+    existed read as recoverable, which is the safe direction: recovery
+    re-derives from reality instead of assuming an answer.
     """
 
-    if record.get(_RECOVERABLE_INDETERMINATE_FIELD) is True:
-        return True
-    return record.get("message") == _RECOVERABLE_CGROUP_INDETERMINATE
+    return record.get(_UNRECOVERABLE_INDETERMINATE_FIELD) is not True
 
 
 _UNIT_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -668,7 +675,7 @@ class SystemdTransientServiceExecutor:
         record["status"] = status.value
         record["message"] = message
         if status is not ExecutionWorkloadStatus.INDETERMINATE:
-            record.pop(_RECOVERABLE_INDETERMINATE_FIELD, None)
+            record.pop(_UNRECOVERABLE_INDETERMINATE_FIELD, None)
         if status is ExecutionWorkloadStatus.RUNNING and record.get("started_at") is None:
             record["started_at"] = _utcnow()
         if status in _FINAL_STATES and previous not in _FINAL_STATES:
@@ -687,14 +694,14 @@ class SystemdTransientServiceExecutor:
             record = _load_json(record_path)
         return record is not None and _is_recoverable_indeterminate(record)
 
-    def _mark_indeterminate(self, record: JsonObject, message: str, *, recoverable: bool = False) -> None:
+    def _mark_indeterminate(self, record: JsonObject, message: str, *, recoverable: bool = True) -> None:
         current_status = _known_persisted_status(record)
         if current_status not in _FINAL_STATES or (
             current_status is ExecutionWorkloadStatus.INDETERMINATE and _is_recoverable_indeterminate(record)
         ):
             self._set_status(record, ExecutionWorkloadStatus.INDETERMINATE, message)
-            if recoverable:
-                record[_RECOVERABLE_INDETERMINATE_FIELD] = True
+            if not recoverable:
+                record[_UNRECOVERABLE_INDETERMINATE_FIELD] = True
 
     def _collect_terminal_unit(self, record: JsonObject) -> None:
         """Ask systemd to release a unit after its terminal record is durable."""
@@ -1105,12 +1112,16 @@ class SystemdTransientServiceExecutor:
 
                 unit_name = record.get("unit_name")
                 if not isinstance(unit_name, str) or not unit_name:
-                    self._mark_indeterminate(record, "systemd execution record has no unit name")
+                    self._mark_indeterminate(record, "systemd execution record has no unit name", recoverable=False)
                     _atomic_write_json(record_path, record)
                     return _durable_observation(remote_id, record)
                 outcome, properties, detail = self._show_unit(unit_name)
                 if outcome == "missing":
-                    self._mark_indeterminate(record, "systemd service disappeared before a terminal state was recorded")
+                    self._mark_indeterminate(
+                        record,
+                        "systemd service disappeared before a terminal state was recorded",
+                        recoverable=False,
+                    )
                 elif outcome == "unavailable" or properties is None:
                     self._mark_indeterminate(record, f"cannot observe systemd service: {detail}")
                 else:
@@ -1120,7 +1131,7 @@ class SystemdTransientServiceExecutor:
                     else:
                         self._set_status(record, status, message)
             except _InvalidDurableRecord as exc:
-                self._mark_indeterminate(record, f"invalid durable record: {exc}")
+                self._mark_indeterminate(record, f"invalid durable record: {exc}", recoverable=False)
             _atomic_write_json(record_path, record)
             self._collect_terminal_unit(record)
             _atomic_write_json(record_path, record)
@@ -1153,7 +1164,7 @@ class SystemdTransientServiceExecutor:
             # to a container that had already exited.
             unit_name = record.get("unit_name")
             if not isinstance(unit_name, str) or not unit_name:
-                self._mark_indeterminate(record, "systemd execution record has no unit name")
+                self._mark_indeterminate(record, "systemd execution record has no unit name", recoverable=False)
                 _atomic_write_json(record_path, record)
                 raise RuntimeError(f"cannot safely stop ambiguous systemd execution {remote_id!r}")
             record["stop_requested"] = True
@@ -1167,7 +1178,7 @@ class SystemdTransientServiceExecutor:
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to stop native runtime: {exc}", recoverable=True)
+                    self._mark_indeterminate(current, f"failed to stop native runtime: {exc}")
                     _atomic_write_json(record_path, current)
             raise RuntimeError(f"failed to stop native runtime for {remote_id!r}: {exc}") from exc
 
@@ -1178,7 +1189,7 @@ class SystemdTransientServiceExecutor:
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {exc}", recoverable=True)
+                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {exc}")
                     _atomic_write_json(record_path, current)
             raise RuntimeError(f"failed to finish native runtime stop for {remote_id!r}: {exc}") from exc
 
@@ -1191,7 +1202,7 @@ class SystemdTransientServiceExecutor:
         with _file_lock(_record_lock_path(record_path)):
             current = _load_json(record_path)
             if current is not None and _known_persisted_status(current) is ExecutionWorkloadStatus.INDETERMINATE:
-                current[_RECOVERABLE_INDETERMINATE_FIELD] = True
+                current.pop(_UNRECOVERABLE_INDETERMINATE_FIELD, None)
                 _atomic_write_json(record_path, current)
 
         observed = self.status(remote_id)

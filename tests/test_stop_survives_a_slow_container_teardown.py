@@ -157,7 +157,7 @@ def test_a_record_poisoned_by_an_older_build_is_still_recoverable(
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["status"] = ExecutionWorkloadStatus.INDETERMINATE.value
     record["message"] = "systemd stop requested by Eyvan"
-    record.pop("indeterminate_recoverable", None)
+    record.pop("indeterminate_unrecoverable", None)
     record_path.write_text(json.dumps(record), encoding="utf-8")
 
     executor.stop(remote_id, _context())
