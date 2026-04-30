@@ -137,9 +137,7 @@ def test_a_record_from_a_build_without_the_flag_reads_as_recoverable() -> None:
 def test_leaving_indeterminate_clears_the_flag(tmp_path: Path) -> None:
     """A stale unrecoverable marker must not outlive the state it described."""
 
-    systemd = FakeSystemd()
-    executor = _executor(tmp_path, systemd)
-    remote_id = executor.submit(_spec(), _context())
+    executor = _executor(tmp_path, FakeSystemd())
     record: dict = {}
     executor._set_status(record, ExecutionWorkloadStatus.INDETERMINATE, "unknown")
     record[_UNRECOVERABLE_INDETERMINATE_FIELD] = True
