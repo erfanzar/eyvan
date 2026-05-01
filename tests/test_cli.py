@@ -1728,6 +1728,11 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
         "provider": "gcp",
         "region": "us-east5",
         "required_executor": "ray-jobs",
+        # Priority is sent explicitly rather than left to the server default:
+        # without it the CLI could not express a job that preempts batch work,
+        # even though the scheduler ranks on exactly these two fields.
+        "priority_band": "interactive",
+        "intra_band_priority": 0,
         "checkpointable": False,
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,

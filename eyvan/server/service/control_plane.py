@@ -426,7 +426,27 @@ class ControlPlaneService:
             quotas=quotas,
             policies=policies,
         )
-        return _explain_from_scheduling_result(workload, result)
+        explanation = _explain_from_scheduling_result(workload, result)
+        if explanation.placeable:
+            return explanation
+        provisioning = tuple(
+            sorted(
+                cell.id
+                for cell in cells
+                if cell.autoscale_request_workload_id == workload.id
+                and cell.state in {CellState.REGISTERING, CellState.READY}
+            )
+        )
+        if not provisioning:
+            return explanation
+        # The scheduler only sees cells that exist, so on its own it reports a
+        # workload waiting for capacity exactly like one that can never run.
+        return explanation.model_copy(
+            update={
+                "provisioning_cell_ids": provisioning,
+                "message": (f"capacity is being provisioned for this workload: {', '.join(provisioning)}"),
+            }
+        )
 
     async def resolve_locality_preferences(
         self,

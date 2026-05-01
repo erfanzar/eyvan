@@ -23,6 +23,7 @@ from eyvan.records import (
     DEFAULT_MAX_RETRIES,
     CapacityClass,
     CommandExecution,
+    PriorityBand,
     ResourceGang,
     ResourceVector,
     WorkloadDefinition,
@@ -409,6 +410,20 @@ def workload() -> None:
 @click.option("--provider")
 @click.option("--region")
 @click.option("--required-executor")
+@click.option(
+    "--priority-band",
+    type=click.Choice(tuple(band.value for band in PriorityBand)),
+    default=PriorityBand.INTERACTIVE.value,
+    show_default=True,
+    help="Scheduling band. A higher band may preempt a lower one for its capacity.",
+)
+@click.option(
+    "--intra-band-priority",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Rank within the band; higher wins.",
+)
 @click.option("--checkpointable", is_flag=True)
 @click.option("--checkpoint-hook")
 @click.option("--checkpoint-output-uri")
@@ -431,6 +446,8 @@ def submit_workload(
     provider: str | None,
     region: str | None,
     required_executor: str | None,
+    priority_band: str,
+    intra_band_priority: int,
     checkpointable: bool,
     checkpoint_hook: str | None,
     checkpoint_output_uri: str | None,
@@ -456,6 +473,8 @@ def submit_workload(
                 provider=provider,
                 region=region,
                 required_executor=required_executor,
+                priority_band=PriorityBand(priority_band),
+                intra_band_priority=intra_band_priority,
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,

@@ -941,6 +941,12 @@ class WorkloadExplanation(EyvanModel):
     message: str | None = Field(default=None, max_length=512)
     cells: tuple[CellRejection, ...] = ()
     considered_cell_count: int = Field(default=0, ge=0)
+    #: Cells the autoscaler is currently building for this workload. The
+    #: scheduler only ever sees cells that already exist, so without this a
+    #: workload waiting on capacity is indistinguishable from one that can
+    #: never be placed -- both report "no cell satisfies all hard workload
+    #: constraints", and only one of them is a problem.
+    provisioning_cell_ids: tuple[str, ...] = ()
     scheduling_reason: str | None = None
     autoscale_block_reason: AutoscaleBlockReason | None = None
     queue_admission_denial: GcpQueueAdmissionDenialTarget | None = None
