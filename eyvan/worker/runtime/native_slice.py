@@ -26,6 +26,11 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
+
+#: Where a resuming workload is told to read its checkpoint from. Must be
+#: derived per rank exactly as the hook derives its write destination.
+_RESUME_CHECKPOINT_ENV = "EYVAN_RESUME_CHECKPOINT_URI"
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
 _COORDINATOR_PORT = 12345
@@ -271,6 +276,15 @@ class NativeSliceExecutor:
                 raise ValueError("native slice workload environment must be a string mapping")
             environment[key] = value
         environment = without_distributed_topology_overrides(environment)
+        # The checkpoint hook writes to ``{base}/rank-{n}``, so a resume handed
+        # the bare base URI reads an object that was never written. It does not
+        # fail: the workload sees "no checkpoint" and restarts from scratch,
+        # which on a live v5p-16 silently discarded 252 completed training
+        # steps after a successful preemption and checkpoint. The two paths
+        # have to agree, so derive the resume URI the same way.
+        resume_uri = environment.get(_RESUME_CHECKPOINT_ENV, "")
+        if resume_uri:
+            environment[_RESUME_CHECKPOINT_ENV] = _rank_checkpoint_uri(resume_uri, rank)
         python_path = environment.get("PYTHONPATH", "")
         environment.update(
             {
