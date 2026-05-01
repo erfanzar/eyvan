@@ -21,13 +21,16 @@ from __future__ import annotations
 import ipaddress
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 import click
 import httpx
 from pydantic import ValidationError
 
+import eyvan
 from eyvan._internal.client_version import client_version
 from eyvan._internal.json_types import JsonValue, is_json_object
+from eyvan.capacity.providers.gcp.runtime.profile import DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
 from eyvan.records import CapacityPoolRecord, CellRecord
 from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
@@ -175,7 +178,15 @@ class DoctorCommandService:
 
     def _fleet_check(self) -> CheckResult:
         try:
-            payload = self.session.client.request("GET", "/api/v1/fleets")
+            # Both query parameters are required by the route. Omitting them
+            # made this check fail with a 422 on every invocation, in every
+            # scope -- so `eyvan doctor` always exited non-zero and the one
+            # question it exists to answer was never actually asked.
+            payload = self.session.client.request(
+                "GET",
+                "/api/v1/fleets",
+                params={"org_id": self.session.org_id, "project_id": self.session.project_id},
+            )
         except EyvanApiError as error:
             return CheckResult(
                 "submittable-fleet",
@@ -437,6 +448,46 @@ class DoctorCommandService:
             return None
         return str(address) if address.version == 4 else None
 
+    def _staged_wheel_check(self) -> CheckResult:
+        """Warn when the pinned worker wheel predates the source it was built from.
+
+        In a source checkout the runtime profile pins one content-addressed
+        wheel, and nothing re-stages it when the source changes -- so a run
+        deploys whatever was staged last, however old. That is silent: the
+        workload succeeds, on code the operator is not looking at.
+
+        Compares modification times rather than rebuilding: a rebuild here would
+        make ``doctor`` slow and write to GCS, and the question is only whether
+        a restage is due.
+        """
+
+        profile_path = Path(DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH).expanduser()
+        if not profile_path.is_file():
+            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "no native GCP runtime profile")
+        try:
+            staged_at = profile_path.stat().st_mtime
+        except OSError as exc:
+            return CheckResult("staged-worker-wheel", CheckStatus.WARN, f"cannot read runtime profile: {exc}")
+
+        package_root = Path(eyvan.__file__).resolve().parent
+        if not (package_root.parent / "pyproject.toml").is_file():
+            # An installed wheel has no source to drift from.
+            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "installed package, not a source checkout")
+        newer = [
+            path
+            for path in package_root.rglob("*.py")
+            if path.stat().st_mtime > staged_at and "__pycache__" not in path.parts
+        ]
+        if not newer:
+            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "staged wheel is newer than the source")
+        sample = ", ".join(sorted(str(path.relative_to(package_root)) for path in newer)[:3])
+        return CheckResult(
+            "staged-worker-wheel",
+            CheckStatus.WARN,
+            f"{len(newer)} source file(s) changed since the wheel was staged ({sample}...)",
+            remedy="eyvan runtime init --yes  # re-stage, or workloads run the previously staged code",
+        )
+
     def report(self) -> DoctorReport:
         """Run every check in dependency order and collect the outcomes."""
 
@@ -460,6 +511,7 @@ class DoctorCommandService:
         report.checks.append(self._price_drift_check())
         report.checks.append(self._kueue_check())
         report.checks.append(self._native_worker_route_check())
+        report.checks.append(self._staged_wheel_check())
         return report
 
     def run(self) -> None:

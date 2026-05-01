@@ -86,6 +86,20 @@ def _by_name(report: DoctorReport) -> dict[str, CheckStatus]:
     return {check.name: check.status for check in report.checks}
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime_profile(tmp_path, monkeypatch) -> None:
+    """Point the staged-wheel check at a profile that does not exist.
+
+    Otherwise every test in this module reports differently depending on
+    whether the machine running it has staged a native GCP worker.
+    """
+
+    monkeypatch.setattr(
+        "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
+        str(tmp_path / "no-runtime-profile.json"),
+    )
+
+
 def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
     report = DoctorCommandService(_session(_healthy())).report()
 
@@ -100,6 +114,7 @@ def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
         "price-drift": CheckStatus.PASS,
         "kueue-preconditions": CheckStatus.PASS,
         "native-worker-route": CheckStatus.PASS,
+        "staged-worker-wheel": CheckStatus.PASS,
     }
 
 
