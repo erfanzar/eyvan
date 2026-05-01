@@ -72,6 +72,16 @@ class EyvanSettings:
     cell_reconcile_interval_s: float = 15.0
     cell_reconcile_concurrency: int = 8
     lease_ttl_s: int = 120
+    indeterminate_execution_grace_s: int = 900
+    """How long an execution status may stay unreadable before its host is replaced.
+
+    An INDETERMINATE observation is not a verdict about the workload, so the
+    controller keeps polling -- but polling forever means a lease and an
+    accelerator are held by something nobody can read. After this window the
+    cell is drained: the host is the only thing that can be reclaimed with
+    certainty, and replacing it destroys any process that did survive.
+    """
+
     checkpoint_grace_s: int = 300
     preemption_stop_grace_s: int = 300
     outbox_claim_ttl_s: int = 90

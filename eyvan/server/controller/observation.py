@@ -263,7 +263,9 @@ class _ControllerObservation:
         message: str | None,
     ) -> None:
         if status is ExecutionWorkloadStatus.INDETERMINATE:
+            await self._escalate_unreadable_execution(workload, cell, message)
             return
+        self._indeterminate_since.pop((workload.id, workload.generation), None)
         preemption_owned = lease.revocation_reason == "preemption" and lease.state in {
             LeaseState.REVOKING,
             LeaseState.QUARANTINED,
@@ -414,6 +416,49 @@ class _ControllerObservation:
                 status.value,
                 exc,
             )
+
+    async def _escalate_unreadable_execution(
+        self,
+        workload: WorkloadRecord,
+        cell: CellRecord,
+        message: str | None,
+    ) -> None:
+        """Replace the host of an execution nobody has been able to read.
+
+        An INDETERMINATE observation says the runtime could not be read, not
+        that the workload finished, so the controller keeps polling. Polling
+        forever is the failure this exists to stop: on 2026-08-02 a workload sat
+        in CANCELLING for forty minutes holding a v5p Multislice because every
+        observation came back unreadable and nothing ever escalated.
+
+        Settling the workload alone would be unsafe -- it might still be running,
+        and releasing the lease would let a second workload onto the same
+        accelerator. The cell is the only thing that can be reclaimed with
+        certainty, so drain it: replacing the host destroys whatever survived,
+        and the existing cell-loss path then recovers the workload.
+        """
+
+        grace = timedelta(seconds=self.settings.indeterminate_execution_grace_s)
+        key = (workload.id, workload.generation)
+        first_seen = self._indeterminate_since.setdefault(key, utcnow())
+        if utcnow() - first_seen < grace:
+            return
+        if cell.state is not CellState.READY:
+            # Already registering or on its way out; the cell-loss path owns it.
+            return
+        self._indeterminate_since.pop(key, None)
+        logger.warning(
+            "draining cell %s: execution of workload %s has been unreadable for %ss (%s)",
+            cell.id,
+            workload.id,
+            self.settings.indeterminate_execution_grace_s,
+            message or "no diagnostic",
+        )
+        await self.drain_cell(
+            self._principal,
+            cell.id,
+            idempotency_key=f"unreadable-execution:{workload.id}:{workload.generation}",
+        )
 
     async def _recover_lost_workload(
         self,

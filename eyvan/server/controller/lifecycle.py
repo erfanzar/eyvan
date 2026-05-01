@@ -13,6 +13,7 @@ import typing as tp
 import uuid
 import weakref
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from eyvan._internal.observability import EyvanMetrics
 from eyvan.artifacts.transfers import ManagedArtifactAccess
@@ -65,6 +66,11 @@ class _ControllerLifecycle:
         self.worker_id = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
         self._principal = _system_principal()
         self._agent_clients: dict[str, CellAgentClient] = {}
+        # When each (workload, generation) was first observed unreadable. Held in
+        # memory on purpose: losing it on a leader change only restarts the
+        # grace period, which delays an escalation rather than triggering one
+        # early -- the safe direction for something that ends in draining a host.
+        self._indeterminate_since: dict[tuple[str, int], datetime] = {}
         self._owns_agent_clients = agent_factory is None
         self._agent_factory = agent_factory or self._default_agent
         self._leader_cycle_lock = asyncio.Lock()
