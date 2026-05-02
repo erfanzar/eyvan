@@ -63,6 +63,11 @@ _RECOVERABLE_CGROUP_INDETERMINATE = "cannot observe systemd workload cgroup befo
 # makes the first transient failure permanent and strands the accelerator.
 _UNRECOVERABLE_INDETERMINATE_FIELD = "indeterminate_unrecoverable"
 
+#: ActiveState values that settle what happened to a workload on their own. A
+#: unit reporting one of these is answering the question even if systemd could
+#: not fully load the unit file.
+_DEFINITIVE_ACTIVE_STATES = frozenset({"failed", "inactive"})
+
 
 def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
     """Return whether a later observation may still resolve this indeterminacy.
@@ -597,7 +602,19 @@ class SystemdTransientServiceExecutor:
         detail = result.stderr.strip()
         if properties.get("LoadState") == "not-found" or result.returncode == 4:
             return "missing", None, detail or "systemd unit is absent"
-        if result.returncode != 0 or properties.get("LoadState") != "loaded":
+        if result.returncode != 0:
+            return "unavailable", None, detail or "systemctl show did not return a loaded unit"
+        if properties.get("LoadState") != "loaded":
+            # A unit systemd declined to load fully -- ``bad-setting``, ``error``
+            # -- still reports its ActiveState, and a terminal ActiveState is
+            # direct evidence about the workload rather than a failure to
+            # observe one. Discarding it cost a live v5p-16 its preemption: the
+            # unit sat at ``bad-setting failed failed`` with no container
+            # running, Eyvan called that unreadable, and the stop phase could
+            # never verify, so the victim stayed in CHECKPOINTING and the
+            # preemptor never got the capacity it had been promised.
+            if properties.get("ActiveState", "").lower() in _DEFINITIVE_ACTIVE_STATES:
+                return "present", properties, detail
             return "unavailable", None, detail or "systemctl show did not return a loaded unit"
         return "present", properties, detail
 
