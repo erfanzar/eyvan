@@ -19,7 +19,10 @@ deliberately distinct from passing.
 from __future__ import annotations
 
 import ipaddress
+import json
+import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -448,44 +451,96 @@ class DoctorCommandService:
             return None
         return str(address) if address.version == 4 else None
 
-    def _staged_wheel_check(self) -> CheckResult:
-        """Warn when the pinned worker wheel predates the source it was built from.
-
-        In a source checkout the runtime profile pins one content-addressed
-        wheel, and nothing re-stages it when the source changes -- so a run
-        deploys whatever was staged last, however old. That is silent: the
-        workload succeeds, on code the operator is not looking at.
-
-        Compares modification times rather than rebuilding: a rebuild here would
-        make ``doctor`` slow and write to GCS, and the question is only whether
-        a restage is due.
-        """
-
-        profile_path = Path(DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH).expanduser()
-        if not profile_path.is_file():
-            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "no native GCP runtime profile")
-        try:
-            staged_at = profile_path.stat().st_mtime
-        except OSError as exc:
-            return CheckResult("staged-worker-wheel", CheckStatus.WARN, f"cannot read runtime profile: {exc}")
+    @staticmethod
+    def _newest_source_mtime() -> float | None:
+        """Return the newest Eyvan source mtime, or None outside a checkout."""
 
         package_root = Path(eyvan.__file__).resolve().parent
         if not (package_root.parent / "pyproject.toml").is_file():
-            # An installed wheel has no source to drift from.
-            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "installed package, not a source checkout")
-        newer = [
-            path
-            for path in package_root.rglob("*.py")
-            if path.stat().st_mtime > staged_at and "__pycache__" not in path.parts
-        ]
-        if not newer:
-            return CheckResult("staged-worker-wheel", CheckStatus.PASS, "staged wheel is newer than the source")
-        sample = ", ".join(sorted(str(path.relative_to(package_root)) for path in newer)[:3])
+            return None
+        return max(
+            (path.stat().st_mtime for path in package_root.rglob("*.py") if "__pycache__" not in path.parts),
+            default=None,
+        )
+
+    @staticmethod
+    def _process_started_at(pid: int) -> float | None:
+        """Return when a PID started, or None when it cannot be read."""
+
+        completed = subprocess.run(
+            ("ps", "-o", "lstart=", "-p", str(pid)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        stamp = completed.stdout.strip()
+        if completed.returncode != 0 or not stamp:
+            return None
+        try:
+            return datetime.strptime(stamp, "%a %b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _running_component_pids() -> dict[str, int]:
+        """Return each locally supervised component's recorded PID.
+
+        Discovered by reading the daemon directory rather than by reconstructing
+        endpoints: the control plane and the cell agent are recorded under their
+        *own* ports, so deriving one from the other silently finds nothing. An
+        earlier version did exactly that, and the swallowed error made this
+        check report success while inspecting no components at all.
+        """
+
+        from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonRecord
+
+        directory = LocalDaemonPaths().resolved_directory
+        pids: dict[str, int] = {}
+        for label, pattern in (("control plane", "control-plane-*.pid"), ("cell agent", "cell-agent-*.pid")):
+            for path in sorted(directory.glob(pattern)):
+                try:
+                    record = LocalDaemonRecord.from_json(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    continue
+                if record is not None:
+                    pids[f"{label} ({record.endpoint.url})"] = record.pid
+        return pids
+
+    def _source_drift_check(self) -> CheckResult:
+        """Report every local component running code older than the source tree.
+
+        A source checkout has three separately deployed surfaces -- the control
+        plane, the cell agent, and the staged worker wheel -- and nothing links
+        any of them to the source they were built from. Each has silently run
+        stale code during this package's own development, including a fix that
+        lived in the agent while only the TPU hosts were redeployed. The failure
+        is invisible: the workload succeeds, on code nobody is looking at.
+        """
+
+        newest = self._newest_source_mtime()
+        if newest is None:
+            return CheckResult("source-drift", CheckStatus.PASS, "installed package, not a source checkout")
+
+        stale: list[str] = []
+        profile_path = Path(DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH).expanduser()
+        if profile_path.is_file():
+            try:
+                if profile_path.stat().st_mtime < newest:
+                    stale.append("staged worker wheel")
+            except OSError:
+                pass
+        for name, pid in self._running_component_pids().items():
+            started = self._process_started_at(pid)
+            if started is not None and started < newest:
+                stale.append(name)
+
+        if not stale:
+            return CheckResult("source-drift", CheckStatus.PASS, "every local component is newer than the source")
         return CheckResult(
-            "staged-worker-wheel",
+            "source-drift",
             CheckStatus.WARN,
-            f"{len(newer)} source file(s) changed since the wheel was staged ({sample}...)",
-            remedy="eyvan runtime init --yes  # re-stage, or workloads run the previously staged code",
+            f"running older code than the source tree: {', '.join(sorted(stale))}",
+            remedy="eyvan runtime init --yes && eyvan runtime restart --yes",
         )
 
     def report(self) -> DoctorReport:
@@ -511,7 +566,7 @@ class DoctorCommandService:
         report.checks.append(self._price_drift_check())
         report.checks.append(self._kueue_check())
         report.checks.append(self._native_worker_route_check())
-        report.checks.append(self._staged_wheel_check())
+        report.checks.append(self._source_drift_check())
         return report
 
     def run(self) -> None:

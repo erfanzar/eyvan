@@ -91,7 +91,9 @@ def test_a_wheel_staged_after_the_source_is_reported_as_current(tmp_path: Path, 
     profile.write_text("{}", encoding="utf-8")
     monkeypatch.setattr("eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH", str(profile))
 
-    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._staged_wheel_check()
+    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+
+    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
     assert check.status is CheckStatus.PASS
 
@@ -108,10 +110,12 @@ def test_source_changed_since_staging_is_reported(tmp_path: Path, monkeypatch: p
 
     os.utime(profile, (stale, stale))
 
-    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._staged_wheel_check()
+    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+
+    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
     assert check.status is CheckStatus.WARN
-    assert "changed since the wheel was staged" in check.detail
+    assert "staged worker wheel" in check.detail
     assert check.remedy is not None and "runtime init" in check.remedy
 
 
@@ -122,7 +126,41 @@ def test_no_runtime_profile_is_not_a_finding(tmp_path: Path, monkeypatch: pytest
         "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
         str(tmp_path / "absent.json"),
     )
+    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
 
-    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._staged_wheel_check()
+    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
     assert check.status is CheckStatus.PASS
+
+
+def test_component_discovery_finds_the_real_pid_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise discovery itself, not a stub standing in for it.
+
+    The other drift tests substitute ``_running_component_pids`` so their
+    outcome does not depend on what this machine is running -- which means none
+    of them would notice if discovery stopped finding anything. It already did
+    once: the first version derived each record path from the control plane's
+    endpoint, but the cell agent is recorded under *its own* port, so it found
+    neither and a broad ``except`` turned that into a green check.
+    """
+
+    import json as _json
+
+    from eyvan.server.local import daemon as daemon_module
+
+    for name, port in (("control-plane-8081-abc", 8081), ("cell-agent-8090-def", 8090)):
+        (tmp_path / f"{name}.pid").write_text(
+            _json.dumps({"endpoint": f"http://127.0.0.1:{port}", "pid": 1000 + port}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        daemon_module.LocalDaemonPaths,
+        "resolved_directory",
+        property(lambda self: tmp_path),
+    )
+
+    discovered = DoctorCommandService._running_component_pids()
+
+    assert set(discovered.values()) == {9081, 9090}
+    assert any("control plane" in label for label in discovered)
+    assert any("cell agent" in label for label in discovered), "the agent is recorded under its own port"
