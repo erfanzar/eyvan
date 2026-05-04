@@ -100,7 +100,7 @@ def _isolated_runtime_profile(tmp_path, monkeypatch) -> None:
     )
     # Whether *this* machine happens to be running a stale control plane must
     # not decide a test's outcome either.
-    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+    monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
 
 
 def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:

@@ -22,6 +22,7 @@ this session three separate times, so ``doctor`` now says it out loud.
 
 from __future__ import annotations
 
+import os
 import time
 import typing as tp
 from pathlib import Path
@@ -91,32 +92,65 @@ def test_a_wheel_staged_after_the_source_is_reported_as_current(tmp_path: Path, 
     profile.write_text("{}", encoding="utf-8")
     monkeypatch.setattr("eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH", str(profile))
 
-    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+    monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
 
     check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
     assert check.status is CheckStatus.PASS
 
 
-def test_source_changed_since_staging_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The drift that silently deploys old code three times in one session."""
+def test_a_wheel_older_than_the_source_is_detected(tmp_path: Path) -> None:
+    """Exercise the real drift computation, not a stub standing in for it.
+
+    ``stale_components`` takes its inputs explicitly precisely so this can be
+    asserted without depending on what the machine running it has deployed.
+    """
+
+    from eyvan.sdk.commands.deployment import WORKER_WHEEL_COMPONENT, stale_components
 
     profile = tmp_path / "runtime.json"
     profile.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr("eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH", str(profile))
-    # Backdate the profile so the real package source is newer than the wheel.
-    stale = time.time() - 86_400
-    import os
+    old = time.time() - 86_400
+    os.utime(profile, (old, old))
 
-    os.utime(profile, (stale, stale))
+    stale = stale_components(runtime_profile_path=profile, newest_source=time.time(), component_pids={})
 
-    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+    assert stale == (WORKER_WHEEL_COMPONENT,)
 
-    check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
-    assert check.status is CheckStatus.WARN
-    assert "staged worker wheel" in check.detail
-    assert check.remedy is not None and "runtime init" in check.remedy
+def test_a_wheel_newer_than_the_source_is_not_reported(tmp_path: Path) -> None:
+    """A current deployment must stay silent or the warning becomes noise."""
+
+    from eyvan.sdk.commands.deployment import stale_components
+
+    profile = tmp_path / "runtime.json"
+    profile.write_text("{}", encoding="utf-8")
+
+    stale = stale_components(
+        runtime_profile_path=profile,
+        newest_source=time.time() - 86_400,
+        component_pids={},
+    )
+
+    assert stale == ()
+
+
+def test_a_running_component_older_than_the_source_is_detected(tmp_path: Path, monkeypatch) -> None:
+    """The surface that actually bit: a daemon left behind by a partial deploy."""
+
+    from eyvan.sdk.commands import deployment
+
+    profile = tmp_path / "runtime.json"
+    profile.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(deployment, "process_started_at", lambda pid: 0.0)
+
+    stale = deployment.stale_components(
+        runtime_profile_path=profile,
+        newest_source=time.time(),
+        component_pids={"cell agent (http://127.0.0.1:8090)": 4242},
+    )
+
+    assert "cell agent (http://127.0.0.1:8090)" in stale
 
 
 def test_no_runtime_profile_is_not_a_finding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,7 +160,7 @@ def test_no_runtime_profile_is_not_a_finding(tmp_path: Path, monkeypatch: pytest
         "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
         str(tmp_path / "absent.json"),
     )
-    monkeypatch.setattr(DoctorCommandService, "_running_component_pids", staticmethod(dict))
+    monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
 
     check = DoctorCommandService(_session(_RecordingClient(_healthy())))._source_drift_check()
 
@@ -159,7 +193,9 @@ def test_component_discovery_finds_the_real_pid_records(tmp_path: Path, monkeypa
         property(lambda self: tmp_path),
     )
 
-    discovered = DoctorCommandService._running_component_pids()
+    from eyvan.sdk.commands.deployment import running_component_pids
+
+    discovered = running_component_pids()
 
     assert set(discovered.values()) == {9081, 9090}
     assert any("control plane" in label for label in discovered)

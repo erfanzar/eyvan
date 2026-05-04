@@ -39,6 +39,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
 from eyvan.capacity.providers.gcp.runtime.supervisor import LocalAgentState, LocalAgentSupervisor
 from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
 from eyvan.sdk.commands.autoscale import autoscale_console, gcloud_default_project, is_interactive
+from eyvan.sdk.commands.deployment import stale_components
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, LocalDaemonSupervisor
 
@@ -652,6 +653,101 @@ def restart_runtime(
         _render_runtime_restarted(console, result)
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeDeployResult:
+    """Non-secret result of redeploying every local Eyvan component at once."""
+
+    wheel_uri: str
+    restart: RuntimeRestartResult
+    stale_after: tuple[str, ...]
+
+    def as_document(self) -> JsonObject:
+        """Return automation-safe deploy output without profile credentials."""
+
+        document = dict(self.restart.as_document())
+        document["native_worker_wheel_uri"] = self.wheel_uri
+        document["stale_components"] = list(self.stale_after)
+        return document
+
+
+class GcpRuntimeDeployError(RuntimeError):
+    """A local runtime could not be redeployed from the current source."""
+
+
+def _deploy_native_runtime(*, endpoint: ControlPlaneEndpoint, profile_path: Path) -> RuntimeDeployResult:
+    """Stage the wheel and restart every local component from one source tree.
+
+    The three surfaces were previously updated by three separate commands, so
+    forgetting one produced a fleet that worked and was wrong -- most expensively
+    when a fix lived in the cell agent while only the TPU hosts were redeployed.
+    Doing them together is the point; verifying afterwards is what makes it a
+    guarantee rather than a convention.
+    """
+
+    store = GcpNativeRuntimeProfileStore(profile_path)
+    try:
+        profile = store.load()
+    except FileNotFoundError as exc:
+        raise GcpRuntimeDeployError("the native GCP runtime is not initialized; run `eyvan runtime init`") from exc
+    except GcpNativeRuntimeProfileError as exc:
+        raise GcpRuntimeDeployError(f"the private native GCP runtime profile is invalid: {exc}") from exc
+
+    wheel_builder = UvNativeWorkerWheelBuilder()
+    try:
+        staged = GcpRuntimeBootstrap(wheel_builder).stage_native_worker_wheel(profile)
+    except GcpRuntimeBootstrapError as exc:
+        raise GcpRuntimeDeployError(f"could not stage the native worker wheel: {exc}") from exc
+    finally:
+        wheel_builder.close()
+    if staged.native_worker_wheel_uri is None:
+        raise GcpRuntimeDeployError("wheel staging completed without a worker wheel URI")
+    store.save(staged)
+
+    restart = _restart_native_runtime(endpoint=endpoint, profile_path=store.path)
+
+    stale = stale_components(runtime_profile_path=store.path)
+    if stale:
+        # Reporting success here would recreate the exact failure this command
+        # exists to remove: a deployment that looks complete and is not.
+        raise GcpRuntimeDeployError(
+            "redeploy finished but these components still run older code than the source: " + ", ".join(stale)
+        )
+    return RuntimeDeployResult(wheel_uri=staged.native_worker_wheel_uri, restart=restart, stale_after=stale)
+
+
+@runtime_group.command("deploy")
+@click.option("--profile", "profile_path", type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--yes", is_flag=True, help="Confirm redeploying every local Eyvan component.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the non-secret deploy summary as JSON.")
+@click.pass_context
+def deploy_runtime(context: click.Context, profile_path: Path | None, yes: bool, as_json: bool) -> None:
+    """Rebuild and redeploy every local component from the current source.
+
+    Stages the worker wheel and restarts the control plane and cell agent as one
+    step, then verifies that nothing is left running older code.
+    """
+
+    console = autoscale_console(err=as_json)
+    endpoint = _runtime_restart_endpoint(context)
+    resolved_profile_path = GcpNativeRuntimeProfileStore(
+        profile_path if profile_path is not None else DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
+    ).path
+    if not yes:
+        if not is_interactive():
+            raise click.ClickException("runtime deploy requires --yes outside a terminal")
+        if not Confirm.ask("Redeploy every local Eyvan component", default=False, console=console):
+            raise click.Abort()
+    try:
+        result = _deploy_native_runtime(endpoint=endpoint, profile_path=resolved_profile_path)
+    except (GcpRuntimeDeployError, GcpRuntimeRestartError, LocalDaemonError) as exc:
+        raise click.ClickException(f"could not redeploy the native GCP runtime: {exc}") from exc
+    if as_json:
+        click.echo(json.dumps(result.as_document(), indent=2, sort_keys=True))
+    else:
+        _render_runtime_restarted(console, result.restart)
+        console.print("[green]every local component now runs the current source[/]")
+
+
 def register_runtime_commands(group: click.Group) -> None:
     """Attach native GCP runtime setup commands to the root CLI."""
 
@@ -659,10 +755,12 @@ def register_runtime_commands(group: click.Group) -> None:
 
 
 __all__ = (
+    "GcpRuntimeDeployError",
     "GcpRuntimeInitializationError",
     "GcpRuntimeInitializer",
     "GcpRuntimeRestartError",
     "NativeWorkerWheelBuildError",
+    "RuntimeDeployResult",
     "RuntimeInitializationResult",
     "RuntimeRestartResult",
     "UvNativeWorkerWheelBuilder",
