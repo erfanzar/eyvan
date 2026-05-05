@@ -274,7 +274,7 @@ def test_native_gang_strips_caller_distributed_topology_overrides() -> None:
             client.close()
 
 
-def test_native_gang_aggregates_status_and_rejects_uncoordinated_checkpoints() -> None:
+def test_native_gang_aggregates_status_across_cells() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/workloads/gang-job":
             state = "RUNNING" if request.url.host == "10.12.0.10" else "SUCCEEDED"
@@ -303,13 +303,6 @@ def test_native_gang_aggregates_status_and_rejects_uncoordinated_checkpoints() -
         logs = executor.logs("gang-job")
         assert "rank 0 cell cell-a" in logs
         assert "rank 3 cell cell-b" in logs
-        with pytest.raises(NotImplementedError, match="multi-cell checkpoint"):
-            executor.checkpoint(
-                "gang-job",
-                hook="python checkpoint.py",
-                output_uri="gs://bucket/checkpoint",
-                context=_context(key="checkpoint", generation=1, token="cell-a-token"),
-            )
     finally:
         for client in clients:
             client.close()

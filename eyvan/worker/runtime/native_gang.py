@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import logging
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 
 import httpx
@@ -448,10 +448,73 @@ class NativeGangExecutor:
         output_uri: str | None,
         context: MutationContext,
     ) -> str:
-        """Reject checkpoint hooks until multi-cell checkpoint coordination exists."""
+        """Launch one checkpoint hook across every cell under a single shared ID.
 
-        del remote_id, hook, output_uri, context
-        raise NotImplementedError("eyvan-native multi-cell checkpoint hooks are not supported yet")
+        Two things differ from a single-cell slice and both are load-bearing.
+
+        A gang holds one lease per cell, so every worker must be addressed with
+        *its own* fence -- the shared ``context`` would be rejected by every
+        worker but one. And each cell's context carries a different idempotency
+        key, so passing them through unchanged would mint N different checkpoint
+        IDs and leave nothing for the caller to poll: ``status`` asks each rank
+        about one logical checkpoint. Each worker is therefore addressed with
+        its own fence carrying the *shared* checkpoint ID, which is exactly the
+        asymmetry ``submit`` already has between per-cell fences and one logical
+        submission ID.
+
+        Launch is all-or-nothing, mirroring ``submit``: a partial launch is
+        retired -- each worker with its own context -- before the original error
+        is raised, because a surviving hook would hold accelerators and could
+        still write to the checkpoint destination. Completion is not asserted
+        here; callers poll ``status``, which reports success only once every
+        rank has succeeded.
+        """
+
+        if not isinstance(hook, str) or not hook.strip():
+            raise ValueError("native gang checkpoint hook must be non-empty")
+        checkpoint_id = context.idempotency_key
+        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+            raise ValueError("native gang checkpoint requires a shared idempotency key")
+        attempted: list[tuple[int, _GangWorker, set[str]]] = []
+        try:
+            for rank, worker in enumerate(self._workers):
+                remote_ids = {checkpoint_id}
+                attempted.append((rank, worker, remote_ids))
+                worker_context = replace(worker.context, idempotency_key=checkpoint_id)
+                launched = worker.executor.checkpoint(
+                    remote_id,
+                    hook=hook,
+                    output_uri=output_uri,
+                    context=worker_context,
+                )
+                remote_ids.add(launched)
+                if launched != checkpoint_id:
+                    raise RuntimeError(
+                        f"native gang worker returned unexpected checkpoint ID {launched!r}; "
+                        f"expected {checkpoint_id!r}"
+                    )
+            return checkpoint_id
+        except BaseException as launch_error:
+            retire_failures: list[str] = []
+            for rank, worker, remote_ids in reversed(attempted):
+                for attempted_remote_id in sorted(remote_ids):
+                    try:
+                        # Each worker is retired under its own cell fence; the
+                        # shared checkpoint ID names *what* to retire, never who
+                        # is allowed to retire it.
+                        worker.executor.retire(
+                            attempted_remote_id,
+                            replace(worker.context, idempotency_key=checkpoint_id),
+                        )
+                    except Exception as exc:
+                        retire_failures.append(
+                            f"rank {rank} cell {worker.cell_id} ({worker.endpoint}): {type(exc).__name__}"
+                        )
+            if retire_failures:
+                detail = f"partial checkpoint cleanup could not retire {_bounded_retire_summary(retire_failures)}"
+                logger.warning("native gang checkpoint failed and %s", detail)
+                _augment_error_detail(launch_error, detail)
+            raise
 
     def logs(self, remote_id: str) -> str:
         """Return rank-prefixed logs from every gang worker when available."""
