@@ -490,8 +490,7 @@ class NativeGangExecutor:
                 remote_ids.add(launched)
                 if launched != checkpoint_id:
                     raise RuntimeError(
-                        f"native gang worker returned unexpected checkpoint ID {launched!r}; "
-                        f"expected {checkpoint_id!r}"
+                        f"native gang worker returned unexpected checkpoint ID {launched!r}; expected {checkpoint_id!r}"
                     )
             return checkpoint_id
         except BaseException as launch_error:
