@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import json
 import signal
+import time
 from pathlib import Path
 
 import pytest
 from test_local_runtime import _command, _context, _spec
 
-from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+from eyvan.capacity.drivers.base import ExecutionWorkloadObservation, ExecutionWorkloadStatus
 from eyvan.worker.runtime.local_process import LocalProcessExecutor
 
 
@@ -70,6 +71,13 @@ def test_an_ambiguous_retirement_does_not_burn_the_whole_timeout(
     ``status`` returns the persisted INDETERMINATE verbatim, so every extra poll
     is guaranteed to read the same answer. Waiting out a 300s default before
     recovering would make supersession unusable.
+
+    The observation is stubbed rather than persisted: an earlier version wrote
+    the record and launched a real process, so whether ``status`` re-derived the
+    value before the loop read it depended on machine load. That test passed
+    alone and failed in the full suite -- the signature this repository treats
+    as a real defect rather than flake, and here it was the test's own timing
+    dependence.
     """
 
     monkeypatch.setenv("EYVAN_SUPERSEDE_WAIT_TIMEOUT_S", "3600")
@@ -77,20 +85,26 @@ def test_an_ambiguous_retirement_does_not_burn_the_whole_timeout(
     executor = LocalProcessExecutor(tmp_path)
     remote_id = executor.submit(_spec(_command("import time; time.sleep(30)")), _context())
 
-    record_path = _record_path(executor, remote_id)
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    record["status"] = ExecutionWorkloadStatus.INDETERMINATE.value
-    record["message"] = "native-local worker ownership is ambiguous; workload was not signalled"
-    record_path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(
+        LocalProcessExecutor,
+        "status",
+        lambda self, rid: ExecutionWorkloadObservation(
+            remote_id=rid,
+            status=ExecutionWorkloadStatus.INDETERMINATE,
+            message="native-local worker ownership is ambiguous; workload was not signalled",
+        ),
+    )
     monkeypatch.setattr(
         "eyvan.worker.runtime.local_process._signal_tracked_worker",
         lambda record, signal_number: True,
     )
 
-    # A one-hour deadline with a real sleep would hang the suite; reaching the
-    # raise at all proves the loop broke out instead of waiting.
+    started = time.monotonic()
     with pytest.raises(RuntimeError, match="before its timeout"):
         executor.retire(remote_id, _context())
+
+    # A one-hour deadline: returning at all proves the loop broke out.
+    assert time.monotonic() - started < 60
 
 
 def test_a_live_local_execution_is_still_retired_normally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
