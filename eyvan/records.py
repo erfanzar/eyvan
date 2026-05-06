@@ -870,20 +870,6 @@ class WorkloadDefinition(EyvanModel):
             _validate_strings(values, field_name=name)
             if len(set(values)) != len(values):
                 raise ValueError(f"{name} must not contain duplicates")
-        return self
-
-    @property
-    def capacity_class_portfolio(self) -> tuple[CanonicalCapacityClass, ...]:
-        """Return every acceptable capacity class, most preferred first.
-
-        ``capacity_class`` stays primary and stays the default, so a spec that
-        declares no additional classes is the single-class request the scheduler
-        already understood. The core scheduler has always ranked a portfolio --
-        ``capacity_class_rank`` is the fourth key of ``PlacementScore`` -- and the
-        only thing collapsing it to one entry was the adapter.
-        """
-
-        return (self.capacity_class, *self.additional_capacity_classes)
         declared_worker_count = self.required_labels.get(WORKER_COUNT_LABEL)
         if declared_worker_count is not None and declared_worker_count != str(self.worker_count):
             raise ValueError(f"required label {WORKER_COUNT_LABEL!r} must match worker_count")
@@ -899,6 +885,19 @@ class WorkloadDefinition(EyvanModel):
             if self.worker_count > MAX_GCP_TPU_MULTISLICE_WORKERS:
                 raise ValueError(f"GCP TPU multislice worker_count must not exceed {MAX_GCP_TPU_MULTISLICE_WORKERS}")
         return self
+
+    @property
+    def capacity_class_portfolio(self) -> tuple[CanonicalCapacityClass, ...]:
+        """Return every acceptable capacity class, most preferred first.
+
+        ``capacity_class`` stays primary and stays the default, so a spec that
+        declares no additional classes is the single-class request the scheduler
+        already understood. The core scheduler has always ranked a portfolio --
+        ``capacity_class_rank`` is the fourth key of ``PlacementScore`` -- and the
+        only thing collapsing it to one entry was the adapter.
+        """
+
+        return (self.capacity_class, *self.additional_capacity_classes)
 
     @property
     def resources_per_cell(self) -> ResourceVector:
