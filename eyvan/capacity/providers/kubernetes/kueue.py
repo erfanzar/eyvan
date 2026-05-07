@@ -23,9 +23,12 @@ So the boundary is:
     preemption disabled.**
 
 The value of this module is that the precondition is *checkable*. An invisible
-correctness hazard becomes a startup failure: ``eyvan doctor`` reads the
-ClusterQueue and the Workloads in it and refuses a configuration that could evict
-Eyvan's work.
+correctness hazard becomes a refusal at the point of use:
+``KubernetesCapacityDriver`` reads the ClusterQueue before creating a Job and
+refuses a configuration that could evict Eyvan's work. The driver is where the
+check belongs because it runs in-cluster with a ServiceAccount; ``eyvan doctor``
+reports the same hazard but can only warn, since it runs on an operator's
+machine with no cluster access.
 """
 
 from __future__ import annotations

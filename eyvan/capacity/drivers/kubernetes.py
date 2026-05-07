@@ -28,8 +28,10 @@ LocalQueue -- destroying a pod with no checkpoint hook and bypassing Eyvan's
 entire ``PreemptionPlan`` / ``CHECKPOINT_AND_STOP`` / ``grace_period_seconds``
 machinery. So: **Eyvan delegates capacity admission to Kueue and retains workload
 admission, and a ClusterQueue Eyvan uses must be exclusively Eyvan's with
-preemption disabled.** ``commands/doctor.py`` checks that precondition, which is
-what turns an invisible correctness hazard into a startup failure.
+preemption disabled.** The driver verifies that precondition before creating a Job, which is what
+turns an invisible correctness hazard into a refusal at the point of use.
+``eyvan doctor`` also reports it, but only as a warning: it runs on an
+operator's machine and cannot read the cluster.
 
 **Honest cost, stated here and in the README.** Eyvan's budgets and fair share
 reason about cells it asked for, not the cluster's real free capacity, so an
@@ -48,7 +50,14 @@ from eyvan._internal.compat import UTC
 from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
-from eyvan.capacity.drivers.base import CellCapabilities, CellObservation, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.base import (
+    CapacityProviderError,
+    CapacityProviderFailureCode,
+    CellCapabilities,
+    CellObservation,
+    MutationContext,
+    StaleMutationError,
+)
 from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
     FleetCellRecord,
@@ -56,6 +65,7 @@ from eyvan.capacity.fleet_state import (
     StaleFenceError,
 )
 from eyvan.capacity.providers.kubernetes.api import KubernetesApi, capacity_state, interpret_job
+from eyvan.capacity.providers.kubernetes.kueue import inspect_cluster_queue
 from eyvan.capacity.providers.kubernetes.workers import (
     fence_fingerprint,
     headless_service_manifest,
@@ -64,6 +74,9 @@ from eyvan.capacity.providers.kubernetes.workers import (
     secret_manifest,
     worker_endpoints,
 )
+
+#: Where Kueue publishes its ClusterQueue objects.
+_KUEUE_API = "/apis/kueue.x-k8s.io/v1beta1"
 
 #: Most workers one Kubernetes cell may contain. A Job's parallelism is the
 #: multislice worker count, and the same ceiling that bounds a TPU multislice
@@ -305,6 +318,7 @@ class KubernetesCapacityDriver:
 
         generation = int(captured.get("generation", record.provider_generation))
         namespace = self.namespace
+        self._require_safe_queue(self._optional_option(options, "queue_name"))
         self.api.create(f"/api/v1/namespaces/{namespace}/services", headless_service_manifest(cell_id, namespace))
         token = self._worker_token(record, generation)
         secret_name: str | None = None
@@ -330,6 +344,48 @@ class KubernetesCapacityDriver:
             ),
         )
         return self.observe(cell_id)
+
+    def _require_safe_queue(self, queue_name: str | None) -> None:
+        """Refuse a ClusterQueue that could evict Eyvan's work.
+
+        Kueue eviction destroys a pod with no checkpoint hook, bypassing the
+        whole PreemptionPlan / CHECKPOINT_AND_STOP / grace_period_seconds
+        protocol, and the only trace is a training job that lost hours with no
+        ledger entry explaining why.
+
+        The check runs here rather than in ``eyvan doctor`` because this is where
+        cluster access exists: the driver runs in-cluster with a ServiceAccount,
+        while doctor runs on an operator's laptop and can only warn. The
+        precondition functions were written and never called from anywhere, and
+        two docstrings claimed doctor refused a configuration it merely warned
+        about.
+
+        A queue Eyvan cannot read is not treated as safe -- an unreadable
+        ClusterQueue is exactly the case where assuming the best silently loses
+        the guarantee.
+        """
+
+        if not queue_name:
+            return
+        response = self.api.request("GET", f"{_KUEUE_API}/clusterqueues/{queue_name}")
+        if response.status_code == 404:
+            payload = None
+        elif response.status_code >= 400:
+            raise CapacityProviderError(
+                f"could not read ClusterQueue {queue_name!r} to verify it cannot evict Eyvan's work "
+                f"(HTTP {response.status_code})",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+            )
+        else:
+            decoded = response.json()
+            payload = decoded if is_json_object(decoded) else None
+        findings = inspect_cluster_queue(payload, queue_name)
+        if findings:
+            detail = "; ".join(f"{finding.problem} -- {finding.remedy}" for finding in findings)
+            raise CapacityProviderError(
+                f"ClusterQueue {queue_name!r} is unsafe for Eyvan: {detail}",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+            )
 
     def _worker_token(self, record: FleetCellRecord, generation: int) -> str | None:
         """Derive this incarnation's native-worker token, or ``None`` if unconfigured.
