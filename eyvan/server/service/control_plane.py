@@ -4941,6 +4941,7 @@ class ControlPlaneService:
     async def collect_artifacts_once(
         self,
         *,
+        principal: Principal | None = None,
         org_id: str | None = None,
         project_id: str | None = None,
         grace_period_s: float = DEFAULT_ARTIFACT_GRACE_PERIOD_S,
@@ -5005,13 +5006,33 @@ class ControlPlaneService:
                 current = await tx.get_managed_artifact(record.uri)
                 if current is None:
                     continue
-                if current.hold is not None and current.hold.active_at(utcnow()):
+                held_after_delete = current.hold is not None and current.hold.active_at(utcnow())
+                if held_after_delete:
                     # Someone claimed it between the check and the delete. The
                     # bytes are already gone, so the honest move is to drop the
                     # index row and let the hold's owner find it missing rather
                     # than leave a row pointing at nothing.
                     logger.warning("artifact %s was held after its bytes were removed", record.uri)
                 await tx.put_managed_artifact(current.model_copy(update={"size_bytes": 0, "updated_at": utcnow()}))
+                if principal is not None:
+                    # In the same transaction as the index update, so a deletion
+                    # cannot be unaudited: bytes removed with no ledger entry is
+                    # exactly the gap that makes a loss unexplainable later.
+                    await self._audit_scoped(
+                        tx,
+                        principal,
+                        org_id=record.org_id,
+                        project_id=record.project_id,
+                        entity_type="artifact",
+                        entity_id=record.uri[:256],
+                        action="artifact.collected",
+                        payload={
+                            "kind": str(record.kind),
+                            "size_bytes": record.size_bytes,
+                            "removed": removed,
+                            "held_after_delete": held_after_delete,
+                        },
+                    )
             if removed:
                 collected.append(record.uri)
                 reclaimed += record.size_bytes

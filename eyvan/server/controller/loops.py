@@ -82,6 +82,35 @@ class _ControllerLoops:
                 zero_interval_disables=True,
                 isolate_failures=True,
             ),
+            # Housekeeping, same treatment. Each of the three below was fully
+            # implemented and tested and called by nothing, so the behaviour did
+            # not exist in production: artifact storage grew without bound, a
+            # replaced result was never marked collectable, and federated budget
+            # grants never expired.
+            #
+            # Marking runs before collection so a result superseded this cycle
+            # becomes a candidate in it, rather than a full interval later.
+            LeaderPhase(
+                "mark-superseded",
+                self.mark_superseded_results_once,
+                interval_s=self.settings.artifact_collection_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
+            LeaderPhase(
+                "collect-artifacts",
+                self.collect_artifacts_once,
+                interval_s=self.settings.artifact_collection_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
+            LeaderPhase(
+                "expire-grants",
+                self.expire_budget_grants_once,
+                interval_s=self.settings.grant_expiry_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
         )
 
     async def _run_leader_phases(self, *, now: float, due: dict[str, float]) -> dict[str, float]:

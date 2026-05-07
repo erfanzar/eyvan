@@ -101,6 +101,28 @@ class EyvanSettings:
     kubernetes_namespace: str = "eyvan"
     kubernetes_worker_image: str = "ghcr.io/erfanzar/eyvan-native-worker:latest"
     retention_interval_s: float = 3600.0
+    artifact_collection_interval_s: float = 3600.0
+    """How often unreferenced managed artifacts are collected. 0 disables it.
+
+    Collection was implemented, tested, and called by nothing, so managed
+    artifact storage grew without bound in production while the index, quota
+    accounting, holds and reverse references all worked.
+    """
+
+    artifact_retention_s: int = 7 * 24 * 3600
+    """How long an unreferenced artifact is kept before it may be collected.
+
+    Distinct from ``grace_period_s``, which is an anti-race window around a
+    single collection pass. 0 disables age-based collection entirely.
+    """
+
+    grant_expiry_interval_s: float = 300.0
+    """How often expired federated budget grants are swept. 0 disables it.
+
+    A grant's expiry is mandatory, so without the sweep headroom is never
+    returned to the granting plane and a tenant can outspend its federated
+    budget indefinitely.
+    """
     #: How often the leader advances cell billing clocks. Slower than reconcile
     #: because the accrual charges elapsed time rather than a fixed tick, so a
     #: longer interval costs resolution, never accuracy. Zero disables it.
@@ -212,6 +234,11 @@ class EyvanSettings:
             kubernetes_namespace=os.getenv("EYVAN_KUBERNETES_NAMESPACE", defaults.kubernetes_namespace),
             kubernetes_worker_image=os.getenv("EYVAN_KUBERNETES_WORKER_IMAGE", defaults.kubernetes_worker_image),
             retention_interval_s=float(os.getenv("EYVAN_RETENTION_INTERVAL_S", defaults.retention_interval_s)),
+            artifact_collection_interval_s=float(
+                os.getenv("EYVAN_ARTIFACT_COLLECTION_INTERVAL_S", defaults.artifact_collection_interval_s)
+            ),
+            artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
+            grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),
             agent_shared_secret=os.getenv("EYVAN_AGENT_SHARED_SECRET"),

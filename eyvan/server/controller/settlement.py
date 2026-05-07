@@ -524,6 +524,61 @@ class _ControllerSettlement:
                 settled += 1
         return settled
 
+    async def collect_artifacts_once(self) -> int:
+        """Delete managed artifacts nothing references and nothing holds.
+
+        The service has always been able to do this; nothing ever asked it to.
+        Its own docstring recorded that no caller passed ``dry_run=False``, so
+        the index, the quota accounting, the legal holds and the reverse
+        reference index all worked while storage grew without bound.
+
+        ``artifact_retention_s`` is an age floor on top of the service's
+        ``grace_period_s``: the grace period closes a race inside one pass,
+        while the retention window is the operator's statement about how long an
+        unreferenced artifact is worth keeping.
+        """
+
+        retention_s = self.settings.artifact_retention_s
+        if retention_s <= 0:
+            return 0
+        collection = await self.service.collect_artifacts_once(
+            principal=self._principal,
+            grace_period_s=float(retention_s),
+            dry_run=False,
+        )
+        deleted = len(collection.collected_uris)
+        if deleted:
+            logger.info(
+                "collected %d unreferenced managed artifact(s), reclaiming %d bytes",
+                deleted,
+                collection.reclaimed_bytes,
+            )
+        return deleted
+
+    async def mark_superseded_results_once(self) -> int:
+        """Mark results a later attempt replaced, so collection can see them.
+
+        Without this the superseded marker is never written, so a replaced
+        result is never a collection candidate and the retention window above
+        can never apply to it.
+        """
+
+        return await self.service.mark_superseded_results_once()
+
+    async def expire_budget_grants_once(self) -> int:
+        """Return headroom from federated budget grants whose expiry has passed.
+
+        A grant's expiry is mandatory at construction, so leaving the sweep
+        uncalled meant every grant lived forever: the granting plane never got
+        its headroom back and a tenant could outspend its federated budget
+        indefinitely.
+        """
+
+        expired = await self.service.expire_budget_grants_once()
+        if expired:
+            logger.info("expired %d federated budget grant(s)", expired)
+        return expired
+
     async def prune_retained_state_once(self) -> dict[str, int]:
         """Delete state past its retention window and report what was removed.
 
