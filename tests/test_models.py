@@ -392,7 +392,16 @@ def test_scheduler_places_an_aggregate_worker_request_only_on_its_exact_physical
     assert result.placements[0].lease.resources.get("tpu") == 16
 
 
-def test_multi_cell_tpu_group_members_cannot_be_preempted_individually() -> None:
+def test_a_multi_cell_tpu_group_is_preempted_as_one_unit() -> None:
+    """A gang is preemptible, and only ever whole.
+
+    This asserted the opposite until multi-cell checkpointing existed: gangs
+    were excluded from preemption entirely, because victim selection is per-cell
+    and could otherwise stop one member while its siblings kept running. The
+    scheduler now takes every sibling lease or rejects the candidate, so the
+    capacity is reclaimable without dismembering the job.
+    """
+
     group_spec = WorkloadDefinition(
         name="two-v5p-16-workers",
         execution=CommandExecution(command="python train.py"),
@@ -461,9 +470,9 @@ def test_multi_cell_tpu_group_members_cannot_be_preempted_individually() -> None
 
     result = CoreSchedulingService().schedule([group, high_priority], cells, leases=leases)
 
-    assert not result.placements
-    assert not result.preemptions
-    assert result.infeasibilities[0].workload_id == high_priority.id
+    assert result.preemptions, "a checkpointable gang must be reclaimable for higher-priority work"
+    victims = {victim.lease_id for plan in result.preemptions for victim in plan.victims}
+    assert victims == {"group-lease-0", "group-lease-1"}, "a gang must be preempted whole, never in part"
 
 
 def test_eyvan_native_accepts_explicit_generic_tpu_routing() -> None:

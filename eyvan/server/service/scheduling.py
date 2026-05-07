@@ -164,11 +164,12 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         capacity_class_preference=portfolio,
         checkpoint_policy=_checkpoint(record),
         estimated_duration_seconds=spec.estimated_duration_seconds,
-        # A spread-cell TPU job must keep every member alive until it can be
-        # preempted as one unit. The existing preemption protocol is
-        # single-cell, so do not expose one member as an individual victim.
-        revocable=spec.cell_group_count == 1
-        and (spec.capacity_class is ApiCapacityClass.SPOT or spec.checkpointable)
+        # A multi-cell gang is preemptible as one unit: the scheduler takes
+        # every sibling lease or none (``_preemption_candidate``), and
+        # ``NativeGangExecutor.checkpoint`` runs the hook on every cell under one
+        # shared checkpoint ID. Exposing a single member as an individual victim
+        # was the hazard, not multi-cell membership itself.
+        revocable=(spec.capacity_class is ApiCapacityClass.SPOT or spec.checkpointable)
         and (policy is None or policy.preemption_enabled),
         cell_group_count=spec.cell_group_count,
         worker_count=spec.worker_count,
@@ -263,8 +264,8 @@ def to_core_lease(
         reserved_cost=record.reserved_cost,
         resource_hours_reserved=_resources(record.resource_hours_reserved),
         checkpoint_policy=_checkpoint(workload),
-        revocable=workload.spec.cell_group_count == 1
-        and (
+        # Gangs are preemptible as one unit; see to_core_workload.
+        revocable=(
             (landed_capacity_class or workload.spec.capacity_class) is ApiCapacityClass.SPOT
             or workload.spec.checkpointable
         )

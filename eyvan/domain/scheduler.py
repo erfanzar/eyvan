@@ -66,6 +66,12 @@ class _LeaseAccounting:
     def __init__(self, leases: tp.Iterable[CapacityLease], *, track_budgets: bool) -> None:
         self._leases_by_id: dict[str, CapacityLease] = {}
         self._leases_by_cell: dict[str, dict[str, CapacityLease]] = {}
+        # A workload holding leases on several cells is a multi-cell gang, and
+        # preemption has to take all of them or none. Derived from the lease set
+        # rather than read off the spec: a *multislice* workload holds one lease
+        # covering N workers, so lease count is exactly the discriminator, and it
+        # is available here where the workload record is not.
+        self._leases_by_workload: dict[str, dict[str, CapacityLease]] = {}
         self._usage_by_scope: dict[IdentityScope, ResourceVector] = {}
         self._usage_by_cell: dict[str, ResourceVector] = {}
         self._reserved_cost_by_scope: dict[IdentityScope, Decimal] = {}
@@ -77,6 +83,7 @@ class _LeaseAccounting:
     def add(self, lease: CapacityLease) -> None:
         self._leases_by_id[lease.lease_id] = lease
         self._leases_by_cell.setdefault(lease.cell_id, {})[lease.lease_id] = lease
+        self._leases_by_workload.setdefault(lease.workload_id, {})[lease.lease_id] = lease
         self._usage_by_cell[lease.cell_id] = self._usage_by_cell.get(lease.cell_id, _EMPTY_RESOURCES) + lease.resources
         for scope in lease.identity.scopes:
             self._usage_by_scope[scope] = self._usage_by_scope.get(scope, _EMPTY_RESOURCES) + lease.resources
@@ -94,6 +101,10 @@ class _LeaseAccounting:
         del cell_leases[lease_id]
         if not cell_leases:
             del self._leases_by_cell[lease.cell_id]
+        workload_leases = self._leases_by_workload[lease.workload_id]
+        del workload_leases[lease_id]
+        if not workload_leases:
+            del self._leases_by_workload[lease.workload_id]
         self._subtract_vector(self._usage_by_cell, lease.cell_id, lease.resources)
         for scope in lease.identity.scopes:
             self._subtract_vector(self._usage_by_scope, scope, lease.resources)
@@ -131,6 +142,11 @@ class _LeaseAccounting:
         used = self._usage_by_cell.get(cell.cell_id, _EMPTY_RESOURCES)
         names = set(cell.capacity) | set(used)
         return ResourceVector((name, max(cell.capacity.get(name) - used.get(name), Decimal(0))) for name in names)
+
+    def leases_for_workload(self, workload_id: str) -> tuple[CapacityLease, ...]:
+        """Return every lease one workload holds, across all of its cells."""
+
+        return tuple(self._leases_by_workload.get(workload_id, {}).values())
 
     def leases_for_cell(self, cell_id: str) -> tp.ValuesView[CapacityLease]:
         return self._leases_by_cell.get(cell_id, {}).values()
@@ -894,11 +910,33 @@ class Scheduler:
 
         reclaimed = ResourceVector()
         selected: list[CapacityLease] = []
+        chosen_ids: set[str] = set()
         for lease in eligible:
-            selected.append(lease)
-            reclaimed += lease.resources
+            if lease.lease_id in chosen_ids:
+                continue
+            # A workload holding leases on several cells is one gang: stopping a
+            # strict subset leaves the survivors running a job that can no longer
+            # complete, holding accelerators nobody can reclaim. Take every
+            # sibling with it.
+            siblings = accounting.leases_for_workload(lease.workload_id)
+            victims = siblings if len(siblings) > 1 else (lease,)
+            if any(not victim.revocable for victim in victims):
+                continue
+            for victim in victims:
+                if victim.lease_id in chosen_ids:
+                    continue
+                chosen_ids.add(victim.lease_id)
+                selected.append(victim)
+                # Only capacity freed *on this cell* helps this placement fit;
+                # a sibling stopped on another cell frees nothing here.
+                if victim.cell_id == cell.cell_id:
+                    reclaimed += victim.resources
+            # An exclusive cell is only free once *its own* leases are all
+            # victims. ``selected`` may now also hold gang siblings on other
+            # cells, so count what this cell actually gives up.
+            selected_here = sum(1 for victim in selected if victim.cell_id == cell.cell_id)
             if (
-                (not exclusive_busy or len(selected) == len(cell_leases))
+                (not exclusive_busy or selected_here == len(cell_leases))
                 and requested.fits_within(remaining + reclaimed)
                 and self._quota_infeasibility(
                     workload,
@@ -921,7 +959,7 @@ class Scheduler:
             is None
         )
         replacement_fits = requested.fits_within(remaining + reclaimed) and (
-            not exclusive_busy or len(selected) == len(cell_leases)
+            not exclusive_busy or sum(1 for victim in selected if victim.cell_id == cell.cell_id) == len(cell_leases)
         )
         if not replacement_fits or not quota_satisfied:
             all_reclaimable = ResourceVector.total(lease.resources for lease in lower_priority)
