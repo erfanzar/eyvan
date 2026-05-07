@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from datetime import timedelta
 
 from eyvan.capacity import (
@@ -523,6 +524,55 @@ class _ControllerSettlement:
                 )
                 settled += 1
         return settled
+
+    async def export_metrics_once(self) -> int:
+        """Publish fleet state, capacity inventory, and spend to Prometheus.
+
+        Four of the seven metric families were declared, exported at ``/metrics``,
+        and written by nothing -- so fleet state, capacity inventory and cost,
+        the three things an operator actually dashboards, always read zero. A
+        gauge that is always zero is worse than an absent one: it looks like an
+        answer.
+
+        Runs on its own slow interval rather than inside the scheduler, because
+        gauges describe a level rather than a rate and re-reading the snapshot on
+        every scheduling pass would buy nothing.
+        """
+
+        if self.metrics is None:
+            return 0
+        async with self.repository.transaction() as transaction:
+            workloads = await transaction.list_workloads()
+            cells = await transaction.list_cells()
+            budgets = await transaction.list_budgets()
+
+        by_state: Counter[str] = Counter(workload.state.value for workload in workloads)
+        self.metrics.workloads.clear()
+        for state, count in by_state.items():
+            self.metrics.workloads.labels(state=state).set(count)
+
+        accelerators: Counter[tuple[str, str, str]] = Counter()
+        for cell in cells:
+            if cell.state is CellState.DELETED:
+                continue
+            key = (cell.state.value, str(cell.capacity_class), cell.accelerator_type or "none")
+            accelerators[key] += int(cell.capacity.gpu) + int(cell.capacity.tpu)
+        self.metrics.capacity.clear()
+        for (state, capacity_class, accelerator_type), total in accelerators.items():
+            self.metrics.capacity.labels(
+                state=state,
+                capacity_class=capacity_class,
+                accelerator_type=accelerator_type,
+            ).set(total)
+
+        self.metrics.project_spend.clear()
+        for budget in budgets:
+            self.metrics.project_spend.labels(
+                org=budget.org_id,
+                project=budget.project_id or "",
+                kind="spent",
+            ).set(float(budget.spent))
+        return len(by_state)
 
     async def collect_artifacts_once(self) -> int:
         """Delete managed artifacts nothing references and nothing holds.

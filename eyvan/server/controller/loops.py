@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
+from eyvan._internal.observability import trace_span
 from eyvan.server.controller._support import (
     LeaderPhase,
     logger,
@@ -104,6 +105,17 @@ class _ControllerLoops:
                 zero_interval_disables=True,
                 isolate_failures=True,
             ),
+            # Gauges describe a level rather than a rate, so they refresh on their
+            # own interval. Four families were declared, exported, and written by
+            # nothing, so fleet state, capacity and spend always read zero -- a
+            # gauge stuck at zero looks like an answer.
+            LeaderPhase(
+                "export-metrics",
+                self.export_metrics_once,
+                interval_s=self.settings.metrics_export_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
             LeaderPhase(
                 "expire-grants",
                 self.expire_budget_grants_once,
@@ -138,13 +150,18 @@ class _ControllerLoops:
                 due[phase.name] = now + phase.interval_s
             if not await self.leader.acquire():
                 return due
-            if not phase.isolate_failures:
-                await phase.run()
-                continue
-            try:
-                await phase.run()
-            except Exception:
-                logger.exception("leader phase %s failed; continuing", phase.name)
+            # One span per phase is where tracing earns its keep: a slow leader
+            # cycle is almost always one phase, and the span names it. Without a
+            # configured tracer provider this is a null context, so it costs
+            # nothing when nobody is collecting.
+            with trace_span("eyvan.leader_phase", phase=phase.name):
+                if not phase.isolate_failures:
+                    await phase.run()
+                    continue
+                try:
+                    await phase.run()
+                except Exception:
+                    logger.exception("leader phase %s failed; continuing", phase.name)
         return due
 
     async def _run_scheduler_loop(self, stop: asyncio.Event) -> None:

@@ -13,6 +13,7 @@ from datetime import timedelta
 
 from pydantic import ValidationError
 
+from eyvan._internal.observability import trace_span
 from eyvan.capacity.audit import CapacityLifecycleEvent
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.records import (
@@ -68,7 +69,20 @@ class _ControllerOutbox:
         """Deliver and settle one command that this controller has just claimed."""
 
         try:
-            await self._dispatch_with_claim_heartbeat(command)
+            # Delivery is the one place a provider or cell agent can block for
+            # minutes, and ``topic`` is exactly the "driver operation" that
+            # ``eyvan_reconcile_seconds`` was declared to be labeled by. The
+            # histogram and the span existed with no call site anywhere, so
+            # neither a slow provider nor a slow agent produced any signal.
+            with (
+                self._measure_reconcile(command.topic),
+                trace_span(
+                    "eyvan.outbox_dispatch",
+                    topic=command.topic,
+                    command_id=command.id,
+                ),
+            ):
+                await self._dispatch_with_claim_heartbeat(command)
         except CapacityApplySuperseded as exc:
             logger.info("discarding superseded capacity apply %s: %s", command.id, exc)
             await self._discard_outbox(command, provider_diagnostic=exc.provider_diagnostic)

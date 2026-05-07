@@ -116,6 +116,13 @@ class EyvanSettings:
     single collection pass. 0 disables age-based collection entirely.
     """
 
+    metrics_export_interval_s: float = 60.0
+    """How often fleet-state, capacity and spend gauges are refreshed. 0 disables.
+
+    Gauges describe a level, not a rate, so they are refreshed on their own slow
+    interval rather than on every scheduling pass.
+    """
+
     grant_expiry_interval_s: float = 300.0
     """How often expired federated budget grants are swept. 0 disables it.
 
@@ -238,6 +245,9 @@ class EyvanSettings:
                 os.getenv("EYVAN_ARTIFACT_COLLECTION_INTERVAL_S", defaults.artifact_collection_interval_s)
             ),
             artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
+            metrics_export_interval_s=float(
+                os.getenv("EYVAN_METRICS_EXPORT_INTERVAL_S", defaults.metrics_export_interval_s)
+            ),
             grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),

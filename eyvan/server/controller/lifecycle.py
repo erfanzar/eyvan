@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import typing as tp
 import uuid
@@ -79,6 +80,19 @@ class _ControllerLifecycle:
         self.metrics = metrics
         self.artifact_access = artifact_access
         self._capacity_lifecycle = CapacityLifecycleLogger(logger)
+
+    def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:
+        """Time one reconciliation operation when metrics are collected.
+
+        Metrics are optional on the controller -- most tests and every embedded
+        use construct it without a registry -- so every call site would
+        otherwise repeat the same ``if self.metrics is None`` dance around a
+        ``with``. Returning a null context keeps that decision in one place.
+        """
+
+        if self.metrics is None:
+            return contextlib.nullcontext()
+        return self.metrics.measure_reconcile(operation)
 
     async def close(self) -> None:
         """Release cached HTTP pools and scheduler leadership."""
