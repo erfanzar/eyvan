@@ -22,6 +22,7 @@ DECLARED_LABELS = {
     "eyvan_workloads": {"state"},
     "eyvan_capacity_accelerators": {"state", "capacity_class", "accelerator_type"},
     "eyvan_project_spend_usd": {"org", "project", "kind"},
+    "eyvan_workload_progress_fraction": {"workload", "rank"},
 }
 
 
@@ -37,6 +38,7 @@ def _instrumented_metrics(registry: CollectorRegistry) -> EyvanMetrics:
     metrics.workloads.labels(state="running").set(3)
     metrics.capacity.labels(state="free", capacity_class="spot", accelerator_type="v5p-16").set(16)
     metrics.project_spend.labels(org="acme", project="research", kind="estimated").set(12.5)
+    metrics.workload_progress.labels(workload="wl-1", rank="0").set(0.25)
     return metrics
 
 

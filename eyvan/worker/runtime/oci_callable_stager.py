@@ -21,7 +21,8 @@ OCI_CALLABLE_RUNNER_FILENAME = "eyvan_oci_callable_worker.py"
 
 OCI_CALLABLE_PROTOCOL_FILENAME = "callable_protocol.py"
 OCI_WORKSPACE_FILENAME = "workspace.py"
-"""Shared protocol source staged beside the OCI callable runner."""
+OCI_HTTP_RETRY_FILENAME = "http_retry.py"
+"""Shared protocol sources staged beside the OCI callable runner."""
 
 
 def _stage_file(source: Path, destination: Path) -> None:
@@ -90,6 +91,13 @@ def stage_oci_callable_runner(directory: str | os.PathLike[str]) -> Path:
         Path(workspace.__file__).resolve(),
         destination_directory / OCI_WORKSPACE_FILENAME,
     )
+    # Same reasoning for the retry policy: callable_protocol imports it as a
+    # sibling once staged, so the container gets the one policy the native
+    # worker uses rather than a second copy that can drift from it.
+    _stage_file(
+        source_directory / OCI_HTTP_RETRY_FILENAME,
+        destination_directory / OCI_HTTP_RETRY_FILENAME,
+    )
     return runner_destination
 
 
@@ -97,5 +105,6 @@ __all__ = (
     "OCI_CALLABLE_PROTOCOL_FILENAME",
     "OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY",
     "OCI_CALLABLE_RUNNER_FILENAME",
+    "OCI_HTTP_RETRY_FILENAME",
     "stage_oci_callable_runner",
 )

@@ -23,6 +23,7 @@ if tp.TYPE_CHECKING:
         execute,
         init,
     )
+    from eyvan.worker.runtime.progress import report_progress
 
 __all__ = (
     "AsyncEyvanClient",
@@ -40,6 +41,7 @@ __all__ = (
     "TpuConfig",
     "execute",
     "init",
+    "report_progress",
 )
 from eyvan._version import __version__
 
@@ -121,6 +123,13 @@ def __getattr__(name: str):
         from eyvan.sdk.execution import init
 
         return _cache_export(name, init)
+    if name == "report_progress":
+        # Not from the SDK: this one runs *inside* the job, which is the path the
+        # rest of this table exists to keep free of the client and its optional
+        # dependencies. It imports nothing but the standard library.
+        from eyvan.worker.runtime.progress import report_progress
+
+        return _cache_export(name, report_progress)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

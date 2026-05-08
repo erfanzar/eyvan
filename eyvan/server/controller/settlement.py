@@ -572,7 +572,28 @@ class _ControllerSettlement:
                 project=budget.project_id or "",
                 kind="spent",
             ).set(float(budget.spent))
+
+        # Progress series are written by the route as reports arrive, not from
+        # this snapshot -- reading them would be one query per live workload. So
+        # this phase prunes rather than rebuilds: a workload that has reached a
+        # terminal state can report nothing further, and its series would
+        # otherwise outlive it for the process's lifetime. ``workload`` is the
+        # one unbounded label in the whole metric set, which is why the pruning
+        # is not optional.
+        live = {workload.id for workload in workloads if workload.state not in TERMINAL_WORKLOAD_STATES}
+        for workload_id, rank in self._progress_series_labels():
+            if workload_id not in live:
+                self.metrics.workload_progress.remove(workload_id, rank)
         return len(by_state)
+
+    def _progress_series_labels(self) -> tuple[tuple[str, str], ...]:
+        """Return the (workload, rank) label pairs currently held by the gauge."""
+
+        if self.metrics is None:
+            return ()
+        return tuple(
+            (values[0], values[1]) for values in list(self.metrics.workload_progress._metrics) if len(values) == 2
+        )
 
     async def collect_artifacts_once(self) -> int:
         """Delete managed artifacts nothing references and nothing holds.

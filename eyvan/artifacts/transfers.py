@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from eyvan.artifacts.managed import (
     ArtifactAction,
@@ -153,6 +153,20 @@ class ManagedArtifactAccess:
             workload_id=workload_id,
             expires=False,
         )
+
+    def progress_report_url(self, *, workload_id: str, org_id: str, project_id: str) -> str:
+        """Return the address a running attempt posts its own progress to.
+
+        No token of its own: the progress route authenticates with the attempt's
+        result-write capability, which is already scoped to this workload,
+        already revoked by a generation bump, and already delivered to every
+        rank. This method exists so the URL is built where every other
+        control-plane address is built, rather than assembled inside a job from
+        a base URL it would otherwise have to be told separately.
+        """
+
+        query = urlencode({"org_id": org_id, "project_id": project_id})
+        return f"{self.public_url}/api/v1/workloads/{quote(workload_id, safe='')}/progress-reports?{query}"
 
 
 __all__ = ("ManagedArtifactAccess", "ManagedArtifactTransfer")

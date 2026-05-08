@@ -34,12 +34,22 @@ from urllib.parse import unquote, urlsplit
 
 import cloudpickle
 
+try:  # staged OCI layout: siblings on sys.path, no package
+    # Sibling first, deliberately. This file is also executed as a bare module
+    # staged next to its siblings inside an OCI image, where importing ``eyvan``
+    # is not merely unavailable but forbidden -- the runner must see only the
+    # bridge, not the host environment. A package-first import would reach for
+    # ``eyvan`` on that path, and the fallback would not catch what a blocked
+    # package raises. Nothing can shadow this on a native worker: the module is
+    # already in ``sys.modules`` before any user workspace joins ``sys.path``.
+    from http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay  # type: ignore[import-not-found]
+except ImportError:
+    from eyvan.worker.runtime.http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay
+
 FORMAT_VERSION = 1
 """Current callable and result artifact wire-format version."""
 
 _RESULT_MAGIC = b"EYVAN-CALLABLE-RESULT\n"
-_HTTP_ATTEMPTS = 3
-_RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 JsonValue: tp.TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 """Recursive JSON values accepted as decorated-callable arguments."""
@@ -255,35 +265,22 @@ def _gcs_location(uri: str) -> tuple[str, str]:
     return parsed.netloc, object_name
 
 
-def _retry_delay(error: urllib.error.HTTPError | None, attempt: int) -> float:
-    """Return a bounded retry delay, honoring a valid HTTP Retry-After header."""
-
-    if error is not None and error.headers is not None:
-        retry_after = error.headers.get("Retry-After")
-        if retry_after is not None:
-            try:
-                return min(max(float(retry_after), 0.0), 30.0)
-            except ValueError:
-                pass
-    return min(0.25 * (2**attempt), 2.0)
-
-
 def _request_bytes(request: str | urllib.request.Request) -> bytes:
     """Read an HTTP artifact with bounded retries."""
 
-    for attempt in range(_HTTP_ATTEMPTS):
+    for attempt in range(HTTP_ATTEMPTS):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
-            if exc.code not in _RETRYABLE_HTTP_STATUS or attempt == _HTTP_ATTEMPTS - 1:
+            if exc.code not in RETRYABLE_HTTP_STATUS or attempt == HTTP_ATTEMPTS - 1:
                 raise
-            delay = _retry_delay(exc, attempt)
+            delay = retry_delay(exc, attempt)
             exc.close()
         except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError, ConnectionError):
-            if attempt == _HTTP_ATTEMPTS - 1:
+            if attempt == HTTP_ATTEMPTS - 1:
                 raise
-            delay = _retry_delay(None, attempt)
+            delay = retry_delay(None, attempt)
         time.sleep(delay)
     raise AssertionError("unreachable")
 

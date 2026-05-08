@@ -274,6 +274,17 @@ class _ControllerWorkloadCommands:
             )
             environment["EYVAN_MANAGED_RESULT_URL"] = transfer.url
             environment["EYVAN_MANAGED_RESULT_TOKEN"] = transfer.token
+            # The progress channel had a route, a schema, a record, a migration
+            # and a read path, and no producer anywhere -- so nothing a job could
+            # do would ever fill it. A job learns the address the same way it
+            # learns every other one: fully formed, from its environment, so
+            # nothing inside the job builds a control-plane URL. Authentication
+            # reuses the result-write token deliberately; the route documents why.
+            environment["EYVAN_PROGRESS_URL"] = self.artifact_access.progress_report_url(
+                workload_id=workload.id,
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+            )
             parts.extend(
                 (
                     "--result-uri-env",

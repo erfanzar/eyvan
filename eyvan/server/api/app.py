@@ -1191,7 +1191,7 @@ def create_app(
             project_id=project_id,
             workload_id=workload_id,
         )
-        return await service.record_progress_report(
+        report = await service.record_progress_report(
             workload_id=workload_id,
             rank=request.rank,
             attempt=request.attempt,
@@ -1200,6 +1200,14 @@ def create_app(
             message=request.message,
             metrics=request.metrics,
         )
+        # Only the fraction becomes a series, and only when the job declared a
+        # total. The metrics dict is displayed and never exported: its keys come
+        # from user code, and one mistyped name in a training loop would mint an
+        # unbounded label set. Series for finished workloads are dropped by the
+        # export phase, which is what keeps ``workload`` from growing forever.
+        if report.fraction is not None:
+            metrics.workload_progress.labels(workload=workload_id, rank=str(report.rank)).set(report.fraction)
+        return report
 
     # response_model=None: agent inventory entries are backend-shaped JSON.
     @app.get("/api/v1/capacity/orphans", tags=["capacity"], response_model=None)
