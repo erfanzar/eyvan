@@ -61,6 +61,7 @@ class AcceleratorConfig(tp.Protocol):
     type: str
     pods: int
     max_retries: int
+    max_failure_retries: int
     capacity_class: CapacityClass
 
 
@@ -90,6 +91,19 @@ def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, mult
         or config.max_retries > 100
     ):
         raise ValueError(f"{label} max_retries must be an integer from 0 through 100")
+    # A separate budget, not a synonym. ``max_retries`` pays for capacity the
+    # fleet lost -- a preemption, a stockout, a reclaimed spot cell -- which says
+    # nothing about the job. ``max_failure_retries`` pays for the job's own
+    # non-zero exit, which usually will repeat, which is why it defaults to zero
+    # and why merging the two would let a deterministically broken job burn a
+    # capacity budget sized for interruptions.
+    if (
+        isinstance(config.max_failure_retries, bool)
+        or not isinstance(config.max_failure_retries, int)
+        or config.max_failure_retries < 0
+        or config.max_failure_retries > 100
+    ):
+        raise ValueError(f"{label} max_failure_retries must be an integer from 0 through 100")
     return accelerator_type
 
 
@@ -100,6 +114,9 @@ class TpuConfig:
     type: str
     pods: int = 1
     max_retries: int = DEFAULT_MAX_RETRIES
+    #: Retries the job's *own* failure, not lost capacity. Zero by default: a
+    #: non-zero exit usually repeats, and re-running it costs an accelerator.
+    max_failure_retries: int = 0
     capacity_class: CapacityClass = CapacityClass.SPOT
 
     def __post_init__(self) -> None:
@@ -123,6 +140,8 @@ class GpuConfig:
 
     type: str
     max_retries: int = DEFAULT_MAX_RETRIES
+    #: Retries the job's *own* failure, not lost capacity. See ``TpuConfig``.
+    max_failure_retries: int = 0
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1
@@ -138,6 +157,8 @@ class CpuConfig:
 
     type: str = "cpu"
     max_retries: int = DEFAULT_MAX_RETRIES
+    #: Retries the job's *own* failure, not lost capacity. See ``TpuConfig``.
+    max_failure_retries: int = 0
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1

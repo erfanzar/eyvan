@@ -1,0 +1,280 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Three complete features nothing could reach.
+
+Each was built, validated and exported, and each was walled off by exactly one
+line somewhere else:
+
+* ``GpuConfig`` and ``CpuConfig`` were complete and everything below the
+  decorator was already ``AcceleratorConfig``-shaped, while ``execute()`` raised
+  ``TypeError("execute requires a TpuConfig")`` -- so the decorator could reach
+  no hardware but TPU.
+* ``max_failure_retries`` existed on the record and both request schemas and
+  appeared nowhere in ``eyvan/sdk/``, so the job-failure budget was reachable
+  only by hand-writing HTTP.
+* ``create_schema`` stamped ``schema_revisions`` and never ``alembic_version``,
+  so a database it bootstrapped could never be migrated afterwards -- Alembic
+  would replay every migration against tables that already existed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from eyvan.sdk.client.jobs import AcceleratorConfig, CpuConfig, GpuConfig, TpuConfig
+from eyvan.sdk.client.requests import pool_callable_request, pool_workload_request
+from eyvan.sdk.execution import execute
+from eyvan.server.persistence.sqlalchemy import SCHEMA_REVISION, create_schema
+
+
+def _noop() -> int:
+    return 0
+
+
+@pytest.mark.parametrize(
+    "config",
+    [TpuConfig(type="v5p-8"), GpuConfig(type="nvidia-tesla-a100"), CpuConfig()],
+    ids=["tpu", "gpu", "cpu"],
+)
+def test_the_decorator_accepts_every_config_it_ships(config: AcceleratorConfig) -> None:
+    """The whole defect: two of the three exported configs were refused."""
+
+    assert execute(config)(_noop).config is config
+
+
+def test_a_config_class_is_rejected_with_a_sentence_that_names_the_mistake() -> None:
+    """``@execute(TpuConfig)`` -- the missing parentheses -- is the likely typo.
+
+    A class object satisfies a data protocol's attribute check as readily as an
+    instance, so a bare protocol test would accept it and fail much later,
+    somewhere that mentions none of this.
+    """
+
+    with pytest.raises(TypeError, match="TpuConfig, GpuConfig, or CpuConfig instance"):
+        execute(TpuConfig)  # type: ignore[arg-type]
+
+
+def test_something_that_is_not_a_config_is_still_rejected() -> None:
+    """Widening the gate must not remove it."""
+
+    with pytest.raises(TypeError, match="TpuConfig, GpuConfig, or CpuConfig instance"):
+        execute("v5p-8")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        TpuConfig(type="v5p-8", max_failure_retries=2),
+        GpuConfig(type="a100", max_failure_retries=2),
+        CpuConfig(max_failure_retries=2),
+    ],
+    ids=["tpu", "gpu", "cpu"],
+)
+def test_every_config_carries_the_job_failure_budget(config: AcceleratorConfig) -> None:
+    """It existed server-side and on no client type."""
+
+    assert config.max_failure_retries == 2
+
+
+@pytest.mark.parametrize("value", [-1, 101, True], ids=["negative", "over-limit", "bool"])
+def test_an_out_of_range_failure_budget_is_rejected_client_side(value: object) -> None:
+    """Same bounds as the record, reported where the caller wrote the number."""
+
+    with pytest.raises(ValueError, match="max_failure_retries"):
+        CpuConfig(max_failure_retries=value)  # type: ignore[arg-type]
+
+
+def test_the_two_budgets_stay_separate_in_the_wire_payload() -> None:
+    """Merging them would let a deterministically broken job burn the capacity budget.
+
+    ``max_retries`` pays for capacity the fleet lost -- a preemption, a stockout
+    -- which says nothing about the job. ``max_failure_retries`` pays for the
+    job's own non-zero exit, which usually repeats. That is why the second
+    defaults to zero and why one number could not serve both.
+    """
+
+    request = pool_workload_request(
+        org_id="acme",
+        project_id="research",
+        command="python train.py",
+        name=None,
+        environment=None,
+        metadata=None,
+        max_retries=5,
+        max_failure_retries=2,
+    )
+
+    assert (request.max_retries, request.max_failure_retries) == (5, 2)
+
+
+def test_the_callable_payload_carries_it_too() -> None:
+    """Both submit routes accept it; both builders must send it."""
+
+    from eyvan.records import CallableExecution
+
+    request = pool_callable_request(
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-8",
+        pods=1,
+        capacity_class=TpuConfig(type="v5p-8").capacity_class,
+        execution=CallableExecution(
+            artifact_uri="eyvan://callables/" + "0" * 64,
+            sha256="0" * 64,
+            python="3.13",
+        ),
+        name=None,
+        environment=None,
+        metadata=None,
+        max_retries=5,
+        max_failure_retries=3,
+    )
+
+    assert (request.max_retries, request.max_failure_retries) == (5, 3)
+
+
+def test_the_failure_budget_defaults_to_zero_on_the_wire() -> None:
+    """A job that fails on its own usually fails again; re-running costs an accelerator."""
+
+    request = pool_workload_request(
+        org_id="acme",
+        project_id="research",
+        command="python train.py",
+        name=None,
+        environment=None,
+        metadata=None,
+        max_retries=5,
+    )
+
+    assert request.max_failure_retries == 0
+
+
+def test_a_bootstrapped_database_can_still_be_migrated() -> None:
+    """Without ``alembic_version`` there is no path forward from ``create_schema``.
+
+    Alembic reads that table to decide what has already run. Finding none it
+    concludes the database is empty and replays ``0002`` onward against tables
+    that already exist, which fails -- so the database is stuck on whatever
+    build created it, permanently.
+    """
+
+    async def bootstrap() -> tuple[str | None, str | None]:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = create_async_engine(f"sqlite+aiosqlite:///{directory}/eyvan.db")
+            try:
+                await create_schema(engine)
+                async with engine.connect() as connection:
+                    alembic = (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+                    declared = (await connection.execute(text("SELECT revision FROM schema_revisions"))).scalar_one()
+                return alembic, declared
+            finally:
+                await engine.dispose()
+
+    alembic, declared = asyncio.run(bootstrap())
+
+    assert alembic == SCHEMA_REVISION
+    # Both stamps, agreeing. ``open()`` reads Alembic's first, so a disagreement
+    # would refuse to serve a database this very function had just created.
+    assert declared == SCHEMA_REVISION
+
+
+def test_the_stamped_revision_comes_from_the_migrations_not_a_constant() -> None:
+    """A hand-maintained constant is the thing that drifts.
+
+    Taking the head from the scripts means adding a migration and forgetting to
+    bump ``SCHEMA_REVISION`` fails loudly at bootstrap rather than stamping a
+    revision the scripts do not have.
+    """
+
+    from alembic.script import ScriptDirectory
+
+    from eyvan.server.persistence.migrate import build_alembic_config
+
+    assert ScriptDirectory.from_config(build_alembic_config()).get_current_head() == SCHEMA_REVISION
+
+
+def test_the_run_command_can_set_the_failure_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``grep max_failure_retries eyvan/sdk/`` used to return nothing.
+
+    The record and both request schemas carried it; the only way to reach it was
+    to hand-write the HTTP call, which defeats having a CLI at all.
+    """
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient, _json_argument
+
+    from eyvan.sdk import cli
+    from eyvan.server.api.schemas import PoolWorkloadSubmitRequest
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--user",
+            "alice",
+            "--org",
+            "acme",
+            "--project",
+            "research",
+            "run",
+            "dev-fleet/gpu-workers",
+            "--max-retries",
+            "5",
+            "--max-failure-retries",
+            "2",
+            "--",
+            "python",
+            "train.py",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    request = PoolWorkloadSubmitRequest.model_validate(_json_argument(fake.calls[0]))
+    assert (request.max_retries, request.max_failure_retries) == (5, 2)
+
+
+def test_the_submit_command_can_set_the_failure_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The explicit-intent path needs it as much as the pool path."""
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient, _json_argument
+
+    from eyvan.sdk import cli
+    from eyvan.server.api.schemas import WorkloadSubmitRequest
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--user",
+            "alice",
+            "--org",
+            "acme",
+            "--project",
+            "research",
+            "workload",
+            "submit",
+            "--name",
+            "train",
+            "--command",
+            "python train.py",
+            "--max-failure-retries",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    request = WorkloadSubmitRequest.model_validate(_json_argument(fake.calls[0]))
+    assert request.spec.max_failure_retries == 4

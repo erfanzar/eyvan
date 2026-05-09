@@ -162,6 +162,7 @@ class EyvanClient:
         environment: tp.Mapping[str, str] | None = None,
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        max_failure_retries: int = 0,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -174,6 +175,7 @@ class EyvanClient:
             environment=environment,
             metadata=metadata,
             max_retries=max_retries,
+            max_failure_retries=max_failure_retries,
         )
         response = self._mutating_request(
             "POST",
@@ -197,6 +199,7 @@ class EyvanClient:
         environment: tp.Mapping[str, str] | None = None,
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        max_failure_retries: int = 0,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -212,6 +215,7 @@ class EyvanClient:
             environment=environment,
             metadata=metadata,
             max_retries=max_retries,
+            max_failure_retries=max_failure_retries,
         )
         response = self._mutating_request(
             "POST",

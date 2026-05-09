@@ -172,6 +172,7 @@ class WorkloadCommandService:
         max_retries: int,
         idempotency_key: str | None,
         command: tuple[str, ...],
+        max_failure_retries: int = 0,
         workspace: Path | None = None,
     ) -> None:
         """Submit one pool-targeted command using context and fleet defaults."""
@@ -189,6 +190,7 @@ class WorkloadCommandService:
                 environment=parse_environment(environment),
                 metadata=None,
                 max_retries=max_retries,
+                max_failure_retries=max_failure_retries,
                 workspace=workspace_ref,
             )
         except (ValidationError, ValueError) as exc:
@@ -347,6 +349,13 @@ class WorkloadCommandService:
 @click.option("--name")
 @click.option("--env", "environment", multiple=True, metavar="KEY=VALUE")
 @click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, show_default=True)
+@click.option(
+    "--max-failure-retries",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Retries for the job's own non-zero exit. Separate from --max-retries, which pays for capacity the fleet lost.",
+)
 @click.option("--idempotency-key")
 @click.option(
     "--workspace",
@@ -366,6 +375,7 @@ def run_workload(
     name: str | None,
     environment: tuple[str, ...],
     max_retries: int,
+    max_failure_retries: int,
     idempotency_key: str | None,
     workspace: Path | None,
     command: tuple[str, ...],
@@ -379,6 +389,7 @@ def run_workload(
         name=name,
         environment=environment,
         max_retries=max_retries,
+        max_failure_retries=max_failure_retries,
         idempotency_key=idempotency_key,
         command=command,
         workspace=workspace,
@@ -428,6 +439,13 @@ def workload() -> None:
 @click.option("--checkpoint-hook")
 @click.option("--checkpoint-output-uri")
 @click.option("--max-retries", type=int, default=0, show_default=True)
+@click.option(
+    "--max-failure-retries",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Retries for the job's own non-zero exit. Separate from --max-retries, which pays for capacity the fleet lost.",
+)
 @click.option("--idempotency-key")
 @click.pass_obj
 def submit_workload(
@@ -452,6 +470,7 @@ def submit_workload(
     checkpoint_hook: str | None,
     checkpoint_output_uri: str | None,
     max_retries: int,
+    max_failure_retries: int,
     idempotency_key: str | None,
 ) -> None:
     """Submit a workload with explicit resource and placement intent."""
@@ -479,6 +498,7 @@ def submit_workload(
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
                 max_retries=max_retries,
+                max_failure_retries=max_failure_retries,
             ),
         )
     except (ValidationError, ValueError) as exc:

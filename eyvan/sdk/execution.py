@@ -37,9 +37,11 @@ from eyvan.sdk.client.jobs import (
     AcceleratorConfig,
     CallableSubmission,
     CallableSubmitter,
+    CpuConfig,
     EyvanJob,
     EyvanJobError,
     EyvanPlacementError,
+    GpuConfig,
     JobBackend,
     JobCompletion,
     TpuConfig,
@@ -364,12 +366,17 @@ class Executable(tp.Generic[P, R]):
 
 
 def execute(
-    config: TpuConfig,
+    config: AcceleratorConfig,
     *,
     context: ExecutionContext[R] | None = None,
     workspace: str | os.PathLike[str] | None = None,
 ) -> tp.Callable[[tp.Callable[P, R]], Executable[P, R]]:
     """Decorate a function for durable, scale-from-zero Eyvan execution.
+
+    Takes any ``AcceleratorConfig`` -- ``TpuConfig``, ``GpuConfig`` or
+    ``CpuConfig``. The GPU and CPU classes were complete, validated and exported
+    while this one entry point refused them, so the only hardware the decorator
+    could reach was TPU; everything below it has always been shape-agnostic.
 
     ``workspace`` opts into shipping a working directory alongside the callable,
     so application modules travel with the job instead of having to be baked
@@ -378,8 +385,12 @@ def execute(
     do behind the caller's back.
     """
 
-    if not isinstance(config, TpuConfig):
-        raise TypeError("execute requires a TpuConfig")
+    # A class object satisfies the protocol's attribute check as readily as an
+    # instance does, so ``@execute(TpuConfig)`` -- the missing parentheses --
+    # would pass a bare protocol test and fail much later with an error naming
+    # none of this. Rejecting the type here is what keeps that a one-line fix.
+    if isinstance(config, type) or not isinstance(config, AcceleratorConfig):
+        raise TypeError("execute requires a TpuConfig, GpuConfig, or CpuConfig instance")
 
     def decorate(fn: tp.Callable[P, R]) -> Executable[P, R]:
         if not callable(fn):
@@ -390,14 +401,17 @@ def execute(
 
 
 __all__ = (
+    "AcceleratorConfig",
     "CallableSubmission",
     "CallableSubmitter",
+    "CpuConfig",
     "Executable",
     "ExecutionContext",
     "EyvanJob",
     "EyvanJobError",
     "EyvanPlacementError",
     "EyvanUnavailableError",
+    "GpuConfig",
     "JobBackend",
     "JobCompletion",
     "TpuConfig",

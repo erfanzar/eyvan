@@ -1737,6 +1737,7 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
         "max_retries": 0,
+        "max_failure_retries": 0,
     }
 
 

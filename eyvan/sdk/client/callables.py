@@ -460,6 +460,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 name=request.callable_name[:200],
                 metadata={"eyvan_invocation_id": request.invocation_id},
                 max_retries=request.tpu.max_retries,
+                max_failure_retries=request.tpu.max_failure_retries,
                 idempotency_key=request.invocation_id,
             )
         except EyvanHTTPError as error:

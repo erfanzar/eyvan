@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Connection,
     DateTime,
     Integer,
     String,
@@ -1031,10 +1032,48 @@ class SqlAlchemyRepository:
         return claimed
 
 
+def _stamp_alembic_head(connection: Connection) -> None:
+    """Record the head revision in ``alembic_version``, as ``alembic stamp head`` would.
+
+    Without this, a database bootstrapped by ``create_schema`` could never be
+    migrated: Alembic would find no version row, conclude the database is empty,
+    and replay every migration from ``0002`` against tables that already exist.
+    The default was ``False`` and the shipped manifest sets it to ``"false"``, so
+    the documented path avoided the trap -- which is exactly what made it a trap,
+    since nothing said so.
+
+    The revision comes from the migration scripts rather than a constant, so the
+    two stamps cannot drift apart.
+    """
+
+    from alembic.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    from eyvan.server.persistence.migrate import build_alembic_config
+
+    head = ScriptDirectory.from_config(build_alembic_config()).get_current_head()
+    if head is None:
+        raise RuntimeError("packaged Alembic migrations declare no head revision")
+    if head != SCHEMA_REVISION:
+        raise RuntimeError(
+            f"packaged migrations are at {head!r} but this build declares SCHEMA_REVISION "
+            f"{SCHEMA_REVISION!r}; the two stamps would disagree"
+        )
+    context = MigrationContext.configure(connection)
+    context._ensure_version_table()
+    context.stamp(ScriptDirectory.from_config(build_alembic_config()), head)
+
+
 async def create_schema(engine: AsyncEngine) -> None:
-    """Create the current schema and stamp its source revision for development."""
+    """Create the current schema and stamp its source revision for development.
+
+    Both stamps, not one. ``schema_revisions`` is what this build reads back at
+    startup; ``alembic_version`` is what a later ``eyvan-migrate upgrade head``
+    reads, and a database missing it is one no migration can ever be applied to.
+    """
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_stamp_alembic_head)
     async with async_sessionmaker(engine).begin() as session:
         await session.merge(SchemaRevisionRow(revision=SCHEMA_REVISION))

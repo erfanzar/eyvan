@@ -321,7 +321,10 @@ async def test_a_database_behind_this_build_refuses_to_open(tmp_path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'behind.db'}")
     await create_schema(engine)
     async with engine.begin() as connection:
-        await connection.execute(text("UPDATE schema_revisions SET revision = '0002_transactional_outbox'"))
+        # Alembic's table is the authoritative stamp and the one a real
+        # un-migrated database would be behind on, so that is what this moves
+        # back. ``schema_revisions`` is covered separately below.
+        await connection.execute(text("UPDATE alembic_version SET version_num = '0002_transactional_outbox'"))
 
     try:
         with pytest.raises(SchemaRevisionMismatch, match="0002_transactional_outbox"):
@@ -345,11 +348,59 @@ async def test_a_database_ahead_of_this_build_also_refuses_to_open(tmp_path) -> 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ahead.db'}")
     await create_schema(engine)
     async with engine.begin() as connection:
-        await connection.execute(text("UPDATE schema_revisions SET revision = '0099_from_the_future'"))
+        await connection.execute(text("UPDATE alembic_version SET version_num = '0099_from_the_future'"))
 
     try:
         with pytest.raises(SchemaRevisionMismatch, match="0099_from_the_future"):
             await SqlAlchemyRepository(engine).open()
+    finally:
+        await engine.dispose()
+
+
+async def test_the_fallback_stamp_is_read_when_alembic_has_none(tmp_path) -> None:
+    """A database predating the Alembic stamp still has to be gated.
+
+    ``create_schema`` stamps both now, but a database bootstrapped by an older
+    build has only ``schema_revisions``. Reading Alembic first must not mean
+    ignoring the other source when Alembic's table is absent -- that would let
+    exactly those databases open against a build they do not match.
+    """
+
+    from sqlalchemy import text
+
+    from eyvan.server.persistence.base import SchemaRevisionMismatch
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy.db'}")
+    await create_schema(engine)
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP TABLE alembic_version"))
+        await connection.execute(text("UPDATE schema_revisions SET revision = '0002_transactional_outbox'"))
+
+    try:
+        with pytest.raises(SchemaRevisionMismatch, match="0002_transactional_outbox"):
+            await SqlAlchemyRepository(engine).open()
+    finally:
+        await engine.dispose()
+
+
+async def test_a_migrated_database_opens_even_with_a_stale_fallback_stamp(tmp_path) -> None:
+    """Alembic first, and it means first.
+
+    Migrations create ``schema_revisions`` and never write a row to it, so after
+    ``create_schema`` at one revision and ``eyvan-migrate`` to a later one the
+    two stamps legitimately disagree. Treating that as a fault would refuse the
+    ordinary upgrade path.
+    """
+
+    from sqlalchemy import text
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'migrated.db'}")
+    await create_schema(engine)
+    async with engine.begin() as connection:
+        await connection.execute(text("UPDATE schema_revisions SET revision = '0002_transactional_outbox'"))
+
+    try:
+        await SqlAlchemyRepository(engine).open()
     finally:
         await engine.dispose()
 
