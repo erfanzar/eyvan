@@ -96,11 +96,12 @@ def list_capacity(
         params={"org_id": scope.org_id, "project_id": scope.project_id},
         headers=session.workload_headers(scope),
     )
-    if not isinstance(payload, dict) or not isinstance(payload.get("pools"), list):
+    pools = payload.get("pools") if isinstance(payload, dict) else None
+    if not isinstance(pools, list):
         raise click.ClickException("control plane returned an unexpected capacity response")
     rows = [
         pool
-        for pool in payload["pools"]
+        for pool in pools
         if isinstance(pool, dict)
         and (accelerator_type is None or pool.get("accelerator_type") == accelerator_type)
         and (capacity_class is None or pool.get("capacity_class") == capacity_class)
@@ -111,7 +112,7 @@ def list_capacity(
     if not rows:
         # Distinguish "your filters matched nothing" from "the fleet is empty":
         # the two have completely different fixes and the same empty table.
-        if payload["pools"]:
+        if pools:
             click.echo("No capacity pools match those filters.")
         else:
             click.echo("No enabled capacity pools are available to this project.")

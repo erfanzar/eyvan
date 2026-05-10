@@ -85,11 +85,12 @@ class DoctorReport:
         return not any(check.status in {CheckStatus.FAIL, CheckStatus.SKIP} for check in self.checks)
 
     def as_json(self) -> dict[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "ok": self.ok,
             "client_version": client_version(),
             "checks": [check.as_json() for check in self.checks],
         }
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +268,7 @@ class DoctorCommandService:
 
         hard_scopes = {
             (budget.get("org_id"), budget.get("project_id"))
-            for budget in budgets
+            for budget in (budgets if isinstance(budgets, list) else ())
             if is_json_object(budget) and budget.get("hard_limit") and budget.get("limit")
         }
         if not hard_scopes:

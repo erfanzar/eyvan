@@ -294,12 +294,15 @@ class GcsBackend:
         # sufficient -- without a retry, one blip still takes out every route
         # that reads fleet state, including the log fetch an operator needs to
         # diagnose the blip.
-        for attempt in range(_READ_ATTEMPTS):
-            body = self._runner(("storage", "cat", self.uri))
+        # Read once, then retry between checks rather than checking inside the
+        # loop: identical attempt count and backoff, and ``body`` is provably
+        # bound afterwards, which the loop-first shape left to the reader.
+        body = self._runner(("storage", "cat", self.uri))
+        for attempt in range(_READ_ATTEMPTS - 1):
             if not self._missing(body) and body.returncode == 0 and body.stdout.strip():
                 break
-            if attempt + 1 < _READ_ATTEMPTS:
-                time.sleep(min(0.2 * (2**attempt), 2.0))
+            time.sleep(min(0.2 * (2**attempt), 2.0))
+            body = self._runner(("storage", "cat", self.uri))
         # `describe` has already proven the object exists at `generation`, so from
         # here an unreadable or blank body is a *failed read*, never an empty
         # fleet. Returning `_empty_document()` here says "this fleet has no

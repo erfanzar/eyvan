@@ -567,17 +567,27 @@ def test_a_transient_read_failure_is_retried_before_it_is_believed() -> None:
 def test_a_read_that_never_succeeds_still_refuses_to_invent_an_empty_fleet() -> None:
     """Retrying must not become guessing: exhausted attempts are still unknown."""
 
-    from eyvan.capacity.fleet_state import FleetStateUnavailableError
+    from eyvan.capacity.fleet_state import _READ_ATTEMPTS, FleetStateUnavailableError
 
     class AlwaysFailingGcs:
+        def __init__(self):
+            self.cat_calls = 0
+
         def __call__(self, args):
             command = tuple(args)
             if command[:3] == ("storage", "objects", "describe"):
                 return subprocess.CompletedProcess(command, 0, json.dumps({"generation": 7}), "")
+            self.cat_calls += 1
             return subprocess.CompletedProcess(command, 1, "", "not found: 404")
 
+    gcs = AlwaysFailingGcs()
     with pytest.raises(FleetStateUnavailableError):
-        GcsBackend("gs://fleet/eyvan/state.json", runner=AlwaysFailingGcs()).read()
+        GcsBackend("gs://fleet/eyvan/state.json", runner=gcs).read()
+
+    # Bounded in both directions. Every route that reads fleet state waits on
+    # this, so an off-by-one that retried forever would hang them all, and one
+    # that retried less would reintroduce the blip this retry exists to absorb.
+    assert gcs.cat_calls == _READ_ATTEMPTS
 
 
 def _empty_for_test() -> dict:

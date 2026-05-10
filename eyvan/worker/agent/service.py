@@ -51,11 +51,17 @@ MutationRequest: tp.TypeAlias = CapacityRequest | CheckpointRequest | WorkloadMu
 GangMemberKey: tp.TypeAlias = tuple[str, str, int, str] | tuple[str, str, int, str, str]
 
 
-class InvalidWorkloadRequestError(HTTPException, ValueError):
+class InvalidWorkloadRequestError(HTTPException, ValueError):  # pyright: ignore[reportUnsafeMultipleInheritance]
     """A workload request that failed validation, mapped to HTTP 422 by the agent API.
 
     Also subclasses :class:`ValueError` so direct in-process callers keep the
     established exception contract.
+
+    The suppression is for the hazard this class does not have: the rule warns
+    that a base initializer may go uncalled, and ``__init__`` below calls both
+    explicitly. ``test_native_gang_agent`` asserts both halves of the contract --
+    ``isinstance(error, ValueError)`` and ``status_code == 422`` -- on the same
+    raised object, so a regression in either fails a test rather than a linter.
     """
 
     def __init__(self, detail: str) -> None:

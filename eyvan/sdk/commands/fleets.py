@@ -99,21 +99,23 @@ def _print_capacity(session: CliSession, *, as_json: bool) -> None:
         "/api/v1/capacity",
         params={"org_id": scope.org_id, "project_id": scope.project_id},
     )
-    if not isinstance(pools, dict) or "pools" not in pools:
+    rows = pools.get("pools") if isinstance(pools, dict) else None
+    if not isinstance(rows, list):
         raise click.ClickException("control plane returned an unexpected capacity response")
     if as_json:
         click.echo(json.dumps(pools, sort_keys=True, indent=2))
         return
-    rows = pools["pools"]
     if not rows:
         click.echo("No enabled capacity pools available.")
         return
     click.echo("Available capacity pools:")
     for pool in rows:
+        if not isinstance(pool, dict):
+            continue
         click.echo(
-            f"  {pool['fleet']:30} {pool['accelerator_type']:10} "
-            f"{pool['capacity_class']:10} {pool['region']:10} {pool['zone'] or '-':10} "
-            f"max={pool['max_cells']}"
+            f"  {pool.get('fleet', '-'):30} {pool.get('accelerator_type', '-'):10} "
+            f"{pool.get('capacity_class', '-'):10} {pool.get('region', '-'):10} "
+            f"{pool.get('zone') or '-':10} max={pool.get('max_cells', '?')}"
         )
 
 

@@ -190,14 +190,16 @@ def job_manifest(
         # in this manifest and never as an annotation: both are readable by
         # anyone who can read the Job.
         pod_spec["volumes"] = [{"name": "eyvan-worker-token", "secret": {"secretName": secret_name}}]
-        container = pod_spec["containers"][0]
+        containers = pod_spec["containers"]
+        assert isinstance(containers, list)
+        container = containers[0]
         assert isinstance(container, dict)
         container["volumeMounts"] = [{"name": "eyvan-worker-token", "mountPath": "/var/run/eyvan", "readOnly": True}]
     if node_selector:
         pod_spec["nodeSelector"] = dict(node_selector)
     if tolerations:
         pod_spec["tolerations"] = [dict(toleration) for toleration in tolerations]
-    return {
+    manifest: JsonObject = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
@@ -215,6 +217,7 @@ def job_manifest(
             "template": {"metadata": {"labels": labels}, "spec": pod_spec},
         },
     }
+    return manifest
 
 
 def secret_manifest(cell_id: str, namespace: str, token: str) -> JsonObject:
