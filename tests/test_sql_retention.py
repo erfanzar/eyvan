@@ -43,6 +43,7 @@ from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from eyvan._internal.json_types import model_json
@@ -55,10 +56,27 @@ from eyvan.records import (
 from eyvan.server.persistence.sqlalchemy import IdempotencyRow, SqlAlchemyRepository, create_schema
 
 
-@pytest.fixture
-async def repository(tmp_path) -> tp.AsyncIterator[SqlAlchemyRepository]:
-    # A file rather than :memory: so every pooled connection sees one schema.
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'eyvan.db'}")
+@pytest.fixture(params=["sqlite", "postgres"])
+async def repository(request, tmp_path) -> tp.AsyncIterator[SqlAlchemyRepository]:
+    """Run every test in this file on both backends.
+
+    SQLite keeps the file runnable with no database installed, which is what it
+    was written against. PostgreSQL is what production uses, and until this
+    parameter existed nothing here had ever executed there: retention prunes
+    page on indexed columns, and a prune that pages on a column the schema
+    lacks deletes nothing and reports success -- a bug this package has already
+    shipped once.
+    """
+
+    if request.param == "postgres":
+        url = request.getfixturevalue("postgres_url")
+        engine = create_async_engine(url)
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            await connection.execute(text("CREATE SCHEMA public"))
+    else:
+        # A file rather than :memory: so every pooled connection sees one schema.
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'eyvan.db'}")
     await create_schema(engine)
     try:
         yield SqlAlchemyRepository(engine)

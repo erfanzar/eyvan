@@ -870,6 +870,19 @@ class SqlAlchemyRepository:
     def __init__(self, engine: AsyncEngine):
         self.engine = engine.execution_options(isolation_level="SERIALIZABLE")
         self._sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        # Outbox claiming runs at READ COMMITTED, alone among the repository's
+        # writes. ``FOR UPDATE SKIP LOCKED`` *is* the serialization here: each
+        # row is locked before it is updated and rows another claimer holds are
+        # skipped, so two workers cannot claim one command. Layering
+        # SERIALIZABLE on top adds no safety and does add spurious 40001s that
+        # scale with replica count -- measured against PostgreSQL 17, four
+        # concurrent claimers failed on the first try. Active-active delivery is
+        # the entire point of the claim, so making it fail more often the more
+        # replicas you run is exactly backwards.
+        self._claim_sessions = async_sessionmaker(
+            engine.execution_options(isolation_level="READ COMMITTED"),
+            expire_on_commit=False,
+        )
 
     async def open(self) -> None:
         """Refuse to serve a database whose schema this build does not match.
@@ -916,16 +929,31 @@ class SqlAlchemyRepository:
 
         return None
 
+    @staticmethod
+    def _translated(exc: DBAPIError) -> BaseException:
+        """Return the typed error for a database failure callers can act on.
+
+        A raw ``DBAPIError`` tells a caller nothing: a unique-violation race and
+        a broken connection arrive as the same class, so either everything is
+        retried or nothing is. Only these three SQLSTATEs mean "the same call
+        would likely succeed now".
+        """
+
+        sqlstate = _transaction_sqlstate(exc.orig)
+        if sqlstate in {"23505", "40001", "40P01"}:
+            return TransientRepositoryError(f"retryable PostgreSQL transaction conflict ({sqlstate})")
+        return exc
+
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[SqlAlchemySession]:
         try:
             async with self._sessions.begin() as session:
                 yield SqlAlchemySession(session)
         except DBAPIError as exc:
-            sqlstate = _transaction_sqlstate(exc.orig)
-            if sqlstate in {"23505", "40001", "40P01"}:
-                raise TransientRepositoryError(f"retryable PostgreSQL transaction conflict ({sqlstate})") from exc
-            raise
+            translated = self._translated(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
 
     async def wait_for_events(
         self,
@@ -1012,23 +1040,33 @@ class SqlAlchemyRepository:
         statement = statement.order_by(OutboxRow.available_at, OutboxRow.id)
         statement = statement.with_for_update(skip_locked=True).limit(limit)
         claimed: list[OutboxRecord] = []
-        async with self._sessions.begin() as session:
-            rows = (await session.scalars(statement)).all()
-            for row in rows:
-                record = OutboxRecord.model_validate(row.data)
-                updated = record.model_copy(
-                    update={
-                        "state": OutboxState.PROCESSING,
-                        "attempts": record.attempts + 1,
-                        "claimed_by": worker_id,
-                        "claimed_until": now + timedelta(seconds=lease_seconds),
-                        "updated_at": now,
-                    }
-                )
-                row.state = updated.state.value
-                row.claimed_until = updated.claimed_until
-                row.data = _dump(updated)
-                claimed.append(updated)
+        try:
+            async with self._claim_sessions.begin() as session:
+                rows = (await session.scalars(statement)).all()
+                for row in rows:
+                    record = OutboxRecord.model_validate(row.data)
+                    updated = record.model_copy(
+                        update={
+                            "state": OutboxState.PROCESSING,
+                            "attempts": record.attempts + 1,
+                            "claimed_by": worker_id,
+                            "claimed_until": now + timedelta(seconds=lease_seconds),
+                            "updated_at": now,
+                        }
+                    )
+                    row.state = updated.state.value
+                    row.claimed_until = updated.claimed_until
+                    row.data = _dump(updated)
+                    claimed.append(updated)
+        except DBAPIError as exc:
+            # This path used to bypass the translation entirely, so a conflict
+            # here reached the outbox loop as a raw DBAPIError, was swallowed by
+            # its broad handler, and cost the whole batch that cycle with only a
+            # stack trace to show for it.
+            translated = self._translated(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
         return claimed
 
 
