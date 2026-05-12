@@ -131,6 +131,9 @@ def test_network_startup_requires_an_explicit_postgres_repository(monkeypatch) -
     bind = ServerBindPolicy.from_host("0.0.0.0")
     monkeypatch.delenv("EYVAN_DEV_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("EYVAN_REPOSITORY_BACKEND", raising=False)
+    # A network bind separately requires a metrics token; this test is about the
+    # repository, so satisfy that requirement rather than assert it here.
+    monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
 
     with pytest.raises(ValueError, match="EYVAN_REPOSITORY_BACKEND=postgres"):
         ServerStartupSettings.from_environment(bind)
@@ -364,6 +367,7 @@ def test_network_factory_requires_postgres_and_never_enables_development_auth(mo
     monkeypatch.delenv("EYVAN_DEV_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("EYVAN_REPOSITORY_BACKEND", raising=False)
     monkeypatch.setenv("EYVAN_CONTROLLER_ENABLED", "0")
+    monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
 
     with pytest.raises(ValueError, match="EYVAN_REPOSITORY_BACKEND=postgres"):
         create_network_app()
@@ -767,7 +771,7 @@ def test_fleet_api_defaults_local_development_agent_but_rejects_missing_remote_r
 
     remote_client = TestClient(
         create_app(
-            settings=EyvanSettings(public_url="https://eyvan.example.com"),
+            settings=EyvanSettings(public_url="https://eyvan.example.com", metrics_token="scrape-token"),
             server_bind=ServerBindPolicy.from_host("0.0.0.0"),
             verifier=_StaticTokenVerifier(Principal(subject="alice", grants=(RoleGrant(role=Role.FLEET_ADMIN),))),
         )
@@ -816,7 +820,7 @@ def test_loopback_development_trusts_only_the_default_callable_scope(tmp_path) -
 
 
 def test_network_bind_never_infers_callable_trust_from_loopback_public_url() -> None:
-    settings = EyvanSettings(public_url="http://127.0.0.1:8080")
+    settings = EyvanSettings(public_url="http://127.0.0.1:8080", metrics_token="scrape-token")
     verifier = _StaticTokenVerifier(
         Principal(
             subject="alice",

@@ -72,6 +72,17 @@ class ServerStartupSettings:
                 "Eyvan development authentication may only be used with a literal loopback server bind; "
                 "disable it or configure OIDC for a network-bound deployment"
             )
+        if not bind.is_loopback and not settings.metrics_token:
+            # ``/metrics`` exports eyvan_project_spend_usd labeled by (org,
+            # project). Unauthenticated on a network bind, that is every
+            # tenant's spend readable by anyone who can reach the port -- and
+            # the shipped manifests have no NetworkPolicy in front of it.
+            # Refusing at startup is the only version of this that cannot be
+            # forgotten; a warning in a log is a gap with documentation attached.
+            raise ValueError(
+                "a network-bound Eyvan server requires EYVAN_METRICS_TOKEN so /metrics does not expose "
+                "per-tenant spend to anyone who can reach the port"
+            )
         mode = DevelopmentAuthMode.EXPLICIT if settings.dev_auth_enabled else DevelopmentAuthMode.DISABLED
         return cls(bind=bind, settings=settings, development_auth_mode=mode)
 

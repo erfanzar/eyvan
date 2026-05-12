@@ -136,6 +136,14 @@ class EyvanSettings:
     cell_billing_interval_s: float = 300.0
     retention_batch_limit: int = 1000
     agent_shared_secret: str | None = field(default=None, repr=False)
+    #: Bearer token a Prometheus scraper presents at ``/metrics``. A separate
+    #: credential rather than an OIDC identity because a scraper has none, and
+    #: because the alternative in practice is leaving the endpoint open: it
+    #: exports ``eyvan_project_spend_usd`` labeled by (org, project), so anyone
+    #: who can reach the port reads every tenant's spend. Required for a
+    #: network-bound server, which is what makes the exposure impossible rather
+    #: than merely discouraged.
+    metrics_token: str | None = field(default=None, repr=False)
     native_worker_root_secret: str | None = field(default=None, repr=False)
     fleet_state_uri: str | None = None
     capacity_backend: str = "gcp"
@@ -252,6 +260,7 @@ class EyvanSettings:
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),
             agent_shared_secret=os.getenv("EYVAN_AGENT_SHARED_SECRET"),
+            metrics_token=os.getenv("EYVAN_METRICS_TOKEN"),
             native_worker_root_secret=os.getenv("EYVAN_NATIVE_WORKER_ROOT_SECRET"),
             fleet_state_uri=os.getenv("EYVAN_FLEET_STATE_URI"),
             capacity_backend=os.getenv("EYVAN_CAPACITY_BACKEND", defaults.capacity_backend),

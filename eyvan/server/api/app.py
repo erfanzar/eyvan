@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import hmac
 import ipaddress
 import json
 import logging
@@ -23,7 +24,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -880,7 +881,26 @@ def create_app(
         return {"uri": uri}
 
     @app.get("/metrics", include_in_schema=False)
-    async def prometheus_metrics() -> Response:
+    async def prometheus_metrics(raw_request: Request) -> Response:
+        """Serve the Prometheus exposition to an authenticated scraper.
+
+        This endpoint had no ``Depends`` at all while exporting
+        ``eyvan_project_spend_usd`` labeled by (org, project) -- every tenant's
+        spend, readable by anyone who could reach the port.
+
+        A bearer token rather than an OIDC identity because a scraper has no
+        identity to present, and the realistic alternative to a token is leaving
+        it open. When no token is configured the endpoint stays open, which is
+        only reachable on a loopback bind: ``ServerStartupSettings`` refuses to
+        start a network-bound server without one.
+        """
+
+        expected = settings.metrics_token
+        if expected:
+            authorization = raw_request.headers.get("Authorization", "")
+            scheme, _, presented = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="metrics token required")
         return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/api/v1/system/reconcile", tags=["system"])
