@@ -12,7 +12,22 @@ from eyvan.server.service.errors import AuthorizationError
 
 _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.FLEET_ADMIN: frozenset(Permission),
-    Role.ORG_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
+    Role.ORG_ADMIN: frozenset(
+        {
+            Permission.READ,
+            Permission.SUBMIT,
+            Permission.OPERATE,
+            Permission.MANAGE_PROJECT,
+            # Its own capacity, not the fleet's. Before this, every one of the
+            # cell and pool mutations was MANAGE_FLEET-only, so a tenant could
+            # not resize a pool it paid for without an operator holding rights
+            # over every other tenant's capacity as well.
+            Permission.MANAGE_OWN_CAPACITY,
+        }
+    ),
+    # Deliberately not project roles. Capacity is an organization-level asset:
+    # a pool serves every project in its org, so letting one project's admin
+    # resize it would let them take capacity from a sibling project.
     Role.PROJECT_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
     Role.PROJECT_OPERATOR: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE}),
     Role.PROJECT_VIEWER: frozenset({Permission.READ}),

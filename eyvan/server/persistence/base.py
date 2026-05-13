@@ -19,9 +19,11 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    OrganizationRecord,
     OutboxRecord,
     OutboxState,
     PolicyRecord,
+    ProjectRecord,
     QuotaRecord,
     UserProgressReport,
     WorkloadRecord,
@@ -104,6 +106,18 @@ class RepositorySession(tp.Protocol):
     async def put_quota(self, quota: QuotaRecord) -> None: ...
 
     async def delete_quota(self, org_id: str, project_id: str | None, principal_id: str | None) -> bool: ...
+
+    async def get_organization(self, org_id: str) -> OrganizationRecord | None: ...
+
+    async def list_organizations(self) -> list[OrganizationRecord]: ...
+
+    async def put_organization(self, organization: OrganizationRecord) -> None: ...
+
+    async def get_project(self, org_id: str, project_id: str) -> ProjectRecord | None: ...
+
+    async def list_projects(self, *, org_id: str | None = None) -> list[ProjectRecord]: ...
+
+    async def put_project(self, project: ProjectRecord) -> None: ...
 
     async def get_budget(self, org_id: str, project_id: str) -> BudgetRecord | None: ...
 

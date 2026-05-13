@@ -23,9 +23,11 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    OrganizationRecord,
     OutboxRecord,
     OutboxState,
     PolicyRecord,
+    ProjectRecord,
     QuotaRecord,
     UserProgressReport,
     WorkloadRecord,
@@ -51,6 +53,10 @@ class ControlPlaneState:
     policies: dict[tuple[str, str], PolicyRecord] = field(default_factory=dict)
     quotas: dict[tuple[str, str, str], QuotaRecord] = field(default_factory=dict)
     budgets: dict[tuple[str, str], BudgetRecord] = field(default_factory=dict)
+    organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
+    #: Keyed by (org, project): project names are unique only within a tenant,
+    #: and two organizations both having a "research" project is the ordinary case.
+    projects: dict[tuple[str, str], ProjectRecord] = field(default_factory=dict)
     #: workload id -> rank -> latest report. Keyed by rank so a new report for a
     #: rank replaces the old one rather than accumulating.
     progress_reports: dict[str, dict[int, UserProgressReport]] = field(default_factory=dict)
@@ -186,6 +192,25 @@ class StateSession(RepositorySession):
 
     async def delete_quota(self, org_id: str, project_id: str | None, principal_id: str | None) -> bool:
         return self._state.quotas.pop((org_id, project_id or "", principal_id or ""), None) is not None
+
+    async def get_organization(self, org_id: str) -> OrganizationRecord | None:
+        return self._state.organizations.get(org_id)
+
+    async def list_organizations(self) -> list[OrganizationRecord]:
+        return sorted(self._state.organizations.values(), key=lambda item: item.id)
+
+    async def put_organization(self, organization: OrganizationRecord) -> None:
+        self._state.organizations[organization.id] = organization
+
+    async def get_project(self, org_id: str, project_id: str) -> ProjectRecord | None:
+        return self._state.projects.get((org_id, project_id))
+
+    async def list_projects(self, *, org_id: str | None = None) -> list[ProjectRecord]:
+        items = (item for item in self._state.projects.values() if org_id is None or item.org_id == org_id)
+        return sorted(items, key=lambda item: (item.org_id, item.id))
+
+    async def put_project(self, project: ProjectRecord) -> None:
+        self._state.projects[project.key] = project
 
     async def get_budget(self, org_id: str, project_id: str) -> BudgetRecord | None:
         return self._state.budgets.get((org_id, project_id))

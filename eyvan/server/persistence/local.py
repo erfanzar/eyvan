@@ -27,9 +27,11 @@ from eyvan.records import (
     CellRecord,
     IdempotencyRecord,
     LeaseRecord,
+    OrganizationRecord,
     OutboxRecord,
     OutboxState,
     PolicyRecord,
+    ProjectRecord,
     QuotaRecord,
     WorkloadRecord,
     utcnow,
@@ -72,6 +74,8 @@ class LocalControlPlaneDocument(BaseModel):
     policies: tuple[PolicyRecord, ...] = ()
     quotas: tuple[QuotaRecord, ...] = ()
     budgets: tuple[BudgetRecord, ...] = ()
+    organizations: tuple[OrganizationRecord, ...] = ()
+    projects: tuple[ProjectRecord, ...] = ()
     idempotency: tuple[IdempotencyRecord, ...] = ()
     outbox: tuple[OutboxRecord, ...] = ()
     events: tuple[AuditEvent, ...] = ()
@@ -95,6 +99,10 @@ class LocalControlPlaneDocument(BaseModel):
             raise ValueError("local control-plane quotas must have unique hierarchical scopes")
         if len({(record.org_id, record.project_id) for record in self.budgets}) != len(self.budgets):
             raise ValueError("local control-plane budgets must have unique organization/project scopes")
+        if len({record.id for record in self.organizations}) != len(self.organizations):
+            raise ValueError("local control-plane organizations must have unique IDs")
+        if len({record.key for record in self.projects}) != len(self.projects):
+            raise ValueError("local control-plane projects must have unique organization/project scopes")
         if len({(record.scope, record.operation, record.key) for record in self.idempotency}) != len(self.idempotency):
             raise ValueError("local control-plane idempotency records must have unique scopes")
         if len({record.id for record in self.outbox}) != len(self.outbox):
@@ -131,6 +139,8 @@ class LocalControlPlaneDocument(BaseModel):
                 )
             ),
             budgets=tuple(sorted(state.budgets.values(), key=lambda record: (record.org_id, record.project_id))),
+            organizations=tuple(sorted(state.organizations.values(), key=lambda record: record.id)),
+            projects=tuple(sorted(state.projects.values(), key=lambda record: record.key)),
             idempotency=tuple(
                 sorted(state.idempotency.values(), key=lambda record: (record.scope, record.operation, record.key))
             ),
@@ -153,6 +163,8 @@ class LocalControlPlaneDocument(BaseModel):
                 (record.org_id, record.project_id or "", record.principal_id or ""): record for record in self.quotas
             },
             budgets={(record.org_id, record.project_id): record for record in self.budgets},
+            organizations={record.id: record for record in self.organizations},
+            projects={record.key: record for record in self.projects},
             idempotency={(record.scope, record.operation, record.key): record for record in self.idempotency},
             outbox={record.id: record for record in self.outbox},
             events=list(self.events),

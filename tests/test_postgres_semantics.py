@@ -113,7 +113,16 @@ async def test_the_migration_chain_runs_against_a_real_database(database) -> Non
         }
 
     assert stamped == SCHEMA_REVISION
-    assert {"workloads", "cells", "leases", "outbox", "audit_events", "progress_reports"} <= tables
+    assert {
+        "workloads",
+        "cells",
+        "leases",
+        "outbox",
+        "audit_events",
+        "progress_reports",
+        "organizations",
+        "projects",
+    } <= tables
 
 
 async def test_a_mismatched_stamp_refuses_to_open_a_real_database(database) -> None:

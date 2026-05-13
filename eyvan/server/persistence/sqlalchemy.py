@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     Connection,
     DateTime,
     Integer,
@@ -46,9 +47,11 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    OrganizationRecord,
     OutboxRecord,
     OutboxState,
     PolicyRecord,
+    ProjectRecord,
     QuotaRecord,
     UserProgressReport,
     WorkloadRecord,
@@ -58,7 +61,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
 
-SCHEMA_REVISION = "0008_progress_reports"
+SCHEMA_REVISION = "0009_tenant_registry"
 
 
 @tp.runtime_checkable
@@ -152,6 +155,23 @@ class BudgetRow(Base):
     __tablename__ = "budgets"
     id: Mapped[str] = mapped_column(String(256), primary_key=True)
     org_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class OrganizationRow(Base):
+    __tablename__ = "organizations"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    #: A real column, not a field inside ``data``: listing enabled tenants is an
+    #: index scan and a JSON extraction cannot use one.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ProjectRow(Base):
+    __tablename__ = "projects"
+    org_id: Mapped[str] = mapped_column(String(128), primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -525,6 +545,39 @@ class SqlAlchemySession:
             return False
         await self.session.delete(row)
         return True
+
+    async def get_organization(self, org_id: str) -> OrganizationRecord | None:
+        row = await self._get_locked(OrganizationRow, org_id)
+        return None if row is None else OrganizationRecord.model_validate(row.data)
+
+    async def list_organizations(self) -> list[OrganizationRecord]:
+        rows = (await self.session.scalars(select(OrganizationRow))).all()
+        return sorted(_decode_rows(OrganizationRecord, rows, table="organizations"), key=lambda item: item.id)
+
+    async def put_organization(self, organization: OrganizationRecord) -> None:
+        await self.session.merge(
+            OrganizationRow(id=organization.id, enabled=organization.enabled, data=_dump(organization))
+        )
+
+    async def get_project(self, org_id: str, project_id: str) -> ProjectRecord | None:
+        row = await self.session.get(ProjectRow, {"org_id": org_id, "id": project_id}, with_for_update=True)
+        return None if row is None else ProjectRecord.model_validate(row.data)
+
+    async def list_projects(self, *, org_id: str | None = None) -> list[ProjectRecord]:
+        statement = select(ProjectRow)
+        if org_id is not None:
+            statement = statement.where(ProjectRow.org_id == org_id)
+        rows = (await self.session.scalars(statement)).all()
+        items = _decode_rows(ProjectRecord, rows, table="projects")
+        return sorted(
+            (item for item in items if org_id is None or item.org_id == org_id),
+            key=lambda item: (item.org_id, item.id),
+        )
+
+    async def put_project(self, project: ProjectRecord) -> None:
+        await self.session.merge(
+            ProjectRow(org_id=project.org_id, id=project.id, enabled=project.enabled, data=_dump(project))
+        )
 
     async def get_budget(self, org_id: str, project_id: str) -> BudgetRecord | None:
         row = await self._get_locked(BudgetRow, _composite_key("budget", org_id, project_id))

@@ -481,6 +481,11 @@ class Permission(StrEnum):
     SUBMIT = "submit"
     OPERATE = "operate"
     MANAGE_PROJECT = "manage_project"
+    #: Administer capacity an organization owns. Distinct from MANAGE_FLEET,
+    #: which reaches every tenant's capacity and the provider configuration
+    #: underneath it: an org admin needs to size its own pools without being
+    #: handed the ability to delete another tenant's cells.
+    MANAGE_OWN_CAPACITY = "manage_own_capacity"
     MANAGE_FLEET = "manage_fleet"
 
 
@@ -1214,6 +1219,12 @@ class CapacityPoolRecord(EyvanModel):
     id: str = Field(max_length=192)
     fleet_name: str = Field(max_length=96)
     node_type: str = Field(max_length=96)
+    #: Organization accountable for this pool, or ``None`` for shared capacity.
+    #: Without it "an org admin may manage its own pools" had no referent: a
+    #: pool belonged to nobody, so the only workable rule was fleet-admin-only.
+    #: ``None`` keeps every existing pool shared and fleet-administered, so
+    #: ownership is something an operator opts a pool into.
+    owner_org_id: str | None = Field(default=None, max_length=128)
     provider: str
     capacity_backend: str | None = None
     provider_project: str | None = None
@@ -1597,6 +1608,80 @@ class QuotaRecord(EyvanModel):
             raise ValueError(f"quota constrained resource {unknown[0]!r} is missing from limits")
         if self.principal_id is not None and self.project_id is None:
             raise ValueError("principal quota scope requires project_id")
+        return self
+
+
+class OrganizationRecord(EyvanModel):
+    """A tenant this control plane knows about.
+
+    Until this existed, ``org_id`` was a free-form string on every request and a
+    tenant was whatever anyone typed. Nothing could answer "which organizations
+    exist", so nothing could list them, bill them, or refuse a typo -- a
+    ``PUT /quotas`` naming ``acmee`` created a quota for a tenant that would
+    never submit anything, and it looked exactly like success.
+
+    Registration is deliberately thin. It is a name and an owner, not a
+    settings object: quotas, budgets and policies are already their own records
+    scoped by ``org_id``, and duplicating any of them here would create two
+    places to look and one of them wrong.
+    """
+
+    id: str = Field(max_length=128)
+    display_name: str = Field(default="", max_length=200)
+    #: Subject of the principal accountable for this tenant. Not a grant --
+    #: authority still comes from :class:`RoleGrant` -- but the answer to "who
+    #: do we talk to", which an audit trail cannot reconstruct after the fact.
+    owner: str = Field(min_length=1, max_length=256)
+    labels: dict[str, str] = Field(default_factory=dict)
+    #: Registered-but-inactive rather than deleted. Deleting an organization
+    #: whose workloads, leases and audit events still reference it would orphan
+    #: all of them; disabling refuses new work while leaving history readable.
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    created_by: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_organization(self) -> OrganizationRecord:
+        _validate_string(self.id, field_name="organization id")
+        _validate_string(self.owner, field_name="organization owner")
+        _validate_string(self.created_by, field_name="organization creator")
+        _validate_string_map(self.labels, field_name="organization labels")
+        return self
+
+
+class ProjectRecord(EyvanModel):
+    """A project inside one registered organization.
+
+    Scoped by ``(org_id, id)`` because project names are only unique within a
+    tenant: two organizations both having a ``research`` project is the ordinary
+    case, and a globally unique project id would make the second one impossible
+    to create for reasons no user could see.
+    """
+
+    org_id: str = Field(max_length=128)
+    id: str = Field(max_length=128)
+    display_name: str = Field(default="", max_length=200)
+    owner: str = Field(min_length=1, max_length=256)
+    labels: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    created_by: str = Field(min_length=1, max_length=256)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Return the scoped identity this record is stored under."""
+
+        return self.org_id, self.id
+
+    @model_validator(mode="after")
+    def validate_project(self) -> ProjectRecord:
+        _validate_string(self.org_id, field_name="project organization id")
+        _validate_string(self.id, field_name="project id")
+        _validate_string(self.owner, field_name="project owner")
+        _validate_string(self.created_by, field_name="project creator")
+        _validate_string_map(self.labels, field_name="project labels")
         return self
 
 

@@ -32,7 +32,15 @@ from eyvan.server.service.errors import AuthorizationError
 #: answers from the thing it is testing proves only that the code equals itself.
 EXPECTED_WITHIN_SCOPE: dict[Role, frozenset[Permission]] = {
     Role.FLEET_ADMIN: frozenset(Permission),
-    Role.ORG_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
+    Role.ORG_ADMIN: frozenset(
+        {
+            Permission.READ,
+            Permission.SUBMIT,
+            Permission.OPERATE,
+            Permission.MANAGE_PROJECT,
+            Permission.MANAGE_OWN_CAPACITY,
+        }
+    ),
     Role.PROJECT_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
     Role.PROJECT_OPERATOR: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE}),
     Role.PROJECT_VIEWER: frozenset({Permission.READ}),
