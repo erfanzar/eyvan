@@ -30,6 +30,7 @@ from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
 from eyvan.sdk.commands.operations import register_operation_commands
 from eyvan.sdk.commands.runtime import register_runtime_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
 
@@ -107,6 +108,7 @@ for register_commands in (
     register_autoscale_commands,
     register_capacity_commands,
     register_governance_commands,
+    register_tenancy_commands,
     register_runtime_commands,
     register_dashboard_commands,
 ):

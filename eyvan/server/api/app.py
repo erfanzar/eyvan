@@ -62,9 +62,11 @@ from eyvan.records import (
     CellRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    OrganizationRecord,
     Permission,
     PolicyRecord,
     Principal,
+    ProjectRecord,
     QueueTrend,
     QuotaRecord,
     UserProgressReport,
@@ -96,12 +98,14 @@ from eyvan.server.api.schemas import (
     HealthResponse,
     NoMatchingCapacityPoolErrorContext,
     NoMatchingCapacityPoolErrorResponse,
+    OrganizationRegisterRequest,
     PlatformAgentNotConfiguredError,
     PolicyPutRequest,
     PoolCallableSubmitRequest,
     PoolWorkloadSubmitRequest,
     PreemptionForceFinalizeRequest,
     ProgressReportRequest,
+    ProjectRegisterRequest,
     QuotaPutRequest,
     WorkloadEstimateRequest,
     WorkloadSubmitRequest,
@@ -1577,6 +1581,65 @@ def create_app(
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> PolicyRecord:
         return await service.get_policy(principal, org_id=org_id, project_id=project_id)
+
+    @app.put("/api/v1/organizations/{org_id}", response_model=OrganizationRecord, tags=["tenancy"])
+    async def register_organization(
+        org_id: str,
+        request: OrganizationRegisterRequest,
+        response: Response,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> OrganizationRecord:
+        """Register a tenant this control plane serves."""
+
+        organization, replayed = await service.register_organization(
+            principal,
+            request.to_record(org_id, created_by=principal.subject),
+            idempotency_key=idempotency_key,
+        )
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+        return organization
+
+    @app.get("/api/v1/organizations", response_model=list[OrganizationRecord], tags=["tenancy"])
+    async def list_organizations(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[OrganizationRecord]:
+        """List tenants the caller has any grant for; everything, for a fleet admin."""
+
+        return await service.list_organizations(principal)
+
+    @app.get("/api/v1/organizations/{org_id}", response_model=OrganizationRecord, tags=["tenancy"])
+    async def get_organization(
+        org_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> OrganizationRecord:
+        return await service.get_organization(principal, org_id)
+
+    @app.put("/api/v1/organizations/{org_id}/projects/{project_id}", response_model=ProjectRecord, tags=["tenancy"])
+    async def register_project(
+        org_id: str,
+        project_id: str,
+        request: ProjectRegisterRequest,
+        response: Response,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> ProjectRecord:
+        project, replayed = await service.register_project(
+            principal,
+            request.to_record(org_id, project_id, created_by=principal.subject),
+            idempotency_key=idempotency_key,
+        )
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+        return project
+
+    @app.get("/api/v1/organizations/{org_id}/projects", response_model=list[ProjectRecord], tags=["tenancy"])
+    async def list_projects(
+        org_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[ProjectRecord]:
+        return await service.list_projects(principal, org_id=org_id)
 
     @app.put("/api/v1/budgets/{org_id}/{project_id}", response_model=BudgetRecord, tags=["governance"])
     async def put_budget(

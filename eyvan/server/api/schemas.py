@@ -24,7 +24,9 @@ from eyvan.records import (
     CellState,
     JsonDocument,
     NativeRuntimeConfig,
+    OrganizationRecord,
     PolicyRecord,
+    ProjectRecord,
     QuotaRecord,
     ResourceLimits,
     WorkloadDefinition,
@@ -322,6 +324,35 @@ class PolicyPutRequest(ApiModel):
 
     def to_record(self, org_id: str, project_id: str) -> PolicyRecord:
         return PolicyRecord(org_id=org_id, project_id=project_id, updated_by="api", **self.model_dump())
+
+
+class OrganizationRegisterRequest(ApiModel):
+    """Register or update one tenant.
+
+    ``id`` comes from the path, so it is absent here: two spellings of the same
+    identity in one request is a mismatch waiting to be resolved silently in
+    whichever direction the handler happens to prefer.
+    """
+
+    display_name: str = Field(default="", max_length=200)
+    owner: str = Field(min_length=1, max_length=256)
+    labels: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+    def to_record(self, org_id: str, *, created_by: str) -> OrganizationRecord:
+        return OrganizationRecord(id=org_id, created_by=created_by, **self.model_dump())
+
+
+class ProjectRegisterRequest(ApiModel):
+    """Register or update one project inside a registered organization."""
+
+    display_name: str = Field(default="", max_length=200)
+    owner: str = Field(min_length=1, max_length=256)
+    labels: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+    def to_record(self, org_id: str, project_id: str, *, created_by: str) -> ProjectRecord:
+        return ProjectRecord(org_id=org_id, id=project_id, created_by=created_by, **self.model_dump())
 
 
 class BudgetPutRequest(ApiModel):

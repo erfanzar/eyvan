@@ -61,6 +61,7 @@ from eyvan.records import (
     LeaseRecord,
     LeaseState,
     ManagedArtifactRecord,
+    OrganizationRecord,
     OutboxRecord,
     OutboxState,
     Permission,
@@ -68,6 +69,7 @@ from eyvan.records import (
     PoolEstimate,
     PoolWarmth,
     Principal,
+    ProjectRecord,
     QueueTrend,
     QueueTrendPoint,
     QuotaRecord,
@@ -953,6 +955,7 @@ class ControlPlaneService:
         )
         if replayed is not None:
             return replayed, True
+        await self._require_registered_scope(tx, org_id, project_id)
         policy = await tx.get_policy(org_id, project_id)
         if policy is not None:
             self._validate_workload_policy(spec, policy)
@@ -3265,6 +3268,7 @@ class ControlPlaneService:
         )
         async with self.repository.transaction() as tx:
             await self._lock_admission_scope(tx, policy.org_id, policy.project_id)
+            await self._require_registered_scope(tx, policy.org_id, policy.project_id)
             existing_key = await self._idempotent_resource(tx, scope, "policy.put", key, fingerprint)
             if existing_key is not None:
                 existing = await tx.get_policy(policy.org_id, policy.project_id)
@@ -3330,6 +3334,7 @@ class ControlPlaneService:
         )
         async with self.repository.transaction() as tx:
             await self._lock_admission_scope(tx, budget.org_id, budget.project_id)
+            await self._require_registered_scope(tx, budget.org_id, budget.project_id)
             existing_key = await self._idempotent_resource(tx, scope, "budget.put", key, fingerprint)
             if existing_key is not None:
                 existing = await tx.get_budget(budget.org_id, budget.project_id)
@@ -3383,6 +3388,7 @@ class ControlPlaneService:
         )
         async with self.repository.transaction() as tx:
             await self._lock_admission_scope(tx, quota.org_id, quota.project_id)
+            await self._require_registered_scope(tx, quota.org_id, quota.project_id)
             existing_key = await self._idempotent_resource(tx, scope, "quota.put", key, fingerprint)
             if existing_key is not None:
                 existing = await tx.get_quota(quota.org_id, quota.project_id, quota.principal_id)
@@ -3486,6 +3492,188 @@ class ControlPlaneService:
             if budget is None:
                 raise NotFoundError(f"budget for {org_id}/{project_id} was not found")
             return budget
+
+    # ----------------------------------------------------------------- tenancy
+
+    def _require_org_administration(self, principal: Principal, org_id: str) -> None:
+        """Require authority over one whole organization, not one project in it.
+
+        ``MANAGE_PROJECT`` is the wrong gate here: a project admin holds it, and
+        registering or disabling a *project* changes what its siblings can be
+        named and whether the organization accepts work at all. The same shape
+        as ``_require_quota_admin``'s unscoped branch, for the same reason.
+        """
+
+        if not any(
+            grant.role == Role.FLEET_ADMIN or (grant.role == Role.ORG_ADMIN and grant.org_id == org_id)
+            for grant in principal.grants
+        ):
+            raise AuthorizationError(f"{principal.subject!r} lacks administration of organization {org_id!r}")
+
+    async def register_organization(
+        self,
+        principal: Principal,
+        organization: OrganizationRecord,
+        *,
+        idempotency_key: str,
+    ) -> tuple[OrganizationRecord, bool]:
+        """Record a tenant this control plane serves.
+
+        Fleet administration only. An organization admin can administer the
+        organization it was granted, and creating a *new* one is how a tenant
+        would otherwise mint itself scopes nobody allocated -- including scopes
+        that then collect quota and budget rows.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        key = _validate_idempotency_key(idempotency_key)
+        fingerprint = _fingerprint(
+            organization.model_copy(update={"created_at": datetime.min, "updated_at": datetime.min, "created_by": ""})
+        )
+        async with self.repository.transaction() as tx:
+            existing_key = await self._idempotent_resource(
+                tx, organization.id, "organization.register", key, fingerprint
+            )
+            if existing_key is not None:
+                existing = await tx.get_organization(organization.id)
+                if existing is None:
+                    raise ConflictError("idempotency record points to a missing organization")
+                return existing, True
+            previous = await tx.get_organization(organization.id)
+            stored = organization.model_copy(
+                update={
+                    "created_at": organization.created_at if previous is None else previous.created_at,
+                    "created_by": principal.subject if previous is None else previous.created_by,
+                    "updated_at": utcnow(),
+                }
+            )
+            await tx.put_organization(stored)
+            await self._bind_idempotency(tx, organization.id, "organization.register", key, fingerprint, stored)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=stored.id,
+                project_id="",
+                entity_type="organization",
+                entity_id=stored.id,
+                action="organization.registered" if previous is None else "organization.updated",
+                payload={"owner": stored.owner, "enabled": stored.enabled},
+            )
+            return stored, False
+
+    async def list_organizations(self, principal: Principal) -> list[OrganizationRecord]:
+        """List tenants, narrowed to those the caller has any grant for.
+
+        A viewer in one organization asking "which tenants exist" must not learn
+        the customer list. Fleet administrators see everything, which is what
+        makes the route usable for operating the plane.
+        """
+
+        async with self.repository.transaction() as tx:
+            organizations = await tx.list_organizations()
+        if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            return organizations
+        visible = {grant.org_id for grant in principal.grants if grant.org_id is not None}
+        return [organization for organization in organizations if organization.id in visible]
+
+    async def get_organization(self, principal: Principal, org_id: str) -> OrganizationRecord:
+        self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=None)
+        async with self.repository.transaction() as tx:
+            organization = await tx.get_organization(org_id)
+        if organization is None:
+            raise NotFoundError(f"organization {org_id!r} is not registered")
+        return organization
+
+    async def register_project(
+        self,
+        principal: Principal,
+        project: ProjectRecord,
+        *,
+        idempotency_key: str,
+    ) -> tuple[ProjectRecord, bool]:
+        """Record a project inside a registered organization.
+
+        Refuses an unregistered organization rather than creating one
+        implicitly: the whole point of the registry is that a scope exists on
+        purpose, and auto-creating the parent from a typo in the child would
+        reproduce exactly the problem it was built to remove.
+        """
+
+        self._require_org_administration(principal, project.org_id)
+        key = _validate_idempotency_key(idempotency_key)
+        scope = _scope(project.org_id, project.id)
+        fingerprint = _fingerprint(
+            project.model_copy(update={"created_at": datetime.min, "updated_at": datetime.min, "created_by": ""})
+        )
+        async with self.repository.transaction() as tx:
+            existing_key = await self._idempotent_resource(tx, scope, "project.register", key, fingerprint)
+            if existing_key is not None:
+                existing = await tx.get_project(project.org_id, project.id)
+                if existing is None:
+                    raise ConflictError("idempotency record points to a missing project")
+                return existing, True
+            organization = await tx.get_organization(project.org_id)
+            if organization is None:
+                raise ConflictError(
+                    f"organization {project.org_id!r} is not registered; register it before its projects"
+                )
+            previous = await tx.get_project(project.org_id, project.id)
+            stored = project.model_copy(
+                update={
+                    "created_at": project.created_at if previous is None else previous.created_at,
+                    "created_by": principal.subject if previous is None else previous.created_by,
+                    "updated_at": utcnow(),
+                }
+            )
+            await tx.put_project(stored)
+            await self._bind_idempotency(tx, scope, "project.register", key, fingerprint, stored)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=stored.org_id,
+                project_id=stored.id,
+                entity_type="project",
+                entity_id=scope,
+                action="project.registered" if previous is None else "project.updated",
+                payload={"owner": stored.owner, "enabled": stored.enabled},
+            )
+            return stored, False
+
+    async def list_projects(self, principal: Principal, *, org_id: str) -> list[ProjectRecord]:
+        self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=None)
+        async with self.repository.transaction() as tx:
+            return await tx.list_projects(org_id=org_id)
+
+    async def _require_registered_scope(
+        self,
+        tx: RepositorySession,
+        org_id: str,
+        project_id: str | None,
+    ) -> None:
+        """Refuse a scope the registry contradicts.
+
+        Scoped enforcement, not a global switch: an organization nobody
+        registered is the pre-registry world and is left alone, so upgrading
+        breaks no existing deployment. Registering one is the operator saying
+        they are managing tenancy here -- from then on its projects must be real,
+        which is what turns a typo in ``PUT /quotas`` from a silent success into
+        an error naming the scope.
+        """
+
+        organization = await tx.get_organization(org_id)
+        if organization is None:
+            return
+        if not organization.enabled:
+            raise ConflictError(f"organization {org_id!r} is disabled and accepts no new work")
+        if project_id is None or not project_id:
+            return
+        project = await tx.get_project(org_id, project_id)
+        if project is None:
+            raise ConflictError(
+                f"project {project_id!r} is not registered in organization {org_id!r}; register it or correct the scope"
+            )
+        if not project.enabled:
+            raise ConflictError(f"project {org_id}/{project_id} is disabled and accepts no new work")
 
     async def estimate_workload(
         self,
@@ -4471,7 +4659,16 @@ class ControlPlaneService:
         operation: str,
         key: str,
         fingerprint: str,
-        resource: WorkloadRecord | LeaseRecord | PolicyRecord | BudgetRecord | QuotaRecord | BudgetGrantRecord,
+        resource: (
+            WorkloadRecord
+            | LeaseRecord
+            | PolicyRecord
+            | BudgetRecord
+            | QuotaRecord
+            | BudgetGrantRecord
+            | OrganizationRecord
+            | ProjectRecord
+        ),
     ) -> None:
         # Explicit on every branch, including the last. This used to fall through
         # to "budget" for anything unrecognized, which silently bound a new record
@@ -4490,6 +4687,13 @@ class ControlPlaneService:
             resource_type, resource_id = "budget_grant", resource.id
         elif isinstance(resource, BudgetRecord):
             resource_type, resource_id = "budget", _scope(resource.org_id, resource.project_id)
+        elif isinstance(resource, ProjectRecord):
+            # Before OrganizationRecord: a project carries an org_id too, and
+            # ordering these the other way would bind every project under its
+            # organization's id, so a replay would return the wrong record.
+            resource_type, resource_id = "project", _scope(resource.org_id, resource.id)
+        elif isinstance(resource, OrganizationRecord):
+            resource_type, resource_id = "organization", resource.id
         else:
             raise TypeError(f"no idempotency binding is defined for {type(resource).__name__}")
         await tx.put_idempotency(
