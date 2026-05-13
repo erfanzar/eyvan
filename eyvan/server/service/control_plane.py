@@ -2409,6 +2409,51 @@ class ControlPlaneService:
             )
             return refenced, False
 
+    def _require_capacity_administration(
+        self,
+        principal: Principal,
+        *,
+        declared_owner: str | None,
+        existing_owner: str | None,
+    ) -> None:
+        """Require authority over one pool, by fleet or by ownership.
+
+        A fleet administrator may do anything, as before. An organization
+        administrator may administer a pool its own organization owns -- which
+        is the whole point of ``MANAGE_OWN_CAPACITY``: sizing capacity you pay
+        for should not require rights over every other tenant's cells and the
+        provider configuration underneath them.
+
+        Both the existing and the declared owner are checked, and they are
+        different refusals:
+
+        * a pool someone else owns cannot be *taken over* by declaring your own
+          organization on an update, and
+        * a pool you own cannot be *handed away* -- to another organization, or
+          to ``None``, which would make it shared capacity you can no longer
+          reach and nobody asked the fleet operator about.
+
+        Unowned pools stay fleet-only. ``owner_org_id`` defaults to ``None``, so
+        every pool that existed before ownership did keeps exactly the authority
+        it had.
+        """
+
+        if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            return
+        if existing_owner is None and declared_owner is None:
+            raise AuthorizationError(f"{principal.subject!r} lacks fleet administration for unowned capacity")
+        for org_id, failure in (
+            (existing_owner, "is owned by another organization"),
+            (declared_owner, "would be owned by another organization"),
+        ):
+            if org_id is None:
+                # A None on either side means the pool is shared before or after
+                # this change, and moving capacity in or out of shared ownership
+                # is a fleet decision.
+                raise AuthorizationError(f"{principal.subject!r} cannot move capacity in or out of shared ownership")
+            if not self.authorizer.allows(principal, Permission.MANAGE_OWN_CAPACITY, org_id=org_id):
+                raise AuthorizationError(f"{principal.subject!r} cannot administer capacity that {failure}")
+
     async def upsert_capacity_pool(
         self,
         principal: Principal,
@@ -2418,7 +2463,6 @@ class ControlPlaneService:
     ) -> tuple[CapacityPoolRecord, bool]:
         """Create or update one declarative autoscaling node type."""
 
-        self.authorizer.require(principal, Permission.MANAGE_FLEET)
         key = _validate_idempotency_key(idempotency_key)
         fingerprint = _fingerprint(
             pool.model_copy(update={"generation": 1, "created_at": datetime.min, "updated_at": datetime.min})
@@ -2431,6 +2475,20 @@ class ControlPlaneService:
                     raise ConflictError("idempotency record points to a missing capacity pool")
                 return existing, True
             existing = await tx.get_capacity_pool(pool.id)
+            # Authorized inside the transaction, against the stored owner rather
+            # than the one the request asserts: reading it outside would leave a
+            # window in which a pool changes hands between the check and the write.
+            self._require_capacity_administration(
+                principal,
+                declared_owner=pool.owner_org_id,
+                existing_owner=None if existing is None else existing.owner_org_id,
+            )
+            if existing is not None and pool.owner_org_id != existing.owner_org_id:
+                # Reassignment is a fleet act even for a fleet admin coming
+                # through this route: it changes who may administer the pool
+                # from here on, which deserves its own deliberate call rather
+                # than being a side effect of an update that changed max_cells.
+                self.authorizer.require(principal, Permission.MANAGE_FLEET)
             now = utcnow()
             stored = pool.model_copy(
                 update={
@@ -2474,7 +2532,14 @@ class ControlPlaneService:
         *,
         idempotency_key: str,
     ) -> tuple[list[CapacityPoolRecord], bool]:
-        """Atomically apply every node type in one declarative fleet."""
+        """Atomically apply every node type in one declarative fleet.
+
+        Fleet administration only, deliberately, even though single-pool
+        mutations now accept an owning organization. This is a *declarative*
+        apply: pools absent from the request are disabled, so an organization
+        admin running it would take down every pool in the fleet they do not
+        own. Per-pool ``upsert``/``disable`` are the ownership-scoped surface.
+        """
 
         self.authorizer.require(principal, Permission.MANAGE_FLEET)
         if not fleet_name or fleet_name != fleet_name.strip():
@@ -2622,7 +2687,6 @@ class ControlPlaneService:
     ) -> tuple[CapacityPoolRecord, bool]:
         """Disable a pool so its managed cells drain to zero."""
 
-        self.authorizer.require(principal, Permission.MANAGE_FLEET)
         key = _validate_idempotency_key(idempotency_key)
         fingerprint = _fingerprint({"pool_id": pool_id, "enabled": False})
         async with self.repository.transaction() as tx:
@@ -2630,6 +2694,11 @@ class ControlPlaneService:
             pool = await tx.get_capacity_pool(pool_id)
             if pool is None:
                 raise NotFoundError(f"capacity pool {pool_id!r} was not found")
+            self._require_capacity_administration(
+                principal,
+                declared_owner=pool.owner_org_id,
+                existing_owner=pool.owner_org_id,
+            )
             if existing_key is not None:
                 return pool, True
             stored = pool.model_copy(
