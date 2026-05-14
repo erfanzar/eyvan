@@ -552,8 +552,68 @@ class RoleGrant(EyvanModel):
             return self
         if not self.org_id:
             raise ValueError(f"{self.role.value} requires an organization scope")
+        if self.role == Role.ORG_ADMIN:
+            # Same reason as fleet admin above, one level down. Organization
+            # administration covers every project in the organization -- the
+            # authorizer never consults ``project_id`` for this role -- so a
+            # stored grant reading ``org_admin @ acme/research`` would suggest a
+            # boundary that does not exist, in an audit log, an admin UI, or a
+            # reviewer's head.
+            if self.project_id is not None:
+                object.__setattr__(self, "project_id", None)
+            return self
         if self.role in {Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_VIEWER} and not self.project_id:
             raise ValueError(f"{self.role.value} requires a project scope")
+        return self
+
+
+class RoleGrantRecord(EyvanModel):
+    """A durable role grant this control plane issued and can revoke.
+
+    Until this existed, ``eyvan_grants`` in an OIDC token was the *only* source
+    of authority, so onboarding a tenant meant configuring an identity provider
+    to mint a bespoke claim that deserializes into ``tuple[RoleGrant, ...]`` --
+    a claim mentioned nowhere in the README. Anyone whose IdP could not be
+    taught a custom claim could not use Eyvan's authorization at all, and
+    revoking access meant an IdP change rather than an API call.
+
+    The claim is still honored. This is a second source, not a replacement:
+    a deployment that already mints the claim keeps working, and one that cannot
+    now has somewhere to put grants. They are unioned, because a grant from
+    either source is a grant the operator made.
+
+    Keyed by ``(subject, role, org_id, project_id)`` so re-issuing the same
+    grant overwrites rather than accumulating -- there is no meaningful
+    difference between holding one copy of a role and holding two.
+    """
+
+    subject: str = Field(min_length=1, max_length=256)
+    grant: RoleGrant
+    #: Time-boxed access, for the case that would otherwise be permanent: a
+    #: temporary elevation during an incident. ``None`` is indefinite, which is
+    #: the ordinary case and should not be dressed up as an expiry nobody chose.
+    expires_at: datetime | None = None
+    reason: str = Field(default="", max_length=512)
+    granted_by: str = Field(min_length=1, max_length=256)
+    granted_at: datetime = Field(default_factory=utcnow)
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        """Return the identity this grant is stored under."""
+
+        return (self.subject, self.grant.role.value, self.grant.org_id or "", self.grant.project_id or "")
+
+    def active_at(self, moment: datetime) -> bool:
+        """Return whether this grant confers authority at one instant."""
+
+        return self.expires_at is None or self.expires_at > moment
+
+    @model_validator(mode="after")
+    def validate_grant_record(self) -> RoleGrantRecord:
+        _validate_string(self.subject, field_name="grant subject")
+        _validate_string(self.granted_by, field_name="grant issuer")
+        if self.expires_at is not None and self.expires_at <= self.granted_at:
+            raise ValueError("grant expiry must be after the moment it was granted")
         return self
 
 

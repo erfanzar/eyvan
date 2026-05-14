@@ -263,6 +263,23 @@ def test_require_stays_silent_when_the_permission_is_held() -> None:
     )
 
 
+def test_an_org_admin_grant_cannot_be_narrowed_into_looking_project_scoped() -> None:
+    """The same hazard as fleet admin, one level down, and it was live.
+
+    Organization administration covers every project in the organization -- the
+    evaluator never reads ``project_id`` for this role. A grant reading
+    ``org_admin @ acme/research`` therefore conferred authority over
+    ``acme/platform`` while naming only ``research``: a boundary that does not
+    exist, shown to whoever reads the audit log or the grant list.
+    """
+
+    grant = RoleGrant(role=Role.ORG_ADMIN, org_id="acme", project_id="research")
+
+    assert (grant.org_id, grant.project_id) == ("acme", None)
+    admin = Principal(subject="p", grants=(grant,))
+    assert Authorizer().allows(admin, Permission.MANAGE_PROJECT, org_id="acme", project_id="platform") is True
+
+
 def test_a_fleet_admin_grant_cannot_be_narrowed_into_looking_scoped() -> None:
     """A stored grant must never appear narrower than the access it confers.
 

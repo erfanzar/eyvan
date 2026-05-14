@@ -29,6 +29,8 @@ from eyvan.records import (
     ProjectRecord,
     QuotaRecord,
     ResourceLimits,
+    RoleGrant,
+    RoleGrantRecord,
     WorkloadDefinition,
     WorkloadRecord,
     WorkspaceRef,
@@ -324,6 +326,23 @@ class PolicyPutRequest(ApiModel):
 
     def to_record(self, org_id: str, project_id: str) -> PolicyRecord:
         return PolicyRecord(org_id=org_id, project_id=project_id, updated_by="api", **self.model_dump())
+
+
+class RoleGrantIssueRequest(ApiModel):
+    """Grant one role to one subject, durably.
+
+    The grant's scope travels inside ``grant`` rather than as sibling fields, so
+    ``RoleGrant``'s own validation -- fleet admin is unscoped, project roles
+    require a project -- applies here instead of being restated and drifting.
+    """
+
+    subject: str = Field(min_length=1, max_length=256)
+    grant: RoleGrant
+    expires_at: datetime | None = None
+    reason: str = Field(default="", max_length=512)
+
+    def to_record(self) -> RoleGrantRecord:
+        return RoleGrantRecord(granted_by="api", **self.model_dump())
 
 
 class OrganizationRegisterRequest(ApiModel):

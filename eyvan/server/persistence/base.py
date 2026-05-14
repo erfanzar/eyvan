@@ -25,6 +25,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    RoleGrantRecord,
     UserProgressReport,
     WorkloadRecord,
     WorkloadState,
@@ -106,6 +107,12 @@ class RepositorySession(tp.Protocol):
     async def put_quota(self, quota: QuotaRecord) -> None: ...
 
     async def delete_quota(self, org_id: str, project_id: str | None, principal_id: str | None) -> bool: ...
+
+    async def list_role_grants(self, *, subject: str | None = None) -> list[RoleGrantRecord]: ...
+
+    async def put_role_grant(self, grant: RoleGrantRecord) -> None: ...
+
+    async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool: ...
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None: ...
 

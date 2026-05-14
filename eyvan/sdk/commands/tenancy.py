@@ -18,12 +18,20 @@ the shared service owns the one factory that produces them.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import click
+from pydantic import ValidationError
 
 from eyvan._internal.json_types import model_json
+from eyvan.records import Role, RoleGrant
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
-from eyvan.server.api.schemas import OrganizationRegisterRequest, ProjectRegisterRequest
+from eyvan.server.api.schemas import (
+    OrganizationRegisterRequest,
+    ProjectRegisterRequest,
+    RoleGrantIssueRequest,
+)
 
 
 def _service(session: CliSession) -> OperationsCommandService:
@@ -166,11 +174,103 @@ def create_project(
     )
 
 
+@click.group("grant")
+def grant() -> None:
+    """Issue and revoke durable role grants.
+
+    Before these existed, authority arrived only as an ``eyvan_grants`` OIDC
+    claim, so granting someone access meant an identity-provider change and
+    revoking it meant another one.
+    """
+
+
+@grant.command("list")
+@click.option("--subject", help="Show only grants held by this subject.")
+@click.option("--org", "org_id", help="Show only grants scoped to this organization.")
+@click.pass_obj
+def list_grants(session: CliSession, subject: str | None, org_id: str | None) -> None:
+    """List durable grants this identity is entitled to see."""
+
+    params: dict[str, str] = {}
+    if subject is not None:
+        params["subject"] = subject
+    if org_id is not None:
+        params["org_id"] = org_id
+    _service(session).read("/api/v1/grants", params=params)
+
+
+@grant.command("add")
+@click.argument("subject")
+@click.option(
+    "--role",
+    required=True,
+    type=click.Choice([role.value for role in Role]),
+    help="Role to grant.",
+)
+@click.option("--org", "org_id", help="Organization scope. Omitted for fleet_admin.")
+@click.option("--project", "project_id", help="Project scope, for project roles.")
+@click.option(
+    "--expires-at",
+    type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]),
+    help="Drop the grant after this instant. Omit for indefinite access.",
+)
+@click.option("--reason", default="", help="Why this was granted, recorded in the ledger.")
+@click.option("--idempotency-key")
+@click.pass_obj
+def add_grant(
+    session: CliSession,
+    subject: str,
+    role: str,
+    org_id: str | None,
+    project_id: str | None,
+    expires_at: datetime | None,
+    reason: str,
+    idempotency_key: str | None,
+) -> None:
+    """Grant SUBJECT a role, effective on their next request."""
+
+    try:
+        request = RoleGrantIssueRequest(
+            subject=subject,
+            grant=RoleGrant(role=Role(role), org_id=org_id, project_id=project_id),
+            expires_at=None if expires_at is None else expires_at.replace(tzinfo=UTC),
+            reason=reason,
+        )
+    except ValidationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    service = _service(session)
+    service.renderer.emit(
+        session.client.request(
+            "POST",
+            "/api/v1/grants",
+            json=model_json(request),
+            headers={"Idempotency-Key": service.keys.create("grant.issue", idempotency_key)},
+        )
+    )
+
+
+@grant.command("revoke")
+@click.argument("subject")
+@click.option("--role", required=True, type=click.Choice([role.value for role in Role]))
+@click.option("--org", "org_id", default="")
+@click.option("--project", "project_id", default="")
+@click.pass_obj
+def revoke_grant(session: CliSession, subject: str, role: str, org_id: str, project_id: str) -> None:
+    """Withdraw a grant from SUBJECT, effective on their next request."""
+
+    session.client.request(
+        "DELETE",
+        "/api/v1/grants",
+        params={"subject": subject, "role": role, "org_id": org_id, "project_id": project_id},
+    )
+    click.echo(f"revoked {role} from {subject}")
+
+
 def register_tenancy_commands(main: click.Group) -> None:
     """Attach the tenancy command groups to the CLI root."""
 
-    for command in (org, project):
+    for command in (org, project, grant):
         main.add_command(command)
 
 
-__all__ = ("org", "project", "register_tenancy_commands")
+__all__ = ("grant", "org", "project", "register_tenancy_commands")

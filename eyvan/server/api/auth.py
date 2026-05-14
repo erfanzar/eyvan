@@ -172,7 +172,32 @@ class RequestAuthenticator:
 
 
 async def authenticated_principal(request: Request) -> Principal:
-    """FastAPI dependency resolved from the application authenticator."""
+    """Resolve the caller, then union the grants this plane issued itself.
+
+    Authentication says who; authority comes from both sources. The OIDC
+    ``eyvan_grants`` claim used to be the only one, so a deployment whose
+    identity provider could not be taught a bespoke claim had no way to
+    authorize anyone, and revoking access meant an IdP change rather than an
+    API call.
+
+    Read per request rather than cached: a revocation that takes effect on the
+    next request is what an operator assumes when they run ``eyvan grant
+    revoke``, and a cache would make that true only eventually.
+    """
 
     authenticator: RequestAuthenticator = request.app.state.authenticator
-    return await authenticator.authenticate(request)
+    principal = await authenticator.authenticate(request)
+    resolver = getattr(request.app.state, "grant_resolver", None)
+    if resolver is None:
+        return principal
+    durable = await resolver(principal.subject)
+    if not durable:
+        return principal
+    # Union, order-preserving, claim first. Duplicates are dropped because
+    # holding a role twice means nothing, and the authorizer already treats
+    # grants as a set of independent statements.
+    merged: list[RoleGrant] = []
+    for grant in (*principal.grants, *durable):
+        if grant not in merged:
+            merged.append(grant)
+    return principal.model_copy(update={"grants": tuple(merged)})

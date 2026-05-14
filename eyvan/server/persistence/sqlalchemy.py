@@ -53,6 +53,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    RoleGrantRecord,
     UserProgressReport,
     WorkloadRecord,
     WorkloadState,
@@ -61,7 +62,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
 
-SCHEMA_REVISION = "0009_tenant_registry"
+SCHEMA_REVISION = "0010_role_grants"
 
 
 @tp.runtime_checkable
@@ -155,6 +156,19 @@ class BudgetRow(Base):
     __tablename__ = "budgets"
     id: Mapped[str] = mapped_column(String(256), primary_key=True)
     org_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class RoleGrantRow(Base):
+    __tablename__ = "role_grants"
+    subject: Mapped[str] = mapped_column(String(256), primary_key=True, index=True)
+    role: Mapped[str] = mapped_column(String(32), primary_key=True)
+    #: The empty string stands in for an absent scope. NULLs are not equal to
+    #: each other in SQL, so a nullable key component would let the same
+    #: fleet-admin grant be inserted an unbounded number of times.
+    org_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -541,6 +555,41 @@ class SqlAlchemySession:
 
     async def delete_quota(self, org_id: str, project_id: str | None, principal_id: str | None) -> bool:
         row = await self._get_locked(QuotaRow, _quota_key(org_id, project_id, principal_id))
+        if row is None:
+            return False
+        await self.session.delete(row)
+        return True
+
+    async def list_role_grants(self, *, subject: str | None = None) -> list[RoleGrantRecord]:
+        statement = select(RoleGrantRow)
+        if subject is not None:
+            statement = statement.where(RoleGrantRow.subject == subject)
+        rows = (await self.session.scalars(statement)).all()
+        items = _decode_rows(RoleGrantRecord, rows, table="role_grants")
+        return sorted(
+            (item for item in items if subject is None or item.subject == subject),
+            key=lambda item: item.key,
+        )
+
+    async def put_role_grant(self, grant: RoleGrantRecord) -> None:
+        subject, role, org_id, project_id = grant.key
+        await self.session.merge(
+            RoleGrantRow(
+                subject=subject,
+                role=role,
+                org_id=org_id,
+                project_id=project_id,
+                expires_at=grant.expires_at,
+                data=_dump(grant),
+            )
+        )
+
+    async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:
+        subject, role, org_id, project_id = key
+        row = await self.session.get(
+            RoleGrantRow,
+            {"subject": subject, "role": role, "org_id": org_id, "project_id": project_id},
+        )
         if row is None:
             return False
         await self.session.delete(row)

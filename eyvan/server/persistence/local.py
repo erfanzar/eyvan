@@ -33,6 +33,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    RoleGrantRecord,
     WorkloadRecord,
     utcnow,
 )
@@ -74,6 +75,7 @@ class LocalControlPlaneDocument(BaseModel):
     policies: tuple[PolicyRecord, ...] = ()
     quotas: tuple[QuotaRecord, ...] = ()
     budgets: tuple[BudgetRecord, ...] = ()
+    role_grants: tuple[RoleGrantRecord, ...] = ()
     organizations: tuple[OrganizationRecord, ...] = ()
     projects: tuple[ProjectRecord, ...] = ()
     idempotency: tuple[IdempotencyRecord, ...] = ()
@@ -99,6 +101,8 @@ class LocalControlPlaneDocument(BaseModel):
             raise ValueError("local control-plane quotas must have unique hierarchical scopes")
         if len({(record.org_id, record.project_id) for record in self.budgets}) != len(self.budgets):
             raise ValueError("local control-plane budgets must have unique organization/project scopes")
+        if len({record.key for record in self.role_grants}) != len(self.role_grants):
+            raise ValueError("local control-plane role grants must have unique subject/role/scope keys")
         if len({record.id for record in self.organizations}) != len(self.organizations):
             raise ValueError("local control-plane organizations must have unique IDs")
         if len({record.key for record in self.projects}) != len(self.projects):
@@ -139,6 +143,7 @@ class LocalControlPlaneDocument(BaseModel):
                 )
             ),
             budgets=tuple(sorted(state.budgets.values(), key=lambda record: (record.org_id, record.project_id))),
+            role_grants=tuple(sorted(state.role_grants.values(), key=lambda record: record.key)),
             organizations=tuple(sorted(state.organizations.values(), key=lambda record: record.id)),
             projects=tuple(sorted(state.projects.values(), key=lambda record: record.key)),
             idempotency=tuple(
@@ -163,6 +168,7 @@ class LocalControlPlaneDocument(BaseModel):
                 (record.org_id, record.project_id or "", record.principal_id or ""): record for record in self.quotas
             },
             budgets={(record.org_id, record.project_id): record for record in self.budgets},
+            role_grants={record.key: record for record in self.role_grants},
             organizations={record.id: record for record in self.organizations},
             projects={record.key: record for record in self.projects},
             idempotency={(record.scope, record.operation, record.key): record for record in self.idempotency},

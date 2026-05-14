@@ -29,6 +29,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    RoleGrantRecord,
     UserProgressReport,
     WorkloadRecord,
     WorkloadState,
@@ -53,6 +54,8 @@ class ControlPlaneState:
     policies: dict[tuple[str, str], PolicyRecord] = field(default_factory=dict)
     quotas: dict[tuple[str, str, str], QuotaRecord] = field(default_factory=dict)
     budgets: dict[tuple[str, str], BudgetRecord] = field(default_factory=dict)
+    #: Keyed by (subject, role, org, project) so re-issuing one overwrites it.
+    role_grants: dict[tuple[str, str, str, str], RoleGrantRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -192,6 +195,16 @@ class StateSession(RepositorySession):
 
     async def delete_quota(self, org_id: str, project_id: str | None, principal_id: str | None) -> bool:
         return self._state.quotas.pop((org_id, project_id or "", principal_id or ""), None) is not None
+
+    async def list_role_grants(self, *, subject: str | None = None) -> list[RoleGrantRecord]:
+        items = (item for item in self._state.role_grants.values() if subject is None or item.subject == subject)
+        return sorted(items, key=lambda item: item.key)
+
+    async def put_role_grant(self, grant: RoleGrantRecord) -> None:
+        self._state.role_grants[grant.key] = grant
+
+    async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:
+        return self._state.role_grants.pop(key, None) is not None
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

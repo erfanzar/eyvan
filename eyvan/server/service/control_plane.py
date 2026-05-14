@@ -75,6 +75,8 @@ from eyvan.records import (
     QuotaRecord,
     ResourceGang,
     Role,
+    RoleGrant,
+    RoleGrantRecord,
     UserProgressReport,
     WarmthReport,
     WorkerResourceScope,
@@ -3743,6 +3745,158 @@ class ControlPlaneService:
             )
         if not project.enabled:
             raise ConflictError(f"project {org_id}/{project_id} is disabled and accepts no new work")
+
+    # ------------------------------------------------------------------ grants
+
+    def _require_grant_administration(self, principal: Principal, grant: RoleGrant) -> None:
+        """Require authority to issue the specific role being granted.
+
+        Escalation is the whole hazard: whoever can issue grants can otherwise
+        write themselves a better one. So the gate scales with what is being
+        handed out rather than being a single "may administer grants"
+        permission.
+
+        * ``fleet_admin`` -- fleet administration, because it is unscoped and
+          reaches every tenant.
+        * ``org_admin`` -- administration of that organization. An org admin may
+          appoint a peer in their own organization and nowhere else.
+        * project roles -- ``MANAGE_PROJECT`` in that exact project, which is
+          ordinary delegation: a project admin adding an operator to their team.
+        """
+
+        if grant.role is Role.FLEET_ADMIN:
+            self.authorizer.require(principal, Permission.MANAGE_FLEET)
+            return
+        if grant.role is Role.ORG_ADMIN:
+            self._require_org_administration(principal, grant.org_id or "")
+            return
+        self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=grant.org_id, project_id=grant.project_id)
+
+    async def issue_role_grant(
+        self,
+        principal: Principal,
+        record: RoleGrantRecord,
+        *,
+        idempotency_key: str,
+    ) -> tuple[RoleGrantRecord, bool]:
+        """Grant a role durably, so authority does not depend on an IdP claim."""
+
+        self._require_grant_administration(principal, record.grant)
+        key = _validate_idempotency_key(idempotency_key)
+        scope = ":".join(record.key)
+        fingerprint = _fingerprint(record.model_copy(update={"granted_at": datetime.min, "granted_by": ""}))
+        async with self.repository.transaction() as tx:
+            existing_key = await self._idempotent_resource(tx, scope, "grant.issue", key, fingerprint)
+            if existing_key is not None:
+                existing = next(
+                    (item for item in await tx.list_role_grants(subject=record.subject) if item.key == record.key),
+                    None,
+                )
+                if existing is None:
+                    raise ConflictError("idempotency record points to a missing role grant")
+                return existing, True
+            stored = record.model_copy(update={"granted_by": principal.subject, "granted_at": utcnow()})
+            await tx.put_role_grant(stored)
+            await tx.put_idempotency(
+                IdempotencyRecord(
+                    scope=scope,
+                    operation="grant.issue",
+                    key=key,
+                    fingerprint=fingerprint,
+                    resource_type="role_grant",
+                    resource_id=scope,
+                )
+            )
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=principal.subject,
+                    org_id=stored.grant.org_id,
+                    project_id=stored.grant.project_id,
+                    entity_type="role_grant",
+                    entity_id=scope,
+                    action="grant.issued",
+                    payload={
+                        "subject": stored.subject,
+                        "role": stored.grant.role.value,
+                        "expires_at": None if stored.expires_at is None else stored.expires_at.isoformat(),
+                        "reason": stored.reason,
+                    },
+                )
+            )
+            return stored, False
+
+    async def revoke_role_grant(self, principal: Principal, record_key: tuple[str, str, str, str]) -> bool:
+        """Withdraw a durable grant.
+
+        Revocation takes the same authority as issuance: someone who could grant
+        a role should be able to take it back, and nobody else should be able to
+        strip access they could not have given.
+        """
+
+        subject, role, org_id, project_id = record_key
+        try:
+            grant = RoleGrant(role=Role(role), org_id=org_id or None, project_id=project_id or None)
+        except ValueError as exc:
+            raise InputError(str(exc)) from exc
+        self._require_grant_administration(principal, grant)
+        async with self.repository.transaction() as tx:
+            removed = await tx.delete_role_grant(record_key)
+            if removed:
+                await tx.append_event(
+                    AuditEvent(
+                        id=_new_id("evt"),
+                        actor=principal.subject,
+                        org_id=grant.org_id,
+                        project_id=grant.project_id,
+                        entity_type="role_grant",
+                        entity_id=":".join(record_key),
+                        action="grant.revoked",
+                        payload={"subject": subject, "role": role},
+                    )
+                )
+            return removed
+
+    async def list_role_grants(
+        self,
+        principal: Principal,
+        *,
+        subject: str | None = None,
+        org_id: str | None = None,
+    ) -> list[RoleGrantRecord]:
+        """List durable grants the caller is entitled to see.
+
+        Narrowed the same way the organization list is: a grant names a person
+        and what they can reach, so an unfiltered listing would be a directory
+        of every tenant's staff.
+        """
+
+        async with self.repository.transaction() as tx:
+            grants = await tx.list_role_grants(subject=subject)
+        if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            return [item for item in grants if org_id is None or item.grant.org_id == org_id]
+        visible = {
+            grant.org_id
+            for grant in principal.grants
+            if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
+        }
+        return [
+            item for item in grants if item.grant.org_id in visible and (org_id is None or item.grant.org_id == org_id)
+        ]
+
+    async def active_grants_for(self, subject: str, *, now: datetime | None = None) -> tuple[RoleGrant, ...]:
+        """Return the unexpired durable grants held by one subject.
+
+        Read on every authenticated request rather than cached: a revocation
+        that takes effect on the next request is the behaviour an operator
+        assumes, and a cache would make "I removed their access" true only
+        eventually. It is one indexed read on an indexed column.
+        """
+
+        moment = now or utcnow()
+        async with self.repository.transaction() as tx:
+            grants = await tx.list_role_grants(subject=subject)
+        return tuple(item.grant for item in grants if item.active_at(moment))
 
     async def estimate_workload(
         self,

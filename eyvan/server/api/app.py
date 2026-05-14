@@ -69,6 +69,7 @@ from eyvan.records import (
     ProjectRecord,
     QueueTrend,
     QuotaRecord,
+    RoleGrantRecord,
     UserProgressReport,
     WarmthReport,
     WorkloadEstimate,
@@ -107,6 +108,7 @@ from eyvan.server.api.schemas import (
     ProgressReportRequest,
     ProjectRegisterRequest,
     QuotaPutRequest,
+    RoleGrantIssueRequest,
     WorkloadEstimateRequest,
     WorkloadSubmitRequest,
 )
@@ -326,6 +328,9 @@ def create_app(
         verifier=verifier,
         local_development_credential=local_development_credential,
     )
+    # The seam that makes durable grants real. Without it the records exist, the
+    # routes issue them, and no request is ever authorized by one.
+    app.state.grant_resolver = service.active_grants_for
     app.state.metrics = metrics
     app.state.metrics_registry = registry
     app.state.controller = controller
@@ -1581,6 +1586,46 @@ def create_app(
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> PolicyRecord:
         return await service.get_policy(principal, org_id=org_id, project_id=project_id)
+
+    @app.post("/api/v1/grants", response_model=RoleGrantRecord, status_code=201, tags=["tenancy"])
+    async def issue_role_grant(
+        request: RoleGrantIssueRequest,
+        response: Response,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> RoleGrantRecord:
+        """Grant a role durably, without an identity-provider change."""
+
+        grant, replayed = await service.issue_role_grant(principal, request.to_record(), idempotency_key=idempotency_key)
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+            response.status_code = 200
+        return grant
+
+    @app.get("/api/v1/grants", response_model=list[RoleGrantRecord], tags=["tenancy"])
+    async def list_role_grants(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        subject: str | None = None,
+        org_id: str | None = None,
+    ) -> list[RoleGrantRecord]:
+        """List durable grants the caller is entitled to see."""
+
+        return await service.list_role_grants(principal, subject=subject, org_id=org_id)
+
+    @app.delete("/api/v1/grants", status_code=204, tags=["tenancy"])
+    async def revoke_role_grant(
+        subject: str,
+        role: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        org_id: str = "",
+        project_id: str = "",
+    ) -> Response:
+        """Withdraw a durable grant, effective on the subject's next request."""
+
+        removed = await service.revoke_role_grant(principal, (subject, role, org_id, project_id))
+        if not removed:
+            raise NotFoundError(f"no grant of {role!r} to {subject!r} in scope {org_id}/{project_id}")
+        return Response(status_code=204)
 
     @app.put("/api/v1/organizations/{org_id}", response_model=OrganizationRecord, tags=["tenancy"])
     async def register_organization(
