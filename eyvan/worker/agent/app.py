@@ -264,6 +264,23 @@ def create_agent_app(
     def logs(cell_id: str, remote_id: str) -> str:
         return service.logs(cell_id, remote_id)
 
+    # response_model=None: the page is a plain JSON document, and building a
+    # response model for it would restate LogRecord's own wire shape.
+    @app.get(
+        "/api/v1/cells/{cell_id}/workloads/{remote_id}/log-page",
+        dependencies=[Depends(authenticate)],
+        response_model=None,
+    )
+    def log_page(cell_id: str, remote_id: str, after: str = "", limit: int = 200) -> JsonObject:
+        """Return one resumable page of structured log records.
+
+        Separate from the plain-text route rather than a format parameter on it:
+        that route's response is ``PlainTextResponse`` and every existing
+        consumer reads it as bytes, so its contract stays exactly as it was.
+        """
+
+        return service.log_page(cell_id, remote_id, after=after, limit=limit)
+
     @app.get(
         "/api/v1/cells/{cell_id}/workload-gangs/{workload_id}/{remote_id}/logs",
         response_class=PlainTextResponse,

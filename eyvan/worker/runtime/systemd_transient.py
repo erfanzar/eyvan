@@ -36,6 +36,7 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime.log_records import LogPage, parse_journal_json
 
 _TERMINAL_STATES = frozenset(
     {
@@ -1388,6 +1389,39 @@ class SystemdTransientServiceExecutor:
         if result.returncode != 0:
             raise SystemdLogsUnavailableError(unit_name, result.stderr.strip())
         return result.stdout
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        """Return one resumable page of structured journal records.
+
+        ``--output=json`` rather than ``--output=cat``: the same read, with the
+        fields a string throws away -- priority, timestamp, PID, and journald's
+        own ``__CURSOR`` to resume from. The cursor is opaque here and handed
+        straight back to journald, which is the only thing that can interpret it.
+
+        An unreadable journal returns a page marked ``unavailable`` rather than
+        raising. ``logs()`` raises because its caller has no other way to tell a
+        transport failure from a silent workload; a page can say so in a field,
+        and a follower polling every second should not have to catch an
+        exception to learn a host is briefly unreachable.
+        """
+
+        record_path = self._record_path(remote_id)
+        with _file_lock(_record_lock_path(record_path)):
+            record = _load_json(record_path)
+            if record is None:
+                return LogPage(unavailable=True, detail="no durable execution record")
+            unit_name = record.get("unit_name")
+            if not isinstance(unit_name, str) or not unit_name:
+                return LogPage(unavailable=True, detail="execution record has no unit")
+        arguments = ["journalctl", "--no-pager", "--output=json", f"--unit={unit_name}", f"--lines={max(1, limit)}"]
+        if after:
+            # journald resumes *after* the cursor, so a follower never re-reads
+            # the line it already has.
+            arguments.extend((f"--after-cursor={after}", "--lines=all"))
+        result = self._run(tuple(arguments))
+        if result.returncode != 0:
+            return LogPage(unavailable=True, detail=result.stderr.strip() or "journalctl failed")
+        return parse_journal_json(result.stdout)
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return live process detail for one workload attempt.

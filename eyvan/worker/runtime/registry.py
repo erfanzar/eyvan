@@ -24,6 +24,7 @@ from eyvan.capacity.drivers.base import (
     UnsupportedCapabilityError,
     canonical_execution_backend,
 )
+from eyvan.worker.runtime.log_records import LogPage
 
 ExecutorFactory = tp.Callable[..., ExecutionDriver]
 logger = logging.getLogger(__name__)
@@ -98,6 +99,25 @@ class IntrospectableExecutionDriver(tp.Protocol):
     """
 
     def process_status(self, remote_id: str) -> JsonObject: ...
+
+
+@tp.runtime_checkable
+class StructuredLogExecutionDriver(tp.Protocol):
+    """Optional structured, resumable log reads.
+
+    ``logs(remote_id) -> str`` is the live contract, and a string cannot carry
+    what an operator needs from a multi-host job: which rank a line came from,
+    whether it was stdout or stderr, where to resume, or whether a rank was
+    unreachable as opposed to silent. Multi-host fan-out today is string
+    concatenation with ``===== rank N =====`` banners.
+
+    Optional, and a protocol rather than a ``getattr`` probe, for the same
+    reason as the three above: ``ray_jobs`` deliberately does not implement it,
+    and a backend that cannot produce cursors should say so by not satisfying
+    the protocol rather than by returning something that looks like a page.
+    """
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage: ...
 
 
 @tp.runtime_checkable
@@ -491,6 +511,7 @@ __all__ = (
     "ExecutionDriverResolver",
     "ExecutionRuntimeRegistry",
     "NativeGangCell",
+    "StructuredLogExecutionDriver",
     "available_execution_drivers",
     "create_execution_driver",
 )

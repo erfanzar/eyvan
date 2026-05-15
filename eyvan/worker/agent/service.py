@@ -42,7 +42,11 @@ from eyvan.worker.agent.models import (
     WorkloadObservation,
     WorkloadRequest,
 )
-from eyvan.worker.runtime.registry import IntrospectableExecutionDriver, NativeGangCell
+from eyvan.worker.runtime.registry import (
+    IntrospectableExecutionDriver,
+    NativeGangCell,
+    StructuredLogExecutionDriver,
+)
 
 if tp.TYPE_CHECKING:
     from eyvan.worker.runtime.native_gang import NativeGangWorkloadResult
@@ -682,6 +686,31 @@ class CellAgentService:
 
     def logs(self, cell_id: str, remote_id: str) -> str:
         return self._executor(cell_id).logs(remote_id)
+
+    def log_page(self, cell_id: str, remote_id: str, *, after: str = "", limit: int = 200) -> JsonObject:
+        """Return one resumable page of structured log records.
+
+        A backend that cannot produce cursors does not implement the protocol,
+        and that is reported as 501 rather than as an empty page: "this backend
+        has no structured logs" and "this workload produced no output" are
+        different answers, and a follower that cannot tell them apart will poll
+        forever against a backend that will never answer.
+        """
+
+        executor = self._executor(cell_id)
+        if not isinstance(executor, StructuredLogExecutionDriver):
+            raise UnsupportedCapabilityError(
+                f"execution backend {self.execution_backend!r} does not expose structured logs"
+            )
+        page = executor.log_page(remote_id, after=after, limit=limit)
+        document: JsonObject = {
+            "records": [dict(record.as_json()) for record in page.records],
+            "next_cursor": page.next_cursor,
+            "unavailable": page.unavailable,
+            "detail": page.detail,
+            "truncated_ranks": list(page.truncated_ranks),
+        }
+        return document
 
     def process_status(self, cell_id: str, remote_id: str) -> JsonObject:
         """Return live process detail for one workload on one cell.
