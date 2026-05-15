@@ -21,6 +21,7 @@ from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_addres
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
 from eyvan.capacity.fleet_state import FleetCellRecord
+from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
 
 RUNTIME_VERSION_BY_FAMILY = {
@@ -913,6 +914,30 @@ class GcloudTpuProvider:
             if worker_port <= 0 or worker_port > 65535:
                 raise GcloudError(f"cell {record.name!r} has an invalid native worker port")
             endpoints = tuple(format_http_ip_endpoint(ip, worker_port) for ip in worker_ips)
+            # The provider stays the authority for how many *slices* an
+            # allocation has; the catalog is the authority for how many *hosts*
+            # a slice has, which the provider response alone cannot contradict
+            # because a short response looks exactly like a small slice.
+            #
+            # Without this, a v5p-16 that came back with one host of two reports
+            # HEALTHY and hands the workload a silently half-sized JAX cluster:
+            # the run starts, forms a smaller mesh than it asked for, and the
+            # only symptom is throughput nobody can explain.
+            #
+            # Only checked for types whose host count this build knows. For the
+            # rest the behaviour is unchanged, which is why an unknown shape is
+            # not an outage.
+            shape = shape_for(spec.accelerator_type)
+            if shape is not None and shape.hosts is not None:
+                expected_vms = spec.node_count * shape.hosts
+                if len(endpoints) != expected_vms:
+                    return ProviderObservation(
+                        CapacityStatus.PROVISIONING,
+                        f"{len(endpoints)} TPU VM endpoints are visible but {spec.accelerator_type} has "
+                        f"{shape.hosts} hosts per slice, so {expected_vms} are expected across "
+                        f"{spec.node_count} allocations",
+                        head_ip=worker_ips[0] if worker_ips else None,
+                    )
             native = record.metadata.get("execution_backend") == "eyvan-native"
             return ProviderObservation(
                 CapacityStatus.HEALTHY,

@@ -434,9 +434,17 @@ def test_provider_observes_every_v5p_32_tpu_host_before_native_execution() -> No
 
 
 def test_provider_uses_every_endpoint_returned_for_a_ready_tpu_node() -> None:
+    """Every endpoint the provider returns reaches the workload, in order.
+
+    Two hosts per node because that is what a v5p-16 slice is. The fixture used
+    to give the second node a single IP, which made the allocation three hosts
+    where the shape says four -- an arrangement the provider cannot produce, and
+    one the hosts-per-slice check now correctly reports as still provisioning.
+    """
+
     nodes = {
         "cell-a-r1-node-0": ("10.2.0.4", "10.2.0.5"),
-        "cell-a-r1-node-1": ("10.2.0.6",),
+        "cell-a-r1-node-1": ("10.2.0.6", "10.2.0.7"),
     }
 
     def runner(args):
@@ -461,6 +469,7 @@ def test_provider_uses_every_endpoint_returned_for_a_ready_tpu_node() -> None:
         "http://10.2.0.4:8123",
         "http://10.2.0.5:8123",
         "http://10.2.0.6:8123",
+        "http://10.2.0.7:8123",
     )
 
 

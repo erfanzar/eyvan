@@ -353,3 +353,100 @@ def test_a_pool_whose_shape_the_catalog_does_not_know_is_left_alone() -> None:
     (pool,) = config.pool_payloads()
 
     assert pool["capacity"]["tpu"] == 32
+
+
+# --------------------------------------------------------------------------- host counts
+
+
+def _tpu_runner(nodes: dict[str, tuple[str, ...]], accelerator_type: str):
+    """A gcloud stand-in returning one node description per allocation."""
+
+    import json
+
+    from test_gcp_provider import _multislice_qr, result
+
+    def runner(args):
+        if "queued-resources" in args:
+            return result(stdout=json.dumps(_multislice_qr(accelerator_type)))
+        node_id = args[args.index("describe") + 1]
+        return result(
+            stdout=json.dumps(
+                {
+                    "state": "READY",
+                    "acceleratorType": accelerator_type,
+                    "metadata": {"eyvan-uid": "0123456789abcdef0123456789abcdef"},
+                    "networkEndpoints": [{"ipAddress": ip} for ip in nodes[node_id]],
+                }
+            )
+        )
+
+    return runner
+
+
+def test_a_slice_short_of_hosts_is_not_reported_healthy() -> None:
+    """The defect this property exists for: a silently half-sized JAX cluster.
+
+    The provider response alone cannot catch it, because a slice missing a host
+    looks exactly like a smaller slice. The run starts, forms a smaller mesh
+    than it asked for, and the only symptom is throughput nobody can explain.
+    """
+
+    from test_gcp_provider import _multislice_record
+
+    from eyvan.capacity import CapacityStatus
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
+
+    short = {
+        "cell-a-r1-node-0": ("10.2.0.4", "10.2.0.5"),
+        "cell-a-r1-node-1": ("10.2.0.6",),
+    }
+
+    observation = GcloudTpuProvider(runner=_tpu_runner(short, "v5p-16")).ensure(_multislice_record())
+
+    assert observation.state is CapacityStatus.PROVISIONING
+    assert "2 hosts per slice" in observation.detail
+    assert "4 are expected" in observation.detail
+
+
+def test_a_complete_slice_is_healthy() -> None:
+    """The check must not block the shape it exists to require."""
+
+    from test_gcp_provider import _multislice_record
+
+    from eyvan.capacity import CapacityStatus
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
+
+    complete = {
+        "cell-a-r1-node-0": ("10.2.0.4", "10.2.0.5"),
+        "cell-a-r1-node-1": ("10.2.0.6", "10.2.0.7"),
+    }
+
+    observation = GcloudTpuProvider(runner=_tpu_runner(complete, "v5p-16")).ensure(_multislice_record())
+
+    assert observation.state is CapacityStatus.HEALTHY
+    assert observation.observed_tpu_vms == 4
+
+
+def test_a_shape_with_no_recorded_host_count_keeps_the_provider_authoritative() -> None:
+    """An unknown host count must not become an outage.
+
+    The catalog records topology only where this repository grounds it, so for
+    everything else the behaviour is exactly what it was: the provider decides.
+    Refusing here would make Eyvan reject slices it simply has not been taught.
+    """
+
+    from test_gcp_provider import _multislice_record
+
+    from eyvan.capacity import CapacityStatus
+    from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
+
+    assert hardware_catalog().require("v6e-16").hosts is None
+    uneven = {
+        "cell-a-r1-node-0": ("10.2.0.4", "10.2.0.5"),
+        "cell-a-r1-node-1": ("10.2.0.6",),
+    }
+
+    observation = GcloudTpuProvider(runner=_tpu_runner(uneven, "v6e-16")).ensure(_multislice_record("v6e-16"))
+
+    assert observation.state is CapacityStatus.HEALTHY
+    assert observation.observed_tpu_vms == 3

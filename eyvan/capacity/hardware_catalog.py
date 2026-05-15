@@ -37,8 +37,6 @@ from pathlib import Path
 
 import yaml
 
-from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
-
 #: Schema version this build understands. A catalog declaring anything else is
 #: refused rather than partially read: a build silently ignoring fields it does
 #: not know would size pools from half a description.
@@ -94,6 +92,13 @@ class AcceleratorShape:
                     f"x {self.chips_per_host} chips per host"
                 )
         if self.kind == "tpu":
+            # Imported here, not at module scope. ``tpu_types`` lives under the
+            # GCP provider package, whose ``__init__`` reaches back into modules
+            # that consume this catalog -- so a module-level import makes the
+            # cycle real and its breakage depend on which module a process
+            # happens to import first. The catalog stays a leaf.
+            from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
+
             parsed = parse_tpu_accelerator_type(self.accelerator_type)
             if parsed is None:
                 raise HardwareCatalogError(f"{self.accelerator_type}: not a valid Cloud TPU accelerator type")
