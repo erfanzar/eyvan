@@ -1,0 +1,81 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Accelerator shapes Eyvan knows the dimensions of.
+#
+# Before this file, shape knowledge lived in three places that could disagree:
+# a compute-TPU dict, a queued-slice dict, and an autoscale policy that derived
+# a chip count from the type suffix and then hardcoded `cpu: 32` for every TPU
+# ever made. Operators made up the difference by hand-writing `resources:` into
+# every fleet YAML.
+#
+# Two version levels, and they mean different things:
+#   catalog_version -- the schema. A build that does not understand it refuses
+#                      to load, rather than silently ignoring fields it cannot
+#                      read.
+#   revision        -- the contents. Recorded on a pool so an operator can tell
+#                      which numbers a running pool was sized from.
+#
+# `hosts` and `chips_per_host` are OPTIONAL and present only where this
+# repository can ground them. For v5p they follow from `ct5p-hightpu-4t`, the
+# machine type already encoded in `fleet_config`: four chips per host. For
+# generations where nothing here establishes a host count, the fields are
+# omitted rather than guessed -- a wrong host count would make Eyvan reject a
+# correctly-provisioned slice, which is worse than not checking.
+
+catalog_version: 1
+revision: "2026-08-04.1"
+
+shapes:
+  - accelerator_type: v5p-8
+    kind: tpu
+    generation: v5p
+    chips: 4
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 32
+    capacity_backend: gcp-compute
+    machine_type: ct5p-hightpu-4t
+    tpu_type: ct5p
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    # Compiled as an integrated Compute Engine TPU VM, so it is deliberately
+    # excluded from queued-resource autoscaling.
+    multislice_capable: false
+
+  - accelerator_type: v5p-16
+    kind: tpu
+    generation: v5p
+    chips: 8
+    quota_units: 16
+    hosts: 2
+    chips_per_host: 4
+    host_cpu: 32
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+
+  - accelerator_type: v5p-32
+    kind: tpu
+    generation: v5p
+    chips: 16
+    quota_units: 32
+    hosts: 4
+    chips_per_host: 4
+    host_cpu: 32
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+
+  - accelerator_type: v6e-16
+    kind: tpu
+    generation: v6e
+    chips: 16
+    quota_units: 16
+    # hosts/chips_per_host deliberately absent: nothing in this repository
+    # establishes v6e host topology, and inventing it would make Eyvan refuse a
+    # slice the provider built correctly.
+    host_cpu: 32
+    capacity_backend: gcp-tpu
+    multislice_capable: true

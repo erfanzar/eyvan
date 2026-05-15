@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_backend_agent_family
+from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.records import (
     CanonicalCapacityClass,
     CapacityClass,
@@ -161,6 +162,32 @@ def _pool_kind_from_resources(value: tp.Mapping[str, JsonValue]) -> str | None:
     return "cpu" if "cpu" in resources else None
 
 
+def _apply_catalog_shape(pool: JsonObject, *, name: str) -> None:
+    """Fill in a known accelerator's resources, or refuse a contradiction.
+
+    A public pool is keyed by its accelerator type, so the shape is already
+    stated -- writing ``resources:`` underneath restates it, and every fleet YAML
+    in this repository restates it identically. Deriving it makes the block
+    optional; checking it when present is the part that catches the mistake,
+    client-side, before any API call.
+
+    A declared block that *contradicts* the catalog is refused by
+    ``TpuNodeType.validate_tpu_resources``, which is the single place that check
+    now lives -- it sees legacy node types too, and this function does not.
+
+    Silence for an unknown type is deliberate. The catalog describes what this
+    build can size, not what a provider can run, and refusing an operator's
+    hand-written pool because Eyvan has not been taught its shape would make the
+    catalog a gate on hardware rather than a convenience.
+    """
+
+    shape = shape_for(name)
+    if shape is None or shape.kind != "tpu":
+        return
+    if "resources" not in pool:
+        pool["resources"] = {"cpu": shape.host_cpu, "tpu": shape.schedulable_tpu}
+
+
 def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
     """Compile one concise ``pools`` entry into the internal node-type shape."""
 
@@ -186,6 +213,8 @@ def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
         if "node_prefix" in provider_options:
             raise ValueError(f"pool {name!r} cannot set provider_options.node_prefix for a one-worker pool")
         pool["provider_options"] = provider_options
+
+    _apply_catalog_shape(pool, name=name)
 
     kind = pool.get("kind")
     if isinstance(kind, str):
@@ -518,14 +547,15 @@ class TpuNodeType(NodeTypeBase):
             raise ValueError("TPU fleet workers cannot set provider_options.node_count above one")
         if self.provider_options.get("node_prefix") is not None:
             raise ValueError("TPU fleet workers cannot set provider_options.node_prefix")
-        profile = _COMPUTE_TPU_PROFILES.get(self.accelerator_type)
-        if profile is not None and self.resources.tpu != profile["tpu_count"]:
-            raise ValueError(f"TPU node type {self.accelerator_type!r} requires resources.tpu == {profile['tpu_count']}")
-        queued_profile = _QUEUED_TPU_SLICE_PROFILES.get(self.accelerator_type)
-        if queued_profile is not None:
-            expected_tpu = queued_profile["tpu_count"]
-            if self.resources.tpu != expected_tpu:
-                raise ValueError(f"TPU node type {self.accelerator_type!r} requires resources.tpu == {expected_tpu}")
+        # One check against the catalog, replacing two dictionary lookups that
+        # asserted the same thing about different subsets of types. A type the
+        # catalog does not describe is left alone: this validates shapes Eyvan
+        # knows, it does not gate hardware on Eyvan knowing it.
+        shape = shape_for(self.accelerator_type)
+        if shape is not None and self.resources.tpu != shape.schedulable_tpu:
+            raise ValueError(
+                f"TPU node type {self.accelerator_type!r} requires resources.tpu == {shape.schedulable_tpu}"
+            )
         return self
 
 
