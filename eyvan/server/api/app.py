@@ -1260,6 +1260,30 @@ def create_app(
         await service.get_workload(principal, workload_id)
         return await controller.workload_logs(workload_id)
 
+    # response_model=None: the page is a plain JSON document whose record shape
+    # LogRecord already defines; a response model would restate it.
+    @app.get("/api/v1/workloads/{workload_id}/log-page", tags=["workloads"], response_model=None)
+    async def workload_log_page(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        after: str = "",
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> JsonObject:
+        """Return one resumable page of structured logs, merged across ranks.
+
+        Separate from ``/logs`` rather than a format parameter on it: that route
+        is declared ``PlainTextResponse`` and every consumer reads it as bytes.
+
+        ``after`` is the ``next_cursor`` from a previous page, which carries the
+        attempt it came from. A cursor from a superseded attempt is reported as
+        ``attempt_changed`` and the read restarts, because the alternative --
+        continuing quietly -- shows the new attempt's first lines appended to the
+        old attempt's tail and reads as a job that resumed.
+        """
+
+        await service.get_workload(principal, workload_id)
+        return await controller.workload_log_page(workload_id, after=after, limit=limit)
+
     # response_model=None: the payload is backend-shaped arbitrary JSON, and the
     # recursive JsonObject alias cannot be turned into a Pydantic response model.
     @app.get("/api/v1/workloads/{workload_id}/process-status", tags=["workloads"], response_model=None)

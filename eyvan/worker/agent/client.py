@@ -304,6 +304,19 @@ class CellAgentClient:
         )
         return response.text
 
+    def log_page(self, cell_id: str, remote_id: str, *, after: str = "", limit: int = 200) -> JsonObject:
+        """Read one resumable page of structured log records from one cell."""
+
+        response = self._send(
+            "GET",
+            f"/api/v1/cells/{cell_id}/workloads/{remote_id}/log-page",
+            params={"after": after, "limit": limit},
+        )
+        payload = response.json()
+        if not is_json_object(payload):
+            raise ValueError("cell agent log page must be a JSON object")
+        return payload
+
     def process_status(self, cell_id: str, remote_id: str) -> JsonObject:
         """Read live process detail for one workload attempt on one cell."""
 

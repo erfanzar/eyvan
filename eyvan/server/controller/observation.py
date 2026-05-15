@@ -56,6 +56,76 @@ from eyvan.worker.agent.models import (
     MutationModel,
     WorkloadMutationRequest,
 )
+from eyvan.worker.runtime.log_records import LogPage, LogRecord, merge_pages
+
+
+def _split_log_cursor(value: str) -> tuple[int | None, str]:
+    """Split ``"{attempt}:{cursor}"`` into its parts.
+
+    A bare cursor with no attempt is accepted and read as "no opinion", so a
+    caller that has never seen an attempt boundary is not forced to invent one.
+    """
+
+    if not value:
+        return None, ""
+    attempt_text, separator, cursor = value.partition(":")
+    if not separator:
+        return None, value
+    try:
+        return int(attempt_text), cursor
+    except ValueError:
+        return None, value
+
+
+def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:
+    """Rebuild a page from one agent's JSON, stamping the rank it came from.
+
+    The agent does not know its own rank -- it knows a cell -- so attribution is
+    applied here, where the gang's ordering is known.
+    """
+
+    raw_records = payload.get("records")
+    records: list[LogRecord] = []
+    if isinstance(raw_records, list):
+        for entry in raw_records:
+            if not isinstance(entry, dict):
+                continue
+            records.append(
+                LogRecord(
+                    message=str(entry.get("message", "")),
+                    stream=str(entry.get("stream", "unknown")),  # type: ignore[arg-type]
+                    cursor=str(entry.get("cursor", "")),
+                    rank=rank,
+                    pid=entry.get("pid") if isinstance(entry.get("pid"), int) else None,
+                )
+            )
+    return LogPage(
+        records=tuple(records),
+        next_cursor=str(payload.get("next_cursor", "")),
+        unavailable=bool(payload.get("unavailable", False)),
+        detail=str(payload.get("detail", "")),
+    )
+
+
+def _log_page_document(page: LogPage, *, attempt: int, attempt_changed: bool = False) -> JsonObject:
+    """Project a merged page onto the wire, carrying the attempt it belongs to.
+
+    ``next_cursor`` is returned as ``"{attempt}:{cursor}"`` so the next request
+    identifies which attempt its position came from. Returning a bare cursor
+    would make an attempt boundary undetectable, which is the whole failure this
+    endpoint has to avoid.
+    """
+
+    document: JsonObject = {
+        "attempt": attempt,
+        "attempt_changed": attempt_changed,
+        "records": [dict(record.as_json()) for record in page.records],
+        "next_cursor": f"{attempt}:{page.next_cursor}" if page.next_cursor else "",
+        "unavailable": page.unavailable,
+        "detail": page.detail,
+        "truncated_ranks": list(page.truncated_ranks),
+    }
+    return document
 
 
 class _ControllerObservation:
@@ -938,6 +1008,68 @@ class _ControllerObservation:
             )
         _lease, cell = members[0]
         return await asyncio.to_thread(self._agent_factory(cell).logs, cell.id, workload.remote_id)
+
+    async def workload_log_page(
+        self,
+        workload_id: str,
+        *,
+        after: str = "",
+        limit: int = 200,
+    ) -> JsonObject:
+        """Return one resumable page of structured logs for a workload attempt.
+
+        The cursor is opaque to the control plane except for one thing it must
+        know: which attempt produced it. ``after`` is ``"{attempt}:{cursor}"``,
+        and a cursor from a previous attempt is *not* resumed from -- it is
+        reported as a change and the read restarts.
+
+        Silently continuing is the failure that matters here. A retry replaces
+        the remote execution entirely, so the old cursor means nothing to the
+        new one; a follower that kept using it would be shown the new attempt's
+        first lines appended to the old attempt's tail, and would conclude the
+        job had resumed where it left off.
+        """
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+        if workload is None:
+            raise LookupError(f"workload {workload_id!r} does not exist")
+        if workload.remote_id is None:
+            return _log_page_document(LogPage(), attempt=workload.attempt)
+
+        requested_attempt, cursor = _split_log_cursor(after)
+        attempt_changed = requested_attempt is not None and requested_attempt != workload.attempt
+        if attempt_changed:
+            cursor = ""
+
+        members = await self._load_workload_members(workload)
+        # ``_ordered_gang_member_pairs`` validates a *gang* -- it refuses fewer
+        # than two cells -- so a single-cell workload uses its one member
+        # directly. The gang path gets the deterministic cell ordering that
+        # makes rank N the same host on every read.
+        ordered = self._ordered_gang_member_pairs(members) if len(members) > 1 else tuple(members)
+        pages: dict[int, LogPage] = {}
+        for rank, (_lease, cell) in enumerate(ordered):
+            try:
+                payload = await asyncio.to_thread(
+                    self._agent_factory(cell).log_page,
+                    cell.id,
+                    workload.remote_id,
+                    after=cursor,
+                    limit=limit,
+                )
+            except Exception as exc:
+                # One unreachable rank must not blank the ranks that answered.
+                # ``merge_pages`` reports it in place, which is the whole reason
+                # ``LogPage`` distinguishes "unavailable" from "empty".
+                pages[rank] = LogPage(unavailable=True, detail=str(exc))
+                continue
+            pages[rank] = _log_page_from_document(payload, rank=rank)
+        return _log_page_document(
+            merge_pages(pages) if pages else LogPage(),
+            attempt=workload.attempt,
+            attempt_changed=attempt_changed,
+        )
 
     async def workload_process_status(self, workload_id: str) -> JsonObject:
         """Read live process detail for one workload attempt.

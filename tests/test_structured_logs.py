@@ -373,3 +373,225 @@ def test_a_workload_with_no_durable_record_is_unavailable_rather_than_silent(tmp
 
     assert page.unavailable is True
     assert page.records == ()
+
+
+# --------------------------------------------------------------------------- the control plane
+
+
+def _cursor_helpers():
+    from eyvan.server.controller.observation import _log_page_document, _split_log_cursor
+
+    return _split_log_cursor, _log_page_document
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", (None, "")),
+        ("3:abc", (3, "abc")),
+        ("abc", (None, "abc")),
+        ("notanint:abc", (None, "notanint:abc")),
+    ],
+    ids=["empty", "attempt-qualified", "bare-cursor", "unparseable"],
+)
+def test_a_cursor_carries_its_attempt_or_admits_it_does_not(value: str, expected: tuple) -> None:
+    """A bare cursor is "no opinion", not attempt zero.
+
+    A caller that has never seen an attempt boundary must not be forced to
+    invent one, and guessing zero would make every first read look like it came
+    from a superseded attempt.
+    """
+
+    split, _document = _cursor_helpers()
+
+    assert split(value) == expected
+
+
+def test_the_returned_cursor_names_the_attempt_it_came_from() -> None:
+    """Returning a bare cursor would make an attempt boundary undetectable."""
+
+    _split, document = _cursor_helpers()
+
+    page = document(LogPage(records=(), next_cursor="c9"), attempt=4)
+
+    assert page["next_cursor"] == "4:c9"
+    assert page["attempt"] == 4
+
+
+def test_an_empty_page_returns_an_empty_cursor_rather_than_a_bare_attempt() -> None:
+    """Resuming from empty means "wherever you were"; a start cursor replays everything."""
+
+    _split, document = _cursor_helpers()
+
+    assert document(LogPage(), attempt=2)["next_cursor"] == ""
+
+
+class _PagingAgent:
+    """A cell agent that serves structured pages and records what it was asked."""
+
+    def __init__(self, *, message: str = "line", fail: bool = False) -> None:
+        self.message = message
+        self.fail = fail
+        self.calls: list[tuple[str, str, str, int]] = []
+
+    def log_page(self, cell_id, remote_id, *, after="", limit=200):
+        self.calls.append((cell_id, remote_id, after, limit))
+        if self.fail:
+            raise RuntimeError("agent unreachable")
+        return {
+            "records": [{"message": self.message, "stream": "stdout", "cursor": "c1", "pid": 7}],
+            "next_cursor": "c1",
+            "unavailable": False,
+            "detail": "",
+            "truncated_ranks": [],
+        }
+
+
+async def _controller_with(agent, *, attempt: int = 1):
+    from datetime import timedelta
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import (
+        CellRecord,
+        CellState,
+        CommandExecution,
+        LeaseRecord,
+        LeaseState,
+        ResourceGang,
+        ResourceVector,
+        WorkloadDefinition,
+        WorkloadRecord,
+        WorkloadState,
+        utcnow,
+    )
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: agent,
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_lease(
+            LeaseRecord(
+                id="lease-1",
+                workload_id="wl-1",
+                cell_id="cell-a",
+                org_id="acme",
+                project_id="research",
+                state=LeaseState.ACTIVE,
+                resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0)),
+                generation=1,
+                fencing_token="token-1",
+                expires_at=utcnow() + timedelta(hours=24),
+            )
+        )
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-a",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(cpu=8),
+                allocatable=ResourceVector(cpu=8),
+                endpoint="http://agent:8090",
+            )
+        )
+        await transaction.put_workload(
+            WorkloadRecord(
+                id="wl-1",
+                org_id="acme",
+                project_id="research",
+                spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                state=WorkloadState.RUNNING,
+                attempt=attempt,
+                lease_id="lease-1",
+                remote_id="remote-1",
+                created_by="alice",
+            )
+        )
+    return controller
+
+
+async def test_a_cursor_from_a_superseded_attempt_restarts_rather_than_continues() -> None:
+    """The crux of this endpoint.
+
+    A retry replaces the remote execution entirely, so the old cursor means
+    nothing to the new one. Continuing quietly would show the new attempt's
+    first lines appended to the old attempt's tail, and a follower would
+    conclude the job resumed where it left off.
+    """
+
+    agent = _PagingAgent()
+    controller = await _controller_with(agent, attempt=2)
+
+    page = await controller.workload_log_page("wl-1", after="1:old-cursor")
+
+    assert page["attempt_changed"] is True
+    assert page["attempt"] == 2
+    # The stale cursor is not handed to the backend, because the backend of the
+    # new attempt has never heard of it.
+    assert agent.calls[0][2] == ""
+
+
+async def test_a_cursor_from_the_current_attempt_resumes() -> None:
+    """The check must not restart a follower that is simply keeping up."""
+
+    agent = _PagingAgent()
+    controller = await _controller_with(agent, attempt=2)
+
+    page = await controller.workload_log_page("wl-1", after="2:c1")
+
+    assert page["attempt_changed"] is False
+    assert agent.calls[0][2] == "c1"
+
+
+async def test_an_unreachable_rank_does_not_blank_the_ranks_that_answered() -> None:
+    """One failing agent must not turn a running job into a silent one."""
+
+    agent = _PagingAgent(fail=True)
+    controller = await _controller_with(agent)
+
+    page = await controller.workload_log_page("wl-1")
+
+    assert page["unavailable"] is True
+    assert "unreachable" in page["detail"]
+
+
+async def test_a_workload_with_no_remote_execution_yields_an_empty_page() -> None:
+    """Queued work has produced no output, which is not an error."""
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    controller = EyvanController(
+        repository,
+        ControlPlaneService(repository, scheduler=CoreSchedulingService()),
+        settings=EyvanSettings(),
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(
+            WorkloadRecord(
+                id="wl-pending",
+                org_id="acme",
+                project_id="research",
+                spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                created_by="alice",
+            )
+        )
+
+    page = await controller.workload_log_page("wl-pending")
+
+    assert page["records"] == []
+    assert page["unavailable"] is False
