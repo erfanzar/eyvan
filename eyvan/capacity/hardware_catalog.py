@@ -64,7 +64,7 @@ class AcceleratorShape:
     generation: str
     chips: int
     quota_units: int
-    host_cpu: float
+    host_cpu: int
     capacity_backend: str
     multislice_capable: bool
     hosts: int | None = None
@@ -79,6 +79,11 @@ class AcceleratorShape:
     def __post_init__(self) -> None:
         if self.chips <= 0 or self.quota_units <= 0:
             raise HardwareCatalogError(f"{self.accelerator_type}: chips and quota_units must be positive")
+        # A whole number, because a host has whole CPUs and ``TpuProfile``
+        # requires a positive integer. Storing a float here would put the
+        # coercion at every call site instead of at the one boundary.
+        if isinstance(self.host_cpu, bool) or not isinstance(self.host_cpu, int) or self.host_cpu <= 0:
+            raise HardwareCatalogError(f"{self.accelerator_type}: host_cpu must be a positive integer")
         if (self.hosts is None) != (self.chips_per_host is None):
             raise HardwareCatalogError(
                 f"{self.accelerator_type}: hosts and chips_per_host are recorded together or not at all"

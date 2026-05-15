@@ -26,7 +26,6 @@ import pytest
 import yaml
 
 from eyvan.capacity.autoscale.profiles import DEFAULT_TPU_PROFILES, tpu_profile_from_accelerator_type
-from eyvan.capacity.fleet_config import _COMPUTE_TPU_PROFILES, _QUEUED_TPU_SLICE_PROFILES
 from eyvan.capacity.hardware_catalog import (
     CATALOG_PATH,
     SUPPORTED_CATALOG_VERSION,
@@ -73,15 +72,33 @@ def test_the_catalog_states_the_shape_the_fleet_actually_runs(accelerator_type: 
     assert shape.host_cpu == expected["cpu"]
 
 
-def test_the_catalog_agrees_with_the_compute_tpu_dictionary() -> None:
+#: Exactly what the two deleted dictionaries in ``fleet_config`` contained. Kept
+#: as literals so retiring them cannot quietly change what a pool is provisioned
+#: with -- the whole risk of a consolidation is that the survivor drifts.
+RETIRED_COMPUTE_PROFILE = {
+    "v5p-8": {
+        "machine_type": "ct5p-hightpu-4t",
+        "tpu_type": "ct5p",
+        "tpu_count": 4,
+        "image_family": "ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e",
+        "image_project": "ubuntu-os-accelerator-images",
+    },
+}
+RETIRED_QUEUED_SLICE_PROFILE = {"v5p-16": 8, "v5p-32": 16}
+
+#: What ``DEFAULT_TPU_PROFILES`` was written out as before it was derived.
+RETIRED_DEFAULT_PROFILES = (("v5p-16", 32, 8), ("v5p-32", 32, 16), ("v6e-8", 32, 8))
+
+
+def test_the_catalog_carries_what_the_compute_dictionary_carried() -> None:
     """``v5p-8`` is provisioned as an integrated Compute Engine TPU VM.
 
-    Its machine type, image and chip count already lived in ``fleet_config``.
-    Disagreeing here would mean a pool sized from the catalog and provisioned
-    from the dict, which is the exact failure this replaces.
+    Its machine type, image and chip count used to live in a second dictionary
+    that had to agree with everything else. Losing any of these on the way to
+    the catalog would provision the wrong machine.
     """
 
-    for accelerator_type, profile in _COMPUTE_TPU_PROFILES.items():
+    for accelerator_type, profile in RETIRED_COMPUTE_PROFILE.items():
         shape = hardware_catalog().require(accelerator_type)
         assert shape.chips == profile["tpu_count"]
         assert shape.machine_type == profile["machine_type"]
@@ -90,11 +107,50 @@ def test_the_catalog_agrees_with_the_compute_tpu_dictionary() -> None:
         assert shape.image_project == profile["image_project"]
 
 
-def test_the_catalog_agrees_with_the_queued_slice_dictionary() -> None:
+def test_the_compiled_provider_options_still_carry_the_compute_profile() -> None:
+    """The values have to survive the whole path, not merely exist in the catalog.
+
+    ``compiled_provider_options`` is what actually reaches the provider, and it
+    used to spread the dictionary in wholesale.
+    """
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    config = EyvanFleetConfig.model_validate(
+        _fleet({"min_workers": 0, "max_workers": 1, "capacity_backend": "gcp-compute"}, name="v5p-8")
+    )
+    (pool,) = config.pool_payloads()
+    options = pool["provider_options"]
+    expected = RETIRED_COMPUTE_PROFILE["v5p-8"]
+
+    assert options["machine_type"] == expected["machine_type"]
+    assert options["tpu_type"] == expected["tpu_type"]
+    assert options["tpu_count"] == expected["tpu_count"]
+    assert options["image_family"] == expected["image_family"]
+    assert options["image_project"] == expected["image_project"]
+
+
+def test_the_catalog_carries_what_the_queued_slice_dictionary_carried() -> None:
     """Each queued worker is one independent slice, and its chip count is its size."""
 
-    for accelerator_type, profile in _QUEUED_TPU_SLICE_PROFILES.items():
-        assert hardware_catalog().require(accelerator_type).chips == profile["tpu_count"]
+    for accelerator_type, chips in RETIRED_QUEUED_SLICE_PROFILE.items():
+        assert hardware_catalog().require(accelerator_type).chips == chips
+
+
+def test_the_derived_compatibility_tuple_still_contains_what_it_used_to() -> None:
+    """Deriving it must not silently drop an entry someone imports.
+
+    ``v6e-8`` was in the hand-written tuple and nowhere else, which is exactly
+    how a fourth copy holds the only record of something.
+    """
+
+    derived = {(profile.accelerator_type, profile.cpu, profile.tpu) for profile in DEFAULT_TPU_PROFILES}
+
+    assert set(RETIRED_DEFAULT_PROFILES) <= derived
+    # v5p-8 is compiled as an integrated Compute Engine TPU VM and excluded from
+    # queued autoscaling, so offering a profile for it would be offering one the
+    # autoscaler refuses to use.
+    assert "v5p-8" not in {profile.accelerator_type for profile in DEFAULT_TPU_PROFILES}
 
 
 def test_the_catalog_agrees_with_the_derived_autoscale_profile() -> None:
@@ -213,6 +269,20 @@ def test_an_unsupported_schema_version_is_refused_rather_than_partly_read(tmp_pa
     document["catalog_version"] = 99
 
     with pytest.raises(HardwareCatalogError, match="this build understands 1"):
+        load_hardware_catalog(_write(tmp_path, document))
+
+
+def test_a_fractional_host_cpu_is_refused(tmp_path) -> None:
+    """A host has whole CPUs, and ``TpuProfile`` requires a positive integer.
+
+    Storing a float would move the coercion to every call site, where one of
+    them would eventually truncate silently.
+    """
+
+    document = _catalog_document()
+    document["shapes"][1]["host_cpu"] = 31.5
+
+    with pytest.raises(HardwareCatalogError, match="positive integer"):
         load_hardware_catalog(_write(tmp_path, document))
 
 
@@ -450,3 +520,54 @@ def test_a_shape_with_no_recorded_host_count_keeps_the_provider_authoritative() 
 
     assert observation.state is CapacityStatus.HEALTHY
     assert observation.observed_tpu_vms == 3
+
+
+def test_autoscale_prefers_the_catalog_over_the_suffix_derivation(monkeypatch) -> None:
+    """The branch is invisible today, which is exactly why it needs a test.
+
+    For every shape currently catalogued the derived answer and the catalog
+    answer agree -- that agreement is the parity this phase was built on. So
+    deleting the catalog branch changes nothing observable, and it would survive
+    review as dead code right up until the first shape whose host CPU is not 32.
+
+    ``shape_for`` is patched, not the function under test: the branch's whole job
+    is to consult the catalog, so substituting the catalog is what exercises it.
+    """
+
+    from eyvan.capacity.autoscale import profiles
+    from eyvan.capacity.hardware_catalog import AcceleratorShape
+
+    unusual = AcceleratorShape(
+        accelerator_type="v5p-16",
+        kind="tpu",
+        generation="v5p",
+        chips=8,
+        quota_units=16,
+        host_cpu=96,
+        capacity_backend="gcp-tpu",
+        multislice_capable=True,
+    )
+    monkeypatch.setattr(profiles, "shape_for", lambda _type: unusual)
+
+    resolved = profiles.tpu_profile_from_accelerator_type("v5p-16")
+
+    assert resolved is not None
+    assert resolved.cpu == 96, "the suffix derivation's fixed 32 won over the catalog"
+    assert resolved.tpu == 8
+
+
+def test_an_uncatalogued_type_keeps_the_conservative_fallback(monkeypatch) -> None:
+    """An unknown shape must autoscale exactly as it did before the catalog.
+
+    The fallback is deliberately the number that used to apply to every TPU, so
+    a type Eyvan has not been taught acquires no new behaviour it did not have.
+    """
+
+    from eyvan.capacity.autoscale import profiles
+
+    monkeypatch.setattr(profiles, "shape_for", lambda _type: None)
+
+    resolved = profiles.tpu_profile_from_accelerator_type("v5p-512")
+
+    assert resolved is not None
+    assert (resolved.cpu, resolved.tpu) == (32, 256)

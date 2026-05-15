@@ -46,39 +46,6 @@ _RESOURCE_KEY_ALIASES = {
 }
 
 
-class _ComputeTpuProfile(tp.TypedDict):
-    """Fixed GCP Compute VM settings for a TPU-in-VM worker shape."""
-
-    machine_type: str
-    tpu_type: str
-    tpu_count: int
-    image_family: str
-    image_project: str
-
-
-class _QueuedTpuSliceProfile(tp.TypedDict):
-    """Fixed TPU count for a queued-resource TPU worker slice."""
-
-    tpu_count: int
-
-
-_COMPUTE_TPU_PROFILES: dict[str, _ComputeTpuProfile] = {
-    "v5p-8": {
-        "machine_type": "ct5p-hightpu-4t",
-        "tpu_type": "ct5p",
-        "tpu_count": 4,
-        "image_family": "ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e",
-        "image_project": "ubuntu-os-accelerator-images",
-    },
-}
-_QUEUED_TPU_SLICE_PROFILES: dict[str, _QueuedTpuSliceProfile] = {
-    # Each worker is one independent queued-resource TPU slice. A fleet pool
-    # scales by creating more workers, never by composing node_count.
-    "v5p-16": {"tpu_count": 8},
-    "v5p-32": {"tpu_count": 16},
-}
-
-
 def _resource_values(resources: ResourceLimits) -> dict[str, float]:
     return {
         "cpu": resources.cpu,
@@ -518,17 +485,31 @@ class TpuNodeType(NodeTypeBase):
 
     @property
     def default_capacity_backend(self) -> str:
-        if self.accelerator_type in _COMPUTE_TPU_PROFILES:
-            return "gcp-compute"
-        return "gcp-tpu"
+        shape = shape_for(self.accelerator_type)
+        return "gcp-tpu" if shape is None else shape.capacity_backend
 
     @property
     def compiled_provider_options(self) -> JsonObject:
-        profile = _COMPUTE_TPU_PROFILES.get(self.accelerator_type)
+        shape = shape_for(self.accelerator_type)
         selected_backend = (self.capacity_backend or self.default_capacity_backend).strip().lower().replace("_", "-")
-        if profile is not None and selected_backend in {"compute", "gcp", "gcp-compute"}:
+        if (
+            shape is not None
+            and shape.machine_type is not None
+            and selected_backend in {"compute", "gcp", "gcp-compute"}
+        ):
             options = super().compiled_provider_options
-            options.update(profile)
+            # An integrated Compute Engine TPU VM. Its machine type, chip count
+            # and image all come from the one catalog entry rather than a second
+            # dictionary that had to agree with it.
+            options.update(
+                {
+                    "machine_type": shape.machine_type,
+                    "tpu_type": shape.tpu_type,
+                    "tpu_count": shape.chips,
+                    "image_family": shape.image_family,
+                    "image_project": shape.image_project,
+                }
+            )
             return options
         options = super().compiled_provider_options
         # A pool worker is always one queued resource.  The public fleet

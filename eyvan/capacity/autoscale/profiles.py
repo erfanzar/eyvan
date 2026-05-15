@@ -11,6 +11,7 @@ import typing as tp
 from dataclasses import dataclass
 
 from eyvan.capacity.autoscale.models import AutoscaleSkipReason, TpuProfile
+from eyvan.capacity.hardware_catalog import hardware_catalog, shape_for
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 
 _NATIVE_TPU_GENERATIONS = frozenset({"v4", "v5e", "v5litepod", "v5p", "v6e"})
@@ -19,6 +20,10 @@ _TPU_QUOTA_UNITS_PER_RESOURCE = {"v4": 2, "v5p": 2}
 # Compute Engine TPU VM. The dynamic Cloud TPU quota catalog must not emit it
 # as a queued-resource autoscale worker.
 _DYNAMIC_QUEUED_ACCELERATOR_EXCLUSIONS = frozenset({"v5p-8"})
+#: Used only for types the hardware catalog does not describe. Deliberately the
+#: value that used to apply to every TPU, so an unknown shape keeps behaving
+#: exactly as it did rather than acquiring a new number nobody chose.
+_FALLBACK_HOST_CPU = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +64,17 @@ class QueuedTpuProfileCatalog:
         tpu = parsed.size // divisor
         if tpu <= 0:
             return TpuProfileResolution(None, AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE)
-        return TpuProfileResolution(TpuProfile(accelerator_type=normalized, cpu=32, tpu=tpu), None)
+        # The catalog when it knows the shape, the derivation when it does not.
+        # ``cpu=32`` was applied to every TPU ever made -- this docstring used to
+        # call it "the same conservative CPU vector until host-specific
+        # discovery is available", and for known types that wait is over. It
+        # stays the fallback so an unrecognized type still autoscales.
+        shape = shape_for(normalized)
+        if shape is not None and shape.kind == "tpu":
+            return TpuProfileResolution(
+                TpuProfile(accelerator_type=normalized, cpu=shape.host_cpu, tpu=shape.schedulable_tpu), None
+            )
+        return TpuProfileResolution(TpuProfile(accelerator_type=normalized, cpu=_FALLBACK_HOST_CPU, tpu=tpu), None)
 
 
 QUEUED_TPU_PROFILE_CATALOG = QueuedTpuProfileCatalog()
@@ -83,13 +98,28 @@ def resolve_queued_tpu_profile(accelerator_type: str) -> TpuProfileResolution:
     return QUEUED_TPU_PROFILE_CATALOG.resolve(accelerator_type)
 
 
+def _default_tpu_profiles() -> tuple[TpuProfile, ...]:
+    """Build the compatibility tuple from the catalog rather than restating it.
+
+    This was the fourth hand-written copy of the same numbers. Deriving it means
+    a catalog edit cannot leave it behind, which is what a "compatibility"
+    constant maintained by hand always eventually does.
+
+    Queued-resource types only: ``v5p-8`` is compiled as an integrated Compute
+    Engine TPU VM and is excluded from queued autoscaling, so listing it here
+    would offer a profile the autoscaler refuses to use.
+    """
+
+    return tuple(
+        TpuProfile(shape.accelerator_type, cpu=shape.host_cpu, tpu=shape.schedulable_tpu)
+        for shape in hardware_catalog().shapes
+        if shape.kind == "tpu" and shape.accelerator_type not in _DYNAMIC_QUEUED_ACCELERATOR_EXCLUSIONS
+    )
+
+
 # Compatibility catalog for direct Python callers. The CLI derives profiles
 # from the accessible GCP accelerator catalog instead of this tuple.
-DEFAULT_TPU_PROFILES: tuple[TpuProfile, ...] = (
-    TpuProfile("v5p-16", cpu=32, tpu=8),
-    TpuProfile("v5p-32", cpu=32, tpu=16),
-    TpuProfile("v6e-8", cpu=32, tpu=8),
-)
+DEFAULT_TPU_PROFILES: tuple[TpuProfile, ...] = _default_tpu_profiles()
 
 
 def select_profiles(
