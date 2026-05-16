@@ -595,3 +595,163 @@ async def test_a_workload_with_no_remote_execution_yields_an_empty_page() -> Non
 
     assert page["records"] == []
     assert page["unavailable"] is False
+
+
+# --------------------------------------------------------------------------- surviving release
+
+
+def _artifact_access(tmp_path):
+    from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
+    from eyvan.artifacts.transfers import ManagedArtifactAccess
+
+    return ManagedArtifactAccess(
+        store=LocalManagedArtifactStore(tmp_path / "artifacts"),
+        signer=ArtifactTokenSigner(b"k" * 32, default_ttl_seconds=3600),
+        public_url="https://eyvan.test",
+        token_ttl_seconds=3600,
+    )
+
+
+async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:
+    """The failure this archive exists for.
+
+    journald lives on the cell. Releasing a cell destroys it, so an attempt's
+    output disappears exactly when the capacity bill stops -- which is also when
+    someone starts asking what happened.
+    """
+
+    agent = _PagingAgent(message="the last thing it printed")
+    controller = await _controller_with(agent)
+    controller.artifact_access = _artifact_access(tmp_path)
+    workload_id = "wl-1"
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload(workload_id)
+    await controller._archive_terminal_logs(workload)
+
+    # Now the cell is gone: no lease, no journal, no agent.
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload(workload_id)
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None}))
+        lease = await transaction.get_lease("lease-1")
+        await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
+
+    page = await controller.workload_log_page(workload_id)
+
+    assert [record["message"] for record in page["records"]] == ["the last thing it printed"]
+    assert page["detail"] == "archived"
+
+
+async def test_an_attempt_with_no_archive_says_so_rather_than_looking_silent(tmp_path) -> None:
+    """After release there is no other source.
+
+    "Printed nothing" and "the record was lost" are different answers, and only
+    one of them means someone should go looking elsewhere.
+    """
+
+    agent = _PagingAgent()
+    controller = await _controller_with(agent)
+    controller.artifact_access = _artifact_access(tmp_path)
+
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-1")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None}))
+        lease = await transaction.get_lease("lease-1")
+        await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
+
+    page = await controller.workload_log_page("wl-1")
+
+    assert page["unavailable"] is True
+    assert page["records"] == []
+
+
+async def test_each_attempt_archives_separately(tmp_path) -> None:
+    """A retry must not overwrite the output that explains why it retried.
+
+    That output is the one an operator is most likely to be looking for.
+    """
+
+    from eyvan.artifacts.managed import log_uri
+
+    access = _artifact_access(tmp_path)
+    first = await _controller_with(_PagingAgent(message="attempt one"), attempt=1)
+    first.artifact_access = access
+    async with first.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await first._archive_terminal_logs(workload)
+
+    second = await _controller_with(_PagingAgent(message="attempt two"), attempt=2)
+    second.artifact_access = access
+    async with second.repository.transaction() as transaction:
+        retried = await transaction.get_workload("wl-1")
+    await second._archive_terminal_logs(retried)
+
+    stored_first = access.store.get(log_uri("wl-1", 1, 0), org_id="acme", project_id="research")
+    stored_second = access.store.get(log_uri("wl-1", 2, 0), org_id="acme", project_id="research")
+
+    assert b"attempt one" in stored_first
+    assert b"attempt two" in stored_second
+
+
+async def test_an_archive_failure_does_not_block_settlement(tmp_path) -> None:
+    """A finished job must be recorded as finished even if its logs could not be saved.
+
+    Aborting settlement here would leave a completed workload holding its lease
+    because its logs were unreadable -- turning a diagnostic gap into a stranded
+    accelerator.
+    """
+
+    class _BrokenStore:
+        def put(self, *_args, **_kwargs):
+            raise RuntimeError("storage is down")
+
+    access = _artifact_access(tmp_path)
+    object.__setattr__(access, "store", _BrokenStore())
+    controller = await _controller_with(_PagingAgent())
+    controller.artifact_access = access
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+
+    # Must not raise.
+    await controller._archive_terminal_logs(workload)
+
+
+async def test_nothing_is_archived_without_managed_artifacts(tmp_path) -> None:
+    """Local development has nowhere to put them and the journal is on the same machine."""
+
+    controller = await _controller_with(_PagingAgent())
+    assert controller.artifact_access is None
+
+    await controller._archive_terminal_logs(await _only_workload(controller))
+
+
+async def _only_workload(controller):
+    async with controller.repository.transaction() as transaction:
+        return await transaction.get_workload("wl-1")
+
+
+async def test_the_release_path_itself_archives(tmp_path) -> None:
+    """Archival has to be wired into release, not merely callable.
+
+    Calling the archive helper directly proves it works and says nothing about
+    whether anything invokes it -- which is precisely how this package's
+    recurring defect looks. This drives the real terminal-release path and then
+    reads the archive back.
+    """
+
+    from eyvan.artifacts.managed import log_uri
+    from eyvan.records import WorkloadState
+
+    access = _artifact_access(tmp_path)
+    controller = await _controller_with(_PagingAgent(message="final line"))
+    controller.artifact_access = access
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+        lease = await transaction.get_lease("lease-1")
+
+    await controller._release_terminal(workload, lease, WorkloadState.SUCCEEDED, "workload.succeeded")
+
+    stored = access.store.get(log_uri("wl-1", 1, 0), org_id="acme", project_id="research")
+    assert b"final line" in stored

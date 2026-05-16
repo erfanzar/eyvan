@@ -36,6 +36,11 @@ class ManagedArtifactKind(StrEnum):
     CALLABLES = "callables"
     RESULTS = "results"
     WORKSPACES = "workspaces"
+    #: Archived structured logs for one terminal attempt. The only durable copy:
+    #: journald lives on the cell, and releasing a cell destroys it, so an
+    #: attempt's output disappears exactly when the capacity bill stops -- which
+    #: is also when someone starts asking what happened.
+    LOGS = "logs"
 
 
 #: Kinds whose object ID *is* the SHA-256 of the stored bytes, so the stored
@@ -159,6 +164,21 @@ def workspace_uri(sha256: str) -> str:
     ).uri
 
 
+def log_uri(workload_id: str, attempt: int, rank: int) -> str:
+    """Build a canonical managed URI for one rank's archived logs.
+
+    Keyed by attempt as well as workload: a retry produces different output from
+    a different execution, and overwriting the predecessor's would destroy the
+    record of the failure that caused the retry -- the one an operator is most
+    likely to be looking for.
+    """
+
+    if attempt < 1 or rank < 0:
+        raise InvalidManagedArtifactURI("log archives require a positive attempt and a non-negative rank")
+    object_id = f"{workload_id}-a{attempt}-r{rank}"
+    return ManagedArtifactRef(ManagedArtifactKind.LOGS, _validate_object_id(ManagedArtifactKind.LOGS, object_id)).uri
+
+
 def result_uri(result_id: str) -> str:
     """Build a canonical managed URI for a result object."""
 
@@ -241,6 +261,9 @@ _OBJECT_EXTENSIONS = {
     ManagedArtifactKind.CALLABLES: ".pkl",
     ManagedArtifactKind.RESULTS: ".result",
     ManagedArtifactKind.WORKSPACES: ".tar.gz",
+    # JSON lines, the same shape the live log page returns, so a reader needs
+    # one parser for archived logs and streaming ones rather than two.
+    ManagedArtifactKind.LOGS: ".jsonl",
 }
 
 

@@ -7,10 +7,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from collections import Counter
 from datetime import timedelta
 
+from eyvan._internal.json_types import JsonObject
+from eyvan.artifacts.managed import log_uri
 from eyvan.capacity import (
     CapacityStatus,
 )
@@ -45,6 +49,12 @@ from eyvan.server.service.errors import ConflictError, NotFoundError
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 
+#: Lines archived per attempt. A ceiling rather than everything, because the
+#: archive is written inside the release path: an unbounded read would make
+#: settling a chatty job slow enough to matter, and the last lines are what
+#: explain a failure. Truncation is visible -- the page reports it.
+_LOG_ARCHIVE_LINE_LIMIT = 1000
+
 
 class _ControllerSettlement:
     """Terminal release, billing, retention, and what capacity failures teach.
@@ -64,6 +74,12 @@ class _ControllerSettlement:
     ) -> None:
         if workload.lease_id != lease.id:
             raise StaleOutboxCommand(f"lease {lease.id!r} no longer owns workload {workload.id!r}")
+        # Archive before settling. Settlement releases the lease, and releasing
+        # a cell destroys its journal -- so the output disappears exactly when
+        # the capacity bill stops, which is also when someone starts asking what
+        # happened. Failures here are swallowed on purpose: a job that ran must
+        # still be recorded as finished even if its logs could not be saved.
+        await self._archive_terminal_logs(workload)
         await self.service.settle_terminal_workload(
             self._principal,
             workload.id,
@@ -74,6 +90,52 @@ class _ControllerSettlement:
             expected_lease_id=lease.id,
             expected_state=workload.state,
         )
+
+    async def _archive_terminal_logs(self, workload: WorkloadRecord) -> None:
+        """Copy one attempt's structured logs into managed storage.
+
+        Best effort, and deliberately so. The alternative -- letting an archive
+        failure abort settlement -- would leave a finished workload holding its
+        lease because its logs were unreadable, turning a diagnostic gap into a
+        stranded accelerator.
+
+        Skipped entirely when managed artifacts are not configured, which is the
+        local development case: there is nowhere to put them and the journal is
+        on the same machine anyway.
+        """
+
+        if self.artifact_access is None or workload.remote_id is None:
+            return
+        try:
+            page = await self.workload_log_page(workload.id, limit=_LOG_ARCHIVE_LINE_LIMIT)
+        except Exception:
+            logger.warning("could not read logs for %s before release", workload.id, exc_info=True)
+            return
+        records = page.get("records")
+        if not isinstance(records, list) or not records:
+            return
+        by_rank: dict[int, list[JsonObject]] = {}
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            rank = entry.get("rank")
+            by_rank.setdefault(rank if isinstance(rank, int) else 0, []).append(entry)
+        for rank, lines in sorted(by_rank.items()):
+            # One object per rank, JSON lines: the same shape the live page
+            # returns, so a reader does not need a second parser for archived
+            # logs than for streaming ones.
+            payload = "\n".join(json.dumps(line, sort_keys=True) for line in lines).encode()
+            uri = log_uri(workload.id, workload.attempt, rank)
+            try:
+                await asyncio.to_thread(
+                    self.artifact_access.store.put,
+                    uri,
+                    payload,
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                )
+            except Exception:
+                logger.warning("could not archive logs for %s rank %d", workload.id, rank, exc_info=True)
 
     async def _record_capacity_stockout(self, cell: CellRecord) -> None:
         """Persist a STOCKOUT belief for a cell reclaimed before it ever became READY.

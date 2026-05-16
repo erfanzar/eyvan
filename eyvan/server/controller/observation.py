@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta
 
 from eyvan._internal.json_types import JsonObject
+from eyvan.artifacts.managed import log_uri
 from eyvan.capacity import (
     DEFINITIVE_CAPACITY_LOSS_STATUSES,
     PENDING_CAPACITY_STATUSES,
@@ -57,6 +59,11 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
 )
 from eyvan.worker.runtime.log_records import LogPage, LogRecord, merge_pages
+
+#: How many ranks an archive read probes before concluding the set has ended.
+#: Bounded because a miss costs a storage round trip, and a gang wider than this
+#: would have failed the multislice ceiling long before it got here.
+_ARCHIVED_RANK_SCAN_LIMIT = 64
 
 
 def _split_log_cursor(value: str) -> tuple[int | None, str]:
@@ -1042,7 +1049,20 @@ class _ControllerObservation:
         if attempt_changed:
             cursor = ""
 
-        members = await self._load_workload_members(workload)
+        try:
+            members = await self._load_workload_members(workload)
+        except StaleOutboxCommand:
+            # No current lease: the cell is released and its journal went with
+            # it. This is the ordinary path for any finished workload, not an
+            # error -- and falling back to the archive is the entire reason the
+            # archive exists.
+            members = ()
+        if not members:
+            return _log_page_document(
+                await self._archived_log_page(workload),
+                attempt=workload.attempt,
+                attempt_changed=attempt_changed,
+            )
         # ``_ordered_gang_member_pairs`` validates a *gang* -- it refuses fewer
         # than two cells -- so a single-cell workload uses its one member
         # directly. The gang path gets the deterministic cell ordering that
@@ -1070,6 +1090,53 @@ class _ControllerObservation:
             attempt=workload.attempt,
             attempt_changed=attempt_changed,
         )
+
+    async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
+        """Read one attempt's archived logs back out of managed storage.
+
+        Returns an ``unavailable`` page rather than an empty one when the
+        archive cannot be read: after a cell is released there is no other
+        source, so "nothing here" and "could not look" are the difference
+        between a job that printed nothing and one whose record was lost.
+        """
+
+        if self.artifact_access is None:
+            return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
+        records: list[LogRecord] = []
+        found = False
+        for rank in range(_ARCHIVED_RANK_SCAN_LIMIT):
+            try:
+                payload = await asyncio.to_thread(
+                    self.artifact_access.store.get,
+                    log_uri(workload.id, workload.attempt, rank),
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                )
+            except Exception:
+                # Absent rather than unreadable: ranks are archived contiguously
+                # from zero, so the first gap is the end of the set.
+                break
+            found = True
+            for line in payload.decode(errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    records.append(
+                        LogRecord(
+                            message=str(entry.get("message", "")),
+                            stream=str(entry.get("stream", "unknown")),  # type: ignore[arg-type]
+                            cursor=str(entry.get("cursor", "")),
+                            rank=rank,
+                            pid=entry.get("pid") if isinstance(entry.get("pid"), int) else None,
+                        )
+                    )
+        if not found:
+            return LogPage(unavailable=True, detail="this attempt has no archived logs")
+        return LogPage(records=tuple(records), detail="archived")
 
     async def workload_process_status(self, workload_id: str) -> JsonObject:
         """Read live process detail for one workload attempt.
