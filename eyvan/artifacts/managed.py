@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 from eyvan._internal.compat import StrEnum
+from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims, verify_signature
 
 _CALLABLE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -620,12 +621,7 @@ class ArtifactTokenSigner:
         }
         if workload_id is not None:
             payload["workload_id"] = workload_id
-        encoded_payload = _b64encode(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-        )
-        signed = f"{_TOKEN_VERSION}.{encoded_payload}".encode()
-        signature = _b64encode(hmac.new(self._secret, signed, hashlib.sha256).digest())
-        return f"{_TOKEN_VERSION}.{encoded_payload}.{signature}"
+        return sign_claims(self._secret, _TOKEN_VERSION, payload)
 
     def verify(
         self,
@@ -644,20 +640,9 @@ class ArtifactTokenSigner:
         org_id = _validate_scope_value(org_id, "org_id")
         project_id = _validate_scope_value(project_id, "project_id")
         workload_id = self._workload(workload_id)
-        if not isinstance(token, str):
-            raise InvalidArtifactToken("invalid artifact transfer token")
-        parts = token.split(".")
-        if len(parts) != 3 or parts[0] != _TOKEN_VERSION:
-            raise InvalidArtifactToken("invalid artifact transfer token")
-        encoded_payload, encoded_signature = parts[1:]
-        signature = _b64decode(encoded_signature)
-        signed = f"{_TOKEN_VERSION}.{encoded_payload}".encode()
-        expected_signature = hmac.new(self._secret, signed, hashlib.sha256).digest()
-        if not hmac.compare_digest(expected_signature, signature):
-            raise InvalidArtifactToken("invalid artifact transfer token")
         try:
-            payload = json.loads(_b64decode(encoded_payload))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            payload = verify_signature(self._secret, _TOKEN_VERSION, token)
+        except InvalidCapabilityToken as exc:
             raise InvalidArtifactToken("invalid artifact transfer token") from exc
         required = {
             "action",
