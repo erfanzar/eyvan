@@ -12,7 +12,6 @@ import asyncio
 import collections
 import hmac
 import ipaddress
-import json
 import logging
 import os
 import secrets
@@ -115,6 +114,7 @@ from eyvan.server.api.schemas import (
 from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
+from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
@@ -146,6 +146,11 @@ UNMATCHED_ROUTE_LABEL = "<unmatched>"
 #: How far behind its cursor an audit follower re-scans, so an event whose
 #: transaction committed after a higher-sequence one is still delivered.
 _AUDIT_STREAM_LOOKBACK = 256
+#: How long a quiet log stream waits before polling again. journald has no
+#: notification channel, so following is polling; a second is short enough to
+#: read as live and long enough that a hundred idle followers are not a hundred
+#: reads a second against every cell agent.
+_LOG_STREAM_POLL_S = 1.0
 
 #: Bound on remembered event ids used to suppress the duplicates that lookback
 #: necessarily re-reads. Comfortably larger than the lookback window.
@@ -1916,8 +1921,11 @@ def create_app(
                     cursor = max(cursor, event.sequence)
                     if not remember(event.id):
                         continue
-                    data = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
-                    yield f"id: {event.sequence}\nevent: {event.action}\ndata: {data}\n\n"
+                    yield sse_frame(
+                        data=event.model_dump(mode="json"),
+                        event=event.action,
+                        identifier=str(event.sequence),
+                    )
                 if not follow or await raw_request.is_disconnected():
                     return
                 new_events = await service.wait_for_events(
@@ -1928,15 +1936,69 @@ def create_app(
                     timeout=15.0,
                 )
                 if not new_events:
-                    yield ": keep-alive\n\n"
+                    yield KEEPALIVE_FRAME
                 else:
                     await asyncio.sleep(0)
 
-        return StreamingResponse(
-            event_source(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        return sse_response(event_source())
+
+    @app.get("/api/v1/workloads/{workload_id}/logs/stream", tags=["workloads"])
+    async def stream_workload_logs(
+        raw_request: Request,
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        after: str = "",
+        last_event_id: tp.Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+        follow: bool = True,
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> StreamingResponse:
+        """Follow one workload's structured logs as they are produced.
+
+        A distinct route rather than a reuse of ``/events/stream``: that stream
+        is scoped to (org, project) and keyed on the audit table's BIGSERIAL,
+        while log records are per-(workload, attempt, rank) and have no global
+        sequence at all. They share this module's transport and nothing else.
+
+        ``Last-Event-ID`` is the same ``"{attempt}:{rank}=cursor|..."`` the
+        paged route returns, so a browser reconnecting resumes every rank where
+        it left off rather than replaying from the tail.
+
+        Authorization happens here, before the generator exists. A check inside
+        it would run after the response was committed, and the caller would see
+        ``200`` followed by silence -- indistinguishable from a quiet job.
+        """
+
+        await service.get_workload(principal, workload_id)
+        cursor = last_event_id or after
+
+        async def log_source() -> tp.AsyncIterator[str]:
+            position = cursor
+            while True:
+                page = await controller.workload_log_page(workload_id, after=position, limit=limit)
+                records = page.get("records")
+                if page.get("attempt_changed"):
+                    # Exactly one typed event, then the cursor resets. Silently
+                    # continuing would show the new attempt's first lines
+                    # appended to the old attempt's tail, and the reader would
+                    # conclude the job resumed where it left off.
+                    yield sse_frame(data={"attempt": page.get("attempt")}, event="log.attempt_changed")
+                if isinstance(records, list) and records:
+                    for record in records:
+                        yield sse_frame(data=record, event="log.record")
+                advanced = page.get("next_cursor")
+                if isinstance(advanced, str) and advanced:
+                    position = advanced
+                if not follow or await raw_request.is_disconnected():
+                    return
+                if not (isinstance(records, list) and records):
+                    # Nothing new. The keep-alive is what tells every buffer
+                    # between here and the client that the stream is alive.
+                    yield KEEPALIVE_FRAME
+                    await asyncio.sleep(_LOG_STREAM_POLL_S)
+                else:
+                    await asyncio.sleep(0)
+
+        return sse_response(log_source())
 
     dashboard_path = os.environ.get("EYVAN_DASHBOARD_DIR")
     dashboard_dir = Path(dashboard_path) if dashboard_path else None

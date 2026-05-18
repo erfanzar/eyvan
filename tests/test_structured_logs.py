@@ -1036,3 +1036,229 @@ async def test_every_rank_of_a_gang_is_asked_from_its_own_position() -> None:
     await controller.workload_log_page("wl-gang", after=first["next_cursor"])
 
     assert agent.asked == {"cell-a": "cell-a-next", "cell-b": "cell-b-next"}
+
+
+# --------------------------------------------------------------------------- following
+
+
+def test_a_frame_is_terminated_so_a_browser_actually_fires() -> None:
+    """The blank line is the frame terminator, and omitting it is invisible locally.
+
+    A stream missing it looks correct in a terminal and never fires an event in
+    a browser, because ``EventSource`` waits for the terminator before
+    dispatching.
+    """
+
+    from eyvan.server.api.sse import sse_frame
+
+    frame = sse_frame(data={"message": "hi"}, event="log.record", identifier="1:0=c1")
+
+    assert frame.endswith("\n\n")
+    assert frame.startswith("id: 1:0=c1\nevent: log.record\ndata: ")
+
+
+def test_a_payload_is_encoded_on_one_line() -> None:
+    """A newline inside a ``data:`` field silently starts a second field.
+
+    A multi-line payload would arrive at the client truncated at the first
+    newline, with no error anywhere.
+    """
+
+    from eyvan.server.api.sse import sse_frame
+
+    frame = sse_frame(data={"message": "line one\nline two"})
+
+    assert frame.count("data: ") == 1
+    assert "\\n" in frame
+
+
+def test_the_stream_response_disables_proxy_buffering() -> None:
+    """An ingress buffer turns "live" into "several minutes late", silently.
+
+    Nothing in any log explains it: the response is correct, it is simply being
+    held until a buffer somewhere fills.
+    """
+
+    async def _empty():
+        if False:
+            yield ""
+
+    from eyvan.server.api.sse import sse_response
+
+    response = sse_response(_empty())
+
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+def _stream_client(controller_pages: list[dict]):
+    """A control plane whose log pages are scripted, so following is deterministic."""
+
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key="k" * 32))
+    remaining = list(controller_pages)
+
+    async def scripted(workload_id, *, after="", limit=200):
+        del workload_id, after, limit
+        return remaining.pop(0) if remaining else {"records": [], "next_cursor": "", "attempt": 1}
+
+    app.state.controller.workload_log_page = scripted
+    return TestClient(app), app
+
+
+def _seed_workload(app) -> None:
+    import asyncio as _asyncio
+
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
+
+    async def store():
+        async with app.state.service.repository.transaction() as transaction:
+            await transaction.put_workload(
+                WorkloadRecord(
+                    id="wl-1",
+                    org_id="acme",
+                    project_id="research",
+                    spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                    created_by="alice",
+                )
+            )
+
+    _asyncio.run(store())
+
+
+def test_following_emits_one_frame_per_record() -> None:
+    """The point of the route: lines arrive as they are produced."""
+
+    client, app = _stream_client(
+        [
+            {
+                "attempt": 1,
+                "attempt_changed": False,
+                "records": [
+                    {"message": "step 1", "stream": "stdout", "rank": 0},
+                    {"message": "step 2", "stream": "stdout", "rank": 1},
+                ],
+                "next_cursor": "1:0=c1|1=c2",
+            }
+        ]
+    )
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text.count("event: log.record") == 2
+    assert "step 1" in response.text
+    assert "step 2" in response.text
+
+
+def test_an_attempt_change_is_announced_exactly_once() -> None:
+    """Surviving an attempt change is the crux, and silence is the wrong answer.
+
+    Continuing quietly shows the new attempt's first lines appended to the old
+    attempt's tail, and the reader concludes the job resumed.
+    """
+
+    client, app = _stream_client(
+        [
+            {
+                "attempt": 2,
+                "attempt_changed": True,
+                "records": [{"message": "restarted", "stream": "stdout", "rank": 0}],
+                "next_cursor": "2:0=c1",
+            }
+        ]
+    )
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+        },
+    )
+
+    assert response.text.count("event: log.attempt_changed") == 1
+    assert "event: log.record" in response.text
+
+
+def test_an_unauthorized_follower_is_refused_before_the_response_is_committed() -> None:
+    """A check inside the generator runs after ``200`` has already been sent.
+
+    The caller then sees a successful, empty stream -- indistinguishable from a
+    job that has printed nothing, which is the worst possible way to deny
+    access.
+    """
+
+    client, app = _stream_client([])
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={
+            "X-Eyvan-User": "mallory",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "rival",
+            "X-Eyvan-Project": "research",
+        },
+    )
+
+    assert response.status_code == 403
+    assert "event: log.record" not in response.text
+
+
+def test_a_reconnecting_browser_resumes_from_last_event_id() -> None:
+    """``EventSource`` reconnects on its own and sends the last id it saw.
+
+    Ignoring the header means every dropped connection replays from the tail --
+    duplicating output the reader already has, and silently losing whatever was
+    produced between the drop and the reconnect.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key="k" * 32))
+    seen: list[str] = []
+
+    async def scripted(workload_id, *, after="", limit=200):
+        del workload_id, limit
+        seen.append(after)
+        return {"attempt": 1, "attempt_changed": False, "records": [], "next_cursor": ""}
+
+    app.state.controller.workload_log_page = scripted
+    _seed_workload(app)
+
+    TestClient(app).get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+            "Last-Event-ID": "2:0=c9|1=c8",
+        },
+    )
+
+    assert seen == ["2:0=c9|1=c8"], "the reconnect replayed from the tail instead of resuming"
