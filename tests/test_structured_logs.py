@@ -387,19 +387,23 @@ def _cursor_helpers():
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        ("", (None, "")),
-        ("3:abc", (3, "abc")),
-        ("abc", (None, "abc")),
-        ("notanint:abc", (None, "notanint:abc")),
+        ("", (None, {})),
+        ("3:0=abc", (3, {0: "abc"})),
+        ("3:0=abc|1=def", (3, {0: "abc", 1: "def"})),
+        ("abc", (None, {})),
+        ("notanint:0=abc", (None, {})),
     ],
-    ids=["empty", "attempt-qualified", "bare-cursor", "unparseable"],
+    ids=["empty", "one-rank", "two-ranks", "no-attempt", "unparseable"],
 )
-def test_a_cursor_carries_its_attempt_or_admits_it_does_not(value: str, expected: tuple) -> None:
-    """A bare cursor is "no opinion", not attempt zero.
+def test_a_cursor_carries_its_attempt_and_a_position_per_rank(value: str, expected: tuple) -> None:
+    """One cursor cannot resume a slice.
 
-    A caller that has never seen an attempt boundary must not be forced to
-    invent one, and guessing zero would make every first read look like it came
-    from a superseded attempt.
+    Each rank has its own journal and its own position in it. ``merge_pages``
+    says the same thing by refusing to invent a single cursor, and a caller that
+    ignored that would hand rank 1 a position from rank 0's journal.
+
+    A value with no attempt is "no opinion" rather than attempt zero, so a first
+    read is not mistaken for a superseded one.
     """
 
     split, _document = _cursor_helpers()
@@ -407,15 +411,23 @@ def test_a_cursor_carries_its_attempt_or_admits_it_does_not(value: str, expected
     assert split(value) == expected
 
 
-def test_the_returned_cursor_names_the_attempt_it_came_from() -> None:
-    """Returning a bare cursor would make an attempt boundary undetectable."""
+def test_the_returned_cursor_carries_every_rank_and_the_attempt() -> None:
+    """Without the attempt, a follower resumes a retry from its predecessor's place."""
 
     _split, document = _cursor_helpers()
 
-    page = document(LogPage(records=(), next_cursor="c9"), attempt=4)
+    page = document(LogPage(), attempt=4, cursors={0: "c9", 1: "c7"})
 
-    assert page["next_cursor"] == "4:c9"
+    assert page["next_cursor"] == "4:0=c9|1=c7"
     assert page["attempt"] == 4
+
+
+def test_a_rank_that_reported_no_position_is_left_out_rather_than_sent_empty() -> None:
+    """An empty cursor means "wherever you were", so writing it down says nothing."""
+
+    _split, document = _cursor_helpers()
+
+    assert document(LogPage(), attempt=2, cursors={0: "c1", 1: ""})["next_cursor"] == "2:0=c1"
 
 
 def test_an_empty_page_returns_an_empty_cursor_rather_than_a_bare_attempt() -> None:
@@ -531,7 +543,7 @@ async def test_a_cursor_from_a_superseded_attempt_restarts_rather_than_continues
     agent = _PagingAgent()
     controller = await _controller_with(agent, attempt=2)
 
-    page = await controller.workload_log_page("wl-1", after="1:old-cursor")
+    page = await controller.workload_log_page("wl-1", after="1:0=old-cursor")
 
     assert page["attempt_changed"] is True
     assert page["attempt"] == 2
@@ -546,7 +558,7 @@ async def test_a_cursor_from_the_current_attempt_resumes() -> None:
     agent = _PagingAgent()
     controller = await _controller_with(agent, attempt=2)
 
-    page = await controller.workload_log_page("wl-1", after="2:c1")
+    page = await controller.workload_log_page("wl-1", after="2:0=c1")
 
     assert page["attempt_changed"] is False
     assert agent.calls[0][2] == "c1"
@@ -871,3 +883,156 @@ def test_the_controller_passes_the_log_window_it_was_configured_with() -> None:
 
     assert "log_retention_s" in source
     assert "retention_by_kind" in source
+
+
+async def test_a_follower_can_actually_advance_through_the_controller() -> None:
+    """The defect this replaced: a cursor that never came back.
+
+    ``merge_pages`` returns an empty ``next_cursor`` on purpose -- no single
+    value resumes N ranks -- so projecting the merged page's cursor onto the
+    wire produced an empty one on every read. A follower polling this endpoint
+    would re-read the same tail forever and never advance, and every test that
+    checked the cursor did so on a page built by hand rather than one that came
+    back through here.
+    """
+
+    agent = _PagingAgent()
+    controller = await _controller_with(agent, attempt=3)
+
+    first = await controller.workload_log_page("wl-1")
+
+    assert first["next_cursor"] == "3:0=c1", "a follower has nowhere to resume from"
+
+    second = await controller.workload_log_page("wl-1", after=first["next_cursor"])
+
+    assert second["attempt_changed"] is False
+    assert agent.calls[-1][2] == "c1", "the position did not reach the backend"
+
+
+async def test_each_rank_is_asked_from_its_own_position() -> None:
+    """Handing rank 1 rank 0's cursor asks journald to resume from an entry it never wrote.
+
+    The two ranks are different journals on different hosts; their cursors are
+    not comparable, let alone interchangeable.
+    """
+
+    from eyvan.server.controller.observation import _split_log_cursor
+
+    attempt, cursors = _split_log_cursor("3:0=from-rank-zero|1=from-rank-one")
+
+    assert attempt == 3
+    assert cursors == {0: "from-rank-zero", 1: "from-rank-one"}
+
+
+class _PerRankAgent:
+    """Records exactly which cursor each cell was asked from."""
+
+    def __init__(self) -> None:
+        self.asked: dict[str, str] = {}
+
+    def log_page(self, cell_id, remote_id, *, after="", limit=200):
+        del remote_id, limit
+        self.asked[cell_id] = after
+        return {
+            "records": [{"message": f"from {cell_id}", "stream": "stdout", "cursor": f"{cell_id}-next"}],
+            "next_cursor": f"{cell_id}-next",
+            "unavailable": False,
+            "detail": "",
+            "truncated_ranks": [],
+        }
+
+
+async def _gang_controller(agent):
+    """A two-cell native gang, which is the shape per-rank cursors exist for."""
+
+    from datetime import timedelta
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import (
+        CellRecord,
+        CellState,
+        CommandExecution,
+        LeaseRecord,
+        LeaseState,
+        ResourceGang,
+        ResourceVector,
+        WorkloadDefinition,
+        WorkloadRecord,
+        WorkloadState,
+        utcnow,
+    )
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    controller = EyvanController(
+        repository,
+        ControlPlaneService(repository, scheduler=CoreSchedulingService()),
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: agent,
+    )
+    async with repository.transaction() as transaction:
+        for index, cell_id in enumerate(("cell-a", "cell-b")):
+            await transaction.put_cell(
+                CellRecord(
+                    id=cell_id,
+                    provider="local",
+                    region="local",
+                    state=CellState.READY,
+                    capacity=ResourceVector(cpu=8),
+                    allocatable=ResourceVector(cpu=8),
+                    # One endpoint across the gang, as the coordinator path requires.
+                    endpoint="http://agent:8090",
+                )
+            )
+            await transaction.put_lease(
+                LeaseRecord(
+                    id=f"lease-{index}",
+                    workload_id="wl-gang",
+                    cell_id=cell_id,
+                    org_id="acme",
+                    project_id="research",
+                    state=LeaseState.ACTIVE,
+                    resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0)),
+                    generation=1,
+                    fencing_token=f"token-{index}",
+                    expires_at=utcnow() + timedelta(hours=24),
+                )
+            )
+        await transaction.put_workload(
+            WorkloadRecord(
+                id="wl-gang",
+                org_id="acme",
+                project_id="research",
+                spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                state=WorkloadState.RUNNING,
+                attempt=1,
+                lease_id="lease-0",
+                lease_ids=["lease-0", "lease-1"],
+                remote_id="remote-1",
+                created_by="alice",
+            )
+        )
+    return controller
+
+
+async def test_every_rank_of_a_gang_is_asked_from_its_own_position() -> None:
+    """The case a single-rank test cannot distinguish.
+
+    Two ranks are two journals on two hosts. Their cursors are not comparable,
+    let alone interchangeable -- handing rank 1 rank 0's cursor asks journald to
+    resume from an entry it never wrote, and journald's answer to that is not
+    "start from the beginning", it is undefined.
+    """
+
+    agent = _PerRankAgent()
+    controller = await _gang_controller(agent)
+
+    first = await controller.workload_log_page("wl-gang")
+    assert first["next_cursor"] == "1:0=cell-a-next|1=cell-b-next"
+
+    await controller.workload_log_page("wl-gang", after=first["next_cursor"])
+
+    assert agent.asked == {"cell-a": "cell-a-next", "cell-b": "cell-b-next"}

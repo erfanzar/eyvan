@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import typing as tp
 import uuid
 from datetime import datetime, timedelta
 
@@ -66,22 +67,53 @@ from eyvan.worker.runtime.log_records import LogPage, LogRecord, merge_pages
 _ARCHIVED_RANK_SCAN_LIMIT = 64
 
 
-def _split_log_cursor(value: str) -> tuple[int | None, str]:
-    """Split ``"{attempt}:{cursor}"`` into its parts.
+def _split_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
+    """Split ``"{attempt}:{rank}={cursor}|{rank}={cursor}"`` into its parts.
 
-    A bare cursor with no attempt is accepted and read as "no opinion", so a
-    caller that has never seen an attempt boundary is not forced to invent one.
+    **Per rank, not one cursor for the slice.** Each rank has its own journal
+    and its own position in it; a single cursor is meaningless to any rank that
+    did not issue it. ``merge_pages`` says the same thing by refusing to invent
+    one -- it returns an empty ``next_cursor`` precisely because no single value
+    can resume N ranks -- and a caller that ignored that would hand rank 1 a
+    cursor from rank 0's journal.
+
+    A bare value with no attempt is read as "no opinion" rather than attempt
+    zero, so a first read is not mistaken for a superseded one.
     """
 
     if not value:
-        return None, ""
-    attempt_text, separator, cursor = value.partition(":")
+        return None, {}
+    attempt_text, separator, remainder = value.partition(":")
     if not separator:
-        return None, value
+        return None, {}
     try:
-        return int(attempt_text), cursor
+        attempt = int(attempt_text)
     except ValueError:
-        return None, value
+        return None, {}
+    cursors: dict[int, str] = {}
+    for entry in remainder.split("|"):
+        rank_text, assigned, cursor = entry.partition("=")
+        if not assigned:
+            continue
+        try:
+            cursors[int(rank_text)] = cursor
+        except ValueError:
+            continue
+    return attempt, cursors
+
+
+def _join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
+    """Encode each rank's position so the next request can resume all of them.
+
+    Empty when no rank reported one, which is distinct from a cursor pointing at
+    the start: resuming from empty means "wherever you were", and a start cursor
+    means "replay everything".
+    """
+
+    live = {rank: cursor for rank, cursor in sorted(cursors.items()) if cursor}
+    if not live:
+        return ""
+    return f"{attempt}:" + "|".join(f"{rank}={cursor}" for rank, cursor in live.items())
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:
@@ -114,20 +146,26 @@ def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:
     )
 
 
-def _log_page_document(page: LogPage, *, attempt: int, attempt_changed: bool = False) -> JsonObject:
+def _log_page_document(
+    page: LogPage,
+    *,
+    attempt: int,
+    attempt_changed: bool = False,
+    cursors: tp.Mapping[int, str] | None = None,
+) -> JsonObject:
     """Project a merged page onto the wire, carrying the attempt it belongs to.
 
-    ``next_cursor`` is returned as ``"{attempt}:{cursor}"`` so the next request
-    identifies which attempt its position came from. Returning a bare cursor
-    would make an attempt boundary undetectable, which is the whole failure this
-    endpoint has to avoid.
+    ``next_cursor`` encodes every rank's position and the attempt they came
+    from. The attempt has to travel with it: without it an attempt boundary is
+    undetectable, and a follower resumes a retry from its predecessor's
+    position.
     """
 
     document: JsonObject = {
         "attempt": attempt,
         "attempt_changed": attempt_changed,
         "records": [dict(record.as_json()) for record in page.records],
-        "next_cursor": f"{attempt}:{page.next_cursor}" if page.next_cursor else "",
+        "next_cursor": _join_log_cursor(attempt, cursors or {}),
         "unavailable": page.unavailable,
         "detail": page.detail,
         "truncated_ranks": list(page.truncated_ranks),
@@ -1044,10 +1082,12 @@ class _ControllerObservation:
         if workload.remote_id is None:
             return _log_page_document(LogPage(), attempt=workload.attempt)
 
-        requested_attempt, cursor = _split_log_cursor(after)
+        requested_attempt, cursors = _split_log_cursor(after)
         attempt_changed = requested_attempt is not None and requested_attempt != workload.attempt
         if attempt_changed:
-            cursor = ""
+            # A retry runs a different execution; the old positions name lines
+            # in journals that no longer exist.
+            cursors = {}
 
         try:
             members = await self._load_workload_members(workload)
@@ -1075,7 +1115,9 @@ class _ControllerObservation:
                     self._agent_factory(cell).log_page,
                     cell.id,
                     workload.remote_id,
-                    after=cursor,
+                    # This rank's own position. Handing it another rank's cursor
+                    # would ask journald to resume from an entry it never wrote.
+                    after=cursors.get(rank, ""),
                     limit=limit,
                 )
             except Exception as exc:
@@ -1085,10 +1127,15 @@ class _ControllerObservation:
                 pages[rank] = LogPage(unavailable=True, detail=str(exc))
                 continue
             pages[rank] = _log_page_from_document(payload, rank=rank)
+        # Captured before the merge, which deliberately drops them: there is no
+        # single cursor for a slice, so the per-rank positions are what a
+        # follower needs back.
+        advanced = {rank: page.next_cursor or cursors.get(rank, "") for rank, page in pages.items()}
         return _log_page_document(
             merge_pages(pages) if pages else LogPage(),
             attempt=workload.attempt,
             attempt_changed=attempt_changed,
+            cursors=advanced,
         )
 
     async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
