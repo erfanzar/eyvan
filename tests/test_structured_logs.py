@@ -755,3 +755,119 @@ async def test_the_release_path_itself_archives(tmp_path) -> None:
 
     stored = access.store.get(log_uri("wl-1", 1, 0), org_id="acme", project_id="research")
     assert b"final line" in stored
+
+
+# --------------------------------------------------------------------------- retention
+
+
+async def _collection_service(tmp_path):
+    from eyvan.artifacts.managed import LocalManagedArtifactStore
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    store = LocalManagedArtifactStore(tmp_path / "artifacts")
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        scheduler=CoreSchedulingService(),
+        artifact_store=store,
+    )
+    return service, store
+
+
+async def _index(service, uri: str, *, age_days: int) -> None:
+    from datetime import timedelta
+
+    from eyvan.records import ManagedArtifactRecord, utcnow
+
+    async with service.repository.transaction() as transaction:
+        await transaction.put_managed_artifact(
+            ManagedArtifactRecord(
+                uri=uri,
+                org_id="acme",
+                project_id="research",
+                kind=uri.split("//")[1].split("/")[0],
+                size_bytes=10,
+                created_at=utcnow() - timedelta(days=age_days),
+            )
+        )
+
+
+async def test_logs_outlive_the_general_artifact_window(tmp_path) -> None:
+    """A callable can be rebuilt from source; an attempt's logs cannot.
+
+    Sharing one window means either deleting the evidence at seven days or
+    keeping every pickle for a month. Neither is the answer, which is why the
+    window is per kind.
+    """
+
+    from eyvan.artifacts.managed import callable_uri, log_uri
+
+    service, _store = await _collection_service(tmp_path)
+    stale_callable = callable_uri("a" * 64)
+    archived_log = log_uri("wl-1", 1, 0)
+    await _index(service, stale_callable, age_days=10)
+    await _index(service, archived_log, age_days=10)
+
+    collection = await service.collect_artifacts_once(
+        grace_period_s=7 * 24 * 3600,
+        retention_by_kind={"logs": 30 * 24 * 3600},
+        dry_run=True,
+    )
+
+    assert stale_callable in collection.collected_uris
+    assert archived_log not in collection.collected_uris, "logs were collected on the general window"
+
+
+async def test_logs_are_collected_once_their_own_window_passes(tmp_path) -> None:
+    """A longer window is still a window; unbounded log storage is the other failure."""
+
+    from eyvan.artifacts.managed import log_uri
+
+    service, _store = await _collection_service(tmp_path)
+    archived_log = log_uri("wl-1", 1, 0)
+    await _index(service, archived_log, age_days=45)
+
+    collection = await service.collect_artifacts_once(
+        grace_period_s=7 * 24 * 3600,
+        retention_by_kind={"logs": 30 * 24 * 3600},
+        dry_run=True,
+    )
+
+    assert archived_log in collection.collected_uris
+
+
+async def test_a_window_of_none_keeps_logs_forever(tmp_path) -> None:
+    """``EYVAN_LOG_RETENTION_S=0`` means keep them, the same "zero disables"
+    convention the other retention windows use.
+
+    Spelled as ``None`` rather than an infinite window because
+    ``timedelta(seconds=inf)`` overflows -- the clever version does not run.
+    """
+
+    from eyvan.artifacts.managed import log_uri
+
+    service, _store = await _collection_service(tmp_path)
+    archived_log = log_uri("wl-1", 1, 0)
+    await _index(service, archived_log, age_days=4000)
+
+    collection = await service.collect_artifacts_once(
+        grace_period_s=7 * 24 * 3600,
+        retention_by_kind={"logs": None},
+        dry_run=True,
+    )
+
+    assert archived_log not in collection.collected_uris
+
+
+def test_the_controller_passes_the_log_window_it_was_configured_with() -> None:
+    """A setting nothing reads is the shape this whole plan is about."""
+
+    import inspect
+
+    from eyvan.server.controller import settlement
+
+    source = inspect.getsource(settlement._ControllerSettlement.collect_artifacts_once)
+
+    assert "log_retention_s" in source
+    assert "retention_by_kind" in source

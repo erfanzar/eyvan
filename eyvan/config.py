@@ -110,6 +110,11 @@ class EyvanSettings:
     """
 
     artifact_retention_s: int = 7 * 24 * 3600
+    #: How long an attempt's archived logs are kept. Longer than the general
+    #: artifact window on purpose: a callable can be rebuilt from its source,
+    #: while logs are the only record of what a run did, and the question they
+    #: answer is usually asked well after the run. Zero keeps them forever.
+    log_retention_s: int = 30 * 24 * 3600
     """How long an unreferenced artifact is kept before it may be collected.
 
     Distinct from ``grace_period_s``, which is an anti-race window around a
@@ -253,6 +258,7 @@ class EyvanSettings:
                 os.getenv("EYVAN_ARTIFACT_COLLECTION_INTERVAL_S", defaults.artifact_collection_interval_s)
             ),
             artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
+            log_retention_s=int(os.getenv("EYVAN_LOG_RETENTION_S", defaults.log_retention_s)),
             metrics_export_interval_s=float(
                 os.getenv("EYVAN_METRICS_EXPORT_INTERVAL_S", defaults.metrics_export_interval_s)
             ),

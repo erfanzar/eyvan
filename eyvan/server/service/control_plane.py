@@ -5372,6 +5372,7 @@ class ControlPlaneService:
         org_id: str | None = None,
         project_id: str | None = None,
         grace_period_s: float = DEFAULT_ARTIFACT_GRACE_PERIOD_S,
+        retention_by_kind: tp.Mapping[str, float | None] | None = None,
         dry_run: bool = True,
         limit: int = 500,
         now: datetime | None = None,
@@ -5400,7 +5401,16 @@ class ControlPlaneService:
         if self.artifact_store is None:
             raise InputError("a managed artifact store is not configured")
         moment = now or utcnow()
-        cutoff = moment - timedelta(seconds=grace_period_s)
+        # Per kind, because they are not the same thing. A callable is
+        # reproducible from its source; an attempt's logs are the only record of
+        # what happened, and they are wanted long after the bytes that produced
+        # them stopped mattering. One window for both means either deleting the
+        # evidence early or keeping every pickle forever.
+        #
+        # ``None`` means never collect this kind. Spelled out rather than as an
+        # infinite window: ``timedelta(seconds=inf)`` overflows, so the clever
+        # version is not merely less clear, it does not run.
+        windows: dict[str, float | None] = dict(retention_by_kind or {})
         collected: list[str] = []
         reclaimed = 0
         held = referenced = within_grace = 0
@@ -5412,7 +5422,11 @@ class ControlPlaneService:
             if record.hold is not None and record.hold.active_at(moment):
                 held += 1
                 continue
-            if record.created_at > cutoff:
+            window = windows.get(str(record.kind), grace_period_s)
+            if window is None:
+                within_grace += 1
+                continue
+            if record.created_at > moment - timedelta(seconds=window):
                 within_grace += 1
                 continue
             async with self.repository.transaction() as tx:

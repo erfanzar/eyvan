@@ -14,7 +14,7 @@ from collections import Counter
 from datetime import timedelta
 
 from eyvan._internal.json_types import JsonObject
-from eyvan.artifacts.managed import log_uri
+from eyvan.artifacts.managed import ManagedArtifactKind, log_uri
 from eyvan.capacity import (
     CapacityStatus,
 )
@@ -674,9 +674,14 @@ class _ControllerSettlement:
         retention_s = self.settings.artifact_retention_s
         if retention_s <= 0:
             return 0
+        log_retention_s = self.settings.log_retention_s
         collection = await self.service.collect_artifacts_once(
             principal=self._principal,
             grace_period_s=float(retention_s),
+            # Logs outlive the general window, and zero means never collect
+            # them -- the same "zero disables" convention the other retention
+            # windows use.
+            retention_by_kind={ManagedArtifactKind.LOGS.value: float(log_retention_s) if log_retention_s > 0 else None},
             dry_run=False,
         )
         deleted = len(collection.collected_uris)
