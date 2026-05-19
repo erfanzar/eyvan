@@ -59,6 +59,57 @@ class JobTreeTooDeepError(ConflictError):
     """
 
 
+#: Live children one parent may hold at once. A ceiling on *concurrency*, not on
+#: total fan-out: ten thousand children submitted one at a time is an ordinary
+#: sweep, while ten thousand at once is a denial of service against the
+#: scheduler and against every other tenant's queue position.
+MAX_LIVE_CHILDREN = 256
+
+
+class JobTreeTooWideError(ConflictError):
+    """Raised when a parent already holds as many live children as it may.
+
+    A 409 rather than a 429: the caller is not being rate limited and retrying
+    in a moment will not help. Something has to finish first, and saying so is
+    what lets a launcher block rather than spin.
+    """
+
+
+async def parent_depth(
+    workload_id: str,
+    load_parent: tp.Callable[[str], tp.Awaitable[WorkloadRecord | None]],
+    *,
+    max_depth: int = MAX_JOB_TREE_DEPTH,
+) -> int:
+    """Return how many ancestors a workload has, refusing an unbounded chain.
+
+    ``collect_descendants`` walks *down* and cannot see this: a self-submitting
+    callable extends the tree upward one link at a time, and every individual
+    step looks like an ordinary parent with one child. Without an upward check
+    the only thing that eventually stops it is the budget.
+    """
+
+    depth = 0
+    seen: set[str] = {workload_id}
+    current = workload_id
+    while True:
+        parent = await load_parent(current)
+        if parent is None:
+            return depth
+        if parent.id in seen:
+            # A cycle cannot be created through the API, but a corrupted or
+            # hand-edited record should terminate rather than hang the request.
+            raise JobTreeTooDeepError(f"job tree above {workload_id!r} contains a cycle at {parent.id!r}")
+        depth += 1
+        if depth >= max_depth:
+            raise JobTreeTooDeepError(
+                f"job tree above {workload_id!r} is deeper than {max_depth} levels; "
+                "a self-submitting callable will not stop on its own"
+            )
+        seen.add(parent.id)
+        current = parent.id
+
+
 async def collect_descendants(
     root_id: str,
     load_children: ChildLoader,
@@ -113,9 +164,12 @@ def validate_parent(child_scope: tuple[str, str], parent: WorkloadRecord) -> Non
 
 __all__ = (
     "MAX_JOB_TREE_DEPTH",
+    "MAX_LIVE_CHILDREN",
     "ChildLoader",
     "JobTreeError",
     "JobTreeTooDeepError",
+    "JobTreeTooWideError",
     "collect_descendants",
+    "parent_depth",
     "validate_parent",
 )

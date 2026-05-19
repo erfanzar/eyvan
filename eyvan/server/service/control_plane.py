@@ -131,7 +131,15 @@ from eyvan.server.service.state import (
     ensure_lease_transition,
     ensure_workload_transition,
 )
-from eyvan.server.service.subjobs import collect_descendants, validate_parent
+from eyvan.server.service.subjobs import (
+    MAX_JOB_TREE_DEPTH,
+    MAX_LIVE_CHILDREN,
+    JobTreeTooDeepError,
+    JobTreeTooWideError,
+    collect_descendants,
+    parent_depth,
+    validate_parent,
+)
 
 
 def _new_id(prefix: str) -> str:
@@ -947,6 +955,7 @@ class ControlPlaneService:
         schedulable: bool = True,
         coordination_kind: CoordinationKind | None = None,
         depends_on: tuple[str, ...] = (),
+        created_by: str | None = None,
     ) -> tuple[WorkloadRecord, bool]:
         replayed = await self._replayed_workload(
             tx,
@@ -980,7 +989,15 @@ class ControlPlaneService:
             org_id=org_id,
             project_id=project_id,
             spec=spec,
-            created_by=principal.subject,
+            # ``principal`` is the *actor* -- who made this call, truthfully
+            # ``workload:<id>`` for an in-job submission -- while ``created_by``
+            # is the *identity* the work belongs to. They are the same for a
+            # human submit and deliberately different for a child.
+            #
+            # A synthetic ``created_by`` would create a fresh per-principal
+            # fair-share leaf and a fresh QuotaRecord scope, so a launcher could
+            # escape the quota its owner is subject to simply by fanning out.
+            created_by=created_by or principal.subject,
             parent_workload_id=parent_workload_id,
             schedulable=schedulable,
             coordination_kind=coordination_kind,
@@ -3897,6 +3914,84 @@ class ControlPlaneService:
         async with self.repository.transaction() as tx:
             grants = await tx.list_role_grants(subject=subject)
         return tuple(item.grant for item in grants if item.active_at(moment))
+
+    async def submit_child_workload(
+        self,
+        *,
+        parent: WorkloadRecord,
+        spec: WorkloadDefinition,
+        idempotency_key: str,
+    ) -> tuple[WorkloadRecord, bool]:
+        """Admit a workload submitted by a running job on its own authority.
+
+        The caller has already been authenticated by its workload capability, so
+        there is no ``Principal`` here to authorize against -- and inventing one
+        would mean synthesizing a grant no identity provider issued, inside the
+        most security-sensitive route in the package.
+
+        Instead the parent *is* the authorization: a child inherits its scope,
+        its identity, and its place in the fair-share tree, and can therefore
+        reach nothing its parent could not.
+        """
+
+        if not parent.spec.can_submit_children:
+            raise AuthorizationError(f"workload {parent.id!r} was not submitted with can_submit_children")
+        if parent.state in TERMINAL_WORKLOAD_STATES or parent.state is WorkloadState.CANCELLING:
+            raise ConflictError(f"workload {parent.id!r} is {parent.state.value}; it cannot gain new children")
+
+        # Derived, not supplied. A launcher's natural key is a step number, and
+        # two siblings both calling their first child "step-1" would otherwise
+        # collide -- the second one silently returning the first one's handle.
+        scoped_key = _validate_idempotency_key(f"{parent.id}:{idempotency_key}")
+        scope = _scope(parent.org_id, parent.project_id)
+        fingerprint = _fingerprint(spec)
+        async with self.repository.transaction() as tx:
+
+            async def _parent_of(workload_id: str) -> WorkloadRecord | None:
+                """Return a workload's parent, not the workload itself.
+
+                Spelled out because ``get_workload`` reads as a plausible parent
+                loader and is not one: passing it directly makes every workload
+                its own parent, which the cycle guard then reports as a corrupt
+                tree on the very first submission.
+                """
+
+                record = await tx.get_workload(workload_id)
+                if record is None or record.parent_workload_id is None:
+                    return None
+                return await tx.get_workload(record.parent_workload_id)
+
+            depth = await parent_depth(parent.id, _parent_of)
+            if depth + 1 >= MAX_JOB_TREE_DEPTH:
+                raise JobTreeTooDeepError(
+                    f"workload {parent.id!r} is already {depth} levels deep; a child would exceed {MAX_JOB_TREE_DEPTH}"
+                )
+            live = [
+                child
+                for child in await tx.list_child_workloads(parent.id)
+                if child.state not in TERMINAL_WORKLOAD_STATES
+            ]
+            if len(live) >= MAX_LIVE_CHILDREN:
+                raise JobTreeTooWideError(
+                    f"workload {parent.id!r} already has {len(live)} live children; "
+                    f"at most {MAX_LIVE_CHILDREN} may run at once"
+                )
+            return await self._store_workload(
+                tx,
+                # The actor is truthfully the workload, which is what the audit
+                # trail should show. The identity is the parent's owner, which
+                # is what quota and fair share must see.
+                Principal(subject=f"workload:{parent.id}", grants=()),
+                org_id=parent.org_id,
+                project_id=parent.project_id,
+                spec=spec,
+                scope=scope,
+                operation="workload.submit_child",
+                key=scoped_key,
+                fingerprint=fingerprint,
+                parent_workload_id=parent.id,
+                created_by=parent.created_by,
+            )
 
     async def estimate_workload(
         self,

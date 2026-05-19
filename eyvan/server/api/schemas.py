@@ -328,6 +328,17 @@ class PolicyPutRequest(ApiModel):
         return PolicyRecord(org_id=org_id, project_id=project_id, updated_by="api", **self.model_dump())
 
 
+class ChildWorkloadSubmitRequest(ApiModel):
+    """A workload submitted by a running job.
+
+    Carries only the spec. Scope, identity and parentage all come from the
+    authenticated parent -- accepting them here would let a job name a scope its
+    parent does not belong to, which is the whole thing the capability prevents.
+    """
+
+    spec: WorkloadDefinition
+
+
 class RoleGrantIssueRequest(ApiModel):
     """Grant one role to one subject, durably.
 

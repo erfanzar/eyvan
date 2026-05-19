@@ -35,6 +35,7 @@ from eyvan._internal.client_version import CLIENT_VERSION_HEADER, is_client_supp
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan._internal.observability import EyvanMetrics
 from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
+from eyvan.artifacts._capability_tokens import InvalidCapabilityToken
 from eyvan.artifacts.managed import (
     ArtifactAction,
     ArtifactTokenSigner,
@@ -46,6 +47,7 @@ from eyvan.artifacts.managed import (
     workspace_uri,
 )
 from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.records import (
@@ -89,6 +91,7 @@ from eyvan.server.api.schemas import (
     CapacityPoolUpsertRequest,
     CapacityResponse,
     CellUpsertRequest,
+    ChildWorkloadSubmitRequest,
     DagSubmitRequest,
     DagSubmitResponse,
     FleetApplyRequest,
@@ -261,10 +264,15 @@ def create_app(
         )
     registry = metrics_registry or CollectorRegistry(auto_describe=True)
     metrics = metrics or EyvanMetrics(registry=registry)
+    workload_capability: WorkloadCapabilitySigner | None = None
     if artifact_access is None:
         if settings.artifact_token_ttl_s <= 0:
             raise ValueError("EYVAN_ARTIFACT_TOKEN_TTL_S must be positive")
         token_key = _artifact_token_key(settings)
+        # The same deployment secret, a different capability. Audience
+        # separation lives in the signed version prefix rather than in a second
+        # key an operator would have to rotate in step with the first.
+        workload_capability = WorkloadCapabilitySigner(token_key)
         artifact_access = ManagedArtifactAccess(
             store=managed_artifact_store_from_uri(settings.artifact_store_uri),
             signer=ArtifactTokenSigner(
@@ -336,6 +344,7 @@ def create_app(
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for
+    app.state.workload_capability = workload_capability
     app.state.metrics = metrics
     app.state.metrics_registry = registry
     app.state.controller = controller
@@ -1267,6 +1276,47 @@ def create_app(
 
     # response_model=None: the page is a plain JSON document whose record shape
     # LogRecord already defines; a response model would restate it.
+    @app.post(
+        "/api/v1/workloads/{workload_id}/children",
+        response_model=WorkloadRecord,
+        status_code=201,
+        tags=["workloads"],
+        include_in_schema=False,
+    )
+    async def submit_child_workload(
+        workload_id: str,
+        request: ChildWorkloadSubmitRequest,
+        token: tp.Annotated[str, Header(alias="X-Eyvan-Workload-Token", min_length=1)],
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+    ) -> WorkloadRecord:
+        """Submit a child workload on a running job's own authority.
+
+        A new header rather than reusing ``X-Eyvan-Artifact-Token``: a redaction
+        rule written for one header cannot be assumed to cover another, and a
+        submit capability appearing in a log because a proxy only knew about the
+        artifact one is the kind of leak nobody notices.
+
+        Not a second authentication path on ``POST /workloads`` either. That
+        would mean either synthesizing a ``Principal`` -- inventing a grant no
+        identity provider issued -- or duplicating the authorization decision
+        inside the most security-sensitive route in the package.
+        """
+
+        if workload_capability is None:
+            raise ConflictError("in-job submission requires a configured artifact token key")
+        async with repository.transaction() as transaction:
+            parent = await transaction.get_workload(workload_id)
+        if parent is None:
+            raise NotFoundError(f"workload {workload_id!r} was not found")
+        try:
+            workload_capability.verify(token, workload_id=workload_id, generation=parent.generation)
+        except InvalidCapabilityToken as exc:
+            raise AuthorizationError("invalid workload capability") from exc
+        child, _replayed = await service.submit_child_workload(
+            parent=parent, spec=request.spec, idempotency_key=idempotency_key
+        )
+        return child
+
     @app.get("/api/v1/workloads/{workload_id}/log-page", tags=["workloads"], response_model=None)
     async def workload_log_page(
         workload_id: str,

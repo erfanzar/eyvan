@@ -880,6 +880,13 @@ class WorkloadDefinition(EyvanModel):
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
     max_retries: int = Field(default=0, ge=0, le=100)
     max_failure_retries: int = Field(default=0, ge=0, le=100)
+    #: Whether this workload receives a capability to submit children of its own.
+    #: Off by default: a job that does not fan out should not be handed a
+    #: credential it cannot use, and a credential nobody asked for is one nobody
+    #: is watching. The gang path issues one token for the attempt, so every rank
+    #: receives the same one -- deciding which rank may use it is the SDK's job,
+    #: not the token's.
+    can_submit_children: bool = False
     cell_group_count: int = Field(default=1, ge=1, le=10_000)
     worker_count: int = Field(default=1, ge=1, le=10_000, strict=True)
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL

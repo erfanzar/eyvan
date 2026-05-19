@@ -131,6 +131,7 @@ EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/artifacts/results/{result_id}": "capability token, not a principal",
     "PUT /api/v1/artifacts/results/{result_id}/content": "capability token, not a principal",
     "POST /api/v1/workloads/{workload_id}/progress-reports": "capability token, not a principal",
+    "POST /api/v1/workloads/{workload_id}/children": "workload capability token, not a principal",
 }
 
 ROUTE_CLASSIFICATION = {**CROSS_TENANT_ROUTES, **FLEET_ONLY_ROUTES, **EXEMPT_ROUTES}

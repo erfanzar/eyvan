@@ -313,3 +313,268 @@ def test_a_verified_capability_round_trips_through_the_shared_encoding() -> None
     assert raw["workload_id"] == "wl-9"
     assert raw["generation"] == 7
     assert raw["expires_at"] is None
+
+
+# --------------------------------------------------------------------------- the route
+
+
+def _plane(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    app = create_app(
+        settings=EyvanSettings(
+            dev_auth_enabled=True,
+            artifact_token_key="k" * 32,
+            artifact_store_uri=str(tmp_path / "artifacts"),
+        )
+    )
+    return TestClient(app), app
+
+
+def _submit_parent(client, *, can_submit_children: bool = True) -> dict:
+    response = client.post(
+        "/api/v1/workloads",
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "spec": {
+                "name": "launcher",
+                "execution": {"kind": "command", "command": "python launch.py"},
+                "can_submit_children": can_submit_children,
+            },
+        },
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+            "Idempotency-Key": "parent",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _child_spec() -> dict:
+    return {"spec": {"name": "step", "execution": {"kind": "command", "command": "python step.py"}}}
+
+
+def test_a_running_job_submits_a_child_on_its_own_authority(tmp_path) -> None:
+    """The capability that did not exist: fanning out without a human's token."""
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    capability = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"]
+    )
+
+    response = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": capability, "Idempotency-Key": "step-1"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["parent_workload_id"] == parent["id"]
+
+
+def test_a_child_belongs_to_its_parents_owner_not_to_the_workload(tmp_path) -> None:
+    """The detail that decides whether fan-out escapes quota.
+
+    ``QuotaRecord`` supports a per-principal scope and fair share leaves on
+    ``created_by``. A synthetic ``workload:wl-x`` subject would create a fresh
+    leaf and a fresh quota scope, so a launcher could outrun the limit its owner
+    is subject to simply by submitting children.
+    """
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    capability = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"]
+    )
+
+    child = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": capability, "Idempotency-Key": "step-1"},
+    ).json()
+
+    assert child["created_by"] == parent["created_by"] == "alice"
+
+
+def test_a_workload_without_the_opt_in_cannot_submit(tmp_path) -> None:
+    """A job that does not fan out should not hold a usable credential."""
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client, can_submit_children=False)
+    capability = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"]
+    )
+
+    response = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": capability, "Idempotency-Key": "step-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_a_capability_from_a_superseded_attempt_is_refused_at_the_route(tmp_path) -> None:
+    """The revocation, end to end rather than at the signer alone."""
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    stale = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"] + 1
+    )
+
+    response = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": stale, "Idempotency-Key": "step-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_one_jobs_capability_cannot_submit_under_another(tmp_path) -> None:
+    """Otherwise any running job could place work in any other job's tree."""
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    other = app.state.workload_capability.issue(
+        workload_id="wl-someone-else", org_id="acme", project_id="research", generation=1
+    )
+
+    response = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": other, "Idempotency-Key": "step-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_sibling_launchers_do_not_collide_on_a_natural_key(tmp_path) -> None:
+    """A launcher's natural key is a step number, and every launcher has step 1.
+
+    Two parents both submitting "step-1" must get two children. Without scoping
+    the key to the parent, the second call replays the first one's record and
+    returns a handle to a job the caller never submitted.
+    """
+
+    client, app = _plane(tmp_path)
+    first = _submit_parent(client)
+    second = client.post(
+        "/api/v1/workloads",
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "spec": {
+                "name": "launcher-2",
+                "execution": {"kind": "command", "command": "python launch.py"},
+                "can_submit_children": True,
+            },
+        },
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+            "Idempotency-Key": "parent-2",
+        },
+    ).json()
+
+    children = []
+    for parent in (first, second):
+        capability = app.state.workload_capability.issue(
+            workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"]
+        )
+        response = client.post(
+            f"/api/v1/workloads/{parent['id']}/children",
+            json=_child_spec(),
+            headers={"X-Eyvan-Workload-Token": capability, "Idempotency-Key": "step-1"},
+        )
+        assert response.status_code == 201, response.text
+        children.append(response.json())
+
+    assert children[0]["id"] != children[1]["id"]
+    assert children[0]["parent_workload_id"] != children[1]["parent_workload_id"]
+
+
+def test_a_retried_submission_returns_the_same_child(tmp_path) -> None:
+    """A launcher that crashes mid-fan-out re-runs its loop."""
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    capability = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=parent["generation"]
+    )
+    headers = {"X-Eyvan-Workload-Token": capability, "Idempotency-Key": "step-1"}
+
+    first = client.post(f"/api/v1/workloads/{parent['id']}/children", json=_child_spec(), headers=headers)
+    second = client.post(f"/api/v1/workloads/{parent['id']}/children", json=_child_spec(), headers=headers)
+
+    assert first.json()["id"] == second.json()["id"]
+
+
+def test_a_forged_capability_is_refused(tmp_path) -> None:
+    """The signature check at the boundary, not only in the signer's own tests."""
+
+    client, _app = _plane(tmp_path)
+    parent = _submit_parent(client)
+
+    response = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": "eyvw1.forged.signature", "Idempotency-Key": "step-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_a_token_stops_working_when_the_parent_is_retried(tmp_path) -> None:
+    """Generation pinning, on a parent whose generation has actually moved.
+
+    Every other test here uses a parent at generation 1, where pinning to the
+    live generation and hardcoding 1 are indistinguishable. This is the case
+    that separates them, and it is the case the design exists for: a retry
+    replaces the attempt, and the credential the dead attempt was holding must
+    stop working immediately rather than at some expiry.
+    """
+
+    import asyncio
+
+    client, app = _plane(tmp_path)
+    parent = _submit_parent(client)
+    stale = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=1
+    )
+
+    async def retry() -> None:
+        async with app.state.service.repository.transaction() as transaction:
+            stored = await transaction.get_workload(parent["id"])
+            await transaction.put_workload(stored.model_copy(update={"generation": 2}))
+
+    asyncio.run(retry())
+
+    refused = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": stale, "Idempotency-Key": "step-1"},
+    )
+    assert refused.status_code == 403, "a credential from the dead attempt still worked"
+
+    reissued = app.state.workload_capability.issue(
+        workload_id=parent["id"], org_id="acme", project_id="research", generation=2
+    )
+    accepted = client.post(
+        f"/api/v1/workloads/{parent['id']}/children",
+        json=_child_spec(),
+        headers={"X-Eyvan-Workload-Token": reissued, "Idempotency-Key": "step-1"},
+    )
+    assert accepted.status_code == 201, accepted.text
