@@ -18,6 +18,7 @@ from datetime import datetime
 
 from eyvan._internal.observability import EyvanMetrics
 from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.audit import CapacityLifecycleLogger
 from eyvan.config import EyvanSettings
 from eyvan.records import (
@@ -59,6 +60,7 @@ class _ControllerLifecycle:
         agent_factory: tp.Callable[[CellRecord], CellAgentClient] | None = None,
         metrics: EyvanMetrics | None = None,
         artifact_access: ManagedArtifactAccess | None = None,
+        workload_capability: WorkloadCapabilitySigner | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -79,6 +81,7 @@ class _ControllerLifecycle:
         self._cell_capacity_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self.metrics = metrics
         self.artifact_access = artifact_access
+        self.workload_capability = workload_capability
         self._capacity_lifecycle = CapacityLifecycleLogger(logger)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:

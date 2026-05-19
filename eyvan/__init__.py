@@ -23,6 +23,7 @@ if tp.TYPE_CHECKING:
         execute,
         init,
     )
+    from eyvan.worker.runtime.in_job import in_job_context, submit_child
     from eyvan.worker.runtime.progress import report_progress
 
 __all__ = (
@@ -40,8 +41,10 @@ __all__ = (
     "GpuConfig",
     "TpuConfig",
     "execute",
+    "in_job_context",
     "init",
     "report_progress",
+    "submit_child",
 )
 from eyvan._version import __version__
 
@@ -123,6 +126,12 @@ def __getattr__(name: str):
         from eyvan.sdk.execution import init
 
         return _cache_export(name, init)
+    if name in {"in_job_context", "submit_child"}:
+        # Same reasoning as report_progress: this runs *inside* the job, so it
+        # must not drag the client in behind it.
+        from eyvan.worker.runtime import in_job
+
+        return _cache_export(name, getattr(in_job, name))
     if name == "report_progress":
         # Not from the SDK: this one runs *inside* the job, which is the path the
         # rest of this table exists to keep free of the client and its optional

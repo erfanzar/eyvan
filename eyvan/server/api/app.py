@@ -296,6 +296,7 @@ def create_app(
         leader=leader,
         metrics=metrics,
         artifact_access=artifact_access,
+        workload_capability=workload_capability,
     )
     workload_progress = WorkloadProgressResolver(service, repository)
 

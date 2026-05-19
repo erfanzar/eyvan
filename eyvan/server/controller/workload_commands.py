@@ -164,6 +164,17 @@ class _ControllerWorkloadCommands:
         parts.append("--")
         return " ".join(shlex.quote(part) for part in parts) + " " + command, environment
 
+    def _children_url(self, workload: WorkloadRecord) -> str:
+        """Return the address a job posts its children to.
+
+        Built here for the same reason the progress URL is: a job should receive
+        a complete address rather than a base URL plus the knowledge of how to
+        assemble one, which would be a second place for the route to be spelled.
+        """
+
+        base = "" if self.artifact_access is None else self.artifact_access.public_url
+        return f"{base}/api/v1/workloads/{workload.id}/children"
+
     def _render_execution(
         self,
         workload: WorkloadRecord,
@@ -185,6 +196,19 @@ class _ControllerWorkloadCommands:
             "EYVAN_ATTEMPT": str(workload.attempt),
             "EYVAN_RESUME_CHECKPOINT_URI": workload.checkpoint_uri or "",
         }
+        if workload.spec.can_submit_children and self.workload_capability is not None:
+            # Beside the workload identity rather than inside the managed-result
+            # block: a command workload fans out too, and only callables get a
+            # managed result. The credential is issued per attempt, pinned to
+            # this generation, so a retry's dispatch mints a new one and the
+            # dead attempt's stops working.
+            environment["EYVAN_WORKLOAD_TOKEN"] = self.workload_capability.issue(
+                workload_id=workload.id,
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                generation=workload.generation,
+            )
+            environment["EYVAN_CHILDREN_URL"] = self._children_url(workload)
         execution = workload.spec.execution
         if execution.kind == "command":
             # A workspace belongs to the workload, not to one execution kind, so

@@ -578,3 +578,294 @@ def test_a_token_stops_working_when_the_parent_is_retried(tmp_path) -> None:
         headers={"X-Eyvan-Workload-Token": reissued, "Idempotency-Key": "step-1"},
     )
     assert accepted.status_code == 201, accepted.text
+
+
+# --------------------------------------------------------------------------- delivery
+
+
+async def test_a_capable_workload_receives_its_credential_at_dispatch(tmp_path) -> None:
+    """The seam that makes the route reachable from inside a job.
+
+    Without it the capability is mintable, the route accepts it, and no running
+    job has ever seen one.
+    """
+
+    from test_controller import FakeAgent, principal
+
+    from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
+    from eyvan.artifacts.transfers import ManagedArtifactAccess
+    from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CellRecord, CellState, CommandExecution, ResourceVector, Role, WorkloadDefinition
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    signer = WorkloadCapabilitySigner(SECRET)
+    fake_agent = FakeAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: fake_agent,
+        artifact_access=ManagedArtifactAccess(
+            store=LocalManagedArtifactStore(tmp_path / "artifacts"),
+            signer=ArtifactTokenSigner(SECRET, default_ttl_seconds=3600, max_ttl_seconds=3600),
+            public_url="https://eyvan.test",
+            token_ttl_seconds=3600,
+        ),
+        workload_capability=signer,
+    )
+    await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        CellRecord(
+            id="cell-a",
+            provider="local",
+            region="local",
+            state=CellState.REGISTERING,
+            capacity=ResourceVector(cpu=8, memory_gib=64),
+            allocatable=ResourceVector(cpu=8, memory_gib=64),
+            endpoint="http://agent:8090",
+        ),
+        idempotency_key="cell",
+    )
+    assert await controller.dispatch_outbox_once() == 1
+    workload, _ = await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="launcher",
+            execution=CommandExecution(command="python launch.py"),
+            can_submit_children=True,
+        ),
+        idempotency_key="launcher",
+    )
+    await controller.reconcile_once()
+    assert await controller.dispatch_outbox_once() == 1
+
+    environment = fake_agent.submissions[0][1].spec["environment"]
+
+    assert environment["EYVAN_CHILDREN_URL"].endswith(f"/api/v1/workloads/{workload.id}/children")
+    signer.verify(environment["EYVAN_WORKLOAD_TOKEN"], workload_id=workload.id, generation=workload.generation)
+
+
+async def test_a_workload_that_did_not_ask_receives_no_credential(tmp_path) -> None:
+    """A credential nobody asked for is one nobody is watching."""
+
+    from test_controller import FakeAgent, principal
+
+    from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CellRecord, CellState, CommandExecution, ResourceVector, Role, WorkloadDefinition
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    fake_agent = FakeAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: fake_agent,
+        workload_capability=WorkloadCapabilitySigner(SECRET),
+    )
+    await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        CellRecord(
+            id="cell-a",
+            provider="local",
+            region="local",
+            state=CellState.REGISTERING,
+            capacity=ResourceVector(cpu=8, memory_gib=64),
+            allocatable=ResourceVector(cpu=8, memory_gib=64),
+            endpoint="http://agent:8090",
+        ),
+        idempotency_key="cell",
+    )
+    assert await controller.dispatch_outbox_once() == 1
+    await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="plain", execution=CommandExecution(command="echo hi")),
+        idempotency_key="plain",
+    )
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+
+    environment = fake_agent.submissions[0][1].spec["environment"]
+
+    assert "EYVAN_WORKLOAD_TOKEN" not in environment
+    assert "EYVAN_CHILDREN_URL" not in environment
+
+
+# --------------------------------------------------------------------------- the in-job side
+
+
+def _job_environment(**overrides: str) -> dict[str, str]:
+    base = {
+        "EYVAN_WORKLOAD_ID": "wl-1",
+        "EYVAN_ATTEMPT": "2",
+        "EYVAN_CHILDREN_URL": "https://eyvan.test/api/v1/workloads/wl-1/children",
+        "EYVAN_WORKLOAD_TOKEN": "token-value",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_a_job_outside_eyvan_has_no_context() -> None:
+    """The same callable has to run on a laptop.
+
+    ``None`` rather than an exception makes detection the caller's branch rather
+    than a failure mode they must catch.
+    """
+
+    from eyvan.worker.runtime.in_job import in_job_context
+
+    assert in_job_context({}) is None
+
+
+def test_a_capable_job_reads_its_own_identity() -> None:
+    """Everything the launcher needs, from the environment it was handed."""
+
+    from eyvan.worker.runtime.in_job import in_job_context
+
+    context = in_job_context(_job_environment(EYVAN_DISTRIBUTED_PROCESS_ID="3"))
+
+    assert context is not None
+    assert (context.workload_id, context.attempt, context.rank) == ("wl-1", 2, 3)
+    assert context.is_coordinator is False
+
+
+def test_the_coordinator_is_the_slice_rank_not_the_replica_index() -> None:
+    """``EYVAN_REPLICA_INDEX`` is 0 on every workload and would make every rank one."""
+
+    from eyvan.worker.runtime.in_job import in_job_context
+
+    context = in_job_context(_job_environment(EYVAN_REPLICA_INDEX="0", EYVAN_DISTRIBUTED_PROCESS_ID="2"))
+
+    assert context is not None
+    assert context.is_coordinator is False
+
+
+def test_a_non_coordinator_rank_raises_rather_than_silently_doing_nothing() -> None:
+    """A no-op returning ``None`` where a job handle is expected is the worse failure.
+
+    The launcher would carry on believing it had fanned out, and the missing
+    work would surface only as a result that never arrives.
+    """
+
+    from eyvan.worker.runtime.in_job import NotRunningUnderEyvan, submit_child
+
+    with pytest.raises(NotRunningUnderEyvan, match="all_ranks"):
+        submit_child(
+            {"name": "child"},
+            idempotency_key="step-1",
+            environment=_job_environment(EYVAN_DISTRIBUTED_PROCESS_ID="1"),
+        )
+
+
+def test_submitting_outside_a_job_says_what_is_missing() -> None:
+    """An error naming the opt-in is the difference between a fix and a search."""
+
+    from eyvan.worker.runtime.in_job import NotRunningUnderEyvan, submit_child
+
+    with pytest.raises(NotRunningUnderEyvan, match="can_submit_children"):
+        submit_child({"name": "child"}, idempotency_key="step-1", environment={})
+
+
+def test_the_in_job_module_does_not_import_the_client() -> None:
+    """A launcher on a TPU worker should not pay for httpx to post one document."""
+
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys, eyvan; eyvan.submit_child; print('eyvan.sdk' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "False"
+
+
+async def test_the_delivered_credential_is_pinned_to_the_live_generation(tmp_path) -> None:
+    """Dispatch must mint for the attempt it is dispatching, not for attempt one.
+
+    This is the third time in this work that a fixture sitting at generation 1
+    made "pin to the live generation" and "hardcode 1" indistinguishable. The
+    parent here is bumped before dispatch so the two answers differ, which is
+    exactly the situation a retry produces: the dispatch that follows a retry
+    must hand the new attempt a credential the *old* attempt's token cannot
+    impersonate.
+    """
+
+    from test_controller import FakeAgent, principal
+
+    from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CellRecord, CellState, CommandExecution, ResourceVector, Role, WorkloadDefinition
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    signer = WorkloadCapabilitySigner(SECRET)
+    fake_agent = FakeAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: fake_agent,
+        workload_capability=signer,
+    )
+    await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        CellRecord(
+            id="cell-a",
+            provider="local",
+            region="local",
+            state=CellState.REGISTERING,
+            capacity=ResourceVector(cpu=8, memory_gib=64),
+            allocatable=ResourceVector(cpu=8, memory_gib=64),
+            endpoint="http://agent:8090",
+        ),
+        idempotency_key="cell",
+    )
+    assert await controller.dispatch_outbox_once() == 1
+    workload, _ = await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="launcher",
+            execution=CommandExecution(command="python launch.py"),
+            can_submit_children=True,
+        ),
+        idempotency_key="launcher",
+    )
+    # The workload has already been retried once by the time it is dispatched.
+    async with repository.transaction() as transaction:
+        stored = await transaction.get_workload(workload.id)
+        await transaction.put_workload(stored.model_copy(update={"generation": 4}))
+
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+
+    environment = fake_agent.submissions[0][1].spec["environment"]
+    token = environment["EYVAN_WORKLOAD_TOKEN"]
+
+    # Verifies at 4, and does not verify at 1.
+    signer.verify(token, workload_id=workload.id, generation=4)
+    with pytest.raises(InvalidWorkloadToken):
+        signer.verify(token, workload_id=workload.id, generation=1)
