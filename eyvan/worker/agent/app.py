@@ -29,6 +29,7 @@ from eyvan.worker.agent.models import (
     CapacityProviderFailure,
     CapacityRequest,
     CheckpointRequest,
+    ExecRequest,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationConflictCode,
@@ -266,6 +267,17 @@ def create_agent_app(
 
     # response_model=None: the page is a plain JSON document, and building a
     # response model for it would restate LogRecord's own wire shape.
+    # response_model=None: the result is backend-shaped JSON.
+    @app.post(
+        "/api/v1/cells/{cell_id}/workloads/{remote_id}/exec",
+        dependencies=[Depends(authenticate)],
+        response_model=None,
+    )
+    def exec_in_workload(cell_id: str, remote_id: str, body: ExecRequest) -> JsonObject:
+        """Run one diagnostic command beside a live workload."""
+
+        return service.exec_in_workload(cell_id, remote_id, body.command, timeout_s=body.timeout_s)
+
     @app.get(
         "/api/v1/cells/{cell_id}/workloads/{remote_id}/log-page",
         dependencies=[Depends(authenticate)],

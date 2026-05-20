@@ -1390,6 +1390,82 @@ class SystemdTransientServiceExecutor:
             raise SystemdLogsUnavailableError(unit_name, result.stderr.strip())
         return result.stdout
 
+    def exec_in_workload(
+        self,
+        remote_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float,
+    ) -> JsonObject:
+        """Run one diagnostic command beside a live workload and return its output.
+
+        **Beside, not inside.** The exec'd process is its own transient unit,
+        not a shell in the workload's cgroup, and the difference matters twice:
+        a process inside that cgroup competes for the memory allocation the
+        trainer is sized against, and its death can take the trainer down with
+        it. A diagnostic that can kill the job it is diagnosing is not one.
+
+        **Not a PTY.** An interactive session needs a bidirectional long-lived
+        socket through five synchronous hops, and ``MutationContext`` has no
+        representation for a *session* -- so a stale controller could hold a
+        shell on a cell whose lease was revoked. One command, one result.
+
+        The source job's identity travels in the environment so a tool can
+        target it: ``process_status`` already exposes the control group and the
+        PIDs, which is what makes ``py-spy dump --pid`` useful from out here.
+        """
+
+        arguments = [str(part) for part in command]
+        if not arguments:
+            raise ValueError("exec requires a command")
+        record_path = self._record_path(remote_id)
+        with _file_lock(_record_lock_path(record_path)):
+            source = _load_json(record_path)
+        if source is None:
+            raise RuntimeError(f"systemd execution {remote_id!r} is absent")
+        unit_name = source.get("unit_name")
+        inherited = source.get("environment")
+        source_environment = (
+            {name: value for name, value in (inherited or {}).items() if isinstance(value, str)}
+            if isinstance(inherited, dict)
+            else {}
+        )
+        # Same filter the checkpoint hook applies, for the same reason: the
+        # source workload is still running, so inheriting its coordinator
+        # address would make this process try to join a cluster it is only
+        # meant to look at.
+        environment = without_distributed_topology_overrides(source_environment)
+        environment["EYVAN_SOURCE_JOB_ID"] = remote_id
+        control_group = source.get("control_group")
+        if isinstance(control_group, str) and control_group:
+            environment["EYVAN_SOURCE_CONTROL_GROUP"] = control_group
+        # The environment and the deadline travel inside the systemd-run
+        # invocation rather than as runner arguments: systemd owns the unit's
+        # lifetime, so a bound it enforces survives this process dying, while a
+        # subprocess timeout here would leave the unit running with nobody
+        # waiting for it.
+        invocation = [
+            "systemd-run",
+            "--quiet",
+            "--pipe",
+            "--collect",
+            "--wait",
+            f"--property=RuntimeMaxSec={max(1, int(timeout_s))}",
+        ]
+        invocation.extend(f"--setenv={name}={value}" for name, value in sorted(environment.items()))
+        invocation.append("--")
+        invocation.extend(arguments)
+        result = self._run(tuple(invocation))
+        document: JsonObject = {
+            "remote_id": remote_id,
+            "unit_name": unit_name if isinstance(unit_name, str) else None,
+            "command": arguments,
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+        return document
+
     def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
         """Return one resumable page of structured journal records.
 

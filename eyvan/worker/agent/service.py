@@ -43,6 +43,7 @@ from eyvan.worker.agent.models import (
     WorkloadRequest,
 )
 from eyvan.worker.runtime.registry import (
+    ExecCapableExecutionDriver,
     IntrospectableExecutionDriver,
     NativeGangCell,
     StructuredLogExecutionDriver,
@@ -686,6 +687,37 @@ class CellAgentService:
 
     def logs(self, cell_id: str, remote_id: str) -> str:
         return self._executor(cell_id).logs(remote_id)
+
+    def exec_in_workload(
+        self,
+        cell_id: str,
+        remote_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float = 30.0,
+    ) -> JsonObject:
+        """Run one diagnostic command beside a live workload.
+
+        Two gates, answering different questions. ``supports_exec`` on the
+        *capacity* driver is the operator's admission decision -- may anyone do
+        this on this fleet. ``ExecCapableExecutionDriver`` is whether this
+        execution backend can do it at all. A backend that can but is not
+        permitted, and one that is permitted but cannot, are different
+        misconfigurations and get different messages.
+        """
+
+        if not self.capacity.capabilities().supports_exec:
+            raise UnsupportedCapabilityError(
+                "this fleet does not permit exec; set supports_exec on the capacity backend to allow it"
+            )
+        executor = self._executor(cell_id)
+        if not isinstance(executor, ExecCapableExecutionDriver):
+            raise UnsupportedCapabilityError(
+                f"execution backend {self.execution_backend!r} cannot exec beside a workload"
+            )
+        if not command:
+            raise InvalidWorkloadRequestError("exec requires a command")
+        return executor.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
 
     def log_page(self, cell_id: str, remote_id: str, *, after: str = "", limit: int = 200) -> JsonObject:
         """Return one resumable page of structured log records.

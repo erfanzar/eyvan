@@ -171,6 +171,21 @@ class CheckpointRequest(WorkloadMutationRequest):
     output_uri: str | None = None
 
 
+class ExecRequest(AgentModel):
+    """One diagnostic command to run beside a live workload.
+
+    A list of arguments, never a shell string. A string would be split by a
+    shell on the host, which turns a diagnostic into an injection surface the
+    moment any part of it is templated.
+    """
+
+    command: tuple[str, ...] = Field(min_length=1)
+    #: Enforced by systemd as the unit's RuntimeMaxSec, so the bound survives
+    #: this agent dying -- a subprocess timeout would leave the unit running
+    #: with nobody waiting for it.
+    timeout_s: float = Field(default=30.0, gt=0, le=600)
+
+
 class AgentObservation(AgentModel):
     cell_id: str
     state: CapacityStatus

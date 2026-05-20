@@ -57,6 +57,7 @@ from eyvan.sdk.contexts import (
 )
 from eyvan.server.local.daemon import ensure_loopback_control_plane
 from eyvan.worker.runtime.callables import dump_callable
+from eyvan.worker.runtime.in_job import in_job_context
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
@@ -185,7 +186,13 @@ def init(
     runtime_profile = _configured_gcp_runtime_profile(endpoint)
     if runtime_profile is not None:
         _validate_native_gcp_artifact_override(configured_artifact_uri, artifact_store)
-    if requires_default_client and endpoint.is_loopback:
+    # Not inside a job. ``init()`` running on a TPU worker would otherwise try
+    # to *start a control plane there*: the default base URL is loopback, and
+    # loopback plus "no client configured" is the local-development signal. A
+    # job already has a control plane -- the one that dispatched it -- and
+    # starting a second one on a worker would fight for the state directory and
+    # answer with an empty fleet.
+    if requires_default_client and endpoint.is_loopback and in_job_context(environment) is None:
         runtime_profile = _prepared_gcp_runtime_profile(endpoint, runtime_profile)
         if runtime_profile is None:
             ensure_loopback_control_plane(endpoint)
