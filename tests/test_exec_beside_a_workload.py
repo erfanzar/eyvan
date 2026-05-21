@@ -359,3 +359,280 @@ def test_init_still_starts_a_control_plane_on_a_laptop(monkeypatch) -> None:
     execution.init(environ={})
 
     assert started, "init stopped starting the local control plane"
+
+
+# --------------------------------------------------------------------------- the control plane
+
+
+class _RankAgent:
+    """An agent that records which cell it was asked to exec on."""
+
+    def __init__(self, *, fail_on: str | None = None) -> None:
+        self.asked: list[tuple[str, tuple[str, ...]]] = []
+        self.fail_on = fail_on
+
+    def exec_in_workload(self, cell_id, remote_id, command, *, timeout_s=30.0):
+        del remote_id, timeout_s
+        self.asked.append((cell_id, tuple(command)))
+        if cell_id == self.fail_on:
+            raise RuntimeError("agent unreachable")
+        return {"exit_code": 0, "stdout": f"from {cell_id}", "stderr": ""}
+
+
+async def _gang(agent):
+    """A two-cell gang, which is the shape rank fan-out exists for."""
+
+    from datetime import timedelta
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import (
+        CellRecord,
+        CellState,
+        CommandExecution,
+        LeaseRecord,
+        LeaseState,
+        ResourceGang,
+        ResourceVector,
+        WorkloadDefinition,
+        WorkloadRecord,
+        WorkloadState,
+        utcnow,
+    )
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    controller = EyvanController(
+        repository,
+        ControlPlaneService(repository, scheduler=CoreSchedulingService()),
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: agent,
+    )
+    async with repository.transaction() as transaction:
+        for index, cell_id in enumerate(("cell-a", "cell-b")):
+            await transaction.put_cell(
+                CellRecord(
+                    id=cell_id,
+                    provider="local",
+                    region="local",
+                    state=CellState.READY,
+                    capacity=ResourceVector(cpu=8),
+                    allocatable=ResourceVector(cpu=8),
+                    endpoint="http://agent:8090",
+                )
+            )
+            await transaction.put_lease(
+                LeaseRecord(
+                    id=f"lease-{index}",
+                    workload_id="wl-gang",
+                    cell_id=cell_id,
+                    org_id="acme",
+                    project_id="research",
+                    state=LeaseState.ACTIVE,
+                    resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0)),
+                    generation=1,
+                    fencing_token=f"token-{index}",
+                    expires_at=utcnow() + timedelta(hours=24),
+                )
+            )
+        await transaction.put_workload(
+            WorkloadRecord(
+                id="wl-gang",
+                org_id="acme",
+                project_id="research",
+                spec=WorkloadDefinition(name="t", execution=CommandExecution(command="python train.py")),
+                state=WorkloadState.RUNNING,
+                lease_id="lease-0",
+                lease_ids=["lease-0", "lease-1"],
+                remote_id="remote-1",
+                created_by="alice",
+            )
+        )
+    return controller
+
+
+async def test_exec_reaches_every_rank_by_default() -> None:
+    """One rank cannot distinguish a hung collective from a slow step."""
+
+    agent = _RankAgent()
+    controller = await _gang(agent)
+
+    result = await controller.workload_exec("wl-gang", ["py-spy", "dump"])
+
+    assert [cell for cell, _command in agent.asked] == ["cell-a", "cell-b"]
+    assert [entry["rank"] for entry in result["results"]] == [0, 1]
+
+
+async def test_one_unreachable_rank_does_not_lose_the_others() -> None:
+    """A result set missing the rank you wanted is still better than an exception.
+
+    The failure is reported beside the ranks that answered rather than replacing
+    them.
+    """
+
+    agent = _RankAgent(fail_on="cell-b")
+    controller = await _gang(agent)
+
+    result = await controller.workload_exec("wl-gang", ["true"])
+
+    assert result["results"][0]["stdout"] == "from cell-a"
+    assert "unreachable" in result["results"][1]["error"]
+
+
+async def test_a_named_rank_narrows_the_fan_out() -> None:
+    """Once the answer is known, asking one host is the cheaper question."""
+
+    agent = _RankAgent()
+    controller = await _gang(agent)
+
+    result = await controller.workload_exec("wl-gang", ["true"], rank=1)
+
+    assert [cell for cell, _command in agent.asked] == ["cell-b"]
+    assert [entry["rank"] for entry in result["results"]] == [1]
+
+
+async def test_a_rank_that_does_not_exist_is_refused() -> None:
+    """An empty result set would read as a workload that answered nothing."""
+
+    from eyvan.server.service.errors import ConflictError
+
+    controller = await _gang(_RankAgent())
+
+    with pytest.raises(ConflictError, match="no rank 7"):
+        await controller.workload_exec("wl-gang", ["true"], rank=7)
+
+
+async def test_exec_against_a_workload_with_no_execution_is_refused() -> None:
+    """Queued work has no host to run a diagnostic on."""
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.errors import ConflictError
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    controller = EyvanController(
+        repository,
+        ControlPlaneService(repository, scheduler=CoreSchedulingService()),
+        settings=EyvanSettings(),
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(
+            WorkloadRecord(
+                id="wl-pending",
+                org_id="acme",
+                project_id="research",
+                spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                created_by="alice",
+            )
+        )
+
+    with pytest.raises(ConflictError, match="not running"):
+        await controller.workload_exec("wl-pending", ["true"])
+
+
+def test_a_viewer_cannot_run_commands_on_the_fleet(tmp_path) -> None:
+    """OPERATE, not READ: this starts a process on a host running someone's job.
+
+    It is not a mutation of the workload, and it is not an observation either.
+    Treating it as one would let read-only access execute code on the fleet.
+    """
+
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.api.app import create_app
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key="k" * 32))
+
+    async def store():
+        async with app.state.service.repository.transaction() as transaction:
+            await transaction.put_workload(
+                WorkloadRecord(
+                    id="wl-1",
+                    org_id="acme",
+                    project_id="research",
+                    spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                    created_by="alice",
+                )
+            )
+
+    asyncio.run(store())
+
+    def attempt(role: str):
+        return TestClient(app).post(
+            "/api/v1/workloads/wl-1/exec",
+            json={"command": ["id"]},
+            headers={
+                "X-Eyvan-User": "bob",
+                "X-Eyvan-Roles": role,
+                "X-Eyvan-Org": "acme",
+                "X-Eyvan-Project": "research",
+            },
+        )
+
+    viewer, operator = attempt("viewer"), attempt("operator")
+
+    assert viewer.status_code == 403
+    assert "operate" in viewer.json()["detail"]
+    # The operator gets *past* authorization, which is what makes this a test of
+    # the gate rather than of something else refusing first: 409 is the workload
+    # having no cell, not a permission answer.
+    assert operator.status_code == 409
+
+
+def test_exec_on_a_workload_whose_lease_is_gone_is_a_conflict_not_a_crash(tmp_path) -> None:
+    """A terminal workload keeps its remote id and loses its lease.
+
+    "Has a remote id" is therefore not "is still somewhere", and letting the
+    internal staleness error escape turned an ordinary race -- the job finished
+    between the read and the exec -- into a 500.
+    """
+
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
+    from eyvan.server.api.app import create_app
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key="k" * 32))
+
+    async def store():
+        async with app.state.service.repository.transaction() as transaction:
+            await transaction.put_workload(
+                WorkloadRecord(
+                    id="wl-1",
+                    org_id="acme",
+                    project_id="research",
+                    spec=WorkloadDefinition(name="t", execution=CommandExecution(command="echo hi")),
+                    state=WorkloadState.RUNNING,
+                    remote_id="remote-1",
+                    created_by="alice",
+                )
+            )
+
+    asyncio.run(store())
+
+    response = TestClient(app).post(
+        "/api/v1/workloads/wl-1/exec",
+        json={"command": ["id"]},
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "no longer holds a cell" in response.json()["detail"]

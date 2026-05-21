@@ -304,6 +304,26 @@ class CellAgentClient:
         )
         return response.text
 
+    def exec_in_workload(
+        self,
+        cell_id: str,
+        remote_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float = 30.0,
+    ) -> JsonObject:
+        """Run one diagnostic command beside a live workload on one cell."""
+
+        response = self._send(
+            "POST",
+            f"/api/v1/cells/{cell_id}/workloads/{remote_id}/exec",
+            json={"command": list(command), "timeout_s": timeout_s},
+        )
+        payload = response.json()
+        if not is_json_object(payload):
+            raise ValueError("cell agent exec result must be a JSON object")
+        return payload
+
     def log_page(self, cell_id: str, remote_id: str, *, after: str = "", limit: int = 200) -> JsonObject:
         """Read one resumable page of structured log records from one cell."""
 

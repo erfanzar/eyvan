@@ -112,6 +112,7 @@ from eyvan.server.api.schemas import (
     QuotaPutRequest,
     RoleGrantIssueRequest,
     WorkloadEstimateRequest,
+    WorkloadExecRequest,
     WorkloadSubmitRequest,
 )
 from eyvan.server.api.server_bind import ServerBindPolicy
@@ -1317,6 +1318,27 @@ def create_app(
             parent=parent, spec=request.spec, idempotency_key=idempotency_key
         )
         return child
+
+    # response_model=None: results are backend-shaped JSON per rank.
+    @app.post("/api/v1/workloads/{workload_id}/exec", tags=["workloads"], response_model=None)
+    async def workload_exec(
+        workload_id: str,
+        request: WorkloadExecRequest,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> JsonObject:
+        """Run one diagnostic command beside every rank of a running workload.
+
+        ``OPERATE`` rather than ``READ``: this starts a process on a host that
+        is running someone's job. It is not a mutation of the workload, but it
+        is not an observation either, and treating it as one would let a viewer
+        run commands on the fleet.
+        """
+
+        workload = await service.get_workload(principal, workload_id)
+        service.authorizer.require(principal, Permission.OPERATE, org_id=workload.org_id, project_id=workload.project_id)
+        return await controller.workload_exec(
+            workload_id, request.command, timeout_s=request.timeout_s, rank=request.rank
+        )
 
     @app.get("/api/v1/workloads/{workload_id}/log-page", tags=["workloads"], response_model=None)
     async def workload_log_page(

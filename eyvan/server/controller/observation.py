@@ -1185,6 +1185,66 @@ class _ControllerObservation:
             return LogPage(unavailable=True, detail="this attempt has no archived logs")
         return LogPage(records=tuple(records), detail="archived")
 
+    async def workload_exec(
+        self,
+        workload_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float = 30.0,
+        rank: int | None = None,
+    ) -> JsonObject:
+        """Run one diagnostic command beside every rank of a workload.
+
+        Fan-out is the default because the question exec answers is almost
+        always "which rank is stuck", and asking one rank cannot distinguish a
+        hung collective from a slow step. ``rank`` narrows it once the answer is
+        known.
+
+        One rank failing does not fail the call: a result set missing the rank
+        you most wanted to see is still more useful than an exception, and the
+        failure is reported in place beside the ranks that answered.
+        """
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+        if workload is None:
+            raise LookupError(f"workload {workload_id!r} does not exist")
+        if workload.remote_id is None:
+            raise ConflictError(f"workload {workload_id!r} is not running on any cell")
+        try:
+            members = await self._load_workload_members(workload)
+        except StaleOutboxCommand as exc:
+            # A terminal workload keeps its remote_id but loses its lease, so
+            # "has a remote id" is not "is still somewhere". Letting the
+            # internal staleness error escape turned an ordinary race -- the job
+            # finished between the read and the exec -- into a 500.
+            raise ConflictError(f"workload {workload_id!r} no longer holds a cell: {exc}") from exc
+        ordered = self._ordered_gang_member_pairs(members) if len(members) > 1 else tuple(members)
+        results: list[JsonObject] = []
+        for index, (_lease, cell) in enumerate(ordered):
+            if rank is not None and index != rank:
+                continue
+            try:
+                payload = await asyncio.to_thread(
+                    self._agent_factory(cell).exec_in_workload,
+                    cell.id,
+                    workload.remote_id,
+                    list(command),
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:
+                results.append({"rank": index, "cell_id": cell.id, "error": str(exc)})
+                continue
+            results.append({**payload, "rank": index, "cell_id": cell.id})
+        if rank is not None and not results:
+            raise ConflictError(f"workload {workload_id!r} has no rank {rank}")
+        document: JsonObject = {
+            "workload_id": workload_id,
+            "attempt": workload.attempt,
+            "results": list(results),
+        }
+        return document
+
     async def workload_process_status(self, workload_id: str) -> JsonObject:
         """Read live process detail for one workload attempt.
 

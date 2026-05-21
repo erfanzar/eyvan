@@ -396,6 +396,37 @@ def run_workload(
     )
 
 
+@click.command("exec")
+@click.argument("workload_id")
+@click.option("--rank", type=int, default=None, help="Run on one rank only. Omitted runs on every rank.")
+@click.option("--timeout", "timeout_s", type=float, default=30.0, show_default=True)
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+@click.pass_obj
+def exec_in_workload(
+    session: CliSession,
+    workload_id: str,
+    rank: int | None,
+    timeout_s: float,
+    command: tuple[str, ...],
+) -> None:
+    """Run COMMAND beside a running workload, on every rank by default.
+
+    Beside it, not inside its cgroup: a process there competes for the memory
+    the trainer is sized against, and its death can take the trainer with it.
+    Every rank by default because the question this answers is usually "which
+    rank is stuck", and one rank cannot distinguish a hung collective from a
+    slow step.
+    """
+
+    WorkloadCommandService(session).renderer.emit(
+        session.client.request(
+            "POST",
+            f"/api/v1/workloads/{workload_id}/exec",
+            json={"command": list(command), "timeout_s": timeout_s, "rank": rank},
+        )
+    )
+
+
 @click.group("workload")
 def workload() -> None:
     """Submit and operate whole workloads."""
@@ -767,6 +798,8 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
 
 for _action in _WORKLOAD_ACTIONS:
     workload.add_command(_workload_action_command(_action))
+
+workload.add_command(exec_in_workload)
 
 
 def register_workload_commands(group: click.Group) -> None:

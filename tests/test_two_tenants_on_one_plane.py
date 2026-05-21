@@ -49,6 +49,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "POST /api/v1/workloads/{workload_id}/cancel": "cancel another org's workload",
     "POST /api/v1/workloads/{workload_id}/retry": "retry another org's workload",
     "POST /api/v1/workloads/{workload_id}/checkpoint": "checkpoint another org's workload",
+    "POST /api/v1/workloads/{workload_id}/exec": "run a command beside another org's workload",
     "POST /api/v1/workloads/estimate": "price work in another org",
     "POST /api/v1/batches": "fan out into another org",
     "POST /api/v1/dags": "release a graph into another org",

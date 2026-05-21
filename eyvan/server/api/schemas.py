@@ -328,6 +328,19 @@ class PolicyPutRequest(ApiModel):
         return PolicyRecord(org_id=org_id, project_id=project_id, updated_by="api", **self.model_dump())
 
 
+class WorkloadExecRequest(ApiModel):
+    """One diagnostic command to run beside a running workload."""
+
+    #: A list of arguments, never a shell string: a string would be split by a
+    #: shell on the host, which is an injection surface as soon as any part of
+    #: it is templated.
+    command: tuple[str, ...] = Field(min_length=1)
+    timeout_s: float = Field(default=30.0, gt=0, le=600)
+    #: ``None`` runs on every rank, which is the default because the question
+    #: exec answers is usually "which rank is stuck".
+    rank: int | None = Field(default=None, ge=0)
+
+
 class ChildWorkloadSubmitRequest(ApiModel):
     """A workload submitted by a running job.
 
