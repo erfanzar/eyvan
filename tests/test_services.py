@@ -460,3 +460,134 @@ def test_old_failures_do_not_inflate_the_backoff_for_a_new_one() -> None:
 
     # One recent failure: the first backoff step, not the ceiling.
     assert 0 < plan.wait_seconds <= 5.0
+
+
+# --------------------------------------------------------------------------- the loop
+
+
+async def _service_plane(policy: ServicePolicy):
+    """A control plane holding one service and nothing else."""
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import Principal, Role, RoleGrant
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service, settings=EyvanSettings())
+    operator = Principal(
+        subject="alice",
+        grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+    )
+    record, _ = await service.submit_service(
+        operator,
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="api", execution=CommandExecution(command="python serve.py")),
+        policy=policy,
+        idempotency_key="svc",
+    )
+    return controller, service, record
+
+
+async def test_the_reconcile_phase_is_registered() -> None:
+    """A pure planner with no caller is the shape this whole plan is about."""
+
+    controller, _service, _record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+
+    assert "reconcile-services" in {phase.name for phase in controller._leader_phases()}
+
+
+async def test_a_service_starts_its_replicas() -> None:
+    """The loop that makes the model real."""
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=2, revision="v1"))
+
+    # One action per pass, so two passes for two replicas.
+    assert await controller.reconcile_services_once() == 1
+    assert await controller.reconcile_services_once() == 1
+
+    async with controller.repository.transaction() as transaction:
+        children = await transaction.list_child_workloads(record.id)
+
+    assert len(children) == 2
+    assert all(child_revision(child) == "v1" for child in children)
+
+
+async def test_a_replica_that_finishes_is_replaced() -> None:
+    """ "SUCCEEDED means start another one", performed rather than merely planned."""
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+        await transaction.put_workload(replica.model_copy(update={"state": WorkloadState.SUCCEEDED}))
+
+    assert await controller.reconcile_services_once() == 1
+
+    async with controller.repository.transaction() as transaction:
+        children = await transaction.list_child_workloads(record.id)
+
+    assert len(children) == 2, "the finished replica was not replaced"
+
+
+async def test_a_steady_service_takes_no_action() -> None:
+    """A loop that acts every pass never converges and never stops spending."""
+
+    controller, _service, _record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    assert await controller.reconcile_services_once() == 0
+
+
+async def test_a_replica_never_retries_inside_itself() -> None:
+    """The service is the thing that restarts.
+
+    A replica retrying internally would hide a crash loop from the backoff that
+    exists to bound it, and the provider would see the requests anyway.
+    """
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+
+    assert (replica.spec.max_retries, replica.spec.max_failure_retries) == (0, 0)
+
+
+async def test_a_replica_does_not_inherit_the_service_policy() -> None:
+    """Otherwise every replica would look like a service to the reconciler.
+
+    It would then be scanned as one, and its own metadata would describe a
+    replica count it has no children to satisfy.
+    """
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+
+    assert service_policy(replica.spec.metadata) is None
+
+
+async def test_a_malformed_policy_does_not_stop_the_loop() -> None:
+    """One bad service must not stop every other service being reconciled.
+
+    The phase is isolated at the loop level too, but a per-service skip keeps
+    the rest of the pass running rather than losing it to the first bad record.
+    """
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload(record.id)
+        broken = stored.spec.model_copy(update={"metadata": {**stored.spec.metadata, "eyvan.service/replicas": "many"}})
+        await transaction.put_workload(stored.model_copy(update={"spec": broken}))
+
+    # Must not raise.
+    assert await controller.reconcile_services_once() == 0

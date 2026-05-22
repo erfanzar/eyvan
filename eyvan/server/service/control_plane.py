@@ -124,6 +124,7 @@ from eyvan.server.service.locality import build_index as locality_index
 from eyvan.server.service.locality import preferred_cells_for
 from eyvan.server.service.pricing_resolver import accelerator_unit_price
 from eyvan.server.service.scheduling import SchedulingService
+from eyvan.server.service.services import ServicePolicy, service_metadata
 from eyvan.server.service.state import (
     ACTIVE_LEASE_STATES,
     TERMINAL_WORKLOAD_STATES,
@@ -3914,6 +3915,45 @@ class ControlPlaneService:
         async with self.repository.transaction() as tx:
             grants = await tx.list_role_grants(subject=subject)
         return tuple(item.grant for item in grants if item.active_at(moment))
+
+    async def submit_service(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        spec: WorkloadDefinition,
+        policy: ServicePolicy,
+        idempotency_key: str,
+    ) -> tuple[WorkloadRecord, bool]:
+        """Create a service: a coordinator whose children are its replicas.
+
+        The replica template is the spec, stored on the parent. The parent never
+        runs -- ``schedulable=False`` -- so the template is inert here and every
+        replica is an ordinary workload submitted from it.
+        """
+
+        self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        key = _validate_idempotency_key(idempotency_key)
+        scope = _scope(org_id, project_id)
+        # The policy travels in metadata so the reconciler can read desired state
+        # off the parent without a second record type and a migration.
+        stored_spec = spec.model_copy(update={"metadata": {**spec.metadata, **service_metadata(policy)}})
+        async with self.repository.transaction() as tx:
+            await self._require_registered_scope(tx, org_id, project_id)
+            return await self._store_workload(
+                tx,
+                principal,
+                org_id=org_id,
+                project_id=project_id,
+                spec=stored_spec,
+                scope=scope,
+                operation="service.create",
+                key=key,
+                fingerprint=_fingerprint(stored_spec),
+                schedulable=False,
+                coordination_kind=CoordinationKind.SERVICE,
+            )
 
     async def submit_child_workload(
         self,

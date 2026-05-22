@@ -122,6 +122,11 @@ class EyvanSettings:
     """
 
     metrics_export_interval_s: float = 60.0
+    #: How often services are brought back to their declared replica count.
+    #: Faster than the housekeeping phases because this is the loop that
+    #: replaces a dead replica -- its interval is the floor on how long a
+    #: service runs short. Zero disables it.
+    service_reconcile_interval_s: float = 5.0
     """How often fleet-state, capacity and spend gauges are refreshed. 0 disables.
 
     Gauges describe a level, not a rate, so they are refreshed on their own slow
@@ -259,6 +264,9 @@ class EyvanSettings:
             ),
             artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
             log_retention_s=int(os.getenv("EYVAN_LOG_RETENTION_S", defaults.log_retention_s)),
+            service_reconcile_interval_s=float(
+                os.getenv("EYVAN_SERVICE_RECONCILE_INTERVAL_S", defaults.service_reconcile_interval_s)
+            ),
             metrics_export_interval_s=float(
                 os.getenv("EYVAN_METRICS_EXPORT_INTERVAL_S", defaults.metrics_export_interval_s)
             ),

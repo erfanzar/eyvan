@@ -63,6 +63,16 @@ class _ControllerLoops:
             # Before scheduling, for the same reason: a group that became feasible
             # this cycle should be placed in it, not a full interval later.
             LeaderPhase("release-groups", self.release_admitted_groups_once),
+            # Before scheduling: a replica started this cycle should be placed
+            # in it rather than a full interval later, which for a service is
+            # the difference between a blip and a visible outage.
+            LeaderPhase(
+                "reconcile-services",
+                self.reconcile_services_once,
+                interval_s=self.settings.service_reconcile_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
             LeaderPhase("schedule", self.reconcile_once),
             # After scheduling, so a cell leased this cycle is not charged as idle
             # for the interval in which it was actually being placed. Failures are

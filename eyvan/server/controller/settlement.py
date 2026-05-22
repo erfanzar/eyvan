@@ -46,8 +46,9 @@ from eyvan.server.controller._support import (
     logger,
 )
 from eyvan.server.persistence.base import RepositorySession
-from eyvan.server.service.errors import ConflictError, NotFoundError
+from eyvan.server.service.errors import AuthorizationError, ConflictError, InputError, NotFoundError
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
+from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, plan_service, service_policy
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 
 #: Lines archived per attempt. A ceiling rather than everything, because the
@@ -668,6 +669,92 @@ class _ControllerSettlement:
         return tuple(
             (values[0], values[1]) for values in list(self.metrics.workload_progress._metrics) if len(values) == 2
         )
+
+    async def reconcile_services_once(self) -> int:
+        """Bring every service to its declared replica count and revision.
+
+        One action per pass per service, deliberately. The planner is pure and
+        could hand back a whole batch, but performing it in one transaction
+        would make a partially-applied roll indistinguishable from a completed
+        one after a crash -- and a service reconciles again in a second anyway.
+
+        Nothing here is a new workload state. A replica is an ordinary workload
+        that succeeds or fails and stays terminal; the service simply asks for
+        another one.
+        """
+
+        reconciled = 0
+        async with self.repository.transaction() as transaction:
+            services = [
+                workload
+                for workload in await transaction.list_workloads(state=WorkloadState.PENDING)
+                if workload.coordination_kind is CoordinationKind.SERVICE
+            ]
+        for service in services:
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_workload(service.id)
+                if current is None or current.coordination_kind is not CoordinationKind.SERVICE:
+                    continue
+                children = await transaction.list_child_workloads(current.id)
+            try:
+                policy = service_policy(current.spec.metadata)
+            except InputError:
+                logger.warning("service %s has a malformed policy; skipping", current.id, exc_info=True)
+                continue
+            if policy is None:
+                continue
+            plan = plan_service(policy, children, now=utcnow())
+            if plan.cancel:
+                await self._cancel_service_replica(current, plan.cancel[0])
+                reconciled += 1
+                continue
+            if plan.submit > 0:
+                await self._start_service_replica(current, policy)
+                reconciled += 1
+        return reconciled
+
+    async def _start_service_replica(self, service: WorkloadRecord, policy: ServicePolicy) -> None:
+        """Submit one replica of a service at its current revision."""
+
+        spec = service.spec.model_copy(
+            update={
+                "metadata": {
+                    **{
+                        name: value
+                        for name, value in service.spec.metadata.items()
+                        if not name.startswith("eyvan.service/")
+                    },
+                    CHILD_REVISION: policy.revision,
+                },
+                # A replica is single-attempt: the service is the thing that
+                # restarts, so a replica retrying inside itself would hide a
+                # crash loop from the backoff that exists to bound it.
+                "max_retries": 0,
+                "max_failure_retries": 0,
+            }
+        )
+        try:
+            await self.service.submit_child_workload(
+                parent=service.model_copy(
+                    update={"spec": service.spec.model_copy(update={"can_submit_children": True})}
+                ),
+                spec=spec,
+                # Deterministic per revision and per slot, so a crash between
+                # the submit and the commit does not start two replicas.
+                idempotency_key=f"replica:{policy.revision}:{uuid.uuid4().hex[:12]}",
+            )
+        except (ConflictError, AuthorizationError):
+            logger.warning("could not start a replica for service %s", service.id, exc_info=True)
+
+    async def _cancel_service_replica(self, service: WorkloadRecord, replica_id: str) -> None:
+        """Retire one replica, leaving the service itself untouched."""
+
+        try:
+            await self.service.cancel_workload(self._principal, replica_id, idempotency_key=f"retire:{replica_id}")
+        except (ConflictError, NotFoundError):
+            # It finished on its own between the plan and the act, which is the
+            # ordinary race for a service and not an error.
+            logger.debug("replica %s of service %s was already terminal", replica_id, service.id)
 
     async def collect_artifacts_once(self) -> int:
         """Delete managed artifacts nothing references and nothing holds.
