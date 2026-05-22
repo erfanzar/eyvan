@@ -403,6 +403,11 @@ class CoordinationKind(StrEnum):
 
     BATCH = "batch"
     DAG = "dag"
+    #: A long-running service: a coordinator whose children are *replicas*.
+    #: Settled by nobody. A batch parent finishes when its children do; a
+    #: service's children are periodically all-terminal by design, which is the
+    #: moment a replacement is due -- so the batch settler must not see it.
+    SERVICE = "service"
     #: Differently-shaped members that admit together. Distinct from BATCH because
     #: the settler must not declare a group finished from a subset of its members,
     #: and distinct from DAG because there are no edges between them -- only the

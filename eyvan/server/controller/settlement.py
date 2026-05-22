@@ -30,6 +30,7 @@ from eyvan.records import (
     CapacityBeliefState,
     CellRecord,
     CellState,
+    CoordinationKind,
     GcpQueueAdmissionDenialTarget,
     LeaseRecord,
     LeaseState,
@@ -543,12 +544,23 @@ class _ControllerSettlement:
             candidate_ids = [
                 workload.id
                 for workload in await transaction.list_workloads(state=WorkloadState.PENDING)
-                if workload.coordination_kind is not None
+                # A service is deliberately excluded. Its children are
+                # periodically all-terminal -- that is what a restart *is* -- so
+                # this settler would declare it SUCCEEDED at the first moment
+                # every replica happened to be between lives, and it would stop
+                # forever. The failure would look like a service that quietly
+                # went away, with a terminal state nobody asked for.
+                if workload.coordination_kind is not None and workload.coordination_kind is not CoordinationKind.SERVICE
             ]
         for workload_id in candidate_ids:
             async with self.repository.transaction() as transaction:
                 parent = await transaction.get_workload(workload_id)
-                if parent is None or parent.coordination_kind is None or parent.state is not WorkloadState.PENDING:
+                if (
+                    parent is None
+                    or parent.coordination_kind is None
+                    or parent.coordination_kind is CoordinationKind.SERVICE
+                    or parent.state is not WorkloadState.PENDING
+                ):
                     continue
                 children = await transaction.list_child_workloads(workload_id)
                 if not children or any(child.state not in TERMINAL_WORKLOAD_STATES for child in children):
