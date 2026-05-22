@@ -1050,6 +1050,20 @@ class WorkloadRecord(EyvanModel):
     lease_id: str | None = None
     lease_ids: tuple[str, ...] = ()
     remote_id: str | None = None
+    #: Where this replica says it can be reached, once it says so.
+    #:
+    #: On the workload rather than in a registry table, which is what makes the
+    #: liveness rule free: an endpoint is served only while the record carrying
+    #: it is RUNNING at the current generation, and a replica that dies takes
+    #: its endpoint with it. A separate table would need a TTL or a heartbeat to
+    #: reach the same conclusion, and both are a second source of truth about
+    #: something the control plane already knows exactly.
+    #:
+    #: Set by the workload itself after it can serve. That is real readiness --
+    #: an authenticated statement by the process that would answer -- rather
+    #: than an inference from a state machine that only knows the process
+    #: started.
+    service_endpoint: str | None = Field(default=None, max_length=512)
     checkpoint_uri: str | None = None
     failure_reason: str | None = None
     scheduling_reason: str | None = None

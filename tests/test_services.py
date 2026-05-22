@@ -591,3 +591,134 @@ async def test_a_malformed_policy_does_not_stop_the_loop() -> None:
 
     # Must not raise.
     assert await controller.reconcile_services_once() == 0
+
+
+# --------------------------------------------------------------------------- the registry
+
+
+async def _running_replica(controller, service_id: str, endpoint: str | None, *, revision: str = "v1"):
+    """Advance one replica to RUNNING, optionally with an endpoint registered."""
+
+    async with controller.repository.transaction() as transaction:
+        children = await transaction.list_child_workloads(service_id)
+        replica = next(child for child in children if child.state is not WorkloadState.RUNNING)
+        await transaction.put_workload(
+            replica.model_copy(update={"state": WorkloadState.RUNNING, "service_endpoint": endpoint})
+        )
+    return replica.id
+
+
+async def test_a_replica_is_advertised_only_after_it_registers() -> None:
+    """RUNNING says a process started; registration says it answered.
+
+    Advertising on RUNNING alone sends traffic to a process still loading its
+    weights, which for a model server is minutes of failed requests.
+    """
+
+    from eyvan.records import Principal, Role, RoleGrant
+
+    operator = Principal(
+        subject="alice",
+        grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+    )
+    controller, service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    await _running_replica(controller, record.id, None)
+    assert await service.service_endpoints(operator, record.id) == []
+
+    await _running_replica_endpoint(controller, record.id, "http://10.0.0.1:8080")
+    endpoints = await service.service_endpoints(operator, record.id)
+
+    assert [entry["endpoint"] for entry in endpoints] == ["http://10.0.0.1:8080"]
+
+
+async def _running_replica_endpoint(controller, service_id: str, endpoint: str) -> None:
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(service_id)
+        await transaction.put_workload(replica.model_copy(update={"service_endpoint": endpoint}))
+
+
+async def test_a_replica_that_dies_takes_its_endpoint_with_it() -> None:
+    """Liveness is derived, so a stale entry is not representable.
+
+    A registry table would need a TTL or a heartbeat to reach the same
+    conclusion, and both are a second source of truth about something the
+    control plane already knows exactly.
+    """
+
+    from eyvan.records import Principal, Role, RoleGrant
+
+    operator = Principal(
+        subject="alice",
+        grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+    )
+    controller, service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+    await _running_replica(controller, record.id, "http://10.0.0.1:8080")
+    assert len(await service.service_endpoints(operator, record.id)) == 1
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+        await transaction.put_workload(replica.model_copy(update={"state": WorkloadState.FAILED}))
+
+    assert await service.service_endpoints(operator, record.id) == []
+
+
+async def test_only_the_current_revision_is_advertised() -> None:
+    """A roll exists to move traffic; advertising both revisions makes it a no-op."""
+
+    from eyvan.records import Principal, Role, RoleGrant
+
+    operator = Principal(
+        subject="alice",
+        grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+    )
+    controller, service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+    await _running_replica(controller, record.id, "http://old:8080")
+
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload(record.id)
+        rolled = stored.spec.model_copy(update={"metadata": {**stored.spec.metadata, "eyvan.service/revision": "v2"}})
+        await transaction.put_workload(stored.model_copy(update={"spec": rolled}))
+
+    assert await service.service_endpoints(operator, record.id) == []
+
+
+async def test_a_terminal_replica_cannot_register() -> None:
+    """A replica that finished cannot subsequently become reachable.
+
+    Accepting the write would publish an endpoint nothing is listening on, and
+    the derived-liveness rule would have no way to notice.
+    """
+
+    from eyvan.server.service.errors import ConflictError
+
+    controller, service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+        finished = replica.model_copy(update={"state": WorkloadState.SUCCEEDED})
+        await transaction.put_workload(finished)
+
+    with pytest.raises(ConflictError, match="cannot register"):
+        await service.register_service_endpoint(workload=finished, endpoint="http://10.0.0.1:8080")
+
+
+async def test_a_superseded_attempt_cannot_register() -> None:
+    """Its endpoint belongs to a process that is being replaced."""
+
+    from eyvan.server.service.errors import ConflictError
+
+    controller, service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    await controller.reconcile_services_once()
+
+    async with controller.repository.transaction() as transaction:
+        (replica,) = await transaction.list_child_workloads(record.id)
+        stale = replica.model_copy(update={"state": WorkloadState.RUNNING})
+        await transaction.put_workload(stale.model_copy(update={"generation": 2}))
+
+    with pytest.raises(ConflictError, match="moved to generation"):
+        await service.register_service_endpoint(workload=stale, endpoint="http://10.0.0.1:8080")

@@ -111,6 +111,7 @@ from eyvan.server.api.schemas import (
     ProjectRegisterRequest,
     QuotaPutRequest,
     RoleGrantIssueRequest,
+    ServiceEndpointRequest,
     WorkloadEstimateRequest,
     WorkloadExecRequest,
     WorkloadSubmitRequest,
@@ -1278,6 +1279,47 @@ def create_app(
 
     # response_model=None: the page is a plain JSON document whose record shape
     # LogRecord already defines; a response model would restate it.
+    @app.put(
+        "/api/v1/workloads/{workload_id}/endpoint",
+        response_model=WorkloadRecord,
+        tags=["workloads"],
+        include_in_schema=False,
+    )
+    async def register_service_endpoint(
+        workload_id: str,
+        request: ServiceEndpointRequest,
+        token: tp.Annotated[str, Header(alias="X-Eyvan-Workload-Token", min_length=1)],
+    ) -> WorkloadRecord:
+        """Publish where this replica can be reached, on its own authority.
+
+        The same capability that authorizes child submission, because it answers
+        the same question: is this request coming from the live attempt of this
+        workload. A separate credential would be a second thing to deliver and
+        rotate for no additional guarantee.
+        """
+
+        if workload_capability is None:
+            raise ConflictError("endpoint registration requires a configured artifact token key")
+        async with repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+        if workload is None:
+            raise NotFoundError(f"workload {workload_id!r} was not found")
+        try:
+            workload_capability.verify(token, workload_id=workload_id, generation=workload.generation)
+        except InvalidCapabilityToken as exc:
+            raise AuthorizationError("invalid workload capability") from exc
+        return await service.register_service_endpoint(workload=workload, endpoint=request.endpoint)
+
+    # response_model=None: one entry per live replica, a plain JSON list.
+    @app.get("/api/v1/workloads/{workload_id}/endpoints", tags=["workloads"], response_model=None)
+    async def service_endpoints(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[JsonObject]:
+        """List the replicas of a service that are currently able to serve."""
+
+        return await service.service_endpoints(principal, workload_id)
+
     @app.post(
         "/api/v1/workloads/{workload_id}/children",
         response_model=WorkloadRecord,

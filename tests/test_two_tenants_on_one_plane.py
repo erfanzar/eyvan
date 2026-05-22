@@ -45,6 +45,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "GET /api/v1/workloads/{workload_id}/progress": "read another org's progress",
     "GET /api/v1/workloads/{workload_id}/process-status": "read another org's process state",
     "GET /api/v1/workloads/{workload_id}/children": "enumerate another org's job tree",
+    "GET /api/v1/workloads/{workload_id}/endpoints": "read another org's service endpoints",
     "POST /api/v1/workloads": "submit into another org",
     "POST /api/v1/workloads/{workload_id}/cancel": "cancel another org's workload",
     "POST /api/v1/workloads/{workload_id}/retry": "retry another org's workload",
@@ -133,6 +134,7 @@ EXEMPT_ROUTES: dict[str, str] = {
     "PUT /api/v1/artifacts/results/{result_id}/content": "capability token, not a principal",
     "POST /api/v1/workloads/{workload_id}/progress-reports": "capability token, not a principal",
     "POST /api/v1/workloads/{workload_id}/children": "workload capability token, not a principal",
+    "PUT /api/v1/workloads/{workload_id}/endpoint": "workload capability token, not a principal",
 }
 
 ROUTE_CLASSIFICATION = {**CROSS_TENANT_ROUTES, **FLEET_ONLY_ROUTES, **EXEMPT_ROUTES}
@@ -243,6 +245,7 @@ def test_a_tenant_cannot_see_or_touch_another_tenants_workload(plane: TestClient
         "progress": plane.get(f"/api/v1/workloads/{workload}/progress", headers=RIVAL),
         "process-status": plane.get(f"/api/v1/workloads/{workload}/process-status", headers=RIVAL),
         "children": plane.get(f"/api/v1/workloads/{workload}/children", headers=RIVAL),
+        "endpoints": plane.get(f"/api/v1/workloads/{workload}/endpoints", headers=RIVAL),
     }
     writes = {
         "cancel": plane.post(f"/api/v1/workloads/{workload}/cancel", headers={**RIVAL, "Idempotency-Key": "x1"}),

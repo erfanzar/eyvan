@@ -341,6 +341,12 @@ class WorkloadExecRequest(ApiModel):
     rank: int | None = Field(default=None, ge=0)
 
 
+class ServiceEndpointRequest(ApiModel):
+    """Where a replica says it can be reached."""
+
+    endpoint: str = Field(min_length=1, max_length=512)
+
+
 class ChildWorkloadSubmitRequest(ApiModel):
     """A workload submitted by a running job.
 

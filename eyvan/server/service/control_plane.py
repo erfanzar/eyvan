@@ -124,7 +124,7 @@ from eyvan.server.service.locality import build_index as locality_index
 from eyvan.server.service.locality import preferred_cells_for
 from eyvan.server.service.pricing_resolver import accelerator_unit_price
 from eyvan.server.service.scheduling import SchedulingService
-from eyvan.server.service.services import ServicePolicy, service_metadata
+from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, service_metadata, service_policy
 from eyvan.server.service.state import (
     ACTIVE_LEASE_STATES,
     TERMINAL_WORKLOAD_STATES,
@@ -3954,6 +3954,66 @@ class ControlPlaneService:
                 schedulable=False,
                 coordination_kind=CoordinationKind.SERVICE,
             )
+
+    async def register_service_endpoint(self, *, workload: WorkloadRecord, endpoint: str) -> WorkloadRecord:
+        """Record where a replica says it can be reached.
+
+        Called by the replica itself, on its own capability, after it can
+        serve. That is what makes this readiness rather than an inference:
+        RUNNING says a process started, and registration says it answered.
+
+        Refused once the workload is terminal. A replica that finished cannot
+        subsequently become reachable, and accepting the write would publish an
+        endpoint nothing is listening on.
+        """
+
+        if not endpoint.strip() or endpoint != endpoint.strip():
+            raise InputError("a service endpoint must be non-empty and trimmed")
+        if workload.state in TERMINAL_WORKLOAD_STATES:
+            raise ConflictError(f"workload {workload.id!r} is {workload.state.value} and cannot register an endpoint")
+        async with self.repository.transaction() as tx:
+            current = await tx.get_workload(workload.id)
+            if current is None:
+                raise NotFoundError(f"workload {workload.id!r} was not found")
+            if current.generation != workload.generation:
+                # The capability was minted for a superseded attempt. Its
+                # endpoint belongs to a process that is being replaced.
+                raise ConflictError(f"workload {workload.id!r} has moved to generation {current.generation}")
+            stored = current.model_copy(update={"service_endpoint": endpoint, "updated_at": utcnow()})
+            await tx.put_workload(stored)
+            return stored
+
+    async def service_endpoints(self, principal: Principal, service_id: str) -> list[JsonObject]:
+        """Return the endpoints of every replica currently able to serve.
+
+        Liveness is derived, never stored: a replica appears here only while its
+        record is RUNNING and carries an endpoint. Nothing expires and nothing
+        heartbeats, so a stale row is not possible -- deletion is garbage
+        collection rather than correctness.
+        """
+
+        service = await self.get_workload(principal, service_id)
+        async with self.repository.transaction() as tx:
+            children = await tx.list_child_workloads(service_id)
+        policy = service_policy(service.spec.metadata)
+        revision = "" if policy is None else policy.revision
+        endpoints: list[JsonObject] = []
+        for child in children:
+            if child.state is not WorkloadState.RUNNING or not child.service_endpoint:
+                continue
+            if revision and child.spec.metadata.get(CHILD_REVISION, "") != revision:
+                # A replica of a superseded revision is still serving, and is
+                # deliberately not advertised: a roll exists to move traffic,
+                # and returning both revisions would make it a no-op.
+                continue
+            endpoints.append(
+                {
+                    "workload_id": child.id,
+                    "endpoint": child.service_endpoint,
+                    "revision": child.spec.metadata.get(CHILD_REVISION, ""),
+                }
+            )
+        return endpoints
 
     async def submit_child_workload(
         self,
