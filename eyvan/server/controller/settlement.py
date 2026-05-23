@@ -18,7 +18,7 @@ from eyvan.artifacts.managed import ManagedArtifactKind, log_uri
 from eyvan.capacity import (
     CapacityStatus,
 )
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, provision_outcome
 from eyvan.domain import (
     CapacityBelief,
     CapacityPoolKey,
@@ -201,15 +201,13 @@ class _ControllerSettlement:
             cell = await transaction.get_cell(command.aggregate_id)
             if cell is None or cell.generation != command.generation or cell.state is not CellState.REGISTERING:
                 return
-            lowered = error.lower()
-            if failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
-                outcome = ProvisionOutcome.PROVIDER_ERROR
-            elif "quota" in lowered:
-                outcome = ProvisionOutcome.QUOTA_ERROR
-            elif "stockout" in lowered or "capacity" in lowered:
-                outcome = ProvisionOutcome.STOCKOUT
-            else:
-                outcome = ProvisionOutcome.PROVIDER_ERROR
+            # Was: search ``error`` for the words "quota" and "capacity". That
+            # read a provider's arbitrary prose as a classification, so
+            # "capacity pool not found" -- a configuration mistake -- became
+            # evidence that a zone had run out of accelerators, and fed it to
+            # the belief that decides where the next workload is placed. The
+            # provider now says which of these it means.
+            outcome = provision_outcome(failure_code)
             observed_at = utcnow()
             unavailable_reason = failure_code.value if failure_code is not None else "provider_failure"
             updated = cell.model_copy(

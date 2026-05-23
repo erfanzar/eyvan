@@ -18,6 +18,7 @@ from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity import READY_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import (
+    CapacityProviderFailureCode,
     CellCapabilities,
     CellObservation,
     MutationContext,
@@ -249,6 +250,7 @@ class GcpTpuCapacityDriver:
             detail=detail,
             observed_at=datetime.now(UTC),
             observed_tpu_vms=GcpTpuCapacityDriver._observed_tpu_vms(record),
+            failure_code=GcpTpuCapacityDriver._failure_code(record),
             metadata={
                 **record.metadata,
                 "project": record.project,
@@ -263,6 +265,21 @@ class GcpTpuCapacityDriver:
                 "head_ip": record.head_ip,
             },
         )
+
+    @staticmethod
+    def _failure_code(record: FleetCellRecord) -> CapacityProviderFailureCode | None:
+        """Recover a persisted provider reason, ignoring one this build cannot name."""
+
+        value = record.metadata.get("provider_failure_code")
+        if not isinstance(value, str):
+            return None
+        try:
+            return CapacityProviderFailureCode(value)
+        except ValueError:
+            # A newer agent's vocabulary. Treated as "no specific reason" rather
+            # than as an error: the observation is still usable, and refusing it
+            # would strand a cell during a rolling upgrade.
+            return None
 
     @staticmethod
     def _observed_tpu_vms(record: FleetCellRecord) -> int | None:
@@ -316,6 +333,14 @@ class GcpTpuCapacityDriver:
                 record.metadata["native_worker_endpoints"] = list(report.worker_endpoints)
             elif report.state not in READY_CAPACITY_STATUSES:
                 record.metadata.pop("native_worker_endpoints", None)
+            if report.failure_code is not None and report.state not in READY_CAPACITY_STATUSES:
+                # Through the durable record rather than returned directly,
+                # because ``observe`` re-reads the record without calling the
+                # provider: a reason that lived only on this call would be
+                # invisible to the next observation of the same cell.
+                record.metadata["provider_failure_code"] = report.failure_code.value
+            else:
+                record.metadata.pop("provider_failure_code", None)
             if report.state in READY_CAPACITY_STATUSES and report.observed_tpu_vms is not None:
                 record.metadata["observed_tpu_vms"] = report.observed_tpu_vms
             elif report.state not in READY_CAPACITY_STATUSES:

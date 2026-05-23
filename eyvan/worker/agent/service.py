@@ -189,6 +189,7 @@ class CellAgentService:
             detail=value.detail,
             metadata=value.metadata,
             observed_tpu_vms=value.observed_tpu_vms,
+            failure_code=value.failure_code,
         )
 
     def _with_execution_readiness(self, value: CellObservation) -> CellObservation:

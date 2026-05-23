@@ -21,7 +21,7 @@ from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
     CapacityStatus,
 )
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode, ExecutionWorkloadStatus
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, ExecutionWorkloadStatus, provision_outcome
 from eyvan.capacity.planning import (
     cell_execution_runtime_is_pending,
 )
@@ -815,6 +815,7 @@ class _ControllerObservation:
             provider_detail = observation.detail or None
             remote_state = observation.state
             observed_tpu_vms = observation.observed_tpu_vms
+            reported_failure_code = observation.failure_code
             if observation.generation != cell.generation and remote_state not in DEFINITIVE_CAPACITY_LOSS_STATUSES:
                 logger.warning(
                     "cell %s reported generation %s while generation %s is desired",
@@ -846,14 +847,26 @@ class _ControllerObservation:
                     else cell.availability
                 )
             else:
+                # Every non-ready, non-pending observation used to be recorded as
+                # a STOCKOUT belief unless the status was explicitly a quota
+                # halt. So an ordinary spot reclamation -- the common ending on
+                # this fleet -- taught the placement engine that the pool had no
+                # capacity, and the next placement routed away from a zone that
+                # was in fact fine. A reported reason now decides.
                 state = CellState.UNAVAILABLE
-                unavailable_reason = cell.unavailable_reason if provider_failure_code is not None else remote_state.value
-                outcome = (
-                    ProvisionOutcome.QUOTA_ERROR
-                    if remote_state is CapacityStatus.HALTED_QUOTA
-                    else ProvisionOutcome.STOCKOUT
+                provider_failure_code = reported_failure_code or provider_failure_code
+                unavailable_reason = (
+                    reported_failure_code.value
+                    if reported_failure_code is not None
+                    # Unchanged when nothing new was reported: a code carried
+                    # over from a previous observation keeps the prose that came
+                    # with it, rather than being flattened into its own name.
+                    else (cell.unavailable_reason if provider_failure_code is not None else remote_state.value)
                 )
-                availability = self._observe_capacity_belief(cell, outcome)
+                availability = self._observe_capacity_belief(
+                    cell,
+                    provision_outcome(reported_failure_code, remote_state),
+                )
         transition: tuple[CellRecord, CellRecord] | None = None
         async with self.repository.transaction() as transaction:
             current = await transaction.get_cell(cell.id)

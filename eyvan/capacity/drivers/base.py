@@ -16,6 +16,7 @@ from typing_extensions import TypedDict
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue
 from eyvan.capacity import CapacityStatus
+from eyvan.domain.availability import ProvisionOutcome
 
 
 def canonical_execution_backend(name: str) -> str:
@@ -83,6 +84,61 @@ class CapacityProviderFailureCode(StrEnum):
     #: The request will fail identically however many times it is retried --
     #: missing credentials, a namespace that does not exist, a rejected manifest.
     CONFIGURATION = "configuration"
+    #: The provider has no capacity of this shape right now. Distinct from
+    #: PROVIDER_ERROR because it says something about the *pool* rather than
+    #: about the request, and the placement engine routes on that difference.
+    STOCKOUT = "stockout"
+    #: The project's quota for this shape is exhausted. Retrying in the same
+    #: pool cannot succeed until a human raises the limit, so it must not look
+    #: like a stockout that another zone might satisfy.
+    QUOTA_EXCEEDED = "quota_exceeded"
+    #: The provider reclaimed capacity Eyvan already held. Expected on spot, and
+    #: the cheapest failure in this enum to retry -- which is precisely why it
+    #: must not be charged to the same budget as a stockout or a bad request.
+    PREEMPTED = "preempted"
+
+
+#: How one provider reason updates a pool's availability belief.
+#:
+#: Explicit and total rather than derived from the failure text. The two places
+#: that needed this both reconstructed it by searching an arbitrary provider
+#: string for the words "quota" and "capacity" -- which meant a message like
+#: "capacity pool not found" (a configuration mistake) was recorded as evidence
+#: that a zone had run out of accelerators, and every reason nobody had written
+#: a substring for became a stockout by default.
+_PROVISION_OUTCOMES: dict[CapacityProviderFailureCode, ProvisionOutcome] = {
+    CapacityProviderFailureCode.STOCKOUT: ProvisionOutcome.STOCKOUT,
+    CapacityProviderFailureCode.QUOTA_EXCEEDED: ProvisionOutcome.QUOTA_ERROR,
+    # Not a stockout. The provider had the capacity and took it back, which says
+    # nothing about whether the pool can satisfy the next request -- and saying
+    # otherwise steers placement away from a zone that is working.
+    CapacityProviderFailureCode.PREEMPTED: ProvisionOutcome.INTERRUPTED,
+    CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED: ProvisionOutcome.PROVIDER_ERROR,
+    CapacityProviderFailureCode.PROVIDER_UNAVAILABLE: ProvisionOutcome.PROVIDER_ERROR,
+    CapacityProviderFailureCode.CONFIGURATION: ProvisionOutcome.PROVIDER_ERROR,
+    CapacityProviderFailureCode.PROVIDER_ERROR: ProvisionOutcome.PROVIDER_ERROR,
+}
+
+
+def provision_outcome(
+    failure_code: CapacityProviderFailureCode | None,
+    status: CapacityStatus | None = None,
+) -> ProvisionOutcome:
+    """Return how one provider failure should move a pool's availability belief.
+
+    ``status`` is the fallback for an observation that reported no reason --
+    an older agent, or a provider that simply did not say. ``HALTED_QUOTA`` is
+    self-describing; anything else unnamed is a provider error, **not** a
+    stockout. Defaulting the unknown to "this pool is empty" is how a belief
+    that drives placement gets poisoned by causes that have nothing to do with
+    capacity.
+    """
+
+    if failure_code is not None:
+        return _PROVISION_OUTCOMES[failure_code]
+    if status is CapacityStatus.HALTED_QUOTA:
+        return ProvisionOutcome.QUOTA_ERROR
+    return ProvisionOutcome.PROVIDER_ERROR
 
 
 class CapacityProviderError(RuntimeError):
@@ -230,6 +286,11 @@ class CellObservation:
     observed_at: datetime | None = None
     metadata: JsonObject = field(default_factory=dict)
     observed_tpu_vms: int | None = None
+    #: Why the provider is in a non-ready state, when it said something specific.
+    #: A code that arrives only on a *raised* provider error is a code that never
+    #: describes a successful observation -- and a spot preemption is a
+    #: successful observation of a reclaimed machine, not an error.
+    failure_code: CapacityProviderFailureCode | None = None
 
 
 class CapacityDriver(tp.Protocol):

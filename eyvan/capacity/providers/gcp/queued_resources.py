@@ -370,6 +370,10 @@ class ProviderObservation:
 
     state: CapacityStatus
     detail: str = ""
+    #: Why the provider is in this state, when it said something specific. The
+    #: prose in ``detail`` is for a human; this is what the control plane routes
+    #: on, so a reason it can act on never has to be recovered by reading text.
+    failure_code: CapacityProviderFailureCode | None = None
     head_ip: str | None = None
     execution_endpoint: str | None = None
     worker_endpoints: tuple[str, ...] = ()
@@ -881,7 +885,18 @@ class GcloudTpuProvider:
                 raise GcloudError(f"TPU cell {record.name!r} has duplicate worker network endpoints")
             if any(state in TERMINAL_NODE_STATES for state in node_states):
                 terminal = ", ".join(sorted({state.value for state in node_states if state in TERMINAL_NODE_STATES}))
-                return ProviderObservation(CapacityStatus.NEEDS_RECREATE, f"TPU VM is terminal ({terminal})")
+                # PREEMPTED is the one terminal state that says something about
+                # the *purchase class* rather than the allocation, and it is the
+                # ordinary end of a spot TPU. Reported typed so the control
+                # plane does not record a spot reclamation as evidence that the
+                # pool is out of capacity -- which is what it did while every
+                # non-ready observation collapsed to one belief.
+                preempted = any(state is GcpTpuNodeState.PREEMPTED for state in node_states)
+                return ProviderObservation(
+                    CapacityStatus.NEEDS_RECREATE,
+                    f"TPU VM is terminal ({terminal})",
+                    failure_code=CapacityProviderFailureCode.PREEMPTED if preempted else None,
+                )
             ambiguous_states = {
                 GcpTpuNodeState.STATE_UNSPECIFIED,
                 GcpTpuNodeState.UNKNOWN,

@@ -194,6 +194,9 @@ class AgentObservation(AgentModel):
     detail: str = ""
     metadata: WireJsonObject = Field(default_factory=dict)
     observed_tpu_vms: int | None = Field(default=None, ge=1)
+    #: Typed reason for a non-ready state, carried beside the human-readable
+    #: ``detail``. Optional so an agent that predates it still validates.
+    failure_code: CapacityProviderFailureCode | None = None
 
 
 class WorkloadObservation(AgentModel):
