@@ -63,6 +63,7 @@ class AcceleratorConfig(tp.Protocol):
     max_retries: int
     max_failure_retries: int
     capacity_class: CapacityClass
+    secret_mounts: tp.Mapping[str, str]
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -118,6 +119,10 @@ class TpuConfig:
     #: non-zero exit usually repeats, and re-running it costs an accelerator.
     max_failure_retries: int = 0
     capacity_class: CapacityClass = CapacityClass.SPOT
+    #: Secret references, resolved at dispatch and injected as environment
+    #: variables on the cell. Unlike a value passed through ``environment``, a
+    #: reference is what gets persisted -- which is the whole point.
+    secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
@@ -145,6 +150,10 @@ class GpuConfig:
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1
+    #: Secret references, resolved at dispatch and injected as environment
+    #: variables on the cell. Unlike a value passed through ``environment``, a
+    #: reference is what gets persisted -- which is the whole point.
+    secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
@@ -162,6 +171,10 @@ class CpuConfig:
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1
+    #: Secret references, resolved at dispatch and injected as environment
+    #: variables on the cell. Unlike a value passed through ``environment``, a
+    #: reference is what gets persisted -- which is the whole point.
+    secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)

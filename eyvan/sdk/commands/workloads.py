@@ -477,6 +477,17 @@ def workload() -> None:
     show_default=True,
     help="Retries for the job's own non-zero exit. Separate from --max-retries, which pays for capacity the fleet lost.",
 )
+@click.option(
+    "--secret",
+    "secret_mounts",
+    multiple=True,
+    metavar="NAME=REFERENCE",
+    help=(
+        "Mount a secret as an environment variable, by reference. The reference is resolved at dispatch and the "
+        "value is never stored in the spec -- unlike --env, which is persisted. The project policy's "
+        "allowed_secret_references must permit the reference."
+    ),
+)
 @click.option("--idempotency-key")
 @click.pass_obj
 def submit_workload(
@@ -502,11 +513,13 @@ def submit_workload(
     checkpoint_output_uri: str | None,
     max_retries: int,
     max_failure_retries: int,
+    secret_mounts: tuple[str, ...],
     idempotency_key: str | None,
 ) -> None:
     """Submit a workload with explicit resource and placement intent."""
 
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    mounts = parse_environment(secret_mounts, option="--secret")
     try:
         request = WorkloadSubmitRequest(
             org_id=scope.org_id,
@@ -530,6 +543,7 @@ def submit_workload(
                 checkpoint_output_uri=checkpoint_output_uri,
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
+                secret_mounts=mounts,
             ),
         )
     except (ValidationError, ValueError) as exc:

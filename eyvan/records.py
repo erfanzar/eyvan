@@ -892,6 +892,13 @@ class WorkloadDefinition(EyvanModel):
     #: receives the same one -- deciding which rank may use it is the SDK's job,
     #: not the token's.
     can_submit_children: bool = False
+    #: Secret *references*, never values. ``environment`` is persisted in the
+    #: spec and readable by anyone who can read the workload, so passing a
+    #: credential through it is the practice this replaces.
+    #:
+    #: Keyed by the environment variable name the worker will populate, so a
+    #: reader can see what a job will be handed without resolving anything.
+    secret_mounts: dict[str, str] = Field(default_factory=dict)
     cell_group_count: int = Field(default=1, ge=1, le=10_000)
     worker_count: int = Field(default=1, ge=1, le=10_000, strict=True)
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL
@@ -1626,6 +1633,16 @@ class PolicyRecord(EyvanModel):
     allowed_capacity_classes: tuple[CanonicalCapacityClass, ...] = ()
     denied_accelerator_types: tuple[str, ...] = ()
     max_priority: int = Field(default=1000, ge=0, le=1000)
+    #: Reference prefixes this project's workloads may mount. Empty means none,
+    #: which is the safe default and not the permissive one.
+    #:
+    #: This is the security-critical field. Without it, any submitter in a
+    #: project can name any secret the *agent's* identity can read -- and the
+    #: agent's identity is broad by construction, because it provisions
+    #: capacity. That is a privilege escalation from "may submit jobs" to "may
+    #: read every secret in the project", available to anyone who can write a
+    #: spec.
+    allowed_secret_references: tuple[str, ...] = ()
     preemption_enabled: bool = True
     revision: int = 1
     updated_by: str

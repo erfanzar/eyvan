@@ -1,0 +1,159 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""The credential one attempt uses to read one of its declared secrets.
+
+A third capability beside the artifact and child-submission ones, on the same
+primitives and with its own version prefix -- which is the part that matters.
+The prefix is inside the signed material, so a stolen artifact token cannot
+verify here and a secret token cannot be replayed against a result upload, even
+if a claim check were wrong.
+
+**Always expiring, unlike the submit capability.** That asymmetry is deliberate.
+A submit capability is safe without a TTL because it grants an action the
+control plane re-authorizes on every use against live state. A secret
+capability hands back a *value*: once read, no later revocation can un-read it,
+so the window in which a leaked token is useful should be bounded by something
+that does not depend on anything else working.
+
+The TTL is nonetheless the weaker of the two controls here. The stronger one is
+the attempt binding -- ``authorize_current_secret_mount`` refuses a token whose
+attempt is not the workload's current one, and every path that retries or
+resumes a workload bumps ``attempt`` (``control_plane.py:1567``, ``:1863``,
+``:1960``, ``controller/preemption.py:689``). So a token stops working the
+moment the attempt it was minted for is over, whether or not it has expired.
+"""
+
+from __future__ import annotations
+
+import time
+import typing as tp
+from dataclasses import dataclass
+
+from eyvan.artifacts._capability_tokens import (
+    InvalidCapabilityToken,
+    require_secret,
+    sign_claims,
+    verify_signature,
+)
+
+#: Distinct from both the artifact and workload prefixes, and signed over.
+SECRET_TOKEN_VERSION = "eyvs1"
+
+#: The only action this capability grants.
+READ_SECRET = "read_secret"
+
+_CLAIM_KEYS = frozenset(
+    {"action", "attempt", "expires_at", "issued_at", "name", "org_id", "project_id", "version", "workload_id"}
+)
+
+
+class InvalidSecretToken(InvalidCapabilityToken):
+    """Raised when a secret capability token is unusable for the request."""
+
+
+@dataclass(frozen=True, slots=True)
+class SecretTokenClaims:
+    """What a verified secret capability asserts.
+
+    Note what is *absent*: the reference. A token names the **mount**, and the
+    reference behind it is read from the workload's current spec at fetch time.
+    Putting the reference in the token would let a capability outlive the spec
+    that authorized it -- an operator who corrected a mount would find the old
+    reference still readable until the token expired.
+    """
+
+    workload_id: str
+    org_id: str
+    project_id: str
+    attempt: int
+    name: str
+    issued_at: int
+    expires_at: int
+
+
+class SecretCapabilitySigner:
+    """Issue and verify the capability an attempt reads its secrets with."""
+
+    def __init__(self, secret: bytes, *, ttl_seconds: float, clock: tp.Callable[[], float] = time.time):
+        self._secret = require_secret(secret, "secret capability secret")
+        if ttl_seconds <= 0:
+            raise ValueError("a secret capability requires a positive TTL")
+        self._ttl_seconds = float(ttl_seconds)
+        self._clock = clock
+
+    def issue(self, *, workload_id: str, org_id: str, project_id: str, attempt: int, name: str) -> str:
+        """Mint a capability for one mount of one attempt."""
+
+        if not workload_id or not org_id or not project_id or not name:
+            raise ValueError("a secret capability requires a workload, organization, project, and mount name")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("a secret capability requires a positive attempt")
+        issued_at = int(self._clock())
+        return sign_claims(
+            self._secret,
+            SECRET_TOKEN_VERSION,
+            {
+                "action": READ_SECRET,
+                "attempt": attempt,
+                "expires_at": issued_at + int(self._ttl_seconds),
+                "issued_at": issued_at,
+                "name": name,
+                "org_id": org_id,
+                "project_id": project_id,
+                "version": 1,
+                "workload_id": workload_id,
+            },
+        )
+
+    def verify(self, token: str, *, workload_id: str, org_id: str, project_id: str) -> SecretTokenClaims:
+        """Verify a capability's authenticity, scope and expiry.
+
+        Whether the *workload* still grants it is a separate question answered
+        against live state by ``authorize_current_secret_mount``. Keeping the two
+        apart is why this file needs no repository: a signature check that also
+        reads a database is a signature check nobody can test in isolation.
+        """
+
+        claims = verify_signature(self._secret, SECRET_TOKEN_VERSION, token)
+        if set(claims) != _CLAIM_KEYS:
+            # Exact, not a superset: an unrecognized claim means a token this
+            # build does not fully understand, and honoring the parts it does
+            # understand is how a capability quietly widens.
+            raise InvalidSecretToken("secret capability has unexpected claims")
+        if claims.get("version") != 1 or claims.get("action") != READ_SECRET:
+            raise InvalidSecretToken("secret capability does not grant a secret read")
+        if claims.get("workload_id") != workload_id:
+            raise InvalidSecretToken("secret capability belongs to a different workload")
+        if claims.get("org_id") != org_id or claims.get("project_id") != project_id:
+            raise InvalidSecretToken("secret capability was issued for a different project")
+        attempt, name = claims.get("attempt"), claims.get("name")
+        issued_at, expires_at = claims.get("issued_at"), claims.get("expires_at")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise InvalidSecretToken("secret capability has an invalid attempt")
+        if not isinstance(name, str) or not name:
+            raise InvalidSecretToken("secret capability names no mount")
+        if not isinstance(issued_at, int) or not isinstance(expires_at, int):
+            raise InvalidSecretToken("secret capability has an invalid validity window")
+        if self._clock() >= expires_at:
+            raise InvalidSecretToken("secret capability has expired")
+        return SecretTokenClaims(
+            workload_id=workload_id,
+            org_id=org_id,
+            project_id=project_id,
+            attempt=attempt,
+            name=name,
+            issued_at=issued_at,
+            expires_at=expires_at,
+        )
+
+
+__all__ = (
+    "READ_SECRET",
+    "SECRET_TOKEN_VERSION",
+    "InvalidSecretToken",
+    "SecretCapabilitySigner",
+    "SecretTokenClaims",
+)

@@ -297,6 +297,17 @@ def get_policy(session: CliSession, org_id: str | None, project_id: str | None) 
     type=click.Choice(tuple(item.value for item in CapacityClass)),
 )
 @click.option("--deny-accelerator-type", "denied_accelerator_types", multiple=True)
+@click.option(
+    "--allow-secret-reference",
+    "allowed_secret_references",
+    multiple=True,
+    metavar="PREFIX",
+    help=(
+        "Reference prefixes this project's workloads may mount with --secret. Unlike every other allow-list here, "
+        "omitting this permits NOTHING: naming a secret grants the reader the control plane's own identity, so the "
+        "safe default is the closed one. Repeat to allow several prefixes."
+    ),
+)
 @click.option("--max-priority", type=int, default=1000, show_default=True)
 @click.option(
     "--no-preemption",
@@ -313,6 +324,7 @@ def set_policy(
     allowed_regions: tuple[str, ...],
     allowed_capacity_classes: tuple[str, ...],
     denied_accelerator_types: tuple[str, ...],
+    allowed_secret_references: tuple[str, ...],
     max_priority: int,
     no_preemption: bool,
     idempotency_key: str | None,
@@ -321,6 +333,12 @@ def set_policy(
 
     An empty allow-list means "no restriction", not "allow nothing" -- which is
     why these options are additive and omitting one leaves that dimension open.
+
+    ``--allow-secret-reference`` is the one exception, and it is deliberate:
+    there the empty list permits nothing. Every other dimension bounds *where*
+    work may run; that one bounds which credentials a submitter may borrow from
+    the control plane's own identity, and a permissive default there would be a
+    privilege escalation available to anyone who can write a spec.
     """
 
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
@@ -330,6 +348,7 @@ def set_policy(
             allowed_regions=allowed_regions,
             allowed_capacity_classes=tp.cast(tp.Any, allowed_capacity_classes),
             denied_accelerator_types=denied_accelerator_types,
+            allowed_secret_references=allowed_secret_references,
             max_priority=max_priority,
             preemption_enabled=not no_preemption,
         )

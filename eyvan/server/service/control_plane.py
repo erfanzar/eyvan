@@ -591,6 +591,7 @@ class ControlPlaneService:
         command: str,
         name: str | None = None,
         environment: tp.Mapping[str, str] | None = None,
+        secret_mounts: tp.Mapping[str, str] | None = None,
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_failure_retries: int = 0,
@@ -653,6 +654,7 @@ class ControlPlaneService:
                 name=name if name is not None else f"{fleet_name}/{node_type}",
                 execution=CommandExecution(command=command),
                 environment=dict(environment or {}),
+                secret_mounts=dict(secret_mounts or {}),
                 metadata=dict(metadata or {}),
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
@@ -684,6 +686,7 @@ class ControlPlaneService:
         capacity_class: CapacityClass = CapacityClass.SPOT,
         name: str | None = None,
         environment: tp.Mapping[str, str] | None = None,
+        secret_mounts: tp.Mapping[str, str] | None = None,
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_failure_retries: int = 0,
@@ -789,6 +792,7 @@ class ControlPlaneService:
                 name=name if name is not None else f"{fleet_name}/{accelerator_type}",
                 execution=execution,
                 environment=dict(environment or {}),
+                secret_mounts=dict(secret_mounts or {}),
                 metadata=dict(metadata or {}),
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
@@ -883,6 +887,7 @@ class ControlPlaneService:
         name: str,
         execution: CommandExecution | CallableExecution,
         environment: tp.Mapping[str, str],
+        secret_mounts: tp.Mapping[str, str],
         metadata: tp.Mapping[str, str],
         max_retries: int,
         max_failure_retries: int,
@@ -907,6 +912,7 @@ class ControlPlaneService:
                 required_topology=pool.topology,
             ),
             environment=dict(environment),
+            secret_mounts=dict(secret_mounts),
             metadata={**dict(metadata), **pool_labels},
             provider=pool.provider,
             region=pool.region,
@@ -971,6 +977,7 @@ class ControlPlaneService:
         policy = await tx.get_policy(org_id, project_id)
         if policy is not None:
             self._validate_workload_policy(spec, policy)
+        self._validate_secret_mounts(spec, policy)
         if parent_workload_id is not None:
             parent = await tx.get_workload(parent_workload_id)
             if parent is None:
@@ -3916,6 +3923,31 @@ class ControlPlaneService:
             grants = await tx.list_role_grants(subject=subject)
         return tuple(item.grant for item in grants if item.active_at(moment))
 
+    @staticmethod
+    def _validate_secret_mounts(spec: WorkloadDefinition, policy: PolicyRecord | None) -> None:
+        """Refuse a secret reference this project has not been allowed to mount.
+
+        At submission, not at dispatch. A reference authorized only when it is
+        resolved would be checked on a host holding the agent's identity, long
+        after the submitter is gone -- so the refusal would arrive as a failed
+        workload rather than a rejected request, and the audit trail would
+        attribute the attempt to the agent.
+
+        Empty allow-list means no mounts, deliberately. The permissive default
+        is the one that turns "may submit jobs" into "may read every secret the
+        agent can reach".
+        """
+
+        if not spec.secret_mounts:
+            return
+        allowed = () if policy is None else policy.allowed_secret_references
+        for name, reference in sorted(spec.secret_mounts.items()):
+            if not any(reference.startswith(prefix) for prefix in allowed):
+                raise AuthorizationError(
+                    f"secret reference {reference!r} for {name} is not permitted in this project; "
+                    "add a prefix to the project policy's allowed_secret_references"
+                )
+
     async def submit_service(
         self,
         principal: Principal,
@@ -5807,6 +5839,150 @@ class ControlPlaneService:
         async with self.repository.transaction() as transaction:
             await transaction.append_event(event)
             await self._touch_artifact(transaction, kind=kind, object_id=object_id)
+
+    async def record_secret_issuance(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        workload_id: str,
+        attempt: int,
+        names: tuple[str, ...],
+        tx: RepositorySession | None = None,
+    ) -> None:
+        """Record which secret mounts one attempt was granted capabilities for.
+
+        Half of a pair. The other half is written when a capability is redeemed,
+        and it is the pairing that carries the signal: a ``secret.read`` for an
+        attempt with no ``secret.issued`` naming that mount is a capability being
+        used outside the dispatch that minted it. Recording only reads would make
+        that indistinguishable from ordinary use.
+
+        Mount **names**, never references and never values. A reference can name
+        a production database; the ledger is read by more people than the spec
+        is.
+        """
+
+        event = AuditEvent(
+            id=_new_id("evt"),
+            # A workload, not a principal: the dispatch that mints these
+            # capabilities is the control plane acting on the workload's behalf,
+            # and attributing it to whoever submitted would put a human's name on
+            # an event they were not present for.
+            actor=f"workload:{workload_id}",
+            org_id=org_id,
+            project_id=project_id,
+            entity_type="workload",
+            entity_id=workload_id,
+            action="secret.issued",
+            payload={"workload_id": workload_id, "attempt": attempt, "names": list(names)},
+        )
+        if tx is not None:
+            await tx.append_event(event)
+            return
+        async with self.repository.transaction() as transaction:
+            await transaction.append_event(event)
+
+    async def record_secret_rejection(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        workload_id: str,
+        name: str,
+        reason: str,
+    ) -> None:
+        """Record a secret capability that failed verification outright.
+
+        Distinct from ``secret.read_denied``, which means a *valid* capability
+        was refused by live state -- an ordinary race with a retry. This one
+        means a token that is expired, forged, or issued for something else was
+        presented, which is the shape a leak takes, and it never reaches the
+        authorization read that would otherwise have recorded it.
+        """
+
+        async with self.repository.transaction() as tx:
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=f"workload:{workload_id}",
+                    org_id=org_id,
+                    project_id=project_id,
+                    entity_type="workload",
+                    entity_id=workload_id,
+                    action="secret.token_rejected",
+                    payload={"workload_id": workload_id, "name": name, "reason": reason[:512]},
+                )
+            )
+
+    async def authorize_secret_mount(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        workload_id: str,
+        attempt: int,
+        name: str,
+    ) -> str:
+        """Return the reference one live attempt may currently read, or refuse.
+
+        This is what makes a secret capability per-*attempt* rather than merely
+        short-lived, and it is the whole authorization decision:
+
+        * the workload is in this project, and running rather than finished;
+        * the attempt is the workload's **current** one, so a capability minted
+          for a preempted or retried attempt is dead the moment the next one
+          starts, without waiting for a TTL;
+        * the mount is still declared, at whatever reference the spec names
+          *now* -- so correcting a mount takes effect immediately rather than
+          when outstanding tokens expire; and
+        * the reference is still permitted by the project's policy, so narrowing
+          ``allowed_secret_references`` after a leak is a real revocation and not
+          merely a bar on future submissions.
+
+        The audit event is written in the **same transaction** as the reads that
+        decide it, so a granted secret read cannot be committed unaudited.
+        """
+
+        async with self.repository.transaction() as tx:
+            workload = await tx.get_workload(workload_id)
+            reference = ""
+            granted = False
+            if (
+                workload is not None
+                and workload.org_id == org_id
+                and workload.project_id == project_id
+                and workload.attempt == attempt
+                and workload.state
+                in {
+                    WorkloadState.LEASED,
+                    WorkloadState.DISPATCHING,
+                    WorkloadState.RUNNING,
+                    WorkloadState.CHECKPOINTING,
+                    WorkloadState.CANCELLING,
+                }
+            ):
+                candidate = workload.spec.secret_mounts.get(name, "")
+                if candidate:
+                    policy = await tx.get_policy(org_id, project_id)
+                    allowed = () if policy is None else policy.allowed_secret_references
+                    if any(candidate.startswith(prefix) for prefix in allowed):
+                        reference, granted = candidate, True
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=f"workload:{workload_id}",
+                    org_id=org_id,
+                    project_id=project_id,
+                    entity_type="workload",
+                    entity_id=workload_id,
+                    action="secret.read" if granted else "secret.read_denied",
+                    payload={"workload_id": workload_id, "attempt": attempt, "name": name},
+                )
+            )
+        if not granted:
+            raise AuthorizationError("secret mount is not current for this workload attempt")
+        return reference
 
     @staticmethod
     async def _touch_artifact(tx: RepositorySession, *, kind: str, object_id: str) -> None:

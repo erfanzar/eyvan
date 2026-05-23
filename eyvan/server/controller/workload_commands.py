@@ -12,6 +12,7 @@ import shlex
 import typing as tp
 import uuid
 from datetime import timedelta
+from urllib.parse import urlencode
 
 from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
@@ -40,6 +41,9 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
     WorkloadRequest,
 )
+
+if tp.TYPE_CHECKING:
+    from eyvan.server.persistence import RepositorySession
 
 
 class _ControllerWorkloadCommands:
@@ -175,6 +179,79 @@ class _ControllerWorkloadCommands:
         base = "" if self.artifact_access is None else self.artifact_access.public_url
         return f"{base}/api/v1/workloads/{workload.id}/children"
 
+    def _secret_environment(self, workload: WorkloadRecord) -> dict[str, str]:
+        """Return the addresses and capabilities for this attempt's secret mounts.
+
+        Values are conspicuously absent. What travels is one short-lived
+        capability per mount and the address to redeem it at, so the secret
+        itself never enters a dispatch command, an agent request, or any record
+        either of them is persisted in.
+
+        A fresh token per *attempt* is the revocation: the previous attempt's
+        capabilities stop being honored the moment ``attempt`` advances, which
+        every retry and every preemption resume does.
+        """
+
+        mounts = workload.spec.secret_mounts
+        if not mounts or self.secret_capability is None or self.artifact_access is None:
+            # Silently empty rather than raising. A replica configured without
+            # managed artifacts has no signing key, and refusing the dispatch
+            # would turn a misconfiguration into an unschedulable workload; the
+            # job fails on the missing variable instead, naming what it wanted.
+            return {}
+        environment = {"EYVAN_SECRET_COUNT": str(len(mounts))}
+        for index, name in enumerate(sorted(mounts)):
+            environment[f"EYVAN_SECRET_{index}_NAME"] = name
+            environment[f"EYVAN_SECRET_{index}_URL"] = self._secret_url(workload, name)
+            environment[f"EYVAN_SECRET_{index}_TOKEN"] = self.secret_capability.issue(
+                workload_id=workload.id,
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                attempt=workload.attempt,
+                name=name,
+            )
+        return environment
+
+    def _secret_url(self, workload: WorkloadRecord, name: str) -> str:
+        """Return the address one mount is redeemed at, fully assembled.
+
+        Same reasoning as ``_children_url``: handing a job a base URL plus the
+        knowledge of how to build the rest makes the route exist in two places.
+        """
+
+        base = "" if self.artifact_access is None else self.artifact_access.public_url
+        query = urlencode(
+            {
+                "org_id": workload.org_id,
+                "project_id": workload.project_id,
+                "workload_id": workload.id,
+                "name": name,
+            }
+        )
+        return f"{base}/api/v1/secrets/content?{query}"
+
+    async def _audit_secret_issuance(self, transaction: RepositorySession, workload: WorkloadRecord) -> None:
+        """Record which mounts an attempt was granted, in the dispatch transaction.
+
+        The other half of the pair the fetch route writes. One issuance here and
+        one read there is what makes a leaked capability visible: a ``secret.read``
+        whose attempt has no matching ``secret.issued`` is a token being used
+        outside the dispatch that minted it, and that is invisible if only reads
+        are recorded.
+        """
+
+        mounts = workload.spec.secret_mounts
+        if not mounts or self.secret_capability is None or self.artifact_access is None:
+            return
+        await self.service.record_secret_issuance(
+            org_id=workload.org_id,
+            project_id=workload.project_id,
+            workload_id=workload.id,
+            attempt=workload.attempt,
+            names=tuple(sorted(mounts)),
+            tx=transaction,
+        )
+
     def _render_execution(
         self,
         workload: WorkloadRecord,
@@ -209,6 +286,7 @@ class _ControllerWorkloadCommands:
                 generation=workload.generation,
             )
             environment["EYVAN_CHILDREN_URL"] = self._children_url(workload)
+        environment.update(self._secret_environment(workload))
         execution = workload.spec.execution
         if execution.kind == "command":
             # A workspace belongs to the workload, not to one execution kind, so
@@ -353,6 +431,7 @@ class _ControllerWorkloadCommands:
                     raise RuntimeError(f"cell {cell.id!r} has not recovered the quarantined lease")
 
             entrypoint, environment = self._render_execution(workload, runtime_environment=cell.runtime.env)
+            await self._audit_secret_issuance(transaction, workload)
             request = WorkloadRequest(
                 mutation=self._mutation(command, lease.fencing_token),
                 spec={
@@ -455,6 +534,7 @@ class _ControllerWorkloadCommands:
             leader_lease = members[0]
             leader_cell = concrete_cells[0]
             entrypoint, environment = self._render_execution(workload, runtime_environment=leader_cell.runtime.env)
+            await self._audit_secret_issuance(transaction, workload)
 
             spec = {
                 "entrypoint": entrypoint,

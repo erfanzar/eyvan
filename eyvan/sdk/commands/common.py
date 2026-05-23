@@ -40,14 +40,19 @@ class FleetConfigLoader:
             raise click.ClickException(f"invalid fleet configuration {path}: {exc}") from exc
 
 
-def parse_environment(values: tuple[str, ...]) -> dict[str, str]:
-    """Parse repeated ``KEY=VALUE`` options without accepting ambiguous input."""
+def parse_environment(values: tuple[str, ...], *, option: str = "--env") -> dict[str, str]:
+    """Parse repeated ``KEY=VALUE`` options without accepting ambiguous input.
+
+    ``option`` names the flag in the error, because more than one flag now has
+    this shape and an error naming the wrong one sends a user to the wrong line
+    of their command.
+    """
 
     result: dict[str, str] = {}
     for value in values:
         key, separator, item = value.partition("=")
         if not separator or not key or key != key.strip() or not item or item != item.strip():
-            raise click.ClickException("--env values must use KEY=VALUE with non-empty trimmed strings")
+            raise click.ClickException(f"{option} values must use KEY=VALUE with non-empty trimmed strings")
         result[key] = item
     return result
 

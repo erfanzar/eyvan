@@ -501,3 +501,49 @@ async def test_a_locked_command_is_skipped_rather_than_waited_on(database) -> No
             )
             await rival.rollback()
         await holder.rollback()
+
+
+async def test_a_secret_allow_list_and_its_mounts_survive_the_real_backend(database) -> None:
+    """The two new fields carry the security decision, so they have to persist.
+
+    Both live inside a JSON column rather than a new one, which is why no
+    migration accompanies them -- and which is exactly the reason to check
+    rather than assume: a field that silently failed to round-trip would
+    reappear empty, and an empty ``allowed_secret_references`` refuses every
+    mount. The failure would look like a policy nobody set.
+    """
+
+    from eyvan.records import PolicyRecord
+
+    repository = await _migrated(database)
+    try:
+        async with repository.transaction() as tx:
+            await tx.put_policy(
+                PolicyRecord(
+                    org_id="acme",
+                    project_id="research",
+                    allowed_secret_references=("gcp-secret://my-project/training-",),
+                    updated_by="root",
+                )
+            )
+            await tx.put_workload(
+                _workload("wl-secret").model_copy(
+                    update={
+                        "spec": WorkloadDefinition(
+                            name="wl-secret",
+                            execution=CommandExecution(command="python train.py"),
+                            secret_mounts={"HF_TOKEN": "gcp-secret://my-project/training-hf-token"},
+                        )
+                    }
+                )
+            )
+        async with repository.transaction() as tx:
+            policy = await tx.get_policy("acme", "research")
+            workload = await tx.get_workload("wl-secret")
+
+        assert policy is not None
+        assert policy.allowed_secret_references == ("gcp-secret://my-project/training-",)
+        assert workload is not None
+        assert workload.spec.secret_mounts == {"HF_TOKEN": "gcp-secret://my-project/training-hf-token"}
+    finally:
+        await repository.close()

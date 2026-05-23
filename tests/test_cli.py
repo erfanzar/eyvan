@@ -1719,6 +1719,7 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
     assert request.spec.model_dump(mode="json", exclude_unset=True) == {
         "name": "tpu-train",
         "execution": {"kind": "command", "command": "python train.py"},
+        "secret_mounts": {},
         "gang": {
             "replicas": 1,
             "per_replica": {"cpu": 1.0, "memory_gib": 1.0, "gpu": 0, "tpu": 8},
@@ -1954,6 +1955,7 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "command": "python -m train --config 'two words.yaml'",
         "name": "train",
         "environment": {"RUN_ID": "experiment-1"},
+        "secret_mounts": {},
         "metadata": {},
         "max_retries": 3,
         "max_failure_retries": 0,

@@ -180,6 +180,10 @@ class PoolWorkloadSubmitRequest(ApiModel):
     command: str = Field(min_length=1)
     name: str | None = Field(default=None, min_length=1, max_length=200)
     environment: dict[str, str] = Field(default_factory=dict)
+    #: Secret *references*, never values. Unlike ``environment``, which is
+    #: persisted in the spec, these are resolved at dispatch and the value never
+    #: enters a record.
+    secret_mounts: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
@@ -199,6 +203,10 @@ class PoolCallableSubmitRequest(ApiModel):
     execution: CallableExecution
     name: str | None = Field(default=None, min_length=1, max_length=200)
     environment: dict[str, str] = Field(default_factory=dict)
+    #: Secret *references*, never values. Unlike ``environment``, which is
+    #: persisted in the spec, these are resolved at dispatch and the value never
+    #: enters a record.
+    secret_mounts: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
@@ -322,6 +330,9 @@ class PolicyPutRequest(ApiModel):
     allowed_capacity_classes: tuple[CanonicalCapacityClass, ...] = ()
     denied_accelerator_types: tuple[str, ...] = ()
     max_priority: int = Field(default=1000, ge=0, le=1000)
+    #: Prefixes of the secret references this project's workloads may mount.
+    #: Empty means *none*, unlike every other list here -- see PolicyRecord.
+    allowed_secret_references: tuple[str, ...] = ()
     preemption_enabled: bool = True
 
     def to_record(self, org_id: str, project_id: str) -> PolicyRecord:

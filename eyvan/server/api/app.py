@@ -46,6 +46,7 @@ from eyvan.artifacts.managed import (
     result_uri,
     workspace_uri,
 )
+from eyvan.artifacts.secret_capability import SecretCapabilitySigner
 from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
@@ -81,6 +82,7 @@ from eyvan.records import (
 )
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
+from eyvan.secrets import SecretUnavailable, read_secret
 from eyvan.server.api.auth import OIDCTokenVerifier, RequestAuthenticator, TokenVerifier, authenticated_principal
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
@@ -267,14 +269,18 @@ def create_app(
     registry = metrics_registry or CollectorRegistry(auto_describe=True)
     metrics = metrics or EyvanMetrics(registry=registry)
     workload_capability: WorkloadCapabilitySigner | None = None
+    secret_capability: SecretCapabilitySigner | None = None
     if artifact_access is None:
         if settings.artifact_token_ttl_s <= 0:
             raise ValueError("EYVAN_ARTIFACT_TOKEN_TTL_S must be positive")
+        if settings.secret_token_ttl_s <= 0:
+            raise ValueError("EYVAN_SECRET_TOKEN_TTL_S must be positive")
         token_key = _artifact_token_key(settings)
         # The same deployment secret, a different capability. Audience
         # separation lives in the signed version prefix rather than in a second
         # key an operator would have to rotate in step with the first.
         workload_capability = WorkloadCapabilitySigner(token_key)
+        secret_capability = SecretCapabilitySigner(token_key, ttl_seconds=settings.secret_token_ttl_s)
         artifact_access = ManagedArtifactAccess(
             store=managed_artifact_store_from_uri(settings.artifact_store_uri),
             signer=ArtifactTokenSigner(
@@ -299,6 +305,7 @@ def create_app(
         metrics=metrics,
         artifact_access=artifact_access,
         workload_capability=workload_capability,
+        secret_capability=secret_capability,
     )
     workload_progress = WorkloadProgressResolver(service, repository)
 
@@ -348,6 +355,7 @@ def create_app(
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for
     app.state.workload_capability = workload_capability
+    app.state.secret_capability = secret_capability
     app.state.metrics = metrics
     app.state.metrics_registry = registry
     app.state.controller = controller
@@ -428,6 +436,24 @@ def create_app(
         del request
         errors = [{key: value for key, value in error.items() if key not in {"input", "ctx"}} for error in exc.errors()]
         return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": errors})
+
+    @app.exception_handler(SecretUnavailable)
+    async def handle_secret_unavailable(request: Request, exc: SecretUnavailable) -> JSONResponse:
+        """A secret store that cannot be reached is retryable, not a bad request.
+
+        The message carries the *reference* and the store's own reason -- almost
+        always "permission denied for service account X", which names the exact
+        grant an operator has to add. It never carries a value, because a
+        resolver that failed never had one.
+        """
+
+        del request
+        logger.warning("Eyvan secret resolution failed: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+            content={"detail": str(exc)},
+        )
 
     @app.exception_handler(TransientRepositoryError)
     async def handle_transient_repository_error(request: Request, exc: TransientRepositoryError) -> JSONResponse:
@@ -888,14 +914,32 @@ def create_app(
             uri = result_uri(result_id)
         except ValueError as exc:
             raise InputError(str(exc)) from exc
-        verify_artifact_token(
-            token,
-            ArtifactAction.WRITE,
-            uri,
-            org_id=org_id,
-            project_id=project_id,
-            workload_id=workload_id,
-        )
+
+        try:
+            # ``authorize_current_result_target`` audits both of *its* outcomes,
+            # but it is never reached when the token itself fails -- so the one
+            # refusal that most needs recording, a capability presented against
+            # an address it was not issued for, was the silent one. Same verb as
+            # the authorization denial, so "a refused write" stays one predicate
+            # over the ledger rather than two.
+            verify_artifact_token(
+                token,
+                ArtifactAction.WRITE,
+                uri,
+                org_id=org_id,
+                project_id=project_id,
+                workload_id=workload_id,
+            )
+        except AuthorizationError:
+            await service.record_artifact_access(
+                org_id=org_id,
+                project_id=project_id,
+                workload_id=workload_id,
+                kind="results",
+                object_id=uri,
+                action="artifact.write_denied",
+            )
+            raise
         await authorize_current_result_target(
             uri,
             org_id=org_id,
@@ -905,6 +949,82 @@ def create_app(
         payload = await artifact_body(raw_request, limit=settings.artifact_max_result_bytes)
         await managed_put(uri, payload, org_id=org_id, project_id=project_id)
         return {"uri": uri}
+
+    @app.get("/api/v1/secrets/content", response_class=Response, include_in_schema=False)
+    async def transfer_secret(
+        org_id: str,
+        project_id: str,
+        workload_id: str,
+        name: str,
+        token: tp.Annotated[str, Header(alias="X-Eyvan-Secret-Token", min_length=1)],
+    ) -> Response:
+        """Resolve one declared secret mount for the attempt that holds its capability.
+
+        Out of the schema deliberately. This is not an API a person calls: it is
+        redeemed by a cell agent holding a capability the control plane minted at
+        dispatch, and publishing it as a documented endpoint invites exactly the
+        wrong integration.
+
+        Its own header, not ``X-Eyvan-Artifact-Token``. A redaction or logging
+        rule written for one header does not silently cover a second one, and a
+        capability that reads out a *value* deserves to be named distinctly from
+        one that reads an artifact.
+        """
+
+        if secret_capability is None:
+            raise AuthorizationError("secret mounts are not configured on this control-plane replica")
+        try:
+            claims = secret_capability.verify(
+                token,
+                workload_id=workload_id,
+                org_id=org_id,
+                project_id=project_id,
+            )
+        except InvalidCapabilityToken as exc:
+            # The base class, not ``InvalidSecretToken``. A forged prefix, bad
+            # base64 or wrong signature is refused by the shared primitive before
+            # this signer's claim rules run, so catching only the narrow type
+            # would turn the most suspicious input on this route into a 500 --
+            # unaudited, and reported to the caller as the server's fault.
+            #
+            # Audited even though the token was never valid: a rejected
+            # capability presented against a live workload is the clearest signal
+            # that one leaked, and it is invisible if only refusals that reach the
+            # authorization read are recorded.
+            await service.record_secret_rejection(
+                org_id=org_id,
+                project_id=project_id,
+                workload_id=workload_id,
+                name=name,
+                reason=str(exc),
+            )
+            raise AuthorizationError(str(exc)) from exc
+        if claims.name != name:
+            raise AuthorizationError("secret capability was issued for a different mount")
+        reference = await service.authorize_secret_mount(
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            attempt=claims.attempt,
+            name=name,
+        )
+        try:
+            # Off the event loop: resolving a reference shells out to the
+            # provider's CLI, and a control-plane replica that stops answering
+            # every other request while one secret resolves is a worse outage
+            # than the one slow fetch.
+            value = await asyncio.to_thread(read_secret, reference)
+        except SecretUnavailable as exc:
+            # Deliberately not re-raised as a repository error just to reach a
+            # 503. A store that cannot be reached is a different incident from a
+            # database that cannot be reached, and collapsing them sends an
+            # operator to the wrong dashboard.
+            raise SecretUnavailable(f"secret mount {name!r} could not be resolved: {exc}") from exc
+        return Response(
+            value,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     @app.get("/metrics", include_in_schema=False)
     async def prometheus_metrics(raw_request: Request) -> Response:
@@ -1105,6 +1225,7 @@ def create_app(
             command=request.command,
             name=request.name,
             environment=request.environment,
+            secret_mounts=request.secret_mounts,
             metadata=request.metadata,
             max_retries=request.max_retries,
             max_failure_retries=request.max_failure_retries,
@@ -1146,6 +1267,7 @@ def create_app(
             execution=request.execution,
             name=request.name,
             environment=request.environment,
+            secret_mounts=request.secret_mounts,
             metadata=request.metadata,
             max_retries=request.max_retries,
             max_failure_retries=request.max_failure_retries,

@@ -459,6 +459,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 capacity_class=request.tpu.capacity_class,
                 name=request.callable_name[:200],
                 metadata={"eyvan_invocation_id": request.invocation_id},
+                secret_mounts=request.tpu.secret_mounts,
                 max_retries=request.tpu.max_retries,
                 max_failure_retries=request.tpu.max_failure_retries,
                 idempotency_key=request.invocation_id,

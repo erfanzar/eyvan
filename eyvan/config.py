@@ -68,6 +68,17 @@ class EyvanSettings:
     artifact_max_callable_bytes: int = 64 * 1024 * 1024
     artifact_max_result_bytes: int = 256 * 1024 * 1024
     artifact_max_workspace_bytes: int = 64 * 1024 * 1024
+    #: How long a secret-read capability stays valid. Short next to the artifact
+    #: TTL because a secret capability hands back a *value*: once read, no later
+    #: revocation can un-read it.
+    #:
+    #: Not shorter than an hour, though. The token is minted at dispatch and
+    #: presented when the cell launches the unit, and between those two moments
+    #: sit provisioning, an image pull and a workspace download. A TTL tuned to
+    #: how long the fetch takes would expire during a slow bootstrap and fail
+    #: the workload for a reason that has nothing to do with its secrets. The
+    #: binding that actually revokes is the attempt, not this.
+    secret_token_ttl_s: int = 3600
     scheduler_interval_s: float = 2.0
     cell_reconcile_interval_s: float = 15.0
     cell_reconcile_concurrency: int = 8
@@ -238,6 +249,7 @@ class EyvanSettings:
             artifact_max_result_bytes=int(
                 os.getenv("EYVAN_ARTIFACT_MAX_RESULT_BYTES", defaults.artifact_max_result_bytes)
             ),
+            secret_token_ttl_s=int(os.getenv("EYVAN_SECRET_TOKEN_TTL_S", defaults.secret_token_ttl_s)),
             artifact_max_workspace_bytes=int(
                 os.getenv("EYVAN_ARTIFACT_MAX_WORKSPACE_BYTES", defaults.artifact_max_workspace_bytes)
             ),

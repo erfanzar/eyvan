@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from eyvan._internal.observability import EyvanMetrics
+from eyvan.artifacts.secret_capability import SecretCapabilitySigner
 from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.audit import CapacityLifecycleLogger
@@ -61,6 +62,7 @@ class _ControllerLifecycle:
         metrics: EyvanMetrics | None = None,
         artifact_access: ManagedArtifactAccess | None = None,
         workload_capability: WorkloadCapabilitySigner | None = None,
+        secret_capability: SecretCapabilitySigner | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -82,6 +84,7 @@ class _ControllerLifecycle:
         self.metrics = metrics
         self.artifact_access = artifact_access
         self.workload_capability = workload_capability
+        self.secret_capability = secret_capability
         self._capacity_lifecycle = CapacityLifecycleLogger(logger)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:

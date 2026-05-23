@@ -37,6 +37,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime.log_records import LogPage, parse_journal_json
+from eyvan.worker.runtime.secret_materialization import materialize_secrets, secret_environment_keys
 
 _TERMINAL_STATES = frozenset(
     {
@@ -845,12 +846,22 @@ class SystemdTransientServiceExecutor:
         unit argv stays free of values. ``EnvironmentFile=`` without
         systemd's ``-`` ignore prefix makes a missing file fail the launch
         loudly instead of silently starting without an environment.
+
+        Declared secrets are resolved here, into that same file. It is already
+        the owner-only private state this workload's environment lives in, so a
+        value written into it inherits the protection rather than needing a
+        second mechanism -- and the capability that fetched it is dropped, so
+        the job receives what it asked for and not the means to ask again.
         """
 
         remote_id = record.get("remote_id")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
         launch_environment = {**self._base_environment, **_environment(spec)}
+        secrets = materialize_secrets(launch_environment)
+        for key in secret_environment_keys(launch_environment):
+            launch_environment.pop(key, None)
+        launch_environment.update(secrets)
         _write_environment_file(self._environment_file_path(remote_id), launch_environment)
 
     def _launch_command(

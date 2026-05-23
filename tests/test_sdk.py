@@ -69,6 +69,7 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "command": "python train.py",
         "name": "daily-train",
         "environment": {"RUN_ID": "42"},
+        "secret_mounts": {},
         "metadata": {"team": "alignment"},
         "max_retries": 2,
         # Separate from ``max_retries``: that budget pays for capacity the fleet
@@ -154,6 +155,7 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "execution": execution.model_dump(mode="json"),
         "name": None,
         "environment": {},
+        "secret_mounts": {},
         "metadata": {},
         "max_retries": 3,
         "max_failure_retries": 0,
