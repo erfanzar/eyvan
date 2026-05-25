@@ -590,3 +590,48 @@ def test_a_callable_config_carries_its_preemption_budget(tmp_path) -> None:
 
     assert json.loads(requests[0].content)["max_preemption_retries"] == 40
     client.close()
+
+
+# --------------------------------------------------------------------------- compute
+
+
+def test_a_reclaimed_spot_vm_reports_a_typed_reason() -> None:
+    """GCE has no PREEMPTED status: a reclaimed Spot VM just reaches TERMINATED.
+
+    So the purchase class is what distinguishes it, and the class is already
+    validated against the spec on the same call.
+    """
+
+    import json
+
+    from test_gcp_compute_provider import instance_payload, record, result
+
+    from eyvan.capacity.providers.gcp.compute_instances import GcloudComputeProvider
+
+    provider = GcloudComputeProvider(
+        runner=lambda _args: result(stdout=json.dumps(instance_payload(status="TERMINATED")))
+    )
+
+    observation = provider.ensure(record())
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.failure_code is CapacityProviderFailureCode.PREEMPTED
+
+
+def test_a_suspended_spot_vm_is_not_called_a_preemption() -> None:
+    """SUSPENDED is not reclamation, and claiming it is would be the same guess.
+
+    Bounded to what the evidence supports: only Spot, and only TERMINATED.
+    """
+
+    import json
+
+    from test_gcp_compute_provider import instance_payload, record, result
+
+    from eyvan.capacity.providers.gcp.compute_instances import GcloudComputeProvider
+
+    provider = GcloudComputeProvider(
+        runner=lambda _args: result(stdout=json.dumps(instance_payload(status="SUSPENDED")))
+    )
+
+    assert provider.ensure(record()).failure_code is None

@@ -22,6 +22,7 @@ from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
 from eyvan.capacity.providers.gcp.queued_resources import (
@@ -946,8 +947,21 @@ class GcloudComputeProvider:
                 CapacityStatus.DRAINING, f"Compute instance is {instance.status.lower()}", head_ip=head_ip
             )
         if instance.status in {GcpComputeInstanceStatus.TERMINATED, GcpComputeInstanceStatus.SUSPENDED}:
+            # GCE has no distinct PREEMPTED status the way Cloud TPU does: a
+            # reclaimed Spot VM simply reaches TERMINATED. What distinguishes it
+            # is the purchase class, which ``_validate_instance`` has already
+            # confirmed against the spec -- an Eyvan-owned Spot instance that
+            # stopped without Eyvan stopping it was reclaimed.
+            #
+            # Limited on purpose to Spot and to TERMINATED. A Standard instance
+            # reaching TERMINATED is a guest shutdown or a host failure, and a
+            # SUSPENDED instance is neither; claiming preemption for those would
+            # be the same guess this exists to remove.
+            preempted = spec.capacity_class == "spot" and instance.status is GcpComputeInstanceStatus.TERMINATED
             return ProviderObservation(
-                CapacityStatus.NEEDS_RECREATE, f"Compute instance is terminal ({instance.status})"
+                CapacityStatus.NEEDS_RECREATE,
+                f"Compute instance is terminal ({instance.status})",
+                failure_code=CapacityProviderFailureCode.PREEMPTED if preempted else None,
             )
         return ProviderObservation(CapacityStatus.UNAVAILABLE, f"Compute instance is {instance.status}", head_ip=head_ip)
 
