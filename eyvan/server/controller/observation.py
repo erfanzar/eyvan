@@ -604,41 +604,55 @@ class _ControllerObservation:
                 expected_cell_id=None if lost_cell is None else lost_cell.id,
             )
             return
-        if (workload.checkpoint_uri or preemption_owned) and (workload.capacity_loss_count < workload.spec.max_retries):
+        # The cloud reclaiming capacity, not Eyvan preempting a lower-priority
+        # job for it. They are charged to different budgets because they mean
+        # opposite things about whether running again can work: a spot
+        # reclamation is the expected ending of a spot job, while a capacity
+        # loss may be a pool that has nothing left to give.
+        provider_preempted = (
+            lost_cell is not None and lost_cell.provider_failure_code is CapacityProviderFailureCode.PREEMPTED
+        )
+        spent, budget = (
+            (workload.preemption_count, workload.spec.max_preemption_retries)
+            if provider_preempted
+            else (workload.capacity_loss_count, workload.spec.max_retries)
+        )
+        if (workload.checkpoint_uri or preemption_owned) and spent < budget:
             await self.service.settle_preempted_workload(
                 self._principal,
                 workload.id,
                 checkpoint_uri=workload.checkpoint_uri,
                 scheduling_reason=(
-                    f"cell lost; resuming from {workload.checkpoint_uri} "
-                    f"({workload.capacity_loss_count + 1} of {workload.spec.max_retries})"
+                    f"cell lost; resuming from {workload.checkpoint_uri} ({spent + 1} of {budget})"
                     if workload.checkpoint_uri
-                    else "cell lost during preemption; restarting without a checkpoint "
-                    f"({workload.capacity_loss_count + 1} of {workload.spec.max_retries})"
+                    else f"cell lost during preemption; restarting without a checkpoint ({spent + 1} of {budget})"
                 ),
                 action="workload.recovery_queued",
                 expected_generation=workload.generation,
                 expected_lease_id=lease.id,
                 expected_state=workload.state,
                 require_preemption_owner=preemption_owned,
+                provider_preempted=provider_preempted,
                 expected_cell_generation=None if lost_cell is None else lost_cell.generation,
                 expected_cell_state=None if lost_cell is None else lost_cell.state,
                 expected_unavailable_reason=None if lost_cell is None else lost_cell.unavailable_reason,
                 expected_cell_id=None if lost_cell is None else lost_cell.id,
             )
             return
-        if lost_cell is not None and workload.capacity_loss_count < workload.spec.max_retries:
+        if lost_cell is not None and spent < budget:
             await self.service.settle_preempted_workload(
                 self._principal,
                 workload.id,
                 scheduling_reason=(
-                    f"{reason}; retrying capacity loss "
-                    f"({workload.capacity_loss_count + 1} of {workload.spec.max_retries})"
+                    f"{reason}; retrying provider preemption ({spent + 1} of {budget})"
+                    if provider_preempted
+                    else f"{reason}; retrying capacity loss ({spent + 1} of {budget})"
                 ),
                 action="workload.capacity_recovery_queued",
                 expected_generation=workload.generation,
                 expected_lease_id=lease.id,
                 expected_state=workload.state,
+                provider_preempted=provider_preempted,
                 expected_cell_generation=lost_cell.generation,
                 expected_cell_state=lost_cell.state,
                 expected_unavailable_reason=lost_cell.unavailable_reason,

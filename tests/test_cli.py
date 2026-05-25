@@ -1739,6 +1739,7 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
         "checkpoint_output_uri": None,
         "max_retries": 0,
         "max_failure_retries": 0,
+        "max_preemption_retries": 10,
     }
 
 
@@ -1959,6 +1960,7 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "metadata": {},
         "max_retries": 3,
         "max_failure_retries": 0,
+        "max_preemption_retries": 10,
         # Absent unless `--workspace` is passed: `eyvan run` must keep sending
         # pure command intent, with the working tree an explicit opt-in rather
         # than something a submission carries by surprise.

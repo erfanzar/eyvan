@@ -38,6 +38,7 @@ def pool_workload_request(
     metadata: tp.Mapping[str, str] | None,
     max_retries: int,
     max_failure_retries: int = 0,
+    max_preemption_retries: int = 10,
     workspace: WorkspaceRef | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
@@ -52,6 +53,7 @@ def pool_workload_request(
         metadata=dict(metadata or {}),
         max_retries=max_retries,
         max_failure_retries=max_failure_retries,
+        max_preemption_retries=max_preemption_retries,
         workspace=workspace,
     )
 
@@ -70,6 +72,7 @@ def pool_callable_request(
     metadata: tp.Mapping[str, str] | None,
     max_retries: int,
     max_failure_retries: int = 0,
+    max_preemption_retries: int = 10,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -88,6 +91,7 @@ def pool_callable_request(
         metadata=dict(metadata or {}),
         max_retries=max_retries,
         max_failure_retries=max_failure_retries,
+        max_preemption_retries=max_preemption_retries,
     )
 
 

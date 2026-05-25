@@ -595,6 +595,7 @@ class ControlPlaneService:
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_failure_retries: int = 0,
+        max_preemption_retries: int = 10,
         workspace: WorkspaceRef | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
@@ -658,6 +659,7 @@ class ControlPlaneService:
                 metadata=dict(metadata or {}),
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
+                max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 workspace=workspace,
             )
@@ -690,6 +692,7 @@ class ControlPlaneService:
         metadata: tp.Mapping[str, str] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_failure_retries: int = 0,
+        max_preemption_retries: int = 10,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -796,6 +799,7 @@ class ControlPlaneService:
                 metadata=dict(metadata or {}),
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
+                max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 worker_count=pods,
             )
@@ -892,6 +896,7 @@ class ControlPlaneService:
         max_retries: int,
         max_failure_retries: int,
         cell_group_count: int,
+        max_preemption_retries: int = 10,
         worker_count: int = 1,
         workspace: WorkspaceRef | None = None,
     ) -> WorkloadDefinition:
@@ -922,6 +927,7 @@ class ControlPlaneService:
             required_labels=required_labels,
             max_retries=max_retries,
             max_failure_retries=max_failure_retries,
+            max_preemption_retries=max_preemption_retries,
             cell_group_count=cell_group_count,
             worker_count=worker_count,
             worker_resource_scope=WorkerResourceScope.PER_WORKER,
@@ -1814,12 +1820,20 @@ class ControlPlaneService:
         expected_lease_id: str | None = None,
         expected_state: WorkloadState | None = None,
         require_preemption_owner: bool = False,
+        provider_preempted: bool = False,
         expected_cell_generation: int | None = None,
         expected_cell_state: CellState | None = None,
         expected_unavailable_reason: str | None = None,
         expected_cell_id: str | None = None,
     ) -> tuple[WorkloadRecord, LeaseRecord | None, BudgetRecord | None]:
-        """Atomically settle a preempted lease and requeue its workload."""
+        """Atomically settle a preempted lease and requeue its workload.
+
+        ``provider_preempted`` charges the restart to the preemption budget
+        instead of the capacity-loss one. Not the same thing as
+        ``require_preemption_owner``, which is about *Eyvan's own* priority
+        preemption -- one is the fleet taking capacity back from a lower-priority
+        job, the other is the cloud taking it back from the fleet.
+        """
 
         self.authorizer.require(principal, Permission.MANAGE_FLEET)
         async with self.repository.transaction() as tx:
@@ -1867,7 +1881,11 @@ class ControlPlaneService:
                 update={
                     "state": WorkloadState.PENDING,
                     "attempt": workload.attempt + 1,
-                    "capacity_loss_count": workload.capacity_loss_count + 1,
+                    **(
+                        {"preemption_count": workload.preemption_count + 1}
+                        if provider_preempted
+                        else {"capacity_loss_count": workload.capacity_loss_count + 1}
+                    ),
                     "generation": next_generation,
                     "spec": self.result_spec_for_generation(
                         workload.spec,

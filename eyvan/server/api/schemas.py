@@ -187,6 +187,7 @@ class PoolWorkloadSubmitRequest(ApiModel):
     metadata: dict[str, str] = Field(default_factory=dict)
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
+    max_preemption_retries: int = Field(default=10, ge=0)
     #: Working tree to materialize on the host before the command runs. Uploaded
     #: separately to the content-addressed workspace route, then referenced here.
     workspace: WorkspaceRef | None = None
@@ -210,6 +211,7 @@ class PoolCallableSubmitRequest(ApiModel):
     metadata: dict[str, str] = Field(default_factory=dict)
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
+    max_preemption_retries: int = Field(default=10, ge=0)
 
 
 class PreemptionForceFinalizeRequest(ApiModel):

@@ -75,6 +75,7 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         # Separate from ``max_retries``: that budget pays for capacity the fleet
         # lost, this one for the job's own non-zero exit, which usually repeats.
         "max_failure_retries": 0,
+        "max_preemption_retries": 10,
         # Explicit opt-in: the SDK sends command intent only, so a submission
         # never carries a working tree the caller did not ask to ship.
         "workspace": None,
@@ -159,6 +160,7 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "metadata": {},
         "max_retries": 3,
         "max_failure_retries": 0,
+        "max_preemption_retries": 10,
     }
     client.close()
 

@@ -885,6 +885,20 @@ class WorkloadDefinition(EyvanModel):
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
     max_retries: int = Field(default=0, ge=0, le=100)
     max_failure_retries: int = Field(default=0, ge=0, le=100)
+    #: Restarts allowed after the *provider* reclaimed the capacity, separate
+    #: from ``max_retries``.
+    #:
+    #: A spot reclamation is the expected ending of a spot job and says nothing
+    #: about whether the fleet can run it again; a stockout says this pool is
+    #: empty, and a bad request says it will fail the same way forever. Charging
+    #: all three to one budget means a job on spot spends its whole allowance on
+    #: the one failure that was always going to happen, and then gives up the
+    #: first time something is genuinely wrong.
+    #:
+    #: The default is deliberately larger than ``max_retries``: this is the
+    #: cheap failure to retry, and a spot job that cannot outlast a handful of
+    #: reclamations cannot use spot at all.
+    max_preemption_retries: int = Field(default=10, ge=0, le=1000)
     #: Whether this workload receives a capability to submit children of its own.
     #: Off by default: a job that does not fan out should not be handed a
     #: credential it cannot use, and a credential nobody asked for is one nobody
@@ -1053,6 +1067,9 @@ class WorkloadRecord(EyvanModel):
     attempt: int = 1
     failure_count: int = Field(default=0, ge=0)
     capacity_loss_count: int = Field(default=0, ge=0)
+    #: Restarts already spent on provider reclamation, charged against
+    #: ``spec.max_preemption_retries`` rather than ``spec.max_retries``.
+    preemption_count: int = Field(default=0, ge=0)
     generation: int = 1
     lease_id: str | None = None
     lease_ids: tuple[str, ...] = ()

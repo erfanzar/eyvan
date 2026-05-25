@@ -462,6 +462,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 secret_mounts=request.tpu.secret_mounts,
                 max_retries=request.tpu.max_retries,
                 max_failure_retries=request.tpu.max_failure_retries,
+                max_preemption_retries=request.tpu.max_preemption_retries,
                 idempotency_key=request.invocation_id,
             )
         except EyvanHTTPError as error:

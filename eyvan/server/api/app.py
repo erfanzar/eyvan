@@ -1229,6 +1229,7 @@ def create_app(
             metadata=request.metadata,
             max_retries=request.max_retries,
             max_failure_retries=request.max_failure_retries,
+            max_preemption_retries=request.max_preemption_retries,
             workspace=request.workspace,
             idempotency_key=idempotency_key,
         )
@@ -1271,6 +1272,7 @@ def create_app(
             metadata=request.metadata,
             max_retries=request.max_retries,
             max_failure_retries=request.max_failure_retries,
+            max_preemption_retries=request.max_preemption_retries,
             idempotency_key=idempotency_key,
         )
         if replayed:

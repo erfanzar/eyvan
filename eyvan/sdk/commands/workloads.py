@@ -478,6 +478,14 @@ def workload() -> None:
     help="Retries for the job's own non-zero exit. Separate from --max-retries, which pays for capacity the fleet lost.",
 )
 @click.option(
+    "--max-preemption-retries",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Restarts allowed after the provider reclaims the capacity. Separate from --max-retries because a spot "
+    "reclamation is expected and cheap to retry, while a stockout means the pool is empty.",
+)
+@click.option(
     "--secret",
     "secret_mounts",
     multiple=True,
@@ -513,6 +521,7 @@ def submit_workload(
     checkpoint_output_uri: str | None,
     max_retries: int,
     max_failure_retries: int,
+    max_preemption_retries: int,
     secret_mounts: tuple[str, ...],
     idempotency_key: str | None,
 ) -> None:
@@ -543,6 +552,7 @@ def submit_workload(
                 checkpoint_output_uri=checkpoint_output_uri,
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
+                max_preemption_retries=max_preemption_retries,
                 secret_mounts=mounts,
             ),
         )

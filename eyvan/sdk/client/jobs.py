@@ -62,6 +62,7 @@ class AcceleratorConfig(tp.Protocol):
     pods: int
     max_retries: int
     max_failure_retries: int
+    max_preemption_retries: int
     capacity_class: CapacityClass
     secret_mounts: tp.Mapping[str, str]
 
@@ -118,6 +119,10 @@ class TpuConfig:
     #: Retries the job's *own* failure, not lost capacity. Zero by default: a
     #: non-zero exit usually repeats, and re-running it costs an accelerator.
     max_failure_retries: int = 0
+    #: Restarts after the provider reclaims the capacity. Larger than
+    #: ``max_retries`` on purpose: this is the cheap failure to retry, and a spot
+    #: job that cannot outlast a handful of reclamations cannot use spot at all.
+    max_preemption_retries: int = 10
     capacity_class: CapacityClass = CapacityClass.SPOT
     #: Secret references, resolved at dispatch and injected as environment
     #: variables on the cell. Unlike a value passed through ``environment``, a
@@ -147,6 +152,8 @@ class GpuConfig:
     max_retries: int = DEFAULT_MAX_RETRIES
     #: Retries the job's *own* failure, not lost capacity. See ``TpuConfig``.
     max_failure_retries: int = 0
+    #: Restarts after the provider reclaims the capacity. See ``TpuConfig``.
+    max_preemption_retries: int = 10
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1
@@ -168,6 +175,8 @@ class CpuConfig:
     max_retries: int = DEFAULT_MAX_RETRIES
     #: Retries the job's *own* failure, not lost capacity. See ``TpuConfig``.
     max_failure_retries: int = 0
+    #: Restarts after the provider reclaims the capacity. See ``TpuConfig``.
+    max_preemption_retries: int = 10
     capacity_class: CapacityClass = CapacityClass.ON_DEMAND
     #: Fixed at one. Present so the submission path is shape-agnostic.
     pods: int = 1

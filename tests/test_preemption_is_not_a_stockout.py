@@ -361,3 +361,232 @@ def test_a_recovered_cell_stops_carrying_its_old_reason(tmp_path) -> None:
     assert recovered.state is CapacityStatus.HEALTHY
     assert recovered.failure_code is None
     assert driver.observe("cell-a").failure_code is None
+
+
+# --------------------------------------------------------------------------- the budget
+
+
+async def _lost_workload(*, failure_code, max_retries=1, max_preemption_retries=1, spent_preemptions=0):
+    """Lose one running workload's cell and return the workload after recovery."""
+
+    from test_controller import FakeAgent, principal
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import (
+        CellRecord,
+        CellState,
+        CommandExecution,
+        ResourceVector,
+        Role,
+        WorkloadDefinition,
+        WorkloadState,
+    )
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CoreSchedulingService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    agent = FakeAgent()
+    controller = EyvanController(repository, service, settings=EyvanSettings(), agent_factory=lambda _cell: agent)
+    await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        CellRecord(
+            id="cell-a",
+            provider="local",
+            region="local",
+            state=CellState.REGISTERING,
+            capacity=ResourceVector(cpu=8, memory_gib=64),
+            allocatable=ResourceVector(cpu=8, memory_gib=64),
+            endpoint="http://agent:8090",
+        ),
+        idempotency_key="cell",
+    )
+    assert await controller.dispatch_outbox_once() == 1
+    workload, _ = await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="train",
+            execution=CommandExecution(command="python train.py"),
+            checkpointable=True,
+            checkpoint_hook="python -m save",
+            checkpoint_output_uri="gs://ckpt",
+            max_retries=max_retries,
+            max_preemption_retries=max_preemption_retries,
+        ),
+        idempotency_key="train",
+    )
+    await controller.reconcile_once()
+    assert await controller.dispatch_outbox_once() == 1
+    async with repository.transaction() as tx:
+        stored = await tx.get_workload(workload.id)
+        assert stored is not None
+        await tx.put_workload(
+            stored.model_copy(
+                update={
+                    "state": WorkloadState.RUNNING,
+                    "checkpoint_uri": "gs://ckpt/step-1",
+                    "preemption_count": spent_preemptions,
+                }
+            )
+        )
+    agent.capacity_state = CapacityStatus.NEEDS_RECREATE
+    agent.capacity_failure_code = failure_code
+    await controller.observe_cells_once()
+    await controller.observe_workloads_once()
+    async with repository.transaction() as tx:
+        return await tx.get_workload(workload.id)
+
+
+async def test_a_reclamation_spends_the_preemption_budget_not_the_capacity_one() -> None:
+    """The two failures mean opposite things about whether running again can work.
+
+    Charging both to ``max_retries`` means a spot job spends its whole allowance
+    on the failure that was always going to happen, then gives up the first time
+    something is genuinely wrong.
+    """
+
+    workload = await _lost_workload(failure_code=CapacityProviderFailureCode.PREEMPTED)
+
+    assert workload is not None
+    assert workload.preemption_count == 1
+    assert workload.capacity_loss_count == 0
+
+
+async def test_an_ordinary_capacity_loss_still_spends_the_capacity_budget() -> None:
+    """The existing accounting has to survive the split, or every job's limit moved."""
+
+    workload = await _lost_workload(failure_code=None)
+
+    assert workload is not None
+    assert workload.capacity_loss_count == 1
+    assert workload.preemption_count == 0
+
+
+async def test_an_exhausted_preemption_budget_stops_the_workload() -> None:
+    """A separate budget is only a budget if it can run out.
+
+    Otherwise "give preemption its own allowance" is "give preemption an
+    unlimited allowance", which is how a broken image on spot bills forever.
+    """
+
+    from eyvan.records import WorkloadState
+
+    workload = await _lost_workload(
+        failure_code=CapacityProviderFailureCode.PREEMPTED,
+        max_preemption_retries=1,
+        spent_preemptions=1,
+    )
+
+    assert workload is not None
+    assert workload.state in {WorkloadState.FAILED, WorkloadState.CANCELLED}
+    assert workload.preemption_count == 1
+
+
+async def test_a_reclamation_does_not_consult_the_capacity_budget() -> None:
+    """A job with no capacity-loss allowance left must still survive a reclamation.
+
+    This is the distinguishing case: with one shared budget the exhausted
+    ``max_retries`` would end the workload, and the split is what keeps it alive.
+    """
+
+    from eyvan.records import WorkloadState
+
+    workload = await _lost_workload(
+        failure_code=CapacityProviderFailureCode.PREEMPTED,
+        max_retries=0,
+        max_preemption_retries=5,
+    )
+
+    assert workload is not None
+    assert workload.state is WorkloadState.PENDING
+    assert workload.preemption_count == 1
+
+
+def test_a_submitter_can_set_the_preemption_budget_from_the_cli(monkeypatch) -> None:
+    """A budget only the default ever reaches is a constant with extra steps."""
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient, _json_argument
+
+    from eyvan.sdk import cli
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--user",
+            "alice",
+            "--org",
+            "acme",
+            "--project",
+            "research",
+            "workload",
+            "submit",
+            "--name",
+            "train",
+            "--command",
+            "python train.py",
+            "--max-preemption-retries",
+            "25",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _json_argument(fake.calls[0])["spec"]["max_preemption_retries"] == 25
+
+
+def test_a_callable_config_carries_its_preemption_budget(tmp_path) -> None:
+    """``@execute`` on spot is the case this budget exists for."""
+
+    import json
+
+    import httpx
+
+    from eyvan.artifacts import LocalArtifactStore
+    from eyvan.records import CallableExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.sdk import EyvanCallableSubmitter, EyvanClient
+    from eyvan.sdk.execution import CallableSubmission, TpuConfig
+    from eyvan.worker.runtime.callables import dump_callable
+
+    store = LocalArtifactStore(tmp_path)
+    artifact = store.put(dump_callable(lambda: None))
+    execution = CallableExecution(
+        artifact_uri=artifact.uri,
+        sha256=artifact.sha256,
+        python=artifact.python,
+        result_uri="gs://artifacts/results/run-1.result",
+    )
+    pending = WorkloadRecord(
+        id="wl-1",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="train", execution=execution),
+        created_by="alice",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=pending.model_dump(mode="json"))
+
+    client = EyvanClient(client=httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test"))
+    EyvanCallableSubmitter(client, store).submit_callable(
+        CallableSubmission(
+            invocation_id="call-1",
+            fleet="research",
+            org_id="acme",
+            project_id="research",
+            callable_name="tests.train",
+            tpu=TpuConfig(type="v5p-16", max_preemption_retries=40),
+            artifact=artifact,
+            result_uri="gs://artifacts/results/run-1.result",
+        )
+    )
+
+    assert json.loads(requests[0].content)["max_preemption_retries"] == 40
+    client.close()
