@@ -94,6 +94,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "DELETE /api/v1/capacity-pools/{pool_id}": "disable a pool",
     "GET /api/v1/capacity/orphans": "capacity no record claims",
     "GET /api/v1/capacity/billing": "fleet-wide cost",
+    "GET /api/v1/capacity/carbon": "fleet-wide grid intensity",
     "GET /api/v1/capacity/warmth": "fleet-wide warm state",
     "GET /api/v1/capacity/queue-trend": "fleet-wide queue depth",
     "GET /api/v1/fleets/{fleet_name}": "one fleet",

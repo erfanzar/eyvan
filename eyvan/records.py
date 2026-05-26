@@ -2089,6 +2089,46 @@ class PoolWarmth(EyvanModel):
         return self.warm_cells >= self.floor
 
 
+class RegionCarbon(EyvanModel):
+    """What is known about one region's grid intensity, including nothing.
+
+    ``intensity`` is null and ``reason`` is populated whenever there is no
+    usable reading, which today is always: no provider ships. Reported rather
+    than omitted, because an operator asking about carbon deserves the answer
+    "nothing is configured" instead of an empty list they have to interpret.
+    """
+
+    region: str
+    #: Grams of CO2e per kWh, or null. Never zero as a stand-in -- zero claims a
+    #: carbon-free grid, which is the strongest statement the field can make.
+    intensity: float | None = None
+    #: Who measured it and when. Both null exactly when ``intensity`` is.
+    source: str | None = None
+    observed_at: datetime | None = None
+    #: Why there is no reading, from the closed ``CarbonUnavailableReason`` set.
+    reason: str | None = None
+    detail: str = ""
+
+
+class CarbonReport(EyvanModel):
+    """Grid intensity across the regions the fleet actually occupies.
+
+    Deliberately not part of placement. A carbon number that silently steered
+    scheduling would produce decisions that look deliberate and are not, so this
+    is a report and only a report until someone brings a source they trust; a
+    test asserts the placement path does not import the module behind it.
+    """
+
+    observed_at: datetime = Field(default_factory=utcnow)
+    regions: tuple[RegionCarbon, ...] = ()
+
+    @property
+    def configured(self) -> bool:
+        """Whether any region produced a usable reading."""
+
+        return any(region.intensity is not None for region in self.regions)
+
+
 class WarmthReport(EyvanModel):
     """Warm-floor status across every pool, at one moment."""
 

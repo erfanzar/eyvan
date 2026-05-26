@@ -141,6 +141,22 @@ def warmth(session: CliSession, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+@capacity.command("carbon")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def carbon(session: CliSession, as_json: bool) -> None:
+    """Report grid intensity for the regions this fleet occupies.
+
+    Expect ``no_provider`` everywhere: none ships, and Eyvan will not invent one.
+    A number this control plane cannot vouch for is worse than none, because the
+    placement decisions it produced would look deliberate -- so carbon is a
+    report here and never an input to scheduling.
+    """
+
+    payload = session.client.request("GET", "/api/v1/capacity/carbon")
+    _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
 @capacity.command("billing")
 @click.option("--pool", "pool_id", help="Restrict the report to one capacity pool.")
 @click.option("--json", "as_json", is_flag=True)

@@ -28,6 +28,7 @@ from eyvan.artifacts.managed import (
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.capacity.planning import cell_matches_template, cell_provides_pool_supply
 from eyvan.domain import costing
+from eyvan.domain.carbon import CarbonSource, CarbonUnavailable, NoCarbonSource, fresh_reading
 from eyvan.domain.models import SchedulingResult
 from eyvan.records import (
     BILLABLE_CELL_STATES,
@@ -48,6 +49,7 @@ from eyvan.records import (
     CallableExecution,
     CapacityClass,
     CapacityPoolRecord,
+    CarbonReport,
     CellBillingAccrual,
     CellBillingReport,
     CellRecord,
@@ -73,6 +75,7 @@ from eyvan.records import (
     QueueTrend,
     QueueTrendPoint,
     QuotaRecord,
+    RegionCarbon,
     ResourceGang,
     Role,
     RoleGrant,
@@ -365,6 +368,11 @@ class ControlPlaneService:
         #: the default: one plane per region with projects pinned to one region
         #: already works, and a plane with no id simply cannot issue grants.
         plane_id: str = "",
+        #: Where grid intensity comes from. ``NoCarbonSource`` by default and in
+        #: every shipped configuration: a provider Eyvan invented would publish
+        #: numbers nobody can check, and the reporting path is the only place a
+        #: real one may ever be consulted.
+        carbon: CarbonSource | None = None,
     ):
         self.repository = repository
         self.authorizer = authorizer or Authorizer()
@@ -372,6 +380,7 @@ class ControlPlaneService:
         self.scheduler = scheduler
         self.artifact_store = artifact_store
         self.plane_id = plane_id
+        self.carbon = carbon or NoCarbonSource()
 
     async def schedule_once(self, principal: Principal):
         """Return one pure scheduling plan without committing its proposed leases."""
@@ -5287,6 +5296,40 @@ class ControlPlaneService:
             accrued_cost=accrued_cost,
             idle_cost=idle_cost,
         )
+
+    async def carbon_report(self, principal: Principal, *, now: datetime | None = None) -> CarbonReport:
+        """Report grid intensity for the regions the fleet actually occupies.
+
+        Only regions with a pool, because a global table of grid intensities is a
+        dataset rather than a report -- and one whose accuracy nobody here could
+        vouch for.
+
+        Every entry today carries ``no_provider``: none ships. Reporting the
+        absence is the deliverable. A carbon feature whose unconfigured state is
+        an empty response is one an operator cannot distinguish from a broken
+        one, and a carbon feature whose unconfigured state is *zero* is one that
+        claims every grid is clean.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        moment = now or utcnow()
+        async with self.repository.transaction() as tx:
+            pools = await tx.list_capacity_pools()
+        regions: list[RegionCarbon] = []
+        for region in sorted({pool.region for pool in pools if pool.region}):
+            reading = fresh_reading(self.carbon.read(region), now=moment)
+            if isinstance(reading, CarbonUnavailable):
+                regions.append(RegionCarbon(region=region, reason=reading.reason.value, detail=reading.detail))
+                continue
+            regions.append(
+                RegionCarbon(
+                    region=region,
+                    intensity=reading.grams_co2e_per_kwh,
+                    source=reading.source,
+                    observed_at=reading.observed_at,
+                )
+            )
+        return CarbonReport(observed_at=moment, regions=tuple(regions))
 
     async def warmth_report(self, principal: Principal, *, now: datetime | None = None) -> WarmthReport:
         """Report every pool's warm floor and whether it is currently held.

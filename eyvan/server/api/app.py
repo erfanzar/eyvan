@@ -60,6 +60,7 @@ from eyvan.records import (
     CallableExecution,
     CapacityClass,
     CapacityPoolRecord,
+    CarbonReport,
     CellBillingReport,
     CellRecord,
     LeaseRecord,
@@ -673,6 +674,26 @@ def create_app(
         return await service.queue_trend(
             principal, org_id=org_id, project_id=project_id, window_s=window_s, buckets=buckets
         )
+
+    @app.get("/api/v1/capacity/carbon", response_model=CarbonReport, tags=["capacity"])
+    async def carbon_report(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> CarbonReport:
+        """Report grid intensity for the regions this fleet occupies.
+
+        Every entry carries ``no_provider`` unless an operator has configured a
+        source, and none ships. That is the answer, not a gap in it: a carbon
+        feature whose unconfigured state is an empty response cannot be told
+        apart from a broken one, and one whose unconfigured state is *zero*
+        claims every grid is clean.
+
+        Reporting only. Nothing in the placement path consults this, and a test
+        asserts the scheduler and the planner do not import the module behind
+        it -- a number nobody has validated would otherwise steer scheduling
+        while looking deliberate.
+        """
+
+        return await service.carbon_report(principal)
 
     @app.get("/api/v1/capacity/warmth", response_model=WarmthReport, tags=["capacity"])
     async def warmth_report(
