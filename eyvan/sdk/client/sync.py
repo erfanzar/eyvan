@@ -24,6 +24,7 @@ from eyvan.records import (
     CellRecord,
     LeaseRecord,
     PolicyRecord,
+    WorkloadEstimate,
     WorkloadProgress,
     WorkloadRecord,
     WorkloadState,
@@ -37,7 +38,7 @@ from eyvan.sdk.client.requests import (
 )
 from eyvan.sdk.client.transport import SyncApiTransport
 from eyvan.sdk.client.types import HeaderMap, QueryParams
-from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadSubmitRequest
+from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadEstimateRequest, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.callables import CallableArtifact
 
@@ -90,6 +91,16 @@ class EyvanClient:
             idempotency_key=idempotency_key,
         )
         return WorkloadRecord.model_validate(response.json())
+
+    def estimate_workload(self, request: WorkloadEstimateRequest) -> WorkloadEstimate:
+        """Ask what a workload would cost, before submitting anything.
+
+        Not a mutating request and no idempotency key: it writes nothing, so a
+        replay is just another read.
+        """
+
+        response = self._transport.request_checked("POST", "/api/v1/workloads/estimate", json=model_json(request))
+        return WorkloadEstimate.model_validate(response.json())
 
     def upload_managed_callable(
         self,

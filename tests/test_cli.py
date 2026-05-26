@@ -140,6 +140,15 @@ class FakeClient:
             if json is None:
                 raise AssertionError("workload submit requires JSON")
             return json
+        if method == "POST" and path == "/api/v1/workloads/estimate":
+            if json is None:
+                raise AssertionError("workload estimate requires JSON")
+            return {
+                "org_id": json["org_id"],
+                "project_id": json["project_id"],
+                "estimated_duration_seconds": 3600,
+                "candidates": [],
+            }
         if method == "POST" and path == "/api/v1/batches":
             if json is None:
                 raise AssertionError("batch submit requires JSON")

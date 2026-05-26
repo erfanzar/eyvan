@@ -26,6 +26,7 @@ from eyvan.records import (
     JsonDocument,
     NativeRuntimeConfig,
     ResourceLimits,
+    WarmWindow,
     validate_capacity_pool_quota_groups,
 )
 
@@ -268,6 +269,11 @@ class NodeTypeBase(FleetConfigModel):
     resources: ResourceLimits
     allocatable: ResourceLimits | None = None
     min_cells: int = Field(default=0, ge=0)
+    #: Recurring windows during which the pool holds a raised cell floor.
+    #:
+    #: Honoured by the planner since ``WarmWindow`` was written; until now every
+    #: writer was a test, so the feature existed and no operator could reach it.
+    warm_windows: tuple[WarmWindow, ...] = ()
     max_cells: int = Field(default=1, ge=0, le=10_000)
     initial_cells: int | None = Field(default=None, ge=0)
     idle_timeout_s: int | None = Field(default=None, ge=0)
@@ -382,6 +388,13 @@ class NodeTypeBase(FleetConfigModel):
         desired = self.desired_initial_cells
         if self.min_cells > self.max_cells:
             raise ValueError("min_cells must not exceed max_cells")
+        for window in self.warm_windows:
+            if window.min_cells > self.max_cells:
+                # Caught here rather than at 09:00 on a Monday. A floor above the
+                # ceiling is a window that can never be satisfied, and the
+                # planner would clamp it silently -- so the operator would see a
+                # pool that quietly ignored the number they wrote.
+                raise ValueError(f"warm window min_cells {window.min_cells} exceeds max_cells {self.max_cells}")
         if desired < self.min_cells:
             raise ValueError("initial_cells must be at least min_cells")
         if desired > self.max_cells:
@@ -729,6 +742,7 @@ class EyvanFleetConfig(FleetConfigModel):
                     "quota_limit": node_type.quota_limit,
                     "quota_units_per_cell": node_type.quota_units_per_cell,
                     "min_cells": node_type.min_cells,
+                    "warm_windows": [model_json(window) for window in node_type.warm_windows],
                     "max_cells": node_type.max_cells,
                     "initial_cells": node_type.desired_initial_cells,
                     "idle_timeout_s": node_type.idle_timeout_s

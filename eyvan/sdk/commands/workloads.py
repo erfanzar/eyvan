@@ -37,7 +37,13 @@ from eyvan.sdk.client.requests import pool_workload_request
 from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
-from eyvan.server.api.schemas import BatchSubmitRequest, DagNodeRequest, DagSubmitRequest, WorkloadSubmitRequest
+from eyvan.server.api.schemas import (
+    BatchSubmitRequest,
+    DagNodeRequest,
+    DagSubmitRequest,
+    WorkloadEstimateRequest,
+    WorkloadSubmitRequest,
+)
 from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 
 WorkloadAction = tp.Literal["cancel", "checkpoint", "retry"]
@@ -430,6 +436,94 @@ def exec_in_workload(
 @click.group("workload")
 def workload() -> None:
     """Submit and operate whole workloads."""
+
+
+@workload.command("estimate")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--name", default="estimate", show_default=True)
+@click.option("--command", default="true", show_default=True, help="Not run; a spec needs one to validate.")
+@click.option("--cpu", type=float, default=1.0, show_default=True)
+@click.option("--memory-gib", type=float, default=1.0, show_default=True)
+@click.option("--gpu", type=int, default=0, show_default=True)
+@click.option("--tpu", type=int, default=0, show_default=True)
+@click.option("--replicas", type=int, default=1, show_default=True)
+@click.option(
+    "--capacity-class",
+    type=click.Choice(tuple(capacity.value for capacity in CapacityClass)),
+    default=CapacityClass.ON_DEMAND.value,
+    show_default=True,
+)
+@click.option("--accelerator-type")
+@click.option("--provider")
+@click.option("--region")
+@click.option(
+    "--duration-s",
+    "estimated_duration_seconds",
+    type=int,
+    default=3600,
+    show_default=True,
+    help="How long the job is expected to run. Every figure is an estimate over this number, so the answer is only "
+    "as honest as it is.",
+)
+@click.pass_obj
+def estimate_workload(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    name: str,
+    command: str,
+    cpu: float,
+    memory_gib: float,
+    gpu: int,
+    tpu: int,
+    replicas: int,
+    capacity_class: str,
+    accelerator_type: str | None,
+    provider: str | None,
+    region: str | None,
+    estimated_duration_seconds: int,
+) -> None:
+    """Ask what a workload would cost before submitting it.
+
+    The route has existed since budgets did; nothing outside the raw HTTP API
+    could reach it, so the question it answers still required submitting a job
+    and reading the resulting lease.
+
+    Not a scheduling dry run. It consults declared pool attributes and prices,
+    never live cell availability -- an estimate that claimed to predict placement
+    would be wrong the moment the fleet moved.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    try:
+        request = WorkloadEstimateRequest(
+            org_id=scope.org_id,
+            project_id=scope.project_id,
+            spec=WorkloadDefinition(
+                name=name,
+                execution=CommandExecution(kind="command", command=command),
+                gang=ResourceGang(
+                    replicas=replicas,
+                    per_replica=ResourceVector(cpu=cpu, memory_gib=memory_gib, gpu=gpu, tpu=tpu),
+                ),
+                capacity_class=CapacityClass(capacity_class),
+                accelerator_type=accelerator_type,
+                provider=provider,
+                region=region,
+                estimated_duration_seconds=estimated_duration_seconds,
+            ),
+        )
+    except (ValidationError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    JsonRenderer().emit(
+        session.client.request(
+            "POST",
+            "/api/v1/workloads/estimate",
+            json=model_json(request),
+            headers=session.workload_headers(scope),
+        )
+    )
 
 
 @workload.command("submit")

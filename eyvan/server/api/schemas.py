@@ -31,6 +31,7 @@ from eyvan.records import (
     ResourceLimits,
     RoleGrant,
     RoleGrantRecord,
+    WarmWindow,
     WorkloadDefinition,
     WorkloadRecord,
     WorkspaceRef,
@@ -271,6 +272,11 @@ class CapacityPoolUpsertRequest(ApiModel):
     quota_limit: int | None = Field(default=None, ge=0)
     quota_units_per_cell: int | None = Field(default=None, ge=1)
     min_cells: int = Field(default=0, ge=0)
+    #: Recurring windows during which the pool holds a raised cell floor.
+    #:
+    #: Honoured by the planner since ``WarmWindow`` was written; until now every
+    #: writer was a test, so the feature existed and no operator could reach it.
+    warm_windows: tuple[WarmWindow, ...] = ()
     initial_cells: int | None = Field(default=None, ge=0)
     max_cells: int = Field(default=1, ge=0, le=10_000)
     idle_timeout_s: float = Field(default=300, ge=0)
