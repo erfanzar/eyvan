@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import typing as tp
+from dataclasses import replace
+from datetime import datetime
 
 from eyvan.domain import (
     Budget,
@@ -41,6 +43,7 @@ from eyvan.records import (
     QuotaRecord,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.records import (
     CapacityClass as ApiCapacityClass,
@@ -48,6 +51,7 @@ from eyvan.records import (
 from eyvan.records import (
     ResourceVector as ApiResourceVector,
 )
+from eyvan.server.service.federation import BudgetGrantRecord
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 
@@ -63,6 +67,9 @@ class SchedulingService(tp.Protocol):
         budgets: tp.Iterable[BudgetRecord] = (),
         quotas: tp.Iterable[QuotaRecord] = (),
         policies: tp.Iterable[PolicyRecord] = (),
+        grants: tp.Iterable[BudgetGrantRecord] = (),
+        plane_id: str = "",
+        now: datetime | None = None,
     ) -> SchedulingResult: ...
 
 
@@ -305,6 +312,74 @@ def to_core_quota(record: QuotaRecord) -> Quota:
     )
 
 
+def federated_budgets(
+    records: tp.Sequence[BudgetRecord],
+    grants: tp.Sequence[BudgetGrantRecord],
+    *,
+    plane_id: str,
+    now: datetime,
+) -> list[Budget]:
+    """Bound this plane's admission by the grants it holds, not by a local counter.
+
+    ``BudgetRecord.spent`` is one durable counter in one database. A tenant with
+    projects on three planes therefore had three independent budgets, each
+    enforcing its own limit and each reporting full compliance while the tenant
+    spent three times what its operator set. Grants existed to fix that and
+    nothing consulted them: ``list_budget_grants`` was called from issuance,
+    status and expiry, and never from admission. A grant was recorded and
+    licensed nothing.
+
+    Three rules, and the second and third are the ones that matter:
+
+    * A plane holding no grants for a tenant is unchanged. That is the home
+      plane, and every non-federated deployment.
+    * A grantee's effective limit is the **tighter** of its grant total and any
+      local limit. A grant may not raise a ceiling a local operator set, and a
+      local record may not exceed the slice the home plane issued.
+    * A grant is a **hard** ceiling even when the local budget is soft.
+      Otherwise a grantee overspends its slice and the bound the whole mechanism
+      provides is void.
+
+    A grantee with grants and no local budget record gets a synthesized one, so
+    the gate exists at all. Without it, the plane with the least local
+    configuration would be the one with no limit -- exactly backwards.
+    """
+
+    granted: dict[tuple[str, str], float] = {}
+    # The empty check is a short-circuit, not the safety property. What actually
+    # keeps a non-federated plane from matching is ``grantee_plane_id``'s
+    # ``min_length=1``: no grant can be addressed to "".
+    if plane_id:
+        for grant in grants:
+            if grant.grantee_plane_id == plane_id and grant.active_at(now):
+                key = (grant.org_id, grant.project_id)
+                granted[key] = granted.get(key, 0.0) + grant.amount
+    budgets: list[Budget] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        key = (record.org_id, record.project_id)
+        seen.add(key)
+        allowance = granted.get(key)
+        if allowance is None:
+            budgets.append(to_core_budget(record))
+            continue
+        budgets.append(replace(to_core_budget(record), limit=min(allowance, record.limit), hard_limit=True))
+    for key, allowance in sorted(granted.items()):
+        if key in seen:
+            continue
+        org_id, project_id = key
+        budgets.append(
+            Budget(
+                scope=IdentityScope(org_id, project_id),
+                limit=allowance,
+                spent=0.0,
+                currency="USD",
+                hard_limit=True,
+            )
+        )
+    return budgets
+
+
 class CoreSchedulingService:
     """Adapter around :class:`eyvan.domain.Scheduler`."""
 
@@ -320,6 +395,9 @@ class CoreSchedulingService:
         budgets: tp.Iterable[BudgetRecord] = (),
         quotas: tp.Iterable[QuotaRecord] = (),
         policies: tp.Iterable[PolicyRecord] = (),
+        grants: tp.Iterable[BudgetGrantRecord] = (),
+        plane_id: str = "",
+        now: datetime | None = None,
     ) -> SchedulingResult:
         workload_records = list(workloads)
         workload_by_id = {workload.id: workload for workload in workload_records}
@@ -354,5 +432,5 @@ class CoreSchedulingService:
                 for lease in active_leases
             ),
             quotas=(to_core_quota(quota) for quota in quotas),
-            budgets=(to_core_budget(budget) for budget in budgets),
+            budgets=federated_budgets(list(budgets), list(grants), plane_id=plane_id, now=now or utcnow()),
         )

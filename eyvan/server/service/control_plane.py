@@ -399,6 +399,10 @@ class ControlPlaneService:
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()
             policies = await tx.list_policies()
+            # The read that made grants real. They were issued, reported on and
+            # expired, and never consulted by the thing that decides whether a
+            # workload may run -- so a grant was recorded and licensed nothing.
+            grants = await tx.list_budget_grants() if self.plane_id else []
         return self.scheduler.schedule(
             workloads,
             cells,
@@ -406,6 +410,8 @@ class ControlPlaneService:
             budgets=budgets,
             quotas=quotas,
             policies=policies,
+            grants=grants,
+            plane_id=self.plane_id,
         )
 
     async def explain_workload(self, principal: Principal, workload_id: str) -> WorkloadExplanation:
@@ -440,6 +446,10 @@ class ControlPlaneService:
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()
             policies = await tx.list_policies()
+            # The read that made grants real. They were issued, reported on and
+            # expired, and never consulted by the thing that decides whether a
+            # workload may run -- so a grant was recorded and licensed nothing.
+            grants = await tx.list_budget_grants() if self.plane_id else []
         result = self.scheduler.schedule(
             workloads,
             cells,
@@ -447,6 +457,8 @@ class ControlPlaneService:
             budgets=budgets,
             quotas=quotas,
             policies=policies,
+            grants=grants,
+            plane_id=self.plane_id,
         )
         explanation = _explain_from_scheduling_result(workload, result)
         if explanation.placeable:
@@ -527,8 +539,19 @@ class ControlPlaneService:
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()
             policies = await tx.list_policies()
+            # The read that made grants real. They were issued, reported on and
+            # expired, and never consulted by the thing that decides whether a
+            # workload may run -- so a grant was recorded and licensed nothing.
+            grants = await tx.list_budget_grants() if self.plane_id else []
         result = self.scheduler.schedule(
-            candidates, cells, leases=leases, budgets=budgets, quotas=quotas, policies=policies
+            candidates,
+            cells,
+            leases=leases,
+            budgets=budgets,
+            quotas=quotas,
+            policies=policies,
+            grants=grants,
+            plane_id=self.plane_id,
         )
         placed = {placement.workload_id for placement in result.placements}
         # Subset, not intersection: a member that no longer exists cannot appear in
