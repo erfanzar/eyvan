@@ -95,9 +95,14 @@ spec:
                 secretKeyRef:
                   name: eyvan-secrets
                   key: agent-shared-secret
+          # Readiness asks "can this replica serve", so it checks the database.
+          # Liveness asks "should this replica be restarted", so it must not:
+          # a liveness probe that depends on a shared database restarts every
+          # replica at once when that database blips, and then prevents recovery
+          # by stampeding reconnections.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5

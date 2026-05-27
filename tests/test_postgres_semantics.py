@@ -547,3 +547,26 @@ async def test_a_secret_allow_list_and_its_mounts_survive_the_real_backend(datab
         assert workload.spec.secret_mounts == {"HF_TOKEN": "gcp-secret://my-project/training-hf-token"}
     finally:
         await repository.close()
+
+
+async def test_the_readiness_probe_makes_a_real_round_trip(database) -> None:
+    """A connection can be checked out and dead.
+
+    So readiness asks the server, rather than inspecting pool state -- and this
+    is the only place that can be verified, because a fake engine answers
+    whatever it was told to.
+    """
+
+    repository = await _migrated(database)
+    try:
+        await repository.ping()
+    finally:
+        await repository.close()
+
+
+# A companion "the database went away" case is deliberately absent here. Engine
+# disposal does not simulate it -- SQLAlchemy simply rebuilds the pool and the
+# next connect succeeds -- and genuinely stopping the server would break the
+# session-scoped fixture every other test in this file shares. The unreachable
+# branch is covered against an in-memory double in ``test_readiness``; what only
+# a real database can prove is the round trip above, and that is what runs here.

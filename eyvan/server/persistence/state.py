@@ -513,6 +513,11 @@ class StateRepository:
 
         return None
 
+    async def ping(self) -> None:
+        """In-memory state is reachable whenever this process is."""
+
+        return None
+
     def _persist(self, state: ControlPlaneState) -> None:
         """Durably commit one validated state snapshot before publishing it in process."""
 

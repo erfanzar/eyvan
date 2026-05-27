@@ -1026,6 +1026,21 @@ class SqlAlchemyRepository:
                 return str(revision)
         return None
 
+    async def ping(self) -> None:
+        """Confirm this replica can still reach its database, right now.
+
+        A real round trip rather than a pool-state inspection: a connection can
+        be checked out and dead, and the only reliable question is whether the
+        server answers.
+
+        Deliberately cheap. This runs on every readiness probe of every replica,
+        so anything heavier than ``SELECT 1`` would put a load on the database
+        proportional to how closely the fleet is being watched.
+        """
+
+        async with self.engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
     async def close(self) -> None:
         """Keep engine disposal owned by the API factory that created it."""
 

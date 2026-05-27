@@ -123,6 +123,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
 EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/health": "liveness; no tenant data",
     "GET /healthz": "liveness; no tenant data",
+    "GET /readyz": "readiness; reports only whether this replica can reach its store",
     "GET /metrics": "separately authenticated by a scrape token; see test_metrics_endpoint_is_not_public",
     "GET /docs": "API documentation",
     "GET /docs/oauth2-redirect": "API documentation",

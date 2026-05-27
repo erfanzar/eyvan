@@ -469,6 +469,40 @@ def create_app(
     @app.get("/healthz", response_model=HealthResponse, tags=["system"])
     @app.get("/api/v1/health", response_model=HealthResponse, tags=["system"])
     async def health() -> HealthResponse:
+        """Liveness: this process is running and its event loop answers.
+
+        Deliberately does **not** touch the database, even though a probe that
+        did would look more thorough. Liveness failure means *restart me*, and a
+        liveness probe that depends on a shared database restarts every replica
+        at once the moment that database blips -- turning a recoverable outage
+        into a total one, then preventing recovery by stampeding reconnections.
+
+        Whether this replica can usefully serve is a different question with a
+        different consequence, and it is answered by ``/readyz``.
+        """
+
+        return HealthResponse(controller=startup.controller_mode)
+
+    @app.get("/readyz", response_model=HealthResponse, tags=["system"], include_in_schema=False)
+    async def readiness(response: Response) -> HealthResponse:
+        """Readiness: this replica can reach its database *now*.
+
+        The gap this closes: the deployment probed ``/healthz`` for readiness,
+        and ``/healthz`` returned a value computed at startup. A replica whose
+        database connection had died therefore reported 200 forever and stayed in
+        the Service's endpoints, absorbing traffic that could only fail.
+
+        503 rather than an exception so the body still names the controller mode:
+        an operator reading a failing probe wants to know which replica this is
+        as much as that it is failing.
+        """
+
+        try:
+            await repository.ping()
+        except Exception as exc:
+            logger.warning("Eyvan readiness probe failed: %s", exc)
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return HealthResponse(status="unavailable", controller=startup.controller_mode)
         return HealthResponse(controller=startup.controller_mode)
 
     async def artifact_body(request: Request, *, limit: int) -> bytes:

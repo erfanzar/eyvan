@@ -246,6 +246,19 @@ class Repository(tp.Protocol):
 
     def transaction(self) -> tp.AsyncContextManager[RepositorySession]: ...
 
+    async def ping(self) -> None:
+        """Raise when this replica cannot currently reach its store.
+
+        Separate from ``open`` because the answer changes: a connection that
+        worked at startup can be gone an hour later, and a readiness probe that
+        reported the startup answer would keep a replica in a Service's endpoints
+        while every request it receives fails.
+
+        Raises rather than returning a bool so the reason survives to the caller.
+        """
+
+        ...
+
     async def wait_for_events(
         self,
         *,
