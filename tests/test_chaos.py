@@ -62,6 +62,7 @@ from eyvan.records import (
     WorkloadState,
     utcnow,
 )
+from eyvan.server.invariants import Invariant, check_fleet
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.errors import ConflictError
@@ -515,6 +516,20 @@ async def test_a_workload_whose_lease_vanished_is_settled_rather_than_stranded()
         settled = await transaction.get_workload(workload.id)
     assert settled.state is WorkloadState.FAILED
     assert "no longer exists" in (settled.failure_reason or "")
+    # And the blast radius is bounded, not merely this one record. Asserted
+    # against the named invariants rather than eyeballed, because a recovery
+    # that settles the workload while leaving *other* state broken looks
+    # identical to a correct one from the workload alone.
+    #
+    # Exactly one violation survives, and it is the one this scenario injected:
+    # ``lease-orphan`` is a real ACTIVE lease that the corrupted workload stopped
+    # pointing at, and the sweep settles by workload, so nothing reaches it.
+    # Eyvan has no orphaned-*lease* reclamation to match its orphaned-workload
+    # sweep -- see I2. Pinned here rather than hidden, so building that sweep
+    # will visibly change this line.
+    violations = await check_fleet(repository)
+    assert [violation.invariant for violation in violations] == [Invariant.NO_LEASES_OUTLIVING_WORKLOADS]
+    assert violations[0].subject == "lease-orphan"
 
 
 @pytest.mark.asyncio

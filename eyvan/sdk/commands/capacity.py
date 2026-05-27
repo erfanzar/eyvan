@@ -141,6 +141,24 @@ def warmth(session: CliSession, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+@capacity.command("invariants")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def invariants(session: CliSession, as_json: bool) -> None:
+    """Report which durability invariants the fleet is currently violating.
+
+    The point-in-time ones. Budget monotonicity and storage growth are
+    statements about a sequence of observations, so a single call cannot settle
+    them; a soak run holds the previous snapshot and compares.
+
+    An empty list is a real claim rather than a default: every check has a test
+    that makes it fire, so silence means the checks ran and found nothing.
+    """
+
+    payload = session.client.request("GET", "/api/v1/system/invariants")
+    _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
 @capacity.command("carbon")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj

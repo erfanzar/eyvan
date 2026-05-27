@@ -106,6 +106,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/leases/{lease_id}": "one lease",
     "GET /api/v1/fleet/events": "unscoped audit trail",
     "POST /api/v1/preemptions/{command_id}/force-finalize": "break-glass preemption finalize",
+    "GET /api/v1/system/invariants": "fleet-wide durability check",
     "POST /api/v1/system/reconcile": "force a scheduling pass",
     "GET /api/v1/artifacts/collectable": "fleet-wide collectable artifacts",
     "GET /api/v1/artifacts/references": "fleet-wide artifact references",

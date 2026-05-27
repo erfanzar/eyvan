@@ -124,6 +124,7 @@ from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
+from eyvan.server.invariants import Invariant, check_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
@@ -1069,6 +1070,32 @@ def create_app(
             if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="metrics token required")
         return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/api/v1/system/invariants", tags=["system"])
+    async def fleet_invariants(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, tp.Any]:
+        """Report which durability invariants the fleet is currently violating.
+
+        The point-in-time half only. Budget monotonicity and storage growth are
+        statements about a *sequence* of observations, so a single request
+        cannot settle them and this does not pretend to -- a soak run holds the
+        previous snapshot and compares.
+
+        An empty ``violations`` list is a real claim, not a default: every check
+        has a test that makes it fire, so silence here means the checks ran and
+        found nothing rather than that nothing ran.
+        """
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        return {
+            "checked": [invariant.value for invariant in Invariant],
+            "violations": [
+                {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
+                for violation in violations
+            ],
+        }
 
     @app.post("/api/v1/system/reconcile", tags=["system"])
     async def reconcile_once(
