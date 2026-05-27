@@ -49,7 +49,7 @@ from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import AuthorizationError, ConflictError, InputError, NotFoundError
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
 from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, plan_service, service_policy
-from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
+from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 
 #: Lines archived per attempt. A ceiling rather than everything, because the
 #: archive is written inside the release path: an unbounded read would make
@@ -478,6 +478,56 @@ class _ControllerSettlement:
                 logger.warning("orphan sweep could not settle workload %s: %s", workload.id, exc)
                 continue
             settled += 1
+        return settled
+
+    async def settle_orphaned_leases_once(self) -> int:
+        """Release leases that no live workload claims.
+
+        ``settle_orphaned_workloads_once`` settles by *workload*, so a lease its
+        workload stopped referencing -- because the workload finished, vanished,
+        or retried onto different capacity -- is reachable from no path at all. It
+        keeps a cell allocated and its cost unsettled forever: capacity the fleet
+        pays for and no tenant is charged for, which is the one leak an operator
+        cannot see in any existing view.
+
+        The same grace period the workload sweep uses, for the same reason.
+        Nothing should write a lease and its workload in separate transactions,
+        but releasing a lease that a dispatch is mid-way through attaching would
+        kill live work, and one cycle of patience removes the entire class of
+        "a race made this look orphaned".
+        """
+
+        grace = timedelta(seconds=max(self.settings.lease_ttl_s, 1))
+        now = utcnow()
+        async with self.repository.transaction() as transaction:
+            leases = await transaction.list_leases()
+            workloads = {workload.id: workload for workload in await transaction.list_workloads()}
+        candidates = [
+            lease
+            for lease in leases
+            if lease.state in ACTIVE_LEASE_STATES
+            and now - lease.updated_at > grace
+            and self.service._lease_is_orphaned(lease, workloads.get(lease.workload_id))
+        ]
+
+        settled = 0
+        for lease in candidates:
+            owner = workloads.get(lease.workload_id)
+            reason = "orphaned: workload no longer exists" if owner is None else "orphaned: workload released it"
+            try:
+                if await self.service.settle_orphaned_lease(
+                    self._principal,
+                    lease.id,
+                    reason=reason,
+                    expected_generation=lease.generation,
+                ):
+                    settled += 1
+            except (ConflictError, NotFoundError) as exc:
+                # It was re-attached or settled between the scan and the write;
+                # the next cycle re-evaluates. Logged rather than swallowed: a
+                # sweep whose whole purpose is reclaiming capacity must not be
+                # able to fail quietly at the step that reclaims it.
+                logger.warning("orphan sweep could not settle lease %s: %s", lease.id, exc)
         return settled
 
     async def quarantine_expired_leases_once(self) -> int:

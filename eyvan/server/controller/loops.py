@@ -54,6 +54,13 @@ class _ControllerLoops:
             # After observation: a workload the observer could resolve this cycle is
             # not an orphan, whatever the previous cycle saw.
             LeaderPhase("settle-orphans", self.settle_orphaned_workloads_once),
+            # After the workload sweep, and separate from it. That one settles by
+            # *workload*, so a lease its workload finished with, vanished from, or
+            # retried away from is reachable from no other phase -- it would hold a
+            # cell and go unbilled forever. Ordering matters: a workload settled
+            # above becomes terminal, which is exactly what makes its leftover
+            # leases visible here in the same cycle.
+            LeaderPhase("settle-orphan-leases", self.settle_orphaned_leases_once),
             # After observation, so a coordinator settles in the same cycle its last
             # task does rather than a full interval later.
             LeaderPhase("settle-coordinators", self.settle_coordinator_workloads_once),

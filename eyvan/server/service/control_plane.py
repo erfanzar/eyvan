@@ -4893,15 +4893,78 @@ class ControlPlaneService:
         if cell.state is not expected_state or cell.unavailable_reason != expected_unavailable_reason:
             raise ConflictError("execution cell recovered or changed after the loss observation")
 
+    async def settle_orphaned_lease(
+        self,
+        principal: Principal,
+        lease_id: str,
+        *,
+        reason: str,
+        expected_generation: int,
+    ) -> bool:
+        """Release one lease that no live workload claims, and charge what it held.
+
+        The counterpart to ``settle_orphaned_workloads_once``, which settles by
+        *workload* and therefore cannot see this: a lease whose workload finished,
+        vanished, or stopped referencing it is reachable from no other path. It
+        keeps its cell allocated and its cost unsettled indefinitely -- capacity
+        the fleet is paying for and no tenant is charged for.
+
+        Re-verified inside the transaction rather than trusted from the scan. A
+        lease that a dispatch re-attached between the two is not orphaned, and
+        releasing it would kill live work; the generation check makes that a
+        no-op instead of a race.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        async with self.repository.transaction() as tx:
+            lease = await tx.get_lease(lease_id)
+            if lease is None or lease.state not in ACTIVE_LEASE_STATES:
+                return False
+            if lease.generation != expected_generation:
+                return False
+            workload = await tx.get_workload(lease.workload_id)
+            if not self._lease_is_orphaned(lease, workload):
+                return False
+            # ``_settle_lease`` persists the lease and the budget itself, so this
+            # only decides *whether* to call it. Re-writing what it returned would
+            # be redundant at best, and a mutation test proved it was never
+            # load-bearing.
+            _settled, _budget, changed = await self._settle_lease(tx, principal, workload, lease, reason=reason)
+            return changed
+
+    @staticmethod
+    def _lease_is_orphaned(lease: LeaseRecord, workload: WorkloadRecord | None) -> bool:
+        """Return whether no live workload still claims this lease.
+
+        Three ways, and the third is the one the workload sweep cannot reach: the
+        workload is gone, the workload is terminal, or the workload is live and
+        has moved on to different leases. A retry or a preemption resume produces
+        exactly that third shape.
+        """
+
+        if workload is None or workload.state in TERMINAL_WORKLOAD_STATES:
+            return True
+        claimed = set(workload.lease_ids) | ({workload.lease_id} if workload.lease_id else set())
+        return lease.id not in claimed
+
     async def _settle_lease(
         self,
         tx: RepositorySession,
         principal: Principal,
-        workload: WorkloadRecord,
+        workload: WorkloadRecord | None,
         lease: LeaseRecord,
         *,
         reason: str,
     ) -> tuple[LeaseRecord, BudgetRecord | None, bool]:
+        """Release one lease and charge what it actually held.
+
+        ``workload`` is optional because a lease can outlive its workload record
+        -- that is the condition the orphaned-lease sweep exists to clear, and
+        refusing to settle without a record would leave the capacity charged and
+        held forever. The lease already carries the workload id, which is all
+        the audit payload ever needed.
+        """
+
         scope = _scope(lease.org_id, lease.project_id)
         await tx.get_idempotency(scope, "budget.settle", scope)
         budget = await tx.get_budget(lease.org_id, lease.project_id)
@@ -4946,7 +5009,7 @@ class ControlPlaneService:
             previous_state=lease.state.value,
             new_state=settled.state.value,
             payload={
-                "workload_id": workload.id,
+                "workload_id": lease.workload_id,
                 "reason": reason,
                 "settled_cost": settled.settled_cost,
                 "accelerator_hours_settled": hours,

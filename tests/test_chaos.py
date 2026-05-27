@@ -516,20 +516,29 @@ async def test_a_workload_whose_lease_vanished_is_settled_rather_than_stranded()
         settled = await transaction.get_workload(workload.id)
     assert settled.state is WorkloadState.FAILED
     assert "no longer exists" in (settled.failure_reason or "")
-    # And the blast radius is bounded, not merely this one record. Asserted
-    # against the named invariants rather than eyeballed, because a recovery
-    # that settles the workload while leaving *other* state broken looks
-    # identical to a correct one from the workload alone.
-    #
-    # Exactly one violation survives, and it is the one this scenario injected:
-    # ``lease-orphan`` is a real ACTIVE lease that the corrupted workload stopped
-    # pointing at, and the sweep settles by workload, so nothing reaches it.
-    # Eyvan has no orphaned-*lease* reclamation to match its orphaned-workload
-    # sweep -- see I2. Pinned here rather than hidden, so building that sweep
-    # will visibly change this line.
-    violations = await check_fleet(repository)
-    assert [violation.invariant for violation in violations] == [Invariant.NO_LEASES_OUTLIVING_WORKLOADS]
-    assert violations[0].subject == "lease-orphan"
+    # The workload sweep settles by *workload*, so ``lease-orphan`` -- a real
+    # ACTIVE lease the corrupted workload stopped pointing at -- is invisible to
+    # it. That is what the lease sweep is for, and asserting the intermediate
+    # state pins which phase does which half.
+    intermediate = await check_fleet(repository)
+    assert [violation.invariant for violation in intermediate] == [Invariant.NO_LEASES_OUTLIVING_WORKLOADS]
+
+    # The lease sweep waits out the same grace period the workload sweep does --
+    # a dispatch mid-way through attaching a lease is indistinguishable from an
+    # orphan, and releasing live capacity is the expensive mistake. Aged here so
+    # the scenario exercises the reclamation rather than the patience.
+    async with repository.transaction() as transaction:
+        stranded = await transaction.get_lease("lease-orphan")
+        await transaction.put_lease(stranded.model_copy(update={"updated_at": utcnow() - timedelta(hours=2)}))
+
+    assert await controller.settle_orphaned_leases_once() == 1
+
+    # And now the fleet is whole, not merely this one record. Asserted against
+    # the named invariants rather than eyeballed, because a recovery that settles
+    # the workload while leaving other state broken looks identical to a correct
+    # one from the workload alone -- which is exactly how the missing lease sweep
+    # went unnoticed.
+    assert await check_fleet(repository) == ()
 
 
 @pytest.mark.asyncio
