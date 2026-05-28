@@ -438,6 +438,56 @@ def workload() -> None:
     """Submit and operate whole workloads."""
 
 
+@workload.command("children")
+@click.argument("workload_id")
+@click.pass_obj
+def list_children(session: CliSession, workload_id: str) -> None:
+    """List the workloads one workload submitted or fanned out to.
+
+    The only view of a job tree. Without it a batch, a DAG or an in-job fan-out
+    is a parent id and a guess: every child is an ordinary workload in the
+    listing, indistinguishable from work a human submitted.
+    """
+
+    JsonRenderer().emit(session.client.request("GET", f"/api/v1/workloads/{workload_id}/children"))
+
+
+@workload.command("endpoints")
+@click.argument("workload_id")
+@click.pass_obj
+def list_endpoints(session: CliSession, workload_id: str) -> None:
+    """List the addresses a service's replicas registered.
+
+    Registration is the readiness signal -- an app says it can serve *after* it
+    can -- so this is also the answer to "is the service actually up", which no
+    other view gives.
+    """
+
+    JsonRenderer().emit(session.client.request("GET", f"/api/v1/workloads/{workload_id}/endpoints"))
+
+
+@workload.command("log-page")
+@click.argument("workload_id")
+@click.option("--after", default="", help="Resume cursor from a previous page.")
+@click.option("--limit", type=int, default=200, show_default=True)
+@click.pass_obj
+def log_page(session: CliSession, workload_id: str, after: str, limit: int) -> None:
+    """Read one structured, per-rank page of a workload's logs.
+
+    Distinct from ``workload logs``, which returns concatenated text with rank
+    banners. This keeps records attributed and resumable, which is what a
+    multi-host job needs and what a banner cannot express.
+    """
+
+    JsonRenderer().emit(
+        session.client.request(
+            "GET",
+            f"/api/v1/workloads/{workload_id}/log-page",
+            params={"after": after, "limit": str(limit)},
+        )
+    )
+
+
 @workload.command("estimate")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")

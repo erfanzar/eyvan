@@ -141,6 +141,62 @@ def warmth(session: CliSession, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+@capacity.group("lease")
+def lease() -> None:
+    """Inspect one capacity lease."""
+
+
+@lease.command("get")
+@click.argument("lease_id")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def get_lease(session: CliSession, lease_id: str, as_json: bool) -> None:
+    """Show one lease record.
+
+    Listing leases is ``eyvan leases``; the single-lease read is what an
+    operator needs when a workload names a lease and the listing is thousands of
+    rows long.
+    """
+
+    _emit(session.client.request("GET", f"/api/v1/leases/{lease_id}"), as_json=as_json, renderer=JsonRenderer())
+
+
+@capacity.command("queue-trend")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--window-s", type=float, default=86_400.0, show_default=True)
+@click.option("--buckets", type=int, default=24, show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def queue_trend(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    window_s: float,
+    buckets: int,
+    as_json: bool,
+) -> None:
+    """Report how deep the queue has been over a window.
+
+    The number behind "should this fleet be bigger". Instantaneous queue depth
+    answers it badly: a fleet that is empty now and was saturated for eight
+    hours looks identical to one that has never been busy.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    payload = session.client.request(
+        "GET",
+        "/api/v1/capacity/queue-trend",
+        params={
+            "org_id": scope.org_id,
+            "project_id": scope.project_id,
+            "window_s": str(window_s),
+            "buckets": str(buckets),
+        },
+    )
+    _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
 @capacity.command("invariants")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
