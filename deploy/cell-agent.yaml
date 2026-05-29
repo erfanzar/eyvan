@@ -63,6 +63,19 @@ spec:
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5
+          # The agent had readiness and no liveness, so a wedged agent stayed
+          # out of the Service and stayed running -- and a cell whose agent
+          # never answers is capacity the control plane cannot observe, cannot
+          # release, and keeps paying for. The failure threshold is generous
+          # because the agent makes long provider calls and a restart mid-call
+          # loses the fence it was holding.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m

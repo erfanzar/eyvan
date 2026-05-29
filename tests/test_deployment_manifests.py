@@ -1,0 +1,229 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""The properties the shipped manifests have to keep.
+
+Manifests are the part of a system nobody tests and everybody edits. A YAML file
+has no compiler, no type checker and no test suite of its own, so a hardening
+decision made once survives exactly until the next person needs a quick change
+and does not know why the line was there.
+
+These assert the decisions, not the file. Each one names the consequence of
+losing it, because that is the information a future editor needs and the diff
+will not carry.
+
+Deliberately not a lint of every field. A test that pinned the whole document
+would fail on every legitimate edit and be deleted within a month, which would
+take the load-bearing assertions with it.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+import yaml
+
+DEPLOY = pathlib.Path(__file__).resolve().parent.parent / "deploy"
+
+
+def _documents(name: str) -> list[dict]:
+    return [document for document in yaml.safe_load_all((DEPLOY / name).read_text(encoding="utf-8")) if document]
+
+
+def _kind(name: str, kind: str) -> dict:
+    matches = [document for document in _documents(name) if document.get("kind") == kind]
+    assert len(matches) == 1, f"{name} should contain exactly one {kind}, found {len(matches)}"
+    return matches[0]
+
+
+def _container(name: str) -> dict:
+    return _kind(name, "Deployment")["spec"]["template"]["spec"]["containers"][0]
+
+
+def _pod(name: str) -> dict:
+    return _kind(name, "Deployment")["spec"]["template"]["spec"]
+
+
+# --------------------------------------------------------------------------- probes
+
+
+def test_readiness_and_liveness_probe_different_endpoints() -> None:
+    """The whole reason the endpoints were split.
+
+    Pointing liveness at the database-checking probe restarts every replica the
+    moment the database blips, turning a recoverable outage into a total one and
+    then preventing recovery by stampeding reconnections.
+    """
+
+    container = _container("control-plane.yaml")
+
+    assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    assert container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+
+
+def test_the_cell_agent_has_a_liveness_probe() -> None:
+    """It had readiness alone, so a wedged agent stayed out of the Service and running.
+
+    A cell whose agent never answers is capacity the control plane cannot
+    observe, cannot release, and keeps paying for.
+    """
+
+    assert _container("cell-agent.yaml")["livenessProbe"]["httpGet"]["path"] == "/healthz"
+
+
+def test_the_agent_liveness_threshold_tolerates_a_long_provider_call() -> None:
+    """A restart mid-call loses the fence the agent was holding.
+
+    So the threshold is generous on purpose, and a future edit that tightens it
+    to look more responsive should have to change this line and read why.
+    """
+
+    probe = _container("cell-agent.yaml")["livenessProbe"]
+
+    assert probe["failureThreshold"] * probe["periodSeconds"] >= 60
+
+
+# --------------------------------------------------------------------------- hardening
+
+
+def test_the_control_plane_does_not_run_as_root() -> None:
+    """It holds a database URL, an artifact signing key and an agent shared secret.
+
+    Root inside that container is root over all three, and the process needs
+    none of it: it binds an unprivileged port and writes nothing outside /tmp.
+    """
+
+    security = _pod("control-plane.yaml")["securityContext"]
+
+    assert security["runAsNonRoot"] is True
+    assert security["runAsUser"] != 0
+
+
+def test_the_control_plane_container_cannot_escalate_or_write_its_image() -> None:
+    """The two settings that decide whether a compromise can persist."""
+
+    security = _container("control-plane.yaml")["securityContext"]
+
+    assert security["allowPrivilegeEscalation"] is False
+    assert security["readOnlyRootFilesystem"] is True
+    assert security["capabilities"]["drop"] == ["ALL"]
+
+
+def test_a_read_only_root_still_leaves_a_writable_tmp() -> None:
+    """Python needs one for anything that spools to disk.
+
+    An emptyDir rather than relaxing the root filesystem: the point is that a
+    compromise cannot persist, and a volume that vanishes with the pod keeps it.
+    """
+
+    mounts = {mount["mountPath"] for mount in _container("control-plane.yaml")["volumeMounts"]}
+    volumes = {volume["name"] for volume in _pod("control-plane.yaml")["volumes"]}
+
+    assert "/tmp" in mounts
+    assert "tmp" in volumes
+
+
+# --------------------------------------------------------------------------- exposure
+
+
+def test_the_network_policy_does_not_blanket_allow_the_api_port() -> None:
+    """``/metrics`` exports every tenant's spend, labeled by org and project.
+
+    It is authenticated by a scrape token an operator may not have configured,
+    and this is the layer that holds when they have not. A rule with an empty
+    ``from`` allows the entire cluster and would silently undo that.
+    """
+
+    policy = _kind("control-plane.yaml", "NetworkPolicy")
+
+    assert policy["spec"]["policyTypes"] == ["Ingress"]
+    for rule in policy["spec"]["ingress"]:
+        assert rule.get("from"), "an ingress rule with no `from` allows every pod in the cluster"
+
+
+def test_reaching_the_api_requires_an_explicit_label() -> None:
+    """More friction than allowing the namespace, and the friction is the feature.
+
+    An unlabelled workload reaching the control plane by accident is how a
+    cluster-wide compromise becomes a fleet-wide one.
+    """
+
+    policy = _kind("control-plane.yaml", "NetworkPolicy")
+    selectors = [
+        selector
+        for rule in policy["spec"]["ingress"]
+        for peer in rule["from"]
+        for key, selector in peer.items()
+        if key in {"podSelector", "namespaceSelector"}
+    ]
+
+    assert selectors, "the policy admits peers without selecting them"
+    assert all(selector.get("matchLabels") for selector in selectors), (
+        "an empty selector matches everything, which is the blanket allow this policy exists to avoid"
+    )
+
+
+def test_scraping_and_api_access_are_separate_grants() -> None:
+    """Neither should confer the other.
+
+    A Prometheus that can call the API, or a client that can read every tenant's
+    spend, are both larger grants than anyone intended to make.
+    """
+
+    policy = _kind("control-plane.yaml", "NetworkPolicy")
+    labels = {
+        frozenset(selector["matchLabels"].items())
+        for rule in policy["spec"]["ingress"]
+        for peer in rule["from"]
+        for selector in peer.values()
+    }
+
+    assert frozenset({("eyvan.dev/api-client", "true")}) in labels
+    assert frozenset({("eyvan.dev/metrics-scraper", "true")}) in labels
+
+
+# --------------------------------------------------------------------------- availability
+
+
+def test_a_drain_cannot_take_the_last_control_plane_replica() -> None:
+    """A node drain with no budget evicts both replicas at once.
+
+    The control plane is what releases capacity; while it is down, every cell in
+    the fleet keeps billing and nothing reclaims them.
+    """
+
+    budget = _kind("control-plane.yaml", "PodDisruptionBudget")
+
+    assert budget["spec"]["minAvailable"] == 1
+    assert budget["spec"]["selector"]["matchLabels"] == {"app": "eyvan-control-plane"}
+
+
+def test_the_disruption_budget_selects_the_deployment_it_protects() -> None:
+    """A budget whose selector matches nothing is a budget that protects nothing.
+
+    It applies cleanly, reports healthy, and evicts everything.
+    """
+
+    budget = _kind("control-plane.yaml", "PodDisruptionBudget")
+    pods = _kind("control-plane.yaml", "Deployment")["spec"]["template"]["metadata"]["labels"]
+
+    assert budget["spec"]["selector"]["matchLabels"].items() <= pods.items()
+
+
+# --------------------------------------------------------------------------- shape
+
+
+@pytest.mark.parametrize("name", ["control-plane.yaml", "cell-agent.yaml", "migration-job.yaml"])
+def test_every_shipped_manifest_parses(name: str) -> None:
+    """A manifest that does not parse fails at ``kubectl apply``, mid-deploy.
+
+    Cheap to check here, expensive to discover there.
+    """
+
+    documents = _documents(name)
+
+    assert documents
+    assert all(document.get("kind") and document.get("apiVersion") for document in documents)

@@ -37,10 +37,26 @@ spec:
         app: eyvan-control-plane
     spec:
       serviceAccountName: eyvan-control-plane
+      # The control plane holds a database URL, an artifact signing key and an
+      # agent shared secret. Root inside that container is root over every one
+      # of them, and it needs none of it: the process binds an unprivileged
+      # port and writes nothing outside /tmp.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: eyvan
           image: eyvan:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
@@ -49,6 +65,12 @@ spec:
               mountPath: /etc/eyvan/platform.yaml
               subPath: platform.yaml
               readOnly: true
+            # readOnlyRootFilesystem leaves no writable /tmp, and Python needs
+            # one for anything that spools to disk. An emptyDir rather than
+            # relaxing the root filesystem: the point is that a compromise
+            # cannot persist, and a tmpfs that vanishes with the pod keeps that.
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: EYVAN_DATABASE_URL
               valueFrom:
@@ -123,6 +145,66 @@ spec:
         - name: platform-config
           configMap:
             name: eyvan-platform
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  # One, not a percentage. With replicas: 2 a 50% budget rounds to one anyway,
+  # and stating the absolute number keeps the guarantee if someone scales to 3:
+  # what matters is that a drain never takes the last replica, not that it
+  # takes a fixed fraction.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  podSelector:
+    matchLabels:
+      app: eyvan-control-plane
+  policyTypes: [Ingress]
+  ingress:
+    # Deliberately not a blanket allow on 8080. `/metrics` exports
+    # `eyvan_project_spend_usd` labeled by (org, project) -- every tenant's
+    # spend -- and it is authenticated by a scrape token that an operator may
+    # not have configured. This is the layer that holds when they have not.
+    #
+    # Anything that must reach the API says so with a label. That is more
+    # friction than allowing the namespace, and the friction is the feature: an
+    # unlabelled workload reaching the control plane by accident is how a
+    # cluster-wide compromise becomes a fleet-wide one.
+    - from:
+        - podSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+        - namespaceSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Prometheus separately, so scraping does not require API access and API
+    # access does not confer scraping.
+    - from:
+        - podSelector:
+            matchLabels:
+              eyvan.dev/metrics-scraper: "true"
+        - namespaceSelector:
+            matchLabels:
+              eyvan.dev/metrics-scraper: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
 ---
 apiVersion: v1
 kind: Service
