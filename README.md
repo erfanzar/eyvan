@@ -8,6 +8,21 @@ whole-gang placement, checkpoint-aware preemption, capacity leases, native GCP
 CPU/GPU/TPU lifecycle management, and native local execution for single-host
 development.
 
+## Documentation
+
+This page is the reference. The task-oriented pages are shorter and are where to
+start:
+
+- [docs/install.md](docs/install.md) — the thirteen things a remote deployment
+  needs, what each is for, and how each fails when it is missing.
+- [docs/operate.md](docs/operate.md) — daily operation: what is queued and why,
+  cost, storage, durability, debugging one workload.
+- [docs/security.md](docs/security.md) — the authority boundary, the three
+  capability tokens, secrets, tenancy, and what is deliberately not covered.
+- [docs/troubleshoot.md](docs/troubleshoot.md) — symptom first, routed to the
+  command that answers it.
+
+
 ## Authority boundary
 
 - Eyvan owns workload admission, capacity envelopes, leases, policy,
