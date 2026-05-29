@@ -1105,6 +1105,31 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="metrics token required")
         return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
 
+    @app.get("/api/v1/dashboard/config", tags=["system"])
+    async def dashboard_config() -> dict[str, str | None]:
+        """Serve the browser's identity configuration at runtime.
+
+        The dashboard's OIDC issuer and client id were compiled into the bundle
+        by ``VITE_`` build arguments, so one image could serve exactly one
+        identity provider -- and an operator with two environments had to build
+        two images that differed in nothing else.
+
+        Unauthenticated on purpose, and safe: an issuer URL and a public OAuth
+        client id are both things the browser is about to send to the identity
+        provider in a redirect anyway. Nothing here is a secret, and requiring a
+        token to learn how to obtain a token is a loop.
+
+        Null when unconfigured rather than absent, so a caller can tell "this
+        control plane runs without OIDC" from "this control plane is too old to
+        answer".
+        """
+
+        return {
+            "issuer": settings.oidc_issuer,
+            "client_id": settings.oidc_dashboard_client_id,
+            "audience": settings.oidc_audience,
+        }
+
     @app.get("/api/v1/system/invariants", tags=["system"])
     async def fleet_invariants(
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],

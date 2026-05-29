@@ -3,7 +3,17 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Focused tests for the live native v5p-16 acceptance harness helpers."""
+"""Focused tests for the live native v5p-16 acceptance harness helpers.
+
+The harnesses live in the *monorepo's* ``scripts/`` directory, not in this
+package -- they drive EasyDeL on real TPUs, so that is where they belong. But
+``libs/eyvan`` is mirrored to a standalone repository, and in that checkout the
+directory simply is not there.
+
+So these skip with a stated reason rather than failing. A test that fails
+because of where a checkout begins teaches contributors that a red suite is
+normal, and that is a much more expensive habit than a skipped test.
+"""
 
 from __future__ import annotations
 
@@ -18,11 +28,24 @@ import pytest
 
 from eyvan.capacity.drivers.base import CapacityStatus, CellObservation, MutationContext
 
+#: The monorepo's script directory, which a standalone checkout of this package
+#: does not have.
+_MONOREPO_SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
+
+
+def _harness(name: str) -> Path:
+    """Return one acceptance harness, or skip when this checkout has no monorepo."""
+
+    script = _MONOREPO_SCRIPTS / name
+    if not script.exists():
+        pytest.skip(f"{name} lives in the monorepo's scripts/, which a standalone eyvan checkout does not include")
+    return script
+
 
 def _load_live_harness() -> ModuleType:
     """Load the standalone acceptance script without invoking its main entrypoint."""
 
-    script = Path(__file__).parents[3] / "scripts" / "eyvan_native_v5p16_live.py"
+    script = _harness("eyvan_native_v5p16_live.py")
     spec = importlib.util.spec_from_file_location("eyvan_native_v5p16_live_test", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -157,10 +180,56 @@ def test_live_harness_reports_one_worker_one_pod_without_slice_language() -> Non
 def test_oci_smoke_has_no_eyvan_runtime_import() -> None:
     """OCI images only need JAX and EasyDeL; bootstrap supplies multihost setup."""
 
-    script = Path(__file__).parents[3] / "scripts" / "eyvan_easydel_tpu_smoke.py"
-    module = ast.parse(script.read_text(encoding="utf-8"))
+    module = ast.parse(_harness("eyvan_easydel_tpu_smoke.py").read_text(encoding="utf-8"))
     imported_modules = {
         alias.name for node in ast.walk(module) if isinstance(node, ast.Import) for alias in node.names
     } | {node.module or "" for node in ast.walk(module) if isinstance(node, ast.ImportFrom)}
 
     assert not any(name == "eyvan" or name.startswith("eyvan.") for name in imported_modules)
+
+
+def test_no_test_depends_on_a_path_outside_this_package() -> None:
+    """``libs/eyvan`` is mirrored to a standalone repository.
+
+    A test that walks up past the package root passes in the monorepo and fails
+    in the mirror, where the directory it reaches for does not exist. The two
+    sites above were exactly that, and they failed rather than skipping -- so
+    the mirror's suite was red for a reason no contributor there could act on.
+
+    This is the guard, not the fix: reaching out is permitted when the reach is
+    guarded by a skip, and forbidden when it is spelled inline where nothing can
+    check it.
+    """
+
+    import re
+
+    offenders: list[str] = []
+    tests = Path(__file__).resolve().parent
+    for path in sorted(tests.glob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if re.search(r"parents\[[3-9]\]", line) and "_MONOREPO_SCRIPTS" not in line:
+                offenders.append(f"{path.name}:{number}")
+
+    assert not offenders, (
+        "these tests reach outside libs/eyvan without a guarded skip, so they fail in the standalone "
+        "mirror rather than skipping: " + ", ".join(offenders)
+    )
+
+
+def test_the_harness_lookup_skips_rather_than_failing_when_the_monorepo_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The mirror's suite must be green, not red-for-a-structural-reason.
+
+    Asserted by running the lookup against a directory that has no harnesses,
+    which is what a standalone checkout looks like -- rather than by trusting
+    that the ``exists()`` branch does what it reads like.
+    """
+
+    monkeypatch.setattr(sys.modules[__name__], "_MONOREPO_SCRIPTS", tmp_path)
+
+    with pytest.raises(BaseException) as raised:
+        _harness("eyvan_native_v5p16_live.py")
+
+    assert raised.typename == "Skipped"
+    assert "standalone eyvan checkout" in str(raised.value)

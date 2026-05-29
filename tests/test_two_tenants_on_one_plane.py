@@ -121,6 +121,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
 
 #: Routes that carry no principal-scoped tenancy at all, each with the reason.
 EXEMPT_ROUTES: dict[str, str] = {
+    "GET /api/v1/dashboard/config": "public OIDC discovery hints; no tenant data and no secret",
     "GET /api/v1/health": "liveness; no tenant data",
     "GET /healthz": "liveness; no tenant data",
     "GET /readyz": "readiness; reports only whether this replica can reach its store",

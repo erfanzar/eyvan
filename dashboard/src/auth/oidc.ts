@@ -67,18 +67,70 @@ function redirectUri(): string {
   return import.meta.env.VITE_EYVAN_OIDC_REDIRECT_URI ?? `${globalThis.location.origin}${globalThis.location.pathname}`;
 }
 
+/**
+ * Identity configuration served by the control plane at runtime.
+ *
+ * The build arguments below compile an issuer and client id into the bundle, so
+ * one image could serve exactly one identity provider -- and an operator with a
+ * staging and a production realm had to build two images that differed in
+ * nothing else.
+ *
+ * Build-time values still win when present, so every existing image behaves
+ * identically. This only fills the gap they leave.
+ */
+let runtimeConfig: { issuer?: string | null; client_id?: string | null } | undefined;
+
+export async function loadRuntimeOidcConfig(fetchImpl: typeof fetch = fetch): Promise<void> {
+  if (runtimeConfig !== undefined) return;
+  if (bakedIssuer() && bakedClientId()) {
+    // Nothing to ask for. A request here would be a round trip whose answer is
+    // discarded, on the critical path of every page load.
+    runtimeConfig = {};
+    return;
+  }
+  try {
+    const response = await fetchImpl("/api/v1/dashboard/config");
+    runtimeConfig = response.ok ? await response.json() : {};
+  } catch {
+    // An unreachable control plane is not an auth misconfiguration. Falling back
+    // to the build-time values keeps the failure where it belongs -- the first
+    // API call -- rather than turning it into "OIDC is not configured".
+    runtimeConfig = {};
+  }
+}
+
+export function __resetRuntimeOidcConfigForTests(): void {
+  runtimeConfig = undefined;
+}
+
+/**
+ * A declared-but-unset build argument becomes the empty string, not undefined.
+ *
+ * That is the shape the shipped Dockerfile produces: `ARG VITE_EYVAN_OIDC_ISSUER`
+ * with no value. Using `??` here would treat `""` as configured, keep it, and
+ * defeat the runtime fallback in exactly the deployment it exists for -- which
+ * is what a test caught before this shipped.
+ */
+function bakedIssuer(): string | undefined {
+  return import.meta.env.VITE_EYVAN_OIDC_ISSUER || undefined;
+}
+
+function bakedClientId(): string | undefined {
+  return import.meta.env.VITE_EYVAN_OIDC_CLIENT_ID || undefined;
+}
+
 function issuer(): string | undefined {
-  return import.meta.env.VITE_EYVAN_OIDC_ISSUER?.replace(/\/$/, "");
+  return (bakedIssuer() ?? runtimeConfig?.issuer ?? undefined)?.replace(/\/$/, "");
 }
 
 function clientId(): string {
-  const configuredClientId = import.meta.env.VITE_EYVAN_OIDC_CLIENT_ID;
+  const configuredClientId = bakedClientId() ?? runtimeConfig?.client_id;
   if (!configuredClientId) throw new Error("VITE_EYVAN_OIDC_CLIENT_ID is not configured");
   return configuredClientId;
 }
 
 export function isOidcConfigured(): boolean {
-  return Boolean(issuer() && import.meta.env.VITE_EYVAN_OIDC_CLIENT_ID);
+  return Boolean(issuer() && (bakedClientId() ?? runtimeConfig?.client_id));
 }
 
 async function metadata(): Promise<OidcMetadata> {

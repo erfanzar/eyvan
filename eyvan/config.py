@@ -57,6 +57,11 @@ class EyvanSettings:
     oidc_issuer: str | None = None
     oidc_audience: str = "eyvan"
     oidc_jwks_url: str | None = None
+    #: The public OAuth client the *browser* uses. Distinct from the API's
+    #: audience: the dashboard is a public client doing PKCE, and the API
+    #: validates tokens minted for it. Baking this into the image at build time
+    #: meant one image could serve exactly one identity provider.
+    oidc_dashboard_client_id: str | None = None
     dev_auth_enabled: bool = False
     # Unset accepts every client. See eyvan._internal.client_version for why the gate is one-sided.
     min_client_version: str | None = None
@@ -235,6 +240,7 @@ class EyvanSettings:
             controller_enabled=truthy("EYVAN_CONTROLLER_ENABLED", defaults.controller_enabled),
             public_url=os.getenv("EYVAN_PUBLIC_URL", defaults.public_url),
             oidc_issuer=os.getenv("EYVAN_OIDC_ISSUER"),
+            oidc_dashboard_client_id=os.getenv("EYVAN_OIDC_DASHBOARD_CLIENT_ID"),
             oidc_audience=os.getenv("EYVAN_OIDC_AUDIENCE", defaults.oidc_audience),
             oidc_jwks_url=os.getenv("EYVAN_OIDC_JWKS_URL"),
             dev_auth_enabled=truthy("EYVAN_DEV_AUTH_ENABLED"),

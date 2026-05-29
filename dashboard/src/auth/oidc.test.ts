@@ -5,7 +5,16 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { apiAuthHeaders, completeLogin, consumeSessionNotice, currentIdentity, getAccessToken } from "./oidc";
+import {
+  __resetRuntimeOidcConfigForTests,
+  apiAuthHeaders,
+  completeLogin,
+  consumeSessionNotice,
+  currentIdentity,
+  getAccessToken,
+  isOidcConfigured,
+  loadRuntimeOidcConfig,
+} from "./oidc";
 
 function memoryStorage(initial: Record<string, string> = {}): Storage {
   const values = new Map(Object.entries(initial));
@@ -99,5 +108,70 @@ describe("OIDC browser authentication", () => {
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "eyvan:auth-changed" }));
     expect(consumeSessionNotice()).toMatch(/expired/i);
     expect(consumeSessionNotice()).toBeUndefined();
+  });
+});
+
+describe("runtime OIDC configuration", () => {
+  afterEach(() => {
+    __resetRuntimeOidcConfigForTests();
+    vi.unstubAllEnvs();
+  });
+
+  it("asks the control plane when the bundle carries no issuer", async () => {
+    // The gap this closes: the issuer and client id were compiled in by VITE_
+    // build arguments, so one image served exactly one identity provider.
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ issuer: "https://idp.example.com", client_id: "eyvan-dashboard" }), {
+        status: 200,
+      }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(fetchImpl).toHaveBeenCalledWith("/api/v1/dashboard/config");
+    expect(isOidcConfigured()).toBe(true);
+  });
+
+  it("does not ask when the bundle already carries both values", async () => {
+    // A round trip whose answer is discarded, on the critical path of every
+    // page load. Existing images must behave exactly as they did.
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://baked.example.com");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "baked-client");
+    const fetchImpl = vi.fn();
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(isOidcConfigured()).toBe(true);
+  });
+
+  it("treats an unreachable control plane as unconfigured rather than as an auth error", async () => {
+    // An unreachable control plane is not an auth misconfiguration. The failure
+    // belongs at the first API call, not as "OIDC is not configured".
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("network down");
+    });
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(isOidcConfigured()).toBe(false);
+  });
+
+  it("ignores a control plane that answers without an issuer", async () => {
+    // A plane running with no OIDC answers with nulls rather than a 404, so the
+    // dashboard can tell "not configured" from "too old to answer".
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(isOidcConfigured()).toBe(false);
   });
 });

@@ -15,6 +15,7 @@ import {
   isDevelopmentAuthEnabled,
   isDemoMode,
   isOidcConfigured,
+  loadRuntimeOidcConfig,
 } from "./oidc";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -24,7 +25,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    completeLogin()
+    // Before anything reads the OIDC configuration. Build-time values still
+    // win; this only fills the gap they leave, which is what lets one image
+    // serve two identity providers.
+    loadRuntimeOidcConfig()
+      .then(() => completeLogin())
       .then(() => {
         if (!cancelled) setIdentity(currentIdentity());
       })

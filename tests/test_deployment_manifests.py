@@ -227,3 +227,44 @@ def test_every_shipped_manifest_parses(name: str) -> None:
 
     assert documents
     assert all(document.get("kind") and document.get("apiVersion") for document in documents)
+
+
+# --------------------------------------------------------------------------- identity
+
+
+def test_the_dashboard_identity_is_configurable_without_rebuilding() -> None:
+    """One image, two identity providers.
+
+    The issuer and client id were compiled in by ``VITE_`` build arguments, so an
+    operator with a staging and a production realm had to build two images that
+    differed in nothing else. The control plane now serves them, and the
+    dashboard prefers the baked values when they exist so every existing image
+    behaves identically.
+    """
+
+    from eyvan.config import EyvanSettings
+
+    assert hasattr(EyvanSettings(), "oidc_dashboard_client_id")
+
+    oidc = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src" / "auth" / "oidc.ts").read_text(
+        encoding="utf-8"
+    )
+    assert "/api/v1/dashboard/config" in oidc
+
+
+def test_a_declared_but_unset_build_argument_does_not_look_configured() -> None:
+    """``ARG VITE_EYVAN_OIDC_ISSUER`` with no value produces the empty string.
+
+    That is what the shipped Dockerfile does, so treating ``""`` as configured
+    would defeat the runtime fallback in exactly the deployment it exists for.
+    Asserted here because the Dockerfile is what creates the condition.
+    """
+
+    dockerfile = (pathlib.Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    oidc = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src" / "auth" / "oidc.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ARG VITE_EYVAN_OIDC_ISSUER" in dockerfile
+    # `||` rather than `??`: only the former treats an empty string as unset.
+    assert "import.meta.env.VITE_EYVAN_OIDC_ISSUER || undefined" in oidc

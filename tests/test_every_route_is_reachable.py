@@ -32,6 +32,8 @@ import ast
 import pathlib
 import re
 
+import pytest
+
 from eyvan.config import EyvanSettings
 from eyvan.server.api.app import create_app
 
@@ -45,6 +47,12 @@ CAPABILITY_ROUTES: dict[str, str] = {
     "POST /api/v1/workloads/{}/progress-reports": "minted as EYVAN_PROGRESS_URL at dispatch",
     "POST /api/v1/workloads/{}/children": "minted as EYVAN_CHILDREN_URL at dispatch",
     "PUT /api/v1/workloads/{}/endpoint": "registered by the running service against its dispatch URL",
+}
+
+#: Routes the *browser* reaches. The dashboard is a first-class client and not
+#: part of the Python SDK, so a Python caller would be the wrong thing to add.
+BROWSER_ROUTES: dict[str, str] = {
+    "GET /api/v1/dashboard/config": "dashboard/src/auth/oidc.ts, so one image can serve two identity providers",
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.
@@ -124,7 +132,7 @@ def test_every_route_is_reachable_or_classified() -> None:
     makes it hold.
     """
 
-    classified = {*CAPABILITY_ROUTES, *DYNAMIC_ROUTES, *DEFERRED_ROUTES}
+    classified = {*CAPABILITY_ROUTES, *BROWSER_ROUTES, *DYNAMIC_ROUTES, *DEFERRED_ROUTES}
     reachable = _requested_paths(_package_root() / "sdk")
 
     unreachable = sorted(
@@ -148,7 +156,7 @@ def test_no_classification_outlives_the_route_it_describes() -> None:
     """
 
     live = {f"{method} {path}" for method, path in _routes()}
-    stale = sorted({*CAPABILITY_ROUTES, *DYNAMIC_ROUTES, *DEFERRED_ROUTES} - live)
+    stale = sorted({*CAPABILITY_ROUTES, *BROWSER_ROUTES, *DYNAMIC_ROUTES, *DEFERRED_ROUTES} - live)
 
     assert not stale, f"these classifications name routes that no longer exist: {', '.join(stale)}"
 
@@ -231,3 +239,20 @@ def test_every_command_module_is_actually_attached_to_the_cli() -> None:
                 orphans.append(f"{module_info.name}.{name}")
 
     assert not orphans, f"these command groups are defined and never attached to the CLI: {', '.join(orphans)}"
+
+
+@pytest.mark.parametrize("route,caller", sorted(BROWSER_ROUTES.items()))
+def test_a_browser_route_is_reached_by_the_dashboard(route: str, caller: str) -> None:
+    """The exemption's premise: the dashboard actually requests it.
+
+    "The browser reaches it" is the whole reason a Python caller would be wrong.
+    A route exempted on that basis and requested by no TypeScript is unreachable
+    by everything, which is the gap this file exists to prevent rather than an
+    instance of it being handled.
+    """
+
+    source = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src").rglob("*.ts*")
+    path = route.split(" ", 1)[1]
+    assert any(path in file.read_text(encoding="utf-8") for file in source), (
+        f"{route} is exempted because {caller} reaches it, and no dashboard source requests it"
+    )
