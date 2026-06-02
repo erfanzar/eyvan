@@ -18,12 +18,13 @@ import {
   ShieldCheck,
   WalletCards,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import { apiClient } from "../api/client";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { LogEntry, WorkloadDetail } from "../types";
+import type { LogEntry, WorkloadDetail, WorkloadExplanation } from "../types";
 
 type DetailTab = "overview" | "timeline" | "logs";
 
@@ -38,6 +39,32 @@ export function WorkloadDetailPage({ workload, onBack, onAction }: WorkloadDetai
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState("all");
   const [copied, setCopied] = useState(false);
+  // The scheduler's per-cell verdict. The page has always shown the flat
+  // `scheduling_reason`, one sentence, while the detail behind it existed and
+  // no page requested it -- so "why is this queued" was answerable only from a
+  // terminal.
+  const [explanation, setExplanation] = useState<WorkloadExplanation | null>(null);
+  const [explainError, setExplainError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setExplanation(null);
+    setExplainError(null);
+    apiClient
+      .explainWorkload(workload.id)
+      .then((result) => {
+        if (!cancelled) setExplanation(result);
+      })
+      .catch((error: unknown) => {
+        // Reported, never swallowed. An empty panel reads as "nothing to
+        // report", which is the one thing it must not say when the request
+        // failed.
+        if (!cancelled) setExplainError(error instanceof Error ? error.message : "Unable to explain this workload");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workload.id]);
   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
   const cancellable = !["completed", "failed", "cancelled", "preempting"].includes(workload.status);
@@ -148,6 +175,26 @@ export function WorkloadDetailPage({ workload, onBack, onAction }: WorkloadDetai
               </>
             ) : (
               <div className="resource-row-detail"><span>Per-workload spend is not reported by the control plane.</span></div>
+            )}
+          </section>
+
+          <section className="panel detail-section">
+            <div className="panel-header"><div><h2>Placement verdict</h2><p>Why the scheduler did or did not place this</p></div><Server size={18} /></div>
+            {explainError && <div className="resource-row-detail"><span>{explainError}</span></div>}
+            {!explainError && !explanation && <div className="resource-row-detail"><span>Asking the scheduler…</span></div>}
+            {explanation && (
+              <dl className="definition-grid">
+                <div><dt>Placeable</dt><dd>{explanation.placeable ? "Yes" : "No"}</dd></div>
+                <div><dt>Reason</dt><dd>{explanation.message ?? explanation.scheduling_reason ?? "None reported"}</dd></div>
+                <div><dt>Cells considered</dt><dd>{explanation.considered_cell_count}</dd></div>
+                {/* The field that separates "waiting for capacity" from "can
+                    never be placed". Both report the same code, and only one is
+                    a problem. */}
+                <div><dt>Being provisioned</dt><dd>{explanation.provisioning_cell_ids.length || "None"}</dd></div>
+                {explanation.cells.slice(0, 4).map((cell) => (
+                  <div key={cell.cell_id}><dt className="monospace">{cell.cell_id}</dt><dd>{cell.reason}</dd></div>
+                ))}
+              </dl>
             )}
           </section>
 

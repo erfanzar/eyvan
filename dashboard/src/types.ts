@@ -224,3 +224,57 @@ export interface DashboardData {
   policies: SchedulingPolicy[];
   auditEvents: AuditEvent[];
 }
+
+/** Per-cell placement detail behind a workload's flat scheduling reason. */
+export interface CellRejection {
+  cell_id: string;
+  reason: string;
+}
+
+export interface WorkloadExplanation {
+  workload_id: string;
+  state: string;
+  placeable: boolean;
+  placement_cell_id: string | null;
+  code: string | null;
+  message: string | null;
+  cells: CellRejection[];
+  considered_cell_count: number;
+  /**
+   * Cells the autoscaler is building for this workload.
+   *
+   * Load-bearing for the panel: without it a workload waiting on capacity looks
+   * identical to one that can never be placed, because both report that no cell
+   * satisfies their constraints and only one is a problem.
+   */
+  provisioning_cell_ids: string[];
+  scheduling_reason: string | null;
+}
+
+export interface WorkloadProcessStatus {
+  remote_id?: string | null;
+  control_group?: string | null;
+  pids?: number[];
+  [key: string]: unknown;
+}
+
+export interface PoolWarmth {
+  pool_id: string;
+  floor: number;
+  window_active: boolean;
+  warm_cells: number;
+  warm_idle_cells: number;
+  hourly_cost: number;
+}
+
+export interface WarmthReport {
+  observed_at: string;
+  pools: PoolWarmth[];
+}
+
+export interface BillingReport {
+  observed_at: string;
+  accrued_cost: number;
+  idle_cost: number;
+  [key: string]: unknown;
+}

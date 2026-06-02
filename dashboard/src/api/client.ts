@@ -17,6 +17,7 @@ import {
 import { apiAuthHeaders, isDemoMode, rejectSession } from "../auth/oidc";
 import type {
   AuditEvent,
+  BillingReport,
   Budget,
   CapacityLease,
   Cell,
@@ -26,6 +27,9 @@ import type {
   PriorityBand,
   SchedulingPolicy,
   SubmitWorkloadInput,
+  WarmthReport,
+  WorkloadExplanation,
+  WorkloadProcessStatus,
   TimelineEvent,
   WorkloadDetail,
   WorkloadStatus,
@@ -525,6 +529,45 @@ export class EyvanApiClient {
       detail.queueReason ??= progress.failure_reason ?? progress.scheduling_reason ?? undefined;
     }
     return detail;
+  }
+
+  /**
+   * Why one workload is or is not currently placeable.
+   *
+   * `scheduling_reason` is one flat sentence, and it is what the dashboard has
+   * always shown. This is the per-cell detail behind it: which cells were
+   * considered, which constraint each failed, and whether any are still being
+   * built -- the difference between "waiting for capacity" and "can never be
+   * placed", which the flat reason cannot express.
+   */
+  async explainWorkload(id: string): Promise<WorkloadExplanation> {
+    return this.request<WorkloadExplanation>(`/workloads/${encodeURIComponent(id)}/explain`);
+  }
+
+  /**
+   * Live process detail for a running attempt.
+   *
+   * Answers "it says RUNNING and nothing is happening", which no other view
+   * does: the control group and pids are what a diagnostic needs to attach to.
+   */
+  async workloadProcessStatus(id: string): Promise<WorkloadProcessStatus> {
+    return this.request<WorkloadProcessStatus>(`/workloads/${encodeURIComponent(id)}/process-status`);
+  }
+
+  /**
+   * Each pool's warm floor and whether it is currently held.
+   *
+   * Read beside billing. Warm capacity is deliberately idle, and without the
+   * pairing the only safe reaction to an unexplained idle figure is to delete
+   * the warm floor -- undoing the fix that put it there.
+   */
+  async getWarmth(): Promise<WarmthReport> {
+    return this.request<WarmthReport>("/capacity/warmth");
+  }
+
+  /** Accrued and idle cell cost across the fleet. */
+  async getBilling(): Promise<BillingReport> {
+    return this.request<BillingReport>("/capacity/billing");
   }
 
   async listCells(knownLeases?: CapacityLease[]): Promise<Cell[]> {

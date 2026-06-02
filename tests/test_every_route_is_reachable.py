@@ -256,3 +256,21 @@ def test_a_browser_route_is_reached_by_the_dashboard(route: str, caller: str) ->
     assert any(path in file.read_text(encoding="utf-8") for file in source), (
         f"{route} is exempted because {caller} reaches it, and no dashboard source requests it"
     )
+
+
+def test_the_dashboard_calls_the_panels_it_gained() -> None:
+    """A client method no page invokes is the same defect one level down.
+
+    ``explainWorkload``, ``getWarmth`` and ``getBilling`` are testable in
+    isolation and would pass their own tests forever while no page ever rendered
+    them -- which is exactly the shape this file exists to catch at the route
+    level, repeated inside the client.
+    """
+
+    pages = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src" / "pages").rglob("*.tsx")
+    source = "\n".join(page.read_text(encoding="utf-8") for page in pages)
+
+    for method in ("explainWorkload", "getWarmth", "getBilling"):
+        assert f"apiClient.{method}" in source or f".{method}(" in source, (
+            f"apiClient.{method} exists and no page calls it"
+        )

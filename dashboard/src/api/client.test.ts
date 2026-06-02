@@ -540,3 +540,96 @@ describe("cell status mapping", () => {
     expect(cellStatus("deleting")).toBe("maintenance");
   });
 });
+
+describe("the panels the dashboard never had", () => {
+  function jsonFetch(payload: unknown) {
+    return vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 })));
+  }
+
+  it("asks the explain route for the per-cell detail behind a flat reason", async () => {
+    // The dashboard showed `scheduling_reason` alone -- one sentence. The
+    // scheduler's actual verdict, per cell, existed and no page requested it.
+    const fetchMock = jsonFetch({
+      workload_id: "wl-1",
+      state: "pending",
+      placeable: false,
+      placement_cell_id: null,
+      code: "no_matching_cell",
+      message: "no cell satisfies all hard workload constraints",
+      cells: [{ cell_id: "cell-a", reason: "insufficient tpu" }],
+      considered_cell_count: 7,
+      provisioning_cell_ids: ["cell-b"],
+      scheduling_reason: "waiting for capacity",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const explanation = await new EyvanApiClient("/api/v1", false).explainWorkload("wl-1");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/workloads/wl-1/explain");
+    expect(explanation.cells).toHaveLength(1);
+    // The field that distinguishes "waiting for capacity" from "can never be
+    // placed" -- both of which report the same code.
+    expect(explanation.provisioning_cell_ids).toEqual(["cell-b"]);
+    expect(explanation.considered_cell_count).toBe(7);
+  });
+
+  it("escapes a workload id rather than pasting it into a path", async () => {
+    // An id is server-generated today, but a path built by concatenation is a
+    // request-forgery waiting for the day one is not.
+    const fetchMock = jsonFetch({ workload_id: "a/b", state: "pending", placeable: false, cells: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new EyvanApiClient("/api/v1", false).explainWorkload("a/b");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/workloads/a%2Fb/explain");
+  });
+
+  it("asks for live process detail, which answers 'running and nothing is happening'", async () => {
+    const fetchMock = jsonFetch({ remote_id: "unit-1", control_group: "/eyvan.slice/x", pids: [42] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await new EyvanApiClient("/api/v1", false).workloadProcessStatus("wl-1");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/workloads/wl-1/process-status");
+    expect(status.pids).toEqual([42]);
+  });
+
+  it("reads warmth so idle cost can be told apart from waste", async () => {
+    // Warm capacity is deliberately idle. Without this the only safe reaction
+    // to an unexplained idle figure is to delete the warm floor.
+    const fetchMock = jsonFetch({
+      observed_at: "2026-07-29T12:00:00Z",
+      pools: [{ pool_id: "research/v5p", floor: 2, window_active: true, warm_cells: 2, warm_idle_cells: 1, hourly_cost: 8 }],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const warmth = await new EyvanApiClient("/api/v1", false).getWarmth();
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/capacity/warmth");
+    expect(warmth.pools[0].window_active).toBe(true);
+    expect(warmth.pools[0].warm_idle_cells).toBe(1);
+  });
+
+  it("reads billing, which is the only view of unused-but-paid-for capacity", async () => {
+    const fetchMock = jsonFetch({ observed_at: "2026-07-29T12:00:00Z", accrued_cost: 120.5, idle_cost: 30.25 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const billing = await new EyvanApiClient("/api/v1", false).getBilling();
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/capacity/billing");
+    expect(billing.idle_cost).toBe(30.25);
+  });
+
+  it("surfaces a failing panel as an error rather than as empty data", async () => {
+    // An empty explain panel reads as "nothing to report", which is the one
+    // thing it must never say when the request failed.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => Promise.resolve(new Response("{}", { status: 503 }))),
+    );
+
+    await expect(new EyvanApiClient("/api/v1", false).getWarmth()).rejects.toEqual(
+      expect.objectContaining({ name: "ApiError", status: 503 }),
+    );
+  });
+});

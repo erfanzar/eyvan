@@ -14,13 +14,14 @@ import {
   RefreshCw,
   Server,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import { apiClient } from "../api/client";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { CapacityLease, Cell } from "../types";
+import type { BillingReport, CapacityLease, Cell, WarmthReport } from "../types";
 
 interface FleetPageProps {
   cells: Cell[];
@@ -32,6 +33,9 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
+  const [warmth, setWarmth] = useState<WarmthReport | null>(null);
+  const [billing, setBilling] = useState<BillingReport | null>(null);
+  const [costError, setCostError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshed, setRefreshed] = useState(false);
   const regions = useMemo(() => Array.from(new Set(cells.map((cell) => cell.region))), [cells]);
@@ -55,6 +59,27 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
     }
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([apiClient.getWarmth(), apiClient.getBilling()])
+      .then(([warmthReport, billingReport]) => {
+        if (cancelled) return;
+        setWarmth(warmthReport);
+        setBilling(billingReport);
+      })
+      .catch((error: unknown) => {
+        // Named, not swallowed. A cost panel that silently shows nothing reads
+        // as "nothing is being spent", which is the most expensive possible
+        // thing for it to say incorrectly.
+        if (!cancelled) setCostError(error instanceof Error ? error.message : "Unable to read fleet cost");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const warmHourlyCost = (warmth?.pools ?? []).reduce((total, pool) => total + pool.hourly_cost, 0);
+
   return (
     <div className="page-stack">
       <section className="metric-grid metric-grid-four" aria-label="Fleet metrics">
@@ -62,6 +87,42 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
         <MetricCard label="Mean scoped utilization" value={`${averageUtilization}%`} detail="active leases in the configured project" icon={Gauge} />
         <MetricCard label="Active leases" value={activeLeases.length.toString()} detail={`${leases.filter((lease) => lease.class === "spot").length} on preemptible capacity`} icon={KeyRound} />
         <MetricCard label="Lease spend" value={`${formatMoney(totalSpend)}/h`} detail="active and activating leases" icon={Cloud} tone="positive" />
+      </section>
+
+      {/* Warmth and billing are reported together on purpose. Warm capacity is
+          deliberately idle, and an operator reading an idle figure without the
+          warm floor beside it has exactly one safe reaction -- delete the warm
+          floor, undoing the fix that put it there. */}
+      <section className="panel data-panel" aria-label="Warm capacity and cost">
+        <div className="panel-header">
+          <div><h2>Warm capacity and cost</h2><p>Which idle cost you asked for, and which you did not</p></div>
+          <Gauge size={18} />
+        </div>
+        {costError && <div className="resource-row-detail"><span>{costError}</span></div>}
+        {!costError && !billing && <div className="resource-row-detail"><span>Reading the billing clock…</span></div>}
+        {billing && (
+          <div className="resource-row-detail">
+            <span>{formatMoney(billing.accrued_cost)} accrued</span>
+            <span>{formatMoney(billing.idle_cost)} idle</span>
+            <span>{formatMoney(warmHourlyCost)}/h held warm</span>
+          </div>
+        )}
+        {warmth && warmth.pools.length > 0 && (
+          <dl className="definition-grid">
+            {warmth.pools.map((pool) => (
+              <div key={pool.pool_id}>
+                <dt className="monospace">{pool.pool_id}</dt>
+                <dd>
+                  {pool.warm_cells}/{pool.floor} held{pool.window_active ? ", window active" : ""}
+                  {pool.warm_idle_cells ? `, ${pool.warm_idle_cells} idle` : ""}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {warmth && warmth.pools.length === 0 && (
+          <div className="resource-row-detail"><span>No pool declares a warm floor.</span></div>
+        )}
       </section>
 
       <section className="panel topology-panel">
