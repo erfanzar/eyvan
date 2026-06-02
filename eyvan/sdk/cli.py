@@ -30,6 +30,7 @@ from eyvan.sdk.commands.governance import register_governance_commands
 from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
 from eyvan.sdk.commands.operations import register_operation_commands
 from eyvan.sdk.commands.runtime import register_runtime_commands
+from eyvan.sdk.commands.soak import register_soak_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
@@ -112,6 +113,7 @@ for register_commands in (
     register_governance_commands,
     register_tenancy_commands,
     register_runtime_commands,
+    register_soak_commands,
     register_dashboard_commands,
 ):
     register_commands(main)

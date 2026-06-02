@@ -59,6 +59,24 @@ fire, so silence means the checks ran and found nothing. The two invariants
 about *change over time* -- budget monotonicity and storage growth -- cannot be
 settled by one call and are not reported here.
 
+## The unattended run
+
+```
+eyvan soak --hours 72 --interval-s 60 --output soak.json
+```
+
+Polls the invariants, keeps each tick's snapshot so the over-time properties can
+be decided at all, and exits non-zero if anything was violated *persistently*. A
+violation seen once is not a finding: the point-in-time checks race with the
+sweeps that fix them, and a run that failed on that race would fail every time
+while proving nothing.
+
+It does not stop on the first problem, and an unreachable control plane does not
+end it. Surviving a restart is among the things the run exists to observe.
+
+This is the evidence no code change substitutes for. Everything else Eyvan
+claims was proven with a human watching, over minutes.
+
 ## Debugging one workload
 
 ```

@@ -124,7 +124,7 @@ from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
-from eyvan.server.invariants import Invariant, check_fleet
+from eyvan.server.invariants import Invariant, check_fleet, snapshot_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
@@ -1148,12 +1148,24 @@ def create_app(
 
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
         violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        # The snapshot travels with the verdict so a long-running observer makes
+        # one call per tick rather than two that describe different moments --
+        # and a budget compared against an artifact count from a second later is
+        # a comparison of two fleets.
+        snapshot = await snapshot_fleet(repository)
         return {
             "checked": [invariant.value for invariant in Invariant],
             "violations": [
                 {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
                 for violation in violations
             ],
+            "snapshot": {
+                "observed_at": snapshot.observed_at.isoformat(),
+                "budget_spend": {f"{org}/{project}": value for (org, project), value in snapshot.budget_spend.items()},
+                "artifact_bytes": snapshot.artifact_bytes,
+                "workload_count": snapshot.workload_count,
+                "cell_count": snapshot.cell_count,
+            },
         }
 
     @app.post("/api/v1/system/reconcile", tags=["system"])
