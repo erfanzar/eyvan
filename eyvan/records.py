@@ -1184,6 +1184,18 @@ class CellRecord(EyvanModel):
     provider_phase: CapacityStatus | None = None
     provider_failure_code: CapacityProviderFailureCode | None = None
     observed_tpu_vms: int | None = Field(default=None, ge=1)
+    #: Named assets this cell's agent reports are materialized on local disk.
+    #:
+    #: A *stronger* locality signal than lease history, which infers presence
+    #: from "a job that declared this asset held this cell recently". The
+    #: inference is free and often right; the report is authoritative for the
+    #: one thing the control plane cannot see, which is the disk.
+    #:
+    #: Still only a preference. An agent that over-reports steers placement
+    #: toward a cell that then pays the pull anyway -- one cache miss, which is
+    #: the same cost a stale inference already carries, and strictly less
+    #: authority than the capacity and readiness an agent already reports.
+    materialized_assets: tuple[str, ...] = ()
     provider_phase_started_at: datetime | None = None
     unavailable_reason: str | None = None
     #: Free-text cause behind ``unavailable_reason``, which is a closed code that

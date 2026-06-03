@@ -97,6 +97,7 @@ class FakeAgent:
         self.capacity_state = CapacityStatus.HEALTHY
         self.observed_tpu_vms: int | None = None
         self.capacity_failure_code = None
+        self.metadata: dict = {}
         self.remote_states: dict[str, ExecutionWorkloadStatus] = {}
 
     def apply_capacity(self, cell_id, request):
@@ -115,6 +116,7 @@ class FakeAgent:
             generation=request.mutation.generation,
             observed_tpu_vms=self.observed_tpu_vms,
             failure_code=self.capacity_failure_code,
+            metadata=self.metadata,
         )
 
     def submit(self, cell_id, request):

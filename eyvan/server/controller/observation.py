@@ -761,6 +761,7 @@ class _ControllerObservation:
         """Reconcile and persist one cell without blocking unrelated cells."""
 
         agent_responded = False
+        materialized_assets: tuple[str, ...] = cell.materialized_assets
         provider_detail: str | None = None
         provider_failure_code = cell.provider_failure_code
         unavailable_reason: str | None = (
@@ -830,6 +831,7 @@ class _ControllerObservation:
             remote_state = observation.state
             observed_tpu_vms = observation.observed_tpu_vms
             reported_failure_code = observation.failure_code
+            materialized_assets = _reported_assets(observation.metadata)
             if observation.generation != cell.generation and remote_state not in DEFINITIVE_CAPACITY_LOSS_STATUSES:
                 logger.warning(
                     "cell %s reported generation %s while generation %s is desired",
@@ -893,6 +895,7 @@ class _ControllerObservation:
                     "provider_phase": remote_state,
                     "provider_failure_code": provider_failure_code,
                     "observed_tpu_vms": observed_tpu_vms,
+                    "materialized_assets": materialized_assets,
                     "provider_phase_started_at": phase_started_at,
                     "unavailable_reason": unavailable_reason,
                     "unavailable_detail": (provider_detail or None) if unavailable_reason else None,
@@ -1293,3 +1296,29 @@ class _ControllerObservation:
             lease.cell_id,
             workload.remote_id,
         )
+
+
+def _reported_assets(metadata: tp.Mapping[str, object] | None) -> tuple[str, ...]:
+    """Read an agent's materialized-asset report out of its observation metadata.
+
+    Carried in the existing free-form metadata rather than as a new wire field,
+    so an agent that never learns to report keeps validating and a control plane
+    that predates the convention keeps parsing. Locality is a preference either
+    way, and a new required field would be a deployment ordering problem in
+    exchange for nothing.
+
+    Anything that is not a list of non-empty strings is ignored rather than
+    rejected. This runs on the observation hot path, and refusing an otherwise
+    good observation over a malformed hint would trade a cache miss for an
+    unobservable cell.
+    """
+
+    if not isinstance(metadata, dict):
+        return ()
+    reported = metadata.get("materialized_assets")
+    if not isinstance(reported, list):
+        return ()
+    names = [value for value in reported if isinstance(value, str) and value.strip()]
+    # Deduplicated and ordered, so two agents reporting the same set produce the
+    # same index and placement does not depend on report ordering.
+    return tuple(sorted(dict.fromkeys(name.strip() for name in names)))

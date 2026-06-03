@@ -500,7 +500,12 @@ class ControlPlaneService:
             return spec
         moment = now or utcnow()
         async with self.repository.transaction() as tx:
-            index = locality_index(await tx.list_workloads(), await tx.list_leases(), now=moment)
+            index = locality_index(
+                await tx.list_workloads(),
+                await tx.list_leases(),
+                now=moment,
+                cells=await tx.list_cells(),
+            )
         preferred = preferred_cells_for(spec.named_assets, index)
         if not preferred:
             return spec

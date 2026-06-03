@@ -12,12 +12,17 @@ mechanism to prefer it: ``WorkloadSpec.preferred_cells`` is the fourth key of th
 scheduler's lexicographic ``PlacementScore``. What was missing is the *index* --
 which cells have already materialized which asset.
 
-**Derived from lease history, not reported by agents.** A cell that ran a job
-declaring asset X twenty minutes ago very probably still has X on local disk.
-That inference costs nothing: the control plane already records which workload
-held which cell and when. The alternative -- an agent-reported cache manifest --
-means a new protocol field, a new trust boundary, and a new way for the control
-plane's belief to diverge from a disk it cannot see.
+**Two signals, and the reported one wins.** A cell that ran a job declaring
+asset X twenty minutes ago very probably still has X on local disk, and that
+inference costs nothing -- the control plane already records which workload held
+which cell and when. But it is a guess about a disk the control plane cannot
+see, and an agent *can* see it. So an agent that reports its materialized assets
+ranks ahead of every inference, and inference still covers every cell whose
+agent reports nothing.
+
+Deliberately additive rather than a replacement. An agent that never learns to
+report leaves the fleet exactly where it was, which is what makes this safe to
+deploy before every agent is upgraded.
 
 **Being wrong is cheap, and that is what makes the inference acceptable.** The
 output feeds a *preference*, never a requirement. A stale entry costs one cache
@@ -32,7 +37,7 @@ import typing as tp
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from eyvan.records import LeaseRecord, WorkloadRecord
+from eyvan.records import CellRecord, LeaseRecord, WorkloadRecord
 
 #: How long a cell is assumed to still hold an asset after a job that used it
 #: last held the cell. Six hours is chosen against the failure it causes: too
@@ -53,6 +58,7 @@ def build_index(
     *,
     now: datetime,
     ttl_s: float = DEFAULT_LOCALITY_TTL_S,
+    cells: tp.Sequence[CellRecord] = (),
 ) -> dict[str, tuple[str, ...]]:
     """Map each named asset to the cells that most recently worked with it.
 
@@ -83,10 +89,24 @@ def build_index(
     ranked: defaultdict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for (asset, cell_id), stamp in seen.items():
         ranked[asset].append((stamp, cell_id))
-    return {
-        asset: tuple(cell_id for _stamp, cell_id in sorted(entries, key=lambda item: (item[0], item[1]), reverse=True))
+    index = {
+        asset: [cell_id for _stamp, cell_id in sorted(entries, key=lambda item: (item[0], item[1]), reverse=True)]
         for asset, entries in ranked.items()
     }
+
+    # Reported assets go to the front, in cell-id order so placement never
+    # depends on how the cells happened to be listed. An agent that can see the
+    # disk beats an inference about it, and a cell that appears in both signals
+    # must appear once -- a duplicate would count twice in the ranking and
+    # silently outweigh a cell holding more of the workload's assets.
+    reported: defaultdict[str, list[str]] = defaultdict(list)
+    for cell in sorted(cells, key=lambda record: record.id):
+        for asset in cell.materialized_assets:
+            reported[asset].append(cell.id)
+    for asset, cell_ids in reported.items():
+        inferred = [cell_id for cell_id in index.get(asset, ()) if cell_id not in set(cell_ids)]
+        index[asset] = [*cell_ids, *inferred]
+    return {asset: tuple(entries) for asset, entries in index.items()}
 
 
 def preferred_cells_for(
