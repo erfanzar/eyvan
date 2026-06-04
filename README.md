@@ -21,6 +21,9 @@ start:
   capability tokens, secrets, tenancy, and what is deliberately not covered.
 - [docs/troubleshoot.md](docs/troubleshoot.md) — symptom first, routed to the
   command that answers it.
+- [docs/proofs.md](docs/proofs.md) — the hardware proofs that have **not** been
+  run, each with its commands, pass criterion, shape and cost. Everything in
+  this package is CPU-verified; none of that is evidence about a TPU.
 
 
 ## Authority boundary

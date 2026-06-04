@@ -193,3 +193,39 @@ def test_the_install_page_still_states_the_real_number_of_prerequisites() -> Non
 
     assert len(rows) == 13
     assert "thirteen" in install.lower()
+
+
+def test_the_proofs_page_states_a_criterion_and_a_shape_for_each_run() -> None:
+    """A proof without a pass criterion is a plan to look at something.
+
+    The page exists so approving a spend is a decision about a known quantity,
+    and a row that says what it costs without saying what would satisfy it is
+    the opposite of that.
+    """
+
+    proofs = (DOCS / "proofs.md").read_text(encoding="utf-8")
+    sections = [block for block in proofs.split("\n## ") if block.startswith("P")]
+
+    assert len(sections) >= 8
+    for section in sections:
+        title = section.splitlines()[0]
+        assert "**Passes when**" in section, f"{title} states no pass criterion"
+        assert "**Shape**" in section, f"{title} states no shape"
+
+
+def test_the_proofs_page_does_not_claim_any_of_them_has_run() -> None:
+    """The whole value of the page is that it is honest about what is unproven.
+
+    A future edit that quietly moves a row from "not run" to "verified" without
+    a run behind it is the exact failure this repository has avoided all along.
+    """
+
+    # Whitespace-normalized: the prose wraps, and a substring check against
+    # wrapped text asserts the line width rather than the sentence.
+    proofs = " ".join((DOCS / "proofs.md").read_text(encoding="utf-8").split()).lower()
+
+    assert "nothing here has been run." in proofs
+    assert "none of that is evidence about a tpu" in proofs
+    # And no row may quietly acquire a result without a run behind it.
+    for claimed in ("verified on hardware", "confirmed on hardware", "passed on v5p", "proven on v5p"):
+        assert claimed not in proofs
