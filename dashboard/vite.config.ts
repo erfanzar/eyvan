@@ -30,5 +30,12 @@ export default defineConfig(({ mode }) => {
     preview: {
       port: 4174,
     },
+    // The default stays "node". Component suites opt in with a
+    // `@vitest-environment jsdom` docblock, per file rather than globally: a DOM
+    // for every file is slower and, worse, lets a test that quietly depends on
+    // one look like a pure test of the data layer.
+    test: {
+      environment: "node",
+    },
   };
 });
