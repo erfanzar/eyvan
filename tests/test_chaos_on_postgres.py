@@ -346,3 +346,39 @@ async def test_the_fleet_is_whole_after_the_matrix(plane) -> None:
     await service.settle_terminal_workload(ADMIN, workload.id, WorkloadState.FAILED, action="workload.failed")
 
     assert await check_fleet(repository) == ()
+
+
+def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
+    """Affected-only CI is silent on the week that matters most.
+
+    Everything else in the workspace workflow runs when its files change, which
+    means a week nobody touched ``libs/eyvan`` produces no PostgreSQL run at all
+    -- and that is exactly the week a dependency bump changes what SERIALIZABLE,
+    advisory locks or asyncpg do underneath it. A schedule is the difference
+    between "these held when we last edited them" and "these hold".
+
+    Skipped outside the monorepo: the workflow lives at the repository root,
+    which a standalone checkout of this package does not have.
+    """
+
+    import pathlib
+
+    import pytest
+    import yaml
+
+    workflow = pathlib.Path(__file__).resolve().parents[3] / ".github" / "workflows" / "workspace-ci.yaml"
+    if not workflow.exists():
+        pytest.skip("the workspace workflow lives in the monorepo, which a standalone eyvan checkout lacks")
+
+    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    # PyYAML parses a bare `on:` key as the boolean True.
+    triggers = document.get("on") or document.get(True) or {}
+
+    assert "schedule" in triggers, "the fault matrix has no scheduled run"
+    steps = [step for job in document["jobs"].values() for step in job.get("steps", []) if "name" in step]
+    postgres = [step for step in steps if "PostgreSQL integration suite" in step["name"]]
+    assert postgres, "no step runs the suite against a real database"
+    assert "test_chaos_on_postgres.py" in postgres[0]["run"], (
+        "the PostgreSQL step does not run the fault matrix this file defines"
+    )
+    assert "schedule" in postgres[0]["if"], "the scheduled run cannot reach the PostgreSQL step"
