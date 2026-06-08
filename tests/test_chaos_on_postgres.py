@@ -366,7 +366,12 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
     import pytest
     import yaml
 
-    workflow = pathlib.Path(__file__).resolve().parents[3] / ".github" / "workflows" / "workspace-ci.yaml"
+    # Named like the harness lookup in ``test_native_v5p16_live`` so the
+    # outside-the-package guard recognises this as a guarded reach rather than
+    # an unguarded one -- which it correctly refused when this was written
+    # without the anchor.
+    _MONOREPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+    workflow = _MONOREPO_ROOT / ".github" / "workflows" / "workspace-ci.yaml"
     if not workflow.exists():
         pytest.skip("the workspace workflow lives in the monorepo, which a standalone eyvan checkout lacks")
 

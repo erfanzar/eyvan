@@ -206,8 +206,15 @@ def test_no_test_depends_on_a_path_outside_this_package() -> None:
     offenders: list[str] = []
     tests = Path(__file__).resolve().parent
     for path in sorted(tests.glob("*.py")):
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if re.search(r"parents\[[3-9]\]", line) and "_MONOREPO_SCRIPTS" not in line:
+        for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            # Comments are stripped before matching. A guard that reads prose
+            # fires on its own explanation, which is how this one first failed:
+            # the sentence describing the rule tripped the rule.
+            line = raw.split("#", 1)[0]
+            # A reach is guarded when it is bound to a named monorepo anchor,
+            # because every such anchor here is paired with an existence check
+            # that skips. An inline walk mid-expression is the unguarded shape.
+            if re.search(r"parents\[[3-9]\]", line) and "_MONOREPO" not in line:
                 offenders.append(f"{path.name}:{number}")
 
     assert not offenders, (
