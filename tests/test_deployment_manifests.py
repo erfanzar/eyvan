@@ -268,3 +268,55 @@ def test_a_declared_but_unset_build_argument_does_not_look_configured() -> None:
     assert "ARG VITE_EYVAN_OIDC_ISSUER" in dockerfile
     # `||` rather than `??`: only the former treats an empty string as unset.
     assert "import.meta.env.VITE_EYVAN_OIDC_ISSUER || undefined" in oidc
+
+
+# --------------------------------------------------------------------------- found on hardware
+
+
+def test_a_slow_ingress_call_is_retryable_rather_than_a_cell_failure() -> None:
+    """Found by running P6, and only findable that way.
+
+    A `firewall-rules update` on a rule with one source range exceeded the
+    hardcoded 60-second timeout on a degraded link. The raw ``TimeoutExpired``
+    reached the agent as an untyped 500, the control plane recorded
+    ``provider_failure`` with no detail, and the Compute instance that call had
+    already created kept running and billing.
+
+    Slow is not failed. The ingress rule is reconciled on every pass, so a slow
+    call should cost one cycle rather than a cell.
+    """
+
+    import subprocess
+
+    from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
+    from eyvan.capacity.providers.gcp import native_worker_ingress
+
+    def slow(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["gcloud", "compute", "firewall-rules", "update"], timeout=1.0)
+
+    original = native_worker_ingress.subprocess.run
+    native_worker_ingress.subprocess.run = slow  # type: ignore[assignment]
+    try:
+        with pytest.raises(CapacityProviderError) as raised:
+            native_worker_ingress._gcloud_runner(["compute", "firewall-rules", "update", "rule"])
+    finally:
+        native_worker_ingress.subprocess.run = original  # type: ignore[assignment]
+
+    assert raised.value.code is CapacityProviderFailureCode.PROVIDER_UNAVAILABLE
+    assert raised.value.retryable is True
+    # The detail an operator was missing entirely: what timed out, and after how
+    # long. It lived only in an agent log file before this.
+    assert "timed out" in str(raised.value)
+    assert "firewall-rules" in str(raised.value)
+
+
+def test_the_ingress_timeout_is_configurable_and_not_sixty_seconds() -> None:
+    """Sixty was proven too tight by a real call on a real link.
+
+    Configurable for the same reason the TPU path is: nobody can pick one number
+    that suits every network between a laptop and Google.
+    """
+
+    from eyvan.capacity.providers.gcp.native_worker_ingress import DEFAULT_INGRESS_TIMEOUT_S
+
+    assert DEFAULT_INGRESS_TIMEOUT_S > 60.0

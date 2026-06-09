@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import subprocess
 import typing as tp
@@ -25,7 +26,7 @@ import httpx
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
-from eyvan.capacity.drivers.base import CapacityProviderError
+from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
 
 _DEFAULT_NETWORK = "default"
 _FIREWALL_PRIORITY = 1000
@@ -258,10 +259,41 @@ class HttpPublicIpv4Resolver:
         return parsed
 
 
-def _gcloud_runner(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run a bounded gcloud command without accepting shell input."""
+#: How long one firewall reconciliation may take.
+#:
+#: Sixty seconds was too tight, and it was found the only way it could be: a
+#: `firewall-rules update` on a rule with a single source range exceeded it on a
+#: degraded link, which marked a cell PROVIDER_ERROR while the Compute instance
+#: it had already created kept running and billing.
+#:
+#: Configurable and defaulted higher, matching the TPU path's reasoning at
+#: ``EYVAN_GCLOUD_TPU_TIMEOUT_S``: a provider call that is slow is not a provider
+#: call that failed, and the two must not share an outcome.
+DEFAULT_INGRESS_TIMEOUT_S = 300.0
 
-    return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=60.0)
+
+def _gcloud_runner(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run a bounded gcloud command, surfacing a timeout as a retryable failure.
+
+    A raw ``TimeoutExpired`` escaping here reached the agent as an untyped 500,
+    which the control plane recorded as ``provider_failure`` with no
+    ``unavailable_detail`` at all -- so an operator saw that a cell had failed
+    and could not learn why without reading an agent log file.
+
+    ``PROVIDER_UNAVAILABLE`` and ``retryable=True`` are the honest
+    classification: the ingress rule is reconciled on every pass, so a slow call
+    costs one cycle rather than a cell.
+    """
+
+    timeout_s = max(float(os.getenv("EYVAN_GCLOUD_INGRESS_TIMEOUT_S", DEFAULT_INGRESS_TIMEOUT_S)), 1.0)
+    try:
+        return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise CapacityProviderError(
+            f"native worker ingress reconciliation timed out after {timeout_s:g}s: gcloud {' '.join(args[:3])}",
+            code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE,
+            retryable=True,
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
