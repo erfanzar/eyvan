@@ -200,3 +200,106 @@ def test_component_discovery_finds_the_real_pid_records(tmp_path: Path, monkeypa
     assert set(discovered.values()) == {9081, 9090}
     assert any("control plane" in label for label in discovered)
     assert any("cell agent" in label for label in discovered), "the agent is recorded under its own port"
+
+
+def _fleet_with(cells: list[dict]) -> tp.Callable[[str], tp.Any]:
+    """A control plane holding one pool and whatever cells a test needs."""
+
+    pool = {
+        "id": "research/cpu",
+        "fleet_name": "research",
+        "node_type": "cpu",
+        "provider": "local",
+        "region": "local",
+        "capacity": {"cpu": 4.0, "memory_gib": 16.0},
+        "allocatable": {"cpu": 4.0, "memory_gib": 16.0},
+        "agent_endpoint": "http://agent:8090",
+    }
+
+    def handler(path: str) -> tp.Any:
+        if path.endswith("/health"):
+            return {"status": "ok", "controller": "active"}
+        if path.endswith("/capacity-pools"):
+            return [pool]
+        if path.endswith("/cells"):
+            return cells
+        return [{"name": "research"}]
+
+    return handler
+
+
+def _cell(cell_id: str, *, prices: dict | None = None, state: str = "ready") -> dict:
+    return {
+        "id": cell_id,
+        "provider": "local",
+        "region": "local",
+        "state": state,
+        "pool_id": "research/cpu",
+        "capacity": {"cpu": 4.0, "memory_gib": 16.0},
+        "allocatable": {"cpu": 4.0, "memory_gib": 16.0},
+        "endpoint": "http://agent:8090",
+        "unit_prices": prices or {},
+    }
+
+
+def test_a_fleet_where_nothing_is_priced_is_not_reported_as_healthy_pricing() -> None:
+    """Found on hardware: 32 live cells, 42,298 billed seconds, $0 reported.
+
+    "Every priced cell agrees with its pool" is vacuously true when no cell is
+    priced, so `doctor` passed while `eyvan capacity billing` reported a fleet
+    that had been running for hours as free. A check that passes because there
+    was nothing to check is the shape this repository keeps finding.
+    """
+
+    client = _RecordingClient(_fleet_with([_cell("cell-a"), _cell("cell-b")]))
+
+    report = DoctorCommandService(_session(client)).report()
+    drift = next(check for check in report.checks if check.name == "price-drift")
+
+    assert drift.status is CheckStatus.WARN
+    assert "structurally zero" in drift.detail
+    assert "2 cell(s)" in drift.detail
+    assert drift.remedy and "unit_prices" in drift.remedy
+
+
+def test_a_priced_fleet_still_passes() -> None:
+    """The warning must not fire on the configuration it exists to encourage."""
+
+    client = _RecordingClient(_fleet_with([_cell("cell-a", prices={"cpu": 0.05})]))
+
+    report = DoctorCommandService(_session(client)).report()
+    drift = next(check for check in report.checks if check.name == "price-drift")
+
+    assert drift.status is CheckStatus.PASS
+
+
+def test_deleted_cells_do_not_trigger_the_warning() -> None:
+    """A fleet that has scaled to zero is not an unpriced fleet.
+
+    Counting released cells would make the warning fire on every idle fleet,
+    which is how a warning becomes noise and then becomes muted.
+    """
+
+    client = _RecordingClient(_fleet_with([_cell("cell-a", state="deleted")]))
+
+    report = DoctorCommandService(_session(client)).report()
+    drift = next(check for check in report.checks if check.name == "price-drift")
+
+    assert drift.status is CheckStatus.PASS
+
+
+def test_a_partly_priced_fleet_is_not_this_warning_s_business() -> None:
+    """One unpriced cell among priced ones is drift, not a structural zero.
+
+    The warning exists for the fleet that cannot compute cost *at all*. Firing
+    it whenever any single cell lacks a price would duplicate the drift check
+    below it and make both harder to act on -- and a one-cell fixture cannot
+    tell the two rules apart, which is how the looser one survived a mutation.
+    """
+
+    client = _RecordingClient(_fleet_with([_cell("cell-a", prices={"cpu": 0.05}), _cell("cell-b")]))
+
+    report = DoctorCommandService(_session(client)).report()
+    drift = next(check for check in report.checks if check.name == "price-drift")
+
+    assert "structurally zero" not in drift.detail

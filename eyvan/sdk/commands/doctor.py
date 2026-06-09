@@ -29,7 +29,7 @@ from pydantic import ValidationError
 from eyvan._internal.client_version import client_version
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.capacity.providers.gcp.runtime.profile import DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
-from eyvan.records import CapacityPoolRecord, CellRecord
+from eyvan.records import CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
@@ -318,6 +318,24 @@ class DoctorCommandService:
             return CheckResult("price-drift", CheckStatus.WARN, f"could not parse capacity records: {error}")
         drift = audit_price_drift(pools=pool_records, cells=cell_records)
         if not drift:
+            # "Every priced cell agrees" is vacuously true on a fleet where no
+            # cell is priced, and that fleet reports $0 accrued and $0 idle
+            # forever. Found on hardware: 32 live cells, 42,298 billed seconds,
+            # and a billing report an operator would read as "this is free".
+            #
+            # Warn rather than fail. A fleet may be deliberately unpriced --
+            # reserved capacity already paid for, or a test fleet -- and the
+            # remedy is a sentence, not a refusal to operate.
+            live = [cell for cell in cell_records if cell.state is not CellState.DELETED]
+            unpriced = [cell for cell in live if not cell.unit_prices]
+            if live and len(unpriced) == len(live):
+                return CheckResult(
+                    "price-drift",
+                    CheckStatus.WARN,
+                    f"no cell carries a price, so cost reporting is structurally zero across {len(live)} cell(s)",
+                    "add `unit_prices` to the pool in your fleet config; `eyvan capacity billing` cannot "
+                    "distinguish a free fleet from an unpriced one",
+                )
             return CheckResult("price-drift", CheckStatus.PASS, "every priced cell agrees with its pool")
         worst = max(drift, key=lambda finding: abs(finding.relative_delta))
         return CheckResult(
