@@ -423,6 +423,34 @@ class ProjectRegisterRequest(ApiModel):
         return ProjectRecord(org_id=org_id, id=project_id, created_by=created_by, **self.model_dump())
 
 
+class PlanePeerPutRequest(ApiModel):
+    """Register another control plane this one may grant budget to.
+
+    ``plane_id`` comes from the path for the same reason it does on an
+    organization: one identity, spelled once.
+    """
+
+    endpoint: str = Field(min_length=1, max_length=512)
+    description: str = Field(default="", max_length=512)
+    enabled: bool = True
+
+
+class BudgetGrantIssueRequest(ApiModel):
+    """Cut a slice of one tenant's budget for one peer plane.
+
+    ``expires_at`` is required and has no default. A grant that cannot lapse
+    turns a home plane going away permanently into unbounded spend on every peer
+    that ever held one, so the record refuses to be built without it -- and a
+    default here would be this layer quietly choosing how long that risk lasts.
+    """
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    grantee_plane_id: str = Field(min_length=1, max_length=128)
+    amount: float = Field(ge=0)
+    expires_at: datetime
+
+
 class BudgetPutRequest(ApiModel):
     limit: float = Field(ge=0)
     accelerator_hour_limits: dict[str, float] = Field(default_factory=dict)

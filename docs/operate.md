@@ -35,6 +35,33 @@ delete the warm floor -- undoing the fix that put it there.
 `eyvan capacity carbon` reports grid intensity per region and will say
 `no_provider` until you configure one. That is the answer, not a gap in it.
 
+## Cost across more than one control plane
+
+A budget is one counter in one database, so a tenant with projects on three
+planes has three independent limits -- each locally compliant while the tenant
+spends three times what you set. Set `EYVAN_PLANE_ID` on every plane and cut the
+peers slices of the home plane's limit:
+
+```
+eyvan federation peer add eu-plane --endpoint https://eu.example
+eyvan federation grant issue eu-plane --org acme --project research \
+  --amount 250 --expires-at 2026-12-31
+eyvan federation grant list                    # who holds headroom right now
+eyvan federation grant list --include-inactive # who used to, and stopped
+```
+
+A plane with no `EYVAN_PLANE_ID` refuses to issue and does not consult grants at
+admission, which is the correct behaviour for the single-plane deployment and
+the reason federation stays off until you name your planes.
+
+`--expires-at` is required. A grant that cannot lapse turns a home plane going
+away permanently into unbounded spend on every peer that ever held one.
+Re-issuing to a peer *replaces* its slice rather than adding to it, so a peer's
+authority is always one number you can read.
+
+Revocation stops new admission and says nothing about what already ran; read
+`reported_spend` on the returned record for that.
+
 ## Storage
 
 ```

@@ -89,6 +89,7 @@ from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
     BatchSubmitRequest,
     BatchSubmitResponse,
+    BudgetGrantIssueRequest,
     BudgetPutRequest,
     CapacityPoolResponse,
     CapacityPoolUpsertRequest,
@@ -105,6 +106,7 @@ from eyvan.server.api.schemas import (
     NoMatchingCapacityPoolErrorContext,
     NoMatchingCapacityPoolErrorResponse,
     OrganizationRegisterRequest,
+    PlanePeerPutRequest,
     PlatformAgentNotConfiguredError,
     PolicyPutRequest,
     PoolCallableSubmitRequest,
@@ -144,6 +146,7 @@ from eyvan.server.service.errors import (
     NoMatchingCapacityPoolError,
     NotFoundError,
 )
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
@@ -261,6 +264,12 @@ def create_app(
             repository,
             callable_trust=CallableProjectTrustPolicy.from_projects(trusted_callable_projects),
             scheduler=CoreSchedulingService(),
+            # Without this the setting, the service parameter and every federation
+            # test all existed while no deployed plane ever had an identity: a
+            # plane with an empty ``plane_id`` refuses to issue grants and skips
+            # consulting them at admission, so federation was configurable,
+            # tested, and off everywhere.
+            plane_id=settings.plane_id,
         )
     if verifier is None and settings.oidc_issuer:
         verifier = OIDCTokenVerifier(
@@ -2013,6 +2022,94 @@ def create_app(
         if not removed:
             raise NotFoundError(f"no grant of {role!r} to {subject!r} in scope {org_id}/{project_id}")
         return Response(status_code=204)
+
+    @app.put("/api/v1/federation/peers/{plane_id}", response_model=PlanePeerRecord, tags=["federation"])
+    async def register_plane_peer(
+        plane_id: str,
+        request: PlanePeerPutRequest,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> PlanePeerRecord:
+        """Register or update a peer control plane.
+
+        Peers are configured, never discovered: a plane that could join by
+        asserting it is a tenant's home plane could claim that tenant's whole
+        budget, and nothing in this design has the standing to refuse it.
+        """
+
+        return await service.put_plane_peer(
+            principal,
+            plane_id=plane_id,
+            endpoint=request.endpoint,
+            description=request.description,
+            enabled=request.enabled,
+        )
+
+    @app.get("/api/v1/federation/peers", response_model=list[PlanePeerRecord], tags=["federation"])
+    async def list_plane_peers(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[PlanePeerRecord]:
+        """List the control planes this one knows about."""
+
+        return await service.list_plane_peers(principal)
+
+    @app.post(
+        "/api/v1/federation/budget-grants",
+        response_model=BudgetGrantRecord,
+        status_code=201,
+        tags=["federation"],
+    )
+    async def issue_budget_grant(
+        request: BudgetGrantIssueRequest,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> BudgetGrantRecord:
+        """Grant a peer plane a slice of this tenant's budget.
+
+        The home plane refuses to issue past its own limit, counting both what it
+        has already granted away and what it has itself spent. That one check is
+        the entire cross-plane guarantee -- no plane consults another at
+        admission time, because the slices were bounded when they were cut.
+        """
+
+        return await service.issue_budget_grant(
+            principal,
+            org_id=request.org_id,
+            project_id=request.project_id,
+            grantee_plane_id=request.grantee_plane_id,
+            amount=request.amount,
+            expires_at=request.expires_at,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.get("/api/v1/federation/budget-grants", response_model=list[BudgetGrantRecord], tags=["federation"])
+    async def list_budget_grants(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        org_id: str | None = None,
+        project_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[BudgetGrantRecord]:
+        """List the budget slices this plane has issued or been issued."""
+
+        return await service.list_budget_grants(
+            principal,
+            org_id=org_id,
+            project_id=project_id,
+            include_inactive=include_inactive,
+        )
+
+    @app.delete("/api/v1/federation/budget-grants/{grant_id}", response_model=BudgetGrantRecord, tags=["federation"])
+    async def revoke_budget_grant(
+        grant_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> BudgetGrantRecord:
+        """Withdraw a peer's authority to spend.
+
+        Returns the grant rather than 204: revocation stops *new* admission and
+        says nothing about what already ran, and ``reported_spend`` on the
+        returned record is what that distinction looks like in numbers.
+        """
+
+        return await service.revoke_budget_grant(principal, grant_id=grant_id)
 
     @app.put("/api/v1/organizations/{org_id}", response_model=OrganizationRecord, tags=["tenancy"])
     async def register_organization(

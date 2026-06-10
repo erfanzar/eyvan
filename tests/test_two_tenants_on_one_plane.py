@@ -56,6 +56,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "POST /api/v1/dags": "release a graph into another org",
     "POST /api/v1/groups": "place a heterogeneous group into another org",
     "GET /api/v1/quotas": "read another org's quotas",
+    "GET /api/v1/federation/budget-grants": "read another org's federated budget slices",
     "GET /api/v1/quotas/current": "read another org's effective quota",
     "PUT /api/v1/quotas": "write another org's quota",
     "DELETE /api/v1/quotas": "delete another org's quota",
@@ -106,6 +107,10 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/leases/{lease_id}": "one lease",
     "GET /api/v1/fleet/events": "unscoped audit trail",
     "POST /api/v1/preemptions/{command_id}/force-finalize": "break-glass preemption finalize",
+    "GET /api/v1/federation/peers": "which control planes this one federates with",
+    "PUT /api/v1/federation/peers/{plane_id}": "register a peer plane",
+    "POST /api/v1/federation/budget-grants": "cut a peer a slice of a tenant's budget",
+    "DELETE /api/v1/federation/budget-grants/{grant_id}": "withdraw a peer's authority to spend",
     "GET /api/v1/system/invariants": "fleet-wide durability check",
     "POST /api/v1/system/reconcile": "force a scheduling pass",
     "GET /api/v1/artifacts/collectable": "fleet-wide collectable artifacts",
@@ -537,3 +542,138 @@ def test_a_tenant_sees_only_its_own_registration_in_a_listing(plane: TestClient)
 
     assert organizations.status_code == 200
     assert [item["id"] for item in organizations.json()] == ["rival"]
+
+
+# --------------------------------------------------------------------------- federation
+
+
+@pytest.fixture
+def home_plane() -> TestClient:
+    """A plane with an identity, serving the same two tenants.
+
+    Federation needs ``plane_id``: a plane with no identity cannot be a home
+    plane and refuses to issue. Kept separate from ``plane`` so the isolation
+    tests above keep asserting against the default deployment, which has no
+    identity and no federation.
+    """
+
+    client = TestClient(
+        create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key="k" * 32, plane_id="us-plane"))
+    )
+    for org in ("acme", "rival"):
+        client.put(
+            f"/api/v1/organizations/{org}",
+            json={"owner": f"owner@{org}"},
+            headers={**ADMIN, "Idempotency-Key": f"o-{org}"},
+        )
+        client.put(
+            f"/api/v1/organizations/{org}/projects/research",
+            json={"owner": f"owner@{org}"},
+            headers={**ADMIN, "Idempotency-Key": f"p-{org}"},
+        )
+    return client
+
+
+def _grant_acme_a_budget_and_a_peer(plane: TestClient) -> str:
+    """Give acme a budget and cut a peer a slice of it. Returns the grant id."""
+
+    plane.put(
+        "/api/v1/budgets/acme/research",
+        json={"limit": 1000.0},
+        headers={**ADMIN, "Idempotency-Key": "b-acme"},
+    )
+    plane.put(
+        "/api/v1/federation/peers/eu-plane",
+        json={"endpoint": "https://eu.example"},
+        headers=ADMIN,
+    )
+    issued = plane.post(
+        "/api/v1/federation/budget-grants",
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "grantee_plane_id": "eu-plane",
+            "amount": 250.0,
+            "expires_at": "2099-01-01T00:00:00Z",
+        },
+        headers={**ADMIN, "Idempotency-Key": "g-acme"},
+    )
+    assert issued.status_code == 201, issued.text
+    return issued.json()["id"]
+
+
+def test_a_tenant_cannot_read_another_tenants_federated_budget(home_plane: TestClient) -> None:
+    """A grant is a tenant's name attached to a sum of money.
+
+    An unnarrowed listing would make every tenant's budget posture -- how much
+    headroom they have and which planes hold it -- readable by anyone with a
+    token, which is the same disclosure the organization listing already
+    refuses.
+    """
+
+    _grant_acme_a_budget_and_a_peer(home_plane)
+
+    rival = home_plane.get("/api/v1/federation/budget-grants", headers=RIVAL)
+
+    assert rival.status_code == 200
+    assert rival.json() == []
+
+
+def test_a_fleet_admin_sees_the_grant_the_tenant_cannot(home_plane: TestClient) -> None:
+    """The narrowing must not be indistinguishable from the feature being broken."""
+
+    grant_id = _grant_acme_a_budget_and_a_peer(home_plane)
+
+    listed = home_plane.get("/api/v1/federation/budget-grants", headers=ADMIN)
+
+    assert [item["id"] for item in listed.json()] == [grant_id]
+
+
+def test_an_operator_cannot_issue_revoke_or_register_a_peer(home_plane: TestClient) -> None:
+    """Issuing a grant is spending authority, not reading it.
+
+    A tenant that could cut its own slices could hand a peer plane its entire
+    limit, which is exactly the bound federation exists to hold.
+    """
+
+    grant_id = _grant_acme_a_budget_and_a_peer(home_plane)
+
+    attempts = {
+        "register-peer": home_plane.put(
+            "/api/v1/federation/peers/hostile", json={"endpoint": "https://hostile.example"}, headers=RIVAL
+        ),
+        "list-peers": home_plane.get("/api/v1/federation/peers", headers=RIVAL),
+        "issue": home_plane.post(
+            "/api/v1/federation/budget-grants",
+            json={
+                "org_id": "acme",
+                "project_id": "research",
+                "grantee_plane_id": "eu-plane",
+                "amount": 1.0,
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+            headers={**RIVAL, "Idempotency-Key": "hostile"},
+        ),
+        "revoke": home_plane.request("DELETE", f"/api/v1/federation/budget-grants/{grant_id}", headers=RIVAL),
+    }
+
+    for name, response in attempts.items():
+        assert response.status_code in {403, 404, 422}, f"{name} reached federation: {response.status_code}"
+
+
+def test_a_revoked_grant_leaves_the_listing_but_not_the_default_one(home_plane: TestClient) -> None:
+    """ "This peer used to hold headroom and stopped" is the first question asked.
+
+    Deleting the record would answer it with silence, and leaving revoked slices
+    in the default listing would make an operator add up authority that no longer
+    exists.
+    """
+
+    grant_id = _grant_acme_a_budget_and_a_peer(home_plane)
+    revoked = home_plane.request("DELETE", f"/api/v1/federation/budget-grants/{grant_id}", headers=ADMIN)
+
+    assert revoked.status_code == 200
+    assert revoked.json()["state"] == "revoked"
+    assert home_plane.get("/api/v1/federation/budget-grants", headers=ADMIN).json() == []
+    everything = home_plane.get("/api/v1/federation/budget-grants?include_inactive=true", headers=ADMIN)
+    assert [item["id"] for item in everything.json()] == [grant_id]

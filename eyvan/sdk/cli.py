@@ -25,6 +25,7 @@ from eyvan.sdk.commands.capacity import register_capacity_commands
 from eyvan.sdk.commands.contexts import register_context_commands
 from eyvan.sdk.commands.dashboard import register_dashboard_commands
 from eyvan.sdk.commands.doctor import register_doctor_commands
+from eyvan.sdk.commands.federation import register_federation_commands
 from eyvan.sdk.commands.fleets import register_fleet_commands
 from eyvan.sdk.commands.governance import register_governance_commands
 from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
@@ -111,6 +112,7 @@ for register_commands in (
     register_artifact_commands,
     register_capacity_commands,
     register_governance_commands,
+    register_federation_commands,
     register_tenancy_commands,
     register_runtime_commands,
     register_soak_commands,

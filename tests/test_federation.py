@@ -505,3 +505,66 @@ async def test_registering_a_peer_twice_preserves_its_creation_time() -> None:
     assert second.created_at == first.created_at
     assert second.endpoint == "https://eu2.example.test"
     assert [peer.plane_id for peer in await service.list_plane_peers(_admin())] == [_PEER]
+
+
+# --------------------------------------------------------------------------- reachability
+
+
+def test_a_deployed_plane_takes_its_identity_from_its_settings() -> None:
+    """The seam that made all of the above true and none of it real.
+
+    ``EyvanSettings.plane_id`` existed and was read from ``EYVAN_PLANE_ID``; the
+    service parameter existed and every test above set it directly; and
+    ``create_app`` passed neither. So a deployed plane always had an empty
+    identity, which means it refused to issue grants *and* skipped consulting
+    them at admission -- federation configurable, tested, and off everywhere.
+
+    Asserted through ``create_app`` rather than the constructor because the
+    constructor was never the thing that was wrong.
+    """
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    app = create_app(settings=EyvanSettings(artifact_token_key="k" * 32, plane_id="us-plane"))
+
+    assert app.state.service.plane_id == "us-plane"
+
+
+def test_the_federation_commands_are_attached() -> None:
+    """Grants were built, tested, wired into admission -- and had no command.
+
+    A mechanism that can only be invoked by hand-writing HTTP against a route
+    that did not exist bounds nothing, which is what "entirely unreachable"
+    meant in the plan.
+    """
+
+    from eyvan.sdk import cli
+
+    assert "federation" in cli.main.commands
+    groups = cli.main.commands["federation"].commands
+    assert set(groups) == {"peer", "grant"}
+    assert set(groups["grant"].commands) == {"list", "issue", "revoke"}
+    assert set(groups["peer"].commands) == {"list", "add"}
+
+
+def test_issuing_a_grant_from_the_cli_requires_an_expiry() -> None:
+    """The one option with no safe default.
+
+    A grant that cannot lapse turns a home plane going away permanently into
+    unbounded spend on every peer that ever held one. The record refuses to be
+    built without an expiry; this asserts the CLI refuses before the request is
+    ever sent, so the refusal does not depend on reaching a server.
+    """
+
+    from click.testing import CliRunner
+
+    from eyvan.sdk import cli
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--user", "root", "--role", "fleet_admin", "federation", "grant", "issue", "eu-plane", "--amount", "10"],
+    )
+
+    assert result.exit_code != 0
+    assert "--expires-at" in result.output

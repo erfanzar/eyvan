@@ -4556,6 +4556,41 @@ class ControlPlaneService:
             )
             return grant
 
+    async def list_budget_grants(
+        self,
+        principal: Principal,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        include_inactive: bool = False,
+        now: datetime | None = None,
+    ) -> list[BudgetGrantRecord]:
+        """List the budget slices this plane has issued or been issued.
+
+        Narrowed exactly as ``list_role_grants`` is. A grant names a tenant and a
+        sum of money, so an unfiltered listing would be every tenant's budget
+        posture readable by anyone with a token.
+
+        Expired grants are excluded by default and not deleted: the sweep marks
+        them EXPIRED and the record stays, because "this peer used to hold
+        headroom and stopped" is the first question asked when a grantee suddenly
+        refuses work. ``include_inactive`` is how that question gets answered.
+        """
+
+        moment = now or utcnow()
+        async with self.repository.transaction() as tx:
+            grants = await tx.list_budget_grants(org_id=org_id, project_id=project_id)
+        if not include_inactive:
+            grants = [grant for grant in grants if grant.active_at(moment)]
+        if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            return list(grants)
+        visible = {
+            grant.org_id
+            for grant in principal.grants
+            if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
+        }
+        return [grant for grant in grants if grant.org_id in visible]
+
     async def revoke_budget_grant(self, principal: Principal, *, grant_id: str) -> BudgetGrantRecord:
         """Withdraw a peer's authority to spend.
 
