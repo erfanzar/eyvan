@@ -15,6 +15,7 @@ import {
   mockWorkloads,
 } from "./mockData";
 import { apiAuthHeaders, isDemoMode, rejectSession } from "../auth/oidc";
+import { followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
   AuditEvent,
   BillingReport,
@@ -454,6 +455,30 @@ export class EyvanApiClient {
   private scope(path: string): string {
     const join = path.includes("?") ? "&" : "?";
     return `${path}${join}org_id=${encodeURIComponent(this.org)}&project_id=${encodeURIComponent(this.project)}`;
+  }
+
+  /**
+   * Follow this tenant's audit stream, calling `onEvent` as changes commit.
+   *
+   * A change *notification*, not a data channel. The stream carries audit
+   * events for one (org, project); the dashboard's own model spans fleet
+   * capacity too, so an event means "refetch", and the slow poll beside it
+   * still covers what this stream cannot see -- another tenant's work landing
+   * on a shared cell, or a cell going unhealthy without an audit event.
+   *
+   * Resolves only when `signal` aborts. In demo mode it resolves immediately:
+   * there is no plane to stream from, and pretending otherwise would show a
+   * "live" indicator over mock data.
+   */
+  async followEvents(onEvent: (event: StreamEvent) => void, signal: AbortSignal, onConnectionChange?: (connected: boolean) => void): Promise<void> {
+    if (this.forceDemo) return;
+    await followEventStream({
+      url: `${this.baseUrl}${this.scope("/events/stream")}`,
+      headers: apiAuthHeaders(),
+      signal,
+      onEvent,
+      onConnectionChange,
+    });
   }
 
   async getHealth(): Promise<ControlPlaneHealth> {

@@ -4,13 +4,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertTriangle, CheckCircle2, X } from "lucide-react";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { apiClient, computeOverview } from "./api/client";
 import { currentIdentity, logout } from "./auth/oidc";
 import { ErrorState, LoadingState } from "./components/PageState";
 import { Shell } from "./components/Shell";
 import { SubmitWorkloadModal } from "./components/SubmitWorkloadModal";
+import { useLiveRefresh } from "./lib/useLiveRefresh";
 import { useVisibilityPolling } from "./lib/useVisibilityPolling";
 import { AuditPage } from "./pages/AuditPage";
 import { BudgetsPage } from "./pages/BudgetsPage";
@@ -21,7 +22,11 @@ import { WorkloadsPage } from "./pages/WorkloadsPage";
 import { navigate, parseRoute, type Route, type Section } from "./routing";
 import type { DashboardData, SchedulingPolicy, SubmitWorkloadInput, WorkloadDetail } from "./types";
 
-const REFRESH_INTERVAL_MS = 8_000;
+// The fallback sweep, not the update path. Updates now arrive as the control
+// plane commits them; this covers what one tenant's audit stream cannot see --
+// fleet capacity moving for another tenant, a cell going unhealthy without an
+// audit event, and a proxy that buffers `text/event-stream` into silence.
+const REFRESH_INTERVAL_MS = 30_000;
 
 export default function App() {
   const [route, setRoute] = useState<Route>(() => parseRoute());
@@ -33,6 +38,10 @@ export default function App() {
   const [submitOpen, setSubmitOpen] = useState(false);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null);
+  // Read by the live-refresh handler, which is created once and must not
+  // resubscribe every time the route changes -- a resubscribe drops the stream
+  // and replays from the last id on every navigation.
+  const detailRouteIdRef = useRef<string | undefined>(undefined);
 
   // Each resource is fetched once per refresh; the overview is computed from the shared data.
   const loadDashboard = useCallback(async (background = false) => {
@@ -79,6 +88,19 @@ export default function App() {
 
   useVisibilityPolling(() => void loadDashboard(true), REFRESH_INTERVAL_MS);
 
+  const subscribe = useCallback(
+    (onEvent: () => void, signal: AbortSignal, onConnectionChange: (connected: boolean) => void) =>
+      apiClient.followEvents(onEvent, signal, onConnectionChange),
+    [],
+  );
+  const live = useLiveRefresh({
+    subscribe,
+    onChange: () => {
+      void loadDashboard(true);
+      if (detailRouteIdRef.current) void loadWorkloadDetail(detailRouteIdRef.current, true);
+    },
+  });
+
   useEffect(() => {
     if (!("workloadId" in route)) {
       setDetailError(null);
@@ -89,6 +111,7 @@ export default function App() {
   }, [route, selectedWorkload?.id, loadWorkloadDetail]);
 
   const detailRouteId = "workloadId" in route ? route.workloadId : undefined;
+  detailRouteIdRef.current = detailRouteId;
   useVisibilityPolling(
     () => {
       if (detailRouteId) void loadWorkloadDetail(detailRouteId, true);
@@ -207,6 +230,7 @@ export default function App() {
         onNavigate={goToSection}
         onSubmit={() => setSubmitOpen(true)}
         health={data?.health}
+        live={live}
         identity={currentIdentity()}
         onLogout={currentIdentity()?.mode === "development" ? undefined : () => void logout()}
       >

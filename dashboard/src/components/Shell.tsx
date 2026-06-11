@@ -28,6 +28,8 @@ interface ShellProps {
   onNavigate: (section: Section) => void;
   onSubmit: () => void;
   health?: ControlPlaneHealth;
+  /** Whether the change stream is attached; undefined in demo mode. */
+  live?: boolean;
   identity?: AuthIdentity;
   onLogout?: () => void;
   children: ReactNode;
@@ -60,6 +62,7 @@ export function Shell({
   onNavigate,
   onSubmit,
   health,
+  live,
   identity,
   onLogout,
   children,
@@ -148,7 +151,11 @@ export function Shell({
             <span className={`health-indicator ${connected ? "" : "health-indicator-pending"}`} aria-hidden="true" />
             <span>
               <strong>{connected ? "Control plane connected" : health?.status === "demo" ? "Demo mode" : "Checking control plane"}</strong>
-              <small>{health ? `${health.service} reported ${health.status}` : "Awaiting health response"}</small>
+              <small>
+                {/* A stream that stopped and a fleet where nothing is happening look
+                    identical from the page. The first is a bug; the second is a Tuesday. */}
+                {live ? "Live -- updating as changes commit" : health ? `${health.service} reported ${health.status}` : "Awaiting health response"}
+              </small>
             </span>
           </div>
           {onLogout ? <button className="profile-button" type="button" aria-label={`Sign out ${identity?.displayName ?? "current user"}`} title="Sign out" onClick={onLogout}>
