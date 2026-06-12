@@ -30,7 +30,7 @@ from eyvan.records import (
     WorkloadRecord,
     WorkloadState,
 )
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
 
 class TransientRepositoryError(RuntimeError):
@@ -187,6 +187,18 @@ class RepositorySession(tp.Protocol):
         project_id: str | None = None,
         grantee_plane_id: str | None = None,
     ) -> list[BudgetGrantRecord]: ...
+
+    async def get_quota_grant(self, grant_id: str) -> QuotaGrantRecord | None: ...
+
+    async def put_quota_grant(self, grant: QuotaGrantRecord) -> None: ...
+
+    async def list_quota_grants(
+        self,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        grantee_plane_id: str | None = None,
+    ) -> list[QuotaGrantRecord]: ...
 
     async def get_idempotency(self, scope: str, operation: str, key: str) -> IdempotencyRecord | None: ...
 

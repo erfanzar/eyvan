@@ -62,6 +62,23 @@ authority is always one number you can read.
 Revocation stops new admission and says nothing about what already ran; read
 `reported_spend` on the returned record for that.
 
+Quota has the same hole and the same fix, in the other currency. Money and chips
+are separate limits and a fleet can hold one while breaching the other -- a
+tenant on a small budget can still exhaust an accelerator pool everyone else is
+queued behind:
+
+```
+eyvan federation quota-grant issue eu-plane --org acme --project research \
+  --tpu 8 --cpu 64 --expires-at 2026-12-31
+eyvan federation quota-grant list
+```
+
+Dimensions you do not name are zero, not unlimited. A grantee's effective ceiling
+is the tighter of the slice and any local quota, so a grant can never raise a
+limit a local operator set. Revoking one stops new admission and leaves running
+work alone: a quota is a concurrent ceiling, and evicting live work to enforce a
+ceiling change would make revocation an outage rather than an administrative act.
+
 ## Storage
 
 ```

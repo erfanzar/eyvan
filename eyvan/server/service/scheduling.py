@@ -10,6 +10,7 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal
 
 from eyvan.domain import (
     Budget,
@@ -43,6 +44,7 @@ from eyvan.records import (
     QuotaRecord,
     WorkloadRecord,
     WorkloadState,
+    resource_quantities,
     utcnow,
 )
 from eyvan.records import (
@@ -51,7 +53,7 @@ from eyvan.records import (
 from eyvan.records import (
     ResourceVector as ApiResourceVector,
 )
-from eyvan.server.service.federation import BudgetGrantRecord
+from eyvan.server.service.federation import BudgetGrantRecord, QuotaGrantRecord
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 
@@ -68,6 +70,7 @@ class SchedulingService(tp.Protocol):
         quotas: tp.Iterable[QuotaRecord] = (),
         policies: tp.Iterable[PolicyRecord] = (),
         grants: tp.Iterable[BudgetGrantRecord] = (),
+        quota_grants: tp.Iterable[QuotaGrantRecord] = (),
         plane_id: str = "",
         now: datetime | None = None,
     ) -> SchedulingResult: ...
@@ -380,6 +383,81 @@ def federated_budgets(
     return budgets
 
 
+def federated_quotas(
+    records: tp.Sequence[QuotaRecord],
+    grants: tp.Sequence[QuotaGrantRecord],
+    *,
+    plane_id: str,
+    now: datetime,
+) -> list[Quota]:
+    """Bound this plane's placement by the quota slices it holds.
+
+    The capacity half of :func:`federated_budgets`, and it exists for the same
+    reason: ``QuotaRecord.limits`` is one vector in one database, so a tenant with
+    projects on three planes could run three times its accelerator ceiling with
+    every plane locally compliant. Money and chips are separate limits, and the
+    scarce thing in a shared fleet is usually chips.
+
+    The same three rules:
+
+    * A plane holding no quota grants for a tenant is unchanged -- the home plane,
+      and every non-federated deployment.
+    * The effective limit is the **tighter** of the grant and any local quota,
+      per dimension. A grant may not raise a ceiling a local operator set, and a
+      local record may not exceed the slice the home plane issued.
+    * A grantee with grants and no local quota record gets the grant as its
+      limit. Without that, the plane with the least local configuration would be
+      the one with no ceiling -- exactly backwards.
+
+    Only project-scoped records are federated. Principal-scoped quotas subdivide
+    a project's share *within* one plane, and a cross-plane grant has nothing to
+    say about how a tenant splits its own slice between its own people.
+    """
+
+    granted: dict[tuple[str, str], dict[str, float]] = {}
+    # As with budgets, the ``plane_id`` check is a short-circuit rather than the
+    # safety property: ``grantee_plane_id`` has ``min_length=1``, so no grant can
+    # be addressed to "".
+    if plane_id:
+        for grant in grants:
+            if grant.grantee_plane_id != plane_id or not grant.active_at(now):
+                continue
+            key = (grant.org_id, grant.project_id)
+            totals = granted.setdefault(key, {})
+            for name, quantity in resource_quantities(grant.limits).items():
+                if quantity:
+                    totals[name] = totals.get(name, 0.0) + quantity
+    quotas: list[Quota] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        if record.principal_id is not None or record.project_id is None:
+            quotas.append(to_core_quota(record))
+            continue
+        key = (record.org_id, record.project_id)
+        allowance = granted.get(key)
+        if allowance is None:
+            quotas.append(to_core_quota(record))
+            continue
+        seen.add(key)
+        local = to_core_quota(record)
+        # A dimension the grant does not mention is zero, not unbounded: a slice
+        # that silently authorized everything it forgot to name would be the
+        # opposite of a ceiling. A dimension the *local* quota does not constrain
+        # is not introduced here either -- the grant cannot add a constraint the
+        # tenant's own operator did not ask for on a plane that is not the home.
+        bounded = {
+            name: min(quantity, Decimal(str(allowance.get(name, 0.0))))
+            for name, quantity in local.limit.as_dict().items()
+        }
+        quotas.append(replace(local, limit=ResourceVector(bounded)))
+    for key, allowance in sorted(granted.items()):
+        if key in seen:
+            continue
+        org_id, project_id = key
+        quotas.append(Quota(scope=IdentityScope(org_id, project_id), limit=ResourceVector(dict(allowance)), weight=1.0))
+    return quotas
+
+
 class CoreSchedulingService:
     """Adapter around :class:`eyvan.domain.Scheduler`."""
 
@@ -396,6 +474,7 @@ class CoreSchedulingService:
         quotas: tp.Iterable[QuotaRecord] = (),
         policies: tp.Iterable[PolicyRecord] = (),
         grants: tp.Iterable[BudgetGrantRecord] = (),
+        quota_grants: tp.Iterable[QuotaGrantRecord] = (),
         plane_id: str = "",
         now: datetime | None = None,
     ) -> SchedulingResult:
@@ -431,6 +510,6 @@ class CoreSchedulingService:
                 )
                 for lease in active_leases
             ),
-            quotas=(to_core_quota(quota) for quota in quotas),
+            quotas=federated_quotas(list(quotas), list(quota_grants), plane_id=plane_id, now=now or utcnow()),
             budgets=federated_budgets(list(budgets), list(grants), plane_id=plane_id, now=now or utcnow()),
         )

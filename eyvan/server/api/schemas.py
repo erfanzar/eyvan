@@ -451,6 +451,21 @@ class BudgetGrantIssueRequest(ApiModel):
     expires_at: datetime
 
 
+class QuotaGrantIssueRequest(ApiModel):
+    """Cut a slice of one tenant's quota for one peer plane.
+
+    ``limits`` is a resource vector rather than a scalar, and omitted dimensions
+    are zero. A slice that silently authorized every resource it forgot to
+    mention would be the opposite of a ceiling.
+    """
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    grantee_plane_id: str = Field(min_length=1, max_length=128)
+    limits: ResourceLimits
+    expires_at: datetime
+
+
 class BudgetPutRequest(ApiModel):
     limit: float = Field(ge=0)
     accelerator_hour_limits: dict[str, float] = Field(default_factory=dict)

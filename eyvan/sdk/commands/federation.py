@@ -25,9 +25,14 @@ import click
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import model_json
+from eyvan.records import ResourceLimits
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
-from eyvan.server.api.schemas import BudgetGrantIssueRequest, PlanePeerPutRequest
+from eyvan.server.api.schemas import (
+    BudgetGrantIssueRequest,
+    PlanePeerPutRequest,
+    QuotaGrantIssueRequest,
+)
 
 
 def _service(session: CliSession) -> OperationsCommandService:
@@ -177,6 +182,106 @@ def revoke_grant(session: CliSession, grant_id: str) -> None:
     """
 
     _service(session).renderer.emit(session.client.request("DELETE", f"/api/v1/federation/budget-grants/{grant_id}"))
+
+
+@federation.group("quota-grant")
+def quota_grant() -> None:
+    """Issue, list and revoke slices of a tenant's resource quota.
+
+    The capacity half of `federation grant`. Money and chips are separate limits
+    and a fleet can hold one while breaching the other: a tenant on a small
+    budget can still exhaust an accelerator pool everyone else is queued behind,
+    because what is scarce is chips.
+    """
+
+
+@quota_grant.command("list")
+@click.option("--org", "org_id", help="Show only grants for this organization.")
+@click.option("--project", "project_id", help="Show only grants for this project.")
+@click.option("--include-inactive", is_flag=True, help="Include revoked and expired slices.")
+@click.pass_obj
+def list_quota_grants(session: CliSession, org_id: str | None, project_id: str | None, include_inactive: bool) -> None:
+    """List the quota slices this plane has issued or been issued."""
+
+    params: dict[str, str] = {}
+    if org_id is not None:
+        params["org_id"] = org_id
+    if project_id is not None:
+        params["project_id"] = project_id
+    if include_inactive:
+        params["include_inactive"] = "true"
+    _service(session).read("/api/v1/federation/quota-grants", params=params)
+
+
+@quota_grant.command("issue")
+@click.argument("grantee_plane_id")
+@click.option("--org", "org_id", help="Organization whose quota is being sliced.")
+@click.option("--project", "project_id", help="Project whose quota is being sliced.")
+@click.option("--cpu", type=float, default=0.0, help="CPU cores the peer may hold concurrently.")
+@click.option("--memory-gib", type=float, default=0.0, help="Memory the peer may hold concurrently.")
+@click.option("--gpu", type=float, default=0.0, help="GPUs the peer may hold concurrently.")
+@click.option("--tpu", type=float, default=0.0, help="TPU chips the peer may hold concurrently.")
+@click.option(
+    "--expires-at",
+    type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]),
+    required=True,
+    help="When the slice lapses. Required, for the same reason a budget slice's expiry is.",
+)
+@click.option("--idempotency-key")
+@click.pass_obj
+def issue_quota_grant(
+    session: CliSession,
+    grantee_plane_id: str,
+    org_id: str | None,
+    project_id: str | None,
+    cpu: float,
+    memory_gib: float,
+    gpu: float,
+    tpu: float,
+    expires_at: datetime,
+    idempotency_key: str | None,
+) -> None:
+    """Grant GRANTEE_PLANE_ID a slice of one tenant's quota.
+
+    Dimensions left unset are zero rather than unlimited. The home plane refuses
+    if the slice overruns its remaining headroom in *any* dimension, and names
+    every dimension that overran.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    try:
+        request = QuotaGrantIssueRequest(
+            org_id=scope.org_id,
+            project_id=scope.project_id,
+            grantee_plane_id=grantee_plane_id,
+            limits=ResourceLimits(cpu=cpu, memory_gib=memory_gib, gpu=gpu, tpu=tpu),
+            expires_at=expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at,
+        )
+    except ValidationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    service = _service(session)
+    service.renderer.emit(
+        session.client.request(
+            "POST",
+            "/api/v1/federation/quota-grants",
+            json=model_json(request),
+            headers={"Idempotency-Key": service.keys.create("quota.grant", idempotency_key)},
+        )
+    )
+
+
+@quota_grant.command("revoke")
+@click.argument("grant_id")
+@click.pass_obj
+def revoke_quota_grant(session: CliSession, grant_id: str) -> None:
+    """Withdraw GRANT_ID, stopping new admission on the grantee.
+
+    Does not disturb what is already running: a quota is a concurrent ceiling,
+    and evicting live work to enforce a ceiling change would make revocation an
+    outage rather than an administrative act.
+    """
+
+    _service(session).renderer.emit(session.client.request("DELETE", f"/api/v1/federation/quota-grants/{grant_id}"))
 
 
 def register_federation_commands(main: click.Group) -> None:

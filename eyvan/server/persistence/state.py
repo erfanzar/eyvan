@@ -36,7 +36,7 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.persistence.base import RepositorySession
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
 #: Outbox states safe to delete. Both are absorbing, so removing a row cannot
 #: drop a command that is still owed delivery.
@@ -65,6 +65,7 @@ class ControlPlaneState:
     progress_reports: dict[str, dict[int, UserProgressReport]] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
+    quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
     managed_artifacts: dict[str, ManagedArtifactRecord] = field(default_factory=dict)
     artifact_references: dict[str, ArtifactReferenceRecord] = field(default_factory=dict)
     idempotency: dict[tuple[str, str, str], IdempotencyRecord] = field(default_factory=dict)
@@ -267,6 +268,28 @@ class StateSession(RepositorySession):
         items = [
             item
             for item in self._state.budget_grants.values()
+            if (org_id is None or item.org_id == org_id)
+            and (project_id is None or item.project_id == project_id)
+            and (grantee_plane_id is None or item.grantee_plane_id == grantee_plane_id)
+        ]
+        return sorted(items, key=lambda item: (item.issued_at, item.id))
+
+    async def get_quota_grant(self, grant_id: str) -> QuotaGrantRecord | None:
+        return self._state.quota_grants.get(grant_id)
+
+    async def put_quota_grant(self, grant: QuotaGrantRecord) -> None:
+        self._state.quota_grants[grant.id] = grant
+
+    async def list_quota_grants(
+        self,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        grantee_plane_id: str | None = None,
+    ) -> list[QuotaGrantRecord]:
+        items = [
+            item
+            for item in self._state.quota_grants.values()
             if (org_id is None or item.org_id == org_id)
             and (project_id is None or item.project_id == project_id)
             and (grantee_plane_id is None or item.grantee_plane_id == grantee_plane_id)

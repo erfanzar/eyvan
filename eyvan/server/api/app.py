@@ -114,6 +114,7 @@ from eyvan.server.api.schemas import (
     PreemptionForceFinalizeRequest,
     ProgressReportRequest,
     ProjectRegisterRequest,
+    QuotaGrantIssueRequest,
     QuotaPutRequest,
     RoleGrantIssueRequest,
     ServiceEndpointRequest,
@@ -146,7 +147,7 @@ from eyvan.server.service.errors import (
     NoMatchingCapacityPoolError,
     NotFoundError,
 )
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
@@ -2110,6 +2111,63 @@ def create_app(
         """
 
         return await service.revoke_budget_grant(principal, grant_id=grant_id)
+
+    @app.post(
+        "/api/v1/federation/quota-grants",
+        response_model=QuotaGrantRecord,
+        status_code=201,
+        tags=["federation"],
+    )
+    async def issue_quota_grant(
+        request: QuotaGrantIssueRequest,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> QuotaGrantRecord:
+        """Grant a peer plane a slice of this tenant's quota.
+
+        Headroom has to hold in every dimension at once, and a refusal names all
+        the dimensions that overran rather than the first.
+        """
+
+        return await service.issue_quota_grant(
+            principal,
+            org_id=request.org_id,
+            project_id=request.project_id,
+            grantee_plane_id=request.grantee_plane_id,
+            limits=request.limits,
+            expires_at=request.expires_at,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.get("/api/v1/federation/quota-grants", response_model=list[QuotaGrantRecord], tags=["federation"])
+    async def list_quota_grants(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        org_id: str | None = None,
+        project_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[QuotaGrantRecord]:
+        """List the quota slices this plane has issued or been issued."""
+
+        return await service.list_quota_grants(
+            principal,
+            org_id=org_id,
+            project_id=project_id,
+            include_inactive=include_inactive,
+        )
+
+    @app.delete("/api/v1/federation/quota-grants/{grant_id}", response_model=QuotaGrantRecord, tags=["federation"])
+    async def revoke_quota_grant(
+        grant_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> QuotaGrantRecord:
+        """Withdraw a peer's authority to place work against this tenant's quota.
+
+        Stops new admission and does not disturb what is already running: a quota
+        is a concurrent ceiling, and evicting live work to enforce a ceiling
+        change would make revocation an outage rather than an administrative act.
+        """
+
+        return await service.revoke_quota_grant(principal, grant_id=grant_id)
 
     @app.put("/api/v1/organizations/{org_id}", response_model=OrganizationRecord, tags=["tenancy"])
     async def register_organization(

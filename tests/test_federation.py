@@ -543,8 +543,9 @@ def test_the_federation_commands_are_attached() -> None:
 
     assert "federation" in cli.main.commands
     groups = cli.main.commands["federation"].commands
-    assert set(groups) == {"peer", "grant"}
+    assert set(groups) == {"peer", "grant", "quota-grant"}
     assert set(groups["grant"].commands) == {"list", "issue", "revoke"}
+    assert set(groups["quota-grant"].commands) == {"list", "issue", "revoke"}
     assert set(groups["peer"].commands) == {"list", "add"}
 
 

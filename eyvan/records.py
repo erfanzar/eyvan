@@ -144,7 +144,13 @@ def _validate_string(value: str | None, *, field_name: str, optional: bool = Fal
         raise ValueError(f"{field_name} must be non-empty and trimmed")
 
 
-def _resource_quantities(resources: ResourceVector) -> dict[str, float]:
+def resource_quantities(resources: ResourceVector) -> dict[str, float]:
+    """Flatten a resource vector to ``{dimension: quantity}``, custom names included.
+
+    Public because federated quota headroom has to hold in *every* dimension at
+    once, and the alternative was a fourth copy of these five lines.
+    """
+
     return {
         "cpu": resources.cpu,
         "memory_gib": resources.memory_gib,
@@ -718,7 +724,7 @@ class ResourceGang(EyvanModel):
 
     @model_validator(mode="after")
     def validate_topology(self) -> ResourceGang:
-        if not any(quantity > 0 for quantity in _resource_quantities(self.per_replica).values()):
+        if not any(quantity > 0 for quantity in resource_quantities(self.per_replica).values()):
             raise ValueError("gang per-replica resources must contain a positive quantity")
         _validate_string_map(self.required_topology, field_name="required topology")
         return self
@@ -1316,8 +1322,8 @@ class CellRecord(EyvanModel):
             raise ValueError("use runtime.init_commands instead of provider_options.startup_script")
         _validate_string_map(self.labels, field_name="cell labels")
         _validate_string_map(self.topology, field_name="cell topology")
-        capacity = _resource_quantities(self.capacity)
-        allocatable = _resource_quantities(self.allocatable)
+        capacity = resource_quantities(self.capacity)
+        allocatable = resource_quantities(self.allocatable)
         if not any(quantity > 0 for quantity in capacity.values()):
             raise ValueError("cell capacity must contain a positive resource quantity")
         if not any(quantity > 0 for quantity in allocatable.values()):
@@ -1326,7 +1332,7 @@ class CellRecord(EyvanModel):
             if allocatable.get(resource, 0) > capacity.get(resource, 0):
                 raise ValueError(f"allocatable {resource} must fit within cell capacity")
         if self.max_replica_resources is not None:
-            maximum = _resource_quantities(self.max_replica_resources)
+            maximum = resource_quantities(self.max_replica_resources)
             if not any(quantity > 0 for quantity in maximum.values()):
                 raise ValueError("max per-replica resources must contain a positive quantity")
             for resource in maximum.keys() | allocatable.keys():

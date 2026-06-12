@@ -77,6 +77,7 @@ from eyvan.records import (
     QuotaRecord,
     RegionCarbon,
     ResourceGang,
+    ResourceLimits,
     Role,
     RoleGrant,
     RoleGrantRecord,
@@ -90,6 +91,7 @@ from eyvan.records import (
     WorkloadState,
     WorkspaceRef,
     artifact_reference_id,
+    resource_quantities,
     utcnow,
     validate_capacity_pool_quota_groups,
 )
@@ -116,9 +118,12 @@ from eyvan.server.service.federation import (
     BudgetGrantRecord,
     GrantState,
     PlanePeerRecord,
+    QuotaGrantRecord,
+    exceeds_quota_headroom,
     federated_spend,
     issuable_amount,
     outstanding_total,
+    quota_headroom,
 )
 from eyvan.server.service.groups import MAX_GROUP_MEMBERS, GroupRole
 from eyvan.server.service.groups import member_names as group_member_names
@@ -193,6 +198,16 @@ def _resource_quantities(resources) -> dict[str, float]:
         "tpu": float(resources.tpu),
         **{name: float(value) for name, value in resources.custom.items()},
     }
+
+
+def _dump_limits(limits: ResourceLimits) -> JsonObject:
+    """Render a limit vector for a fingerprint or an audit payload.
+
+    Only the non-zero dimensions, so re-issuing the same grant produces the same
+    fingerprint whether or not the caller spelled out the zeros.
+    """
+
+    return {name: quantity for name, quantity in sorted(resource_quantities(limits).items()) if quantity}
 
 
 def _capacity_apply_payload(cell: CellRecord) -> JsonObject:
@@ -403,6 +418,7 @@ class ControlPlaneService:
             # expired, and never consulted by the thing that decides whether a
             # workload may run -- so a grant was recorded and licensed nothing.
             grants = await tx.list_budget_grants() if self.plane_id else []
+            quota_grants = await tx.list_quota_grants() if self.plane_id else []
         return self.scheduler.schedule(
             workloads,
             cells,
@@ -411,6 +427,7 @@ class ControlPlaneService:
             quotas=quotas,
             policies=policies,
             grants=grants,
+            quota_grants=quota_grants,
             plane_id=self.plane_id,
         )
 
@@ -450,6 +467,7 @@ class ControlPlaneService:
             # expired, and never consulted by the thing that decides whether a
             # workload may run -- so a grant was recorded and licensed nothing.
             grants = await tx.list_budget_grants() if self.plane_id else []
+            quota_grants = await tx.list_quota_grants() if self.plane_id else []
         result = self.scheduler.schedule(
             workloads,
             cells,
@@ -458,6 +476,7 @@ class ControlPlaneService:
             quotas=quotas,
             policies=policies,
             grants=grants,
+            quota_grants=quota_grants,
             plane_id=self.plane_id,
         )
         explanation = _explain_from_scheduling_result(workload, result)
@@ -548,6 +567,7 @@ class ControlPlaneService:
             # expired, and never consulted by the thing that decides whether a
             # workload may run -- so a grant was recorded and licensed nothing.
             grants = await tx.list_budget_grants() if self.plane_id else []
+            quota_grants = await tx.list_quota_grants() if self.plane_id else []
         result = self.scheduler.schedule(
             candidates,
             cells,
@@ -556,6 +576,7 @@ class ControlPlaneService:
             quotas=quotas,
             policies=policies,
             grants=grants,
+            quota_grants=quota_grants,
             plane_id=self.plane_id,
         )
         placed = {placement.workload_id for placement in result.placements}
@@ -4657,6 +4678,156 @@ class ControlPlaneService:
             stale_reports=sum(1 for grant in active if grant.reported_at is None),
         )
 
+    async def issue_quota_grant(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        grantee_plane_id: str,
+        limits: ResourceLimits,
+        expires_at: datetime,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> QuotaGrantRecord:
+        """Grant a peer plane a slice of this tenant's quota.
+
+        The budget analogue with one difference that matters: headroom has to hold
+        in *every* dimension at once. A grant of 8 TPU and 64 CPU against a quota
+        with TPU to spare and no CPU left is refused, and the refusal names every
+        overrun dimension rather than the first -- an operator correcting one
+        number at a time against a four-dimensional ceiling is four round trips,
+        and the fourth is where they grant themselves fleet admin instead.
+
+        Raises:
+            InputError: If the grant overruns the tenant's remaining ceiling in any
+                dimension, or if this plane has no identity.
+            NotFoundError: If the tenant has no quota, or the peer is unregistered.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        if not self.plane_id:
+            raise InputError("this control plane has no plane_id, so it cannot issue quota grants")
+        if grantee_plane_id == self.plane_id:
+            raise InputError("a plane does not grant quota to itself; it holds the limit directly")
+        moment = now or utcnow()
+        key = _validate_idempotency_key(idempotency_key)
+        scope = _scope(org_id, project_id)
+        fingerprint = _fingerprint(
+            {"grantee": grantee_plane_id, "limits": _dump_limits(limits), "expires_at": expires_at.isoformat()}
+        )
+        async with self.repository.transaction() as tx:
+            await self._lock_admission_scope(tx, org_id, project_id)
+            existing_key = await self._idempotent_resource(tx, scope, "quota.grant", key, fingerprint)
+            if existing_key is not None:
+                stored = await tx.get_quota_grant(existing_key.resource_id)
+                if stored is not None:
+                    return stored
+            quota = await tx.get_quota(org_id, project_id, None)
+            if quota is None:
+                raise NotFoundError(f"quota for {org_id}/{project_id} was not found")
+            peer = await tx.get_plane_peer(grantee_plane_id)
+            if peer is None or not peer.enabled:
+                raise NotFoundError(f"plane peer {grantee_plane_id!r} is not registered or is disabled")
+            grants = await tx.list_quota_grants(org_id=org_id, project_id=project_id)
+            replacing = next(
+                (grant for grant in grants if grant.grantee_plane_id == grantee_plane_id and grant.active_at(moment)),
+                None,
+            )
+            headroom = quota_headroom(
+                quota.limits, grants, now=moment, replacing=None if replacing is None else replacing.id
+            )
+            overrun = exceeds_quota_headroom(limits, headroom)
+            if overrun:
+                detail = ", ".join(
+                    f"{name} {resource_quantities(limits)[name]} > {headroom.get(name, 0.0)}" for name in overrun
+                )
+                raise InputError(f"quota grant exceeds the headroom on {org_id}/{project_id}: {detail}")
+            if replacing is not None:
+                await tx.put_quota_grant(replacing.model_copy(update={"state": GrantState.REVOKED}))
+            grant = QuotaGrantRecord(
+                id=_new_id("qgr"),
+                org_id=org_id,
+                project_id=project_id,
+                home_plane_id=self.plane_id,
+                grantee_plane_id=grantee_plane_id,
+                limits=limits,
+                issued_at=moment,
+                expires_at=expires_at,
+            )
+            await tx.put_quota_grant(grant)
+            await self._bind_idempotency(tx, scope, "quota.grant", key, fingerprint, grant)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=org_id,
+                project_id=project_id,
+                entity_type="quota_grant",
+                entity_id=grant.id,
+                action="quota.granted",
+                payload={
+                    "grantee_plane_id": grantee_plane_id,
+                    "limits": _dump_limits(limits),
+                    "replaced": None if replacing is None else replacing.id,
+                },
+            )
+            return grant
+
+    async def list_quota_grants(
+        self,
+        principal: Principal,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        include_inactive: bool = False,
+        now: datetime | None = None,
+    ) -> list[QuotaGrantRecord]:
+        """List the quota slices this plane has issued or been issued."""
+
+        moment = now or utcnow()
+        async with self.repository.transaction() as tx:
+            grants = await tx.list_quota_grants(org_id=org_id, project_id=project_id)
+        if not include_inactive:
+            grants = [grant for grant in grants if grant.active_at(moment)]
+        if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            return list(grants)
+        visible = {
+            grant.org_id
+            for grant in principal.grants
+            if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
+        }
+        return [grant for grant in grants if grant.org_id in visible]
+
+    async def revoke_quota_grant(self, principal: Principal, *, grant_id: str) -> QuotaGrantRecord:
+        """Withdraw a peer's authority to place work against this tenant's quota.
+
+        Stops *new* admission on the grantee and does not disturb what is already
+        running: a quota is a concurrent ceiling, and evicting live work to enforce
+        a ceiling change would make revocation a fleet-wide outage rather than an
+        administrative act.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        async with self.repository.transaction() as tx:
+            grant = await tx.get_quota_grant(grant_id)
+            if grant is None:
+                raise NotFoundError(f"quota grant {grant_id!r} was not found")
+            if grant.state is not GrantState.ACTIVE:
+                return grant
+            revoked = grant.model_copy(update={"state": GrantState.REVOKED})
+            await tx.put_quota_grant(revoked)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=grant.org_id,
+                project_id=grant.project_id,
+                entity_type="quota_grant",
+                entity_id=grant.id,
+                action="quota.grant_revoked",
+                payload={"grantee_plane_id": grant.grantee_plane_id},
+            )
+            return revoked
+
     async def expire_budget_grants_once(self, *, now: datetime | None = None) -> int:
         """Mark elapsed grants EXPIRED so an unreachable home plane fails closed.
 
@@ -4672,6 +4843,14 @@ class ControlPlaneService:
             for grant in await tx.list_budget_grants():
                 if grant.state is GrantState.ACTIVE and moment >= grant.expires_at:
                     await tx.put_budget_grant(grant.model_copy(update={"state": GrantState.EXPIRED}))
+                    expired += 1
+            # Quota slices lapse in the same pass rather than in a second leader
+            # phase. They expire on the same clock for the same reason, and a
+            # separate phase would be one more thing to forget to register --
+            # which is exactly how the budget sweep spent its first life.
+            for quota_grant in await tx.list_quota_grants():
+                if quota_grant.state is GrantState.ACTIVE and moment >= quota_grant.expires_at:
+                    await tx.put_quota_grant(quota_grant.model_copy(update={"state": GrantState.EXPIRED}))
                     expired += 1
         return expired
 
@@ -5288,6 +5467,8 @@ class ControlPlaneService:
             resource_id = self._quota_id(resource.org_id, resource.project_id, resource.principal_id)
         elif isinstance(resource, BudgetGrantRecord):
             resource_type, resource_id = "budget_grant", resource.id
+        elif isinstance(resource, QuotaGrantRecord):
+            resource_type, resource_id = "quota_grant", resource.id
         elif isinstance(resource, BudgetRecord):
             resource_type, resource_id = "budget", _scope(resource.org_id, resource.project_id)
         elif isinstance(resource, ProjectRecord):

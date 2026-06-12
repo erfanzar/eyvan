@@ -60,9 +60,9 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
-from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord
+from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0010_role_grants"
+SCHEMA_REVISION = "0011_quota_grants"
 
 
 @tp.runtime_checkable
@@ -212,6 +212,20 @@ class BudgetGrantRow(Base):
     grantee_plane_id: Mapped[str | None] = mapped_column(String(128), index=True)
     #: Indexed alongside ``state`` because the expiry sweep filters *and* pages on
     #: both -- exactly the lesson migration 0005 was written to record.
+    state: Mapped[str | None] = mapped_column(String(32), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class QuotaGrantRow(Base):
+    __tablename__ = "quota_grants"
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    org_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    grantee_plane_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    #: ``state`` and ``expires_at`` indexed together for the same reason the
+    #: budget grants are: the expiry sweep filters and pages on both.
     state: Mapped[str | None] = mapped_column(String(32), index=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
@@ -710,6 +724,42 @@ class SqlAlchemySession:
         statement = statement.order_by(BudgetGrantRow.issued_at, BudgetGrantRow.id)
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(BudgetGrantRecord, rows, table="budget_grants")
+
+    async def get_quota_grant(self, grant_id: str) -> QuotaGrantRecord | None:
+        row = await self._get_locked(QuotaGrantRow, grant_id)
+        return None if row is None else QuotaGrantRecord.model_validate(row.data)
+
+    async def put_quota_grant(self, grant: QuotaGrantRecord) -> None:
+        await self.session.merge(
+            QuotaGrantRow(
+                id=grant.id,
+                org_id=grant.org_id,
+                project_id=grant.project_id,
+                grantee_plane_id=grant.grantee_plane_id,
+                state=grant.state.value,
+                expires_at=grant.expires_at,
+                issued_at=grant.issued_at,
+                data=_dump(grant),
+            )
+        )
+
+    async def list_quota_grants(
+        self,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        grantee_plane_id: str | None = None,
+    ) -> list[QuotaGrantRecord]:
+        statement = select(QuotaGrantRow)
+        if org_id is not None:
+            statement = statement.where(QuotaGrantRow.org_id == org_id)
+        if project_id is not None:
+            statement = statement.where(QuotaGrantRow.project_id == project_id)
+        if grantee_plane_id is not None:
+            statement = statement.where(QuotaGrantRow.grantee_plane_id == grantee_plane_id)
+        statement = statement.order_by(QuotaGrantRow.issued_at, QuotaGrantRow.id)
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_rows(QuotaGrantRecord, rows, table="quota_grants")
 
     async def get_managed_artifact(self, uri: str) -> ManagedArtifactRecord | None:
         row = await self._get_locked(ManagedArtifactRow, uri)

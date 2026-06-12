@@ -38,7 +38,7 @@ from datetime import datetime
 from pydantic import Field, model_validator
 
 from eyvan._internal.compat import StrEnum
-from eyvan.records import EyvanModel, utcnow
+from eyvan.records import CanonicalResourceLimits, EyvanModel, ResourceLimits, resource_quantities, utcnow
 
 
 class GrantState(StrEnum):
@@ -124,6 +124,107 @@ class BudgetGrantRecord(EyvanModel):
         return self.state is GrantState.ACTIVE and moment < self.expires_at
 
 
+class QuotaGrantRecord(EyvanModel):
+    """One slice of a tenant's *quota*, issued by its home plane to a peer.
+
+    The same hole as budgets, in a different currency. ``QuotaRecord.limits`` is
+    one durable vector in one database, so a tenant with projects on three planes
+    could run three times its TPU ceiling with every plane locally compliant.
+    Money and chips are separate limits and a fleet can hold one while breaching
+    the other -- a tenant granted a small budget on cheap Spot capacity can still
+    exhaust an accelerator pool everyone else is queued for.
+
+    Deliberately a mirror of :class:`BudgetGrantRecord` rather than a
+    generalization of it. The two differ in exactly one place -- a scalar becomes
+    a vector, and headroom therefore has to hold in *every* dimension at once --
+    and collapsing them into one generic grant would put that difference behind a
+    type parameter where nobody reviewing an admission decision would see it.
+    """
+
+    id: str = Field(min_length=1, max_length=96)
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    home_plane_id: str = Field(min_length=1, max_length=128)
+    grantee_plane_id: str = Field(min_length=1, max_length=128)
+    #: The slice itself. Omitted dimensions are zero, not unlimited: a grant that
+    #: silently authorized every resource it forgot to mention would be the
+    #: opposite of a ceiling.
+    limits: CanonicalResourceLimits
+    state: GrantState = GrantState.ACTIVE
+    issued_at: datetime = Field(default_factory=utcnow)
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def validate_grant(self) -> QuotaGrantRecord:
+        if self.home_plane_id == self.grantee_plane_id:
+            raise ValueError("a plane does not grant quota to itself; it holds the limit directly")
+        if self.expires_at <= self.issued_at:
+            raise ValueError("a quota grant must expire after it is issued")
+        if not any(quantity > 0 for quantity in resource_quantities(self.limits).values()):
+            raise ValueError("a quota grant must carry a positive quantity in at least one dimension")
+        return self
+
+    def active_at(self, moment: datetime) -> bool:
+        """Return whether this grant authorizes capacity at ``moment``."""
+
+        return self.state is GrantState.ACTIVE and moment < self.expires_at
+
+
+def outstanding_quota(grants: tp.Sequence[QuotaGrantRecord], *, now: datetime) -> dict[str, float]:
+    """Return the per-dimension total currently authorized on peers."""
+
+    totals: dict[str, float] = {}
+    for grant in grants:
+        if not grant.active_at(now):
+            continue
+        for name, quantity in resource_quantities(grant.limits).items():
+            totals[name] = totals.get(name, 0.0) + quantity
+    return totals
+
+
+def quota_headroom(
+    limits: ResourceLimits,
+    grants: tp.Sequence[QuotaGrantRecord],
+    *,
+    now: datetime,
+    replacing: str | None = None,
+) -> dict[str, float]:
+    """Return how much of each dimension the home plane may still grant away.
+
+    No ``local_spent`` analogue, and the omission is deliberate rather than an
+    oversight. A budget's ``spent`` is a durable counter of money already gone; a
+    quota's usage is whatever happens to be running right now, and subtracting it
+    would make the *same* grant issuable or not depending on which jobs were live
+    at that second. A quota is a concurrent ceiling, so the home plane keeps its
+    own full ceiling and cuts slices out of it -- the local plane simply may not
+    grant away more than it holds.
+    """
+
+    committed = outstanding_quota([grant for grant in grants if replacing is None or grant.id != replacing], now=now)
+    return {
+        name: max(0.0, quantity - committed.get(name, 0.0)) for name, quantity in resource_quantities(limits).items()
+    }
+
+
+def exceeds_quota_headroom(
+    requested: ResourceLimits,
+    headroom: tp.Mapping[str, float],
+) -> tuple[str, ...]:
+    """Return the dimensions in which ``requested`` overruns ``headroom``.
+
+    Every dimension, not the first: an operator correcting one number at a time
+    against a four-dimensional refusal is four round trips, and the fourth is the
+    one where they give up and grant themselves fleet admin.
+
+    A dimension the tenant's own quota does not constrain has no headroom at all,
+    so requesting it is refused rather than treated as unlimited.
+    """
+
+    return tuple(
+        sorted(name for name, quantity in resource_quantities(requested).items() if quantity > headroom.get(name, 0.0))
+    )
+
+
 def outstanding_total(grants: tp.Sequence[BudgetGrantRecord], *, now: datetime) -> float:
     """Return the total currently authorized on peers."""
 
@@ -174,7 +275,11 @@ __all__ = (
     "BudgetGrantRecord",
     "GrantState",
     "PlanePeerRecord",
+    "QuotaGrantRecord",
+    "exceeds_quota_headroom",
     "federated_spend",
     "issuable_amount",
+    "outstanding_quota",
     "outstanding_total",
+    "quota_headroom",
 )
