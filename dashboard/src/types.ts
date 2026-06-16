@@ -272,6 +272,22 @@ export interface WarmthReport {
   pools: PoolWarmth[];
 }
 
+export interface PoolLaunchLatency {
+  pool_id: string;
+  accelerator_type?: string | null;
+  /** Null when the pool has never provisioned successfully -- not zero. */
+  p95_seconds: number | null;
+  median_seconds: number | null;
+  slowest_seconds: number | null;
+  samples: number;
+  cells_in_cooldown: number;
+}
+
+export interface LaunchLatencyReport {
+  observed_at: string;
+  pools: PoolLaunchLatency[];
+}
+
 export interface BillingReport {
   observed_at: string;
   accrued_cost: number;

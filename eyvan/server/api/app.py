@@ -63,6 +63,7 @@ from eyvan.records import (
     CarbonReport,
     CellBillingReport,
     CellRecord,
+    LaunchLatencyReport,
     LeaseRecord,
     ManagedArtifactRecord,
     OrganizationRecord,
@@ -739,6 +740,20 @@ def create_app(
         """
 
         return await service.carbon_report(principal)
+
+    @app.get("/api/v1/capacity/launch-latency", response_model=LaunchLatencyReport, tags=["capacity"])
+    async def launch_latency(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> LaunchLatencyReport:
+        """Report how long each pool takes to hand over usable capacity.
+
+        The same ``provision_latencies_s`` the scheduler ranks pools on, which is
+        why every figure carries its sample count: a p95 over three provisions is
+        not a p95, and presenting one as equivalent to a p95 over three hundred
+        invites the confident wrong decision this exists to prevent.
+        """
+
+        return await service.launch_latency_report(principal)
 
     @app.get("/api/v1/capacity/warmth", response_model=WarmthReport, tags=["capacity"])
     async def warmth_report(

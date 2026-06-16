@@ -129,3 +129,99 @@ describe("the warm capacity and cost panel", () => {
     await waitFor(() => expect(screen.getByText("No pool declares a warm floor.")).toBeDefined());
   });
 });
+
+describe("the launch latency panel", () => {
+  const cells: Cell[] = [];
+  const leases: CapacityLease[] = [];
+
+  function quietCost(): void {
+    vi.spyOn(apiClient, "getWarmth").mockResolvedValue({ observed_at: "2026-07-29T12:00:00Z", pools: [] });
+    vi.spyOn(apiClient, "getBilling").mockResolvedValue({
+      observed_at: "2026-07-29T12:00:00Z",
+      accrued_cost: 0,
+      idle_cost: 0,
+    });
+  }
+
+  it("shows the percentile with the evidence behind it", async () => {
+    // The sample count is rendered because a p95 over three provisions is not a
+    // p95, and a panel that hid the difference would invite exactly the
+    // confident wrong decision this exists to prevent.
+    quietCost();
+    vi.spyOn(apiClient, "getLaunchLatency").mockResolvedValue({
+      observed_at: "2026-07-29T12:00:00Z",
+      pools: [
+        {
+          pool_id: "research/v5p",
+          accelerator_type: "v5p-8",
+          p95_seconds: 412,
+          median_seconds: 180,
+          slowest_seconds: 900,
+          samples: 37,
+          cells_in_cooldown: 0,
+        },
+      ],
+    });
+
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+
+    await waitFor(() => expect(screen.getByText("Launch latency")).toBeDefined());
+    expect(screen.getByText("p95 412s over 37 provisions")).toBeDefined();
+  });
+
+  it("says a pool is unmeasured rather than rendering it as instant", async () => {
+    // The failure this panel most easily introduces: a pool that has never
+    // provisioned sorts to the top of any latency table and reads as the
+    // fastest option on the page.
+    quietCost();
+    vi.spyOn(apiClient, "getLaunchLatency").mockResolvedValue({
+      observed_at: "2026-07-29T12:00:00Z",
+      pools: [
+        {
+          pool_id: "research/v6e",
+          accelerator_type: "v6e-16",
+          p95_seconds: null,
+          median_seconds: null,
+          slowest_seconds: null,
+          samples: 0,
+          cells_in_cooldown: 0,
+        },
+      ],
+    });
+
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+
+    await waitFor(() => expect(screen.getByText("never provisioned - no measurement")).toBeDefined());
+  });
+
+  it("names a cooldown, because a pool nobody asks looks fast", async () => {
+    quietCost();
+    vi.spyOn(apiClient, "getLaunchLatency").mockResolvedValue({
+      observed_at: "2026-07-29T12:00:00Z",
+      pools: [
+        {
+          pool_id: "research/v5p",
+          accelerator_type: "v5p-8",
+          p95_seconds: 60,
+          median_seconds: 60,
+          slowest_seconds: 60,
+          samples: 4,
+          cells_in_cooldown: 3,
+        },
+      ],
+    });
+
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+
+    await waitFor(() => expect(screen.getByText("p95 60s over 4 provisions, 3 in cooldown")).toBeDefined());
+  });
+
+  it("reports a failure rather than rendering an empty panel", async () => {
+    quietCost();
+    vi.spyOn(apiClient, "getLaunchLatency").mockRejectedValue(new Error("Eyvan API request timed out"));
+
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+
+    await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
+  });
+});

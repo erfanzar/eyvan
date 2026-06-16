@@ -141,6 +141,21 @@ def warmth(session: CliSession, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+@capacity.command("launch-latency")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def launch_latency(session: CliSession, as_json: bool) -> None:
+    """Report how long each pool takes to hand over usable capacity.
+
+    The same samples the scheduler ranks pools on, which is why every figure
+    carries its sample count. A p95 over three provisions is not a p95, and a
+    pool reporting no samples at all is not fast -- it is unmeasured, and the two
+    are the same shape in a table sorted by latency.
+    """
+
+    _emit(session.client.request("GET", "/api/v1/capacity/launch-latency"), as_json=as_json, renderer=JsonRenderer())
+
+
 @capacity.group("lease")
 def lease() -> None:
     """Inspect one capacity lease."""

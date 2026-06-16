@@ -19,6 +19,13 @@ or policy.
 or a pattern. Instantaneous queue depth cannot distinguish a fleet that is
 briefly busy from one that has been saturated for eight hours.
 
+`eyvan capacity launch-latency` answers "why did my job land in the slow
+region". It reports the same p95 the scheduler ranks pools on, with the sample
+count beside every figure: a p95 over three provisions is not a p95, and a pool
+reporting no samples is unmeasured rather than instant. A pool with cells in
+cooldown is not being asked, so its latency figure is frozen at whatever it was
+before the failures started -- which is why that count is on the same line.
+
 ## Cost
 
 ```

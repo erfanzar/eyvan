@@ -13,6 +13,7 @@ import {
   Network,
   RefreshCw,
   Server,
+  Timer,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -21,7 +22,7 @@ import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { BillingReport, CapacityLease, Cell, WarmthReport } from "../types";
+import type { BillingReport, CapacityLease, Cell, LaunchLatencyReport, WarmthReport } from "../types";
 
 interface FleetPageProps {
   cells: Cell[];
@@ -34,6 +35,8 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
   const [region, setRegion] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
   const [warmth, setWarmth] = useState<WarmthReport | null>(null);
+  const [latency, setLatency] = useState<LaunchLatencyReport | null>(null);
+  const [latencyError, setLatencyError] = useState<string | null>(null);
   const [billing, setBilling] = useState<BillingReport | null>(null);
   const [costError, setCostError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
@@ -72,6 +75,17 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
         // as "nothing is being spent", which is the most expensive possible
         // thing for it to say incorrectly.
         if (!cancelled) setCostError(error instanceof Error ? error.message : "Unable to read fleet cost");
+      });
+    apiClient
+      .getLaunchLatency()
+      .then((report) => {
+        if (!cancelled) setLatency(report);
+      })
+      .catch((error: unknown) => {
+        // Named for the same reason the cost error is: an empty latency panel
+        // reads as "every pool is instant", which is the most misleading thing
+        // it could say.
+        if (!cancelled) setLatencyError(error instanceof Error ? error.message : "Unable to read launch latency");
       });
     return () => {
       cancelled = true;
@@ -122,6 +136,38 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
         )}
         {warmth && warmth.pools.length === 0 && (
           <div className="resource-row-detail"><span>No pool declares a warm floor.</span></div>
+        )}
+      </section>
+
+      {/* The number the scheduler has ranked pools on since it existed, shown to
+          the person choosing a pool. Sample counts are rendered beside every
+          figure because a p95 over three provisions is not a p95, and a pool
+          with no samples sorts to the top of any latency table as if it were
+          the fastest thing available. */}
+      <section className="panel data-panel" aria-label="Launch latency">
+        <div className="panel-header">
+          <div><h2>Launch latency</h2><p>How long each pool takes to hand over usable capacity</p></div>
+          <Timer size={18} />
+        </div>
+        {latencyError && <div className="resource-row-detail"><span>{latencyError}</span></div>}
+        {!latencyError && !latency && <div className="resource-row-detail"><span>Reading provisioning history…</span></div>}
+        {latency && latency.pools.length === 0 && (
+          <div className="resource-row-detail"><span>No capacity pool is configured.</span></div>
+        )}
+        {latency && latency.pools.length > 0 && (
+          <dl className="definition-grid">
+            {latency.pools.map((pool) => (
+              <div key={pool.pool_id}>
+                <dt className="monospace">{pool.pool_id}</dt>
+                <dd>
+                  {pool.samples === 0
+                    ? "never provisioned - no measurement"
+                    : `p95 ${Math.round(pool.p95_seconds ?? 0)}s over ${pool.samples} provision${pool.samples === 1 ? "" : "s"}`}
+                  {pool.cells_in_cooldown > 0 ? `, ${pool.cells_in_cooldown} in cooldown` : ""}
+                </dd>
+              </div>
+            ))}
+          </dl>
         )}
       </section>
 

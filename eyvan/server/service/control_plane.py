@@ -28,6 +28,7 @@ from eyvan.artifacts.managed import (
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.capacity.planning import cell_matches_template, cell_provides_pool_supply
 from eyvan.domain import costing
+from eyvan.domain.availability import p95_latency
 from eyvan.domain.carbon import CarbonSource, CarbonUnavailable, NoCarbonSource, fresh_reading
 from eyvan.domain.models import SchedulingResult
 from eyvan.records import (
@@ -60,6 +61,7 @@ from eyvan.records import (
     FederatedBudgetStatus,
     GcpQueueAdmissionDenialTarget,
     IdempotencyRecord,
+    LaunchLatencyReport,
     LeaseRecord,
     LeaseState,
     ManagedArtifactRecord,
@@ -69,6 +71,7 @@ from eyvan.records import (
     Permission,
     PolicyRecord,
     PoolEstimate,
+    PoolLaunchLatency,
     PoolWarmth,
     Principal,
     ProjectRecord,
@@ -5678,6 +5681,50 @@ class ControlPlaneService:
             )
         warmth.sort(key=lambda entry: entry.pool_id)
         return WarmthReport(observed_at=moment, pools=tuple(warmth))
+
+    async def launch_latency_report(self, principal: Principal, *, now: datetime | None = None) -> LaunchLatencyReport:
+        """Report how long each pool takes to hand over usable capacity.
+
+        Read from the same ``provision_latencies_s`` samples the scheduler ranks
+        on, rather than from a second time series. A separate store would drift
+        from the numbers that actually decide placement, and the first symptom
+        would be a dashboard disagreeing with a scheduling verdict -- which is
+        worse than no dashboard.
+
+        Percentiles are computed over the pool's cells pooled together, because
+        an operator picks a *pool* and lives with whichever cell it hands them.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        moment = now or utcnow()
+        async with self.repository.transaction() as tx:
+            pools = await tx.list_capacity_pools()
+            cells = await tx.list_cells()
+        by_pool: dict[str, list[CellRecord]] = {}
+        for cell in cells:
+            if cell.pool_id is not None and cell.state is not CellState.DELETED:
+                by_pool.setdefault(cell.pool_id, []).append(cell)
+        entries: list[PoolLaunchLatency] = []
+        for pool in pools:
+            members = by_pool.get(pool.id, [])
+            samples = sorted(latency for cell in members for latency in cell.availability.provision_latencies_s)
+            entries.append(
+                PoolLaunchLatency(
+                    pool_id=pool.id,
+                    accelerator_type=pool.accelerator_type,
+                    p95_seconds=p95_latency(samples),
+                    median_seconds=samples[len(samples) // 2] if samples else None,
+                    slowest_seconds=samples[-1] if samples else None,
+                    samples=len(samples),
+                    cells_in_cooldown=sum(
+                        1
+                        for cell in members
+                        if cell.availability.cooldown_until is not None and cell.availability.cooldown_until > moment
+                    ),
+                )
+            )
+        entries.sort(key=lambda entry: entry.pool_id)
+        return LaunchLatencyReport(observed_at=moment, pools=tuple(entries))
 
     async def cell_billing_report(self, principal: Principal, *, pool_id: str | None = None) -> CellBillingReport:
         """Report accrued and idle cell cost, optionally for one pool.

@@ -23,6 +23,7 @@ import type {
   CapacityLease,
   Cell,
   ControlPlaneHealth,
+  LaunchLatencyReport,
   LogEntry,
   OverviewData,
   PriorityBand,
@@ -586,6 +587,11 @@ export class EyvanApiClient {
    * pairing the only safe reaction to an unexplained idle figure is to delete
    * the warm floor -- undoing the fix that put it there.
    */
+  /** Provisioning latency per pool, from the samples the scheduler ranks on. */
+  async getLaunchLatency(): Promise<LaunchLatencyReport> {
+    return this.request<LaunchLatencyReport>("/capacity/launch-latency");
+  }
+
   async getWarmth(): Promise<WarmthReport> {
     return this.request<WarmthReport>("/capacity/warmth");
   }

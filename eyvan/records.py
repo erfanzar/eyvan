@@ -2147,6 +2147,54 @@ class CarbonReport(EyvanModel):
         return any(region.intensity is not None for region in self.regions)
 
 
+class PoolLaunchLatency(EyvanModel):
+    """How long one pool takes to hand over usable capacity, and on what evidence.
+
+    The scheduler has ranked pools by this number since it existed -- ``p95`` of
+    the same ``provision_latencies_s`` samples -- and nothing ever showed it to
+    the person deciding which pool to ask for. "Why did my job land in the slow
+    region" had no answer that did not involve reading the scheduler.
+
+    ``samples`` is reported beside every percentile and is not decoration. A p95
+    over three provisions is not a p95, and a report that presented one as
+    equivalent to a p95 over three hundred would be inviting exactly the
+    confident wrong decision this exists to prevent.
+    """
+
+    pool_id: str
+    accelerator_type: str | None = None
+    #: Nearest-rank p95 over the retained samples, in seconds. ``None`` when the
+    #: pool has never successfully provisioned -- distinct from zero, which is a
+    #: pool that provisions instantly.
+    p95_seconds: float | None = None
+    median_seconds: float | None = None
+    slowest_seconds: float | None = None
+    #: How many provisions back the figures above.
+    samples: int = Field(default=0, ge=0)
+    #: Cells currently held back by a cooldown after repeated failures. A pool
+    #: whose latency looks excellent because it has stopped being asked is not a
+    #: fast pool.
+    cells_in_cooldown: int = Field(default=0, ge=0)
+
+
+class LaunchLatencyReport(EyvanModel):
+    """Provisioning latency across every pool, at one moment."""
+
+    observed_at: datetime = Field(default_factory=utcnow)
+    pools: tuple[PoolLaunchLatency, ...] = ()
+
+    @property
+    def unmeasured(self) -> tuple[PoolLaunchLatency, ...]:
+        """Return pools with no successful provision to report on.
+
+        Surfaced separately because "no data" and "fast" are the same shape in a
+        table sorted by latency, and one of them is a pool nobody should be
+        planning around.
+        """
+
+        return tuple(pool for pool in self.pools if pool.samples == 0)
+
+
 class WarmthReport(EyvanModel):
     """Warm-floor status across every pool, at one moment."""
 
