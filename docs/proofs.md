@@ -8,6 +8,20 @@ This page exists so approving a spend is a decision about a known quantity. Each
 proof states what it establishes, the exact commands, the pass criterion, the
 shape, and roughly what it costs. Nothing here has been run.
 
+**The criteria are executable.** `eyvan proof catalog | preemption | warm-window
+| secret` evaluates the stated criterion against the live plane and exits 0 on
+pass, 1 on failure, and **2 when the run did not exercise the behaviour at all**.
+That third verdict is the one that matters: a spot slice that was never
+reclaimed, a pool that never got a cell, an observation taken outside the warm
+window -- each produces a clean-looking run that establishes nothing, and reading
+it off a screen at the end of a spend is exactly when nobody is inclined to
+notice. The judgement lives in `eyvan/sdk/commands/proof.py` and is tested
+without hardware; the commands only fetch.
+
+P2 and P3 stay procedural on purpose: they need a host killed mid-stream and a
+job that submits its own children, and an "automated" verdict over a run whose
+interesting half is manual would be worse than none.
+
 Fleet configs live in the monorepo's `configs/`. All are spot.
 
 ## Why these and not a general soak of everything
@@ -34,8 +48,15 @@ eyvan cells --json                              # observed_tpu_vms == catalog ho
 eyvan down --yes
 ```
 
+```
+eyvan proof catalog --accelerator-type v5p-16      # exit 0, 1 or 2
+```
+
 **Passes when** the pool's resources match the catalog entry for `v5p-16` and
-`observed_tpu_vms` is 2, with no `resources:` block in the fleet YAML.
+`observed_tpu_vms` is 2, with no `resources:` block in the fleet YAML. A cell
+that never reported `observed_tpu_vms`, or a catalog shape with no recorded host
+count, is **inconclusive** rather than passing -- the check that matters would
+otherwise be skipped silently.
 **Shape** v5p-16, one slice. **~35 minutes.**
 
 ## P2 — multi-host structured logs, with a rank lost mid-stream
@@ -97,9 +118,19 @@ eyvan events --json | grep secret.               # one secret.issued, one secret
 eyvan down --yes
 ```
 
+```
+eyvan proof secret <workload-id> --value-file /tmp/expected   # 0600, deleted after
+```
+
+The value comes from a file rather than an argument: a secret on the command line
+lands in shell history and in every process listing on the host.
+
 **Passes when** the job prints the length, `eyvan events` shows exactly one
 `secret.issued` and one `secret.read` for that attempt, and grepping the workload
-record, the audit payloads and the logs finds the value nowhere.
+record, the audit payloads and the logs finds the value nowhere. The audit
+payloads are the half a person checking by hand forgets, and the one place a
+well-meaning "context" field would put the value -- in the store retained for
+ninety days.
 **Shape** v5p-16. **~30 minutes.**
 
 ## P5 — spot reclamation is charged to the preemption budget
@@ -120,8 +151,16 @@ eyvan workload get <id> --json                   # preemption_count 1, capacity_
 eyvan capacity list --json                       # the pool has no stockout cooldown
 ```
 
+```
+eyvan proof preemption <workload-id>
+```
+
 **Passes when** all four hold. `--max-retries 0` is deliberate: under the old
 shared budget the workload would have failed, so this is the distinguishing case.
+A run GCP never reclaimed exits 2: "we were not preempted" is not "preemption is
+classified correctly". The cooldown check is scoped to this proof's own pool,
+because an unrelated pool's backoff failing every preemption run is how a proof
+becomes something people re-run until it is green.
 **Shape** v5p-16 spot, run until reclaimed. **1–3 hours, opportunistic** — run it
 alongside another proof rather than waiting on it.
 
@@ -141,8 +180,18 @@ eyvan capacity billing --json                    # idle cost matches the window
 eyvan down --yes
 ```
 
+```
+eyvan capacity warmth --json > inside.json         # during the window
+eyvan proof warm-window --pool research/cpu --inside inside.json   # after it closes
+```
+
+Two observations, because a floor that is held and a floor that is *never*
+released look identical from inside the window.
+
 **Passes when** the floor is held for the window's duration and released within
-one reconcile interval of its end.
+one reconcile interval of its end. If the pool carries no `unit_prices` the cost
+half exits 2 rather than passing: zero cost on an unpriced fleet is not evidence
+that idle cost was measured, it is evidence that nothing could be.
 **Shape** CPU fleet. **~1 hour** (window length plus margin).
 
 ## P7 — Kubernetes against a real API server

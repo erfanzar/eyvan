@@ -30,6 +30,7 @@ from eyvan.sdk.commands.fleets import register_fleet_commands
 from eyvan.sdk.commands.governance import register_governance_commands
 from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
 from eyvan.sdk.commands.operations import register_operation_commands
+from eyvan.sdk.commands.proof import register_proof_commands
 from eyvan.sdk.commands.runtime import register_runtime_commands
 from eyvan.sdk.commands.soak import register_soak_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
@@ -114,6 +115,7 @@ for register_commands in (
     register_governance_commands,
     register_federation_commands,
     register_tenancy_commands,
+    register_proof_commands,
     register_runtime_commands,
     register_soak_commands,
     register_dashboard_commands,

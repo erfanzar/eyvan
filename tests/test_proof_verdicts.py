@@ -1,0 +1,512 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""The criteria that decide whether a hardware spend proved anything.
+
+``docs/proofs.md`` stated each pass criterion in prose, so the verdict was
+whatever a person concluded from a screen of JSON at the end of a run they were
+relieved to have finished. That is the worst possible moment to ask someone to be
+sceptical, and it has already gone wrong once.
+
+**Most of what follows asserts INCONCLUSIVE rather than PASS or FAIL**, and that
+is the point rather than an accident of coverage. Every proof here has a shape
+where nothing contradicted the claim because nothing exercised it: no cell was
+created, the spot slice was never reclaimed, the observation was taken outside
+the window. Each of those produces a clean-looking run that establishes nothing,
+and a two-state verdict has no way to say so -- it says "pass".
+"""
+
+from __future__ import annotations
+
+from eyvan.sdk.commands.proof import (
+    EXIT_CODES,
+    Verdict,
+    evaluate_catalog_authority,
+    evaluate_secret_delivery,
+    evaluate_spot_preemption,
+    evaluate_warm_window,
+)
+
+
+def _check(result, name: str) -> Verdict:
+    return next(check.verdict for check in result.checks if check.name == name)
+
+
+# --------------------------------------------------------------------------- the verdict algebra
+
+
+def test_a_failure_outranks_an_inconclusive() -> None:
+    """One definitively wrong criterion is not softened by an unmeasured one."""
+
+    result = evaluate_spot_preemption(
+        {"preemption_count": 0, "capacity_loss_count": 2, "state": "pending"},
+        [],
+        [],
+    )
+
+    assert result.verdict is Verdict.FAIL
+
+
+def test_each_verdict_has_a_distinct_exit_code() -> None:
+    """A scheduled run has to tell "wrong" from "did not happen".
+
+    They call for different responses: one is a defect to fix, the other is a run
+    to repeat, and a single non-zero exit conflates them.
+    """
+
+    assert sorted(EXIT_CODES.values()) == [0, 1, 2]
+    assert EXIT_CODES[Verdict.PASS] == 0
+
+
+def test_a_proof_with_no_checks_is_not_a_pass() -> None:
+    """The degenerate case, asserted because it is the one that reads as success.
+
+    An empty check list is what a proof produces when nothing matched anything,
+    and `all([])` is True.
+    """
+
+    from eyvan.sdk.commands.proof import ProofResult
+
+    assert ProofResult("P0", ()).verdict is Verdict.INCONCLUSIVE
+
+
+# --------------------------------------------------------------------------- P1
+
+
+def _pool(pool_id: str = "research/v5p", accelerator: str = "v5p-16") -> dict:
+    return {"id": pool_id, "accelerator_type": accelerator}
+
+
+def _cell(cell_id: str, *, hosts: int | None = 2, pool: str = "research/v5p", state: str = "ready") -> dict:
+    return {"id": cell_id, "pool_id": pool, "state": state, "observed_tpu_vms": hosts}
+
+
+def test_a_slice_with_the_catalog_host_count_passes() -> None:
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a"), _cell("cell-b")], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_a_half_sized_slice_fails() -> None:
+    """The defect the proof exists for.
+
+    A provider returning one host of two starts every rank, builds the wrong
+    mesh, and runs at half throughput while reporting success.
+    """
+
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a", hosts=1)], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert "expected 2 host(s)" in next(check.detail for check in result.checks if check.verdict is Verdict.FAIL)
+
+
+def test_a_fleet_that_never_applied_is_inconclusive() -> None:
+    """Not a pass. No pool means nothing was observed, not that hosts matched."""
+
+    result = evaluate_catalog_authority([], [], accelerator_type="v5p-16", catalog_hosts=2)
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_a_pool_with_no_live_cells_is_inconclusive() -> None:
+    """The run that dies during provisioning: pool applied, cell never arrived."""
+
+    result = evaluate_catalog_authority([_pool()], [], accelerator_type="v5p-16", catalog_hosts=2)
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert _check(result, "cells-exist") is Verdict.INCONCLUSIVE
+
+
+def test_a_cell_that_never_reported_hosts_is_inconclusive() -> None:
+    """`None` is "not observed", and treating it as a mismatch would be a lie."""
+
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a", hosts=None)], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert _check(result, "hosts-observed") is Verdict.INCONCLUSIVE
+
+
+def test_a_catalog_with_no_host_count_cannot_be_the_authority_for_one() -> None:
+    """`hosts` is optional in the catalog, so the proof must notice its absence.
+
+    Otherwise a shape with no recorded host count silently skips the only check
+    that matters and the proof reports a pass.
+    """
+
+    result = evaluate_catalog_authority([_pool()], [_cell("cell-a")], accelerator_type="v5p-16", catalog_hosts=None)
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_deleted_cells_do_not_decide_the_verdict() -> None:
+    """A released cell's last observation says nothing about this run."""
+
+    result = evaluate_catalog_authority(
+        [_pool()],
+        [_cell("cell-old", hosts=1, state="deleted"), _cell("cell-a", hosts=2)],
+        accelerator_type="v5p-16",
+        catalog_hosts=2,
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+# --------------------------------------------------------------------------- P5
+
+
+def _preempted(**overrides) -> dict:
+    return {"preemption_count": 1, "capacity_loss_count": 0, "state": "running", **overrides}
+
+
+def test_a_clean_reclamation_passes() -> None:
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [{"id": "cell-a", "pool_id": "research/v5p", "provider_failure_code": "preempted", "availability": {}}],
+        [{"id": "research/v5p"}],
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_a_run_that_was_never_reclaimed_is_inconclusive() -> None:
+    """The common outcome of a short spot run, and the one most easily misread.
+
+    Nothing failed. Nothing was classified either, and "we were not preempted"
+    is not "preemption is classified correctly".
+    """
+
+    result = evaluate_spot_preemption({"preemption_count": 0, "capacity_loss_count": 0, "state": "running"}, [], [])
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_a_reclamation_charged_to_the_failure_budget_fails() -> None:
+    """Exactly the regression the phase fixed, stated as a criterion."""
+
+    result = evaluate_spot_preemption(
+        {"preemption_count": 0, "capacity_loss_count": 1, "state": "running"},
+        [{"id": "cell-a", "pool_id": "p", "provider_failure_code": "preempted", "availability": {}}],
+        [{"id": "p"}],
+    )
+
+    assert _check(result, "charged-to-the-preemption-budget") is Verdict.FAIL
+
+
+def test_both_budgets_moving_is_also_a_failure() -> None:
+    """Double-charging is not half-right; it consumes a retry budget twice."""
+
+    result = evaluate_spot_preemption(
+        _preempted(capacity_loss_count=1),
+        [{"id": "cell-a", "pool_id": "p", "provider_failure_code": "preempted", "availability": {}}],
+        [{"id": "p"}],
+    )
+
+    assert _check(result, "charged-to-the-preemption-budget") is Verdict.FAIL
+
+
+def test_a_cooldown_after_a_reclamation_fails() -> None:
+    """An interruption records no failure and sets no cooldown.
+
+    A cell in cooldown after a reclamation means the outcome was classified as a
+    stockout or a provider error, and the consequence is worse than a wrong
+    label: a cooled-down pool stops being asked, so the fleet quietly shrinks.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {
+                "id": "cell-a",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "availability": {"cooldown_until": "2026-08-05T12:00:00Z"},
+            }
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL
+
+
+def test_a_cooldown_on_an_unrelated_pool_is_not_this_proof_s_business() -> None:
+    """Another pool's backoff must not fail this proof.
+
+    Otherwise any fleet with one unhealthy pool anywhere fails every preemption
+    run, and the proof becomes something people re-run until it is green.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {"id": "cell-a", "pool_id": "research/v5p", "provider_failure_code": "preempted", "availability": {}},
+            {"id": "other", "pool_id": "elsewhere", "availability": {"cooldown_until": "2026-08-05T12:00:00Z"}},
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+
+
+def test_a_workload_that_failed_did_not_survive_its_preemption() -> None:
+    result = evaluate_spot_preemption(
+        _preempted(state="failed"),
+        [{"id": "cell-a", "pool_id": "p", "provider_failure_code": "preempted", "availability": {}}],
+        [{"id": "p"}],
+    )
+
+    assert _check(result, "workload-survived") is Verdict.FAIL
+
+
+def test_the_wrong_failure_code_fails() -> None:
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [{"id": "cell-a", "pool_id": "p", "provider_failure_code": "provider_error", "availability": {}}],
+        [{"id": "p"}],
+    )
+
+    assert _check(result, "classified-as-preempted") is Verdict.FAIL
+
+
+# --------------------------------------------------------------------------- P6
+
+
+def _warmth(*, active: bool, floor: int, warm: int, pool_id: str = "research/cpu") -> dict:
+    return {"pools": [{"pool_id": pool_id, "window_active": active, "floor": floor, "warm_cells": warm}]}
+
+
+def _billing(**overrides) -> dict:
+    return {"idle_seconds": 3600.0, "idle_cost": 2.5, "unpriced_cells": 0, **overrides}
+
+
+def test_a_window_held_and_released_passes() -> None:
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_a_floor_that_never_released_fails() -> None:
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=1, warm=1),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "floor-released") is Verdict.FAIL
+
+
+def test_a_floor_that_was_never_held_fails() -> None:
+    """The window's whole promise: the 09:00 latency happens anyway without it."""
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=2, warm=0),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "floor-held") is Verdict.FAIL
+
+
+def test_an_observation_taken_outside_the_window_settles_nothing() -> None:
+    """Both observations after the window is a run that measured the wrong hour."""
+
+    result = evaluate_warm_window(
+        _warmth(active=False, floor=0, warm=0),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert _check(result, "window-was-active") is Verdict.INCONCLUSIVE
+
+
+def test_a_second_observation_still_inside_the_window_settles_nothing() -> None:
+    """Held-and-still-held is not held-and-released."""
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=True, floor=1, warm=1),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "window-closed") is Verdict.INCONCLUSIVE
+
+
+def test_an_unpriced_fleet_cannot_prove_the_cost_half() -> None:
+    """The finding that produced the doctor fix, as a proof criterion.
+
+    Zero cost on an unpriced fleet is not evidence that idle cost was measured;
+    it is evidence that nothing could be. Passing here is how a fleet that has
+    been running for hours reads as free.
+    """
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(idle_cost=0.0, unpriced_cells=3),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "idle-cost-accrued") is Verdict.INCONCLUSIVE
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_idle_seconds_with_no_idle_cost_on_a_priced_fleet_fails() -> None:
+    """Distinct from the unpriced case: here the price exists and the clock did not."""
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(idle_cost=0.0),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "idle-cost-accrued") is Verdict.FAIL
+
+
+def test_a_missing_pool_is_inconclusive() -> None:
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(),
+        pool_id="research/absent",
+    )
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+# --------------------------------------------------------------------------- P4
+
+
+_VALUE = "hf_secretvalue123"
+
+
+def _event(action: str, *, attempt: int = 1, **payload) -> dict:
+    return {"action": action, "payload": {"attempt": attempt, **payload}}
+
+
+def test_a_secret_used_once_and_recorded_nowhere_passes() -> None:
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")],
+        {"id": "wl-1", "spec": {"secret_mounts": {"HF_TOKEN": "gcp-secret://p/t"}}},
+        "token length 17\n",
+        secret_value=_VALUE,
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_a_value_in_the_log_fails() -> None:
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")],
+        {"id": "wl-1"},
+        f"printing {_VALUE} for debugging\n",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "value-never-recorded") is Verdict.FAIL
+
+
+def test_a_value_in_an_audit_payload_fails() -> None:
+    """The place a person checking by hand does not think to look.
+
+    A well-meaning "context" field on the issuance event is exactly how the value
+    would end up in the one store that is retained for ninety days.
+    """
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued", context=_VALUE), _event("secret.read")],
+        {"id": "wl-1"},
+        "token length 17\n",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "value-never-recorded") is Verdict.FAIL
+
+
+def test_a_value_in_the_workload_record_fails() -> None:
+    """The defect the whole phase exists to remove: a credential in a spec."""
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")],
+        {"id": "wl-1", "spec": {"environment": {"HF_TOKEN": _VALUE}}},
+        "",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "value-never-recorded") is Verdict.FAIL
+
+
+def test_a_read_with_no_issuance_in_its_attempt_fails() -> None:
+    """The signal a leaked token produces, and the reason both events exist."""
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued", attempt=1), _event("secret.read", attempt=2)],
+        {"id": "wl-1"},
+        "",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "read-matches-an-issuance") is Verdict.FAIL
+
+
+def test_a_mount_that_was_never_exercised_is_inconclusive() -> None:
+    """No secret event means the workload never read it -- not that it leaked nothing."""
+
+    result = evaluate_secret_delivery([], {"id": "wl-1"}, "", secret_value=_VALUE)
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_two_reads_for_one_issuance_fails() -> None:
+    """Per-attempt means once. A second read is a token outliving its attempt."""
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read"), _event("secret.read")],
+        {"id": "wl-1"},
+        "",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "one-read") is Verdict.FAIL
+
+
+def test_without_the_value_the_absence_check_cannot_run() -> None:
+    """An empty needle matches every haystack, so this must refuse rather than pass."""
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")], {"id": "wl-1"}, "", secret_value=""
+    )
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+# --------------------------------------------------------------------------- the commands
+
+
+def test_every_proof_evaluator_has_a_command() -> None:
+    """An evaluator with no caller decides nothing, which is this repo's defect.
+
+    The four criteria that can be machine-decided are the four commands; the
+    proofs that need a host killed mid-run stay procedural on purpose, and are
+    not silently listed here as if they were automated.
+    """
+
+    from eyvan.sdk import cli
+
+    assert set(cli.main.commands["proof"].commands) == {"catalog", "preemption", "warm-window", "secret"}
