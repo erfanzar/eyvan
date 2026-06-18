@@ -348,12 +348,18 @@ class DoctorCommandService:
         )
 
     def _kueue_check(self) -> CheckResult:
-        """Refuse a Kueue configuration that could evict Eyvan's workloads.
+        """Report a Kueue configuration that could evict Eyvan's workloads.
 
-        This is the highest-value check in the Kubernetes backend, because the
-        hazard it catches is otherwise invisible: Kueue eviction destroys a pod
-        with no checkpoint hook, bypassing Eyvan's whole preemption protocol, and
-        the only trace is a training job that lost hours with no ledger entry
+        Reports, and deliberately does not refuse. The refusal lives in
+        ``KubernetesCapacityDriver``, which reads the ClusterQueue before
+        creating a Job and raises: it runs in-cluster with a ServiceAccount,
+        while this runs on an operator's machine that usually cannot reach the
+        Kubernetes API at all. Saying "refuse" here would describe a gate that
+        does not exist, and on a safety check that is worse than saying nothing.
+
+        The hazard is otherwise invisible: Kueue eviction destroys a pod with no
+        checkpoint hook, bypassing Eyvan's whole preemption protocol, and the
+        only trace is a training job that lost hours with no ledger entry
         explaining why.
 
         PASS -- not SKIP -- when no pool names a queue. ``DoctorReport.ok`` treats
