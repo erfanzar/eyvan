@@ -510,3 +510,58 @@ def test_every_proof_evaluator_has_a_command() -> None:
     from eyvan.sdk import cli
 
     assert set(cli.main.commands["proof"].commands) == {"catalog", "preemption", "warm-window", "secret"}
+
+
+# --------------------------------------------------------------------------- reachability
+
+
+def test_a_plane_that_cannot_answer_is_inconclusive_not_a_failure() -> None:
+    """Found by pointing the finished command at a real plane.
+
+    A mistyped workload id exited 1 -- the code for "this proof failed" -- so a
+    scheduled run would have reported the preemption behaviour as broken when
+    nothing had been asked about it.
+
+    Defect shape (a) from the plan: a handler turning "I could not find out" into
+    a fact. It is worse here than anywhere else, because the fact it invents is a
+    verdict about the thing the spend existed to establish.
+    """
+
+    import click
+
+    from eyvan.sdk.commands.proof import _gather
+
+    def unreachable():
+        raise click.ClickException("404: workload 'typo' was not found")
+
+    result = _gather("P5", unreachable)
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert "typo" in result.checks[0].detail
+
+
+def test_a_dropped_connection_is_also_inconclusive() -> None:
+    """A control plane restarting mid-proof is not a proof failure."""
+
+    from eyvan.sdk.commands.proof import _gather
+
+    def dropped():
+        raise ConnectionError("connection reset by peer")
+
+    assert _gather("P1", dropped).verdict is Verdict.INCONCLUSIVE
+
+
+def test_a_real_verdict_passes_through_the_guard_unchanged() -> None:
+    """The guard must not swallow the answer it exists to protect.
+
+    A wrapper that turned every result into inconclusive would make the proofs
+    incapable of ever passing, which is a failure mode the error path alone
+    cannot detect.
+    """
+
+    from eyvan.sdk.commands.proof import Check as ProofCheck
+    from eyvan.sdk.commands.proof import ProofResult, _gather
+
+    expected = ProofResult("P1", (ProofCheck("x", Verdict.PASS, "ok"),))
+
+    assert _gather("P1", lambda: expected) is expected

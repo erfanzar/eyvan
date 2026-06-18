@@ -422,6 +422,27 @@ def _emit(result: ProofResult) -> None:
     raise SystemExit(EXIT_CODES[result.verdict])
 
 
+def _gather(proof_name: str, fetch: tp.Callable[[], ProofResult]) -> ProofResult:
+    """Run ``fetch``, turning an unreachable plane into INCONCLUSIVE.
+
+    Found by pointing the finished command at a real plane: a mistyped workload
+    id exited 1, which is the code for "this proof failed". A scheduled run would
+    have reported the preemption behaviour as broken when nothing had been asked
+    about it.
+
+    That is defect shape (a) from the plan -- a handler turning "I could not find
+    out" into a fact -- and it is worse here than anywhere else, because the fact
+    it invents is a verdict about the thing the spend existed to establish.
+    """
+
+    try:
+        return fetch()
+    except click.ClickException as error:
+        return ProofResult(proof_name, (_unknown("plane-reachable", f"the plane could not answer: {error.message}"),))
+    except OSError as error:
+        return ProofResult(proof_name, (_unknown("plane-reachable", f"the plane could not be reached: {error}"),))
+
+
 @proof.command("catalog")
 @click.option("--accelerator-type", required=True, help="The shape the fleet declares, e.g. v5p-16.")
 @click.pass_obj
@@ -432,11 +453,14 @@ def catalog_proof(session: CliSession, accelerator_type: str) -> None:
 
     shape = shape_for(accelerator_type)
     _emit(
-        evaluate_catalog_authority(
-            session.client.request("GET", "/api/v1/capacity-pools"),
-            session.client.request("GET", "/api/v1/cells"),
-            accelerator_type=accelerator_type,
-            catalog_hosts=None if shape is None else shape.hosts,
+        _gather(
+            "P1",
+            lambda: evaluate_catalog_authority(
+                session.client.request("GET", "/api/v1/capacity-pools"),
+                session.client.request("GET", "/api/v1/cells"),
+                accelerator_type=accelerator_type,
+                catalog_hosts=None if shape is None else shape.hosts,
+            ),
         )
     )
 
@@ -448,10 +472,13 @@ def preemption_proof(session: CliSession, workload_id: str) -> None:
     """P5 -- a reclaimed Spot slice is charged to the preemption budget."""
 
     _emit(
-        evaluate_spot_preemption(
-            session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
-            session.client.request("GET", "/api/v1/cells"),
-            session.client.request("GET", "/api/v1/capacity-pools"),
+        _gather(
+            "P5",
+            lambda: evaluate_spot_preemption(
+                session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
+                session.client.request("GET", "/api/v1/cells"),
+                session.client.request("GET", "/api/v1/capacity-pools"),
+            ),
         )
     )
 
@@ -475,11 +502,14 @@ def warm_window_proof(session: CliSession, pool_id: str, inside: str) -> None:
     with open(inside, encoding="utf-8") as handle:
         captured = json.load(handle)
     _emit(
-        evaluate_warm_window(
-            captured,
-            session.client.request("GET", "/api/v1/capacity/warmth"),
-            session.client.request("GET", "/api/v1/capacity/billing"),
-            pool_id=pool_id,
+        _gather(
+            "P6",
+            lambda: evaluate_warm_window(
+                captured,
+                session.client.request("GET", "/api/v1/capacity/warmth"),
+                session.client.request("GET", "/api/v1/capacity/billing"),
+                pool_id=pool_id,
+            ),
         )
     )
 
@@ -510,15 +540,18 @@ def secret_proof(
         value = handle.read().strip()
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     _emit(
-        evaluate_secret_delivery(
-            session.client.request(
-                "GET",
-                "/api/v1/events",
-                params={"org_id": scope.org_id, "project_id": scope.project_id, "limit": "1000"},
+        _gather(
+            "P4",
+            lambda: evaluate_secret_delivery(
+                session.client.request(
+                    "GET",
+                    "/api/v1/events",
+                    params={"org_id": scope.org_id, "project_id": scope.project_id, "limit": "1000"},
+                ),
+                session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
+                str(session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs")),
+                secret_value=value,
             ),
-            session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
-            str(session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs")),
-            secret_value=value,
         )
     )
 
