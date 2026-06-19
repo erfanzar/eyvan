@@ -2697,6 +2697,15 @@ class ControlPlaneService:
                             "enabled": False,
                             "min_cells": 0,
                             "max_cells": 0,
+                            # Zeroed with the others, and not an afterthought:
+                            # the record requires min <= initial <= max, so a
+                            # pool that declared a floor kept `initial_cells` at
+                            # 1 and became invalid the moment anything
+                            # re-validated it. `model_copy` does not re-run
+                            # validators, so the bad record was written silently
+                            # and surfaced later as a 422 on an unrelated call --
+                            # with the fleet still enabled and still billing.
+                            "initial_cells": 0,
                             "generation": previous.generation + 1,
                             "updated_at": now,
                         }
@@ -2868,6 +2877,13 @@ class ControlPlaneService:
                             "enabled": False,
                             "min_cells": 0,
                             "max_cells": 0,
+                            # Same reason as the prune in ``apply_fleet``: the
+                            # record requires min <= initial <= max, so leaving a
+                            # floor's ``initial_cells`` at 1 wrote a pool that is
+                            # invalid on re-read. ``eyvan down`` then failed with
+                            # a 422 naming a field the operator never set, and
+                            # the fleet stayed enabled and billing.
+                            "initial_cells": 0,
                             "generation": pool.generation + 1,
                             "updated_at": now,
                         }
