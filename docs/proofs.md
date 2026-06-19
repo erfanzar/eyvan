@@ -189,7 +189,14 @@ Two observations, because a floor that is held and a floor that is *never*
 released look identical from inside the window.
 
 **Passes when** the floor is held for the window's duration and released within
-one reconcile interval of its end. If the pool carries no `unit_prices` the cost
+one reconcile interval of its end.
+
+**Run 2026-08-05, exit 0.** Window 13:00-14:00 UTC on a spot `n2-standard-4` in
+`us-east5-a`. Cell ready 5m12s after apply; floor held 1 of 1 through the window;
+floor fell to 0 at the boundary; 9894s idle accrued $0.0305. Teardown released
+the cell and deleted the VM -- slowly, because every provider call from a laptop
+goes through gcloud, which is why the cell sat in `deleting` for six minutes
+after the VM was already `STOPPING`. If the pool carries no `unit_prices` the cost
 half exits 2 rather than passing: zero cost on an unpriced fleet is not evidence
 that idle cost was measured, it is evidence that nothing could be.
 **Shape** CPU fleet. **~1 hour** (window length plus margin).

@@ -323,21 +323,31 @@ def evaluate_warm_window(inside: dict, outside: dict, billing: dict, *, pool_id:
     # The cost half. A window that holds capacity and bills nothing is a fleet
     # whose pool carries no price, and reporting that as a passing cost check is
     # how an unpriced fleet reads as a free one.
-    if int(billing.get("unpriced_cells", 0)):
+    idle_seconds = float(billing.get("idle_seconds", 0))
+    idle_cost = float(billing.get("idle_cost", 0))
+    unpriced = int(billing.get("unpriced_cells", 0))
+    if idle_seconds <= 0:
+        checks.append(_unknown("idle-cost-accrued", "no idle time was billed, so the warm period was not measured"))
+    elif idle_cost > 0:
+        # Cost was computed, so the failure this check exists for -- a fleet that
+        # reads as free because nothing carries a price -- did not occur. Any
+        # unpriced cells are named anyway: on a pool that has been rebuilt they
+        # are the *released* incarnations, and they drag the total down without
+        # explaining themselves.
+        detail = f"{idle_seconds:.0f}s idle, {idle_cost:.4f} accrued"
+        checks.append(
+            _passed("idle-cost-accrued", detail if not unpriced else f"{detail} ({unpriced} released cell(s) unpriced)")
+        )
+    elif unpriced:
         checks.append(
             _unknown(
                 "idle-cost-accrued",
-                f"{billing['unpriced_cells']} cell(s) carry no price, so cost cannot distinguish free from unpriced",
+                f"{unpriced} cell(s) carry no price and nothing accrued, "
+                "so cost cannot distinguish a free pool from an unpriced one",
             )
         )
-    elif float(billing.get("idle_seconds", 0)) <= 0:
-        checks.append(_unknown("idle-cost-accrued", "no idle time was billed, so the warm period was not measured"))
-    elif float(billing.get("idle_cost", 0)) <= 0:
-        checks.append(_failed("idle-cost-accrued", "idle seconds accrued with no idle cost"))
     else:
-        checks.append(
-            _passed("idle-cost-accrued", f"{billing['idle_seconds']:.0f}s idle, {billing['idle_cost']:.4f} accrued")
-        )
+        checks.append(_failed("idle-cost-accrued", f"{idle_seconds:.0f}s idle on a priced pool accrued no cost"))
     return ProofResult("P6", tuple(checks))
 
 
@@ -507,7 +517,12 @@ def warm_window_proof(session: CliSession, pool_id: str, inside: str) -> None:
             lambda: evaluate_warm_window(
                 captured,
                 session.client.request("GET", "/api/v1/capacity/warmth"),
-                session.client.request("GET", "/api/v1/capacity/billing"),
+                # Scoped to this pool. The fleet-wide report counts every cell
+                # the plane has ever held, and a long-lived fleet's historical
+                # unpriced cells would make the cost half inconclusive on every
+                # run regardless of how the pool under test is priced -- found
+                # by running P6 against a plane with 33 of them.
+                session.client.request("GET", "/api/v1/capacity/billing", params={"pool_id": pool_id}),
                 pool_id=pool_id,
             ),
         )

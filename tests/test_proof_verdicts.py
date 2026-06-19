@@ -565,3 +565,40 @@ def test_a_real_verdict_passes_through_the_guard_unchanged() -> None:
     expected = ProofResult("P1", (ProofCheck("x", Verdict.PASS, "ok"),))
 
     assert _gather("P1", lambda: expected) is expected
+
+
+def test_released_unpriced_cells_do_not_block_a_measured_cost() -> None:
+    """Found by running P6 against a pool that had been rebuilt twice.
+
+    The pool's two earlier incarnations were released before it carried prices,
+    so `unpriced_cells` was 2 while the live cell was priced and had accrued real
+    cost. Treating any unpriced cell as disqualifying made the cost half
+    inconclusive on a run that had measured cost correctly -- the check refusing
+    to answer a question it had the answer to.
+
+    The rule is about the failure it exists to catch: a fleet reading as free
+    because nothing is priced. Cost above zero means that did not happen.
+    """
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(idle_cost=0.0304, idle_seconds=9894.0, unpriced_cells=2),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "idle-cost-accrued") is Verdict.PASS
+    assert result.verdict is Verdict.PASS
+
+
+def test_a_fully_priced_pool_that_accrued_nothing_still_fails() -> None:
+    """The clock not running is a defect, and must not be softened to inconclusive."""
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=1, warm=1),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(idle_cost=0.0, idle_seconds=3600.0, unpriced_cells=0),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "idle-cost-accrued") is Verdict.FAIL
