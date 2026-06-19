@@ -75,6 +75,94 @@ def _names_a_real_command(path: tuple[str, ...]) -> bool:
     return True
 
 
+def _documented_options(text: str) -> set[tuple[tuple[str, ...], str]]:
+    """Every ``eyvan a b --flag`` pairing, as (command path, flag).
+
+    Walks each invocation through the command tree rather than requiring the
+    flag to follow the command words directly, because the common runbook shape
+    puts an argument in between: ``eyvan workload get <id> --json``. Matching
+    only adjacent flags silently skipped exactly those lines.
+
+    Long flags only. A short flag is one character and collides constantly with
+    ordinary prose, and the failure this catches -- copying an invocation out of
+    a runbook mid-run -- is a long-flag failure in practice.
+    """
+
+    found: set[tuple[tuple[str, ...], str]] = set()
+    for line in text.splitlines():
+        for match in re.finditer(r"`?\beyvan((?: [^\s`]+)+)", line):
+            path: list[str] = []
+            flags: list[str] = []
+            node: click.Command = cli.main
+            for token in match.group(1).split():
+                # A redirect or pipe ends the invocation; `<id>` does not, and an
+                # earlier pattern that excluded ">" wholesale skipped every line
+                # shaped `eyvan workload get <id> --json` -- which is most of them.
+                # `--` ends Eyvan's own options: everything after it belongs to
+                # the process being exec'd, so `exec -- py-spy --pid` was being
+                # read as two eyvan flags.
+                if token in {"--", ">", ">>", "|", "&&", ";", "#"}:
+                    break
+                if token.startswith("--"):
+                    flags.append(token.split("=")[0])
+                    continue
+                if flags:
+                    continue  # an option's value, not a subcommand
+                if isinstance(node, click.Group) and token in node.commands:
+                    path.append(token)
+                    node = node.commands[token]
+            if path:
+                found.update((tuple(path), flag) for flag in flags)
+    return found
+
+
+def _resolve(path: tuple[str, ...]) -> click.Command | None:
+    """Return the command a path names, or ``None`` if it names none."""
+
+    node: click.Command = cli.main
+    for word in path:
+        if not isinstance(node, click.Group):
+            return node
+        child = node.commands.get(word)
+        if child is None:
+            return None
+        node = child
+    return node
+
+
+def _accepts(command: click.Command, flag: str) -> bool:
+    """Whether ``command`` -- or the root, for global flags -- declares ``flag``."""
+
+    for source in (command, cli.main):
+        for parameter in source.params:
+            if flag in getattr(parameter, "opts", ()) or flag in getattr(parameter, "secondary_opts", ()):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("page", _pages(), ids=lambda path: path.name)
+def test_every_documented_flag_exists(page: pathlib.Path) -> None:
+    """A runbook flag that does not exist fails in the middle of a paid run.
+
+    The sibling test above checks command *paths*, and passed while
+    ``docs/proofs.md`` told an operator to run ``eyvan cells --json`` five
+    different ways. ``cells`` resolves, so the path was fine; the flag has never
+    existed, and those commands emit JSON with no flag at all.
+
+    That is worse than an ordinary documentation error. These pages are followed
+    while a TPU is billing, by someone who cannot tell a typo in the runbook from
+    a regression in the tool.
+    """
+
+    unknown: list[str] = []
+    for path, flag in sorted(_documented_options(page.read_text(encoding="utf-8"))):
+        command = _resolve(path)
+        if command is not None and not _accepts(command, flag):
+            unknown.append(f"eyvan {' '.join(path)} {flag}")
+
+    assert not unknown, f"{page.name} documents flags that do not exist: {', '.join(unknown)}"
+
+
 def test_the_docs_directory_exists_and_is_not_empty() -> None:
     """The README was 49 KB of reference prose and there was no ``docs/``.
 

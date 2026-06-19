@@ -42,9 +42,9 @@ provider returning 1 of 2 hosts yields a silently half-sized JAX cluster; only
 real hardware produces that case.
 
 ```
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan capacity pool get research/v5p --json     # resources from the catalog, not the YAML
-eyvan cells --json                              # observed_tpu_vms == catalog hosts
+eyvan cells                              # observed_tpu_vms == catalog hosts
 eyvan down --yes
 ```
 
@@ -66,11 +66,11 @@ otherwise be skipped silently.
 failure this exists to prevent, and it needs two real hosts.
 
 ```
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload submit --name logs --command 'python -c "import time;[print(i) or time.sleep(1) for i in range(600)]"' --tpu 8
-eyvan workload log-page <id> --json              # records attributed per rank
+eyvan workload log-page <id>              # records attributed per rank
 # kill one host out of band, then:
-eyvan workload log-page <id> --after <cursor> --json
+eyvan workload log-page <id> --after <cursor>
 eyvan down --yes
 ```
 
@@ -87,12 +87,12 @@ retry bumps the generation, and that `exec` runs beside a trainer without
 disturbing it.
 
 ```
-eyvan up --config configs/eyvan-live-cpu-us-east5-a.yaml
+eyvan up configs/eyvan-live-cpu-us-east5-a.yaml
 # a callable submitted with can_submit_children=True that fans out three ways
-eyvan workload children <parent> --json          # created_by is the parent's owner
+eyvan workload children <parent>          # created_by is the parent's owner
 eyvan down --yes
 
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload exec <id> -- py-spy dump --pid <pid>
 eyvan down --yes
 ```
@@ -110,11 +110,11 @@ issuance and one read; and that the capability is refused once the attempt ends.
 
 ```
 eyvan policy set --allow-secret-reference gcp-secret://<project>/eyvan-proof-
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload submit --name secret-proof --command 'python -c "import os;print(len(os.environ[\"HF_TOKEN\"]))"' \
   --secret HF_TOKEN=gcp-secret://<project>/eyvan-proof-token --tpu 8
 eyvan workload logs <id>                         # the length, never the value
-eyvan events --json | grep secret.               # one secret.issued, one secret.read
+eyvan events --org <org> --project <project> | grep secret.               # one secret.issued, one secret.read
 eyvan down --yes
 ```
 
@@ -141,13 +141,13 @@ slice produces `PREEMPTED` rather than `PROVIDER_ERROR`, that it consumes
 stocked-out, and that the workload resumes from its checkpoint.
 
 ```
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload submit --name preempt-proof --command '<checkpointing trainer>' \
   --tpu 8 --checkpointable --checkpoint-hook ... --checkpoint-output-uri gs://... \
   --max-retries 0 --max-preemption-retries 5
 # wait for GCP to reclaim
-eyvan cells --json                               # provider_failure_code == preempted
-eyvan workload get <id> --json                   # preemption_count 1, capacity_loss_count 0
+eyvan cells                               # provider_failure_code == preempted
+eyvan workload get <id>                   # preemption_count 1, capacity_loss_count 0
 eyvan capacity list --json                       # the pool has no stockout cooldown
 ```
 
@@ -172,7 +172,7 @@ exactly that period. Needs wall-clock time; nothing else does.
 
 ```
 # add warm_windows to configs/eyvan-live-cpu-us-east5-a.yaml
-eyvan up --config configs/eyvan-live-cpu-us-east5-a.yaml
+eyvan up configs/eyvan-live-cpu-us-east5-a.yaml
 eyvan capacity warmth --json                     # window_active, floor held
 # after the window closes
 eyvan capacity warmth --json                     # window_active false, floor released
@@ -212,8 +212,8 @@ work.
 to hours with a human watching. This is the only evidence about days.
 
 ```
-eyvan up --config configs/eyvan-live-cpu-us-east5-a.yaml
-eyvan up --config configs/eyvan-live-v5p16-us-east5-a.yaml
+eyvan up configs/eyvan-live-cpu-us-east5-a.yaml
+eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 # submit a mixed load: short callables, a long checkpointed trainer,
 # a batch fan-out, and a service
 eyvan soak --hours 72 --interval-s 60 --output soak.json
