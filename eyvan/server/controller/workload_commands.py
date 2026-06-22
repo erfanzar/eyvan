@@ -12,7 +12,7 @@ import shlex
 import typing as tp
 import uuid
 from datetime import timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
@@ -44,6 +44,13 @@ from eyvan.worker.agent.models import (
 
 if tp.TYPE_CHECKING:
     from eyvan.server.persistence import RepositorySession
+
+
+#: Hosts a remote worker cannot reach when it resolves them itself.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+#: Providers whose cells share a host with the control plane, so loopback works.
+_LOCAL_PROVIDERS = frozenset({"local"})
 
 
 class _ControllerWorkloadCommands:
@@ -167,6 +174,36 @@ class _ControllerWorkloadCommands:
             parts.extend(("--workspace-uri", workspace.uri))
         parts.append("--")
         return " ".join(shlex.quote(part) for part in parts) + " " + command, environment
+
+    def _refuse_unreachable_callback(self, workload: WorkloadRecord, cell: CellRecord) -> None:
+        """Refuse a dispatch whose callback URL the target cell cannot reach.
+
+        Secret mounts and in-job submission hand the worker an address and expect
+        it to call back. That address is this plane's ``public_url``, and a
+        loopback one resolves on the *worker's* host -- so a remote cell gets
+        connection-refused several minutes later, and the durable failure blames
+        the worker for a control-plane misconfiguration.
+
+        Found by running P4: a secret mount was accepted, dispatched, and failed
+        eight minutes later with ``Connection refused``, when the impossibility
+        was knowable before the cell was ever contacted.
+
+        Local cells are exempt because loopback genuinely works for them, which
+        is the whole development topology and must keep working.
+        """
+
+        needs_callback = bool(workload.spec.secret_mounts) or workload.spec.can_submit_children
+        if not needs_callback or self.artifact_access is None:
+            return
+        base = self.artifact_access.public_url
+        host = urlparse(base).hostname or ""
+        if host not in _LOOPBACK_HOSTS or cell.provider in _LOCAL_PROVIDERS:
+            return
+        wants = "secret mounts" if workload.spec.secret_mounts else "in-job submission"
+        raise RuntimeError(
+            f"this control plane advertises {base!r}, which a cell on provider {cell.provider!r} cannot reach; "
+            f"{wants} require a callback address the worker can resolve -- set EYVAN_PUBLIC_URL"
+        )
 
     def _children_url(self, workload: WorkloadRecord) -> str:
         """Return the address a job posts its children to.
@@ -430,6 +467,7 @@ class _ControllerWorkloadCommands:
                 if observation.state not in READY_CAPACITY_STATUSES:
                     raise RuntimeError(f"cell {cell.id!r} has not recovered the quarantined lease")
 
+            self._refuse_unreachable_callback(workload, cell)
             entrypoint, environment = self._render_execution(workload, runtime_environment=cell.runtime.env)
             await self._audit_secret_issuance(transaction, workload)
             request = WorkloadRequest(
@@ -533,6 +571,7 @@ class _ControllerWorkloadCommands:
 
             leader_lease = members[0]
             leader_cell = concrete_cells[0]
+            self._refuse_unreachable_callback(workload, leader_cell)
             entrypoint, environment = self._render_execution(workload, runtime_environment=leader_cell.runtime.env)
             await self._audit_secret_issuance(transaction, workload)
 

@@ -125,6 +125,14 @@ eyvan proof secret <workload-id> --value-file /tmp/expected   # 0600, deleted af
 The value comes from a file rather than an argument: a secret on the command line
 lands in shell history and in every process listing on the host.
 
+**Run 2026-08-05, exit 2 (inconclusive).** The confidentiality half held: the
+value appeared in no workload record and no audit payload, and one
+`secret.issued` was written. Delivery did not happen -- the worker got
+`Connection refused` fetching the secret, because this control plane advertises
+`http://127.0.0.1:8081` and a GCE worker resolves that on its own host. A plane
+whose `EYVAN_PUBLIC_URL` a worker cannot reach cannot run this proof; dispatch
+now refuses such a workload immediately rather than failing eight minutes later.
+
 **Passes when** the job prints the length, `eyvan events` shows exactly one
 `secret.issued` and one `secret.read` for that attempt, and grepping the workload
 record, the audit payloads and the logs finds the value nowhere. The audit
