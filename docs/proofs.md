@@ -282,6 +282,19 @@ actually pruning.
 
 Read `artifact_growth` even on a pass: it is the number that says whether
 collection ran at all, and a total alone cannot.
+
+**Run 2026-08-05: a 30-minute soak, exit 0. This is not P8.** 30 observations,
+0 unreachable, no invariant violated once let alone persistently, and no
+over-time finding. 76 workloads churned through a local fleet during it -- short
+jobs every 25s and a three-minute job every tenth -- so the leases, settlement
+and outbox paths were genuinely exercised rather than watched while idle.
+
+What it does not establish is what P8 is for. Thirty minutes is not three days,
+and the plan is explicit that the duration is the load-bearing part. There was
+no TPU fleet. And `artifact_growth` was 0 because command workloads store no
+results, so the one criterion this page singles out -- whether collection runs
+at all -- was not exercised. A shorter soak answers "did anything break just
+now", which is the question that was already answerable.
 **Shape** CPU fleet plus v5p-16. **72 hours.** This is the largest single spend
 here and the only one that cannot be shortened without changing what it proves.
 
