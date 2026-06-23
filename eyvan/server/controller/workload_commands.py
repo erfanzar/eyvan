@@ -52,6 +52,15 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 #: Providers whose cells share a host with the control plane, so loopback works.
 _LOCAL_PROVIDERS = frozenset({"local"})
 
+#: Executors that actually redeem a secret capability into the job's environment.
+#:
+#: Stated rather than probed because the consequence of getting it wrong is
+#: silent: an executor that ignores ``secret_mounts`` runs the job with the
+#: variable simply absent, and the only trace is the workload failing on a
+#: KeyError somewhere in user code. Only ``systemd_transient`` calls
+#: ``materialize_secrets``; add a name here when another runtime learns to.
+_SECRET_MATERIALIZING_EXECUTORS = frozenset({"eyvan-native"})
+
 
 class _ControllerWorkloadCommands:
     """Rendering and dispatching workload, gang, cancel, and checkpoint commands.
@@ -192,6 +201,16 @@ class _ControllerWorkloadCommands:
         is the whole development topology and must keep working.
         """
 
+        if workload.spec.secret_mounts and cell.executor not in _SECRET_MATERIALIZING_EXECUTORS:
+            # Refused rather than run without them. The control plane has already
+            # minted a per-attempt capability and written ``secret.issued``, so a
+            # silent drop leaves an issuance with no matching read -- which is
+            # precisely the signal a *leaked* token produces. Normal operation on
+            # such an executor would make that signal meaningless.
+            raise RuntimeError(
+                f"executor {cell.executor!r} does not materialize secret mounts, and this workload declares "
+                f"{sorted(workload.spec.secret_mounts)}; it would run with those variables absent"
+            )
         needs_callback = bool(workload.spec.secret_mounts) or workload.spec.can_submit_children
         if not needs_callback or self.artifact_access is None:
             return
