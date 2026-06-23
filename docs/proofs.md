@@ -97,9 +97,27 @@ eyvan workload exec <id> -- py-spy dump --pid <pid>
 eyvan down --yes
 ```
 
+```
+eyvan proof children <parent-id> --expected 3 --late-submit-status 409
+```
+
 **Passes when** every child's `created_by` is the submitting human rather than
 `workload:<id>`, the ceiling returns 409, a stale-generation token is refused,
 and `py-spy` returns a stack from every rank with the trainer still RUNNING.
+
+**Run 2026-08-05, exit 2 (inconclusive).** On a local cell, because the children
+URL is the same loopback address the secret URL is and a remote worker cannot
+reach it. A running job submitted three children with its capability, all
+accepted 201; every child carried `created_by='erfan'` -- the submitting human,
+not `workload:<id>` -- and every one was parented into the submitter's own
+scope. Reusing the capability after the parent reached SUCCEEDED was refused
+with 409, so the capability is bounded by the parent's state rather than by an
+expiry.
+
+Inconclusive because two criteria were not exercised: the live-children ceiling
+needs 256 concurrent children, and the `exec` half needs a TPU -- the local
+driver reports `supports_exec: False`, correctly, since a shell on this host is
+already available without asking Eyvan for one.
 **Shape** CPU fleet, then v5p-16. **~40 minutes.**
 
 ## P4 — secret delivery, per attempt

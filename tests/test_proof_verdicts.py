@@ -24,6 +24,7 @@ from eyvan.sdk.commands.proof import (
     EXIT_CODES,
     Verdict,
     evaluate_catalog_authority,
+    evaluate_in_job_submission,
     evaluate_kubernetes_preconditions,
     evaluate_secret_delivery,
     evaluate_spot_preemption,
@@ -516,6 +517,7 @@ def test_every_proof_evaluator_has_a_command() -> None:
         "warm-window",
         "secret",
         "kubernetes",
+        "children",
     }
 
 
@@ -688,3 +690,103 @@ def test_the_wrong_failure_code_is_not_a_pass() -> None:
     result = evaluate_kubernetes_preconditions(_k8s(**{"unsafe-queue": "provider_unavailable"}))
 
     assert _check(result, "unsafe-queue") is Verdict.FAIL
+
+
+# --------------------------------------------------------------------------- P3
+
+
+_PARENT = {"id": "wl-parent", "created_by": "alice", "org_id": "acme", "project_id": "research"}
+
+
+def _child(child_id: str, **overrides) -> dict:
+    base = {
+        "id": child_id,
+        "created_by": "alice",
+        "parent_workload_id": "wl-parent",
+        "org_id": "acme",
+        "project_id": "research",
+    }
+    base.update(overrides)
+    return base
+
+
+def _p3(children, **kw):
+    kw.setdefault("expected_children", 2)
+    kw.setdefault("late_submit_status", 409)
+    kw.setdefault("ceiling_status", 409)
+    return evaluate_in_job_submission(_PARENT, children, **kw)
+
+
+def test_children_under_the_owners_identity_pass() -> None:
+    assert _p3([_child("a"), _child("b")]).verdict is Verdict.PASS
+
+
+def test_a_synthetic_created_by_fails() -> None:
+    """The criterion the plan singled out, and the one nothing else would catch.
+
+    A child attributed to `workload:<id>` competes as a fresh per-principal
+    fair-share leaf against a fresh quota scope, so a self-submitting launcher
+    escapes the limits its owner is subject to. The job tree looks correct
+    throughout.
+    """
+
+    result = _p3([_child("a"), _child("b", created_by="workload:wl-parent")])
+
+    assert _check(result, "children-carry-the-owner") is Verdict.FAIL
+
+
+def test_a_child_in_another_scope_fails() -> None:
+    """The capability exists to stop a job naming a scope its parent is not in."""
+
+    result = _p3([_child("a"), _child("b", project_id="finance")])
+
+    assert _check(result, "children-are-parented") is Verdict.FAIL
+
+
+def test_an_unparented_child_fails() -> None:
+    result = _p3([_child("a"), _child("b", parent_workload_id="wl-someone-else")])
+
+    assert _check(result, "children-are-parented") is Verdict.FAIL
+
+
+def test_a_terminated_parent_that_still_accepts_children_fails() -> None:
+    """A capability outliving its parent is the leak the design revokes by state."""
+
+    result = _p3([_child("a"), _child("b")], late_submit_status=201)
+
+    assert _check(result, "capability-expires-with-the-parent") is Verdict.FAIL
+
+
+def test_an_unattempted_reuse_is_inconclusive() -> None:
+    result = _p3([_child("a"), _child("b")], late_submit_status=None)
+
+    assert _check(result, "capability-expires-with-the-parent") is Verdict.INCONCLUSIVE
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_an_unreached_ceiling_is_inconclusive_not_a_pass() -> None:
+    """256 concurrent children is impractical in most runs, and saying so is the point."""
+
+    result = _p3([_child("a"), _child("b")], ceiling_status=None)
+
+    assert _check(result, "width-ceiling") is Verdict.INCONCLUSIVE
+
+
+def test_a_ceiling_that_admits_fails() -> None:
+    result = _p3([_child("a"), _child("b")], ceiling_status=201)
+
+    assert _check(result, "width-ceiling") is Verdict.FAIL
+
+
+def test_a_parent_that_submitted_nothing_is_inconclusive() -> None:
+    """No children means the capability was never used, not that it works."""
+
+    assert _p3([]).verdict is Verdict.INCONCLUSIVE
+
+
+def test_a_short_fan_out_is_a_failure_not_a_pass() -> None:
+    """Two of three accepted means one was rejected, and that is a result."""
+
+    result = _p3([_child("a")], expected_children=3)
+
+    assert _check(result, "children-created") is Verdict.FAIL

@@ -34,6 +34,7 @@ import click
 from eyvan._internal.compat import StrEnum
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
+from eyvan.server.service.subjobs import MAX_LIVE_CHILDREN
 
 
 class Verdict(StrEnum):
@@ -450,6 +451,85 @@ def evaluate_kubernetes_preconditions(observations: tp.Mapping[str, str | None])
     return ProofResult("P7", tuple(checks))
 
 
+# --------------------------------------------------------------------------- P3
+
+
+def evaluate_in_job_submission(
+    parent: dict,
+    children: tp.Sequence[dict],
+    *,
+    expected_children: int,
+    late_submit_status: int | None,
+    ceiling_status: int | None,
+) -> ProofResult:
+    """P3 -- a running job submits children under its owner's identity.
+
+    ``created_by`` is the criterion that matters most and the one most easily
+    got wrong in a way nothing notices. A child attributed to
+    ``workload:<id>`` competes as a fresh per-principal fair-share leaf and
+    against a fresh quota scope, so a self-submitting launcher would escape the
+    limits its owner is subject to simply by fanning out. The job tree would look
+    correct the whole time.
+    """
+
+    checks: list[Check] = []
+    if not children:
+        return ProofResult(
+            "P3",
+            (_unknown("children-created", "the parent submitted no children; nothing about the capability was used"),),
+        )
+    if len(children) == expected_children:
+        checks.append(_passed("children-created", f"{len(children)} child(ren) accepted"))
+    else:
+        checks.append(_failed("children-created", f"expected {expected_children}, found {len(children)}"))
+
+    owner = parent.get("created_by")
+    synthetic = [child["id"] for child in children if child.get("created_by") != owner]
+    if synthetic:
+        checks.append(
+            _failed(
+                "children-carry-the-owner",
+                f"{len(synthetic)} child(ren) not attributed to {owner!r}: {', '.join(sorted(synthetic)[:3])}",
+            )
+        )
+    else:
+        checks.append(_passed("children-carry-the-owner", f"every child is attributed to {owner!r}"))
+
+    orphans = [child["id"] for child in children if child.get("parent_workload_id") != parent.get("id")]
+    scope = {(child.get("org_id"), child.get("project_id")) for child in children}
+    if orphans:
+        checks.append(_failed("children-are-parented", f"{len(orphans)} child(ren) name a different parent"))
+    elif scope != {(parent.get("org_id"), parent.get("project_id"))}:
+        checks.append(_failed("children-are-parented", f"children landed in {sorted(scope)}, not the parent's scope"))
+    else:
+        checks.append(_passed("children-are-parented", "every child is parented and in the parent's scope"))
+
+    if late_submit_status is None:
+        checks.append(_unknown("capability-expires-with-the-parent", "reuse after termination was not attempted"))
+    elif late_submit_status == 409:
+        checks.append(_passed("capability-expires-with-the-parent", "refused with 409 once the parent was terminal"))
+    else:
+        checks.append(
+            _failed(
+                "capability-expires-with-the-parent",
+                f"a terminated parent still accepted a child (HTTP {late_submit_status})",
+            )
+        )
+
+    if ceiling_status is None:
+        checks.append(
+            _unknown(
+                "width-ceiling",
+                f"the live-children ceiling was not reached; it takes {MAX_LIVE_CHILDREN} concurrent children",
+            )
+        )
+    elif ceiling_status == 409:
+        checks.append(_passed("width-ceiling", "the ceiling refused with 409"))
+    else:
+        checks.append(_failed("width-ceiling", f"the ceiling did not refuse (HTTP {ceiling_status})"))
+    return ProofResult("P3", tuple(checks))
+
+
 # --------------------------------------------------------------------------- the command
 
 
@@ -655,6 +735,46 @@ def kubernetes_proof(api_server: str, token_file: str, ca_file: str, safe_queue:
     )
 
 
+@proof.command("children")
+@click.argument("parent_id")
+@click.option("--expected", type=int, default=3, show_default=True, help="How many children the job submitted.")
+@click.option(
+    "--late-submit-status",
+    type=int,
+    help="HTTP status from reusing the capability after the parent terminated. Omit if not attempted.",
+)
+@click.option("--ceiling-status", type=int, help="HTTP status from exceeding the live-children ceiling.")
+@click.pass_obj
+def children_proof(
+    session: CliSession,
+    parent_id: str,
+    expected: int,
+    late_submit_status: int | None,
+    ceiling_status: int | None,
+) -> None:
+    """P3 -- a running job submits children under its owner's identity.
+
+    The two status codes are passed in rather than provoked here: reusing a
+    capability needs the token the job was given, which only the job ever holds,
+    and reaching the width ceiling needs hundreds of concurrent children. Both
+    are omitted rather than faked when a run did not exercise them, and both
+    report inconclusive when omitted.
+    """
+
+    _emit(
+        _gather(
+            "P3",
+            lambda: evaluate_in_job_submission(
+                session.client.request("GET", f"/api/v1/workloads/{parent_id}"),
+                session.client.request("GET", f"/api/v1/workloads/{parent_id}/children"),
+                expected_children=expected,
+                late_submit_status=late_submit_status,
+                ceiling_status=ceiling_status,
+            ),
+        )
+    )
+
+
 def register_proof_commands(main: click.Group) -> None:
     """Attach the proof command group to the CLI root."""
 
@@ -667,6 +787,7 @@ __all__ = (
     "ProofResult",
     "Verdict",
     "evaluate_catalog_authority",
+    "evaluate_in_job_submission",
     "evaluate_kubernetes_preconditions",
     "evaluate_secret_delivery",
     "evaluate_spot_preemption",
