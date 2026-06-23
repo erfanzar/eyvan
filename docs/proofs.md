@@ -216,9 +216,31 @@ leaked previous incarnation deleted rather than adopted, pods Pending past
 `provisioning_timeout_s`, and with Kueue installed an `Inadmissible` Workload
 mapping to `QUEUE_ADMISSION_DENIED` rather than terminal failure.
 
+```
+eyvan proof kubernetes --api-server https://<master-ip> \
+  --token-file <token> --ca-file <ca.crt>
+```
+
+Credentials are files, not arguments: a bearer token on a command line lands in
+shell history and in every process listing on the host.
+
 **Passes when** each maps to the documented `CapacityProviderFailureCode`, and
 `eyvan capacity pool` refuses a ClusterQueue whose preemption could evict Eyvan's
 work.
+
+**Run 2026-08-05, exit 0.** GKE 1.35 in `us-east5-a`, Kueue v0.10.1, one
+ClusterQueue with preemption `Never`/`Never` and one with
+`LowerPriority`/`Any`. No queue and the safe queue were allowed; the unsafe
+queue and a missing one were both refused with `configuration`, the documented
+code. The transport itself was exercised for the first time against a real API
+server: `get_job` on an absent Job returned `None`, `create` returned `True`
+then `False` on replay -- a 409 `AlreadyExists` handled as idempotent rather
+than raised -- and a Foreground delete returned 200.
+
+Everything decided here is driver-to-API-server, so no workload had to run and
+no worker had to reach the control plane. What that leaves unproven is the full
+lifecycle: pods registering back and a workload executing need a control plane
+the cluster can route to, which a laptop advertising loopback is not.
 **Shape** GKE, CPU node pool then one GPU node pool. **~2 hours, modest cost.**
 
 ## P8 — the soak

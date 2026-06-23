@@ -24,6 +24,7 @@ from eyvan.sdk.commands.proof import (
     EXIT_CODES,
     Verdict,
     evaluate_catalog_authority,
+    evaluate_kubernetes_preconditions,
     evaluate_secret_delivery,
     evaluate_spot_preemption,
     evaluate_warm_window,
@@ -509,7 +510,13 @@ def test_every_proof_evaluator_has_a_command() -> None:
 
     from eyvan.sdk import cli
 
-    assert set(cli.main.commands["proof"].commands) == {"catalog", "preemption", "warm-window", "secret"}
+    assert set(cli.main.commands["proof"].commands) == {
+        "catalog",
+        "preemption",
+        "warm-window",
+        "secret",
+        "kubernetes",
+    }
 
 
 # --------------------------------------------------------------------------- reachability
@@ -602,3 +609,82 @@ def test_a_fully_priced_pool_that_accrued_nothing_still_fails() -> None:
     )
 
     assert _check(result, "idle-cost-accrued") is Verdict.FAIL
+
+
+# --------------------------------------------------------------------------- P7
+
+
+def _k8s(**overrides: str | None) -> dict[str, str | None]:
+    base: dict[str, str | None] = {
+        "no-queue": None,
+        "safe-queue": None,
+        "unsafe-queue": "configuration",
+        "missing-queue": "configuration",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_a_driver_that_refuses_the_right_queues_passes() -> None:
+    assert evaluate_kubernetes_preconditions(_k8s()).verdict is Verdict.PASS
+
+
+def test_admitting_an_unsafe_queue_fails() -> None:
+    """The hazard the whole check exists for.
+
+    Kueue eviction destroys a pod with no checkpoint hook, bypassing Eyvan's
+    preemption protocol entirely, and the only trace is a training job that lost
+    hours with nothing in the ledger explaining why.
+    """
+
+    result = evaluate_kubernetes_preconditions(_k8s(**{"unsafe-queue": None}))
+
+    assert _check(result, "unsafe-queue") is Verdict.FAIL
+
+
+def test_refusing_a_safe_queue_also_fails() -> None:
+    """A driver that refuses everything is unusable with Kueue at all.
+
+    Asserted separately because a check written only against the hazard passes
+    trivially for an implementation that says no to everything.
+    """
+
+    result = evaluate_kubernetes_preconditions(_k8s(**{"safe-queue": "configuration"}))
+
+    assert _check(result, "safe-queue") is Verdict.FAIL
+
+
+def test_a_missing_queue_must_be_refused() -> None:
+    """A pool pointed at a queue that does not exist suspends every Job forever.
+
+    Reporting "no problems" for that is worse than a refusal, because the fleet
+    looks configured and never runs anything.
+    """
+
+    result = evaluate_kubernetes_preconditions(_k8s(**{"missing-queue": None}))
+
+    assert _check(result, "missing-queue") is Verdict.FAIL
+
+
+def test_an_unexercised_case_is_inconclusive_not_a_pass() -> None:
+    """A cluster with no Kueue cannot answer, and must not appear to."""
+
+    observations = _k8s()
+    del observations["unsafe-queue"]
+
+    result = evaluate_kubernetes_preconditions(observations)
+
+    assert _check(result, "unsafe-queue") is Verdict.INCONCLUSIVE
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_the_wrong_failure_code_is_not_a_pass() -> None:
+    """The criterion is the *documented* code, not merely some refusal.
+
+    A refusal typed as a transient provider error would be retried forever
+    against a configuration that can never become safe.
+    """
+
+    result = evaluate_kubernetes_preconditions(_k8s(**{"unsafe-queue": "provider_unavailable"}))
+
+    assert _check(result, "unsafe-queue") is Verdict.FAIL

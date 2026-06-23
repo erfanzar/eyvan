@@ -413,6 +413,43 @@ def evaluate_secret_delivery(
     return ProofResult("P4", tuple(checks))
 
 
+# --------------------------------------------------------------------------- P7
+
+
+def evaluate_kubernetes_preconditions(observations: tp.Mapping[str, str | None]) -> ProofResult:
+    """P7 -- the Kueue precondition, decided against a real API server.
+
+    ``observations`` maps a case name to the failure code the driver produced,
+    or ``None`` when it allowed the configuration.
+
+    Both halves matter and they fail differently. Refusing everything is a
+    driver nobody can use with Kueue at all; refusing nothing is the hazard the
+    check exists for -- Kueue eviction destroys a pod with no checkpoint hook,
+    bypassing Eyvan's whole preemption protocol, and the only trace is a
+    training job that lost hours with no ledger entry explaining why.
+    """
+
+    expected: tuple[tuple[str, str | None, str], ...] = (
+        ("no-queue", None, "a pool naming no queue has nothing to verify"),
+        ("safe-queue", None, "preemption Never/Never cannot evict Eyvan's work"),
+        ("unsafe-queue", "configuration", "preemption that could evict must be refused"),
+        ("missing-queue", "configuration", "a queue that does not exist suspends every Job forever"),
+    )
+    checks: list[Check] = []
+    for case, want, why in expected:
+        if case not in observations:
+            checks.append(_unknown(case, f"the run did not exercise this case ({why})"))
+            continue
+        got = observations[case]
+        if got == want:
+            checks.append(_passed(case, "allowed" if want is None else f"refused with {want!r}"))
+        elif want is None:
+            checks.append(_failed(case, f"refused with {got!r}; {why}"))
+        else:
+            checks.append(_failed(case, f"allowed; {why}"))
+    return ProofResult("P7", tuple(checks))
+
+
 # --------------------------------------------------------------------------- the command
 
 
@@ -571,6 +608,53 @@ def secret_proof(
     )
 
 
+@proof.command("kubernetes")
+@click.option("--api-server", required=True, help="https://<master-ip> of the cluster under test.")
+@click.option("--token-file", type=click.Path(exists=True, dir_okay=False), required=True)
+@click.option("--ca-file", type=click.Path(exists=True, dir_okay=False), required=True)
+@click.option("--safe-queue", default="eyvan-safe", show_default=True)
+@click.option("--unsafe-queue", default="eyvan-unsafe", show_default=True)
+def kubernetes_proof(api_server: str, token_file: str, ca_file: str, safe_queue: str, unsafe_queue: str) -> None:
+    """P7 -- drive the real Kubernetes transport against a real API server.
+
+    Credentials are files rather than arguments for the same reason the secret
+    proof takes a file: a bearer token on a command line lands in shell history
+    and in every process listing on the host.
+
+    Needs a cluster with Kueue installed and two ClusterQueues -- one with
+    preemption Never/Never, one with preemption enabled. Everything this decides
+    is driver-to-API-server, so no workload has to run and no worker has to
+    reach the control plane.
+    """
+
+    from eyvan.capacity.drivers.base import CapacityProviderError
+    from eyvan.capacity.drivers.kubernetes import KubernetesCapacityDriver
+    from eyvan.capacity.providers.kubernetes.api import KubernetesApi
+
+    driver = KubernetesCapacityDriver(api=KubernetesApi(base_url=api_server, token_path=token_file, ca_path=ca_file))
+
+    def probe(queue: str | None) -> str | None:
+        try:
+            driver._require_safe_queue(queue)
+        except CapacityProviderError as error:
+            return error.code.value
+        return None
+
+    _emit(
+        _gather(
+            "P7",
+            lambda: evaluate_kubernetes_preconditions(
+                {
+                    "no-queue": probe(None),
+                    "safe-queue": probe(safe_queue),
+                    "unsafe-queue": probe(unsafe_queue),
+                    "missing-queue": probe("eyvan-proof-absent-queue"),
+                }
+            ),
+        )
+    )
+
+
 def register_proof_commands(main: click.Group) -> None:
     """Attach the proof command group to the CLI root."""
 
@@ -583,6 +667,7 @@ __all__ = (
     "ProofResult",
     "Verdict",
     "evaluate_catalog_authority",
+    "evaluate_kubernetes_preconditions",
     "evaluate_secret_delivery",
     "evaluate_spot_preemption",
     "evaluate_warm_window",
