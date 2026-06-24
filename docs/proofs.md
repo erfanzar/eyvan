@@ -53,7 +53,21 @@ eyvan proof catalog --accelerator-type v5p-16      # exit 0, 1 or 2
 ```
 
 **Passes when** the pool's resources match the catalog entry for `v5p-16` and
-`observed_tpu_vms` is 2, with no `resources:` block in the fleet YAML. A cell
+`observed_tpu_vms` is 2, with no `resources:` block in the fleet YAML.
+
+**Run 2026-08-06, exit 0.** v5p-16 spot in `us-central1-a`, slice ready 7m9s
+after apply. With no `resources:` block the pool resolved to `cpu 32, tpu 8` --
+the catalog's `host_cpu` and `chips` -- and the cell reported
+`observed_tpu_vms: 2`, the catalog's `hosts`. The provider is authoritative for
+how many slices; the catalog is authoritative for hosts per slice, which is the
+property a provider returning one host of two would violate silently.
+
+One thing this exposed: the catalog sets `host_memory_gib` for no shape, so a
+pool built from it advertises **zero memory**. `eyvan workload submit` defaults
+to 1 GiB, so the default submit cannot place on a catalog-derived TPU pool at
+all -- it reports `insufficient_capacity`, which is true and unhelpful. Making
+`resources:` optional is what put that path in reach; nothing else exercises
+it. A cell
 that never reported `observed_tpu_vms`, or a catalog shape with no recorded host
 count, is **inconclusive** rather than passing -- the check that matters would
 otherwise be skipped silently.
@@ -77,6 +91,17 @@ eyvan down --yes
 **Passes when** the second page reports the killed rank as unavailable while
 still returning the surviving rank's records, and the archived blob exists after
 terminality so the cell can be released without losing logs.
+
+**Attempted 2026-08-06: not runnable on this path.** `eyvan workload log-page`
+answered `unavailable: true` with
+`execution backend 'eyvan-native' does not expose structured logs`. Only
+`systemd_transient` implements `StructuredLogExecutionDriver`; the remote
+native-worker protocol that TPU fleets use does not, so per-rank attribution
+cannot be demonstrated on the executor this proof targets. The route degraded
+honestly rather than returning an empty page -- "this backend has no structured
+logs" and "this workload produced no output" stay distinguishable, which is what
+that code was written to preserve -- but the capability is absent where it
+matters.
 **Shape** v5p-16 multi-host. **~45 minutes.**
 
 ## P3 — in-job submission and exec
@@ -306,6 +331,23 @@ P5 is opportunistic — start it and let it run while P1 through P4 execute on
 other slices. P6 needs wall-clock time and nothing else, so it can overlap
 anything. P8 goes last, after the others have confirmed the individual
 behaviours it assumes.
+
+## A defect this page's runs found, still open
+
+**A cancel the worker cannot complete makes a slice unreleasable.** Observed
+2026-08-06 on the v5p-16 in `us-central1-a`. The native worker answered
+`500 Internal Server Error` on
+`POST /api/v1/workloads/<id>/stop`; the agent retried 24 times; the workload
+stayed in `cancelling` for the rest of its life, never released its lease, and
+`eyvan down` could not drain the cell -- 13 minutes in `draining` with the
+queued resource still ACTIVE. The slice had to be released with
+`gcloud compute tpus queued-resources delete --force`.
+
+Two things make it worse than a stuck job. The capacity keeps billing, and it is
+a TPU. And `eyvan capacity invariants` reported **no violations** throughout: the
+checks cover a workload non-terminal with *no* live lease, and this is the
+inverse -- non-terminal, holding one, forever. A soak would not have caught it
+either.
 
 ## What a failure means
 
