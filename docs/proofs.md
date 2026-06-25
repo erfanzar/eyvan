@@ -344,10 +344,26 @@ queued resource still ACTIVE. The slice had to be released with
 `gcloud compute tpus queued-resources delete --force`.
 
 Two things make it worse than a stuck job. The capacity keeps billing, and it is
-a TPU. And `eyvan capacity invariants` reported **no violations** throughout: the
-checks cover a workload non-terminal with *no* live lease, and this is the
-inverse -- non-terminal, holding one, forever. A soak would not have caught it
-either.
+a TPU. And `eyvan capacity invariants` reported **no violations** throughout.
+
+That second half is fixed: I3 listed only PENDING and PROCESSING commands, and a
+command that keeps failing lives in FAILED between attempts -- so the check could
+only ever catch a command nobody had picked up. With FAILED included it now names
+both stuck commands with their topic and age, verified against this exact live
+state (`workload.cancel` failed for 3198s, `capacity.drain` for 2227s).
+
+**The state itself is still unrecoverable, and that is the open half.** The chain
+deadlocks: the workload never leaves `cancelling`, so its lease stays active, so
+`eyvan cell-delete` refuses with *"still owns 1 active lease(s)"*, so the cell
+stays `draining`, so `eyvan down` never completes. `preemption-force-finalize`
+does not apply -- it attests *preemption* victims, and this is an ordinary
+cancel. There is no operator command that resolves it, and a subsequent fleet in
+the same zone did not provision while it persisted.
+
+Bounding the retry is not obviously right either: forcing the workload terminal
+means declaring a process dead that the worker never confirmed stopping, which is
+a decision about replacing the cell rather than a retry constant. Making it
+visible was the part that could be fixed without deciding that.
 
 ## What a failure means
 
