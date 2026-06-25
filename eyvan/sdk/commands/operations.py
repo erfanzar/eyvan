@@ -112,6 +112,33 @@ def force_finalize_preemption(
     )
 
 
+@click.command("workload-force-finalize")
+@click.argument("workload_id")
+@click.option("--reason", required=True)
+@click.option("--idempotency-key")
+@click.pass_obj
+def force_finalize_workload(
+    session: CliSession,
+    workload_id: str,
+    reason: str,
+    idempotency_key: str | None,
+) -> None:
+    """Settle a workload whose stop the worker will never confirm.
+
+    Break glass, and it gives up the cell rather than returning it: the process
+    may still be running on a host nobody could stop, so scheduling onto it
+    again would be worse than the deadlock this escapes.
+    """
+
+    OperationsCommandService(session).mutate(
+        "POST",
+        f"/api/v1/workloads/{workload_id}/force-finalize",
+        operation="workload-force-finalize",
+        idempotency_key=idempotency_key,
+        request=PreemptionForceFinalizeRequest(reason=reason),
+    )
+
+
 @click.command("leases")
 @click.option("--org", "org_id", required=True)
 @click.option("--project", "project_id", required=True)
@@ -166,7 +193,15 @@ def list_events(session: CliSession, org_id: str, project_id: str, after: int, f
 def register_operation_commands(group: click.Group) -> None:
     """Attach operational commands to the root command group."""
 
-    for command in (list_cells, drain_cell, delete_cell, force_finalize_preemption, list_leases, list_events):
+    for command in (
+        list_cells,
+        drain_cell,
+        delete_cell,
+        force_finalize_preemption,
+        force_finalize_workload,
+        list_leases,
+        list_events,
+    ):
         group.add_command(command)
 
 

@@ -352,8 +352,17 @@ only ever catch a command nobody had picked up. With FAILED included it now name
 both stuck commands with their topic and age, verified against this exact live
 state (`workload.cancel` failed for 3198s, `capacity.drain` for 2227s).
 
-**The state itself is still unrecoverable, and that is the open half.** The chain
-deadlocks: the workload never leaves `cancelling`, so its lease stays active, so
+**The state was unrecoverable; there is now an escape.**
+`eyvan workload-force-finalize <id> --reason ...` settles a workload whose stop
+the worker will never confirm: it discards the stuck command, releases the
+lease, and **drains the cell rather than returning it** -- nobody confirmed the
+process stopped, so scheduling other work onto that host would be worse than the
+deadlock. It is refused on anything not stuck for `STUCK_CANCEL_AFTER_S`, the
+same threshold I3 reports at, so an operator cannot force-finalize something the
+invariants still call healthy. Used against the live deadlock this section
+describes, it settled the workload and the fleet came back to zero violations.
+
+The chain it escapes: the workload never leaves `cancelling`, so its lease stays active, so
 `eyvan cell-delete` refuses with *"still owns 1 active lease(s)"*, so the cell
 stays `draining`, so `eyvan down` never completes. `preemption-force-finalize`
 does not apply -- it attests *preemption* victims, and this is an ordinary

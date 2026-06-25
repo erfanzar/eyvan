@@ -368,6 +368,16 @@ def _explain_from_scheduling_result(workload: WorkloadRecord, result: Scheduling
     )
 
 
+#: How long a cancellation must have been failing before it counts as stuck
+#: rather than in flight.
+#:
+#: Matches ``STUCK_OUTBOX_AFTER_S``, the point at which I3 reports the same
+#: command. An operator should not be able to force-finalize something the
+#: invariants still call healthy -- two thresholds that disagree would mean the
+#: break-glass and the alarm describe different fleets.
+STUCK_CANCEL_AFTER_S = 900.0
+
+
 class ControlPlaneService:
     """Own authorization, lifecycle validation, idempotency, and audit atomicity."""
 
@@ -1667,6 +1677,116 @@ class ControlPlaneService:
             )
             await self._bind_idempotency(tx, scope, "workload.retry", key, fingerprint, updated)
             return updated, False
+
+    async def force_finalize_stuck_workload(
+        self,
+        principal: Principal,
+        workload_id: str,
+        *,
+        reason: str,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> tuple[WorkloadRecord, bool]:
+        """Settle a workload whose stop the worker will never confirm.
+
+        The escape from a deadlock observed on hardware: a native worker answered
+        500 to every ``/stop``, the agent retried indefinitely, and the workload
+        stayed in CANCELLING. Its lease therefore stayed active, so the cell
+        could not be deleted -- ``cell-delete`` refuses while leases are held --
+        so it never left DRAINING and ``eyvan down`` never completed. Nothing in
+        the CLI resolved it; ``force_finalize_preemption`` attests *preemption*
+        victims and does not apply to an ordinary cancel.
+
+        **This declares a process dead that nobody confirmed stopping.** That is
+        why the cell is drained rather than returned to service: the workload may
+        still be running on it, and scheduling something else onto a host in that
+        state would be worse than the deadlock. The capacity is given up, not
+        recycled.
+
+        Refused unless the stop has genuinely stopped making progress -- a live
+        cancel in flight is not this, and a break-glass that also works on
+        healthy work is one that gets used on healthy work.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        key = _validate_idempotency_key(idempotency_key)
+        reason = reason.strip()
+        if not reason:
+            raise InputError("force-finalize reason must not be empty")
+        moment = now or utcnow()
+        fingerprint = _fingerprint({"workload_id": workload_id, "reason": reason})
+        async with self.repository.transaction() as tx:
+            existing = await self._idempotent_resource(tx, "fleet", "workload.force_finalize", key, fingerprint)
+            workload = await self._require_workload(tx, workload_id)
+            if existing is not None:
+                return workload, True
+            if workload.state in TERMINAL_WORKLOAD_STATES:
+                raise ConflictError(f"workload {workload_id!r} is already {workload.state.value}")
+            if workload.state is not WorkloadState.CANCELLING:
+                raise ConflictError(
+                    f"workload {workload_id!r} is {workload.state.value}; only a stuck cancellation is "
+                    "force-finalized, because this gives up the cell rather than returning it"
+                )
+            stuck = [
+                command
+                for command in await tx.list_outbox_for_aggregates(
+                    "workload", {workload_id: workload.generation}, topic="workload.cancel"
+                )
+                if command.state in {OutboxState.FAILED, OutboxState.PENDING, OutboxState.PROCESSING}
+                and command.created_at <= moment - timedelta(seconds=STUCK_CANCEL_AFTER_S)
+            ]
+            if not stuck:
+                raise ConflictError(
+                    f"workload {workload_id!r} has no cancel older than {STUCK_CANCEL_AFTER_S:g}s; "
+                    "a cancellation still in flight is not stuck"
+                )
+            for command in stuck:
+                await tx.put_outbox(
+                    command.model_copy(
+                        update={
+                            "state": OutboxState.DISCARDED,
+                            "claimed_by": None,
+                            "claimed_until": None,
+                            "last_error": f"force-finalized: {reason}",
+                            "updated_at": moment,
+                        }
+                    )
+                )
+            drained: set[str] = set()
+            for lease in await tx.list_leases(workload_id=workload_id):
+                if lease.state not in ACTIVE_LEASE_STATES:
+                    continue
+                await self._settle_lease(tx, principal, workload, lease, reason="force-finalized")
+                drained.add(lease.cell_id)
+            for cell_id in sorted(drained):
+                cell = await tx.get_cell(cell_id)
+                if cell is None or cell.state in {CellState.DELETED, CellState.DELETING}:
+                    continue
+                await tx.put_cell(cell.model_copy(update={"state": CellState.DRAINING, "updated_at": moment}))
+            settled = workload.model_copy(
+                update={
+                    "state": WorkloadState.CANCELLED,
+                    "failure_reason": f"force-finalized after an unconfirmed stop: {reason}",
+                    "updated_at": moment,
+                }
+            )
+            await tx.put_workload(settled)
+            await self._bind_idempotency(tx, "fleet", "workload.force_finalize", key, fingerprint, settled)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                entity_type="workload",
+                entity_id=workload_id,
+                action="workload.force_finalized",
+                payload={
+                    "reason": reason,
+                    "discarded_commands": sorted(command.id for command in stuck),
+                    "drained_cells": sorted(drained),
+                },
+            )
+            return settled, False
 
     async def force_finalize_preemption(
         self,

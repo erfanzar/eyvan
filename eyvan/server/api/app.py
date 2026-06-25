@@ -1742,6 +1742,31 @@ def create_app(
         return workload
 
     @app.post(
+        "/api/v1/workloads/{workload_id}/force-finalize",
+        response_model=WorkloadRecord,
+        tags=["workloads"],
+    )
+    async def force_finalize_stuck_workload(
+        workload_id: str,
+        request: PreemptionForceFinalizeRequest,
+        response: Response,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> WorkloadRecord:
+        """Settle a workload whose stop the worker will never confirm.
+
+        Break glass. It gives up the cell rather than returning it, because the
+        process may still be running on a host nobody could stop.
+        """
+
+        workload, replayed = await service.force_finalize_stuck_workload(
+            principal, workload_id, reason=request.reason, idempotency_key=idempotency_key
+        )
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+        return workload
+
+    @app.post(
         "/api/v1/preemptions/{command_id}/force-finalize",
         response_model=WorkloadRecord,
         tags=["workloads"],

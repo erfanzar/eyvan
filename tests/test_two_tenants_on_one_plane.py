@@ -109,6 +109,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/leases/{lease_id}": "one lease",
     "GET /api/v1/fleet/events": "unscoped audit trail",
     "POST /api/v1/preemptions/{command_id}/force-finalize": "break-glass preemption finalize",
+    "POST /api/v1/workloads/{workload_id}/force-finalize": "break-glass; it gives up a cell, not just a workload",
     "GET /api/v1/federation/peers": "which control planes this one federates with",
     "PUT /api/v1/federation/peers/{plane_id}": "register a peer plane",
     "POST /api/v1/federation/budget-grants": "cut a peer a slice of a tenant's budget",
