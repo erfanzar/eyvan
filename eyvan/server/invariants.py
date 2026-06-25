@@ -68,6 +68,11 @@ LIVE_CELL_STATES: tp.Final[frozenset[CellState]] = frozenset(
 #: than in flight. Generous on purpose: a provider call can legitimately take
 #: minutes, and an invariant that fires during normal slowness trains an
 #: operator to ignore it.
+#:
+#: Measured from ``created_at``, so it covers a command being retried as well as
+#: one that has never been tried. Retry backoff caps at 300s, so a command still
+#: failing after this window has had at least several attempts and is not merely
+#: unlucky.
 STUCK_OUTBOX_AFTER_S = 900.0
 
 #: How far past its retention window a record may sit before pruning is judged
@@ -177,6 +182,13 @@ async def check_fleet(
         budgets = await tx.list_budgets()
         pending_outbox = await tx.list_outbox(state=OutboxState.PENDING, limit=1000)
         processing_outbox = await tx.list_outbox(state=OutboxState.PROCESSING, limit=1000)
+        # FAILED is where a command that keeps failing actually sits. Between
+        # attempts it is settled to FAILED with `available_at` in the future, so
+        # a command retrying forever is PENDING or PROCESSING only for the
+        # instant it is being tried -- and this check, which looked at those two
+        # states alone, reported a healthy fleet while a v5p-16 was pinned by a
+        # cancel the worker answered 500 to twenty-four times.
+        failed_outbox = await tx.list_outbox(state=OutboxState.FAILED, limit=1000)
         oldest_events = await tx.list_events(limit=1)
 
     violations: list[Violation] = []
@@ -224,7 +236,7 @@ async def check_fleet(
             )
 
     stuck_before = moment - timedelta(seconds=STUCK_OUTBOX_AFTER_S)
-    for command in (*pending_outbox, *processing_outbox):
+    for command in (*pending_outbox, *processing_outbox, *failed_outbox):
         if command.created_at <= stuck_before:
             age = int((moment - command.created_at).total_seconds())
             violations.append(
