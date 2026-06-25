@@ -347,6 +347,51 @@ class DoctorCommandService:
             "re-apply the fleet config, or price the pool deliberately if the difference is intended",
         )
 
+    def _unschedulable_pool_check(self) -> CheckResult:
+        """Report a pool that advertises no memory, and so can never be placed on.
+
+        Found by running P1. The hardware catalog records ``host_memory_gib`` for
+        no shape, so a pool whose resources come from the catalog -- which is
+        exactly what omitting ``resources:`` from fleet YAML now does -- comes up
+        with ``memory_gib: 0``. ``eyvan workload submit`` defaults to 1 GiB, so
+        the default submit can never place on it and reports
+        ``insufficient_capacity``: true, and useless.
+
+        A warning rather than a failure. A pool that genuinely wants to schedule
+        on TPU alone is a coherent configuration, and the operator who wrote it
+        should not be told their fleet is broken. The one who did not write it,
+        and cannot see why nothing schedules, is who this is for.
+        """
+
+        name = "pool-schedulability"
+        try:
+            pools = self.session.client.request("GET", "/api/v1/capacity-pools")
+        except EyvanUnavailableError as error:
+            return CheckResult(name, CheckStatus.FAIL, f"control plane became unreachable: {error}")
+        except EyvanApiError as error:
+            if error.status_code in {401, 403}:
+                return CheckResult(name, CheckStatus.WARN, "not authorized to read capacity pools")
+            raise
+        if not isinstance(pools, list):
+            return CheckResult(name, CheckStatus.WARN, "control plane returned an unexpected shape")
+        memoryless = sorted(
+            str(pool.get("id"))
+            for pool in pools
+            if is_json_object(pool)
+            and pool.get("enabled")
+            and is_json_object(allocatable := pool.get("allocatable", {}))
+            and not float(allocatable.get("memory_gib") or 0)
+        )
+        if not memoryless:
+            return CheckResult(name, CheckStatus.PASS, "every enabled pool advertises memory")
+        return CheckResult(
+            name,
+            CheckStatus.WARN,
+            f"{len(memoryless)} enabled pool(s) advertise no memory: {', '.join(memoryless[:3])}",
+            "a workload asking for any memory can never place there -- `eyvan workload submit` defaults to "
+            "1 GiB. Set `resources:` in the fleet YAML, or submit with `--memory-gib 0`",
+        )
+
     def _kueue_check(self) -> CheckResult:
         """Report a Kueue configuration that could evict Eyvan's workloads.
 
@@ -517,6 +562,7 @@ class DoctorCommandService:
         report.checks.append(self._fleet_check())
         report.checks.append(self._budget_pricing_check())
         report.checks.append(self._price_drift_check())
+        report.checks.append(self._unschedulable_pool_check())
         report.checks.append(self._kueue_check())
         report.checks.append(self._native_worker_route_check())
         report.checks.append(self._source_drift_check())

@@ -303,3 +303,72 @@ def test_a_partly_priced_fleet_is_not_this_warning_s_business() -> None:
     drift = next(check for check in report.checks if check.name == "price-drift")
 
     assert "structurally zero" not in drift.detail
+
+
+def _fleet_with_pools(pools: list[dict]) -> tp.Callable[[str], tp.Any]:
+    """A control plane holding the given pools and no cells."""
+
+    def handler(path: str) -> tp.Any:
+        if path.endswith("/health"):
+            return {"status": "ok", "controller": "active"}
+        if path.endswith("/capacity-pools"):
+            return pools
+        if path.endswith("/cells"):
+            return []
+        return [{"name": "research"}]
+
+    return handler
+
+
+def _pool(pool_id: str, *, memory_gib: float, enabled: bool = True) -> dict:
+    return {
+        "id": pool_id,
+        "fleet_name": "research",
+        "node_type": "tpu",
+        "provider": "local",
+        "region": "local",
+        "enabled": enabled,
+        "capacity": {"cpu": 32.0, "memory_gib": memory_gib, "tpu": 8},
+        "allocatable": {"cpu": 32.0, "memory_gib": memory_gib, "tpu": 8},
+        "agent_endpoint": "http://agent:8090",
+    }
+
+
+def test_a_pool_that_advertises_no_memory_is_reported() -> None:
+    """Found by running P1.
+
+    The hardware catalog records `host_memory_gib` for no shape, so a pool built
+    from it -- which is what omitting `resources:` from fleet YAML now does --
+    comes up with zero memory. `eyvan workload submit` defaults to 1 GiB, so the
+    default submit can never place there and answers `insufficient_capacity`:
+    true, and useless to whoever did not write the config.
+    """
+
+    client = _RecordingClient(_fleet_with_pools([_pool("research/v5p", memory_gib=0.0)]))
+
+    report = DoctorCommandService(_session(client)).report()
+    check = next(c for c in report.checks if c.name == "pool-schedulability")
+
+    assert check.status is CheckStatus.WARN
+    assert "research/v5p" in check.detail
+    assert check.remedy and "--memory-gib 0" in check.remedy
+
+
+def test_a_pool_with_memory_passes() -> None:
+    """The gate must not fire on the configuration it exists to encourage."""
+
+    client = _RecordingClient(_fleet_with_pools([_pool("research/cpu", memory_gib=16.0)]))
+
+    report = DoctorCommandService(_session(client)).report()
+
+    assert next(c for c in report.checks if c.name == "pool-schedulability").status is CheckStatus.PASS
+
+
+def test_a_disabled_pool_is_not_reported() -> None:
+    """A pool nobody can submit to cannot be the reason a submission fails."""
+
+    client = _RecordingClient(_fleet_with_pools([_pool("research/old", memory_gib=0.0, enabled=False)]))
+
+    report = DoctorCommandService(_session(client)).report()
+
+    assert next(c for c in report.checks if c.name == "pool-schedulability").status is CheckStatus.PASS

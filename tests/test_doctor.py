@@ -115,6 +115,7 @@ def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
         "submittable-fleet": CheckStatus.PASS,
         "budget-pricing": CheckStatus.PASS,
         "price-drift": CheckStatus.PASS,
+        "pool-schedulability": CheckStatus.PASS,
         "kueue-preconditions": CheckStatus.PASS,
         "native-worker-route": CheckStatus.PASS,
         "source-drift": CheckStatus.PASS,
