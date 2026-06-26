@@ -62,6 +62,35 @@ def test_a_page_survives_a_round_trip() -> None:
     assert [r.message for r in restored.records] == ["hello"]
     assert restored.records[0].timestamp == page.records[0].timestamp
     assert restored.next_cursor == "c1"
+    # The field this round trip was silently dropping. `stream` is decoded by the
+    # sender, and feeding it back through the *priority* mapper turned every
+    # 'stdout' and 'stderr' into 'unknown' -- so the one thing structured logs add
+    # over plain text was empty on every remote read, and the first version of
+    # this test asserted everything except it.
+    assert restored.records[0].stream == "stdout"
+
+
+def test_both_streams_survive_the_wire() -> None:
+    """stdout and stderr must stay distinguishable, which is half the point."""
+
+    document = {
+        "records": [
+            dict(LogRecord(message="out", stream="stdout").as_json()),
+            dict(LogRecord(message="err", stream="stderr").as_json()),
+        ]
+    }
+
+    page = log_page_from_json(document)
+
+    assert [r.stream for r in page.records] == ["stdout", "stderr"]
+
+
+def test_a_raw_journald_priority_is_still_understood() -> None:
+    """A sender forwarding PRIORITY rather than a decoded name still works."""
+
+    page = log_page_from_json({"records": [{"message": "x", "stream": 3}]})
+
+    assert page.records[0].stream == "stderr"
 
 
 def test_a_malformed_payload_becomes_unavailable_rather_than_raising() -> None:
@@ -181,3 +210,43 @@ def test_the_slice_cursor_carries_every_host_position() -> None:
 
     _attempt, cursors = split_log_cursor(page.next_cursor)
     assert cursors == {0: "c0", 1: "c1"}
+
+
+def test_the_control_plane_decoder_keeps_the_timestamp() -> None:
+    """The defect that made multi-host ordering meaningless.
+
+    `_log_page_from_document` built `LogRecord` itself and omitted `timestamp`
+    entirely, so every record read over the wire arrived without one. Worse than
+    a missing column: `merge_pages` orders by `(timestamp or _EPOCH, rank)`, so
+    with every timestamp None a multi-host page collapsed to rank order and the
+    chronological interleaving that per-rank attribution exists to produce was
+    silently gone.
+    """
+
+    from eyvan.server.controller.observation import _log_page_from_document
+
+    document = {"records": [dict(_record("line", cursor="c1").as_json())], "next_cursor": "c1"}
+
+    page = _log_page_from_document(document, rank=3)
+
+    assert page.records[0].timestamp == datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    assert page.records[0].stream == "stdout"
+    assert page.records[0].rank == 3
+
+
+def test_records_from_two_hosts_interleave_by_time() -> None:
+    """What the lost timestamp cost: ordering across hosts.
+
+    Rank 1's earlier line must sort before rank 0's later one. Without
+    timestamps every record ties at the epoch and the merge degenerates to rank
+    order, which reads as "host 0's whole log, then host 1's".
+    """
+
+    from eyvan.worker.runtime.log_records import merge_pages
+
+    early = LogRecord(message="early", timestamp=datetime(2026, 8, 6, 12, 0, 0, tzinfo=UTC), rank=1)
+    late = LogRecord(message="late", timestamp=datetime(2026, 8, 6, 12, 0, 5, tzinfo=UTC), rank=0)
+
+    merged = merge_pages({0: LogPage(records=(late,)), 1: LogPage(records=(early,))})
+
+    assert [r.message for r in merged.records] == ["early", "late"]

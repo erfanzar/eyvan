@@ -135,6 +135,19 @@ def join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
     return f"{attempt}:" + "|".join(f"{rank}={cursor}" for rank, cursor in live.items())
 
 
+def _stream_from_wire(value: object) -> LogStream:
+    """Accept a stream name the sender already decoded.
+
+    Falls back to the priority mapping so a sender that forwards a raw journald
+    PRIORITY is still understood; the two are distinguishable because the stream
+    names are a closed set.
+    """
+
+    if value in ("stdout", "stderr", "unknown"):
+        return tp.cast("LogStream", value)
+    return stream_for_priority(value if isinstance(value, (str, int)) else None)
+
+
 def log_page_from_json(payload: object) -> LogPage:
     """Rebuild a page from the wire shape ``LogPage`` writes.
 
@@ -167,7 +180,12 @@ def log_page_from_json(payload: object) -> LogPage:
         records.append(
             LogRecord(
                 message=str(item.get("message", "")),
-                stream=stream_for_priority(item.get("stream")),
+                # Already decoded by the sender. Feeding it back through
+                # ``stream_for_priority`` -- which expects a journald PRIORITY --
+                # silently turned every 'stdout' and 'stderr' into 'unknown', so
+                # the one field structured logs add over plain text was empty on
+                # every remote read.
+                stream=_stream_from_wire(item.get("stream")),
                 timestamp=parsed,
                 cursor=str(item.get("cursor", "")),
                 rank=rank if isinstance(rank, int) else None,

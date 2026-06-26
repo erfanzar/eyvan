@@ -11,6 +11,7 @@ import asyncio
 import json
 import typing as tp
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from eyvan._internal.json_types import JsonObject
@@ -62,6 +63,7 @@ from eyvan.worker.agent.models import (
 from eyvan.worker.runtime.log_records import (
     LogPage,
     LogRecord,
+    log_page_from_json,
     merge_pages,
 )
 from eyvan.worker.runtime.log_records import (
@@ -82,28 +84,23 @@ def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:
 
     The agent does not know its own rank -- it knows a cell -- so attribution is
     applied here, where the gang's ordering is known.
+
+    Decoding is delegated rather than repeated. This function used to build
+    ``LogRecord`` itself and omitted ``timestamp`` entirely, so every record read
+    over the wire arrived without one. That is worse than a missing column:
+    ``merge_pages`` orders by ``(timestamp or _EPOCH, rank)``, so with every
+    timestamp ``None`` a multi-host page collapsed to rank order and the
+    chronological interleaving that per-rank attribution exists to produce was
+    silently gone.
     """
 
-    raw_records = payload.get("records")
-    records: list[LogRecord] = []
-    if isinstance(raw_records, list):
-        for entry in raw_records:
-            if not isinstance(entry, dict):
-                continue
-            records.append(
-                LogRecord(
-                    message=str(entry.get("message", "")),
-                    stream=str(entry.get("stream", "unknown")),  # type: ignore[arg-type]
-                    cursor=str(entry.get("cursor", "")),
-                    rank=rank,
-                    pid=entry.get("pid") if isinstance(entry.get("pid"), int) else None,
-                )
-            )
+    page = log_page_from_json(payload)
     return LogPage(
-        records=tuple(records),
-        next_cursor=str(payload.get("next_cursor", "")),
-        unavailable=bool(payload.get("unavailable", False)),
-        detail=str(payload.get("detail", "")),
+        records=tuple(replace(record, rank=rank) for record in page.records),
+        next_cursor=page.next_cursor,
+        unavailable=page.unavailable,
+        detail=page.detail,
+        truncated_ranks=page.truncated_ranks,
     )
 
 
