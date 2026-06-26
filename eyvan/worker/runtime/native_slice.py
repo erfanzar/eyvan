@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import logging
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 
 import httpx
@@ -25,6 +25,12 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime.log_records import (
+    LogPage,
+    join_log_cursor,
+    merge_pages,
+    split_log_cursor,
+)
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
@@ -494,6 +500,52 @@ class NativeSliceExecutor:
                 logs = f"native worker log retrieval failed: {type(exc).__name__}: {exc}"
             sections.append(f"===== rank {rank} {endpoint} =====\n{logs}")
         return "\n".join(sections)
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        """Return one structured page covering every host in this slice.
+
+        The control plane fans out across *cells* and treats each as one rank. A
+        multi-host slice is one cell, so the hosts inside it have to be merged
+        here or a v5p-16 would report only whichever host answered first.
+
+        Each host resumes from its own position. A single cursor is meaningless
+        to a journal that did not issue it, which is why `merge_pages` refuses to
+        invent one, and the same per-rank encoding the control plane uses is
+        reused rather than respelled.
+
+        An unreachable host is reported *in place* via `truncated_ranks` rather
+        than dropped: a fan-out that silently returned the hosts it could reach
+        would show a complete-looking log for a half-dead slice, which is the
+        failure this whole aggregation exists to prevent.
+        """
+
+        _attempt, cursors = split_log_cursor(after)
+        pages: dict[int, LogPage] = {}
+        next_cursors: dict[int, str] = {}
+        for rank, worker in enumerate(self._workers):
+            try:
+                page = worker.log_page(remote_id, after=cursors.get(rank, ""), limit=limit)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                page = LogPage(unavailable=True, detail=f"{type(exc).__name__}: {exc}")
+            pages[rank] = LogPage(
+                records=tuple(replace(record, rank=rank) for record in page.records),
+                next_cursor=page.next_cursor,
+                unavailable=page.unavailable,
+                detail=page.detail,
+            )
+            if page.next_cursor:
+                next_cursors[rank] = page.next_cursor
+        merged = merge_pages(pages)
+        # ``merge_pages`` deliberately returns no cursor; the slice-level one is
+        # the per-host positions joined, which is the only thing that can resume
+        # every host.
+        return LogPage(
+            records=merged.records,
+            next_cursor=join_log_cursor(_attempt or 0, next_cursors),
+            unavailable=merged.unavailable,
+            detail=merged.detail,
+            truncated_ranks=merged.truncated_ranks,
+        )
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return per-rank process detail across every host in the slice.

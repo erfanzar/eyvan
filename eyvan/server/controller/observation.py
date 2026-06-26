@@ -59,61 +59,22 @@ from eyvan.worker.agent.models import (
     MutationModel,
     WorkloadMutationRequest,
 )
-from eyvan.worker.runtime.log_records import LogPage, LogRecord, merge_pages
+from eyvan.worker.runtime.log_records import (
+    LogPage,
+    LogRecord,
+    merge_pages,
+)
+from eyvan.worker.runtime.log_records import (
+    join_log_cursor as _join_log_cursor,
+)
+from eyvan.worker.runtime.log_records import (
+    split_log_cursor as _split_log_cursor,
+)
 
 #: How many ranks an archive read probes before concluding the set has ended.
 #: Bounded because a miss costs a storage round trip, and a gang wider than this
 #: would have failed the multislice ceiling long before it got here.
 _ARCHIVED_RANK_SCAN_LIMIT = 64
-
-
-def _split_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
-    """Split ``"{attempt}:{rank}={cursor}|{rank}={cursor}"`` into its parts.
-
-    **Per rank, not one cursor for the slice.** Each rank has its own journal
-    and its own position in it; a single cursor is meaningless to any rank that
-    did not issue it. ``merge_pages`` says the same thing by refusing to invent
-    one -- it returns an empty ``next_cursor`` precisely because no single value
-    can resume N ranks -- and a caller that ignored that would hand rank 1 a
-    cursor from rank 0's journal.
-
-    A bare value with no attempt is read as "no opinion" rather than attempt
-    zero, so a first read is not mistaken for a superseded one.
-    """
-
-    if not value:
-        return None, {}
-    attempt_text, separator, remainder = value.partition(":")
-    if not separator:
-        return None, {}
-    try:
-        attempt = int(attempt_text)
-    except ValueError:
-        return None, {}
-    cursors: dict[int, str] = {}
-    for entry in remainder.split("|"):
-        rank_text, assigned, cursor = entry.partition("=")
-        if not assigned:
-            continue
-        try:
-            cursors[int(rank_text)] = cursor
-        except ValueError:
-            continue
-    return attempt, cursors
-
-
-def _join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
-    """Encode each rank's position so the next request can resume all of them.
-
-    Empty when no rank reported one, which is distinct from a cursor pointing at
-    the start: resuming from empty means "wherever you were", and a start cursor
-    means "replay everything".
-    """
-
-    live = {rank: cursor for rank, cursor in sorted(cursors.items()) if cursor}
-    if not live:
-        return ""
-    return f"{attempt}:" + "|".join(f"{rank}={cursor}" for rank, cursor in live.items())
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:

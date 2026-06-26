@@ -86,6 +86,104 @@ class LogPage:
     truncated_ranks: tuple[int, ...] = field(default_factory=tuple)
 
 
+def split_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
+    """Split ``"{attempt}:{rank}={cursor}|{rank}={cursor}"`` into its parts.
+
+    **Per rank, not one cursor for the slice.** Each rank has its own journal
+    and its own position in it; a single cursor is meaningless to any rank that
+    did not issue it. ``merge_pages`` says the same thing by refusing to invent
+    one -- it returns an empty ``next_cursor`` precisely because no single value
+    can resume N ranks -- and a caller that ignored that would hand rank 1 a
+    cursor from rank 0's journal.
+
+    A bare value with no attempt is read as "no opinion" rather than attempt
+    zero, so a first read is not mistaken for a superseded one.
+    """
+
+    if not value:
+        return None, {}
+    attempt_text, separator, remainder = value.partition(":")
+    if not separator:
+        return None, {}
+    try:
+        attempt = int(attempt_text)
+    except ValueError:
+        return None, {}
+    cursors: dict[int, str] = {}
+    for entry in remainder.split("|"):
+        rank_text, assigned, cursor = entry.partition("=")
+        if not assigned:
+            continue
+        try:
+            cursors[int(rank_text)] = cursor
+        except ValueError:
+            continue
+    return attempt, cursors
+
+
+def join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
+    """Encode each rank's position so the next request can resume all of them.
+
+    Empty when no rank reported one, which is distinct from a cursor pointing at
+    the start: resuming from empty means "wherever you were", and a start cursor
+    means "replay everything".
+    """
+
+    live = {rank: cursor for rank, cursor in sorted(cursors.items()) if cursor}
+    if not live:
+        return ""
+    return f"{attempt}:" + "|".join(f"{rank}={cursor}" for rank, cursor in live.items())
+
+
+def log_page_from_json(payload: object) -> LogPage:
+    """Rebuild a page from the wire shape ``LogPage`` writes.
+
+    The inverse of ``as_json`` and the route's own document, kept beside them so
+    the two cannot drift: a remote driver that decoded these fields itself would
+    be a second spelling of the protocol.
+
+    A malformed payload becomes an ``unavailable`` page rather than an
+    exception, for the same reason ``log_page`` returns one: a follower polling
+    every second should not have to catch an exception to learn a host answered
+    badly, and "unavailable" is the honest description of what it got.
+    """
+
+    if not isinstance(payload, dict):
+        return LogPage(unavailable=True, detail="native worker returned a non-object log page")
+    raw_records = payload.get("records")
+    records: list[LogRecord] = []
+    for item in raw_records if isinstance(raw_records, list) else []:
+        if not isinstance(item, dict):
+            continue
+        stamp = item.get("timestamp")
+        parsed: datetime | None = None
+        if isinstance(stamp, str) and stamp:
+            try:
+                parsed = datetime.fromisoformat(stamp)
+            except ValueError:
+                parsed = None
+        rank = item.get("rank")
+        pid = item.get("pid")
+        records.append(
+            LogRecord(
+                message=str(item.get("message", "")),
+                stream=stream_for_priority(item.get("stream")),
+                timestamp=parsed,
+                cursor=str(item.get("cursor", "")),
+                rank=rank if isinstance(rank, int) else None,
+                pid=pid if isinstance(pid, int) else None,
+            )
+        )
+    truncated = payload.get("truncated_ranks")
+    return LogPage(
+        records=tuple(records),
+        next_cursor=str(payload.get("next_cursor", "")),
+        unavailable=bool(payload.get("unavailable")),
+        detail=str(payload.get("detail", "")),
+        truncated_ranks=tuple(r for r in (truncated if isinstance(truncated, list) else []) if isinstance(r, int)),
+    )
+
+
 def stream_for_priority(priority: str | int | None) -> LogStream:
     """Map a journald PRIORITY to a stream name.
 

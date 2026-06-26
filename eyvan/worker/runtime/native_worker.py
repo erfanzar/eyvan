@@ -293,6 +293,42 @@ def create_native_worker_app(
         return executor.logs(remote_id)
 
     @app.get(
+        "/api/v1/workloads/{remote_id}/log-page",
+        dependencies=[Depends(authenticate)],
+        response_model=None,
+    )
+    def log_page(remote_id: str, after: str = "", limit: int = 200) -> JsonObject:
+        """Return one resumable page of structured records.
+
+        The executor on this host has produced these since Phase 4 -- the
+        systemd runtime parses journald's own JSON, with priority, timestamp,
+        PID and an opaque cursor. Nothing exposed them over the wire, so the
+        control plane could only fetch `logs()`, which is those records with the
+        fields thrown away, and `eyvan workload log-page` answered
+        `unsupported_capability` for every fleet that runs on a remote worker.
+
+        A 501 when the executor genuinely cannot produce pages, never an empty
+        one: "this backend has no structured logs" and "this workload produced
+        no output" are different answers, and a follower that cannot tell them
+        apart polls forever against a backend that will never answer.
+        """
+
+        page = getattr(executor, "log_page", None)
+        if page is None:
+            raise HTTPException(
+                status_code=501,
+                detail=f"execution backend {type(executor).__name__} does not expose structured logs",
+            )
+        result = page(remote_id, after=after, limit=limit)
+        return {
+            "records": [dict(record.as_json()) for record in result.records],
+            "next_cursor": result.next_cursor,
+            "unavailable": result.unavailable,
+            "detail": result.detail,
+            "truncated_ranks": list(result.truncated_ranks),
+        }
+
+    @app.get(
         "/api/v1/workloads/{remote_id}/process-status",
         dependencies=[Depends(authenticate)],
         response_model=None,

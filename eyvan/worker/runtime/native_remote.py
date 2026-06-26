@@ -26,6 +26,7 @@ from eyvan.worker.agent.models import (
     WorkloadRequest,
 )
 from eyvan.worker.agent.models import WorkloadObservation as AgentWorkloadObservation
+from eyvan.worker.runtime.log_records import LogPage, log_page_from_json
 
 
 class NativeRemoteExecutor:
@@ -175,6 +176,31 @@ class NativeRemoteExecutor:
 
     def logs(self, remote_id: str) -> str:
         return self._raise_for_status(self._request("GET", f"/api/v1/workloads/{remote_id}/logs")).text
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        """Fetch one structured page from the worker that owns this workload.
+
+        This is the hop that was missing. Both ends already had everything: the
+        worker's systemd runtime produces pages, and `log_records` knows how to
+        merge and render them -- there was simply no route between them, so the
+        capability was absent on precisely the fleets it was written for.
+
+        A transport failure becomes an unavailable page rather than an
+        exception, matching what the systemd runtime does locally. `logs()`
+        raises because a string cannot say "the host is unreachable"; a page can.
+        """
+
+        try:
+            response = self._request(
+                "GET", f"/api/v1/workloads/{remote_id}/log-page", params={"after": after, "limit": limit}
+            )
+        except httpx.HTTPError as error:
+            return LogPage(unavailable=True, detail=f"native worker was unreachable: {error}")
+        if response.status_code == 501:
+            return LogPage(unavailable=True, detail=response.text[:500])
+        if response.status_code >= 400:
+            return LogPage(unavailable=True, detail=f"native worker answered {response.status_code}")
+        return log_page_from_json(response.json())
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return live process detail for one workload on this host."""
