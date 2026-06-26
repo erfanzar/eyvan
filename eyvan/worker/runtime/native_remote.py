@@ -80,11 +80,13 @@ class NativeRemoteExecutor:
         path: str,
         *,
         json: JsonObject | None = None,
+        params: tp.Mapping[str, str | int] | None = None,
         timeout: float | None = None,
     ) -> httpx.Response:
+        query = dict(params) if params else None
         if timeout is None:
-            return self.client.request(method, path, headers=self._headers, json=json)
-        return self.client.request(method, path, headers=self._headers, json=json, timeout=timeout)
+            return self.client.request(method, path, headers=self._headers, json=json, params=query)
+        return self.client.request(method, path, headers=self._headers, json=json, params=query, timeout=timeout)
 
     def health(self) -> bool:
         """Return whether the native worker accepts HTTP requests."""
