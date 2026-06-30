@@ -28,6 +28,7 @@ from eyvan.sdk.commands.proof import (
     evaluate_kubernetes_preconditions,
     evaluate_secret_delivery,
     evaluate_spot_preemption,
+    evaluate_structured_logs,
     evaluate_warm_window,
 )
 
@@ -518,6 +519,7 @@ def test_every_proof_evaluator_has_a_command() -> None:
         "secret",
         "kubernetes",
         "children",
+        "logs",
     }
 
 
@@ -790,3 +792,126 @@ def test_a_short_fan_out_is_a_failure_not_a_pass() -> None:
     result = _p3([_child("a")], expected_children=3)
 
     assert _check(result, "children-created") is Verdict.FAIL
+
+
+# --------------------------------------------------------------------------- P2
+
+
+def _log_record(rank: int = 0, **overrides) -> dict:
+    base = {
+        "message": "line",
+        "stream": "stdout",
+        "timestamp": "2026-08-07T02:50:43+00:00",
+        "cursor": "s=abc;i=1",
+        "rank": rank,
+        "pid": 42,
+    }
+    base.update(overrides)
+    return base
+
+
+def _log_page(records=None, **overrides) -> dict:
+    page = {
+        "records": records if records is not None else [_log_record()],
+        "next_cursor": "1:0=s=abc",
+        "unavailable": False,
+        "detail": "",
+        "truncated_ranks": [],
+    }
+    page.update(overrides)
+    return page
+
+
+def test_a_two_rank_page_passes_only_once_a_rank_has_actually_been_lost() -> None:
+    """P2's criterion is a rank *killed* mid-stream, not merely two healthy ones.
+
+    A slice where nothing went wrong has not exercised the reporting path, so the
+    run says so instead of passing. That is the difference between "both hosts
+    answered" and "a host stopped answering and we could still see the other".
+    """
+
+    healthy = evaluate_structured_logs(_log_page([_log_record(0), _log_record(1)]), expected_ranks=2)
+    assert _check(healthy, "unreachable-rank-reported-in-place") is Verdict.INCONCLUSIVE
+    assert healthy.verdict is Verdict.INCONCLUSIVE
+
+    lost = evaluate_structured_logs(_log_page([_log_record(0)], truncated_ranks=[1]), expected_ranks=2)
+    assert lost.verdict is Verdict.PASS
+
+
+def test_a_page_with_no_timestamps_fails() -> None:
+    """The defect that made multi-host ordering meaningless.
+
+    `merge_pages` orders by timestamp, so a page without them collapses to rank
+    order and the interleaving per-rank attribution exists for is gone.
+    """
+
+    result = evaluate_structured_logs(
+        _log_page([_log_record(0, timestamp=None), _log_record(1, timestamp=None)]), expected_ranks=2
+    )
+
+    assert _check(result, "records-carry-a-timestamp") is Verdict.FAIL
+
+
+def test_a_page_with_no_streams_fails() -> None:
+    """Without stdout/stderr this is `logs()` in a more expensive shape."""
+
+    result = evaluate_structured_logs(
+        _log_page([_log_record(0, stream="unknown"), _log_record(1, stream="unknown")]), expected_ranks=2
+    )
+
+    assert _check(result, "records-carry-a-stream") is Verdict.FAIL
+
+
+def test_a_page_with_no_cursors_fails() -> None:
+    """A record nobody can resume from makes `--follow` restart every poll."""
+
+    result = evaluate_structured_logs(_log_page([_log_record(0, cursor="")]), expected_ranks=1)
+
+    assert _check(result, "records-are-resumable") is Verdict.FAIL
+
+
+def test_a_missing_rank_is_a_failure_not_silence() -> None:
+    """The whole point: a rank that vanished must not read as a quiet host."""
+
+    result = evaluate_structured_logs(_log_page([_log_record(0)]), expected_ranks=2)
+
+    assert _check(result, "per-rank-attribution") is Verdict.FAIL
+
+
+def test_a_rank_reported_unavailable_still_counts_as_accounted_for() -> None:
+    """Reported-in-place is the correct outcome, not a missing rank."""
+
+    result = evaluate_structured_logs(_log_page([_log_record(0)], truncated_ranks=[1]), expected_ranks=2)
+
+    assert _check(result, "per-rank-attribution") is Verdict.PASS
+    assert _check(result, "unreachable-rank-reported-in-place") is Verdict.PASS
+
+
+def test_a_single_host_run_cannot_show_attribution() -> None:
+    """Honest about what one host can prove, rather than passing trivially."""
+
+    result = evaluate_structured_logs(_log_page(), expected_ranks=1)
+
+    assert _check(result, "per-rank-attribution") is Verdict.INCONCLUSIVE
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_an_absent_backend_is_distinguished_from_an_empty_page() -> None:
+    """Both are inconclusive; only one is a reason to stop running the proof.
+
+    "This backend has no structured logs" and "this workload produced no output"
+    are the distinction the whole log path is built around -- a 501 rather than
+    an empty page, so a follower cannot poll forever against something that will
+    never answer. A verdict that collapsed them would throw that away at the last
+    step, and asserting only the verdict cannot tell them apart.
+    """
+
+    absent = evaluate_structured_logs(
+        _log_page([], unavailable=True, detail="does not expose structured logs"), expected_ranks=2
+    )
+    silent = evaluate_structured_logs(_log_page([]), expected_ranks=2)
+
+    assert absent.verdict is Verdict.INCONCLUSIVE
+    assert silent.verdict is Verdict.INCONCLUSIVE
+    assert "does not expose structured logs" in absent.checks[0].detail
+    assert "does not expose structured logs" not in silent.checks[0].detail

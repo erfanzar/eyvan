@@ -530,6 +530,89 @@ def evaluate_in_job_submission(
     return ProofResult("P3", tuple(checks))
 
 
+# --------------------------------------------------------------------------- P2
+
+
+def evaluate_structured_logs(page: dict, *, expected_ranks: int) -> ProofResult:
+    """P2 -- per-rank structured logs, and an unreachable rank reported in place.
+
+    The failure this exists to prevent is a missing rank that looks like silence.
+    A fan-out returning only the hosts it could reach shows a complete-looking
+    log for a half-dead slice, and the reader has no way to tell.
+
+    ``expected_ranks`` is passed rather than inferred: inferring it from the page
+    would make "one rank answered" indistinguishable from "one rank exists",
+    which is precisely the confusion being tested for.
+    """
+
+    checks: list[Check] = []
+    records = page.get("records") or []
+    if page.get("unavailable") and not records:
+        return ProofResult(
+            "P2",
+            (
+                _unknown(
+                    "structured-records",
+                    f"the backend returned no structured page: {str(page.get('detail'))[:120]}",
+                ),
+            ),
+        )
+    if not records:
+        return ProofResult("P2", (_unknown("structured-records", "the page was empty; nothing was attributed"),))
+    checks.append(_passed("structured-records", f"{len(records)} record(s)"))
+
+    # The fields structured logs add over concatenated text. A page of messages
+    # with none of them is `logs()` in a different shape.
+    stamped = [r for r in records if r.get("timestamp")]
+    if stamped:
+        checks.append(_passed("records-carry-a-timestamp", f"{len(stamped)}/{len(records)} timestamped"))
+    else:
+        checks.append(
+            _failed(
+                "records-carry-a-timestamp",
+                "no record carries a timestamp; merge_pages orders by it, so multi-rank pages "
+                "collapse to rank order and interleaving is lost",
+            )
+        )
+    if any(r.get("stream") in {"stdout", "stderr"} for r in records):
+        checks.append(_passed("records-carry-a-stream", "stdout/stderr preserved"))
+    else:
+        checks.append(_failed("records-carry-a-stream", "every record reports stream 'unknown'"))
+    if any(r.get("cursor") for r in records):
+        checks.append(_passed("records-are-resumable", "records carry backend cursors"))
+    else:
+        checks.append(_failed("records-are-resumable", "no record carries a cursor, so no follower can resume"))
+
+    seen = {r.get("rank") for r in records} | set(page.get("truncated_ranks") or [])
+    if expected_ranks <= 1:
+        checks.append(
+            _unknown(
+                "per-rank-attribution",
+                "a single-host run cannot show attribution; the failure mode needs at least two ranks",
+            )
+        )
+    elif len(seen) >= expected_ranks:
+        checks.append(_passed("per-rank-attribution", f"{len(seen)} rank(s) accounted for"))
+    else:
+        checks.append(
+            _failed("per-rank-attribution", f"only {len(seen)} of {expected_ranks} rank(s) appear anywhere in the page")
+        )
+
+    truncated = page.get("truncated_ranks") or []
+    if expected_ranks <= 1:
+        checks.append(_unknown("unreachable-rank-reported-in-place", "no second rank to lose"))
+    elif truncated:
+        checks.append(_passed("unreachable-rank-reported-in-place", f"rank(s) {sorted(truncated)} reported unavailable"))
+    else:
+        checks.append(
+            _unknown(
+                "unreachable-rank-reported-in-place",
+                "no rank was unreachable during this run, so the reporting path was not exercised",
+            )
+        )
+    return ProofResult("P2", tuple(checks))
+
+
 # --------------------------------------------------------------------------- the command
 
 
@@ -775,6 +858,30 @@ def children_proof(
     )
 
 
+@proof.command("logs")
+@click.argument("workload_id")
+@click.option("--ranks", type=int, default=1, show_default=True, help="How many hosts the workload actually spans.")
+@click.option("--limit", type=int, default=50, show_default=True)
+@click.pass_obj
+def logs_proof(session: CliSession, workload_id: str, ranks: int, limit: int) -> None:
+    """P2 -- per-rank structured logs, with an unreachable rank visible.
+
+    ``--ranks`` is supplied rather than inferred, because inferring it from the
+    page makes "one rank answered" indistinguishable from "one rank exists" --
+    the exact confusion this proof is about.
+    """
+
+    _emit(
+        _gather(
+            "P2",
+            lambda: evaluate_structured_logs(
+                session.client.request("GET", f"/api/v1/workloads/{workload_id}/log-page", params={"limit": limit}),
+                expected_ranks=ranks,
+            ),
+        )
+    )
+
+
 def register_proof_commands(main: click.Group) -> None:
     """Attach the proof command group to the CLI root."""
 
@@ -791,6 +898,7 @@ __all__ = (
     "evaluate_kubernetes_preconditions",
     "evaluate_secret_delivery",
     "evaluate_spot_preemption",
+    "evaluate_structured_logs",
     "evaluate_warm_window",
     "proof",
     "register_proof_commands",

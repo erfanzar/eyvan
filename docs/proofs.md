@@ -92,7 +92,26 @@ eyvan down --yes
 still returning the surviving rank's records, and the archived blob exists after
 terminality so the cell can be released without losing logs.
 
-**Attempted 2026-08-06: not runnable on this path.** `eyvan workload log-page`
+**Run 2026-08-07, exit 2 (inconclusive).** Runnable now: the worker exposes
+`/log-page`, `NativeWorkerClient` fetches it, and `NativeSliceExecutor` fans out
+across the hosts inside a cell. On a CPU cell with the current wheel the page
+carried 50 records, all timestamped, stdout and stderr preserved, and real
+journald cursors -- everything structured logs add over concatenated text.
+
+Inconclusive on the two checks that need a slice: a single host cannot show
+per-rank attribution, and no rank was lost, so the report-in-place path was not
+exercised. Both say so rather than passing. Killing a host mid-stream on a
+two-host slice is what remains, and it needs a v5p-16 carrying the new worker
+wheel.
+
+Two defects were found by reading one real page, both invisible to the unit
+tests: the decoder fed an already-decoded stream name back through the *priority*
+mapper, so every stdout and stderr read as `unknown`; and the control plane's
+decoder omitted `timestamp` entirely, which matters because `merge_pages` orders
+by it -- every multi-host page would have collapsed to rank order with the
+interleaving silently gone.
+
+**Superseded, kept for the record -- 2026-08-06: not runnable on this path.** `eyvan workload log-page`
 answered `unavailable: true` with
 `execution backend 'eyvan-native' does not expose structured logs`. Only
 `systemd_transient` implements `StructuredLogExecutionDriver`; the remote
