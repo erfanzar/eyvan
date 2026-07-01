@@ -124,3 +124,22 @@ async def test_the_age_is_measured_from_creation_not_from_the_last_attempt() -> 
     found = await _violations(command)
 
     assert len(found) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_message_states_what_it_measured() -> None:
+    """ "Created Ns ago and still X" and "has been X for Ns" are different claims.
+
+    Only the first is measured: the age comes from `created_at`, so a command
+    that has been retrying for hours may have entered PROCESSING a second ago.
+    The original wording asserted the second, and an operator reading it would go
+    looking for a four-hour hang in whichever state the command happened to be in
+    when the check ran.
+    """
+
+    found = await _violations(_command(OutboxState.PROCESSING, age_s=STUCK_OUTBOX_AFTER_S + 100, attempts=9))
+
+    assert len(found) == 1
+    assert "was created" in found[0].detail
+    assert "is still processing" in found[0].detail
+    assert "has been processing for" not in found[0].detail

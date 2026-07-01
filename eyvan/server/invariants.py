@@ -73,6 +73,12 @@ LIVE_CELL_STATES: tp.Final[frozenset[CellState]] = frozenset(
 #: one that has never been tried. Retry backoff caps at 300s, so a command still
 #: failing after this window has had at least several attempts and is not merely
 #: unlucky.
+#:
+#: The message says "created Ns ago and is still X" rather than "has been X for
+#: Ns" because those are different claims and only the first is measured. A
+#: command that has been retrying for hours may have entered PROCESSING a second
+#: ago, and an operator reading the wrong one goes looking for a four-hour hang
+#: in the wrong place.
 STUCK_OUTBOX_AFTER_S = 900.0
 
 #: How far past its retention window a record may sit before pruning is judged
@@ -243,7 +249,8 @@ async def check_fleet(
                 Violation(
                     Invariant.NO_STUCK_OUTBOX,
                     command.id,
-                    f"outbox command {command.id} ({command.topic}) has been {command.state.value} for {age}s",
+                    f"outbox command {command.id} ({command.topic}) was created {age}s ago and is still "
+                    f"{command.state.value}",
                 )
             )
 
