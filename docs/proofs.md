@@ -227,6 +227,22 @@ eyvan proof preemption <workload-id>
 
 **Passes when** all four hold. `--max-retries 0` is deliberate: under the old
 shared budget the workload would have failed, so this is the distinguishing case.
+
+**Run 2026-08-07, exit 2 (inconclusive).** A v5p-16 spot slice in
+`us-central1-a` ran a checkpointing workload for 4h20m with
+`--max-retries 0 --max-preemption-retries 5`. GCP never reclaimed it, so the
+classification was never exercised and the verdict says exactly that:
+*"the slice was never reclaimed; nothing about classification was exercised"*.
+
+This is the outcome the three-verdict scheme exists for. Four hours of an
+unpreempted slice is not evidence that a reclamation would be classified
+correctly, and a pass/fail verdict would have had to call it a pass. The run was
+stopped rather than extended: the slice bills the whole time it waits, and the
+plan's own estimate of 1-3 hours had already been exceeded by half again.
+
+Do not simulate the reclamation to close this. Deleting the VM by hand produces
+no GCE preemption signal, so it exercises the provider-error path instead and
+would report a failure that is not a defect.
 A run GCP never reclaimed exits 2: "we were not preempted" is not "preemption is
 classified correctly". The cooldown check is scoped to this proof's own pool,
 because an unrelated pool's backoff failing every preemption run is how a proof
