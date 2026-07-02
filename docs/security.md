@@ -1,5 +1,20 @@
 # Security model
 
+## Pending production boundary decisions
+
+These accepted design records are implementation-pending and must not be read as
+current security claims:
+
+- [artifact scope and generation-fenced deletion](design/0001-scoped-artifact-lifecycle.md)
+  aligns the metadata key with the tenant-scoped byte store;
+- [log rank and cursor compatibility](design/0002-global-log-ranks-and-cursors.md)
+  treats an opaque cursor as untrusted state, not as a credential;
+- [service health and metrics ownership](design/0003-service-health-and-metrics.md)
+  keeps requests, responses, and raw application telemetry out of Eyvan; and
+- [federation trust and witnessed ownership](design/0004-federation-consistency.md)
+  requires external PKI and an external quorum-backed lease/CAS service rather
+  than an Eyvan-built CA or consensus protocol.
+
 ## The authority boundary
 
 The control plane holds the credentials that matter: a database URL, an artifact

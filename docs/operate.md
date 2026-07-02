@@ -1,5 +1,18 @@
 # Operating Eyvan
 
+## Pending production design contracts
+
+The following accepted records define migrations and later capabilities; they do
+**not** describe behavior implemented by the current release:
+
+- [scoped artifact identity and fenced upload/deletion](design/0001-scoped-artifact-lifecycle.md);
+- [flattened log ranks, opaque cursors, and archive compatibility](design/0002-global-log-ranks-and-cursors.md);
+- [managed-service health and metrics ownership](design/0003-service-health-and-metrics.md); and
+- [federation trust, consistency, and witnessed ownership](design/0004-federation-consistency.md).
+
+Keep artifact collection and federation/failover enablement behind their stated
+evidence gates while those records remain implementation-pending.
+
 ## Every day
 
 ```
@@ -43,6 +56,12 @@ delete the warm floor -- undoing the fix that put it there.
 `no_provider` until you configure one. That is the answer, not a gap in it.
 
 ## Cost across more than one control plane
+
+> **Current boundary:** the commands below create and enforce grant records in
+> this plane's database. The current release does not authenticate or replicate
+> them to the peer URL and does not transfer workload ownership. Treat this as a
+> manual/experimental control, not secure federation; DR-0004 defines the gated
+> production protocol linked above.
 
 A budget is one counter in one database, so a tenant with projects on three
 planes has three independent limits -- each locally compliant while the tenant
