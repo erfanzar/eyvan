@@ -12,7 +12,9 @@ external ``alembic.ini`` or a source checkout.
 
 from __future__ import annotations
 
+import argparse
 import os
+import typing as tp
 from pathlib import Path
 
 from alembic import command
@@ -44,10 +46,15 @@ def build_alembic_config(database_url: str | None = None) -> Config:
     return config
 
 
-def main() -> None:
-    """Upgrade the configured database to ``head`` (``alembic upgrade head``)."""
+def main(argv: tp.Sequence[str] | None = None) -> None:
+    """Upgrade the configured database, defaulting to the packaged head."""
 
-    command.upgrade(build_alembic_config(), "head")
+    parser = argparse.ArgumentParser(description="Upgrade the Eyvan control-plane database")
+    parser.add_argument("revision", nargs="?", default="head", help="Alembic target revision (default: head)")
+    parser.add_argument("--database-url", help="override EYVAN_DATABASE_URL for this invocation")
+    parser.add_argument("--sql", action="store_true", help="print offline SQL instead of applying the migration")
+    args = parser.parse_args(argv)
+    command.upgrade(build_alembic_config(args.database_url), args.revision, sql=args.sql)
 
 
 if __name__ == "__main__":

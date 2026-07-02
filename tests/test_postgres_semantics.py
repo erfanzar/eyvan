@@ -175,6 +175,47 @@ async def test_leadership_transfers_only_after_the_holder_releases(database) -> 
         await follower.release()
 
 
+async def test_leadership_transfers_after_the_holder_backend_is_terminated(database) -> None:
+    """A database interruption releases the old session lock and elects one follower.
+
+    This kills the actual PostgreSQL backend session rather than calling
+    ``release``. It exercises the failure path used when PostgreSQL restarts or
+    a network connection dies: the former holder must discard its dead
+    connection, must not report ownership, and must be able to contend again
+    after the new holder releases.
+    """
+
+    await _migrated(database)
+    holder, follower = PostgresAdvisoryLeader(database), PostgresAdvisoryLeader(database)
+
+    try:
+        assert await holder.acquire() is True
+        assert await follower.acquire() is False
+        assert holder._connection is not None
+        backend_pid = int(await holder._connection.scalar(text("SELECT pg_backend_pid()")))
+
+        async with database.connect() as observer:
+            terminated = bool(
+                await observer.scalar(text("SELECT pg_terminate_backend(:backend_pid)"), {"backend_pid": backend_pid})
+            )
+        assert terminated is True
+
+        follower_acquired = False
+        for _ in range(20):
+            follower_acquired = await follower.acquire()
+            if follower_acquired:
+                break
+            await asyncio.sleep(0.05)
+        assert follower_acquired is True
+        assert await holder.acquire() is False
+
+        await follower.release()
+        assert await holder.acquire() is True
+    finally:
+        await holder.release()
+        await follower.release()
+
+
 async def test_the_holder_reverifies_ownership_rather_than_liveness(database) -> None:
     """``pg_try_advisory_lock`` is re-entrant, so re-calling it proves nothing.
 

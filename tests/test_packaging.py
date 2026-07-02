@@ -116,12 +116,37 @@ def test_migrate_main_upgrades_head_with_env_database_url(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(migrate.command, "upgrade", fake_upgrade)
     monkeypatch.setenv("EYVAN_DATABASE_URL", "postgresql+asyncpg://eyvan:eyvan@db.internal:5432/eyvan")
-    migrate.main()
+    migrate.main([])
     assert len(calls) == 1
     config, revision = calls[0]
     assert revision == "head"
     assert config.get_main_option("sqlalchemy.url") == "postgresql+asyncpg://eyvan:eyvan@db.internal:5432/eyvan"
     assert Path(config.get_main_option("script_location")) == migrate.MIGRATIONS_DIR
+
+
+def test_migrate_help_never_opens_or_changes_a_database(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    called = False
+
+    def fail_upgrade(*_args: tp.Any, **_kwargs: tp.Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(migrate.command, "upgrade", fail_upgrade)
+    with pytest.raises(SystemExit, match="0"):
+        migrate.main(["--help"])
+    assert called is False
+    assert "Upgrade the Eyvan control-plane database" in capsys.readouterr().out
+
+
+def test_migrate_can_render_offline_sql_without_applying(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, bool, str]] = []
+
+    def fake_upgrade(config: tp.Any, revision: str, *, sql: bool) -> None:
+        calls.append((revision, sql, config.get_main_option("sqlalchemy.url")))
+
+    monkeypatch.setattr(migrate.command, "upgrade", fake_upgrade)
+    migrate.main(["--database-url", "postgresql+asyncpg://example/db", "--sql", "0011_quota_grants"])
+    assert calls == [("0011_quota_grants", True, "postgresql+asyncpg://example/db")]
 
 
 def test_dockerfiles_install_from_pinned_requirements() -> None:
