@@ -189,7 +189,7 @@ runtime:                       # fleet defaults
 pools:
   v5p-16:
     label: v5p-16             # optional; must equal the mapping key
-    resources: {CPU: 32, TPU: 8}
+    # CPU, host memory, and TPU count come from the sourced hardware catalog.
     min_workers: 4            # four independent v5p-16 workers stay warm
     max_workers: 0            # unbounded YAML spelling; internally capped at 10,000
     runtime:                   # node override
@@ -206,7 +206,6 @@ pools:
 
   v5p-32:
     label: v5p-32
-    resources: {CPU: 32, TPU: 16}
     min_workers: 8
     max_workers: 0
     provider_options:
@@ -515,10 +514,29 @@ already one worker. One agent in generic `gcp` mode can route both
 Compute Engine and Cloud TPU cells. Mixed fleets can also set `agent_endpoint`
 per pool when projects or VPC boundaries require separate agents.
 
+Known TPU pool names inherit positive per-host CPU, memory, and TPU count from
+`eyvan/capacity/data/accelerator_shapes.yaml`; each catalog entry cites the
+versioned Google Cloud page that establishes those values. A positive explicit
+CPU or memory value is a deliberate schedulable override, while omitted values
+keep the catalog value. Both `resources` and an explicitly supplied
+`allocatable` vector must advertise exactly the catalog accelerator count.
+Unknown TPU shapes and all manually described GPU shapes are intentionally
+allowed only with an explicit complete `resources` vector containing positive
+CPU, `memory_gib`, and the matching accelerator resource; an `allocatable`
+vector, when set, must be complete in the same way.
+Quota/accelerator discovery does not report host RAM, so autoscale skips an
+uncatalogued discovered shape rather than generating a zero-memory pool. After
+upgrading from a build that produced zero-CPU or zero-memory pools, remove or
+replace explicit zero resource overrides and reapply with `eyvan up
+<fleet.yaml>`; for a quota-generated cached fleet, regenerate with `eyvan
+autoscale generate` first or rerun `eyvan up --quota-based --preemptible`.
+`eyvan doctor` names any enabled legacy accelerator pools still needing repair.
+
 `v5p-8` is a built-in Compute Engine-managed TPU profile. The operator supplies
-the public TPU shape, four-chip resource vector, and worker bootstrap
-identity; Eyvan derives `ct5p-hightpu-4t`, the TPU image, integrated accelerator
-metadata, Spot provisioning, terminate-on-maintenance, and delete-on-preemption:
+the public TPU shape and worker bootstrap identity; Eyvan derives its sourced
+per-host CPU and memory, four-chip resource vector, `ct5p-hightpu-4t`, the TPU
+image, integrated accelerator metadata, Spot provisioning,
+terminate-on-maintenance, and delete-on-preemption:
 
 ```yaml
 provider:
@@ -532,8 +550,6 @@ capacity_class: spot
 
 pools:
   v5p-8:
-    resources:
-      TPU: 4
     min_workers: 0
     max_workers: 1
     agent_endpoint: https://eyvan-agent.example.com

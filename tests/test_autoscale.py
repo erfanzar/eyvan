@@ -71,7 +71,7 @@ def test_generator_creates_one_complete_spot_worker_pool_with_no_slice_knobs() -
         "capacity_class": "spot",
         "max_workers": 0,
         "min_workers": 4,
-        "resources": {"CPU": 32, "TPU": 8},
+        "resources": {"CPU": 208, "memory_gib": 448, "TPU": 8},
         "provider_options": {
             "bootstrap_egress": "public-internet",
         },
@@ -431,26 +431,42 @@ def test_profile_selection_accepts_generation_filters_and_rejects_unknown_profil
         select_profiles(generations=("v7",))
 
 
-def test_dynamic_profile_factory_supports_native_tpu_families_without_a_fixed_catalog() -> None:
-    assert tpu_profile_from_accelerator_type("v5p-512") == TpuProfile("v5p-512", cpu=32, tpu=256)
-    assert tpu_profile_from_accelerator_type("v6e-64") == TpuProfile("v6e-64", cpu=32, tpu=64)
-    assert tpu_profile_from_accelerator_type("v5litepod-8") is not None
+def test_dynamic_profile_factory_skips_types_without_authoritative_host_resources() -> None:
+    assert tpu_profile_from_accelerator_type("v5p-512") is None
+    assert tpu_profile_from_accelerator_type("v6e-64") is None
+    assert tpu_profile_from_accelerator_type("v5litepod-8") is None
     assert tpu_profile_from_accelerator_type("v5p-8") is None
     assert tpu_profile_from_accelerator_type("v7-64") is None
 
 
+def test_an_explicit_unknown_profile_with_memory_can_still_be_compiled() -> None:
+    """Manual host resources are the intentional escape hatch for new hardware."""
+
+    profile = TpuProfile("v5p-512", cpu=96, memory_gib=384, tpu=256)
+    generated = generate_autoscale_config(
+        AutoscaleRequest(project="project-a", zone="us-east5-a", profile=profile, fleet_prefix="research")
+    )
+
+    assert _pool_document(generated.document, "v5p-512")["resources"] == {
+        "CPU": 96,
+        "memory_gib": 384,
+        "TPU": 256,
+    }
+    assert generated.config.pool_payloads()[0]["capacity"]["memory_gib"] == 384
+
+
 def test_zone_generator_groups_types_and_records_shared_generation_quota_without_duplicate_caps() -> None:
     v5p_16 = tpu_profile_from_accelerator_type("v5p-16")
-    v5p_512 = tpu_profile_from_accelerator_type("v5p-512")
-    v6e_64 = tpu_profile_from_accelerator_type("v6e-64")
+    v5p_32 = tpu_profile_from_accelerator_type("v5p-32")
+    v6e_16 = tpu_profile_from_accelerator_type("v6e-16")
     assert v5p_16 is not None
-    assert v5p_512 is not None
-    assert v6e_64 is not None
+    assert v5p_32 is not None
+    assert v6e_16 is not None
     generated = generate_zone_autoscale_config(
         AutoscaleZoneRequest(
             project="project-a",
             zone="us-central1-a",
-            profiles=(v6e_64, v5p_512, v5p_16),
+            profiles=(v6e_16, v5p_32, v5p_16),
             fleet_prefix="research",
         ),
         quotas=(
@@ -458,10 +474,10 @@ def test_zone_generator_groups_types_and_records_shared_generation_quota_without
                 "us-central1-a", "v5p-16", "v5p", 1024, source_metric="tpu-v5p-preemptible", available_tpus=1024
             ),
             QuotaSnapshot(
-                "us-central1-a", "v5p-512", "v5p", 1024, source_metric="tpu-v5p-preemptible", available_tpus=1024
+                "us-central1-a", "v5p-32", "v5p", 1024, source_metric="tpu-v5p-preemptible", available_tpus=1024
             ),
             QuotaSnapshot(
-                "us-central1-a", "v6e-64", "v6e", 512, source_metric="tpu-v6e-preemptible", available_tpus=512
+                "us-central1-a", "v6e-16", "v6e", 512, source_metric="tpu-v6e-preemptible", available_tpus=512
             ),
         ),
     )
@@ -469,19 +485,19 @@ def test_zone_generator_groups_types_and_records_shared_generation_quota_without
     assert generated.fleet_name == "research-us-central1-a"
     generated_pools = _json_object(generated.document["pools"])
     v5p_16_pool = _json_object(generated_pools["v5p-16"])
-    v5p_512_pool = _json_object(generated_pools["v5p-512"])
-    v6e_64_pool = _json_object(generated_pools["v6e-64"])
-    assert sorted(generated_pools) == ["v5p-16", "v5p-512", "v6e-64"]
+    v5p_32_pool = _json_object(generated_pools["v5p-32"])
+    v6e_16_pool = _json_object(generated_pools["v6e-16"])
+    assert sorted(generated_pools) == ["v5p-16", "v5p-32", "v6e-16"]
     assert v5p_16_pool["max_workers"] == 0
-    assert v5p_512_pool["max_workers"] == 0
-    assert v5p_512_pool["resources"] == {"CPU": 32, "TPU": 256}
+    assert v5p_32_pool["max_workers"] == 0
+    assert v5p_32_pool["resources"] == {"CPU": 208, "memory_gib": 448, "TPU": 16}
     assert v5p_16_pool.get("quota_group") == "gcp-tpu-spot:project-a:us-central1-a:v5p"
     assert v5p_16_pool.get("quota_limit") == 1024
     assert v5p_16_pool.get("quota_units_per_cell") == 16
-    assert v5p_512_pool.get("quota_units_per_cell") == 512
-    assert v6e_64_pool["max_workers"] == 8
-    assert v6e_64_pool["resources"] == {"CPU": 32, "TPU": 64}
-    assert v6e_64_pool.get("quota_group") == "gcp-tpu-spot:project-a:us-central1-a:v6e"
+    assert v5p_32_pool.get("quota_units_per_cell") == 32
+    assert v6e_16_pool["max_workers"] == 32
+    assert v6e_16_pool["resources"] == {"CPU": 180, "memory_gib": 720, "TPU": 16}
+    assert v6e_16_pool.get("quota_group") == "gcp-tpu-spot:project-a:us-central1-a:v6e"
     assert [(quota.generation, quota.quota_tpus, quota.shared) for quota in generated.generation_quotas] == [
         ("v5p", 1024, True),
         ("v6e", 512, False),
@@ -559,15 +575,15 @@ def test_cache_hides_legacy_profile_entries_after_a_zone_config_replaces_the_zon
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
     cache.store(generate_autoscale_config(_request()))
     v5p_16 = tpu_profile_from_accelerator_type("v5p-16")
-    v6e_64 = tpu_profile_from_accelerator_type("v6e-64")
+    v6e_16 = tpu_profile_from_accelerator_type("v6e-16")
     assert v5p_16 is not None
-    assert v6e_64 is not None
+    assert v6e_16 is not None
     cache.store(
         generate_zone_autoscale_config(
             AutoscaleZoneRequest(
                 project="project-a",
                 zone="us-east5-a",
-                profiles=(v5p_16, v6e_64),
+                profiles=(v5p_16, v6e_16),
                 fleet_prefix="research",
             )
         )
@@ -577,7 +593,7 @@ def test_cache_hides_legacy_profile_entries_after_a_zone_config_replaces_the_zon
 
     assert [entry.config.name for entry in entries] == ["research-us-east5-a"]
     rendered_pools = _json_array(entries[0].as_dict()["pools"])
-    assert sorted(_json_object(entry)["accelerator_type"] for entry in rendered_pools) == ["v5p-16", "v6e-64"]
+    assert sorted(_json_object(entry)["accelerator_type"] for entry in rendered_pools) == ["v5p-16", "v6e-16"]
 
 
 def test_long_fleet_prefix_uses_a_stable_collision_resistant_name() -> None:

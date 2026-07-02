@@ -325,8 +325,8 @@ def test_gcp_profile_daemon_routes_omitted_pool_agents_to_its_supervised_local_a
         "provider_project": "eyvan-project",
         "region": "us-central1",
         "zone": "us-central1-c",
-        "capacity": {"tpu": 16},
-        "allocatable": {"tpu": 16},
+        "capacity": {"cpu": 180, "memory_gib": 720, "tpu": 16},
+        "allocatable": {"cpu": 180, "memory_gib": 720, "tpu": 16},
         "accelerator_type": "v6e-16",
         "capacity_class": "spot",
         "executor": "eyvan-native",
@@ -504,8 +504,8 @@ def test_pool_run_api_derives_infrastructure_and_forbids_overrides() -> None:
                     "provider_project": "project-a",
                     "region": "us-east5",
                     "zone": "us-east5-a",
-                    "capacity": {"cpu": 0, "memory_gib": 0, "tpu": 8},
-                    "allocatable": {"cpu": 0, "memory_gib": 0, "tpu": 8},
+                    "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 4},
+                    "allocatable": {"cpu": 208, "memory_gib": 448, "tpu": 4},
                     "accelerator_type": "v5p-8",
                     "capacity_class": "spot",
                     "executor": "native-local",
@@ -531,7 +531,13 @@ def test_pool_run_api_derives_infrastructure_and_forbids_overrides() -> None:
 
     assert submitted.status_code == 201
     spec = submitted.json()["spec"]
-    assert spec["gang"]["per_replica"] == {"cpu": 0.0, "memory_gib": 0.0, "gpu": 0, "tpu": 8, "custom": {}}
+    assert spec["gang"]["per_replica"] == {
+        "cpu": 208.0,
+        "memory_gib": 448.0,
+        "gpu": 0,
+        "tpu": 4,
+        "custom": {},
+    }
     assert spec["provider"] == "gcp"
     assert spec["region"] == "us-east5"
     assert spec["accelerator_type"] == "v5p-8"
@@ -577,8 +583,8 @@ def test_capacity_endpoint_lists_enabled_pools_and_filters_by_shape() -> None:
                     "provider_project": "project-a",
                     "region": "us-east5",
                     "zone": "us-east5-a",
-                    "capacity": {"tpu": 8},
-                    "allocatable": {"tpu": 8},
+                    "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 4},
+                    "allocatable": {"cpu": 208, "memory_gib": 448, "tpu": 4},
                     "accelerator_type": "v5p-8",
                     "capacity_class": "spot",
                     "executor": "native-local",
@@ -595,8 +601,8 @@ def test_capacity_endpoint_lists_enabled_pools_and_filters_by_shape() -> None:
                     "provider_project": "project-a",
                     "region": "us-central1",
                     "zone": "us-central1-c",
-                    "capacity": {"tpu": 16},
-                    "allocatable": {"tpu": 16},
+                    "capacity": {"cpu": 180, "memory_gib": 720, "tpu": 16},
+                    "allocatable": {"cpu": 180, "memory_gib": 720, "tpu": 16},
                     "accelerator_type": "v6e-16",
                     "capacity_class": "on-demand",
                     "executor": "native-local",
@@ -717,8 +723,8 @@ def test_fleet_api_resolves_the_platform_default_agent_for_omitted_endpoint(tmp_
                     "provider_project": "project-a",
                     "region": "us-east5",
                     "zone": "us-east5-a",
-                    "capacity": {"tpu": 8},
-                    "allocatable": {"tpu": 8},
+                    "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 4},
+                    "allocatable": {"cpu": 208, "memory_gib": 448, "tpu": 4},
                     "accelerator_type": "v5p-8",
                     "capacity_class": "spot",
                     "executor": "eyvan-native",
@@ -745,8 +751,8 @@ def test_fleet_api_defaults_local_development_agent_but_rejects_missing_remote_r
                 "provider_project": "project-a",
                 "region": "us-east5",
                 "zone": "us-east5-a",
-                "capacity": {"tpu": 8},
-                "allocatable": {"tpu": 8},
+                "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 4},
+                "allocatable": {"cpu": 208, "memory_gib": 448, "tpu": 4},
                 "accelerator_type": "v5p-8",
                 "capacity_class": "spot",
                 "executor": "eyvan-native",
@@ -955,8 +961,8 @@ def test_pool_callable_api_selects_an_atomic_tpu_worker_cell_and_preserves_idemp
                     "provider_project": "project-a",
                     "region": "us-east5",
                     "zone": "us-east5-a",
-                    "capacity": {"tpu": 8},
-                    "allocatable": {"tpu": 8},
+                    "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 4},
+                    "allocatable": {"cpu": 208, "memory_gib": 448, "tpu": 4},
                     "accelerator_type": "v5p-8",
                     "capacity_class": "spot",
                     "executor": "eyvan-native",
@@ -1000,7 +1006,7 @@ def test_pool_callable_api_selects_an_atomic_tpu_worker_cell_and_preserves_idemp
     }
     assert spec["gang"] == {
         "replicas": 1,
-        "per_replica": {"cpu": 0.0, "memory_gib": 0.0, "gpu": 0, "tpu": 8, "custom": {}},
+        "per_replica": {"cpu": 208.0, "memory_gib": 448.0, "gpu": 0, "tpu": 4, "custom": {}},
         "required_topology": {"fabric": "ici"},
     }
     assert spec["accelerator_type"] == "v5p-8"
@@ -1026,7 +1032,7 @@ def test_pool_callable_api_selects_an_atomic_tpu_worker_cell_and_preserves_idemp
     assert two_pod_spec["cell_group_count"] == 1
     assert two_pod_spec["worker_count"] == 2
     assert two_pod_spec["worker_resource_scope"] == "per_worker"
-    assert two_pod_spec["gang"]["per_replica"]["tpu"] == 8
+    assert two_pod_spec["gang"]["per_replica"]["tpu"] == 4
     assert two_pod_spec["required_labels"]["eyvan_worker_count"] == "2"
 
     missing_pool = client.post(
@@ -1107,6 +1113,81 @@ def test_rbac_and_quota_crud() -> None:
     assert deleted.status_code == 204
 
 
+@pytest.mark.parametrize("boundary", ["pool", "cell"])
+def test_direct_capacity_api_rejects_catalog_accelerator_kind_bypass(boundary: str) -> None:
+    """Both durable HTTP writes must enforce the shared catalog contract."""
+
+    common = {
+        "provider": "gcp",
+        "capacity_backend": "gcp-tpu",
+        "provider_project": "gcp-project-a",
+        "region": "us-east5",
+        "zone": "us-east5-a",
+        "capacity": {"cpu": 64, "memory_gib": 256, "gpu": 1},
+        "allocatable": {"cpu": 64, "memory_gib": 256, "gpu": 1},
+        "accelerator_type": "v5p-16",
+    }
+    if boundary == "pool":
+        path = "/api/v1/capacity-pools"
+        payload = {
+            **common,
+            "id": "research-v5p-16",
+            "fleet_name": "research",
+            "node_type": "v5p-16",
+            "agent_endpoint": "http://agent:8090",
+        }
+    else:
+        path = "/api/v1/cells"
+        payload = {**common, "id": "research-v5p-16-0001", "endpoint": "http://worker:8100"}
+    client = TestClient(create_app(settings=EyvanSettings(dev_auth_enabled=True)))
+
+    response = client.post(
+        path,
+        headers={**_headers("fleet_admin"), "Idempotency-Key": f"invalid-{boundary}"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert "is a tpu type" in response.text
+    assert "advertise gpu" in response.text
+
+
+@pytest.mark.parametrize("boundary", ["pool", "cell"])
+def test_direct_capacity_api_rejects_gcp_backend_with_non_gcp_provider(boundary: str) -> None:
+    """Changing an informational-looking label cannot bypass the selected GCP driver contract."""
+
+    common = {
+        "provider": "local",
+        "capacity_backend": "gcp-tpu",
+        "region": "local",
+        "capacity": {"cpu": 64, "memory_gib": 256, "tpu": 999},
+        "allocatable": {"cpu": 64, "memory_gib": 256, "tpu": 999},
+        "accelerator_type": "v5p-16",
+    }
+    if boundary == "pool":
+        path = "/api/v1/capacity-pools"
+        payload = {
+            **common,
+            "id": "research-v5p-16",
+            "fleet_name": "research",
+            "node_type": "v5p-16",
+            "agent_endpoint": "http://agent:8090",
+        }
+    else:
+        path = "/api/v1/cells"
+        payload = {**common, "id": "research-v5p-16-0001", "endpoint": "http://worker:8100"}
+    client = TestClient(create_app(settings=EyvanSettings(dev_auth_enabled=True)))
+
+    response = client.post(
+        path,
+        headers={**_headers("fleet_admin"), "Idempotency-Key": f"provider-backend-{boundary}"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert "requires provider 'gcp'" in response.text
+
+
 def test_api_cell_topology_reaches_global_scheduler() -> None:
     repository = InMemoryRepository()
     app = create_app(settings=EyvanSettings(dev_auth_enabled=True), repository=repository)
@@ -1120,8 +1201,8 @@ def test_api_cell_topology_reaches_global_scheduler() -> None:
             "provider_project": "gcp-project-a",
             "region": "us-central2",
             "zone": "us-central2-b",
-            "capacity": {"cpu": 0, "memory_gib": 0, "tpu": 8},
-            "allocatable": {"cpu": 0, "memory_gib": 0, "tpu": 8},
+            "capacity": {"cpu": 360, "memory_gib": 1440, "tpu": 8},
+            "allocatable": {"cpu": 360, "memory_gib": 1440, "tpu": 8},
             "accelerator_type": "v6e-8",
             "labels": {"team": "ml"},
             "topology": {"slice": "single-slice"},
@@ -1201,6 +1282,7 @@ def test_fleet_api_atomically_applies_disables_and_reports_capacity_pools() -> N
             "zone": "us-central1-a",
             "capacity": {"cpu": 8, "memory_gib": 32, "gpu": int(is_gpu)},
             "allocatable": {"cpu": 8, "memory_gib": 32, "gpu": int(is_gpu)},
+            "accelerator_type": "nvidia-l4" if is_gpu else "cpu",
             "executor": "native-local",
             "agent_endpoint": "http://agent:8090",
             "provider_options": {

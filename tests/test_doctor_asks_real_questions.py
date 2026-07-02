@@ -320,7 +320,7 @@ def _fleet_with_pools(pools: list[dict]) -> tp.Callable[[str], tp.Any]:
     return handler
 
 
-def _pool(pool_id: str, *, memory_gib: float, enabled: bool = True) -> dict:
+def _pool(pool_id: str, *, cpu: float = 32.0, memory_gib: float, enabled: bool = True) -> dict:
     return {
         "id": pool_id,
         "fleet_name": "research",
@@ -328,20 +328,18 @@ def _pool(pool_id: str, *, memory_gib: float, enabled: bool = True) -> dict:
         "provider": "local",
         "region": "local",
         "enabled": enabled,
-        "capacity": {"cpu": 32.0, "memory_gib": memory_gib, "tpu": 8},
-        "allocatable": {"cpu": 32.0, "memory_gib": memory_gib, "tpu": 8},
+        "capacity": {"cpu": cpu, "memory_gib": memory_gib, "tpu": 8},
+        "allocatable": {"cpu": cpu, "memory_gib": memory_gib, "tpu": 8},
         "agent_endpoint": "http://agent:8090",
     }
 
 
 def test_a_pool_that_advertises_no_memory_is_reported() -> None:
-    """Found by running P1.
+    """Legacy rows stay visible and direct operators to the actual repair.
 
-    The hardware catalog records `host_memory_gib` for no shape, so a pool built
-    from it -- which is what omitting `resources:` from fleet YAML now does --
-    comes up with zero memory. `eyvan workload submit` defaults to 1 GiB, so the
-    default submit can never place there and answers `insufficient_capacity`:
-    true, and useless to whoever did not write the config.
+    New catalog and API paths reject zero memory, but hiding an old durable row
+    would make it impossible for doctor to explain why the default 1 GiB
+    workload still cannot place after a binary upgrade.
     """
 
     client = _RecordingClient(_fleet_with_pools([_pool("research/v5p", memory_gib=0.0)]))
@@ -351,7 +349,25 @@ def test_a_pool_that_advertises_no_memory_is_reported() -> None:
 
     assert check.status is CheckStatus.WARN
     assert "research/v5p" in check.detail
-    assert check.remedy and "--memory-gib 0" in check.remedy
+    assert "capacity.memory_gib" in check.detail
+    assert check.remedy and "remove explicit zero" in check.remedy
+    assert "eyvan up <fleet.yaml>" in check.remedy
+    assert "eyvan autoscale generate" in check.remedy
+    assert "quota/catalog cache is regenerated" in check.remedy
+    assert "--memory-gib 0" not in check.remedy
+
+
+def test_an_accelerator_pool_with_zero_cpu_and_positive_memory_is_reported() -> None:
+    """Accelerator count and RAM do not make a zero-CPU host schedulable."""
+
+    client = _RecordingClient(_fleet_with_pools([_pool("research/v5p", cpu=0.0, memory_gib=448.0)]))
+
+    report = DoctorCommandService(_session(client)).report()
+    check = next(c for c in report.checks if c.name == "pool-schedulability")
+
+    assert check.status is CheckStatus.WARN
+    assert "research/v5p (capacity.cpu, allocatable.cpu)" in check.detail
+    assert check.remedy and "remove explicit zero" in check.remedy
 
 
 def test_a_pool_with_memory_passes() -> None:
@@ -368,6 +384,20 @@ def test_a_disabled_pool_is_not_reported() -> None:
     """A pool nobody can submit to cannot be the reason a submission fails."""
 
     client = _RecordingClient(_fleet_with_pools([_pool("research/old", memory_gib=0.0, enabled=False)]))
+
+    report = DoctorCommandService(_session(client)).report()
+
+    assert next(c for c in report.checks if c.name == "pool-schedulability").status is CheckStatus.PASS
+
+
+def test_a_cpu_only_pool_is_outside_the_accelerator_repair_check() -> None:
+    """This migration warning must not claim every legacy CPU pool is catalog-backed."""
+
+    pool = _pool("research/cpu", cpu=0.0, memory_gib=0.0)
+    pool["node_type"] = "cpu"
+    pool["capacity"] = {"cpu": 0.0, "memory_gib": 0.0}
+    pool["allocatable"] = {"cpu": 0.0, "memory_gib": 0.0}
+    client = _RecordingClient(_fleet_with_pools([pool]))
 
     report = DoctorCommandService(_session(client)).report()
 

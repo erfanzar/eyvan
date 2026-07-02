@@ -22,9 +22,7 @@ runtime:
 pools:
   v5p-16:
     label: v5p-16
-    resources:
-      CPU: 32
-      TPU: 8
+    # Per-host CPU, memory, and TPU count come from the sourced catalog.
     min_workers: 0
     max_workers: 2
     runtime:

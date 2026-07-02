@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_backend_agent_family
-from eyvan.capacity.hardware_catalog import shape_for
+from eyvan.capacity.hardware_catalog import shape_for, validate_accelerator_write_boundary
 from eyvan.records import (
     CanonicalCapacityClass,
     CapacityClass,
@@ -130,30 +130,30 @@ def _pool_kind_from_resources(value: tp.Mapping[str, JsonValue]) -> str | None:
     return "cpu" if "cpu" in resources else None
 
 
-def _apply_catalog_shape(pool: JsonObject, *, name: str) -> None:
-    """Fill in a known accelerator's resources, or refuse a contradiction.
+def _apply_catalog_shape(pool: JsonObject, *, accelerator_type: str) -> None:
+    """Fill every omitted admission resource for a known accelerator shape.
 
     A public pool is keyed by its accelerator type, so the shape is already
-    stated -- writing ``resources:`` underneath restates it, and every fleet YAML
-    in this repository restates it identically. Deriving it makes the block
-    optional; checking it when present is the part that catches the mistake,
-    client-side, before any API call.
+    stated. An explicit positive CPU or memory value remains an intentional
+    schedulable override; omitted values inherit the provider-sourced catalog.
+    TPU count itself is a shape invariant and is checked later by
+    ``TpuNodeType.validate_tpu_resources``.
 
-    A declared block that *contradicts* the catalog is refused by
-    ``TpuNodeType.validate_tpu_resources``, which is the single place that check
-    now lives -- it sees legacy node types too, and this function does not.
-
-    Silence for an unknown type is deliberate. The catalog describes what this
-    build can size, not what a provider can run, and refusing an operator's
-    hand-written pool because Eyvan has not been taught its shape would make the
-    catalog a gate on hardware rather than a convenience.
+    Silence for an unknown type is deliberate only at this normalization step.
+    The typed node validator then requires a complete positive manual resource
+    vector. That keeps new hardware usable without turning a provider-discovered
+    name into a zero-memory schedulable pool.
     """
 
-    shape = shape_for(name)
+    shape = shape_for(accelerator_type)
     if shape is None or shape.kind != "tpu":
         return
-    if "resources" not in pool:
-        pool["resources"] = {"cpu": shape.host_cpu, "tpu": shape.schedulable_tpu}
+    resources = pool.setdefault("resources", {})
+    if not is_json_object(resources):
+        return
+    resources.setdefault("cpu", shape.host_cpu)
+    resources.setdefault("memory_gib", shape.host_memory_gib)
+    resources.setdefault("tpu", shape.schedulable_tpu)
 
 
 def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
@@ -182,7 +182,7 @@ def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
             raise ValueError(f"pool {name!r} cannot set provider_options.node_prefix for a one-worker pool")
         pool["provider_options"] = provider_options
 
-    _apply_catalog_shape(pool, name=name)
+    _apply_catalog_shape(pool, accelerator_type=name)
 
     kind = pool.get("kind")
     if isinstance(kind, str):
@@ -213,6 +213,8 @@ def _normalize_legacy_node_type(name: str, value: JsonValue) -> JsonValue:
             raise ValueError(
                 f"legacy node_types.{name!r}.slices must be 1; migrate multi-slice capacity to independent pools"
             )
+    if node_type.get("kind") == "tpu" and isinstance(accelerator_type := node_type.get("accelerator_type"), str):
+        _apply_catalog_shape(node_type, accelerator_type=accelerator_type)
     provider_options = node_type.get("provider_options")
     if is_json_object(provider_options):
         provider_options = dict(provider_options)
@@ -333,6 +335,16 @@ class NodeTypeBase(FleetConfigModel):
                 stacklevel=2,
             )
 
+    def _validate_host_admission_resources(self, *, kind: str) -> None:
+        """Require positive CPU and memory on every schedulable host vector."""
+
+        vectors = (("resources", self.resources), ("allocatable", self.allocatable or self.resources))
+        for field_name, resources in vectors:
+            if resources.cpu <= 0:
+                raise ValueError(f"{kind} node types require {field_name}.cpu > 0")
+            if resources.memory_gib <= 0:
+                raise ValueError(f"{kind} node types require {field_name}.memory_gib > 0")
+
     @model_validator(mode="before")
     @classmethod
     def normalize_worker_scaling_aliases(cls, value: tp.Any) -> tp.Any:
@@ -447,8 +459,7 @@ class CpuNodeType(NodeTypeBase):
 
     @model_validator(mode="after")
     def validate_cpu_resources(self) -> CpuNodeType:
-        if self.resources.cpu <= 0:
-            raise ValueError("CPU node types require resources.cpu > 0")
+        self._validate_host_admission_resources(kind="CPU")
         if self.resources.gpu or self.resources.tpu:
             raise ValueError("CPU node types cannot advertise GPU or TPU resources")
         return self
@@ -479,9 +490,12 @@ class GpuNodeType(NodeTypeBase):
 
     @model_validator(mode="after")
     def validate_gpu_resources(self) -> GpuNodeType:
+        self._validate_host_admission_resources(kind="GPU")
         if self.resources.gpu <= 0:
             raise ValueError("GPU node types require resources.gpu > 0")
-        if self.resources.tpu:
+        if self.allocatable is not None and self.allocatable.gpu <= 0:
+            raise ValueError("GPU node types require allocatable.gpu > 0 when allocatable is set")
+        if self.resources.tpu or (self.allocatable is not None and self.allocatable.tpu):
             raise ValueError("GPU node types cannot advertise TPU resources")
         return self
 
@@ -532,24 +546,42 @@ class TpuNodeType(NodeTypeBase):
 
     @model_validator(mode="after")
     def validate_tpu_resources(self) -> TpuNodeType:
+        shape = shape_for(self.accelerator_type)
+        allocatable = self.allocatable or self.resources
+        if shape is None and any(
+            value <= 0
+            for value in (
+                self.resources.cpu,
+                self.resources.memory_gib,
+                allocatable.cpu,
+                allocatable.memory_gib,
+            )
+        ):
+            raise ValueError(
+                f"unknown TPU shape {self.accelerator_type!r} requires explicit positive CPU and memory_gib "
+                "in resources and allocatable when allocatable is set"
+            )
+        self._validate_host_admission_resources(kind="TPU")
         if self.resources.tpu <= 0:
             raise ValueError("TPU node types require resources.tpu > 0")
-        if self.resources.gpu:
+        if self.allocatable is not None and self.allocatable.tpu <= 0:
+            raise ValueError("TPU node types require allocatable.tpu > 0 when allocatable is set")
+        if self.resources.gpu or (self.allocatable is not None and self.allocatable.gpu):
             raise ValueError("TPU node types cannot advertise GPU resources")
         configured_nodes = self.provider_options.get("node_count", 1)
         if isinstance(configured_nodes, bool) or not isinstance(configured_nodes, int) or configured_nodes != 1:
             raise ValueError("TPU fleet workers cannot set provider_options.node_count above one")
         if self.provider_options.get("node_prefix") is not None:
             raise ValueError("TPU fleet workers cannot set provider_options.node_prefix")
-        # One check against the catalog, replacing two dictionary lookups that
-        # asserted the same thing about different subsets of types. A type the
-        # catalog does not describe is left alone: this validates shapes Eyvan
-        # knows, it does not gate hardware on Eyvan knowing it.
-        shape = shape_for(self.accelerator_type)
-        if shape is not None and self.resources.tpu != shape.schedulable_tpu:
-            raise ValueError(
-                f"TPU node type {self.accelerator_type!r} requires resources.tpu == {shape.schedulable_tpu}"
-            )
+        # A known shape fixes accelerator count. An unknown type is intentionally
+        # allowed only after the complete manual host vector above has passed;
+        # that keeps the catalog extensible without guessing discovered hardware.
+        if shape is not None:
+            for field_name, resources in (("resources", self.resources), ("allocatable", allocatable)):
+                if resources.tpu != shape.schedulable_tpu:
+                    raise ValueError(
+                        f"TPU node type {self.accelerator_type!r} requires {field_name}.tpu == {shape.schedulable_tpu}"
+                    )
         return self
 
 
@@ -635,6 +667,14 @@ class EyvanFleetConfig(FleetConfigModel):
             executor = canonical_execution_backend(node_type.executor or self.executor)
             capacity_backend = (node_type.capacity_backend or node_type.default_capacity_backend).strip().lower()
             capacity_backend = capacity_backend.replace("_", "-")
+            validate_accelerator_write_boundary(
+                provider=self.provider.type,
+                capacity_backend=capacity_backend,
+                accelerator_type=node_type.cell_accelerator_type,
+                capacity=node_type.resources,
+                allocatable=node_type.allocatable or node_type.resources,
+                boundary=f"fleet node type {name!r}",
+            )
             native_legacy_tpu = capacity_backend in {"gcp-tpu", "tpu"} or (
                 capacity_backend == "gcp" and node_type.default_capacity_backend == "gcp-tpu"
             )

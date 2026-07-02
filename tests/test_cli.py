@@ -711,28 +711,15 @@ def test_autoscale_generate_discovers_dynamic_types_and_caches_one_zone_fleet(mo
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert [entry["fleet"] for entry in payload["generated"]] == ["research-us-central1-a"]
-    assert [pool["accelerator_type"] for pool in payload["generated"][0]["pools"]] == [
-        "v5p-16",
-        "v5p-512",
-        "v6e-64",
-    ]
+    assert [pool["accelerator_type"] for pool in payload["generated"][0]["pools"]] == ["v5p-16"]
     assert payload["generated"][0]["generation_quotas"] == [
         {
             "available_tpus": 1024,
             "generation": "v5p",
             "preemptible": True,
             "quota_tpus": 1024,
-            "shared": True,
-            "source_metric": "tpu.googleapis.com/tpu-v5p-preemptible",
-            "zone": "us-central1-a",
-        },
-        {
-            "available_tpus": 512,
-            "generation": "v6e",
-            "preemptible": True,
-            "quota_tpus": 512,
             "shared": False,
-            "source_metric": "tpu.googleapis.com/tpu-v6e-preemptible",
+            "source_metric": "tpu.googleapis.com/tpu-v5p-preemptible",
             "zone": "us-central1-a",
         },
     ]
@@ -744,7 +731,21 @@ def test_autoscale_generate_discovers_dynamic_types_and_caches_one_zone_fleet(mo
             "scope": "generation",
             "type_count": 1,
             "zone": "us-central1-a",
-        }
+        },
+        {
+            "generation": "v5p",
+            "reason": "Eyvan cannot derive a typed queued-resource worker shape",
+            "scope": "generation",
+            "type_count": 1,
+            "zone": "us-central1-a",
+        },
+        {
+            "generation": "v6e",
+            "reason": "Eyvan cannot derive a typed queued-resource worker shape",
+            "scope": "generation",
+            "type_count": 1,
+            "zone": "us-central1-a",
+        },
     ]
     entries = AutoscaleConfigCache(cache_dir).list()
     assert [entry.config.name for entry in entries] == ["research-us-central1-a"]
@@ -784,7 +785,7 @@ def test_autoscale_generate_renders_a_compact_terminal_summary(monkeypatch, tmp_
                 ),
                 TpuQuotaAvailability(
                     zone="us-central1-a",
-                    accelerator_type="v6e-64",
+                    accelerator_type="v6e-16",
                     generation="v6e",
                     quota_tpus=512,
                     available_tpus=512,
@@ -1092,20 +1093,20 @@ def test_up_filters_a_cached_queue_denied_tpu_pool_before_applying(monkeypatch, 
 def test_up_cached_selector_groups_tpu_families_by_zone(monkeypatch, tmp_path) -> None:
     cache_dir = tmp_path / "autoscale"
     v5p_16 = tpu_profile_from_accelerator_type("v5p-16")
-    v5p_512 = tpu_profile_from_accelerator_type("v5p-512")
+    v5p_32 = tpu_profile_from_accelerator_type("v5p-32")
     assert v5p_16 is not None
-    assert v5p_512 is not None
+    assert v5p_32 is not None
     AutoscaleConfigCache(cache_dir).store(
         generate_zone_autoscale_config(
             AutoscaleZoneRequest(
                 project="project-a",
                 zone="us-central1-a",
-                profiles=(v5p_16, v5p_512),
+                profiles=(v5p_16, v5p_32),
                 fleet_prefix="research",
             ),
             quotas=(
                 QuotaSnapshot("us-central1-a", "v5p-16", "v5p", 1024, available_tpus=1024),
-                QuotaSnapshot("us-central1-a", "v5p-512", "v5p", 1024, available_tpus=1024),
+                QuotaSnapshot("us-central1-a", "v5p-32", "v5p", 1024, available_tpus=1024),
             ),
         )
     )
@@ -1275,7 +1276,7 @@ def test_quota_based_up_renders_a_bounded_terminal_summary(monkeypatch, tmp_path
                     preemptible=True,
                     metric="tpu.googleapis.com/tpu-v6e-preemptible",
                 )
-                for accelerator_type in ("v6e-8", "v6e-64")
+                for accelerator_type in ("v6e-8", "v6e-16")
             )
 
     cache_dir = tmp_path / "autoscale"

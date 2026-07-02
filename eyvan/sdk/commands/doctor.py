@@ -19,6 +19,7 @@ deliberately distinct from passing.
 from __future__ import annotations
 
 import ipaddress
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -36,6 +37,37 @@ from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.service.pricing_resolver import audit_price_drift
+
+
+def _positive_resource(document: dict[str, JsonValue], name: str) -> bool:
+    """Return whether a raw API resource field is a positive finite number."""
+
+    value = document.get(name)
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and value > 0
+        and (not isinstance(value, float) or math.isfinite(value))
+    )
+
+
+def _pool_advertises_accelerator(pool: dict[str, JsonValue]) -> bool:
+    """Recognize accelerator pools without requiring legacy rows to revalidate."""
+
+    accelerator_type = pool.get("accelerator_type")
+    if isinstance(accelerator_type, str) and accelerator_type.strip().lower() not in {"", "cpu"}:
+        return True
+    capacity_backend = pool.get("capacity_backend")
+    if isinstance(capacity_backend, str) and capacity_backend.strip().lower().replace("_", "-") in {
+        "gcp-tpu",
+        "tpu",
+    }:
+        return True
+    for field_name in ("capacity", "allocatable"):
+        resources = pool.get(field_name)
+        if is_json_object(resources) and any(_positive_resource(resources, kind) for kind in ("gpu", "tpu")):
+            return True
+    return False
 
 
 class CheckStatus(str, Enum):
@@ -348,19 +380,12 @@ class DoctorCommandService:
         )
 
     def _unschedulable_pool_check(self) -> CheckResult:
-        """Report a pool that advertises no memory, and so can never be placed on.
+        """Report enabled legacy accelerator pools with no schedulable host vector.
 
-        Found by running P1. The hardware catalog records ``host_memory_gib`` for
-        no shape, so a pool whose resources come from the catalog -- which is
-        exactly what omitting ``resources:`` from fleet YAML now does -- comes up
-        with ``memory_gib: 0``. ``eyvan workload submit`` defaults to 1 GiB, so
-        the default submit can never place on it and reports
-        ``insufficient_capacity``: true, and useless.
-
-        A warning rather than a failure. A pool that genuinely wants to schedule
-        on TPU alone is a coherent configuration, and the operator who wrote it
-        should not be told their fleet is broken. The one who did not write it,
-        and cannot see why nothing schedules, is who this is for.
+        Catalog and request validation prevent new rows from acquiring this
+        state. Durable rows remain readable so this check can name both missing
+        admission dimensions: the documented default workload needs positive CPU
+        and memory, not merely an accelerator count.
         """
 
         name = "pool-schedulability"
@@ -374,22 +399,38 @@ class DoctorCommandService:
             raise
         if not isinstance(pools, list):
             return CheckResult(name, CheckStatus.WARN, "control plane returned an unexpected shape")
-        memoryless = sorted(
-            str(pool.get("id"))
-            for pool in pools
-            if is_json_object(pool)
-            and pool.get("enabled")
-            and is_json_object(allocatable := pool.get("allocatable", {}))
-            and not float(allocatable.get("memory_gib") or 0)
-        )
-        if not memoryless:
-            return CheckResult(name, CheckStatus.PASS, "every enabled pool advertises memory")
+
+        unschedulable: list[tuple[str, tuple[str, ...]]] = []
+        for pool in pools:
+            if not is_json_object(pool) or pool.get("enabled") is not True or not _pool_advertises_accelerator(pool):
+                continue
+            invalid: list[str] = []
+            for field_name in ("capacity", "allocatable"):
+                resources = pool.get(field_name)
+                for resource_name in ("cpu", "memory_gib"):
+                    if not is_json_object(resources) or not _positive_resource(resources, resource_name):
+                        invalid.append(f"{field_name}.{resource_name}")
+            if invalid:
+                unschedulable.append((str(pool.get("id")), tuple(invalid)))
+        unschedulable.sort(key=lambda finding: finding[0])
+        if not unschedulable:
+            return CheckResult(
+                name,
+                CheckStatus.PASS,
+                "every enabled accelerator pool advertises positive CPU and memory",
+            )
+
+        examples = ", ".join(f"{pool_id} ({', '.join(fields)})" for pool_id, fields in unschedulable[:3])
         return CheckResult(
             name,
             CheckStatus.WARN,
-            f"{len(memoryless)} enabled pool(s) advertise no memory: {', '.join(memoryless[:3])}",
-            "a workload asking for any memory can never place there -- `eyvan workload submit` defaults to "
-            "1 GiB. Set `resources:` in the fleet YAML, or submit with `--memory-gib 0`",
+            f"{len(unschedulable)} enabled accelerator pool(s) have non-positive host CPU or memory: {examples}",
+            "Edit the fleet YAML first: remove explicit zero `resources.cpu`, `resources.memory_gib`, "
+            "`allocatable.cpu`, or `allocatable.memory_gib` overrides for cataloged shapes, or replace them "
+            "with positive host values; unknown shapes require complete manual resource and allocatable vectors. "
+            "Then run `eyvan up <fleet.yaml>`. If this is a quota-generated cached fleet, run "
+            "`eyvan autoscale generate` before `eyvan up`, or rerun `eyvan up --quota-based --preemptible`, "
+            "so the quota/catalog cache is regenerated.",
         )
 
     def _kueue_check(self) -> CheckResult:
