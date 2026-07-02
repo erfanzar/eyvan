@@ -391,6 +391,20 @@ export function computeOverview(
   };
 }
 
+/** Budget for a control-plane read that is answered from its own store. */
+const CONTROL_PLANE_TIMEOUT_MS = 3_500;
+
+/**
+ * Budget for a read the control plane forwards to a worker.
+ *
+ * Logs are fetched from the host that produced them, so the latency is a
+ * network round trip to a TPU VM rather than a database read -- 12s is ordinary
+ * for a live slice. Sharing the control-plane budget meant the workload detail
+ * page timed out on every workload whose logs were remote, which is every
+ * workload that has actually run somewhere.
+ */
+const WORKER_FORWARDED_TIMEOUT_MS = 30_000;
+
 export class EyvanApiClient {
   private readonly org = import.meta.env.VITE_EYVAN_ORG ?? "acme";
   private readonly project = import.meta.env.VITE_EYVAN_PROJECT ?? "research";
@@ -400,9 +414,9 @@ export class EyvanApiClient {
     private readonly forceDemo = isDemoMode(),
   ) {}
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T>(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<T> {
     const controller = new AbortController();
-    const timeout = globalThis.setTimeout(() => controller.abort(), 3500);
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
@@ -432,9 +446,9 @@ export class EyvanApiClient {
     }
   }
 
-  private async requestText(path: string): Promise<string> {
+  private async requestText(path: string, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<string> {
     const controller = new AbortController();
-    const timeout = globalThis.setTimeout(() => controller.abort(), 3500);
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}${path}`, { headers: apiAuthHeaders(), signal: controller.signal });
       if (!response.ok) {
@@ -518,10 +532,20 @@ export class EyvanApiClient {
       ? cloneMock(mockWorkloads)
       : (await this.request<RawWorkload[]>(this.scope("/workloads"), { method: "GET" })).map(mapWorkload);
     const search = filters.search?.toLowerCase();
-    return workloads.filter((workload) =>
-      (!search || workload.name.toLowerCase().includes(search) || workload.id.toLowerCase().includes(search) || workload.user.toLowerCase().includes(search)) &&
-      (!filters.status || workload.status === filters.status) &&
-      (!filters.priority || workload.priority === filters.priority));
+    return workloads
+      .filter((workload) =>
+        (!search || workload.name.toLowerCase().includes(search) || workload.id.toLowerCase().includes(search) || workload.user.toLowerCase().includes(search)) &&
+        (!filters.status || workload.status === filters.status) &&
+        (!filters.priority || workload.priority === filters.priority))
+      // Newest first. The control plane returns insertion order, so a fleet that
+      // has run for a while buried the job you just submitted under every job
+      // you had ever submitted -- and the one you want is almost always the last
+      // one. Ties break on id so the order is stable across polls rather than
+      // shuffling under the reader.
+      .sort((left, right) => {
+        const delta = Date.parse(right.submittedAt) - Date.parse(left.submittedAt);
+        return delta !== 0 && Number.isFinite(delta) ? delta : right.id.localeCompare(left.id);
+      });
   }
 
   async getWorkload(id: string): Promise<WorkloadDetail> {
@@ -533,8 +557,19 @@ export class EyvanApiClient {
     const raw = await this.request<RawWorkload>(`/workloads/${encodeURIComponent(id)}`, { method: "GET" });
     const detail = mapWorkload(raw);
     const [events, logs, progress, leases] = await Promise.all([
-      this.request<RawEvent[]>(this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`), { method: "GET" }),
-      this.requestText(`/workloads/${encodeURIComponent(id)}/logs`),
+      // Also best-effort. The timeline is context; losing it should cost the
+      // timeline, not the page.
+      this.request<RawEvent[]>(this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`), {
+        method: "GET",
+      }).catch(() => [] as RawEvent[]),
+      // Best-effort, and slow on purpose: this is forwarded to the worker. It
+      // used to share the 3.5s control-plane budget *and* sit in this
+      // `Promise.all` with no fallback, so one slow log fetch blanked a page
+      // whose workload, events and progress had all answered in under half a
+      // second. An empty detail page reads as "this workload does not exist".
+      this.requestText(`/workloads/${encodeURIComponent(id)}/logs`, WORKER_FORWARDED_TIMEOUT_MS).catch(
+        (error: unknown) => `logs unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+      ),
       // Progress is best-effort: an older control plane without the endpoint must not break the detail page.
       this.request<RawWorkloadProgress>(`/workloads/${encodeURIComponent(id)}/progress`, { method: "GET" }).catch(() => undefined),
       // Allocation comes from this workload's own leases. It used to be hardcoded

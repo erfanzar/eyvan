@@ -633,3 +633,149 @@ describe("the panels the dashboard never had", () => {
     );
   });
 });
+
+describe("the workload detail page under a slow worker", () => {
+  const raw = {
+    id: "wl-1",
+    org_id: "acme",
+    project_id: "research",
+    state: "running",
+    attempt: 1,
+    created_by: "alice",
+    created_at: "2026-08-07T12:00:00Z",
+    updated_at: "2026-08-07T12:00:00Z",
+    spec: {
+      name: "train",
+      execution: { kind: "command" as const, command: "python train.py" },
+      gang: { replicas: 1, per_replica: { cpu: 1, memory_gib: 1, gpu: 0, tpu: 0, custom: {} }, required_topology: {} },
+      metadata: {},
+      priority_band: "interactive" as const,
+    },
+  };
+
+  const json = (body: unknown) =>
+    new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+  function route(overrides: Record<string, () => Response | Promise<Response>>) {
+    return vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      for (const [fragment, handler] of Object.entries(overrides)) {
+        if (url.includes(fragment)) return handler();
+      }
+      // Shape per endpoint. A catch-all returning the workload made `/leases`
+      // answer with an object, and the failure looked like a code bug.
+      if (url.includes("/leases")) return json([]);
+      if (url.includes("/events")) return json([]);
+      if (url.includes("/logs")) return new Response("log text", { status: 200 });
+      if (url.includes("/progress")) return json({ workload_id: "wl-1", workload_state: "running", phase: "running", request: { cells: 1, workers_per_cell: 1 }, capacity: { ready_workers: 1 } });
+      return json(raw);
+    });
+  }
+
+  it("renders the workload even when the log fetch fails", async () => {
+    // The bug this replaces: `/logs` is forwarded to the worker that produced
+    // them, so on a live slice it takes ~12s against a 3.5s client budget. It sat
+    // in the same `Promise.all` as the workload, its events and its progress --
+    // all of which answered in under half a second -- with no fallback, so the
+    // page rendered "Unable to load Eyvan state" for a workload that existed.
+    vi.stubGlobal(
+      "fetch",
+      route({ "/logs": () => Promise.reject(new Error("Eyvan API request timed out")) }),
+    );
+
+    const detail = await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
+
+    expect(detail.id).toBe("wl-1");
+    expect(detail.name).toBe("train");
+  });
+
+  it("says why the logs are missing rather than showing an empty pane", async () => {
+    // An empty log pane reads as "this job printed nothing", which is a
+    // different and more alarming claim than "we could not fetch them".
+    vi.stubGlobal("fetch", route({ "/logs": () => Promise.reject(new Error("boom")) }));
+
+    const detail = await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
+
+    expect(JSON.stringify(detail.logs)).toContain("logs unavailable");
+  });
+
+  it("survives a failed event fetch too", async () => {
+    // The timeline is context. Losing it should cost the timeline, not the page.
+    vi.stubGlobal("fetch", route({ "/events": () => Promise.reject(new Error("boom")) }));
+
+    const detail = await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
+
+    expect(detail.id).toBe("wl-1");
+  });
+
+  it("gives the worker-forwarded read a longer budget than a control-plane read", async () => {
+    // Not merely "a bigger number": the two reads have different physics. One is
+    // answered from the plane's own store, the other is a network round trip to a
+    // TPU VM.
+    const seen: number[] = [];
+    const original = globalThis.setTimeout;
+    vi.stubGlobal("setTimeout", ((fn: () => void, ms?: number) => {
+      if (typeof ms === "number") seen.push(ms);
+      return original(fn, ms);
+    }) as typeof globalThis.setTimeout);
+    vi.stubGlobal("fetch", route({}));
+
+    await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
+
+    expect(Math.max(...seen)).toBeGreaterThan(Math.min(...seen));
+    expect(Math.max(...seen)).toBeGreaterThanOrEqual(30_000);
+  });
+});
+
+describe("workload ordering", () => {
+  function listOf(...stamps: Array<[string, string]>) {
+    return stamps.map(([id, created]) => ({
+      id,
+      org_id: "acme",
+      project_id: "research",
+      state: "succeeded",
+      attempt: 1,
+      created_by: "alice",
+      created_at: created,
+      updated_at: created,
+      spec: {
+        name: id,
+        execution: { kind: "command" as const, command: "x" },
+        gang: { replicas: 1, per_replica: { cpu: 1, memory_gib: 1, gpu: 0, tpu: 0, custom: {} }, required_topology: {} },
+        metadata: {},
+        priority_band: "interactive" as const,
+      },
+    }));
+  }
+
+  it("lists the newest job first", async () => {
+    // The control plane returns insertion order, so the job you just submitted
+    // was buried under every job you had ever submitted.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(listOf(
+      ["oldest", "2026-08-01T00:00:00Z"],
+      ["newest", "2026-08-07T00:00:00Z"],
+      ["middle", "2026-08-04T00:00:00Z"],
+    )), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    const list = await new EyvanApiClient("/api/v1", false).listWorkloads();
+
+    expect(list.map((w) => w.id)).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("orders identical timestamps deterministically", async () => {
+    // Otherwise the rows shuffle on every poll and the page is unreadable while
+    // a burst of jobs lands in the same second -- which is what a fan-out is.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(listOf(
+      ["wl-a", "2026-08-07T00:00:00Z"],
+      ["wl-c", "2026-08-07T00:00:00Z"],
+      ["wl-b", "2026-08-07T00:00:00Z"],
+    )), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    const client = new EyvanApiClient("/api/v1", false);
+    const first = (await client.listWorkloads()).map((w) => w.id);
+    const second = (await client.listWorkloads()).map((w) => w.id);
+
+    expect(first).toEqual(second);
+    expect(first).toEqual(["wl-c", "wl-b", "wl-a"]);
+  });
+});
