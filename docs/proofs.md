@@ -22,7 +22,29 @@ P2 and P3 stay procedural on purpose: they need a host killed mid-stream and a
 job that submits its own children, and an "automated" verdict over a run whose
 interesting half is manual would be worse than none.
 
-Fleet configs live in the monorepo's `configs/`. All are spot.
+Fleet configs live in the monorepo's `configs/`. GCP inputs are checked in as
+sanitized `*.yaml.in` templates rather than runnable files. Render one to an
+owner-controlled path only after supplying the target project, bucket, and an
+immutable OCI image digest:
+
+```bash
+uv run python scripts/render_eyvan_config.py \
+  configs/eyvan-live-v5p16-pods2-us-east5-a.yaml.in \
+  --output /tmp/eyvan-live-v5p16.yaml \
+  --set GCP_PROJECT_ID=your-project \
+  --set GCS_BUCKET=your-bucket \
+  --set OCI_IMAGE=REGION-docker.pkg.dev/PROJECT/REPOSITORY/IMAGE@sha256:64_HEX_DIGEST
+```
+
+The renderer refuses mutable image tags, unresolved placeholders, unsafe YAML
+characters, and an existing output unless `--force` is explicit. It writes mode
+0600 and never applies the result. Commands below that name a config refer to
+that rendered output, not to the `.in` template. Applying a GCP fleet provisions
+billable resources; obtain operator approval before `eyvan up`, out-of-band host
+failure, `eyvan down`, or any direct live harness. The live Python harnesses also require
+`--confirm-provider-mutations`.
+
+All proof fleets are spot unless a proof explicitly states otherwise.
 
 ## Why these and not a general soak of everything
 
