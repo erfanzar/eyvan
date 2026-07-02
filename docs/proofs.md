@@ -343,7 +343,31 @@ actually pruning.
 Read `artifact_growth` even on a pass: it is the number that says whether
 collection ran at all, and a total alone cannot.
 
-**Run 2026-08-05: a 30-minute soak, exit 0. This is not P8.** 30 observations,
+**In flight since 2026-08-07 03:12 UTC — the real run.** 72 hours against a CPU
+fleet in `us-east5-a` with continuous mixed churn: a short job every 10 minutes
+and a ten-minute job every twelfth. Detached, so it outlives the session that
+started it; the verdict lands in `p8-soak-exit` and the detail in `p8-soak.json`
+around **2026-08-10 03:12 UTC**.
+
+Deviation, stated rather than buried: CPU only. The plan asks for a CPU fleet
+*plus a small TPU fleet*, and a v5p-16 held for 72 hours is a spend of a
+different order than the ~$3 this costs. The TPU half is unproven.
+
+The churn rate was wrong twice before it was right, and both times the mistake
+was the same: pacing against the seconds a job *sleeps* rather than the ~2.5
+minutes it *occupies a cell* once dispatch is counted. The queue grew instead of
+staying flat, which measures backpressure rather than durability and over 72
+hours would have buried the invariants under tens of thousands of pending
+records.
+
+It has already found two things in its first seven hours, both through the
+invariant that was structurally blind until this session: a `workload.cancel`
+stuck failing for six hours -- the same defect as the one that pinned a v5p-16,
+cleared with `eyvan workload-force-finalize` -- and a wording defect in I3's own
+message, which claimed a command "has been processing for" an age measured from
+its creation.
+
+**Earlier, 2026-08-05: a 30-minute soak, exit 0. This is not P8.** 30 observations,
 0 unreachable, no invariant violated once let alone persistently, and no
 over-time finding. 76 workloads churned through a local fleet during it -- short
 jobs every 25s and a three-minute job every tenth -- so the leases, settlement
