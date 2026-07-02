@@ -374,7 +374,16 @@ does not require the local file after creation: `eyvan status research`
 queries the durable server-side aggregate directly. In a terminal it renders a
 compact fleet, worker-pool, shared-quota, and attention summary without platform
 routing fields. Redirected output remains JSON for automation; pass `--json` to
-force the complete server record in a terminal.
+force the complete server record in a terminal. That machine-versus-human
+choice uses the stream's physical TTY state and is not changed by color
+variables.
+
+SDK receipts and command renderers resolve styling consistently. An explicit
+programmatic `force_terminal` value chooses terminal or plain layout first.
+Otherwise `FORCE_COLOR` may promote redirected human output to terminal layout,
+except that `NO_COLOR` wins a conflict and falls back to the stream's physical
+TTY state. `NO_COLOR` always disables ANSI styling, including with
+`force_terminal=True`.
 
 ### Generated TPU autoscale fleets
 

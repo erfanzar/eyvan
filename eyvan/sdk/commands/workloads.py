@@ -37,6 +37,7 @@ from eyvan.sdk.client.requests import pool_workload_request
 from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
+from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.server.api.schemas import (
     BatchSubmitRequest,
     DagNodeRequest,
@@ -310,7 +311,7 @@ class WorkloadCommandService:
         """Write a compact human summary to stderr, leaving JSON stdout unchanged."""
 
         stream = click.get_text_stream("stderr")
-        if not stream.isatty() or not is_json_object(response):
+        if not stream_is_terminal(stream) or not is_json_object(response):
             return
         try:
             explanation = WorkloadExplanation.model_validate(response)

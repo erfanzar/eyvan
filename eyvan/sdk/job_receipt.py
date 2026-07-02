@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import sys
 import typing as tp
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from eyvan._internal.compat import StrEnum
+from eyvan.sdk.terminal import terminal_console
 
 
 class JobLifecycleState(StrEnum):
@@ -136,6 +137,7 @@ class JobTerminalOutput:
         writer: tp.Callable[[str], None] | None = None,
         stream: tp.TextIO | None = None,
         force_terminal: bool | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         if writer is not None and stream is not None:
             raise ValueError("JobTerminalOutput accepts writer or stream, not both")
@@ -143,12 +145,10 @@ class JobTerminalOutput:
         self._console = (
             None
             if writer is not None
-            else Console(
-                file=sys.stderr if stream is None else stream,
-                highlight=False,
-                soft_wrap=True,
+            else terminal_console(
+                sys.stderr if stream is None else stream,
                 force_terminal=force_terminal,
-                color_system="standard" if force_terminal else None,
+                environment=environment,
             )
         )
 

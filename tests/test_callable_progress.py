@@ -33,7 +33,14 @@ from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
 from eyvan.sdk.client.sync import EyvanClient
 from eyvan.sdk.client.transport import EyvanHTTPError
+from eyvan.sdk.job_receipt import JobTerminalOutput
 from eyvan.worker.runtime.callables import dump_callable
+
+
+def _plain_output() -> JobTerminalOutput:
+    """Select the redirected public rendering contract independently of process color variables."""
+
+    return JobTerminalOutput(force_terminal=False, environment={})
 
 
 def _workload(
@@ -145,7 +152,7 @@ def test_callable_submission_prints_durable_job_controls(tmp_path, capsys, tpu: 
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store)
+    submitter = EyvanCallableSubmitter[None](client, store, terminal_output=_plain_output())
 
     job = submitter.submit_callable(
         CallableSubmission(
@@ -200,7 +207,12 @@ def test_callable_submission_does_not_block_an_explicit_target_after_discovery_d
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store, queue_admission_cache=cache)
+    submitter = EyvanCallableSubmitter[None](
+        client,
+        store,
+        terminal_output=_plain_output(),
+        queue_admission_cache=cache,
+    )
 
     job = submitter.submit_callable(
         CallableSubmission(
@@ -274,7 +286,12 @@ def test_callable_result_renders_scale_from_zero_and_provider_diagnostic_once(tm
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
-    submitter = EyvanCallableSubmitter[None](client, store, queue_admission_cache=cache)
+    submitter = EyvanCallableSubmitter[None](
+        client,
+        store,
+        terminal_output=_plain_output(),
+        queue_admission_cache=cache,
+    )
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-v6e-16",
@@ -346,7 +363,12 @@ def test_callable_wait_caches_a_terminal_queue_denial_without_progress_polling(t
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
-    submitter = EyvanCallableSubmitter[None](client, store, queue_admission_cache=cache)
+    submitter = EyvanCallableSubmitter[None](
+        client,
+        store,
+        terminal_output=_plain_output(),
+        queue_admission_cache=cache,
+    )
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-terminal-denial",
@@ -413,6 +435,7 @@ def test_callable_result_preserves_queue_denial_when_local_cache_target_is_inval
     submitter = EyvanCallableSubmitter[None](
         client,
         store,
+        terminal_output=_plain_output(),
         queue_admission_cache=AutoscaleConfigCache(tmp_path / "autoscale"),
     )
     job = submitter.submit_callable(
@@ -455,7 +478,7 @@ def test_callable_result_does_not_hide_progress_authorization_errors(tmp_path, c
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store)
+    submitter = EyvanCallableSubmitter[None](client, store, terminal_output=_plain_output())
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-progress-auth",
@@ -508,7 +531,7 @@ def test_callable_result_uses_the_durable_workload_fallback_when_progress_is_tem
     monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store)
+    submitter = EyvanCallableSubmitter[None](client, store, terminal_output=_plain_output())
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-progress-fallback",
@@ -666,7 +689,7 @@ def test_callable_result_renders_nonterminal_states(
     monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store)
+    submitter = EyvanCallableSubmitter[None](client, store, terminal_output=_plain_output())
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-control-state",
@@ -722,7 +745,7 @@ def test_callable_progress_wait_short_circuits_progress_polling_on_a_terminal_ob
     monkeypatch.setattr("eyvan.sdk.client.sync.time.sleep", lambda _seconds: None)
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     client = EyvanClient(client=raw)
-    submitter = EyvanCallableSubmitter[None](client, store)
+    submitter = EyvanCallableSubmitter[None](client, store, terminal_output=_plain_output())
     job = submitter.submit_callable(
         CallableSubmission(
             invocation_id="call-terminal-observation",

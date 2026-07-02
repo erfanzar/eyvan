@@ -231,6 +231,18 @@ def _invoke(monkeypatch, tmp_path, fake: FakeClient, *args: str):
     return CliRunner().invoke(cli.main, ["--user", "alice", "--role", "fleet_admin", *args, str(config)])
 
 
+def _select_plain_fleet_status_rendering(monkeypatch) -> None:
+    """Exercise the human view without inheriting terminal color from the test runner."""
+
+    console_factory = fleet_status_rendering.fleet_status_console
+    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    monkeypatch.setattr(
+        fleet_status_rendering,
+        "fleet_status_console",
+        lambda: console_factory(force_terminal=False, environment={}),
+    )
+
+
 def _json_argument(call: tuple[str, str, RequestArguments]) -> JsonObject:
     payload = call[2].get("json")
     if payload is None:
@@ -1516,7 +1528,7 @@ def _fleet_status_document() -> JsonObject:
 
 def test_status_renders_compact_tty_summary_without_platform_internals(monkeypatch, tmp_path) -> None:
     fake = FakeClient(_fleet_status_document())
-    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    _select_plain_fleet_status_rendering(monkeypatch)
 
     result = _invoke(monkeypatch, tmp_path, fake, "status")
 
@@ -1545,7 +1557,7 @@ def test_status_marks_an_empty_warm_pool_under_provisioned(monkeypatch, tmp_path
     pool = _fleet_status_pool(min_cells=2, initial_cells=3)
     document = FleetStatusResponse(name="dev-fleet", pools=[pool], cells=[]).model_dump(mode="json")
     fake = FakeClient(document)
-    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    _select_plain_fleet_status_rendering(monkeypatch)
 
     result = _invoke(monkeypatch, tmp_path, fake, "status")
 
@@ -1581,7 +1593,7 @@ def test_status_treats_server_values_as_literal_text(monkeypatch, tmp_path) -> N
     )
     document = FleetStatusResponse(name="dev-fleet", pools=[pool], cells=[cell]).model_dump(mode="json")
     fake = FakeClient(document)
-    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    _select_plain_fleet_status_rendering(monkeypatch)
 
     result = _invoke(monkeypatch, tmp_path, fake, "status")
 
@@ -1596,7 +1608,7 @@ def test_status_treats_server_values_as_literal_text(monkeypatch, tmp_path) -> N
 def test_status_json_overrides_interactive_rendering(monkeypatch, tmp_path) -> None:
     document = _fleet_status_document()
     fake = FakeClient(document)
-    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    _select_plain_fleet_status_rendering(monkeypatch)
 
     result = _invoke(monkeypatch, tmp_path, fake, "status", "--json")
 
@@ -1619,7 +1631,7 @@ def test_status_orders_worker_shapes_by_numeric_size(monkeypatch, tmp_path) -> N
         for size in sizes
     ]
     fake = FakeClient(FleetStatusResponse(name="dev-fleet", pools=pools, cells=[]).model_dump(mode="json"))
-    monkeypatch.setattr(fleet_status_rendering, "is_interactive_output", lambda: True)
+    _select_plain_fleet_status_rendering(monkeypatch)
 
     result = _invoke(monkeypatch, tmp_path, fake, "status")
 
@@ -2028,6 +2040,7 @@ def test_run_prints_durable_job_controls_without_changing_json_stdout(monkeypatc
             "python",
             "train.py",
         ],
+        env={"NO_COLOR": "1", "FORCE_COLOR": "1"},
     )
 
     assert result.exit_code == 0, result.output

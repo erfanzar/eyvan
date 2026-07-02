@@ -37,6 +37,7 @@ from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
+from eyvan.sdk.terminal import stream_is_terminal
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
 
@@ -78,7 +79,7 @@ def main(
         and ctx.get_parameter_source("role") is ParameterSource.DEFAULT
     ):
         role = "fleet_admin"
-        if sys.stderr.isatty():
+        if stream_is_terminal(sys.stderr):
             click.echo(
                 "Using role 'fleet_admin' for the loopback development endpoint; pass --role to override it.",
                 err=True,

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import click
@@ -17,21 +18,30 @@ from rich.table import Table
 from rich.text import Text
 
 from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState, ResourceLimits
+from eyvan.sdk.terminal import stream_is_terminal, terminal_console
 from eyvan.server.api.schemas import FleetStatusResponse
 
 _ATTENTION_CELL_LIMIT = 12
 
 
 def is_interactive_output() -> bool:
-    """Return whether stdout is an interactive terminal."""
+    """Return whether stdout is a physical terminal suitable for human output."""
 
-    return click.get_text_stream("stdout").isatty()
+    return stream_is_terminal(click.get_text_stream("stdout"))
 
 
-def fleet_status_console() -> Console:
+def fleet_status_console(
+    *,
+    force_terminal: bool | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> Console:
     """Create a Rich console bound to Click's stdout stream."""
 
-    return Console(file=click.get_text_stream("stdout"), highlight=False, soft_wrap=True)
+    return terminal_console(
+        click.get_text_stream("stdout"),
+        force_terminal=force_terminal,
+        environment=environment,
+    )
 
 
 def _quantity(value: float | int) -> str:

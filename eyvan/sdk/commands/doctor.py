@@ -35,6 +35,7 @@ from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.server.service.pricing_resolver import audit_price_drift
 
 
@@ -573,7 +574,7 @@ class DoctorCommandService:
 
         report = self.report()
         stream = click.get_text_stream("stderr")
-        if stream.isatty():
+        if stream_is_terminal(stream):
             for check in report.checks:
                 click.echo(f"  {check.status.value.upper():5} {check.name}  {check.detail}", file=stream)
                 if check.remedy:

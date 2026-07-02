@@ -206,6 +206,8 @@ def test_native_gcp_profile_rejects_a_local_artifact_store_before_submitting_wor
 
 
 def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("FORCE_COLOR", "1")
     config_path = tmp_path / "eyvan-context.json"
     set_active_context(
         EyvanContext(

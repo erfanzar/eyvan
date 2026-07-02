@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +35,7 @@ from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
 from eyvan.records import CapacityClass
 from eyvan.sdk.commands.fleet_status import is_interactive_output
+from eyvan.sdk.terminal import terminal_console
 
 _EGRESS_CHOICES: tuple[tuple[str, str, str], ...] = (
     ("1", "private-google-access", "Private Google APIs only"),
@@ -73,11 +74,16 @@ def is_interactive() -> bool:
     return sys.stdin.isatty()
 
 
-def autoscale_console(*, err: bool = False) -> Console:
+def autoscale_console(
+    *,
+    err: bool = False,
+    force_terminal: bool | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> Console:
     """Create a Rich console bound to Click's current output stream."""
 
     stream = click.get_text_stream("stderr" if err else "stdout")
-    return Console(file=stream, highlight=False, soft_wrap=True)
+    return terminal_console(stream, force_terminal=force_terminal, environment=environment)
 
 
 def _quota_balance_label(quota: GenerationQuotaSnapshot) -> str:
