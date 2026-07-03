@@ -84,7 +84,11 @@ def _pool_document(request: AutoscaleRequest, *, quota: QuotaSnapshot | None) ->
     max_workers = _profile_max_workers(request, quota)
     if request.min_workers > max_workers and max_workers != 0:
         raise ValueError("min_workers exceeds the quota-constrained max_workers")
-    resources: JsonObject = {"CPU": request.profile.cpu, "TPU": request.profile.tpu}
+    resources: JsonObject = {
+        "CPU": request.profile.cpu,
+        "memory_gib": request.profile.memory_gib,
+        "TPU": request.profile.tpu,
+    }
     provider_options: JsonObject = {"bootstrap_egress": request.bootstrap_egress}
     pool: JsonObject = {
         "label": request.profile.accelerator_type,

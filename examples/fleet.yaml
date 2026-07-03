@@ -59,10 +59,7 @@ node_types:
   tpu-workers:
     kind: tpu
     accelerator_type: v5p-8
-    resources:
-      cpu: 0
-      memory_gib: 0
-      tpu: 4
+    # Known TPU resources are filled from the sourced hardware catalog.
     min_workers: 0
     max_workers: 16
     agent_endpoint: https://eyvan-tpu-agent.example.com

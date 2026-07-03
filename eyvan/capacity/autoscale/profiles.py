@@ -20,10 +20,6 @@ _TPU_QUOTA_UNITS_PER_RESOURCE = {"v4": 2, "v5p": 2}
 # Compute Engine TPU VM. The dynamic Cloud TPU quota catalog must not emit it
 # as a queued-resource autoscale worker.
 _DYNAMIC_QUEUED_ACCELERATOR_EXCLUSIONS = frozenset({"v5p-8"})
-#: Used only for types the hardware catalog does not describe. Deliberately the
-#: value that used to apply to every TPU, so an unknown shape keeps behaving
-#: exactly as it did rather than acquiring a new number nobody chose.
-_FALLBACK_HOST_CPU = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,17 +60,24 @@ class QueuedTpuProfileCatalog:
         tpu = parsed.size // divisor
         if tpu <= 0:
             return TpuProfileResolution(None, AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE)
-        # The catalog when it knows the shape, the derivation when it does not.
-        # ``cpu=32`` was applied to every TPU ever made -- this docstring used to
-        # call it "the same conservative CPU vector until host-specific
-        # discovery is available", and for known types that wait is over. It
-        # stays the fallback so an unrecognized type still autoscales.
+        # A provider accelerator name and quota suffix establish TPU count only.
+        # They say nothing authoritative about host CPU or memory. Emitting the
+        # old ``cpu=32, memory_gib=0`` fallback made an unknown discovered type
+        # look schedulable while every normal workload was guaranteed not to fit.
+        # Unknown hardware remains available through an explicit fleet resource
+        # vector or a directly constructed ``TpuProfile`` with positive memory.
         shape = shape_for(normalized)
-        if shape is not None and shape.kind == "tpu":
-            return TpuProfileResolution(
-                TpuProfile(accelerator_type=normalized, cpu=shape.host_cpu, tpu=shape.schedulable_tpu), None
-            )
-        return TpuProfileResolution(TpuProfile(accelerator_type=normalized, cpu=_FALLBACK_HOST_CPU, tpu=tpu), None)
+        if shape is None or shape.kind != "tpu":
+            return TpuProfileResolution(None, AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE)
+        return TpuProfileResolution(
+            TpuProfile(
+                accelerator_type=normalized,
+                cpu=shape.host_cpu,
+                memory_gib=shape.host_memory_gib,
+                tpu=shape.schedulable_tpu,
+            ),
+            None,
+        )
 
 
 QUEUED_TPU_PROFILE_CATALOG = QueuedTpuProfileCatalog()
@@ -85,8 +88,8 @@ def tpu_profile_from_accelerator_type(accelerator_type: str) -> TpuProfile | Non
 
     Cloud TPU quota units use the public accelerator suffix. v4 and v5p use
     two quota units per schedulable TPU resource while v5e, LitePod, and v6e
-    use one. Every native TPU worker reserves the same conservative CPU vector
-    until host-specific discovery is available.
+    use one. CPU and memory do not follow from that suffix, so a discovered type
+    is returned only when the versioned hardware catalog supplies both.
     """
 
     return QUEUED_TPU_PROFILE_CATALOG.resolve(accelerator_type).profile
@@ -111,7 +114,12 @@ def _default_tpu_profiles() -> tuple[TpuProfile, ...]:
     """
 
     return tuple(
-        TpuProfile(shape.accelerator_type, cpu=shape.host_cpu, tpu=shape.schedulable_tpu)
+        TpuProfile(
+            shape.accelerator_type,
+            cpu=shape.host_cpu,
+            memory_gib=shape.host_memory_gib,
+            tpu=shape.schedulable_tpu,
+        )
         for shape in hardware_catalog().shapes
         if shape.kind == "tpu" and shape.accelerator_type not in _DYNAMIC_QUEUED_ACCELERATOR_EXCLUSIONS
     )

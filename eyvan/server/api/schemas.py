@@ -11,8 +11,9 @@ import typing as tp
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from eyvan.capacity.hardware_catalog import validate_accelerator_write_boundary
 from eyvan.records import (
     DEFAULT_MAX_RETRIES,
     BudgetRecord,
@@ -242,6 +243,20 @@ class CellUpsertRequest(ApiModel):
     max_replica_resources: ResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
 
+    @model_validator(mode="after")
+    def validate_accelerator_semantics(self) -> CellUpsertRequest:
+        """Reject impossible accelerator inventory before it becomes durable."""
+
+        validate_accelerator_write_boundary(
+            provider=self.provider,
+            capacity_backend=self.capacity_backend,
+            accelerator_type=self.accelerator_type,
+            capacity=self.capacity,
+            allocatable=self.allocatable,
+            boundary="accelerator cell",
+        )
+        return self
+
     def to_record(self) -> CellRecord:
         return CellRecord(**self.model_dump())
 
@@ -285,6 +300,24 @@ class CapacityPoolUpsertRequest(ApiModel):
     upscaling_speed: float = Field(default=1.0, gt=0)
     launch_batch: int = Field(default=5, ge=1)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_accelerator_semantics(self) -> CapacityPoolUpsertRequest:
+        """Reject impossible accelerator templates before they become durable.
+
+        ``CapacityPoolRecord`` deliberately remains able to decode legacy rows;
+        direct pool upserts and fleet apply both pass through this request model.
+        """
+
+        validate_accelerator_write_boundary(
+            provider=self.provider,
+            capacity_backend=self.capacity_backend,
+            accelerator_type=self.accelerator_type,
+            capacity=self.capacity,
+            allocatable=self.allocatable,
+            boundary="accelerator pool",
+        )
+        return self
 
     def to_record(self, *, default_agent_endpoint: str | None = None) -> CapacityPoolRecord:
         """Resolve the platform default agent before persisting a pool."""

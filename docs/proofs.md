@@ -74,8 +74,9 @@ eyvan down --yes
 eyvan proof catalog --accelerator-type v5p-16      # exit 0, 1 or 2
 ```
 
-**Passes when** the pool's resources match the catalog entry for `v5p-16` and
-`observed_tpu_vms` is 2, with no `resources:` block in the fleet YAML.
+**Passes when** the pool's positive CPU, memory, and TPU resources match the
+catalog entry for `v5p-16`, `observed_tpu_vms` is 2, and the fleet YAML has no
+`resources:` block.
 
 **Run 2026-08-06, exit 0.** v5p-16 spot in `us-central1-a`, slice ready 7m9s
 after apply. With no `resources:` block the pool resolved to `cpu 32, tpu 8` --
@@ -84,12 +85,13 @@ the catalog's `host_cpu` and `chips` -- and the cell reported
 how many slices; the catalog is authoritative for hosts per slice, which is the
 property a provider returning one host of two would violate silently.
 
-One thing this exposed: the catalog sets `host_memory_gib` for no shape, so a
-pool built from it advertises **zero memory**. `eyvan workload submit` defaults
-to 1 GiB, so the default submit cannot place on a catalog-derived TPU pool at
-all -- it reports `insufficient_capacity`, which is true and unhelpful. Making
-`resources:` optional is what put that path in reach; nothing else exercises
-it. A cell
+That run also exposed the historical zero-memory defect: the catalog then set
+`host_memory_gib` for no shape, so the otherwise successful pool could not place
+the 1 GiB default workload. Catalog revision `2026-08-04.2` sources positive
+per-VM CPU and memory and the fleet/autoscale compilers persist both. The run
+above remains evidence for host-count authority, not evidence for the corrected
+resource vector; re-run P1 after reapplying the fleet to qualify that change.
+`eyvan doctor` reports old durable pools that still advertise zero memory. A cell
 that never reported `observed_tpu_vms`, or a catalog shape with no recorded host
 count, is **inconclusive** rather than passing -- the check that matters would
 otherwise be skipped silently.

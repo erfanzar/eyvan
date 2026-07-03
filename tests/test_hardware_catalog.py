@@ -3,19 +3,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""One source of shape truth, proved to agree with the three it replaces.
+"""One source of shape truth, including provider-sourced host resources.
 
 ``fleet_config`` held a compute-TPU dict and a queued-slice dict;
 ``autoscale.profiles`` derived a chip count from the type suffix and hardcoded
-``cpu=32`` for every TPU; every fleet YAML restated the answer by hand. Three
-sources for one fact are three chances to disagree, and the operator writing the
-fourth copy has no way to know which one they are supposed to match.
+``cpu=32, memory_gib=0`` for every TPU; every fleet YAML restated part of the
+answer by hand. A discovered type name never supplied RAM, so that fallback
+created durable pools which no default workload could use.
 
-The parity tests below are the load-bearing ones. A catalog that is internally
-consistent but disagrees with the code it replaces would not consolidate
-anything -- it would add a fourth source. So the expected numbers are written as
-literals rather than read from either side: a test that compares the catalog to
-the dict it replaced passes just as happily when both are wrong together.
+The resource literals below come from the versioned Google Cloud pages cited by
+each catalog row, not from production code. Consumption tests then follow the
+value through autoscale, fleet/API compilation, durable records, and cells so a
+field that exists only in the YAML cannot produce a false pass.
 """
 
 from __future__ import annotations
@@ -35,14 +34,15 @@ from eyvan.capacity.hardware_catalog import (
     shape_for,
 )
 
-#: What each shape is, written out. Not derived from the catalog and not read
-#: from the code being replaced -- both of those would let the test agree with a
-#: mistake. These are the numbers the live fleets in ``configs/`` run on.
+#: Provider-published per-TPU-VM resources, written as independent literals.
+#: Google Cloud's v5p and v6e pages (both versioned "Last updated 2026-08-04
+#: UTC") establish these CPU/RAM values and topology-dependent VM shapes.
 EXPECTED = {
-    "v5p-8": {"chips": 4, "quota_units": 8, "hosts": 1, "cpu": 32},
-    "v5p-16": {"chips": 8, "quota_units": 16, "hosts": 2, "cpu": 32},
-    "v5p-32": {"chips": 16, "quota_units": 32, "hosts": 4, "cpu": 32},
-    "v6e-16": {"chips": 16, "quota_units": 16, "hosts": None, "cpu": 32},
+    "v5p-8": {"chips": 4, "quota_units": 8, "hosts": 1, "cpu": 208, "memory_gib": 448, "source": "v5p"},
+    "v5p-16": {"chips": 8, "quota_units": 16, "hosts": 2, "cpu": 208, "memory_gib": 448, "source": "v5p"},
+    "v5p-32": {"chips": 16, "quota_units": 32, "hosts": 4, "cpu": 208, "memory_gib": 448, "source": "v5p"},
+    "v6e-8": {"chips": 8, "quota_units": 8, "hosts": None, "cpu": 360, "memory_gib": 1440, "source": "v6e"},
+    "v6e-16": {"chips": 16, "quota_units": 16, "hosts": None, "cpu": 180, "memory_gib": 720, "source": "v6e"},
 }
 
 
@@ -70,6 +70,9 @@ def test_the_catalog_states_the_shape_the_fleet_actually_runs(accelerator_type: 
     assert shape.quota_units == expected["quota_units"]
     assert shape.hosts == expected["hosts"]
     assert shape.host_cpu == expected["cpu"]
+    assert shape.host_memory_gib == expected["memory_gib"]
+    assert shape.source_url == f"https://cloud.google.com/tpu/docs/{expected['source']}"
+    assert shape.source_version == "Last updated 2026-08-04 UTC"
 
 
 #: Exactly what the two deleted dictionaries in ``fleet_config`` contained. Kept
@@ -86,8 +89,9 @@ RETIRED_COMPUTE_PROFILE = {
 }
 RETIRED_QUEUED_SLICE_PROFILE = {"v5p-16": 8, "v5p-32": 16}
 
-#: What ``DEFAULT_TPU_PROFILES`` was written out as before it was derived.
-RETIRED_DEFAULT_PROFILES = (("v5p-16", 32, 8), ("v5p-32", 32, 16), ("v6e-8", 32, 8))
+#: Names and TPU counts the old compatibility tuple exposed. Its guessed CPU
+#: value is intentionally not retained now that provider-sourced values exist.
+RETIRED_DEFAULT_PROFILES = (("v5p-16", 8), ("v5p-32", 16), ("v6e-8", 8))
 
 
 def test_the_catalog_carries_what_the_compute_dictionary_carried() -> None:
@@ -144,9 +148,10 @@ def test_the_derived_compatibility_tuple_still_contains_what_it_used_to() -> Non
     how a fourth copy holds the only record of something.
     """
 
-    derived = {(profile.accelerator_type, profile.cpu, profile.tpu) for profile in DEFAULT_TPU_PROFILES}
+    derived = {(profile.accelerator_type, profile.tpu) for profile in DEFAULT_TPU_PROFILES}
 
     assert set(RETIRED_DEFAULT_PROFILES) <= derived
+    assert all(profile.cpu > 0 and profile.memory_gib > 0 for profile in DEFAULT_TPU_PROFILES)
     # v5p-8 is compiled as an integrated Compute Engine TPU VM and excluded from
     # queued autoscaling, so offering a profile for it would be offering one the
     # autoscaler refuses to use.
@@ -170,6 +175,7 @@ def test_the_catalog_agrees_with_the_derived_autoscale_profile() -> None:
         shape = hardware_catalog().require(accelerator_type)
         assert shape.schedulable_tpu == derived.tpu, accelerator_type
         assert shape.host_cpu == derived.cpu, accelerator_type
+        assert shape.host_memory_gib == derived.memory_gib, accelerator_type
 
 
 def test_the_catalog_agrees_with_the_compatibility_profile_tuple() -> None:
@@ -179,7 +185,11 @@ def test_the_catalog_agrees_with_the_compatibility_profile_tuple() -> None:
         shape = shape_for(profile.accelerator_type)
         if shape is None:
             continue
-        assert (shape.schedulable_tpu, shape.host_cpu) == (profile.tpu, profile.cpu), profile.accelerator_type
+        assert (shape.schedulable_tpu, shape.host_cpu, shape.host_memory_gib) == (
+            profile.tpu,
+            profile.cpu,
+            profile.memory_gib,
+        ), profile.accelerator_type
 
 
 # --------------------------------------------------------------------------- invariants
@@ -268,7 +278,7 @@ def test_an_unsupported_schema_version_is_refused_rather_than_partly_read(tmp_pa
     document = _catalog_document()
     document["catalog_version"] = 99
 
-    with pytest.raises(HardwareCatalogError, match="this build understands 1"):
+    with pytest.raises(HardwareCatalogError, match="this build understands 2"):
         load_hardware_catalog(_write(tmp_path, document))
 
 
@@ -283,6 +293,32 @@ def test_a_fractional_host_cpu_is_refused(tmp_path) -> None:
     document["shapes"][1]["host_cpu"] = 31.5
 
     with pytest.raises(HardwareCatalogError, match="positive integer"):
+        load_hardware_catalog(_write(tmp_path, document))
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf")])
+def test_non_positive_or_non_finite_host_memory_is_refused(tmp_path, value: float) -> None:
+    """Admission memory cannot be absent, zero, negative, or non-finite."""
+
+    document = _catalog_document()
+    document["shapes"][1]["host_memory_gib"] = value
+
+    with pytest.raises(HardwareCatalogError, match="host_memory_gib must be a positive finite number"):
+        load_hardware_catalog(_write(tmp_path, document))
+
+
+def test_every_accelerator_entry_requires_versioned_provider_provenance(tmp_path) -> None:
+    """Future TPU or GPU rows cannot turn an operator's estimate into catalog fact."""
+
+    document = _catalog_document()
+    document["shapes"][1].pop("source_version")
+
+    with pytest.raises(HardwareCatalogError, match="source_version"):
+        load_hardware_catalog(_write(tmp_path, document))
+
+    document = _catalog_document()
+    document["shapes"][1]["source_url"] = "provider-notes.txt"
+    with pytest.raises(HardwareCatalogError, match="absolute HTTPS URL"):
         load_hardware_catalog(_write(tmp_path, document))
 
 
@@ -302,7 +338,7 @@ def test_malformed_yaml_names_the_file(tmp_path) -> None:
     path = tmp_path / "catalog.yaml"
     path.write_text(
         textwrap.dedent("""\
-        catalog_version: 1
+        catalog_version: 2
         shapes: [
         """),
         encoding="utf-8",
@@ -377,7 +413,40 @@ def test_a_pool_named_after_a_known_shape_needs_no_resources_block() -> None:
     (pool,) = config.pool_payloads()
 
     assert pool["capacity"]["tpu"] == 8
-    assert pool["capacity"]["cpu"] == 32
+    assert pool["capacity"]["cpu"] == 208
+    assert pool["capacity"]["memory_gib"] == 448
+    assert pool["allocatable"]["memory_gib"] == 448
+
+
+@pytest.mark.parametrize("accelerator_type", sorted(EXPECTED))
+def test_every_catalog_shape_reaches_a_durable_schedulable_pool(accelerator_type: str) -> None:
+    """Prove memory survives catalog -> fleet -> API record -> cell/document.
+
+    Merely asserting the YAML field would miss the original defect: autoscale and
+    durable pool compilation each used their own resource vector. The default
+    workload asks for one CPU and one GiB plus the complete shape TPU count.
+    """
+
+    from eyvan._internal.json_types import model_json
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+    from eyvan.records import CapacityPoolRecord, ResourceVector
+    from eyvan.server.api.schemas import FleetApplyRequest
+
+    shape = hardware_catalog().require(accelerator_type)
+    config = EyvanFleetConfig.model_validate(_fleet({"min_workers": 0, "max_workers": 1}, name=accelerator_type))
+    (payload,) = config.pool_payloads()
+    request = FleetApplyRequest.model_validate({"pools": [payload]})
+    (record,) = request.to_records(default_agent_endpoint="https://agent.example.com")
+    restored = CapacityPoolRecord.model_validate(model_json(record))
+    cell = restored.make_cell("catalog-cell")
+    default_workload = ResourceVector(tpu=shape.schedulable_tpu)
+
+    assert restored.capacity.memory_gib == shape.host_memory_gib
+    assert restored.allocatable.memory_gib == shape.host_memory_gib
+    assert cell.capacity.memory_gib == shape.host_memory_gib
+    assert default_workload.cpu <= cell.allocatable.cpu
+    assert default_workload.memory_gib <= cell.allocatable.memory_gib
+    assert default_workload.tpu <= cell.allocatable.tpu
 
 
 def test_a_declared_block_that_contradicts_the_catalog_is_refused() -> None:
@@ -406,23 +475,229 @@ def test_a_matching_declared_block_still_works() -> None:
     (pool,) = config.pool_payloads()
 
     assert pool["capacity"]["tpu"] == 8
+    assert pool["capacity"]["cpu"] == 32, "an explicit positive schedulable override must be retained"
+    assert pool["capacity"]["memory_gib"] == 448, "an omitted dimension must come from the catalog"
 
 
-def test_a_pool_whose_shape_the_catalog_does_not_know_is_left_alone() -> None:
-    """The catalog describes what Eyvan can size, not what a provider can run.
+def test_a_known_pool_cannot_explicitly_restore_zero_memory() -> None:
+    """A stale override must fail before it can recreate the legacy durable row."""
 
-    Refusing an operator's hand-written pool because Eyvan has not been taught
-    its shape would turn a convenience into a gate on hardware.
+    from pydantic import ValidationError
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    with pytest.raises(ValidationError, match=r"resources\.memory_gib > 0"):
+        EyvanFleetConfig.model_validate(
+            _fleet(
+                {
+                    "min_workers": 0,
+                    "max_workers": 1,
+                    "resources": {"CPU": 32, "memory_gib": 0, "TPU": 8},
+                }
+            )
+        )
+
+
+def test_api_rejects_new_zero_memory_pool_but_legacy_record_remains_readable() -> None:
+    """Write-time safety must not hide the rows doctor needs operators to repair."""
+
+    from pydantic import ValidationError
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+    from eyvan.records import CapacityPoolRecord
+    from eyvan.server.api.schemas import FleetApplyRequest
+
+    config = EyvanFleetConfig.model_validate(_fleet({"min_workers": 0, "max_workers": 1}))
+    (payload,) = config.pool_payloads()
+    payload["capacity"] = {"cpu": 32, "memory_gib": 0, "tpu": 8}
+    payload["allocatable"] = {"cpu": 32, "memory_gib": 0, "tpu": 8}
+
+    with pytest.raises(ValidationError, match=r"accelerator pool capacity requires positive cpu and memory_gib"):
+        FleetApplyRequest.model_validate({"pools": [payload]})
+
+    payload["agent_endpoint"] = "https://agent.example.com"
+    legacy = CapacityPoolRecord.model_validate(payload)
+    assert legacy.capacity.memory_gib == 0
+
+
+def _direct_accelerator_write_payload(boundary: str) -> dict:
+    common = {
+        "provider": "gcp",
+        "capacity_backend": "gcp-tpu",
+        "provider_project": "gcp-project",
+        "region": "us-east5",
+        "zone": "us-east5-a",
+        "capacity": {"cpu": 64, "memory_gib": 256, "tpu": 8},
+        "allocatable": {"cpu": 32, "memory_gib": 128, "tpu": 8},
+        "accelerator_type": "v5p-16",
+        "agent_endpoint": "http://agent:8090",
+    }
+    if boundary == "pool":
+        return {
+            **common,
+            "id": "research-v5p-16",
+            "fleet_name": "research",
+            "node_type": "v5p-16",
+        }
+    common.pop("agent_endpoint")
+    return {**common, "id": "research-v5p-16-0001", "endpoint": "http://worker:8100"}
+
+
+@pytest.mark.parametrize("boundary", ["pool", "cell"])
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        ("catalog-kind", r"is a tpu type.*advertise gpu"),
+        ("capacity-count", r"capacity\.tpu.*catalog count 8"),
+        ("allocatable-count", r"allocatable\.tpu.*catalog count 8"),
+        ("backend-kind", r"capacity_backend.*requires tpu resources"),
+    ],
+)
+def test_direct_accelerator_write_boundaries_reject_impossible_gcp_semantics(
+    boundary: str,
+    invalid: str,
+    message: str,
+) -> None:
+    """Direct pool and cell APIs must not bypass the typed fleet catalog guard."""
+
+    from pydantic import ValidationError
+
+    from eyvan.server.api.schemas import CapacityPoolUpsertRequest, CellUpsertRequest
+
+    payload = _direct_accelerator_write_payload(boundary)
+    if invalid == "catalog-kind":
+        payload["capacity"] = {"cpu": 64, "memory_gib": 256, "gpu": 1}
+        payload["allocatable"] = {"cpu": 32, "memory_gib": 128, "gpu": 1}
+    elif invalid == "capacity-count":
+        payload["capacity"] = {"cpu": 64, "memory_gib": 256, "tpu": 999}
+    elif invalid == "allocatable-count":
+        payload["allocatable"] = {"cpu": 32, "memory_gib": 128, "tpu": 4}
+    else:
+        payload["accelerator_type"] = "nvidia-l4"
+        payload["capacity"] = {"cpu": 64, "memory_gib": 256, "gpu": 1}
+        payload["allocatable"] = {"cpu": 32, "memory_gib": 128, "gpu": 1}
+    request_type = CapacityPoolUpsertRequest if boundary == "pool" else CellUpsertRequest
+
+    with pytest.raises(ValidationError, match=message):
+        request_type.model_validate(payload)
+
+
+@pytest.mark.parametrize("boundary", ["pool", "cell"])
+def test_direct_known_shape_writes_allow_positive_cpu_and_memory_overrides(boundary: str) -> None:
+    """The catalog fixes accelerator count, not an operator's positive host reservation."""
+
+    from eyvan.server.api.schemas import CapacityPoolUpsertRequest, CellUpsertRequest
+
+    payload = _direct_accelerator_write_payload(boundary)
+    request_type = CapacityPoolUpsertRequest if boundary == "pool" else CellUpsertRequest
+
+    request = request_type.model_validate(payload)
+
+    assert request.capacity.cpu == 64
+    assert request.capacity.memory_gib == 256
+    assert request.allocatable.cpu == 32
+    assert request.allocatable.memory_gib == 128
+    assert request.capacity.tpu == request.allocatable.tpu == 8
+
+
+@pytest.mark.parametrize("boundary", ["pool", "cell"])
+def test_direct_gcp_backends_cannot_hide_behind_a_non_gcp_provider(boundary: str) -> None:
+    """The driver follows ``capacity_backend``; the provider label cannot bypass its catalog."""
+
+    from pydantic import ValidationError
+
+    from eyvan.server.api.schemas import CapacityPoolUpsertRequest, CellUpsertRequest
+
+    payload = _direct_accelerator_write_payload(boundary)
+    payload["provider"] = "local"
+    payload["capacity"]["tpu"] = 999
+    payload["allocatable"]["tpu"] = 999
+    request_type = CapacityPoolUpsertRequest if boundary == "pool" else CellUpsertRequest
+
+    with pytest.raises(ValidationError, match=r"capacity_backend .* requires provider 'gcp'"):
+        request_type.model_validate(payload)
+
+
+def test_typed_fleet_gcp_backend_cannot_hide_behind_a_local_provider() -> None:
+    """The declarative compiler shares the same provider/backend boundary as direct writes."""
+
+    from pydantic import ValidationError
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    document = {
+        "version": 1,
+        "name": "local-fleet",
+        "provider": {"type": "local", "region": "local"},
+        "agent_endpoint": "https://agent.example.com",
+        "executor": "eyvan-native",
+        "node_types": {
+            "gpu": {
+                "kind": "gpu",
+                "machine_type": "local-gpu",
+                "accelerator_type": "nvidia-l4",
+                "capacity_backend": "gcp-tpu",
+                "resources": {"cpu": 8, "memory_gib": 32, "gpu": 1},
+            }
+        },
+    }
+
+    with pytest.raises(ValidationError, match=r"capacity_backend .* requires provider 'gcp'"):
+        EyvanFleetConfig.model_validate(document)
+
+
+def test_direct_unknown_gcp_shape_requires_and_accepts_the_complete_manual_vector() -> None:
+    """An uncatalogued provider name is usable, but never with guessed host resources."""
+
+    from pydantic import ValidationError
+
+    from eyvan.server.api.schemas import CapacityPoolUpsertRequest
+
+    incomplete = _direct_accelerator_write_payload("pool")
+    incomplete["accelerator_type"] = "v5p-64"
+    incomplete["capacity"] = {"cpu": 64, "memory_gib": 256, "tpu": 32}
+    incomplete["allocatable"] = {"cpu": 64, "memory_gib": 256}
+
+    with pytest.raises(ValidationError, match=r"unknown GCP accelerator shape.*complete manual"):
+        CapacityPoolUpsertRequest.model_validate(incomplete)
+
+    incomplete["allocatable"]["tpu"] = 32
+    request = CapacityPoolUpsertRequest.model_validate(incomplete)
+    assert request.capacity.tpu == request.allocatable.tpu == 32
+
+
+def test_a_pool_whose_shape_the_catalog_does_not_know_allows_complete_manual_resources() -> None:
+    """The catalog is not a hardware gate, but unknown resources are operator-owned.
+
+    Provider discovery supplies a type name, not host RAM. An explicit complete
+    vector is therefore the intentional escape hatch instead of a guessed
+    catalog entry or a zero-memory pool.
     """
 
     from eyvan.capacity.fleet_config import EyvanFleetConfig
 
     config = EyvanFleetConfig.model_validate(
-        _fleet({"min_workers": 0, "max_workers": 1, "resources": {"CPU": 64, "TPU": 32}}, name="v5p-64")
+        _fleet(
+            {"min_workers": 0, "max_workers": 1, "resources": {"CPU": 64, "memory_gib": 256, "TPU": 32}},
+            name="v5p-64",
+        )
     )
     (pool,) = config.pool_payloads()
 
-    assert pool["capacity"]["tpu"] == 32
+    assert pool["capacity"] == {"cpu": 64.0, "memory_gib": 256.0, "gpu": 0, "tpu": 32, "custom": {}}
+
+
+def test_an_unknown_pool_without_explicit_memory_is_refused() -> None:
+    """A type suffix cannot silently manufacture schedulable host resources."""
+
+    from pydantic import ValidationError
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    with pytest.raises(ValidationError, match=r"unknown TPU shape.*explicit positive CPU and memory_gib"):
+        EyvanFleetConfig.model_validate(
+            _fleet({"min_workers": 0, "max_workers": 1, "resources": {"CPU": 64, "TPU": 32}}, name="v5p-64")
+        )
 
 
 # --------------------------------------------------------------------------- host counts
@@ -544,8 +819,11 @@ def test_autoscale_prefers_the_catalog_over_the_suffix_derivation(monkeypatch) -
         chips=8,
         quota_units=16,
         host_cpu=96,
+        host_memory_gib=384,
         capacity_backend="gcp-tpu",
         multislice_capable=True,
+        source_url="https://provider.example.com/tpu/v5p",
+        source_version="2026-08-04",
     )
     monkeypatch.setattr(profiles, "shape_for", lambda _type: unusual)
 
@@ -553,21 +831,18 @@ def test_autoscale_prefers_the_catalog_over_the_suffix_derivation(monkeypatch) -
 
     assert resolved is not None
     assert resolved.cpu == 96, "the suffix derivation's fixed 32 won over the catalog"
+    assert resolved.memory_gib == 384
     assert resolved.tpu == 8
 
 
-def test_an_uncatalogued_type_keeps_the_conservative_fallback(monkeypatch) -> None:
-    """An unknown shape must autoscale exactly as it did before the catalog.
-
-    The fallback is deliberately the number that used to apply to every TPU, so
-    a type Eyvan has not been taught acquires no new behaviour it did not have.
-    """
+def test_an_uncatalogued_discovered_type_is_skipped_instead_of_getting_zero_memory(monkeypatch) -> None:
+    """A quota suffix proves accelerator count and nothing about its TPU VM host."""
 
     from eyvan.capacity.autoscale import profiles
 
     monkeypatch.setattr(profiles, "shape_for", lambda _type: None)
 
-    resolved = profiles.tpu_profile_from_accelerator_type("v5p-512")
+    resolution = profiles.resolve_queued_tpu_profile("v5p-512")
 
-    assert resolved is not None
-    assert (resolved.cpu, resolved.tpu) == (32, 256)
+    assert resolution.profile is None
+    assert resolution.skip_reason is profiles.AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE

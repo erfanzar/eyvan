@@ -26,21 +26,29 @@ recorded only where this repository grounds them. Making them mandatory would
 mean inventing topology for generations nothing here describes, and a wrong host
 count makes Eyvan reject a slice the provider built correctly -- a worse failure
 than not checking, because it looks like a provider fault.
+
+CPU and memory are different: both participate in admission, so every built-in
+shape must carry positive per-VM values plus the provider document and version
+that establish them. A future GPU entry has the same requirement. Hardware the
+catalog does not describe remains usable only through an explicit, complete fleet
+resource vector; provider discovery alone is not evidence for host resources.
 """
 
 from __future__ import annotations
 
+import math
 import typing as tp
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
 #: Schema version this build understands. A catalog declaring anything else is
 #: refused rather than partially read: a build silently ignoring fields it does
 #: not know would size pools from half a description.
-SUPPORTED_CATALOG_VERSION = 1
+SUPPORTED_CATALOG_VERSION = 2
 
 CATALOG_PATH = Path(__file__).resolve().parent / "data" / "accelerator_shapes.yaml"
 
@@ -57,6 +65,12 @@ class AcceleratorShape:
     counts. They differ by generation -- v4 and v5p bill two units per chip,
     v5e/v6e one -- and conflating them is why a v5p-16 pool asking for 16 TPUs
     would silently request twice the hardware.
+
+    ``host_cpu`` and ``host_memory_gib`` are the resources of one TPU VM host,
+    not a sum across a multi-host slice. Eyvan launches the native workload on
+    every host, so admission must ensure the per-host request fits each host.
+    ``source_url`` and ``source_version`` make those otherwise easy-to-guess
+    numbers reviewable and make unsourced future accelerator entries invalid.
     """
 
     accelerator_type: str
@@ -65,11 +79,13 @@ class AcceleratorShape:
     chips: int
     quota_units: int
     host_cpu: int
+    host_memory_gib: float
     capacity_backend: str
     multislice_capable: bool
+    source_url: str
+    source_version: str
     hosts: int | None = None
     chips_per_host: int | None = None
-    host_memory_gib: float = 0.0
     machine_type: str | None = None
     tpu_type: str | None = None
     image_family: str | None = None
@@ -84,6 +100,22 @@ class AcceleratorShape:
         # coercion at every call site instead of at the one boundary.
         if isinstance(self.host_cpu, bool) or not isinstance(self.host_cpu, int) or self.host_cpu <= 0:
             raise HardwareCatalogError(f"{self.accelerator_type}: host_cpu must be a positive integer")
+        if (
+            isinstance(self.host_memory_gib, bool)
+            or not isinstance(self.host_memory_gib, int | float)
+            or not math.isfinite(self.host_memory_gib)
+            or self.host_memory_gib <= 0
+        ):
+            raise HardwareCatalogError(f"{self.accelerator_type}: host_memory_gib must be a positive finite number")
+        source = urlparse(self.source_url) if isinstance(self.source_url, str) else None
+        if source is None or source.scheme != "https" or not source.netloc:
+            raise HardwareCatalogError(f"{self.accelerator_type}: source_url must be an absolute HTTPS URL")
+        if (
+            not isinstance(self.source_version, str)
+            or not self.source_version.strip()
+            or self.source_version != self.source_version.strip()
+        ):
+            raise HardwareCatalogError(f"{self.accelerator_type}: source_version must be a non-empty trimmed string")
         if (self.hosts is None) != (self.chips_per_host is None):
             raise HardwareCatalogError(
                 f"{self.accelerator_type}: hosts and chips_per_host are recorded together or not at all"
@@ -228,6 +260,121 @@ def shape_for(accelerator_type: str) -> AcceleratorShape | None:
     return hardware_catalog().get(accelerator_type)
 
 
+class _AdmissionResourceVector(tp.Protocol):
+    """The built-in resource dimensions needed at an accelerator write boundary."""
+
+    cpu: float
+    memory_gib: float
+    gpu: int
+    tpu: int
+
+
+def _advertised_accelerator_kinds(resources: _AdmissionResourceVector) -> set[str]:
+    return {kind for kind in ("gpu", "tpu") if getattr(resources, kind) > 0}
+
+
+def _gcp_accelerator_kind(accelerator_type: str, shape: AcceleratorShape | None) -> str | None:
+    """Classify provider names whose kind is independently knowable."""
+
+    if shape is not None:
+        return shape.kind
+    from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
+
+    if accelerator_type == "tpu" or parse_tpu_accelerator_type(accelerator_type) is not None:
+        return "tpu"
+    if accelerator_type == "gpu" or accelerator_type.startswith("nvidia-"):
+        return "gpu"
+    return None
+
+
+def validate_accelerator_write_boundary(
+    *,
+    provider: str,
+    capacity_backend: str | None,
+    accelerator_type: str | None,
+    capacity: _AdmissionResourceVector,
+    allocatable: _AdmissionResourceVector,
+    boundary: str,
+) -> None:
+    """Validate accelerator identity and admission resources before persistence.
+
+    Durable records deliberately do not call this function: historical rows with
+    incomplete vectors must remain readable so ``eyvan doctor`` can name and
+    repair them. Public cell/pool requests and the typed fleet compiler do call
+    it, so no new write can bypass catalog kind/count semantics.
+
+    Known GCP shapes fix only accelerator kind and count. Positive CPU and memory
+    remain documented admission overrides. An uncatalogued GCP type stays usable
+    through the documented manual escape hatch, but both capacity and allocatable
+    must then be complete positive host vectors.
+    """
+
+    normalized_provider = provider.strip().lower()
+    normalized_backend = (capacity_backend or "").strip().lower().replace("_", "-")
+    normalized_type = accelerator_type.strip().lower() if accelerator_type is not None else None
+    gcp_backends = {"gcp", "gcp-tpu", "tpu", "gcp-compute", "compute"}
+    if normalized_backend in gcp_backends and normalized_provider != "gcp":
+        raise ValueError(f"{boundary} capacity_backend {capacity_backend!r} requires provider 'gcp', not {provider!r}")
+    type_declares_accelerator = normalized_type not in {None, "cpu"}
+    backend_declares_tpu = normalized_backend in {"gcp-tpu", "tpu"}
+    vector_declares_accelerator = any(
+        amount > 0 for resources in (capacity, allocatable) for amount in (resources.gpu, resources.tpu)
+    )
+    if not (type_declares_accelerator or backend_declares_tpu or vector_declares_accelerator):
+        return
+    if not type_declares_accelerator or normalized_type is None:
+        raise ValueError(f"{boundary} accelerator resources require a non-CPU accelerator_type")
+
+    shape = shape_for(normalized_type) if normalized_provider == "gcp" else None
+    capacity_kinds = _advertised_accelerator_kinds(capacity)
+    allocatable_kinds = _advertised_accelerator_kinds(allocatable)
+    vectors_are_complete = (
+        capacity.cpu > 0
+        and capacity.memory_gib > 0
+        and allocatable.cpu > 0
+        and allocatable.memory_gib > 0
+        and len(capacity_kinds) == 1
+        and allocatable_kinds == capacity_kinds
+    )
+    if normalized_provider == "gcp" and shape is None and not vectors_are_complete:
+        raise ValueError(
+            f"{boundary} unknown GCP accelerator shape {accelerator_type!r} requires complete manual capacity and "
+            "allocatable vectors with positive cpu, memory_gib, and the same one of gpu or tpu"
+        )
+
+    for field_name, resources in (("capacity", capacity), ("allocatable", allocatable)):
+        if resources.cpu <= 0 or resources.memory_gib <= 0:
+            raise ValueError(f"{boundary} {field_name} requires positive cpu and memory_gib for accelerator admission")
+    if len(capacity_kinds) != 1 or allocatable_kinds != capacity_kinds:
+        raise ValueError(f"{boundary} capacity and allocatable must advertise the same one of gpu or tpu")
+    kind = next(iter(capacity_kinds))
+
+    if normalized_provider == "gcp":
+        expected_kind = _gcp_accelerator_kind(normalized_type, shape)
+        if expected_kind is not None and kind != expected_kind:
+            raise ValueError(
+                f"{boundary} accelerator_type {accelerator_type!r} is a {expected_kind} type, "
+                f"but capacity and allocatable advertise {kind}"
+            )
+        if normalized_backend in {"gcp-tpu", "tpu"} and kind != "tpu":
+            raise ValueError(f"{boundary} capacity_backend {capacity_backend!r} requires tpu resources, not {kind}")
+        if normalized_backend in {"gcp-compute", "compute"} and kind == "tpu":
+            integrated_tpu = shape is not None and shape.capacity_backend in {"gcp-compute", "compute"}
+            if not integrated_tpu:
+                raise ValueError(
+                    f"{boundary} capacity_backend {capacity_backend!r} cannot provision TPU type "
+                    f"{accelerator_type!r}; use gcp-tpu/gcp or a cataloged gcp-compute TPU shape"
+                )
+        if shape is not None:
+            expected_count = shape.chips
+            for field_name, resources in (("capacity", capacity), ("allocatable", allocatable)):
+                if getattr(resources, shape.kind) != expected_count:
+                    raise ValueError(
+                        f"{boundary} {field_name}.{shape.kind} must equal catalog count {expected_count} "
+                        f"for {shape.accelerator_type!r}"
+                    )
+
+
 __all__: tp.Final = (
     "CATALOG_PATH",
     "SUPPORTED_CATALOG_VERSION",
@@ -237,4 +384,5 @@ __all__: tp.Final = (
     "hardware_catalog",
     "load_hardware_catalog",
     "shape_for",
+    "validate_accelerator_write_boundary",
 )

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -284,10 +285,17 @@ class AutoscaleDefaults:
 
 @dataclass(frozen=True, slots=True)
 class TpuProfile:
-    """One Eyvan-tested complete TPU worker shape."""
+    """One complete TPU worker shape with all host admission resources.
+
+    Discovered accelerator names and quota suffixes establish only TPU count;
+    they do not establish a host's CPU or RAM. Callers constructing a profile
+    outside the shipped catalog must therefore provide positive memory
+    explicitly rather than inheriting a zero or guessed fallback.
+    """
 
     accelerator_type: str
     cpu: int
+    memory_gib: float
     tpu: int
 
     def __post_init__(self) -> None:
@@ -295,6 +303,13 @@ class TpuProfile:
             raise ValueError(f"unsupported TPU accelerator type {self.accelerator_type!r}")
         if isinstance(self.cpu, bool) or not isinstance(self.cpu, int) or self.cpu <= 0:
             raise ValueError("cpu must be a positive integer")
+        if (
+            isinstance(self.memory_gib, bool)
+            or not isinstance(self.memory_gib, int | float)
+            or not math.isfinite(self.memory_gib)
+            or self.memory_gib <= 0
+        ):
+            raise ValueError("memory_gib must be a positive number")
         if isinstance(self.tpu, bool) or not isinstance(self.tpu, int) or self.tpu <= 0:
             raise ValueError("tpu must be a positive integer")
 

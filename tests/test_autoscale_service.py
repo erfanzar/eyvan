@@ -100,9 +100,12 @@ def test_generation_service_groups_zone_profiles_and_persists_typed_result(tmp_p
     )
 
     assert [entry.config.name for entry in result.entries] == ["research-us-east5-a"]
-    assert sorted(result.entries[0].config.pools) == ["v5p-16", "v5p-512", "v6e-64"]
+    assert sorted(result.entries[0].config.pools) == ["v5p-16"]
     assert result.entries[0].config.pools["v5p-16"].quota_group == "gcp-tpu-spot:project-a:us-east5-a:v5p"
-    assert result.entries[0].config.pools["v6e-64"].max_cells == 8
+    assert [(item.reason, item.generation, item.type_count) for item in result.skipped] == [
+        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v5p", 1),
+        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v6e", 1),
+    ]
     assert result.cached is True
     assert [entry.config.name for entry in cache.list()] == ["research-us-east5-a"]
     rendered_quotas = _json_array(result.as_dict()["quota"])
@@ -198,11 +201,13 @@ def test_generation_service_omits_only_the_exact_cached_queue_admission_denial(t
         persist=False,
     )
 
-    assert [entry.config.name for entry in result.entries] == ["research-us-east5-a"]
-    assert sorted(result.entries[0].config.pools) == ["v6e-32"]
+    assert result.entries == ()
     assert [
         (candidate.reason, candidate.generation, candidate.zone, candidate.type_count) for candidate in result.skipped
-    ] == [(AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL, "v6e", "us-east5-a", 1)]
+    ] == [
+        (AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL, "v6e", "us-east5-a", 1),
+        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v6e", "us-east5-a", 1),
+    ]
 
 
 def test_generation_service_groups_oversized_catalog_types_and_hides_them_from_json(tmp_path) -> None:
@@ -222,13 +227,13 @@ def test_generation_service_groups_oversized_catalog_types_and_hides_them_from_j
         persist=False,
     )
 
-    assert sorted(result.entries[0].config.pools) == ["v5p-16", "v5p-3968"]
+    assert sorted(result.entries[0].config.pools) == ["v5p-16"]
     assert [(candidate.reason, candidate.generation, candidate.type_count) for candidate in result.skipped] == [
         (AutoscaleSkipReason.COMPUTE_BACKED_TPU_VM, "v5p", 1),
-        (AutoscaleSkipReason.SHARED_SPOT_QUOTA_TOO_SMALL, "v5p", len(oversized)),
+        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v5p", len(oversized) + 1),
     ]
     payload = result.as_dict()
-    assert [_json_object(entry)["accelerator_type"] for entry in _json_array(payload["quota"])] == ["v5p-16", "v5p-3968"]
+    assert [_json_object(entry)["accelerator_type"] for entry in _json_array(payload["quota"])] == ["v5p-16"]
     skipped = _json_array(payload["skipped"])
     assert len(skipped) == 2
     assert all("accelerator_type" not in _json_object(entry) for entry in skipped)

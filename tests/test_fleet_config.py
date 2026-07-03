@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
-from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.capacity.fleet_config import EyvanFleetConfig, GpuNodeType, TpuNodeType
 from eyvan.server.api.schemas import FleetApplyRequest
 
 
@@ -192,7 +192,7 @@ def test_native_compute_fleet_uses_the_default_worker_identity_and_requires_boot
         "cpu": {
             "kind": "cpu",
             "machine_type": "n2-standard-8",
-            "resources": {"cpu": 8},
+            "resources": {"cpu": 8, "memory_gib": 32},
         }
     }
     raw["executor"] = "eyvan-native"
@@ -253,7 +253,7 @@ def test_public_tpu_pool_compiles_one_slice_per_worker_and_normalizes_resource_k
 
     assert pool["capacity_backend"] == "gcp-tpu"
     assert pool["node_type"] == "v5p-16"
-    assert pool["capacity"] == {"cpu": 32.0, "memory_gib": 0.0, "gpu": 0, "tpu": 8, "custom": {}}
+    assert pool["capacity"] == {"cpu": 32.0, "memory_gib": 448.0, "gpu": 0, "tpu": 8, "custom": {}}
     assert pool["min_cells"] == 4
     assert pool["initial_cells"] == 4
     assert pool["max_cells"] == 10_000
@@ -502,6 +502,31 @@ def test_v5p_8_non_compute_backend_does_not_receive_compute_options(capacity_bac
     assert pool["provider_options"] == {"runtime_version": "tpu-ubuntu2204-base"}
 
 
+def test_programmatic_gpu_node_rejects_partial_allocatable_without_gpu() -> None:
+    """A typed node must not compile CPU/RAM-only allocatable GPU capacity."""
+
+    with pytest.raises(ValidationError, match=r"allocatable\.gpu > 0"):
+        GpuNodeType(
+            kind="gpu",
+            accelerator_type="nvidia-l4",
+            machine_type="g2-standard-8",
+            resources={"cpu": 8, "memory_gib": 32, "gpu": 1},
+            allocatable={"cpu": 8, "memory_gib": 32},
+        )
+
+
+def test_programmatic_tpu_node_rejects_partial_allocatable_without_tpu() -> None:
+    """The uncatalogued TPU escape hatch requires both complete vectors."""
+
+    with pytest.raises(ValidationError, match=r"allocatable\.tpu > 0"):
+        TpuNodeType(
+            kind="tpu",
+            accelerator_type="v5p-64",
+            resources={"cpu": 64, "memory_gib": 256, "tpu": 32},
+            allocatable={"cpu": 64, "memory_gib": 256},
+        )
+
+
 @pytest.mark.parametrize(
     ("node", "message"),
     [
@@ -529,7 +554,7 @@ def test_v5p_8_non_compute_backend_does_not_receive_compute_options(capacity_bac
             {
                 "kind": "cpu",
                 "machine_type": "n2-standard-8",
-                "resources": {"cpu": 8},
+                "resources": {"cpu": 8, "memory_gib": 32},
                 "min_cells": 2,
                 "max_cells": 1,
             },
