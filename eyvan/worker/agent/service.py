@@ -189,6 +189,7 @@ class CellAgentService:
             detail=value.detail,
             metadata=value.metadata,
             observed_tpu_vms=value.observed_tpu_vms,
+            runtime_process_count=value.runtime_process_count,
             failure_code=value.failure_code,
         )
 

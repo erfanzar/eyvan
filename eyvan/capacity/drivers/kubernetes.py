@@ -259,6 +259,7 @@ class KubernetesCapacityDriver:
             observed_at=datetime.now(UTC),
             metadata=metadata,
             observed_tpu_vms=declared if endpoints else None,
+            runtime_process_count=len(endpoints) if endpoints else None,
         )
 
     # ---- lifecycle ----------------------------------------------------------

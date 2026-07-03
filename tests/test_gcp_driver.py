@@ -605,6 +605,7 @@ def test_reconcile_persists_native_worker_endpoints_and_observed_tpu_vm_count(tm
             execution_endpoint="http://10.0.0.2:8100",
             worker_endpoints=("http://10.0.0.2:8100", "http://10.0.0.3:8100"),
             observed_tpu_vms=2,
+            runtime_process_count=2,
         ),
     ]
     _state, _, driver = make_driver(tmp_path, provider)
@@ -618,6 +619,13 @@ def test_reconcile_persists_native_worker_endpoints_and_observed_tpu_vm_count(tm
     ]
     assert observation.observed_tpu_vms == 2
     assert observation.metadata["observed_tpu_vms"] == 2
+    assert observation.runtime_process_count == 2
+    assert observation.metadata["runtime_process_count"] == 2
+
+    provider.reports = [ProviderObservation(CapacityStatus.UNAVAILABLE, "one host disappeared")]
+    lost = driver.reconcile("cell", context("reconcile-after-loss"))
+    assert lost.runtime_process_count == 2
+    assert lost.observed_tpu_vms is None
 
 
 @pytest.mark.parametrize(

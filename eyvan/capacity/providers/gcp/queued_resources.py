@@ -378,6 +378,7 @@ class ProviderObservation:
     execution_endpoint: str | None = None
     worker_endpoints: tuple[str, ...] = ()
     observed_tpu_vms: int | None = None
+    runtime_process_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -961,6 +962,7 @@ class GcloudTpuProvider:
                 execution_endpoint=endpoints[0] if native else None,
                 worker_endpoints=endpoints if native else (),
                 observed_tpu_vms=len(endpoints),
+                runtime_process_count=len(endpoints),
             )
         return self._queued_resource_observation(qr)
 

@@ -194,6 +194,9 @@ class AgentObservation(AgentModel):
     detail: str = ""
     metadata: WireJsonObject = Field(default_factory=dict)
     observed_tpu_vms: int | None = Field(default=None, ge=1)
+    # Optional for rolling compatibility with agents that predate durable log
+    # rank width. The controller retains the last exact value when it is absent.
+    runtime_process_count: int | None = Field(default=None, ge=1, le=10_000)
     #: Typed reason for a non-ready state, carried beside the human-readable
     #: ``detail``. Optional so an agent that predates it still validates.
     failure_code: CapacityProviderFailureCode | None = None

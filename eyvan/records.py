@@ -1190,6 +1190,14 @@ class CellRecord(EyvanModel):
     provider_phase: CapacityStatus | None = None
     provider_failure_code: CapacityProviderFailureCode | None = None
     observed_tpu_vms: int | None = Field(default=None, ge=1)
+    #: Durable width of this cell in runtime/native-worker/JAX processes.
+    #:
+    #: ``worker_count`` counts allocation units (TPU slices). A v5p-16 cell with
+    #: one allocated slice has ``worker_count == 1`` but two runtime processes.
+    #: Log rank offsets must survive a lost endpoint, so they use this persisted
+    #: provider-observed width rather than recounting whichever endpoints answer
+    #: a later request. One is the backward-compatible single-host default.
+    runtime_process_count: int = Field(default=1, ge=1, le=10_000, strict=True)
     #: Named assets this cell's agent reports are materialized on local disk.
     #:
     #: A *stronger* locality signal than lease history, which infers presence
@@ -1252,19 +1260,32 @@ class CellRecord(EyvanModel):
 
     @model_validator(mode="before")
     @classmethod
-    def upgrade_legacy_worker_count(cls, value: tp.Any) -> tp.Any:
-        """Restore the worker count omitted by records written before that field existed."""
+    def upgrade_legacy_runtime_widths(cls, value: tp.Any) -> tp.Any:
+        """Restore fields omitted by older durable cell documents.
 
-        if not is_json_object(value) or "worker_count" in value:
+        Healthy TPU records already carried the provider-observed VM count, and
+        manual records carried their declared endpoint list. Reusing those
+        durable observations preserves an exact rank width across an upgrade;
+        records without either remain safely readable as single-host cells.
+        """
+
+        if not is_json_object(value):
             return value
-        provider_options = value.get("provider_options")
-        if not is_json_object(provider_options) or "node_count" not in provider_options:
-            return value
-        node_count = provider_options["node_count"]
-        if isinstance(node_count, bool) or not isinstance(node_count, int) or node_count < 1:
-            raise ValueError("GCP TPU provider_options.node_count must be a positive integer")
         upgraded = dict(value)
-        upgraded["worker_count"] = node_count
+        provider_options = value.get("provider_options")
+        if "worker_count" not in value and is_json_object(provider_options) and "node_count" in provider_options:
+            node_count = provider_options["node_count"]
+            if isinstance(node_count, bool) or not isinstance(node_count, int) or node_count < 1:
+                raise ValueError("GCP TPU provider_options.node_count must be a positive integer")
+            upgraded["worker_count"] = node_count
+        if "runtime_process_count" not in value:
+            observed = value.get("observed_tpu_vms")
+            if isinstance(observed, int) and not isinstance(observed, bool) and observed > 0:
+                upgraded["runtime_process_count"] = observed
+            elif value.get("provider") == "manual" and is_json_object(provider_options):
+                hosts = provider_options.get("hosts")
+                if isinstance(hosts, list) and hosts:
+                    upgraded["runtime_process_count"] = len(hosts)
         return upgraded
 
     @model_validator(mode="after")

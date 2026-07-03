@@ -420,6 +420,7 @@ def test_a_ready_cell_publishes_one_endpoint_per_worker(tmp_path) -> None:
 
     assert observation.state is CapacityStatus.HEALTHY
     assert len(observation.metadata["native_worker_endpoints"]) == 2
+    assert observation.runtime_process_count == 2
 
 
 def test_endpoints_are_withheld_until_every_worker_is_ready(tmp_path) -> None:
@@ -435,6 +436,7 @@ def test_endpoints_are_withheld_until_every_worker_is_ready(tmp_path) -> None:
 
     assert observation.state is CapacityStatus.PROVISIONING
     assert observation.metadata["native_worker_endpoints"] == []
+    assert observation.runtime_process_count is None
 
 
 def test_the_management_uid_is_derived_and_includes_the_namespace(tmp_path) -> None:

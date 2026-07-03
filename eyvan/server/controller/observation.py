@@ -61,6 +61,9 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
 )
 from eyvan.worker.runtime.log_records import (
+    LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
+    LOG_ARCHIVE_MANIFEST_KEY,
+    LOG_ARCHIVE_MANIFEST_VERSION,
     LogPage,
     LogRecord,
     log_page_from_json,
@@ -73,34 +76,71 @@ from eyvan.worker.runtime.log_records import (
     split_log_cursor as _split_log_cursor,
 )
 
-#: How many ranks an archive read probes before concluding the set has ended.
-#: Bounded because a miss costs a storage round trip, and a gang wider than this
-#: would have failed the multislice ceiling long before it got here.
-_ARCHIVED_RANK_SCAN_LIMIT = 64
+#: How many contiguous ranks a pre-manifest archive read probes. New archives
+#: carry their exact rank set and do not use this compatibility ceiling.
+_ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 
 
-def _log_page_from_document(payload: JsonObject, *, rank: int) -> LogPage:
-    """Rebuild a page from one agent's JSON, stamping the rank it came from.
+def _log_page_from_document(payload: JsonObject, *, rank: int, runtime_process_count: int = 1) -> LogPage:
+    """Rebuild one cell page and translate its local ranks into global ranks.
 
-    The agent does not know its own rank -- it knows a cell -- so attribution is
-    applied here, where the gang's ordering is known.
+    ``rank`` is the cell's first global rank. A multi-host runtime already
+    attributes records to its inner host, so replacing every record with the
+    outer cell index collapses all hosts in that cell into one identity. Ordered
+    cells plus each durable ``runtime_process_count`` instead define a stable
+    flattened rank space: ``global = cell_offset + local``. Truncated inner ranks
+    use the same mapping.
 
     Decoding is delegated rather than repeated. This function used to build
     ``LogRecord`` itself and omitted ``timestamp`` entirely, so every record read
-    over the wire arrived without one. That is worse than a missing column:
-    ``merge_pages`` orders by ``(timestamp or _EPOCH, rank)``, so with every
-    timestamp ``None`` a multi-host page collapsed to rank order and the
-    chronological interleaving that per-rank attribution exists to produce was
-    silently gone.
+    over the wire arrived without one and chronological interleaving was lost.
+
+    A response containing an out-of-range local rank is partial, not merely
+    malformed decoration: advancing its nested cursor would permanently skip the
+    dropped line. The whole cell is marked truncated and its position is retained
+    so a corrected retry can replay it.
     """
 
+    if runtime_process_count < 1:
+        raise ValueError("structured log runtime process count must be positive")
     page = log_page_from_json(payload)
+    records: list[LogRecord] = []
+    malformed_rank = False
+    for record in page.records:
+        local_rank = record.rank
+        if (
+            isinstance(local_rank, bool)
+            or not isinstance(local_rank, int)
+            or not 0 <= local_rank < runtime_process_count
+        ):
+            malformed_rank = True
+            continue
+        records.append(replace(record, rank=rank + local_rank))
+
+    truncated: set[int] = set()
+    for local_rank in page.truncated_ranks:
+        if (
+            isinstance(local_rank, bool)
+            or not isinstance(local_rank, int)
+            or not 0 <= local_rank < runtime_process_count
+        ):
+            malformed_rank = True
+            continue
+        truncated.add(rank + local_rank)
+    expected = set(range(rank, rank + runtime_process_count))
+    if page.unavailable and not truncated:
+        truncated.update(expected)
+    detail = page.detail
+    if malformed_rank:
+        truncated.update(expected)
+        invalid_detail = "cell returned a log rank outside its durable runtime process width"
+        detail = f"{detail}; {invalid_detail}" if detail else invalid_detail
     return LogPage(
-        records=tuple(replace(record, rank=rank) for record in page.records),
-        next_cursor=page.next_cursor,
+        records=tuple(records),
+        next_cursor="" if malformed_rank or page.unavailable else page.next_cursor,
         unavailable=page.unavailable,
-        detail=page.detail,
-        truncated_ranks=page.truncated_ranks,
+        detail=detail,
+        truncated_ranks=tuple(sorted(truncated)),
     )
 
 
@@ -726,6 +766,9 @@ class _ControllerObservation:
             cell.unavailable_reason if provider_failure_code is not None else "agent_unreachable"
         )
         observed_tpu_vms: int | None = None
+        # Runtime width is durable. A provider error or a currently unreachable
+        # host must not collapse it and shift every later cell's log ranks.
+        runtime_process_count = cell.runtime_process_count
         try:
             mutation = MutationModel(
                 idempotency_key=f"reconcile:{cell.id}:{cell.generation}",
@@ -788,6 +831,9 @@ class _ControllerObservation:
             provider_detail = observation.detail or None
             remote_state = observation.state
             observed_tpu_vms = observation.observed_tpu_vms
+            reported_runtime_process_count = observation.runtime_process_count or observation.observed_tpu_vms
+            if reported_runtime_process_count is not None:
+                runtime_process_count = reported_runtime_process_count
             reported_failure_code = observation.failure_code
             materialized_assets = _reported_assets(observation.metadata)
             if observation.generation != cell.generation and remote_state not in DEFINITIVE_CAPACITY_LOSS_STATUSES:
@@ -853,6 +899,7 @@ class _ControllerObservation:
                     "provider_phase": remote_state,
                     "provider_failure_code": provider_failure_code,
                     "observed_tpu_vms": observed_tpu_vms,
+                    "runtime_process_count": runtime_process_count,
                     "materialized_assets": materialized_assets,
                     "provider_phase_started_at": phase_started_at,
                     "unavailable_reason": unavailable_reason,
@@ -1051,10 +1098,11 @@ class _ControllerObservation:
     ) -> JsonObject:
         """Return one resumable page of structured logs for a workload attempt.
 
-        The cursor is opaque to the control plane except for one thing it must
-        know: which attempt produced it. ``after`` is ``"{attempt}:{cursor}"``,
-        and a cursor from a previous attempt is *not* resumed from -- it is
-        reported as a change and the read restarts.
+        The cursor is a versioned opaque document carrying the attempt and one
+        backend position per ordered cell. A multi-host cell's position is
+        itself opaque and may contain another fan-out cursor. A cursor from a
+        previous attempt is not resumed from: the read restarts and reports the
+        attempt change.
 
         Silently continuing is the failure that matters here. A retry replaces
         the remote execution entirely, so the old cursor means nothing to the
@@ -1097,28 +1145,41 @@ class _ControllerObservation:
         # makes rank N the same host on every read.
         ordered = self._ordered_gang_member_pairs(members) if len(members) > 1 else tuple(members)
         pages: dict[int, LogPage] = {}
-        for rank, (_lease, cell) in enumerate(ordered):
+        advanced: dict[int, str] = {}
+        global_rank = 0
+        for cell_index, (_lease, cell) in enumerate(ordered):
             try:
                 payload = await asyncio.to_thread(
                     self._agent_factory(cell).log_page,
                     cell.id,
                     workload.remote_id,
-                    # This rank's own position. Handing it another rank's cursor
-                    # would ask journald to resume from an entry it never wrote.
-                    after=cursors.get(rank, ""),
+                    # The outer cursor addresses cells. A multi-host cell's value
+                    # is itself an opaque cursor addressing each inner journal.
+                    after=cursors.get(cell_index, ""),
                     limit=limit,
                 )
             except Exception as exc:
-                # One unreachable rank must not blank the ranks that answered.
-                # ``merge_pages`` reports it in place, which is the whole reason
-                # ``LogPage`` distinguishes "unavailable" from "empty".
-                pages[rank] = LogPage(unavailable=True, detail=str(exc))
-                continue
-            pages[rank] = _log_page_from_document(payload, rank=rank)
-        # Captured before the merge, which deliberately drops them: there is no
-        # single cursor for a slice, so the per-rank positions are what a
-        # follower needs back.
-        advanced = {rank: page.next_cursor or cursors.get(rank, "") for rank, page in pages.items()}
+                # The cell boundary failed before its inner ranks could answer;
+                # every declared host is therefore explicitly truncated.
+                page = LogPage(
+                    unavailable=True,
+                    detail=str(exc),
+                    truncated_ranks=tuple(range(global_rank, global_rank + cell.runtime_process_count)),
+                )
+            else:
+                page = _log_page_from_document(
+                    payload,
+                    rank=global_rank,
+                    runtime_process_count=cell.runtime_process_count,
+                )
+            pages[global_rank] = page
+            # A cell that produced no new lines (or is temporarily unreachable)
+            # must keep its previous nested position. Dropping it would replay
+            # every inner journal in that cell on the next poll.
+            position = page.next_cursor or cursors.get(cell_index, "")
+            if position:
+                advanced[cell_index] = position
+            global_rank += cell.runtime_process_count
         return _log_page_document(
             merge_pages(pages) if pages else LogPage(),
             attempt=workload.attempt,
@@ -1129,49 +1190,110 @@ class _ControllerObservation:
     async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
         """Read one attempt's archived logs back out of managed storage.
 
-        Returns an ``unavailable`` page rather than an empty one when the
-        archive cannot be read: after a cell is released there is no other
-        source, so "nothing here" and "could not look" are the difference
-        between a job that printed nothing and one whose record was lost.
+        New archives carry a manifest in rank zero. It records the exact sparse
+        global-rank set and which ranks were unavailable at collection time, so
+        replay does not turn a partial live read into a complete-looking one.
+        Archives written before the manifest remain readable through the former
+        contiguous-rank scan.
         """
 
         if self.artifact_access is None:
             return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
-        records: list[LogRecord] = []
-        found = False
-        for rank in range(_ARCHIVED_RANK_SCAN_LIMIT):
-            try:
-                payload = await asyncio.to_thread(
-                    self.artifact_access.store.get,
-                    log_uri(workload.id, workload.attempt, rank),
-                    org_id=workload.org_id,
-                    project_id=workload.project_id,
-                )
-            except Exception:
-                # Absent rather than unreadable: ranks are archived contiguously
-                # from zero, so the first gap is the end of the set.
-                break
-            found = True
+
+        async def read_rank(rank: int) -> bytes:
+            return await asyncio.to_thread(
+                self.artifact_access.store.get,
+                log_uri(workload.id, workload.attempt, rank),
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+            )
+
+        try:
+            first_payload = await read_rank(0)
+        except Exception:
+            return LogPage(unavailable=True, detail="this attempt has no archived logs")
+
+        def entries(payload: bytes) -> list[object]:
+            decoded: list[object] = []
             for line in payload.decode(errors="replace").splitlines():
                 if not line.strip():
                     continue
                 try:
-                    entry = json.loads(line)
+                    decoded.append(json.loads(line))
                 except ValueError:
                     continue
-                if isinstance(entry, dict):
-                    records.append(
-                        LogRecord(
-                            message=str(entry.get("message", "")),
-                            stream=str(entry.get("stream", "unknown")),  # type: ignore[arg-type]
-                            cursor=str(entry.get("cursor", "")),
-                            rank=rank,
-                            pid=entry.get("pid") if isinstance(entry.get("pid"), int) else None,
-                        )
-                    )
-        if not found:
-            return LogPage(unavailable=True, detail="this attempt has no archived logs")
-        return LogPage(records=tuple(records), detail="archived")
+            return decoded
+
+        first_entries = entries(first_payload)
+        manifest: JsonObject | None = None
+        record_entries: dict[int, list[JsonObject]] = {0: []}
+        for entry in first_entries:
+            if (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and entry[0] == LOG_ARCHIVE_MANIFEST_KEY
+                and isinstance(entry[1], dict)
+                and entry[1].get("version") == LOG_ARCHIVE_MANIFEST_VERSION
+            ):
+                manifest = entry[1]
+            elif isinstance(entry, dict):
+                record_entries[0].append(entry)
+
+        truncated: set[int] = set()
+        unavailable = False
+        missing_archives: list[int] = []
+        if manifest is not None:
+            raw_ranks = manifest.get("ranks")
+            raw_truncated = manifest.get("truncated_ranks")
+            ranks = {
+                rank
+                for rank in (raw_ranks if isinstance(raw_ranks, list) else [])
+                if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0
+            }
+            truncated.update(
+                rank
+                for rank in (raw_truncated if isinstance(raw_truncated, list) else [])
+                if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0
+            )
+            # A writer declares every real or truncated rank in ``ranks``. Union
+            # here as rolling compatibility with an early manifest that named a
+            # truncated rank only in the dedicated field; if its object contains
+            # surviving lines they must still be replayed.
+            ranks.update(truncated)
+            unavailable = bool(manifest.get("unavailable"))
+            for rank in sorted(ranks - {0}):
+                try:
+                    record_entries[rank] = [entry for entry in entries(await read_rank(rank)) if isinstance(entry, dict)]
+                except Exception:
+                    # The manifest says this rank existed. Losing its object is
+                    # therefore explicit truncation, not the end of a contiguous
+                    # scan and not a silent empty rank.
+                    truncated.add(rank)
+                    missing_archives.append(rank)
+        else:
+            # Legacy archives had no manifest and wrote ranks contiguously from
+            # zero. Retain that decoder so already-terminal workloads remain
+            # readable after the control plane is upgraded.
+            for rank in range(1, _ARCHIVED_RANK_SCAN_LIMIT):
+                try:
+                    record_entries[rank] = [entry for entry in entries(await read_rank(rank)) if isinstance(entry, dict)]
+                except Exception:
+                    break
+
+        archived_pages: dict[int, LogPage] = {}
+        for rank, archived_entries in sorted(record_entries.items()):
+            page = log_page_from_json({"records": archived_entries})
+            archived_pages[rank] = LogPage(records=tuple(replace(record, rank=rank) for record in page.records))
+        records = merge_pages(archived_pages).records
+        detail = "archived"
+        if missing_archives:
+            detail += "; rank archives could not be read: " + ", ".join(str(rank) for rank in missing_archives)
+        return LogPage(
+            records=tuple(records),
+            unavailable=(unavailable or bool(truncated)) and not records,
+            detail=detail,
+            truncated_ranks=tuple(sorted(truncated)),
+        )
 
     async def workload_exec(
         self,

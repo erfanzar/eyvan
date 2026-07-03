@@ -286,6 +286,10 @@ class CellObservation:
     observed_at: datetime | None = None
     metadata: JsonObject = field(default_factory=dict)
     observed_tpu_vms: int | None = None
+    #: Stable number of runtime/JAX processes exposed by this cell. This is not
+    #: ``worker_count``: the latter counts allocated slices, while one TPU slice
+    #: can expose several native-worker endpoints.
+    runtime_process_count: int | None = None
     #: Why the provider is in a non-ready state, when it said something specific.
     #: A code that arrives only on a *raised* provider error is a code that never
     #: describes a successful observation -- and a spot preemption is a

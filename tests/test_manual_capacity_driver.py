@@ -64,6 +64,7 @@ def test_multi_host_cell_publishes_worker_endpoints_for_slice_execution(tmp_path
     )
 
     assert applied.metadata["native_worker_endpoints"] == ["http://host-a:8100", "http://host-b:8100"]
+    assert applied.runtime_process_count == 2
 
 
 def test_management_uid_is_derived_so_worker_tokens_stay_stable(tmp_path) -> None:

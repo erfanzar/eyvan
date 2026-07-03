@@ -927,6 +927,7 @@ class GcloudComputeProvider:
                 "Compute instance is running",
                 head_ip=head_ip,
                 execution_endpoint=self._execution_endpoint(record, head_ip),
+                runtime_process_count=1,
             )
         if instance.status is GcpComputeInstanceStatus.RUNNING:
             return ProviderObservation(

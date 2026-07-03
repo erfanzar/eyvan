@@ -13,7 +13,7 @@ import uuid
 from collections import Counter
 from datetime import timedelta
 
-from eyvan._internal.json_types import JsonObject
+from eyvan._internal.json_types import JsonObject, JsonValue
 from eyvan.artifacts.managed import ManagedArtifactKind, log_uri
 from eyvan.capacity import (
     CapacityStatus,
@@ -50,11 +50,17 @@ from eyvan.server.service.errors import AuthorizationError, ConflictError, Input
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
 from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, plan_service, service_policy
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.worker.runtime.log_records import (
+    LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
+    LOG_ARCHIVE_MANIFEST_KEY,
+    LOG_ARCHIVE_MANIFEST_VERSION,
+)
 
-#: Lines archived per attempt. A ceiling rather than everything, because the
-#: archive is written inside the release path: an unbounded read would make
+#: Lines archived per runtime rank. A ceiling rather than everything, because
+#: the archive is written inside the release path: an unbounded read would make
 #: settling a chatty job slow enough to matter, and the last lines are what
-#: explain a failure. Truncation is visible -- the page reports it.
+#: explain a failure. One extra line is requested so hitting the ceiling can be
+#: distinguished from exceeding it and truncation is explicit in the manifest.
 _LOG_ARCHIVE_LINE_LIMIT = 1000
 
 
@@ -109,23 +115,66 @@ class _ControllerSettlement:
         if self.artifact_access is None or workload.remote_id is None:
             return
         try:
-            page = await self.workload_log_page(workload.id, limit=_LOG_ARCHIVE_LINE_LIMIT)
+            page = await self.workload_log_page(workload.id, limit=_LOG_ARCHIVE_LINE_LIMIT + 1)
         except Exception:
             logger.warning("could not read logs for %s before release", workload.id, exc_info=True)
             return
         records = page.get("records")
-        if not isinstance(records, list) or not records:
+        if not isinstance(records, list):
             return
         by_rank: dict[int, list[JsonObject]] = {}
         for entry in records:
             if not isinstance(entry, dict):
                 continue
             rank = entry.get("rank")
-            by_rank.setdefault(rank if isinstance(rank, int) else 0, []).append(entry)
-        for rank, lines in sorted(by_rank.items()):
-            # One object per rank, JSON lines: the same shape the live page
-            # returns, so a reader does not need a second parser for archived
-            # logs than for streaming ones.
+            global_rank = rank if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0 else 0
+            by_rank.setdefault(global_rank, []).append(entry)
+        raw_truncated = page.get("truncated_ranks")
+        truncated = {
+            rank
+            for rank in (raw_truncated if isinstance(raw_truncated, list) else [])
+            if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0
+        }
+        # The provider was asked for one sentinel line beyond the advertised
+        # ceiling. Trim independently per global rank so one chatty process does
+        # not consume every other rank's diagnostic tail. Keep the last lines:
+        # they are the ones nearest the terminal failure this archive explains.
+        for rank, lines in by_rank.items():
+            if len(lines) > _LOG_ARCHIVE_LINE_LIMIT:
+                by_rank[rank] = lines[-_LOG_ARCHIVE_LINE_LIMIT:]
+                truncated.add(rank)
+
+        archived_ranks = sorted(set(by_rank) | truncated)
+        manifest_ranks: list[JsonValue] = list(archived_ranks)
+        manifest_truncated: list[JsonValue] = list(sorted(truncated))
+        manifest_body: JsonObject = {
+            "version": LOG_ARCHIVE_MANIFEST_VERSION,
+            "ranks": manifest_ranks,
+            "truncated_ranks": manifest_truncated,
+            "unavailable": bool(page.get("unavailable")),
+            "line_limit_per_rank": _LOG_ARCHIVE_LINE_LIMIT,
+        }
+        # A JSON array rather than a record-shaped object keeps old readers
+        # compatible: their archive decoder ignores non-object lines instead of
+        # rendering the manifest as a blank log message during a rolling upgrade.
+        manifest: JsonValue = [LOG_ARCHIVE_MANIFEST_KEY, manifest_body]
+        # Rank zero always carries the manifest, even when the workload emitted
+        # no lines or rank zero itself was unreachable. That distinguishes a
+        # successfully archived empty page from a missing archive and lets replay
+        # find sparse ranks without guessing where the first gap means "end".
+        #
+        # Old readers scan contiguously and stop at the first gap. Bridge gaps
+        # only as far as a real rank they can actually reach inside their fixed
+        # compatibility window. Sparse high ranks are written directly because
+        # the manifest names them; writing every intervening empty object would
+        # make one corrupt/high rank an O(max_rank) release operation.
+        legacy_visible = [rank for rank in archived_ranks if rank < LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT]
+        compatibility_ranks = set(range(max(legacy_visible) + 1)) if legacy_visible else {0}
+        write_ranks = sorted({0, *archived_ranks, *compatibility_ranks})
+        for rank in write_ranks:
+            lines: list[JsonValue] = list(by_rank.get(rank, ()))
+            if rank == 0:
+                lines.insert(0, manifest)
             payload = "\n".join(json.dumps(line, sort_keys=True) for line in lines).encode()
             uri = log_uri(workload.id, workload.attempt, rank)
             try:

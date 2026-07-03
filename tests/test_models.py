@@ -113,6 +113,26 @@ def test_cell_legacy_worker_count_upgrade_rejects_invalid_node_counts(node_count
         CellRecord.model_validate(_legacy_multislice_cell(node_count))
 
 
+def test_legacy_cell_runtime_width_uses_durable_observation_or_safe_single_host_default() -> None:
+    observed = _legacy_multislice_cell()
+    observed["observed_tpu_vms"] = 4
+    assert CellRecord.model_validate(observed).runtime_process_count == 4
+
+    unknown = _legacy_multislice_cell()
+    assert CellRecord.model_validate(unknown).runtime_process_count == 1
+
+    manual = {
+        "id": "manual-rack",
+        "provider": "manual",
+        "capacity_backend": "manual",
+        "region": "lab",
+        "capacity": {"cpu": 8},
+        "allocatable": {"cpu": 8},
+        "provider_options": {"hosts": ["http://host-a:8100", "http://host-b:8100"]},
+    }
+    assert CellRecord.model_validate(manual).runtime_process_count == 2
+
+
 def test_cell_legacy_worker_count_upgrade_does_not_override_explicit_conflict() -> None:
     payload = _legacy_multislice_cell()
     payload["worker_count"] = 3
