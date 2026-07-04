@@ -110,6 +110,7 @@ class ManualCapacityDriver:
             generation=record.generation,
             execution_endpoint=hosts[0] if len(hosts) == 1 else record.execution_endpoint,
             observed_at=datetime.now(UTC),
+            runtime_process_count=len(hosts) if hosts else 1,
             metadata={
                 "provider": self.provider_name,
                 "capacity_backend": self.provider_name,

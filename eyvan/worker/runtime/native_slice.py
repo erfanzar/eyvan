@@ -504,9 +504,10 @@ class NativeSliceExecutor:
     def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
         """Return one structured page covering every host in this slice.
 
-        The control plane fans out across *cells* and treats each as one rank. A
-        multi-host slice is one cell, so the hosts inside it have to be merged
-        here or a v5p-16 would report only whichever host answered first.
+        The control plane fans out across *cells*, while this layer exposes
+        every host's local rank inside one cell. The controller offsets those
+        local ranks into the workload's deterministic global rank space; without
+        this merge a v5p-16 would report only whichever host answered first.
 
         Each host resumes from its own position. A single cursor is meaningless
         to a journal that did not issue it, which is why `merge_pages` refuses to
@@ -532,9 +533,15 @@ class NativeSliceExecutor:
                 next_cursor=page.next_cursor,
                 unavailable=page.unavailable,
                 detail=page.detail,
+                truncated_ranks=(rank,) if page.truncated_ranks else (),
             )
-            if page.next_cursor:
-                next_cursors[rank] = page.next_cursor
+            # A backend legitimately returns no cursor when this poll produced
+            # no new lines. Keep the position it was asked from; dropping it
+            # would restart that host on the next outer poll and duplicate its
+            # tail. The same applies while a host is temporarily unreachable.
+            advanced = cursors.get(rank, "") if page.unavailable else (page.next_cursor or cursors.get(rank, ""))
+            if advanced:
+                next_cursors[rank] = advanced
         merged = merge_pages(pages)
         # ``merge_pages`` deliberately returns no cursor; the slice-level one is
         # the per-host positions joined, which is the only thing that can resume

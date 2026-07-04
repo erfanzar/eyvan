@@ -24,6 +24,7 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime.log_records import LogPage, join_log_cursor, merge_pages, split_log_cursor
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
@@ -528,6 +529,42 @@ class NativeGangExecutor:
                 logs = f"native worker log retrieval failed: {type(exc).__name__}: {exc}"
             sections.append(f"===== rank {rank} cell {worker.cell_id} {worker.endpoint} =====\n{logs}")
         return "\n".join(sections)
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        """Return one structured page across every globally ranked gang host.
+
+        Members are sorted by cell ID and flattened in endpoint order during
+        construction, the same order used to assign JAX process IDs. Log ranks
+        therefore describe the process that emitted a line rather than merely
+        the cell that happened to contain it.
+        """
+
+        _attempt, cursors = split_log_cursor(after)
+        pages: dict[int, LogPage] = {}
+        next_cursors: dict[int, str] = {}
+        for rank, worker in enumerate(self._workers):
+            try:
+                page = worker.executor.log_page(remote_id, after=cursors.get(rank, ""), limit=limit)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                page = LogPage(unavailable=True, detail=f"{type(exc).__name__}: {exc}")
+            pages[rank] = LogPage(
+                records=tuple(replace(record, rank=rank) for record in page.records),
+                next_cursor=page.next_cursor,
+                unavailable=page.unavailable,
+                detail=page.detail,
+                truncated_ranks=(rank,) if page.truncated_ranks else (),
+            )
+            advanced = cursors.get(rank, "") if page.unavailable else (page.next_cursor or cursors.get(rank, ""))
+            if advanced:
+                next_cursors[rank] = advanced
+        merged = merge_pages(pages)
+        return LogPage(
+            records=merged.records,
+            next_cursor=join_log_cursor(_attempt or 0, next_cursors),
+            unavailable=merged.unavailable,
+            detail=merged.detail,
+            truncated_ranks=merged.truncated_ranks,
+        )
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return per-cell process detail across every gang member."""

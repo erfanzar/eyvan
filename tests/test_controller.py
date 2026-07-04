@@ -96,6 +96,7 @@ class FakeAgent:
         self.releases = []
         self.capacity_state = CapacityStatus.HEALTHY
         self.observed_tpu_vms: int | None = None
+        self.runtime_process_count: int | None = None
         self.capacity_failure_code = None
         self.metadata: dict = {}
         self.remote_states: dict[str, ExecutionWorkloadStatus] = {}
@@ -107,6 +108,7 @@ class FakeAgent:
             state=self.capacity_state,
             generation=request.mutation.generation,
             observed_tpu_vms=self.observed_tpu_vms,
+            runtime_process_count=self.runtime_process_count,
         )
 
     def reconcile(self, cell_id, request):
@@ -115,6 +117,7 @@ class FakeAgent:
             state=self.capacity_state,
             generation=request.mutation.generation,
             observed_tpu_vms=self.observed_tpu_vms,
+            runtime_process_count=self.runtime_process_count,
             failure_code=self.capacity_failure_code,
             metadata=self.metadata,
         )
@@ -2601,13 +2604,24 @@ async def test_controller_advances_waiting_capacity_to_ready() -> None:
     assert waiting_cells[0].availability.success_evidence == 1
     fake_agent.capacity_state = CapacityStatus.HEALTHY
     fake_agent.observed_tpu_vms = 8
+    fake_agent.runtime_process_count = 8
 
     assert await controller.observe_cells_once() == 1
 
     _, cells, _, _ = await snapshot(repository)
     assert cells[0].state is CellState.READY
     assert cells[0].observed_tpu_vms == 8
+    assert cells[0].runtime_process_count == 8
     assert cells[0].last_heartbeat_at is not None
+
+    # A later loss yields no live endpoint set. The rank width remains the last
+    # exact provider observation rather than collapsing and renumbering logs.
+    fake_agent.capacity_state = CapacityStatus.UNAVAILABLE
+    fake_agent.observed_tpu_vms = None
+    fake_agent.runtime_process_count = None
+    assert await controller.observe_cells_once() == 1
+    _, lost_cells, _, _ = await snapshot(repository)
+    assert lost_cells[0].runtime_process_count == 8
 
 
 @pytest.mark.asyncio
@@ -2651,6 +2665,39 @@ async def test_metadata_capacity_update_does_not_reprovision_the_cell() -> None:
     _, cells, _, commands = await snapshot(repository)
     assert (cells[0].generation, cells[0].state, cells[0].capacity.tpu) == (1, CellState.READY, 32)
     assert [(command.generation, command.state) for command in commands] == [(1, OutboxState.SUCCEEDED)]
+
+
+@pytest.mark.asyncio
+async def test_metadata_update_preserves_provider_observed_runtime_process_count() -> None:
+    """A declarative update cannot reset active log rank width to legacy one."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    fake_agent = FakeAgent()
+    fake_agent.runtime_process_count = 2
+    controller = EyvanController(repository, service, agent_factory=lambda _cell: fake_agent)  # type: ignore[arg-type]
+    original = CellRecord(
+        id="cell-a",
+        provider="gcp",
+        provider_project="gcp-project-a",
+        region="us-central2",
+        zone="us-central2-b",
+        capacity=ResourceVector(tpu=8),
+        allocatable=ResourceVector(tpu=8),
+        accelerator_type="v5p-16",
+        endpoint="http://agent:8090",
+    )
+    await service.upsert_cell(principal(Role.FLEET_ADMIN), original, idempotency_key="cell-v1")
+    await controller.dispatch_outbox_once()
+
+    updated, _ = await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        original.model_copy(update={"unit_prices": {"tpu": 2.0}}),
+        idempotency_key="cell-v2",
+    )
+
+    assert updated.runtime_process_count == 2
+    assert updated.generation == 1
 
 
 @pytest.mark.asyncio

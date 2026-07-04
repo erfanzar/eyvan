@@ -23,6 +23,7 @@ structured logs" and "this workload printed nothing".
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -390,10 +391,11 @@ def _cursor_helpers():
         ("", (None, {})),
         ("3:0=abc", (3, {0: "abc"})),
         ("3:0=abc|1=def", (3, {0: "abc", 1: "def"})),
+        ("3:s=abc|journal=cursor", (3, {0: "s=abc|journal=cursor"})),
         ("abc", (None, {})),
         ("notanint:0=abc", (None, {})),
     ],
-    ids=["empty", "one-rank", "two-ranks", "no-attempt", "unparseable"],
+    ids=["empty", "one-rank", "two-ranks", "legacy-single-rank", "no-attempt", "unparseable"],
 )
 def test_a_cursor_carries_its_attempt_and_a_position_per_rank(value: str, expected: tuple) -> None:
     """One cursor cannot resume a slice.
@@ -418,7 +420,9 @@ def test_the_returned_cursor_carries_every_rank_and_the_attempt() -> None:
 
     page = document(LogPage(), attempt=4, cursors={0: "c9", 1: "c7"})
 
-    assert page["next_cursor"] == "4:0=c9|1=c7"
+    assert page["next_cursor"].startswith("eyvan-log-v2.")
+    assert "|" not in page["next_cursor"]
+    assert _split(page["next_cursor"]) == (4, {0: "c9", 1: "c7"})
     assert page["attempt"] == 4
 
 
@@ -427,7 +431,8 @@ def test_a_rank_that_reported_no_position_is_left_out_rather_than_sent_empty() -
 
     _split, document = _cursor_helpers()
 
-    assert document(LogPage(), attempt=2, cursors={0: "c1", 1: ""})["next_cursor"] == "2:0=c1"
+    encoded = document(LogPage(), attempt=2, cursors={0: "c1", 1: ""})["next_cursor"]
+    assert _split(encoded) == (2, {0: "c1"})
 
 
 def test_an_empty_page_returns_an_empty_cursor_rather_than_a_bare_attempt() -> None:
@@ -705,6 +710,187 @@ async def test_each_attempt_archives_separately(tmp_path) -> None:
     assert b"attempt two" in stored_second
 
 
+async def test_archive_overflow_is_trimmed_per_rank_and_replays_as_visibly_partial(tmp_path) -> None:
+    """The 1,001st line is a sentinel, not a line silently discarded."""
+
+    from eyvan.artifacts.managed import log_uri
+    from eyvan.server.controller.settlement import _LOG_ARCHIVE_LINE_LIMIT
+
+    class _ChattyAgent:
+        def __init__(self) -> None:
+            self.requested_limits: list[int] = []
+
+        def log_page(self, _cell_id, _remote_id, *, after="", limit=200):
+            assert after == ""
+            self.requested_limits.append(limit)
+            return {
+                "records": [
+                    {
+                        "message": f"rank-{rank}-line-{line}",
+                        "stream": "stderr" if rank else "stdout",
+                        "rank": rank,
+                        "pid": rank + 10,
+                    }
+                    for rank in (0, 1)
+                    for line in range(limit)
+                ],
+                "next_cursor": "archive-tail",
+                "unavailable": False,
+                "detail": "",
+                "truncated_ranks": [],
+            }
+
+    agent = _ChattyAgent()
+    controller = await _controller_with(agent)
+    controller.artifact_access = _artifact_access(tmp_path)
+    async with controller.repository.transaction() as transaction:
+        cell = await transaction.get_cell("cell-a")
+        await transaction.put_cell(cell.model_copy(update={"runtime_process_count": 2}))
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+
+    assert agent.requested_limits == [_LOG_ARCHIVE_LINE_LIMIT + 1]
+    manifest_line = controller.artifact_access.store.get(
+        log_uri("wl-1", 1, 0), org_id="acme", project_id="research"
+    ).splitlines()[0]
+    manifest = json.loads(manifest_line)[1]
+    assert manifest["line_limit_per_rank"] == _LOG_ARCHIVE_LINE_LIMIT
+    assert manifest["truncated_ranks"] == [0, 1]
+
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-1")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None}))
+        lease = await transaction.get_lease("lease-1")
+        await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
+    replayed = await controller.workload_log_page("wl-1")
+
+    assert len(replayed["records"]) == 2 * _LOG_ARCHIVE_LINE_LIMIT
+    assert replayed["truncated_ranks"] == [0, 1]
+    assert replayed["unavailable"] is False
+    by_rank = {rank: [record for record in replayed["records"] if record["rank"] == rank] for rank in (0, 1)}
+    for rank, records in by_rank.items():
+        assert records[0]["message"] == f"rank-{rank}-line-1"
+        assert records[-1]["message"] == f"rank-{rank}-line-{_LOG_ARCHIVE_LINE_LIMIT}"
+        assert {record["stream"] for record in records} == ({"stdout"} if rank == 0 else {"stderr"})
+
+
+async def test_sparse_high_rank_archive_writes_are_bounded_and_direct(tmp_path) -> None:
+    """A manifest rank of one million must not create one million gap objects."""
+
+    from eyvan.artifacts.managed import log_uri
+
+    class _CountingStore:
+        def __init__(self, backing) -> None:
+            self.backing = backing
+            self.put_uris: list[str] = []
+
+        def put(self, uri, payload, **scope):
+            self.put_uris.append(uri)
+            return self.backing.put(uri, payload, **scope)
+
+        def get(self, uri, **scope):
+            return self.backing.get(uri, **scope)
+
+    controller = await _controller_with(_PagingAgent())
+    access = _artifact_access(tmp_path)
+    counting = _CountingStore(access.store)
+    object.__setattr__(access, "store", counting)
+    controller.artifact_access = access
+    high_rank = 1_000_000
+
+    async def sparse_page(_workload_id, *, after="", limit=200):
+        assert after == ""
+        assert limit == 1001
+        return {
+            "records": [{"message": "survived", "stream": "stdout", "rank": high_rank}],
+            "truncated_ranks": [high_rank + 1],
+            "unavailable": False,
+        }
+
+    controller.workload_log_page = sparse_page
+    workload = await _only_workload(controller)
+    await controller._archive_terminal_logs(workload)
+
+    assert counting.put_uris == [
+        log_uri("wl-1", 1, 0),
+        log_uri("wl-1", 1, high_rank),
+        log_uri("wl-1", 1, high_rank + 1),
+    ]
+    replayed = await controller._archived_log_page(workload)
+    assert [(record.rank, record.message) for record in replayed.records] == [(high_rank, "survived")]
+    assert replayed.truncated_ranks == (high_rank + 1,)
+
+
+async def test_checked_in_legacy_archive_is_read_by_the_manifest_aware_reader(tmp_path) -> None:
+    """Terminal attempts written before manifests remain readable after upgrade."""
+
+    from datetime import UTC, datetime
+
+    from eyvan.artifacts.managed import log_uri
+
+    controller = await _controller_with(_PagingAgent())
+    controller.artifact_access = _artifact_access(tmp_path)
+    fixtures = Path(__file__).parent / "fixtures" / "log_archives"
+    for rank in (0, 1):
+        controller.artifact_access.store.put(
+            log_uri("wl-1", 1, rank),
+            (fixtures / f"legacy-rank-{rank}.jsonl").read_bytes(),
+            org_id="acme",
+            project_id="research",
+        )
+
+    page = await controller._archived_log_page(await _only_workload(controller))
+
+    assert [(record.rank, record.message, record.stream) for record in page.records] == [
+        (1, "legacy earlier stderr", "stderr"),
+        (0, "legacy later stdout", "stdout"),
+    ]
+    assert page.records[0].timestamp == datetime(2026, 8, 1, 12, 0, 1, tzinfo=UTC)
+    assert page.truncated_ranks == ()
+
+
+async def test_new_manifest_archive_retains_the_old_contiguous_jsonl_shape(tmp_path) -> None:
+    """A rolling old reader ignores the array manifest and reaches sparse low ranks."""
+
+    from eyvan.artifacts.managed import log_uri
+
+    controller = await _controller_with(_PagingAgent())
+    controller.artifact_access = _artifact_access(tmp_path)
+
+    async def sparse_page(_workload_id, *, after="", limit=200):
+        del after
+        assert limit == 1001
+        return {
+            "records": [
+                {"message": "rank zero", "stream": "stdout", "rank": 0},
+                {"message": "rank two", "stream": "stderr", "rank": 2},
+            ],
+            "truncated_ranks": [],
+            "unavailable": False,
+        }
+
+    controller.workload_log_page = sparse_page
+    await controller._archive_terminal_logs(await _only_workload(controller))
+
+    # Frozen pre-manifest reader shape: contiguous scan, stop on first missing
+    # object, and render only JSON objects. The new manifest is an array so it is
+    # ignored rather than appearing as an empty message.
+    old_shape_records: list[tuple[int, str]] = []
+    for rank in range(64):
+        try:
+            payload = controller.artifact_access.store.get(
+                log_uri("wl-1", 1, rank), org_id="acme", project_id="research"
+            )
+        except Exception:
+            break
+        for line in payload.splitlines():
+            entry = json.loads(line)
+            if isinstance(entry, dict):
+                old_shape_records.append((rank, str(entry.get("message", ""))))
+
+    assert old_shape_records == [(0, "rank zero"), (2, "rank two")]
+
+
 async def test_an_archive_failure_does_not_block_settlement(tmp_path) -> None:
     """A finished job must be recorded as finished even if its logs could not be saved.
 
@@ -901,7 +1087,8 @@ async def test_a_follower_can_actually_advance_through_the_controller() -> None:
 
     first = await controller.workload_log_page("wl-1")
 
-    assert first["next_cursor"] == "3:0=c1", "a follower has nowhere to resume from"
+    assert first["next_cursor"].startswith("eyvan-log-v2."), "a follower has nowhere to resume from"
+    assert _cursor_helpers()[0](first["next_cursor"]) == (3, {0: "c1"})
 
     second = await controller.workload_log_page("wl-1", after=first["next_cursor"])
 
@@ -942,8 +1129,8 @@ class _PerRankAgent:
         }
 
 
-async def _gang_controller(agent):
-    """A two-cell native gang, which is the shape per-rank cursors exist for."""
+async def _gang_controller(agent, *, runtime_process_counts: tuple[int, int] = (1, 1)):
+    """A two-cell gang whose durable rank widths come from provider observation."""
 
     from datetime import timedelta
 
@@ -974,19 +1161,40 @@ async def _gang_controller(agent):
         agent_factory=lambda _cell: agent,
     )
     async with repository.transaction() as transaction:
-        for index, cell_id in enumerate(("cell-a", "cell-b")):
-            await transaction.put_cell(
-                CellRecord(
+        for index, (cell_id, process_count) in enumerate(zip(("cell-a", "cell-b"), runtime_process_counts, strict=True)):
+            if process_count == 1:
+                cell = CellRecord(
                     id=cell_id,
                     provider="local",
                     region="local",
                     state=CellState.READY,
                     capacity=ResourceVector(cpu=8),
                     allocatable=ResourceVector(cpu=8),
-                    # One endpoint across the gang, as the coordinator path requires.
                     endpoint="http://agent:8090",
+                    runtime_process_count=1,
                 )
-            )
+            else:
+                # One allocated TPU slice, not ``process_count`` slices. A
+                # v5p-16 has two native-worker/JAX endpoints and v5p-32 has four.
+                accelerator_type = "v5p-16" if process_count == 2 else "v5p-32"
+                tpu = 8 if process_count == 2 else 16
+                cell = CellRecord(
+                    id=cell_id,
+                    provider="gcp",
+                    capacity_backend="gcp-tpu",
+                    provider_project="provider-project",
+                    region="us-central1",
+                    zone="us-central1-a",
+                    state=CellState.READY,
+                    capacity=ResourceVector(cpu=32, tpu=tpu),
+                    allocatable=ResourceVector(cpu=32, tpu=tpu),
+                    accelerator_type=accelerator_type,
+                    endpoint="http://agent:8090",
+                    worker_count=1,
+                    observed_tpu_vms=process_count,
+                    runtime_process_count=process_count,
+                )
+            await transaction.put_cell(cell)
             await transaction.put_lease(
                 LeaseRecord(
                     id=f"lease-{index}",
@@ -1031,11 +1239,252 @@ async def test_every_rank_of_a_gang_is_asked_from_its_own_position() -> None:
     controller = await _gang_controller(agent)
 
     first = await controller.workload_log_page("wl-gang")
-    assert first["next_cursor"] == "1:0=cell-a-next|1=cell-b-next"
+    assert _cursor_helpers()[0](first["next_cursor"]) == (1, {0: "cell-a-next", 1: "cell-b-next"})
 
     await controller.workload_log_page("wl-gang", after=first["next_cursor"])
 
     assert agent.asked == {"cell-a": "cell-a-next", "cell-b": "cell-b-next"}
+
+
+class _JournalHost:
+    """A two-line journal with backend cursors that contain legacy delimiters."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        fail_once_after_first: bool = False,
+        always_unreachable: bool = False,
+    ) -> None:
+        self.name = name
+        self.first_cursor = f"s={name}|position=1"
+        self.second_cursor = f"s={name}|position=2"
+        self.fail_once_after_first = fail_once_after_first
+        self.always_unreachable = always_unreachable
+        self.failed = False
+        self.seen_after: list[str] = []
+
+    def log_page(self, _remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        del limit
+        self.seen_after.append(after)
+        if self.always_unreachable:
+            raise RuntimeError("inner host is unreachable")
+        if not after:
+            return LogPage(
+                records=(LogRecord(message=f"{self.name}:0", stream="stdout", cursor=self.first_cursor),),
+                next_cursor=self.first_cursor,
+            )
+        if after == self.first_cursor:
+            if self.fail_once_after_first and not self.failed:
+                self.failed = True
+                raise RuntimeError("inner host is unreachable")
+            return LogPage(
+                records=(LogRecord(message=f"{self.name}:1", stream="stdout", cursor=self.second_cursor),),
+                next_cursor=self.second_cursor,
+            )
+        if after == self.second_cursor:
+            # No new line means no newly issued cursor. The fan-out layers must
+            # retain the position they supplied rather than restart this host.
+            return LogPage()
+        raise AssertionError(f"{self.name} received foreign cursor {after!r}")
+
+
+class _MultiHostAgent:
+    def __init__(self, hosts: dict[str, tuple[_JournalHost, ...]]) -> None:
+        from eyvan.worker.runtime.native_slice import NativeSliceExecutor
+
+        self.slices = {}
+        self.unreachable_cells: set[str] = set()
+        for cell_id, cell_hosts in hosts.items():
+            executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
+            executor._workers = cell_hosts
+            self.slices[cell_id] = executor
+
+    def log_page(self, cell_id, remote_id, *, after="", limit=200):
+        if cell_id in self.unreachable_cells:
+            raise RuntimeError("whole cell is unreachable")
+        page = self.slices[cell_id].log_page(remote_id, after=after, limit=limit)
+        return {
+            "records": [dict(record.as_json()) for record in page.records],
+            "next_cursor": page.next_cursor,
+            "unavailable": page.unavailable,
+            "detail": page.detail,
+            "truncated_ranks": list(page.truncated_ranks),
+        }
+
+
+async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal() -> None:
+    """Exercise controller -> cell -> inner-host cursor composition end to end."""
+
+    from eyvan.worker.runtime.log_records import split_log_cursor
+
+    hosts = {
+        "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
+        "cell-b": (_JournalHost("b0"), _JournalHost("b1", fail_once_after_first=True)),
+    }
+    controller = await _gang_controller(_MultiHostAgent(hosts), runtime_process_counts=(2, 2))
+    async with controller.repository.transaction() as transaction:
+        cells = await transaction.list_cells()
+    assert [(cell.worker_count, cell.runtime_process_count) for cell in sorted(cells, key=lambda cell: cell.id)] == [
+        (1, 2),
+        (1, 2),
+    ]
+
+    first = await controller.workload_log_page("wl-gang")
+    assert [(record["rank"], record["message"]) for record in first["records"]] == [
+        (0, "a0:0"),
+        (1, "a1:0"),
+        (2, "b0:0"),
+        (3, "b1:0"),
+    ]
+    assert first["truncated_ranks"] == []
+    attempt, cell_cursors = split_log_cursor(first["next_cursor"])
+    assert attempt == 1
+    assert set(cell_cursors) == {0, 1}
+    _inner_attempt, cell_a_cursors = split_log_cursor(cell_cursors[0])
+    _inner_attempt, cell_b_cursors = split_log_cursor(cell_cursors[1])
+    assert cell_a_cursors == {0: hosts["cell-a"][0].first_cursor, 1: hosts["cell-a"][1].first_cursor}
+    assert cell_b_cursors == {0: hosts["cell-b"][0].first_cursor, 1: hosts["cell-b"][1].first_cursor}
+    assert all("|" in cursor for cursor in (*cell_a_cursors.values(), *cell_b_cursors.values()))
+
+    second = await controller.workload_log_page("wl-gang", after=first["next_cursor"])
+    assert [(record["rank"], record["message"]) for record in second["records"]] == [
+        (0, "a0:1"),
+        (1, "a1:1"),
+        (2, "b0:1"),
+    ]
+    assert second["truncated_ranks"] == [3]
+    assert second["unavailable"] is False
+
+    # The unreachable host's last good inner cursor survives the outer page.
+    _attempt, second_cells = split_log_cursor(second["next_cursor"])
+    _attempt, second_cell_b = split_log_cursor(second_cells[1])
+    assert second_cell_b[1] == hosts["cell-b"][1].first_cursor
+
+    third = await controller.workload_log_page("wl-gang", after=second["next_cursor"])
+    assert [(record["rank"], record["message"]) for record in third["records"]] == [(3, "b1:1")]
+    assert third["truncated_ranks"] == []
+
+    all_lines = [record["message"] for page in (first, second, third) for record in page["records"]]
+    assert sorted(all_lines) == ["a0:0", "a0:1", "a1:0", "a1:1", "b0:0", "b0:1", "b1:0", "b1:1"]
+    assert len(all_lines) == len(set(all_lines)), "a resumed journal duplicated a line"
+    assert hosts["cell-b"][1].seen_after == ["", hosts["cell-b"][1].first_cursor, hosts["cell-b"][1].first_cursor]
+
+
+async def test_unequal_cell_widths_stay_stable_when_a_whole_and_inner_host_are_unreachable() -> None:
+    """Lost endpoints cannot collapse offsets or renumber following JAX ranks."""
+
+    from eyvan.worker.runtime.log_records import split_log_cursor
+
+    hosts = {
+        "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
+        "cell-b": (
+            _JournalHost("b0"),
+            _JournalHost("b1", always_unreachable=True),
+            _JournalHost("b2"),
+            _JournalHost("b3"),
+        ),
+    }
+    agent = _MultiHostAgent(hosts)
+    controller = await _gang_controller(agent, runtime_process_counts=(2, 4))
+
+    first = await controller.workload_log_page("wl-gang")
+    assert [(record["rank"], record["message"]) for record in first["records"]] == [
+        (0, "a0:0"),
+        (1, "a1:0"),
+        (2, "b0:0"),
+        (4, "b2:0"),
+        (5, "b3:0"),
+    ]
+    assert first["truncated_ranks"] == [3]
+    _attempt, first_cells = split_log_cursor(first["next_cursor"])
+
+    # Losing the whole two-process first cell must not move cell B from offset 2
+    # to offset 0, and its last good nested cursor must remain resumable.
+    agent.unreachable_cells.add("cell-a")
+    second = await controller.workload_log_page("wl-gang", after=first["next_cursor"])
+    assert [(record["rank"], record["message"]) for record in second["records"]] == [
+        (2, "b0:1"),
+        (4, "b2:1"),
+        (5, "b3:1"),
+    ]
+    assert second["truncated_ranks"] == [0, 1, 3]
+    _attempt, second_cells = split_log_cursor(second["next_cursor"])
+    assert second_cells[0] == first_cells[0], "an unreachable whole cell advanced or lost its nested cursor"
+
+
+async def test_a_dropped_out_of_range_record_does_not_advance_its_cell_cursor() -> None:
+    """A malformed rank cannot be skipped permanently by accepting its cursor."""
+
+    from eyvan.worker.runtime.log_records import split_log_cursor
+
+    class _MalformedRankAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def log_page(self, _cell_id, _remote_id, *, after="", limit=200):
+            del limit
+            self.calls += 1
+            if self.calls == 1:
+                assert after == ""
+                return {
+                    "records": [{"message": "kept", "rank": 0}],
+                    "next_cursor": "last-good",
+                    "unavailable": False,
+                    "detail": "",
+                    "truncated_ranks": [],
+                }
+            assert after == "last-good"
+            return {
+                "records": [{"message": "would be dropped", "rank": 7}],
+                "next_cursor": "past-dropped-record",
+                "unavailable": False,
+                "detail": "",
+                "truncated_ranks": [],
+            }
+
+    controller = await _controller_with(_MalformedRankAgent())
+    first = await controller.workload_log_page("wl-1")
+    second = await controller.workload_log_page("wl-1", after=first["next_cursor"])
+
+    assert second["records"] == []
+    assert second["truncated_ranks"] == [0]
+    assert "durable runtime process width" in second["detail"]
+    assert split_log_cursor(second["next_cursor"]) == (1, {0: "last-good"})
+
+
+async def test_multi_host_archive_replays_global_ranks_and_explicit_truncation(tmp_path) -> None:
+    """A released cell must not turn an unreachable inner host into silence."""
+
+    hosts = {
+        "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
+        "cell-b": (_JournalHost("b0"), _JournalHost("b1", always_unreachable=True)),
+    }
+    controller = await _gang_controller(_MultiHostAgent(hosts), runtime_process_counts=(2, 2))
+    controller.artifact_access = _artifact_access(tmp_path)
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-gang")
+    await controller._archive_terminal_logs(workload)
+
+    # Release every source cell; only the archived JSONL and its manifest remain.
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-gang")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None, "lease_ids": []}))
+        for lease_id in ("lease-0", "lease-1"):
+            lease = await transaction.get_lease(lease_id)
+            await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
+
+    replayed = await controller.workload_log_page("wl-gang")
+
+    assert [(record["rank"], record["message"]) for record in replayed["records"]] == [
+        (0, "a0:0"),
+        (1, "a1:0"),
+        (2, "b0:0"),
+    ]
+    assert replayed["truncated_ranks"] == [3]
+    assert replayed["unavailable"] is False
+    assert replayed["detail"] == "archived"
 
 
 # --------------------------------------------------------------------------- following

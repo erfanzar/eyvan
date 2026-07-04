@@ -51,6 +51,7 @@ def workload_request(generation: int, token: str) -> WorkloadRequest:
 class FakeCapacity:
     def __init__(self, *, observed_tpu_vms: int | None = None) -> None:
         self.observed_tpu_vms = observed_tpu_vms
+        self.runtime_process_count = observed_tpu_vms
 
     def capabilities(self):
         return CellCapabilities(
@@ -67,6 +68,7 @@ class FakeCapacity:
             generation=3,
             execution_endpoint="local",
             observed_tpu_vms=self.observed_tpu_vms,
+            runtime_process_count=self.runtime_process_count,
         )
 
     def reconcile(self, cell_id, _context):
@@ -470,6 +472,7 @@ def test_agent_observation_includes_gcp_reported_tpu_vm_count(tmp_path) -> None:
 
     assert response.status_code == 200
     assert response.json()["observed_tpu_vms"] == 8
+    assert response.json()["runtime_process_count"] == 8
 
 
 def test_agent_does_not_report_provider_capacity_ready_before_execution_runtime(tmp_path) -> None:

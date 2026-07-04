@@ -130,6 +130,111 @@ def test_native_gang_submit_uses_global_ranks_and_per_cell_credentials() -> None
             client.close()
 
 
+def test_native_gang_structured_logs_use_the_same_global_rank_order() -> None:
+    from eyvan.worker.runtime.log_records import split_log_cursor
+    from eyvan.worker.runtime.registry import StructuredLogExecutionDriver
+
+    requested: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/workloads/gang-job/log-page"
+        host = request.url.host
+        requested[host] = request.url.params.get("after", "")
+        cursor = f"s={host}|position=1"
+        return httpx.Response(
+            200,
+            json={
+                "records": [{"message": host, "stream": "stdout", "rank": 0, "cursor": cursor}],
+                "next_cursor": cursor,
+                "unavailable": False,
+                "detail": "",
+                "truncated_ranks": [],
+            },
+        )
+
+    endpoints = (
+        "http://10.12.0.10:8100",
+        "http://10.12.0.11:8100",
+        "http://10.12.0.20:8100",
+        "http://10.12.0.21:8100",
+    )
+    clients = [_client(endpoint, handler) for endpoint in endpoints]
+    try:
+        executor = NativeGangExecutor(_members(), clients=clients)
+        assert isinstance(executor, StructuredLogExecutionDriver)
+        first = executor.log_page("gang-job")
+
+        assert [(record.rank, record.message) for record in first.records] == [
+            (0, "10.12.0.10"),
+            (1, "10.12.0.11"),
+            (2, "10.12.0.20"),
+            (3, "10.12.0.21"),
+        ]
+        _attempt, cursors = split_log_cursor(first.next_cursor)
+        assert cursors == {
+            rank: f"s={endpoint.split('//')[1].split(':')[0]}|position=1" for rank, endpoint in enumerate(endpoints)
+        }
+
+        executor.log_page("gang-job", after=first.next_cursor)
+        assert requested == {
+            endpoint.split("//")[1].split(":")[0]: cursors[rank] for rank, endpoint in enumerate(endpoints)
+        }
+    finally:
+        for client in clients:
+            client.close()
+
+
+def test_native_gang_empty_and_unreachable_ranks_retain_their_previous_cursors() -> None:
+    """A quiet or lost rank must not restart from the beginning on the next poll."""
+
+    from collections import Counter
+
+    from eyvan.worker.runtime.log_records import split_log_cursor
+
+    calls: Counter[str] = Counter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        calls[host] += 1
+        if calls[host] == 1:
+            cursor = f"s={host}|position=1"
+            return httpx.Response(
+                200,
+                json={"records": [{"message": host}], "next_cursor": cursor, "unavailable": False},
+            )
+        if host == "10.12.0.10":
+            return httpx.Response(200, json={"records": [], "next_cursor": "", "unavailable": False})
+        if host == "10.12.0.11":
+            raise httpx.ConnectError("host disappeared", request=request)
+        cursor = f"s={host}|position=2"
+        return httpx.Response(200, json={"records": [{"message": host}], "next_cursor": cursor})
+
+    endpoints = (
+        "http://10.12.0.10:8100",
+        "http://10.12.0.11:8100",
+        "http://10.12.0.20:8100",
+        "http://10.12.0.21:8100",
+    )
+    clients = [_client(endpoint, handler) for endpoint in endpoints]
+    try:
+        executor = NativeGangExecutor(_members(), clients=clients)
+        first = executor.log_page("gang-job")
+        _attempt, first_positions = split_log_cursor(first.next_cursor)
+
+        second = executor.log_page("gang-job", after=first.next_cursor)
+        _attempt, second_positions = split_log_cursor(second.next_cursor)
+
+        assert second_positions[0] == first_positions[0]
+        assert second_positions[1] == first_positions[1]
+        assert second_positions[2].endswith("position=2")
+        assert second_positions[3].endswith("position=2")
+        assert second.truncated_ranks == (1,)
+    finally:
+        for client in clients:
+            client.close()
+
+
 def test_native_gang_retires_every_attempted_worker_with_its_cell_fence() -> None:
     calls: list[tuple[str, str, httpx.Request]] = []
 

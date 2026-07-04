@@ -73,6 +73,7 @@ class LocalCapacityDriver:
             generation=record.generation,
             execution_endpoint=record.execution_endpoint,
             observed_at=datetime.now(UTC),
+            runtime_process_count=1,
             metadata={
                 "provider": cls.provider_name,
                 "capacity_backend": cls.provider_name,

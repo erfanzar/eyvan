@@ -2381,6 +2381,15 @@ class ControlPlaneService:
                     "availability": cell.availability if existing is None else existing.availability,
                     "provider_phase": None if requires_provision else existing.provider_phase,
                     "provider_failure_code": None if requires_provision else existing.provider_failure_code,
+                    # Provider-owned rank width is observation state, not
+                    # declarative template metadata. A labels/prices update can
+                    # happen while leases are active and must not reset it to
+                    # the model's legacy single-host default.
+                    "runtime_process_count": (
+                        cell.runtime_process_count
+                        if existing is None or requires_provision
+                        else existing.runtime_process_count
+                    ),
                     "provider_phase_started_at": None if requires_provision else existing.provider_phase_started_at,
                     "unavailable_reason": None if requires_provision else existing.unavailable_reason,
                     "last_heartbeat_at": None if requires_provision else existing.last_heartbeat_at,

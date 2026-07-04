@@ -399,6 +399,7 @@ def test_provider_observes_only_owned_running_gpu() -> None:
 
     assert observation.state is CapacityStatus.HEALTHY
     assert observation.head_ip == "10.20.0.7"
+    assert observation.runtime_process_count == 1
     assert len(calls) == 1
 
 

@@ -220,6 +220,11 @@ class _ControllerCapacityCommands:
                             "provider_phase": remote_state,
                             "provider_failure_code": None,
                             "observed_tpu_vms": observation.observed_tpu_vms,
+                            "runtime_process_count": (
+                                observation.runtime_process_count
+                                or observation.observed_tpu_vms
+                                or current.runtime_process_count
+                            ),
                             "provider_phase_started_at": phase_started_at,
                             "availability": availability,
                             "last_heartbeat_at": observed_at,

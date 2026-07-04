@@ -377,6 +377,7 @@ def test_provider_observes_every_multislice_tpu_vm_before_native_execution() -> 
         "http://10.2.0.7:8123",
     )
     assert observation.observed_tpu_vms == 4
+    assert observation.runtime_process_count == 4
 
 
 def test_provider_reports_only_gcp_observed_v6e_tpu_vm_count() -> None:
@@ -404,6 +405,7 @@ def test_provider_reports_only_gcp_observed_v6e_tpu_vm_count() -> None:
 
     assert observation.state is CapacityStatus.HEALTHY
     assert observation.observed_tpu_vms == 8
+    assert observation.runtime_process_count == 8
     assert observation.detail == "2 TPU worker allocations and 8 TPU VMs are ready"
 
 

@@ -44,6 +44,7 @@ def test_local_capacity_driver_materializes_and_releases_a_development_cell(tmp_
 
     assert applied.state is CapacityStatus.HEALTHY
     assert applied.execution_endpoint == "local"
+    assert applied.runtime_process_count == 1
     assert applied.metadata["capacity_backend"] == "local"
     assert applied.metadata["region"] == "local"
     assert driver.reconcile("local-cell", _context("reconcile")).state is CapacityStatus.HEALTHY

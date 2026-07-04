@@ -128,6 +128,14 @@ exercised. Both say so rather than passing. Killing a host mid-stream on a
 two-host slice is what remains, and it needs a v5p-16 carrying the new worker
 wheel.
 
+Rank width is persisted separately from allocation width. ``worker_count`` is
+the number of TPU slices in a cell; ``runtime_process_count`` is the exact
+provider-observed native-worker/JAX endpoint count and remains stable when a
+later observation loses a host. Terminal archives store an exact sparse-rank
+manifest. A per-rank line ceiling is requested with one sentinel line, and any
+trimmed or unreachable rank remains explicit on replay rather than looking
+complete.
+
 Two defects were found by reading one real page, both invisible to the unit
 tests: the decoder fed an already-decoded stream name back through the *priority*
 mapper, so every stdout and stderr read as `unknown`; and the control plane's

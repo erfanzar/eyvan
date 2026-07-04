@@ -250,6 +250,7 @@ class GcpTpuCapacityDriver:
             detail=detail,
             observed_at=datetime.now(UTC),
             observed_tpu_vms=GcpTpuCapacityDriver._observed_tpu_vms(record),
+            runtime_process_count=GcpTpuCapacityDriver._runtime_process_count(record),
             failure_code=GcpTpuCapacityDriver._failure_code(record),
             metadata={
                 **record.metadata,
@@ -289,6 +290,15 @@ class GcpTpuCapacityDriver:
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
         return None
+
+    @staticmethod
+    def _runtime_process_count(record: FleetCellRecord) -> int | None:
+        """Return the last exact execution width, including legacy TPU records."""
+
+        value = record.metadata.get("runtime_process_count")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return GcpTpuCapacityDriver._observed_tpu_vms(record)
 
     @staticmethod
     def _accept_mutation(record: FleetCellRecord, context: MutationContext) -> bool:
@@ -345,6 +355,14 @@ class GcpTpuCapacityDriver:
                 record.metadata["observed_tpu_vms"] = report.observed_tpu_vms
             elif report.state not in READY_CAPACITY_STATUSES:
                 record.metadata.pop("observed_tpu_vms", None)
+            if report.runtime_process_count is not None:
+                count = report.runtime_process_count
+                if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                    raise ValueError("provider reported an invalid runtime process count")
+                # Deliberately retained through a later partial/unreachable
+                # observation. Recounting only endpoints that still answer would
+                # shift every following cell's global log ranks.
+                record.metadata["runtime_process_count"] = count
             record.metadata.pop("recreate_intent", None)
 
         record = self._persist_owned_cell(

@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 from eyvan.worker.runtime.log_records import (
     LogPage,
@@ -126,10 +127,55 @@ def test_each_rank_resumes_from_its_own_position() -> None:
     assert cursors == {0: "a", 1: "b"}
 
 
+def test_an_inner_cursor_can_contain_the_legacy_delimiters() -> None:
+    """Opaque v2 framing must not parse backend cursor contents as structure."""
+
+    inner = "s=journal|position=7"
+    encoded = join_log_cursor(2, {0: inner})
+
+    assert "|" not in encoded
+    assert split_log_cursor(encoded) == (2, {0: inner})
+
+
+def test_v2_cursor_encoding_is_deterministic_across_mapping_order() -> None:
+    first = join_log_cursor(4, {2: "c2", 0: "c0", 1: "c1"})
+    second = join_log_cursor(4, {1: "c1", 2: "c2", 0: "c0"})
+
+    assert first == second
+    assert first.startswith("eyvan-log-v2.")
+
+
+def test_nested_slice_cursors_with_the_largest_manual_host_count_round_trip() -> None:
+    """The safety bounds must still admit real two-level fan-out cursors."""
+
+    inner_positions = {rank: f"s=journal-{rank}|position=7" for rank in range(512)}
+    inner = join_log_cursor(0, inner_positions)
+    outer = join_log_cursor(9, {0: inner, 1: join_log_cursor(0, {0: "single-host"})})
+
+    assert split_log_cursor(outer) == (9, {0: inner, 1: join_log_cursor(0, {0: "single-host"})})
+    assert split_log_cursor(split_log_cursor(outer)[1][0]) == (0, inner_positions)
+
+
+def test_cursor_size_and_entry_bounds_fail_closed_before_decode() -> None:
+    """Hostile query cursors cannot trigger unbounded base64/JSON work."""
+
+    import eyvan.worker.runtime.log_records as log_records
+
+    oversized = "x" * (log_records._LOG_CURSOR_MAX_BYTES + 1)
+    assert split_log_cursor(oversized) == (None, {})
+    assert split_log_cursor(f"eyvan-log-v2.{oversized}") == (None, {})
+    with pytest.raises(ValueError, match="entry limit"):
+        join_log_cursor(1, {rank: "c" for rank in range(log_records._LOG_CURSOR_MAX_ENTRIES + 1)})
+    with pytest.raises(ValueError, match="size limit"):
+        join_log_cursor(1, {0: "x" * (log_records._LOG_CURSOR_MAX_VALUE_BYTES + 1)})
+
+
 def test_a_rank_that_reported_no_cursor_is_omitted() -> None:
     """Encoding an empty cursor would tell that rank to replay everything."""
 
-    assert join_log_cursor(1, {0: "a", 1: ""}) == "1:0=a"
+    encoded = join_log_cursor(1, {0: "a", 1: ""})
+    assert encoded.startswith("eyvan-log-v2.")
+    assert split_log_cursor(encoded) == (1, {0: "a"})
 
 
 def test_no_cursors_at_all_encodes_to_empty() -> None:
