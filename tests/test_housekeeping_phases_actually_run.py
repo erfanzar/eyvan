@@ -30,7 +30,7 @@ from test_controller import principal
 
 from eyvan.artifacts.managed import callable_uri
 from eyvan.config import EyvanSettings
-from eyvan.records import Role
+from eyvan.records import ProjectRecord, Role
 from eyvan.server.controller import EyvanController
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.service.control_plane import ControlPlaneService
@@ -109,6 +109,15 @@ async def test_collection_asks_the_service_to_actually_delete() -> None:
     """
 
     controller = _controller(artifact_retention_s=3600)
+    async with controller.repository.transaction() as tx:
+        await tx.put_project(
+            ProjectRecord(
+                org_id="acme",
+                id="research",
+                owner="alice",
+                created_by="alice",
+            )
+        )
     seen: dict[str, object] = {}
 
     async def _collect(**kwargs: object):
@@ -125,6 +134,7 @@ async def test_collection_asks_the_service_to_actually_delete() -> None:
     await controller.collect_artifacts_once()
 
     assert seen["dry_run"] is False, "collection ran in dry-run mode and deleted nothing"
+    assert (seen["org_id"], seen["project_id"]) == ("acme", "research")
     assert seen["grace_period_s"] == 3600.0
     assert seen["principal"] is not None, "an unaudited deletion is an unexplainable loss"
 
@@ -174,7 +184,9 @@ async def test_a_deleted_artifact_is_audited(tmp_path) -> None:
     await _stored(service, store, callable_uri(_DIGEST))
     admin = principal(Role.FLEET_ADMIN)
 
-    collection = await service.collect_artifacts_once(principal=admin, dry_run=False, grace_period_s=0.0)
+    collection = await service.collect_artifacts_once(
+        org_id="acme", project_id="research", principal=admin, dry_run=False, grace_period_s=0.0
+    )
 
     assert collection.collected_uris, "nothing was collected, so the audit assertion would be vacuous"
     async with service.repository.transaction() as tx:
@@ -192,7 +204,9 @@ async def test_a_dry_run_collection_audits_nothing(tmp_path) -> None:
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
 
-    await service.collect_artifacts_once(principal=principal(Role.FLEET_ADMIN), dry_run=True, grace_period_s=0.0)
+    await service.collect_artifacts_once(
+        org_id="acme", project_id="research", principal=principal(Role.FLEET_ADMIN), dry_run=True, grace_period_s=0.0
+    )
 
     async with service.repository.transaction() as tx:
         events = await tx.list_events(org_id="acme", project_id="research")

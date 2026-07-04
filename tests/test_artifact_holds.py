@@ -130,7 +130,9 @@ async def test_a_held_artifact_is_not_collectable_even_with_no_references() -> N
     before = await service.collectable_artifacts(_principal(), org_id="acme", project_id="research")
     assert [item.uri for item in before] == [uri]
 
-    await service.hold_artifact(_principal(), uri=uri, reason="under investigation")
+    await service.hold_artifact(
+        _principal(), org_id="acme", project_id="research", uri=uri, reason="under investigation"
+    )
 
     collectable = await service.collectable_artifacts(_principal(), org_id="acme", project_id="research")
     assert collectable == []
@@ -142,7 +144,9 @@ async def test_a_hold_records_who_placed_it_and_why() -> None:
     uri = callable_uri(_DIGEST)
     await _index(service, uri)
 
-    held = await service.hold_artifact(_principal(), uri=uri, reason="reproducing issue 41")
+    held = await service.hold_artifact(
+        _principal(), org_id="acme", project_id="research", uri=uri, reason="reproducing issue 41"
+    )
 
     assert held.hold is not None
     assert held.hold.held_by == "alice", "attributed to the caller, not a typed-in name"
@@ -155,7 +159,14 @@ async def test_an_expired_hold_stops_protecting_the_artifact() -> None:
     uri = callable_uri(_DIGEST)
     await _index(service, uri)
     now = utcnow()
-    await service.hold_artifact(_principal(), uri=uri, reason="for a week", expires_at=now + timedelta(days=7))
+    await service.hold_artifact(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        reason="for a week",
+        expires_at=now + timedelta(days=7),
+    )
 
     during = await service.collectable_artifacts(_principal(), org_id="acme", project_id="research", now=now)
     after = await service.collectable_artifacts(
@@ -173,13 +184,13 @@ async def test_anyone_with_manage_permission_may_release_another_persons_hold() 
     service = await _service()
     uri = callable_uri(_DIGEST)
     await _index(service, uri)
-    await service.hold_artifact(_principal(), uri=uri, reason="mine")
+    await service.hold_artifact(_principal(), org_id="acme", project_id="research", uri=uri, reason="mine")
     other = Principal(
         subject="carol",
         grants=(RoleGrant(role=Role.PROJECT_ADMIN, org_id="acme", project_id="research"),),
     )
 
-    released = await service.release_artifact_hold(other, uri=uri)
+    released = await service.release_artifact_hold(other, org_id="acme", project_id="research", uri=uri)
 
     assert released.hold is None
 
@@ -190,7 +201,7 @@ async def test_releasing_an_unheld_artifact_is_a_no_op_not_an_error() -> None:
     uri = callable_uri(_DIGEST)
     await _index(service, uri)
 
-    released = await service.release_artifact_hold(_principal(), uri=uri)
+    released = await service.release_artifact_hold(_principal(), org_id="acme", project_id="research", uri=uri)
 
     assert released.hold is None
 
@@ -202,7 +213,7 @@ async def test_a_viewer_cannot_place_a_hold() -> None:
     await _index(service, uri)
 
     with pytest.raises(AuthorizationError):
-        await service.hold_artifact(_viewer(), uri=uri, reason="please keep")
+        await service.hold_artifact(_viewer(), org_id="acme", project_id="research", uri=uri, reason="please keep")
 
 
 @pytest.mark.asyncio
@@ -210,7 +221,9 @@ async def test_holding_an_unindexed_artifact_is_a_not_found() -> None:
     service = await _service()
 
     with pytest.raises(NotFoundError):
-        await service.hold_artifact(_principal(), uri=callable_uri(_DIGEST), reason="keep")
+        await service.hold_artifact(
+            _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST), reason="keep"
+        )
 
 
 @pytest.mark.asyncio
@@ -274,8 +287,8 @@ async def test_a_retrys_older_result_is_marked_superseded_by_the_newer_one() -> 
 
     assert marked == 1
     async with service.repository.transaction() as tx:
-        old = await tx.get_managed_artifact(first.result_uri)
-        new = await tx.get_managed_artifact(second.result_uri)
+        old = await tx.get_managed_artifact("acme", "research", first.result_uri)
+        new = await tx.get_managed_artifact("acme", "research", second.result_uri)
     assert old is not None and new is not None
     assert old.superseded_at is not None
     assert old.superseded_by_uri == second.result_uri
@@ -344,8 +357,8 @@ async def test_supersession_never_marks_a_callable_or_workspace() -> None:
     await service.mark_superseded_results_once()
 
     async with service.repository.transaction() as tx:
-        callable_record = await tx.get_managed_artifact(callable_uri(_DIGEST))
-        workspace_record = await tx.get_managed_artifact(workspace_uri(_OTHER_DIGEST))
+        callable_record = await tx.get_managed_artifact("acme", "research", callable_uri(_DIGEST))
+        workspace_record = await tx.get_managed_artifact("acme", "research", workspace_uri(_OTHER_DIGEST))
     assert callable_record is not None and callable_record.superseded_at is None
     assert workspace_record is not None and workspace_record.superseded_at is None
 
@@ -370,6 +383,6 @@ async def test_supersession_is_recorded_and_not_acted_on() -> None:
     await service.mark_superseded_results_once()
 
     async with service.repository.transaction() as tx:
-        stored = await tx.get_managed_artifact(first.result_uri)
+        stored = await tx.get_managed_artifact("acme", "research", first.result_uri)
     assert stored is not None, "supersession marks; it never removes"
     assert stored.size_bytes == 1024

@@ -97,7 +97,7 @@ async def _stored(
     await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=len(payload))
     store.put(uri, payload, org_id="acme", project_id="research")
     async with service.repository.transaction() as tx:
-        record = await tx.get_managed_artifact(uri)
+        record = await tx.get_managed_artifact("acme", "research", uri)
         assert record is not None
         await tx.put_managed_artifact(record.model_copy(update={"created_at": utcnow() - age}))
 
@@ -122,7 +122,7 @@ async def test_a_collector_without_a_store_refuses_rather_than_no_ops(tmp_path) 
     service = ControlPlaneService(repository=repository)
 
     with pytest.raises(InputError, match="artifact store"):
-        await service.collect_artifacts_once()
+        await service.collect_artifacts_once(org_id="acme", project_id="research")
 
 
 @pytest.mark.asyncio
@@ -130,7 +130,7 @@ async def test_a_dry_run_names_what_it_would_take_and_removes_nothing(tmp_path) 
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
 
-    result = await service.collect_artifacts_once()
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research")
 
     assert result.dry_run is True
     assert result.collected_uris == (callable_uri(_DIGEST),)
@@ -145,7 +145,7 @@ async def test_dry_run_is_the_default(tmp_path) -> None:
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
 
-    await service.collect_artifacts_once()
+    await service.collect_artifacts_once(org_id="acme", project_id="research")
 
     assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="research")
 
@@ -155,7 +155,7 @@ async def test_a_real_pass_removes_the_bytes_and_zeroes_the_ledger(tmp_path) -> 
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
 
-    result = await service.collect_artifacts_once(dry_run=False)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.dry_run is False
     assert result.collected_uris == (callable_uri(_DIGEST),)
@@ -171,7 +171,7 @@ async def test_a_freshly_uploaded_artifact_survives_the_grace_period(tmp_path) -
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST), age=timedelta(minutes=5))
 
-    result = await service.collect_artifacts_once(dry_run=False)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
     assert result.within_grace == 1
@@ -190,7 +190,7 @@ async def test_a_referenced_artifact_is_never_collected(tmp_path) -> None:
         idempotency_key="submit-1",
     )
 
-    result = await service.collect_artifacts_once(dry_run=False)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
     assert result.referenced == 1
@@ -201,9 +201,11 @@ async def test_a_referenced_artifact_is_never_collected(tmp_path) -> None:
 async def test_a_held_artifact_is_never_collected(tmp_path) -> None:
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
-    await service.hold_artifact(_principal(), uri=callable_uri(_DIGEST), reason="under investigation")
+    await service.hold_artifact(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST), reason="under investigation"
+    )
 
-    result = await service.collect_artifacts_once(dry_run=False)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
     assert result.held == 1
@@ -216,12 +218,14 @@ async def test_an_expired_hold_no_longer_protects(tmp_path) -> None:
     await _stored(service, store, callable_uri(_DIGEST))
     await service.hold_artifact(
         _principal(),
+        org_id="acme",
+        project_id="research",
         uri=callable_uri(_DIGEST),
         reason="for an hour",
         expires_at=utcnow() - timedelta(minutes=1),
     )
 
-    result = await service.collect_artifacts_once(dry_run=False)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == (callable_uri(_DIGEST),)
 
@@ -237,7 +241,7 @@ async def test_collection_is_scoped_to_the_requested_project(tmp_path) -> None:
     )
     store.put(workspace_uri(_OTHER_DIGEST), _OTHER_PAYLOAD, org_id="acme", project_id="other")
     async with service.repository.transaction() as tx:
-        record = await tx.get_managed_artifact(workspace_uri(_OTHER_DIGEST))
+        record = await tx.get_managed_artifact("acme", "other", workspace_uri(_OTHER_DIGEST))
         assert record is not None
         await tx.put_managed_artifact(record.model_copy(update={"created_at": utcnow() - _OLD}))
 
@@ -253,9 +257,9 @@ async def test_a_second_pass_over_already_collected_bytes_is_not_an_error(tmp_pa
 
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
-    await service.collect_artifacts_once(dry_run=False)
+    await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
-    repeat = await service.collect_artifacts_once(dry_run=False)
+    repeat = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert repeat.collected_uris == (), "the object is gone; there is nothing left to take"
 
@@ -269,7 +273,7 @@ async def test_the_pass_is_bounded(tmp_path) -> None:
         payload = f"payload-{index}".encode()
         await _stored(service, store, callable_uri(hashlib.sha256(payload).hexdigest()), payload=payload)
 
-    result = await service.collect_artifacts_once(limit=2)
+    result = await service.collect_artifacts_once(org_id="acme", project_id="research", limit=2)
 
     assert len(result.collected_uris) == 2
 

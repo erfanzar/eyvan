@@ -822,21 +822,33 @@ class _ControllerSettlement:
         if retention_s <= 0:
             return 0
         log_retention_s = self.settings.log_retention_s
-        collection = await self.service.collect_artifacts_once(
-            principal=self._principal,
-            grace_period_s=float(retention_s),
-            # Logs outlive the general window, and zero means never collect
-            # them -- the same "zero disables" convention the other retention
-            # windows use.
-            retention_by_kind={ManagedArtifactKind.LOGS.value: float(log_retention_s) if log_retention_s > 0 else None},
-            dry_run=False,
-        )
-        deleted = len(collection.collected_uris)
+        retention_by_kind = {ManagedArtifactKind.LOGS.value: float(log_retention_s) if log_retention_s > 0 else None}
+        # Artifact rows may never be listed without a complete scope. The durable
+        # project registry is the only safe source of scopes here: an opaque store
+        # prefix cannot be reversed, and an orphaned prefix must be reported by
+        # inventory rather than guessed into a tenant and deleted.
+        async with self.repository.transaction() as tx:
+            projects = await tx.list_projects()
+        deleted = reclaimed = 0
+        for project in projects:
+            collection = await self.service.collect_artifacts_once(
+                org_id=project.org_id,
+                project_id=project.id,
+                principal=self._principal,
+                grace_period_s=float(retention_s),
+                # Logs outlive the general window, and zero means never collect
+                # them -- the same "zero disables" convention the other retention
+                # windows use.
+                retention_by_kind=retention_by_kind,
+                dry_run=False,
+            )
+            deleted += len(collection.collected_uris)
+            reclaimed += collection.reclaimed_bytes
         if deleted:
             logger.info(
                 "collected %d unreferenced managed artifact(s), reclaiming %d bytes",
                 deleted,
-                collection.reclaimed_bytes,
+                reclaimed,
             )
         return deleted
 

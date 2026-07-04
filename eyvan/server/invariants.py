@@ -153,13 +153,13 @@ async def snapshot_fleet(repository: Repository, *, now: datetime | None = None)
     moment = now or utcnow()
     async with repository.transaction() as tx:
         budgets = await tx.list_budgets()
-        artifacts = await tx.list_managed_artifacts()
+        artifact_bytes = await tx.sum_all_managed_artifact_bytes()
         workloads = await tx.list_workloads()
         cells = await tx.list_cells()
     return FleetSnapshot(
         observed_at=moment,
         budget_spend={(budget.org_id, budget.project_id): (budget.spent, budget.revision) for budget in budgets},
-        artifact_bytes=sum(artifact.size_bytes for artifact in artifacts),
+        artifact_bytes=artifact_bytes,
         workload_count=len(workloads),
         cell_count=len([cell for cell in cells if cell.state is not CellState.DELETED]),
     )

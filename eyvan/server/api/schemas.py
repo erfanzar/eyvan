@@ -117,9 +117,24 @@ class ProgressReportRequest(ApiModel):
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
-class ArtifactHoldRequest(ApiModel):
-    """Place an explicit human claim on one indexed artifact."""
+class ArtifactInventoryReindexRequest(ApiModel):
+    """Explicit additive repair for one previously inspected scope page."""
 
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    cursor: str | None = Field(default=None, min_length=1, max_length=512)
+    limit: int = Field(default=100, ge=1, le=1000)
+    #: Must exactly repeat ``org_id/project_id``. The redundancy is deliberate:
+    #: a mutating flag copied from a dry-run command must not silently target a
+    #: context-selected tenant the operator did not read.
+    acknowledge_scope: str = Field(min_length=3, max_length=257)
+
+
+class ArtifactHoldRequest(ApiModel):
+    """Place an explicit human claim on one scoped indexed artifact."""
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
     uri: str = Field(min_length=1, max_length=512)
     reason: str = Field(min_length=1, max_length=512)
     #: ``None`` is an indefinite hold, which is permitted: the honest lifetime of

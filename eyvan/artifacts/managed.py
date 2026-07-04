@@ -9,18 +9,22 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import heapq
 import hmac
 import json
 import os
 import re
+import stat as stat_module
 import subprocess
 import tempfile
 import time
 import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import url2pathname
+
+import httpx
 
 from eyvan._internal.compat import StrEnum
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims, verify_signature
@@ -62,6 +66,33 @@ class InvalidManagedArtifactURI(ValueError):
 
 class ManagedArtifactConflictError(RuntimeError):
     """Raised when an immutable managed object already has different bytes."""
+
+
+class ManagedArtifactInventoryError(RuntimeError):
+    """Raised when physical inventory cannot be observed conclusively.
+
+    A list or metadata failure is never translated into an empty scope or a
+    missing object. Callers must surface the inventory as inconclusive and must
+    not reindex from a partial observation.
+    """
+
+
+MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE = 1000
+
+_GCS_JSON_API_ROOT = "https://storage.googleapis.com/storage/v1"
+_GCS_INVENTORY_FIELDS = "items(name,size,generation),nextPageToken"
+_GCS_STAT_FIELDS = "name,size,generation"
+_GCS_INVENTORY_TIMEOUT_SECONDS = 30.0
+_GCS_ACCESS_TOKEN_TIMEOUT_SECONDS = 10.0
+_GCS_METADATA_TOKEN_TIMEOUT_SECONDS = 2.0
+_GCS_METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+_MAX_INVENTORY_CURSOR_BYTES = 512
+_MAX_GCS_ACCESS_TOKEN_BYTES = 16 * 1024
+_MAX_GCS_PAGE_TOKEN_BYTES = 16 * 1024
+_MAX_GCS_OBJECT_NAME_BYTES = 1024
+_MAX_GCS_INVENTORY_URL_BYTES = 16 * 1024
+_MAX_GCS_INVENTORY_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_GCS_INTEGER_DIGITS = 20
 
 
 class InvalidArtifactToken(ValueError):
@@ -128,8 +159,86 @@ class ManagedArtifactStore(tp.Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedArtifactObjectMetadata:
+    """Authoritative metadata captured from one physical object observation.
+
+    ``object_version`` identifies the exact provider generation or local file
+    instance observed alongside ``size_bytes``. It is report evidence, not the
+    conditional-deletion state introduced by the later artifact state-machine
+    migration.
+    """
+
+    uri: str
+    size_bytes: int
+    object_version: str
+
+    def __post_init__(self) -> None:
+        parse_managed_uri(self.uri)
+        if self.size_bytes < 0:
+            raise ValueError("managed artifact inventory size must be non-negative")
+        if not self.object_version.strip():
+            raise ValueError("managed artifact inventory object version must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedArtifactInventoryPage:
+    """One bounded page from exactly one known tenant prefix."""
+
+    objects: tuple[ManagedArtifactObjectMetadata, ...]
+    next_cursor: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not self.next_cursor.strip():
+            raise ValueError("managed artifact inventory cursor must not be blank")
+
+
+@tp.runtime_checkable
+class ManagedArtifactInventoryStore(ManagedArtifactStore, tp.Protocol):
+    """The seam a dry-run inventory reconciler requires from every backend.
+
+    Listing is scope-explicit and bounded. Errors propagate: a failed listing is
+    inconclusive and must never be interpreted as an empty prefix. ``stat`` and
+    page entries carry immutable object versions so a future reconciler can
+    distinguish replacements without reading or deleting bytes.
+    """
+
+    def list_scope(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        cursor: str | None = None,
+        limit: int = 1000,
+    ) -> ManagedArtifactInventoryPage: ...
+
+    def stat(self, uri: str, *, org_id: str, project_id: str) -> ManagedArtifactObjectMetadata | None: ...
+
+
+def _validate_inventory_page_request(cursor: str | None, limit: int) -> str | None:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE
+    ):
+        raise ValueError(
+            f"managed artifact inventory limit must be between 1 and {MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE}"
+        )
+    if cursor is not None:
+        if not isinstance(cursor, str) or not cursor.strip():
+            raise ValueError("managed artifact inventory cursor must not be blank")
+        try:
+            cursor_size = len(cursor.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError("managed artifact inventory cursor must be valid UTF-8") from None
+        if cursor_size > _MAX_INVENTORY_CURSOR_BYTES:
+            raise ValueError("managed artifact inventory cursor is too large")
+        parse_managed_uri(cursor)
+    return cursor
+
+
 class CommandRunner(tp.Protocol):
-    """Injectable subprocess boundary used by the GCS backend."""
+    """Injectable subprocess boundary used by the GCS byte-transfer backend."""
 
     def __call__(
         self,
@@ -138,6 +247,130 @@ class CommandRunner(tp.Protocol):
         check: bool,
         capture_output: bool,
     ) -> subprocess.CompletedProcess[bytes]: ...
+
+
+class _GCSInventoryTransport(tp.Protocol):
+    """Injectable, read-only HTTP boundary for the GCS JSON inventory API."""
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]: ...
+
+
+class _GCSInventoryResponseTooLarge(RuntimeError):
+    """Internal signal that a streaming response crossed its fixed body cap."""
+
+
+def _httpx_gcs_inventory_transport(
+    url: str,
+    *,
+    headers: tp.Mapping[str, str],
+    timeout_seconds: float,
+    maximum_response_bytes: int,
+) -> tuple[int, bytes]:
+    """Perform one non-redirecting, response-bounded GCS JSON API request."""
+
+    timeout = httpx.Timeout(timeout_seconds)
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            with client.stream("GET", url, headers=dict(headers)) as response:
+                raw_length = response.headers.get("content-length")
+                if raw_length is not None:
+                    if len(raw_length) > _MAX_GCS_INTEGER_DIGITS or not raw_length.isascii() or not raw_length.isdigit():
+                        raise _GCSInventoryResponseTooLarge
+                    if int(raw_length) > maximum_response_bytes:
+                        raise _GCSInventoryResponseTooLarge
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > maximum_response_bytes:
+                        raise _GCSInventoryResponseTooLarge
+                    body.extend(chunk)
+                return response.status_code, bytes(body)
+    except _GCSInventoryResponseTooLarge:
+        raise
+    except httpx.TimeoutException as exc:
+        raise TimeoutError from exc
+    except httpx.HTTPError as exc:
+        raise OSError from exc
+
+
+def _gcloud_inventory_access_token() -> str:
+    """Read an ephemeral OAuth token from the ambient gcloud/workload identity."""
+
+    try:
+        completed = subprocess.run(
+            ["gcloud", "auth", "print-access-token"],
+            check=False,
+            capture_output=True,
+            timeout=_GCS_ACCESS_TOKEN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
+    if completed.returncode != 0:
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed")
+    raw_token = completed.stdout
+    if not isinstance(raw_token, bytes) or len(raw_token) > _MAX_GCS_ACCESS_TOKEN_BYTES:
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup returned an invalid access token")
+    try:
+        token = raw_token.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup returned an invalid access token") from None
+    return token
+
+
+def _metadata_inventory_access_token() -> str:
+    """Read an ephemeral token from the fixed Google workload metadata endpoint."""
+
+    maximum_body_bytes = _MAX_GCS_ACCESS_TOKEN_BYTES * 2
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(_GCS_METADATA_TOKEN_TIMEOUT_SECONDS),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            with client.stream(
+                "GET",
+                _GCS_METADATA_TOKEN_URL,
+                headers={"Accept-Encoding": "identity", "Metadata-Flavor": "Google"},
+            ) as response:
+                if response.status_code != 200 or response.headers.get("metadata-flavor") != "Google":
+                    raise ManagedArtifactInventoryError("ambient GCS credential lookup failed")
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > maximum_body_bytes:
+                        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed")
+                    body.extend(chunk)
+    except ManagedArtifactInventoryError:
+        raise
+    except (httpx.HTTPError, OSError):
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
+    try:
+        document = json.loads(bytes(body))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
+    if not isinstance(document, dict) or set(document) - {"access_token", "expires_in", "token_type"}:
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed")
+    token = document.get("access_token")
+    if not isinstance(token, str):
+        raise ManagedArtifactInventoryError("ambient GCS credential lookup failed")
+    return token
+
+
+def _ambient_gcs_inventory_access_token() -> str:
+    """Use ambient gcloud credentials, then workload metadata when gcloud is absent."""
+
+    try:
+        return _gcloud_inventory_access_token()
+    except ManagedArtifactInventoryError:
+        try:
+            return _metadata_inventory_access_token()
+        except ManagedArtifactInventoryError:
+            raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
 
 
 def _validate_object_id(kind: ManagedArtifactKind, object_id: str) -> str:
@@ -376,6 +609,144 @@ class LocalManagedArtifactStore:
         target = self._path(reference, org_id, project_id, create_parent=False)
         return target.is_file()
 
+    def _inventory_scope_directory(self, org_id: str, project_id: str) -> Path | None:
+        """Return one known scope directory without following directory links."""
+
+        relative = Path("scopes", storage_scope(org_id, project_id))
+        current = self.root
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise ManagedArtifactInventoryError(f"could not stat managed artifact root: {exc}") from exc
+        if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
+            raise ManagedArtifactInventoryError("managed artifact root must remain a real directory")
+        for component in relative.parts:
+            current /= component
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ManagedArtifactInventoryError(f"could not stat managed artifact inventory scope: {exc}") from exc
+            if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
+                raise ManagedArtifactInventoryError(
+                    "managed artifact inventory scope must contain only real directories"
+                )
+        return current
+
+    @staticmethod
+    def _local_inventory_metadata(target: Path, uri: str) -> ManagedArtifactObjectMetadata | None:
+        """Observe size and replacement identity from one no-follow descriptor."""
+
+        try:
+            descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ManagedArtifactInventoryError(f"could not open managed artifact inventory object: {exc}") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat_module.S_ISREG(metadata.st_mode):
+                raise ManagedArtifactInventoryError("managed artifact inventory object must be a regular file")
+            # dev+inode identifies the live file instance. ctime protects against
+            # inode reuse and changes on in-place mutation; size is captured by
+            # the same fstat call, so a report never pairs two observations.
+            version = f"local:{metadata.st_dev}:{metadata.st_ino}:{metadata.st_ctime_ns}"
+            return ManagedArtifactObjectMetadata(uri=uri, size_bytes=metadata.st_size, object_version=version)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _reference_from_local_entry(kind: ManagedArtifactKind, filename: str) -> ManagedArtifactRef:
+        extension = _OBJECT_EXTENSIONS[kind]
+        if not filename.endswith(extension):
+            raise ManagedArtifactInventoryError(f"managed artifact inventory found an unexpected file in {kind.value!r}")
+        object_id = filename[: -len(extension)]
+        try:
+            reference = ManagedArtifactRef(kind, _validate_object_id(kind, object_id))
+        except (InvalidManagedArtifactURI, ValueError) as exc:
+            raise ManagedArtifactInventoryError(
+                f"managed artifact inventory found a non-canonical object in {kind.value!r}"
+            ) from exc
+        if filename != f"{reference.object_id}{extension}":
+            raise ManagedArtifactInventoryError(
+                f"managed artifact inventory found a non-canonical object in {kind.value!r}"
+            )
+        return reference
+
+    def list_scope(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        cursor: str | None = None,
+        limit: int = MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
+    ) -> ManagedArtifactInventoryPage:
+        """List a bounded page from exactly one explicitly supplied local scope."""
+
+        cursor = _validate_inventory_page_request(cursor, limit)
+        scope = self._inventory_scope_directory(org_id, project_id)
+        if scope is None:
+            return ManagedArtifactInventoryPage(objects=())
+        known = {kind.value: kind for kind in ManagedArtifactKind}
+
+        def observed() -> tp.Iterator[ManagedArtifactObjectMetadata]:
+            try:
+                entries = tuple(os.scandir(scope))
+            except OSError as exc:
+                raise ManagedArtifactInventoryError(f"could not list managed artifact inventory scope: {exc}") from exc
+            for entry in entries:
+                if entry.name not in known or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    raise ManagedArtifactInventoryError("managed artifact inventory scope contains an unexpected entry")
+                kind = known[entry.name]
+                try:
+                    children = os.scandir(entry.path)
+                except OSError as exc:
+                    raise ManagedArtifactInventoryError(
+                        f"could not list managed artifact inventory kind {kind.value!r}: {exc}"
+                    ) from exc
+                with children:
+                    for child in children:
+                        if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                            raise ManagedArtifactInventoryError(
+                                f"managed artifact inventory kind {kind.value!r} contains a non-file entry"
+                            )
+                        reference = self._reference_from_local_entry(kind, child.name)
+                        if cursor is not None and reference.uri <= cursor:
+                            continue
+                        metadata = self._local_inventory_metadata(Path(child.path), reference.uri)
+                        if metadata is None:
+                            raise ManagedArtifactInventoryError(
+                                "managed artifact disappeared while its inventory page was being observed"
+                            )
+                        yield metadata
+
+        # nsmallest keeps memory bounded to one page even when a local scope has
+        # millions of objects. Invalid entries are still visited and fail closed.
+        page = heapq.nsmallest(limit + 1, observed(), key=lambda item: item.uri)
+        has_more = len(page) > limit
+        selected = tuple(page[:limit])
+        return ManagedArtifactInventoryPage(
+            objects=selected,
+            next_cursor=selected[-1].uri if has_more else None,
+        )
+
+    def stat(
+        self,
+        uri: str,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> ManagedArtifactObjectMetadata | None:
+        """Observe one scoped local object's authoritative size and file identity."""
+
+        reference = parse_managed_uri(uri)
+        try:
+            target = self._path(reference, org_id, project_id, create_parent=False)
+        except OSError as exc:
+            raise ManagedArtifactInventoryError(f"could not resolve managed artifact inventory object: {exc}") from exc
+        return self._local_inventory_metadata(target, reference.uri)
+
     def delete(self, uri: str, *, org_id: str, project_id: str) -> bool:
         """Unlink one scoped local object, reporting whether it was there.
 
@@ -398,20 +769,50 @@ class LocalManagedArtifactStore:
 
 
 class GCSManagedArtifactStore:
-    """Immutable managed artifact storage backed by ``gcloud storage``."""
+    """Immutable GCS storage with a bounded, live-only JSON API inventory path."""
 
-    def __init__(self, root_uri: str, *, runner: CommandRunner = subprocess.run):
+    def __init__(
+        self,
+        root_uri: str,
+        *,
+        runner: CommandRunner = subprocess.run,
+        inventory_transport: _GCSInventoryTransport = _httpx_gcs_inventory_transport,
+        access_token_provider: tp.Callable[[], str] = _ambient_gcs_inventory_access_token,
+        inventory_timeout_seconds: float = _GCS_INVENTORY_TIMEOUT_SECONDS,
+    ):
+        if not isinstance(root_uri, str) or any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in root_uri
+        ):
+            raise ValueError("GCS managed artifact root must be a canonical URI without control characters")
         parsed = urlsplit(root_uri.rstrip("/"))
         if parsed.scheme != "gs" or not parsed.netloc or parsed.query or parsed.fragment:
             raise ValueError("GCS managed artifact storage requires a gs://bucket[/prefix] URI")
-        if "@" in parsed.netloc or ":" in parsed.netloc or "%" in parsed.path:
-            raise ValueError("GCS managed artifact root must use a canonical bucket and prefix")
+        if (
+            "@" in parsed.netloc
+            or ":" in parsed.netloc
+            or "%" in parsed.path
+            or any(character in f"{parsed.netloc}{parsed.path}" for character in "*?[]\r\n\0")
+        ):
+            raise ValueError("GCS managed artifact root must use a canonical, non-wildcard bucket and prefix")
         components = tuple(component for component in parsed.path.split("/") if component)
         if any(component in {".", ".."} for component in components):
             raise ValueError("GCS managed artifact root cannot contain relative path components")
         suffix = f"/{'/'.join(components)}" if components else ""
         self.root_uri = f"gs://{parsed.netloc}{suffix}"
+        self._bucket = parsed.netloc
+        self._root_object_prefix = "/".join(components)
         self._runner = runner
+        if not callable(inventory_transport) or not callable(access_token_provider):
+            raise TypeError("GCS inventory transport and access token provider must be callable")
+        if (
+            isinstance(inventory_timeout_seconds, bool)
+            or not isinstance(inventory_timeout_seconds, (int, float))
+            or not 0 < inventory_timeout_seconds <= 120
+        ):
+            raise ValueError("GCS inventory timeout must be between 0 and 120 seconds")
+        self._inventory_transport = inventory_transport
+        self._access_token_provider = access_token_provider
+        self._inventory_timeout_seconds = float(inventory_timeout_seconds)
 
     def _object_uri(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> str:
         relative = _relative_object_path(reference, org_id, project_id).as_posix()
@@ -480,6 +881,324 @@ class GCSManagedArtifactStore:
             capture_output=True,
         )
         return completed.returncode == 0
+
+    def _scope_object_name_prefix(self, org_id: str, project_id: str) -> str:
+        suffix = f"scopes/{storage_scope(org_id, project_id)}/"
+        prefix = f"{self._root_object_prefix}/{suffix}" if self._root_object_prefix else suffix
+        self._validate_gcs_object_name(prefix, description="scope prefix")
+        return prefix
+
+    @staticmethod
+    def _validate_gcs_object_name(name: str, *, description: str) -> str:
+        if not isinstance(name, str) or not name:
+            raise ManagedArtifactInventoryError(f"GCS inventory returned an invalid {description}")
+        try:
+            encoded = name.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ManagedArtifactInventoryError(f"GCS inventory returned an invalid {description}") from None
+        if len(encoded) > _MAX_GCS_OBJECT_NAME_BYTES:
+            raise ManagedArtifactInventoryError(f"GCS inventory returned an oversized {description}")
+        return name
+
+    def _object_name(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> str:
+        parsed = urlsplit(self._object_uri(reference, org_id, project_id))
+        if parsed.scheme != "gs" or parsed.netloc != self._bucket:
+            raise ManagedArtifactInventoryError("managed artifact inventory object escaped its configured GCS bucket")
+        return self._validate_gcs_object_name(parsed.path.lstrip("/"), description="object name")
+
+    def _reference_from_gcs_name(self, name: str, org_id: str, project_id: str) -> ManagedArtifactRef:
+        name = self._validate_gcs_object_name(name, description="object name")
+        prefix = self._scope_object_name_prefix(org_id, project_id)
+        if not name.startswith(prefix):
+            raise ManagedArtifactInventoryError("GCS inventory returned an object outside the requested scope prefix")
+        relative = name[len(prefix) :]
+        components = relative.split("/")
+        if len(components) != 2:
+            raise ManagedArtifactInventoryError("GCS inventory returned a non-canonical managed artifact path")
+        try:
+            kind = ManagedArtifactKind(components[0])
+        except ValueError:
+            raise ManagedArtifactInventoryError("GCS inventory returned an unknown managed artifact kind") from None
+        filename = components[1]
+        extension = _OBJECT_EXTENSIONS[kind]
+        if not filename.endswith(extension):
+            raise ManagedArtifactInventoryError("GCS inventory returned an object with an unexpected extension")
+        object_id = filename[: -len(extension)]
+        try:
+            reference = ManagedArtifactRef(kind, _validate_object_id(kind, object_id))
+        except (InvalidManagedArtifactURI, ValueError):
+            raise ManagedArtifactInventoryError("GCS inventory returned a non-canonical managed artifact ID") from None
+        if self._object_name(reference, org_id, project_id) != name:
+            raise ManagedArtifactInventoryError("GCS inventory returned a non-canonical managed artifact path")
+        return reference
+
+    @staticmethod
+    def _json_api_url(path: str, parameters: tp.Mapping[str, str]) -> str:
+        query = urlencode(tuple(parameters.items()), doseq=False, safe="", quote_via=quote)
+        url = f"{_GCS_JSON_API_ROOT}/{path}?{query}"
+        try:
+            url_size = len(url.encode("ascii"))
+        except UnicodeEncodeError:
+            raise ManagedArtifactInventoryError("GCS inventory request URL was invalid") from None
+        if url_size > _MAX_GCS_INVENTORY_URL_BYTES:
+            raise ManagedArtifactInventoryError("GCS inventory request URL was too large")
+        return url
+
+    def _access_token(self) -> str:
+        try:
+            token = self._access_token_provider()
+        except Exception:
+            raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
+        if not isinstance(token, str):
+            raise ManagedArtifactInventoryError("ambient GCS credential lookup returned an invalid access token")
+        try:
+            encoded = token.encode("ascii")
+        except UnicodeEncodeError:
+            raise ManagedArtifactInventoryError(
+                "ambient GCS credential lookup returned an invalid access token"
+            ) from None
+        if (
+            not token
+            or token != token.strip()
+            or len(encoded) > _MAX_GCS_ACCESS_TOKEN_BYTES
+            or any(character < 0x21 or character > 0x7E for character in encoded)
+        ):
+            raise ManagedArtifactInventoryError("ambient GCS credential lookup returned an invalid access token")
+        return token
+
+    def _request_inventory_json(self, url: str, *, absent_on_not_found: bool = False) -> bytes | None:
+        token = self._access_token()
+        try:
+            response = self._inventory_transport(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout_seconds=self._inventory_timeout_seconds,
+                maximum_response_bytes=_MAX_GCS_INVENTORY_RESPONSE_BYTES,
+            )
+        except _GCSInventoryResponseTooLarge:
+            raise ManagedArtifactInventoryError("GCS inventory response exceeded the bounded body size") from None
+        except (TimeoutError, httpx.TimeoutException):
+            raise ManagedArtifactInventoryError("GCS inventory request timed out") from None
+        except Exception:
+            raise ManagedArtifactInventoryError("GCS inventory request failed") from None
+        if not isinstance(response, tuple) or len(response) != 2:
+            raise ManagedArtifactInventoryError("GCS inventory transport returned an invalid response")
+        status_code, payload = response
+        if isinstance(status_code, bool) or not isinstance(status_code, int) or not 100 <= status_code <= 599:
+            raise ManagedArtifactInventoryError("GCS inventory transport returned an invalid status")
+        if not isinstance(payload, bytes) or len(payload) > _MAX_GCS_INVENTORY_RESPONSE_BYTES:
+            raise ManagedArtifactInventoryError("GCS inventory response exceeded the bounded body size")
+        if absent_on_not_found and status_code == 404:
+            return None
+        if status_code != 200:
+            # The status is useful and bounded. Provider bodies and URLs may
+            # contain secrets, tenant identifiers, or attacker-controlled text.
+            raise ManagedArtifactInventoryError(f"GCS inventory request failed with HTTP status {status_code}")
+        return payload
+
+    @staticmethod
+    def _decode_gcs_json(payload: bytes) -> dict[str, tp.Any]:
+        def unique_object(pairs: list[tuple[str, tp.Any]]) -> dict[str, tp.Any]:
+            value: dict[str, tp.Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate JSON key")
+                value[key] = item
+            return value
+
+        def reject_constant(_value: str) -> tp.NoReturn:
+            raise ValueError("non-finite JSON number")
+
+        try:
+            decoded = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=unique_object,
+                parse_constant=reject_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ManagedArtifactInventoryError("GCS inventory returned malformed JSON") from None
+        if not isinstance(decoded, dict):
+            raise ManagedArtifactInventoryError("GCS inventory returned an invalid JSON document")
+        return decoded
+
+    @staticmethod
+    def _parse_gcs_uint64(value: tp.Any, *, field: str, minimum: int) -> tuple[int, str]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > _MAX_GCS_INTEGER_DIGITS
+            or not value.isascii()
+            or not value.isdigit()
+        ):
+            raise ManagedArtifactInventoryError(f"GCS inventory returned an invalid {field}")
+        parsed = int(value)
+        if parsed < minimum or parsed > (1 << 64) - 1:
+            raise ManagedArtifactInventoryError(f"GCS inventory returned an invalid {field}")
+        return parsed, value
+
+    def _metadata_from_gcs_item(
+        self,
+        item: tp.Any,
+        *,
+        org_id: str,
+        project_id: str,
+        expected_name: str | None = None,
+    ) -> tuple[str, ManagedArtifactObjectMetadata]:
+        if not isinstance(item, dict) or set(item) != {"name", "size", "generation"}:
+            raise ManagedArtifactInventoryError("GCS inventory returned an invalid object metadata document")
+        name = self._validate_gcs_object_name(item["name"], description="object name")
+        if expected_name is not None and name != expected_name:
+            raise ManagedArtifactInventoryError("GCS stat returned metadata for a different object")
+        size_bytes, _size_text = self._parse_gcs_uint64(item["size"], field="object size", minimum=0)
+        _generation, generation_text = self._parse_gcs_uint64(item["generation"], field="object generation", minimum=1)
+        reference = self._reference_from_gcs_name(name, org_id, project_id)
+        return (
+            name,
+            ManagedArtifactObjectMetadata(
+                uri=reference.uri,
+                size_bytes=size_bytes,
+                object_version=f"gcs:{generation_text}",
+            ),
+        )
+
+    def _parse_gcs_list_page(
+        self,
+        payload: bytes,
+        *,
+        org_id: str,
+        project_id: str,
+        maximum_items: int,
+    ) -> tuple[list[tuple[str, ManagedArtifactObjectMetadata]], str | None]:
+        decoded = self._decode_gcs_json(payload)
+        if not set(decoded).issubset({"items", "nextPageToken"}):
+            raise ManagedArtifactInventoryError("GCS inventory returned unexpected JSON fields")
+        raw_items = decoded.get("items", [])
+        if not isinstance(raw_items, list) or len(raw_items) > maximum_items:
+            raise ManagedArtifactInventoryError("GCS inventory returned an invalid or unbounded object page")
+        parsed: list[tuple[str, ManagedArtifactObjectMetadata]] = []
+        names: set[str] = set()
+        previous_name: str | None = None
+        for item in raw_items:
+            name, metadata = self._metadata_from_gcs_item(item, org_id=org_id, project_id=project_id)
+            if name in names:
+                raise ManagedArtifactInventoryError("GCS inventory returned duplicate object names")
+            if previous_name is not None and name < previous_name:
+                raise ManagedArtifactInventoryError("GCS inventory returned objects out of lexical order")
+            names.add(name)
+            previous_name = name
+            parsed.append((name, metadata))
+
+        next_page_token: str | None = None
+        if "nextPageToken" in decoded:
+            raw_token = decoded["nextPageToken"]
+            if not isinstance(raw_token, str):
+                raise ManagedArtifactInventoryError("GCS inventory returned an invalid page token")
+            try:
+                encoded_token = raw_token.encode("ascii")
+            except UnicodeEncodeError:
+                raise ManagedArtifactInventoryError("GCS inventory returned an invalid page token") from None
+            if (
+                not raw_token
+                or raw_token != raw_token.strip()
+                or len(encoded_token) > _MAX_GCS_PAGE_TOKEN_BYTES
+                or any(character < 0x21 or character > 0x7E for character in encoded_token)
+            ):
+                raise ManagedArtifactInventoryError("GCS inventory returned an invalid page token")
+            next_page_token = raw_token
+        return parsed, next_page_token
+
+    def list_scope(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        cursor: str | None = None,
+        limit: int = MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
+    ) -> ManagedArtifactInventoryPage:
+        """List one bounded page of current live objects from one exact scope.
+
+        The GCS JSON API receives the scope as a server-side ``prefix``, an
+        explicit ``versions=false``/``softDeleted=false``, and
+        ``maxResults=limit+1``. The public
+        cursor remains the last canonical managed URI; it resumes through a
+        strict-successor ``startOffset`` while ``nextPageToken`` is used only as
+        bounded evidence that the provider has another page. Exactly one object
+        list request is consumed per call.
+        """
+
+        cursor = _validate_inventory_page_request(cursor, limit)
+        maximum = limit + 1
+        prefix = self._scope_object_name_prefix(org_id, project_id)
+        parameters = {
+            "prefix": prefix,
+            "maxResults": str(maximum),
+            "versions": "false",
+            "softDeleted": "false",
+            "projection": "noAcl",
+            "fields": _GCS_INVENTORY_FIELDS,
+        }
+        cursor_name: str | None = None
+        if cursor is not None:
+            cursor_name = self._object_name(parse_managed_uri(cursor), org_id, project_id)
+            # GCS startOffset is inclusive. ``!`` sorts before every character
+            # permitted after a canonical result ID prefix (the minimum is
+            # ``-``), but ``cursor!`` still sorts after the cursor itself. It is
+            # therefore a strict lower bound that excludes the cursor even on a
+            # short provider page without skipping a longer canonical filename.
+            parameters["startOffset"] = f"{cursor_name}!"
+        bucket = quote(self._bucket, safe="")
+        url = self._json_api_url(f"b/{bucket}/o", parameters)
+        payload = self._request_inventory_json(url)
+        assert payload is not None
+        parsed, next_page_token = self._parse_gcs_list_page(
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            maximum_items=maximum,
+        )
+        if cursor_name is not None and any(name <= cursor_name for name, _metadata in parsed):
+            raise ManagedArtifactInventoryError("GCS inventory cursor did not advance monotonically")
+        has_more = len(parsed) > limit or next_page_token is not None
+        selected = tuple(metadata for _name, metadata in parsed[:limit])
+        if has_more and not selected:
+            raise ManagedArtifactInventoryError("GCS inventory page token did not advance the public cursor")
+        return ManagedArtifactInventoryPage(
+            objects=selected,
+            next_cursor=selected[-1].uri if has_more else None,
+        )
+
+    def stat(
+        self,
+        uri: str,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> ManagedArtifactObjectMetadata | None:
+        """GET metadata for exactly one current live object, never its versions."""
+
+        reference = parse_managed_uri(uri)
+        object_name = self._object_name(reference, org_id, project_id)
+        bucket = quote(self._bucket, safe="")
+        encoded_name = quote(object_name, safe="")
+        url = self._json_api_url(
+            f"b/{bucket}/o/{encoded_name}",
+            {"projection": "noAcl", "softDeleted": "false", "fields": _GCS_STAT_FIELDS},
+        )
+        payload = self._request_inventory_json(url, absent_on_not_found=True)
+        if payload is None:
+            return None
+        decoded = self._decode_gcs_json(payload)
+        _name, metadata = self._metadata_from_gcs_item(
+            decoded,
+            org_id=org_id,
+            project_id=project_id,
+            expected_name=object_name,
+        )
+        return metadata
 
     def delete(self, uri: str, *, org_id: str, project_id: str) -> bool:
         """Remove one scoped GCS object, reporting whether it was there.
@@ -722,6 +1441,7 @@ class ArtifactTokenSigner:
 
 
 __all__ = (
+    "MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE",
     "ArtifactAction",
     "ArtifactTokenClaims",
     "ArtifactTokenSigner",
@@ -732,7 +1452,11 @@ __all__ = (
     "InvalidManagedArtifactURI",
     "LocalManagedArtifactStore",
     "ManagedArtifactConflictError",
+    "ManagedArtifactInventoryError",
+    "ManagedArtifactInventoryPage",
+    "ManagedArtifactInventoryStore",
     "ManagedArtifactKind",
+    "ManagedArtifactObjectMetadata",
     "ManagedArtifactRef",
     "ManagedArtifactStore",
     "callable_uri",

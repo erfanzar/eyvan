@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import subprocess
 import typing as tp
 import uuid
 from datetime import datetime, timedelta
@@ -19,7 +20,12 @@ from pydantic import BaseModel
 
 from eyvan._internal.json_types import JsonObject, JsonValue, model_json
 from eyvan.artifacts.managed import (
+    CONTENT_ADDRESSED_KINDS,
+    MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
+    ManagedArtifactInventoryError,
+    ManagedArtifactInventoryStore,
     ManagedArtifactKind,
+    ManagedArtifactObjectMetadata,
     ManagedArtifactRef,
     ManagedArtifactStore,
     is_managed_uri,
@@ -41,6 +47,9 @@ from eyvan.records import (
     WORKER_COUNT_LABEL,
     ArtifactCollection,
     ArtifactHold,
+    ArtifactInventoryEntry,
+    ArtifactInventoryReport,
+    ArtifactInventoryStatus,
     ArtifactReferenceRecord,
     ArtifactUsage,
     AuditEvent,
@@ -392,6 +401,11 @@ class ControlPlaneService:
         #: every deployment that does not run a collector -- which is all of them
         #: until an operator opts in -- carries no path to removing bytes at all.
         artifact_store: ManagedArtifactStore | None = None,
+        #: Read-only/additive inventory can be exposed before the deletion state
+        #: machine. It is deliberately separate from ``artifact_store`` so wiring
+        #: API uploads for inventory does not silently enable the current unsafe
+        #: collector path in a deployment.
+        inventory_store: ManagedArtifactInventoryStore | None = None,
         #: This plane's identity among peers. Empty means "not federated", which is
         #: the default: one plane per region with projects pinned to one region
         #: already works, and a plane with no id simply cannot issue grants.
@@ -407,6 +421,7 @@ class ControlPlaneService:
         self.callable_trust = callable_trust
         self.scheduler = scheduler
         self.artifact_store = artifact_store
+        self.inventory_store = inventory_store
         self.plane_id = plane_id
         self.carbon = carbon or NoCarbonSource()
 
@@ -1133,7 +1148,7 @@ class ControlPlaneService:
         for uri in self.referenced_artifact_uris(workload.spec):
             await tx.put_artifact_reference(
                 ArtifactReferenceRecord(
-                    id=artifact_reference_id(uri, workload.id),
+                    id=artifact_reference_id(workload.org_id, workload.project_id, uri, workload.id),
                     uri=uri,
                     workload_id=workload.id,
                     org_id=workload.org_id,
@@ -1155,7 +1170,12 @@ class ControlPlaneService:
         artifact was *once* in use rather than never indexed at all.
         """
 
-        for reference in await tx.list_artifact_references(workload_id=workload.id, active_only=True):
+        for reference in await tx.list_artifact_references(
+            org_id=workload.org_id,
+            project_id=workload.project_id,
+            workload_id=workload.id,
+            active_only=True,
+        ):
             await tx.put_artifact_reference(reference.model_copy(update={"released_at": now}))
 
     @staticmethod
@@ -5907,10 +5927,9 @@ class ControlPlaneService:
         that already landed would leave the store and the index disagreeing about
         what exists, which is the one thing this index must never do.
 
-        Re-indexing a content-addressed URI is an update, not an addition. Two
-        projects uploading the same callable produce one row and one charge --
-        the store holds one object, so charging twice would bill for bytes that
-        do not exist.
+        Re-indexing a content-addressed URI is an update only within the requested
+        project. The physical store namespaces bytes by organization and project,
+        so another project using the same URI owns an independent row and charge.
 
         Raises:
             InputError: If the write would exceed the scope's artifact byte quota.
@@ -5919,7 +5938,7 @@ class ControlPlaneService:
         reference = parse_managed_uri(uri)
         now = utcnow()
         async with self.repository.transaction() as tx:
-            existing = await tx.get_managed_artifact(uri)
+            existing = await tx.get_managed_artifact(org_id, project_id, uri)
             quota = await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
             if quota is not None:
                 stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
@@ -5986,6 +6005,232 @@ class ControlPlaneService:
                 limit=limit,
             )
 
+    async def inventory_managed_artifacts(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        cursor: str | None = None,
+        limit: int = 100,
+        reindex_missing: bool = False,
+        acknowledge_scope: str | None = None,
+    ) -> ArtifactInventoryReport:
+        """Compare one bounded physical page with one scoped index page.
+
+        The comparison is built completely before an optional reindex begins.
+        Reindexing is additive only: it can create metadata for a physical-only
+        URI observed in this exact scope, and cannot update an existing row,
+        repair a discrepancy, infer another tenant, or delete bytes.
+        """
+
+        permission = Permission.MANAGE_PROJECT if reindex_missing else Permission.READ
+        self.authorizer.require(principal, permission, org_id=org_id, project_id=project_id)
+        configured_inventory_store = self.inventory_store
+        if configured_inventory_store is None and isinstance(self.artifact_store, ManagedArtifactInventoryStore):
+            configured_inventory_store = self.artifact_store
+        if configured_inventory_store is None:
+            raise InputError("the configured managed artifact store does not support bounded inventory")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE
+        ):
+            raise InputError(
+                f"artifact inventory limit must be between 1 and {MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE}"
+            )
+        if cursor is not None:
+            try:
+                parse_managed_uri(cursor)
+            except ValueError as exc:
+                raise InputError("artifact inventory cursor must be a canonical managed artifact URI") from exc
+        expected_acknowledgement = f"{org_id}/{project_id}"
+        if reindex_missing and acknowledge_scope != expected_acknowledgement:
+            raise InputError(
+                "reindexing missing artifact metadata requires acknowledge_scope="
+                f"{expected_acknowledgement!r}; run the report-only inventory first"
+            )
+
+        store = configured_inventory_store
+        physical_page = await asyncio.to_thread(
+            store.list_scope,
+            org_id=org_id,
+            project_id=project_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        async with self.repository.transaction() as tx:
+            indexed_page = await tx.list_managed_artifacts_page(
+                org_id=org_id,
+                project_id=project_id,
+                after_uri=cursor,
+                limit=limit + 1,
+            )
+        physical = {item.uri: item for item in physical_page.objects}
+        indexed = {item.uri: item for item in indexed_page}
+        union = sorted(set(physical) | set(indexed))
+        selected = union[:limit]
+        has_more = len(union) > limit or physical_page.next_cursor is not None or len(indexed_page) > limit
+
+        entries: list[ArtifactInventoryEntry] = []
+        for uri in selected:
+            record = indexed.get(uri)
+            observed = physical.get(uri)
+            if observed is None and record is not None:
+                # A point observation distinguishes genuinely missing bytes from
+                # list pagination or a concurrent create. Any stat error raises;
+                # it is never interpreted as absence.
+                observed = await asyncio.to_thread(
+                    store.stat,
+                    uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+            if record is None:
+                if observed is None:
+                    # Every selected URI came from at least one source. Reaching
+                    # neither means the observations changed underneath us; an
+                    # additive repair from that evidence would be unsafe.
+                    raise ConflictError("artifact inventory changed during observation; rerun the dry-run")
+                status = ArtifactInventoryStatus.PHYSICAL_ONLY
+            elif observed is None:
+                status = ArtifactInventoryStatus.INDEX_ONLY
+            elif record.size_bytes != observed.size_bytes:
+                status = ArtifactInventoryStatus.SIZE_MISMATCH
+            else:
+                status = ArtifactInventoryStatus.MATCHED
+            entries.append(
+                ArtifactInventoryEntry(
+                    uri=uri,
+                    status=status,
+                    indexed_size_bytes=None if record is None else record.size_bytes,
+                    observed_size_bytes=None if observed is None else observed.size_bytes,
+                    observed_object_version=None if observed is None else observed.object_version,
+                )
+            )
+
+        reindexed = 0
+        if reindex_missing:
+            # Validate every physical-only observation before the first database
+            # write. A late list/stat/digest error therefore leaves the whole
+            # page report-only instead of partially reindexed.
+            validated: list[ManagedArtifactObjectMetadata] = []
+            for entry in entries:
+                if entry.status is not ArtifactInventoryStatus.PHYSICAL_ONLY:
+                    continue
+                assert entry.observed_size_bytes is not None
+                assert entry.observed_object_version is not None
+                expected = ManagedArtifactObjectMetadata(
+                    uri=entry.uri,
+                    size_bytes=entry.observed_size_bytes,
+                    object_version=entry.observed_object_version,
+                )
+                reference = parse_managed_uri(entry.uri)
+                if reference.kind in CONTENT_ADDRESSED_KINDS:
+                    try:
+                        payload = await asyncio.to_thread(
+                            store.get,
+                            entry.uri,
+                            org_id=org_id,
+                            project_id=project_id,
+                        )
+                    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+                        raise ManagedArtifactInventoryError(
+                            f"could not verify content-addressed inventory object {entry.uri!r}"
+                        ) from exc
+                    if len(payload) != expected.size_bytes:
+                        raise ConflictError(
+                            f"artifact {entry.uri!r} changed while its content digest was verified; rerun inventory"
+                        )
+                validated.append(expected)
+
+            # This is the last provider observation before the additive database
+            # transaction. In particular it runs after content-addressed reads,
+            # so a replacement during digest validation cannot reindex metadata
+            # from the older listed generation. ``stat`` means the current live
+            # GCS object; noncurrent/deleted generations never satisfy equality.
+            for expected in validated:
+                current = await asyncio.to_thread(
+                    store.stat,
+                    expected.uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+                if current != expected:
+                    raise ConflictError(
+                        f"artifact {expected.uri!r} changed after the dry-run observation; rerun inventory"
+                    )
+            added_uris = await self._reindex_observed_artifacts(
+                principal,
+                org_id=org_id,
+                project_id=project_id,
+                metadata=tuple(validated),
+            )
+            reindexed = len(added_uris)
+            entries = [entry.model_copy(update={"reindexed": entry.uri in added_uris}) for entry in entries]
+
+        return ArtifactInventoryReport(
+            org_id=org_id,
+            project_id=project_id,
+            entries=tuple(entries),
+            next_cursor=selected[-1] if has_more and selected else None,
+            dry_run=not reindex_missing,
+            reindexed_count=reindexed,
+        )
+
+    async def _reindex_observed_artifacts(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        metadata: tuple[ManagedArtifactObjectMetadata, ...],
+    ) -> frozenset[str]:
+        """Atomically add observed physical-only rows and their audit events."""
+
+        if not metadata:
+            return frozenset()
+        now = utcnow()
+        async with self.repository.transaction() as tx:
+            missing: list[tuple[ManagedArtifactObjectMetadata, ManagedArtifactRef]] = []
+            for observed in metadata:
+                if await tx.get_managed_artifact(org_id, project_id, observed.uri) is None:
+                    missing.append((observed, parse_managed_uri(observed.uri)))
+            quota = await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
+            stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
+            projected = stored + sum(observed.size_bytes for observed, _reference in missing)
+            if quota is not None and projected > quota:
+                raise InputError(
+                    f"reindexing observed artifacts would put {org_id}/{project_id} at {projected} bytes, "
+                    f"above its {quota}-byte artifact quota"
+                )
+            for observed, reference in missing:
+                record = ManagedArtifactRecord(
+                    uri=observed.uri,
+                    kind=reference.kind.value,
+                    org_id=org_id,
+                    project_id=project_id,
+                    size_bytes=observed.size_bytes,
+                    sha256=reference.object_id if reference.kind in CONTENT_ADDRESSED_KINDS else None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                await tx.put_managed_artifact(record)
+                await self._audit_scoped(
+                    tx,
+                    principal,
+                    org_id=org_id,
+                    project_id=project_id,
+                    entity_type="artifact",
+                    entity_id=observed.uri[:256],
+                    action="artifact.inventory_reindexed",
+                    payload={
+                        "size_bytes": observed.size_bytes,
+                        "object_version": observed.object_version,
+                    },
+                )
+        return frozenset(observed.uri for observed, _reference in missing)
+
     async def artifact_usage(
         self,
         principal: Principal,
@@ -5999,11 +6244,11 @@ class ControlPlaneService:
         async with self.repository.transaction() as tx:
             stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
             limit = None if project_id is None else await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
-            artifacts = await tx.list_managed_artifacts(org_id=org_id, project_id=project_id, limit=100_000)
+            artifact_count = await tx.count_managed_artifacts(org_id=org_id, project_id=project_id)
         return ArtifactUsage(
             org_id=org_id,
             project_id=project_id,
-            artifact_count=len(artifacts),
+            artifact_count=artifact_count,
             stored_bytes=stored,
             quota_bytes=limit,
         )
@@ -6012,33 +6257,31 @@ class ControlPlaneService:
         self,
         principal: Principal,
         *,
+        org_id: str,
+        project_id: str,
         uri: str,
         reason: str,
         expires_at: datetime | None = None,
     ) -> ManagedArtifactRecord:
-        """Place an explicit human claim on one artifact.
+        """Place an explicit human claim on one scoped artifact.
 
-        Attributed to the calling principal rather than accepting a ``held_by``
-        parameter: a hold whose owner can be typed in is a hold nobody can be
-        asked about, and "who said to keep this" is the only question that ever
-        gets asked of one.
+        The caller supplies the scope and is authorized before any row lookup. A
+        URI alone is never used to discover which tenant owns an artifact.
         """
 
+        self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
         async with self.repository.transaction() as tx:
-            record = await tx.get_managed_artifact(uri)
+            record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:
-                raise NotFoundError(f"artifact {uri!r} is not indexed")
-            self.authorizer.require(
-                principal, Permission.MANAGE_PROJECT, org_id=record.org_id, project_id=record.project_id
-            )
+                raise NotFoundError(f"artifact {uri!r} is not indexed in {org_id}/{project_id}")
             hold = ArtifactHold(reason=reason, held_by=principal.subject, expires_at=expires_at)
             held = record.model_copy(update={"hold": hold, "updated_at": utcnow()})
             await tx.put_managed_artifact(held)
             await self._audit_scoped(
                 tx,
                 principal,
-                org_id=record.org_id,
-                project_id=record.project_id,
+                org_id=org_id,
+                project_id=project_id,
                 entity_type="artifact",
                 entity_id=uri[:256],
                 action="artifact.held",
@@ -6046,22 +6289,21 @@ class ControlPlaneService:
             )
             return held
 
-    async def release_artifact_hold(self, principal: Principal, *, uri: str) -> ManagedArtifactRecord:
-        """Remove the hold on one artifact.
+    async def release_artifact_hold(
+        self, principal: Principal, *, org_id: str, project_id: str, uri: str
+    ) -> ManagedArtifactRecord:
+        """Remove the hold on one scoped artifact.
 
-        Anyone with manage permission in the project may release, including a hold
-        someone else placed. The alternative -- only the holder may release -- makes
-        an artifact permanently unreclaimable when that person leaves, and the audit
-        event records who released what, which is the accountability that matters.
+        Anyone with manage permission in the requested project may release,
+        including a hold someone else placed. Authorization happens before the
+        scoped lookup so another tenant's URI is never an ownership oracle.
         """
 
+        self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
         async with self.repository.transaction() as tx:
-            record = await tx.get_managed_artifact(uri)
+            record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:
-                raise NotFoundError(f"artifact {uri!r} is not indexed")
-            self.authorizer.require(
-                principal, Permission.MANAGE_PROJECT, org_id=record.org_id, project_id=record.project_id
-            )
+                raise NotFoundError(f"artifact {uri!r} is not indexed in {org_id}/{project_id}")
             if record.hold is None:
                 return record
             released = record.model_copy(update={"hold": None, "updated_at": utcnow()})
@@ -6069,8 +6311,8 @@ class ControlPlaneService:
             await self._audit_scoped(
                 tx,
                 principal,
-                org_id=record.org_id,
-                project_id=record.project_id,
+                org_id=org_id,
+                project_id=project_id,
                 entity_type="artifact",
                 entity_id=uri[:256],
                 action="artifact.hold_released",
@@ -6103,10 +6345,14 @@ class ControlPlaneService:
                 current = execution.result_uri
                 if not is_managed_uri(current):
                     continue
-                for reference in await tx.list_artifact_references(workload_id=workload.id):
+                for reference in await tx.list_artifact_references(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    workload_id=workload.id,
+                ):
                     if reference.uri == current or not reference.uri.startswith(_MANAGED_RESULT_PREFIX):
                         continue
-                    record = await tx.get_managed_artifact(reference.uri)
+                    record = await tx.get_managed_artifact(workload.org_id, workload.project_id, reference.uri)
                     if record is None or record.superseded_at is not None:
                         continue
                     await tx.put_managed_artifact(
@@ -6138,7 +6384,12 @@ class ControlPlaneService:
         collectable: list[ManagedArtifactRecord] = []
         async with self.repository.transaction() as tx:
             for record in await tx.list_managed_artifacts(org_id=org_id, project_id=project_id, limit=100_000):
-                live = await tx.list_artifact_references(uri=record.uri, active_only=True)
+                live = await tx.list_artifact_references(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    active_only=True,
+                )
                 if record.collectable_at(moment, has_live_reference=bool(live)):
                     collectable.append(record)
         return collectable
@@ -6146,9 +6397,9 @@ class ControlPlaneService:
     async def collect_artifacts_once(
         self,
         *,
+        org_id: str,
+        project_id: str,
         principal: Principal | None = None,
-        org_id: str | None = None,
-        project_id: str | None = None,
         grace_period_s: float = DEFAULT_ARTIFACT_GRACE_PERIOD_S,
         retention_by_kind: tp.Mapping[str, float | None] | None = None,
         dry_run: bool = True,
@@ -6167,7 +6418,9 @@ class ControlPlaneService:
 
         ``dry_run`` defaults to true for the same reason the index shipped before
         any collector: the first real pass on a fleet should be one a human read
-        first. Nothing in this package calls it with ``dry_run=False``.
+        first. The legacy controller can call the destructive branch when a
+        deletion store is explicitly wired, but M1.5 does not add the serialized,
+        version-conditional state machine that would make that branch race-free.
 
         Order matters on failure. The store object is removed first and the index
         row second, so a crash between them leaves an index entry for bytes that
@@ -6208,7 +6461,12 @@ class ControlPlaneService:
                 within_grace += 1
                 continue
             async with self.repository.transaction() as tx:
-                if await tx.list_artifact_references(uri=record.uri, active_only=True):
+                if await tx.list_artifact_references(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    active_only=True,
+                ):
                     referenced += 1
                     continue
             if dry_run:
@@ -6222,7 +6480,7 @@ class ControlPlaneService:
                 project_id=record.project_id,
             )
             async with self.repository.transaction() as tx:
-                current = await tx.get_managed_artifact(record.uri)
+                current = await tx.get_managed_artifact(org_id, project_id, record.uri)
                 if current is None:
                     continue
                 held_after_delete = current.hold is not None and current.hold.active_at(utcnow())
@@ -6268,28 +6526,29 @@ class ControlPlaneService:
         self,
         principal: Principal,
         *,
+        org_id: str,
+        project_id: str,
         uri: str,
         active_only: bool = False,
     ) -> list[ArtifactReferenceRecord]:
-        """List the workloads that claim one artifact.
+        """List the workloads that claim one scoped artifact.
 
-        Answers the question no collector could previously ask. Scoped by the
-        artifact's own index row rather than by the caller's project, because a
-        content-addressed object is genuinely shared and a partial answer would
-        be more dangerous than no answer.
+        The requested scope is authorized before lookup. The same URI in another
+        project is a different artifact and neither its existence nor its
+        references are discoverable through this request.
         """
 
+        self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
         async with self.repository.transaction() as tx:
-            record = await tx.get_managed_artifact(uri)
+            record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:
-                raise NotFoundError(f"artifact {uri!r} is not indexed")
-            self.authorizer.require(
-                principal,
-                Permission.READ,
-                org_id=record.org_id,
-                project_id=record.project_id,
+                raise NotFoundError(f"artifact {uri!r} is not indexed in {org_id}/{project_id}")
+            return await tx.list_artifact_references(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                active_only=active_only,
             )
-            return await tx.list_artifact_references(uri=uri, active_only=active_only)
 
     async def record_progress_report(
         self,
@@ -6385,11 +6644,23 @@ class ControlPlaneService:
         )
         if tx is not None:
             await tx.append_event(event)
-            await self._touch_artifact(tx, kind=kind, object_id=object_id)
+            await self._touch_artifact(
+                tx,
+                org_id=org_id,
+                project_id=project_id,
+                kind=kind,
+                object_id=object_id,
+            )
             return
         async with self.repository.transaction() as transaction:
             await transaction.append_event(event)
-            await self._touch_artifact(transaction, kind=kind, object_id=object_id)
+            await self._touch_artifact(
+                transaction,
+                org_id=org_id,
+                project_id=project_id,
+                kind=kind,
+                object_id=object_id,
+            )
 
     async def record_secret_issuance(
         self,
@@ -6536,7 +6807,14 @@ class ControlPlaneService:
         return reference
 
     @staticmethod
-    async def _touch_artifact(tx: RepositorySession, *, kind: str, object_id: str) -> None:
+    async def _touch_artifact(
+        tx: RepositorySession,
+        *,
+        org_id: str,
+        project_id: str,
+        kind: str,
+        object_id: str,
+    ) -> None:
         """Stamp an indexed artifact's last access, if it is indexed at all.
 
         Best-effort by construction: an artifact stored before this index existed
@@ -6550,7 +6828,7 @@ class ControlPlaneService:
             uri = ManagedArtifactRef(ManagedArtifactKind(kind), object_id).uri
         except ValueError:
             return
-        record = await tx.get_managed_artifact(uri)
+        record = await tx.get_managed_artifact(org_id, project_id, uri)
         if record is None:
             return
         await tx.put_managed_artifact(record.model_copy(update={"last_accessed_at": utcnow()}))

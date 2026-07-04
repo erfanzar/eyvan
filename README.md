@@ -24,6 +24,9 @@ start:
 - [docs/proofs.md](docs/proofs.md) — the hardware proofs that have **not** been
   run, each with its commands, pass criterion, shape and cost. Everything in
   this package is CPU-verified; none of that is evidence about a TPU.
+- [docs/artifact-safety.md](docs/artifact-safety.md) — the maintenance-only
+  scoped-identity migration, 426 client transition, bounded dry-run inventory,
+  additive reindex acknowledgement, and the deletion guarantees not yet shipped.
 
 
 ## Authority boundary

@@ -12,9 +12,9 @@ future collector would have to trust:
 **Bytes are recorded at store time**, because they cannot be recovered later
 without reading every object back.
 
-**A content-addressed URI is charged once.** The store holds one object per
-digest, so charging each uploading project separately would bill for bytes that
-do not exist.
+**A content-addressed URI is charged once per project.** The physical store is
+tenant-scoped, so identical digests in two projects are independent bytes and
+ledger rows; re-uploading within one project still replaces its one charge.
 
 **"Unreferenced" is computable.** A reference is created with the workload that
 names an artifact and released when that workload can no longer run -- and the
@@ -277,9 +277,13 @@ async def test_submitting_a_callable_workload_claims_every_artifact_it_names() -
         idempotency_key="submit-1",
     )
 
-    references = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST))
+    references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST)
+    )
     assert [reference.workload_id for reference in references] == [workload.id]
-    workspace_references = await service.artifact_references(_principal(), uri=workspace_uri(_OTHER_DIGEST))
+    workspace_references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=workspace_uri(_OTHER_DIGEST)
+    )
     assert [reference.workload_id for reference in workspace_references] == [workload.id]
 
 
@@ -300,7 +304,9 @@ async def test_the_allocated_result_uri_is_claimed_before_anything_writes_it() -
     assert execution.result_uri is not None
     await service.index_managed_artifact(org_id="acme", project_id="research", uri=execution.result_uri, size_bytes=1)
 
-    references = await service.artifact_references(_principal(), uri=execution.result_uri)
+    references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=execution.result_uri
+    )
 
     assert [reference.workload_id for reference in references] == [workload.id]
 
@@ -320,7 +326,7 @@ async def test_a_command_workload_claims_nothing() -> None:
         _principal(), org_id="acme", project_id="research", spec=spec, idempotency_key="submit-1"
     )
     async with service.repository.transaction() as tx:
-        assert await tx.list_artifact_references(workload_id=workload.id) == []
+        assert await tx.list_artifact_references(org_id="acme", project_id="research", workload_id=workload.id) == []
 
 
 @pytest.mark.asyncio
@@ -350,7 +356,9 @@ async def test_a_replayed_submission_does_not_inflate_the_reference_set() -> Non
         )
     await service.index_managed_artifact(org_id="acme", project_id="research", uri=callable_uri(_DIGEST), size_bytes=1)
 
-    references = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST))
+    references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST)
+    )
 
     assert len(references) == 1
 
@@ -372,7 +380,9 @@ async def test_two_workloads_sharing_one_callable_are_both_recorded() -> None:
         for index in range(2)
     ]
 
-    references = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST))
+    references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST)
+    )
 
     assert sorted(reference.workload_id for reference in references) == sorted(item.id for item in submitted)
 
@@ -393,8 +403,12 @@ async def test_a_terminal_workload_releases_its_claims_without_erasing_them() ->
     await service.cancel_workload(_principal(), workload.id, idempotency_key="cancel-1")
     await service.settle_terminal_workload(_admin(), workload_id=workload.id, target=WorkloadState.CANCELLED)
 
-    live = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST), active_only=True)
-    all_references = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST))
+    live = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST), active_only=True
+    )
+    all_references = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST)
+    )
 
     assert live == [], "a terminal workload no longer holds its artifacts"
     assert len(all_references) == 1, "the history of who referenced what is kept"
@@ -422,7 +436,9 @@ async def test_one_workload_terminating_does_not_release_a_siblings_claim() -> N
     await service.cancel_workload(_principal(), first.id, idempotency_key="cancel-1")
     await service.settle_terminal_workload(_admin(), workload_id=first.id, target=WorkloadState.CANCELLED)
 
-    live = await service.artifact_references(_principal(), uri=callable_uri(_DIGEST), active_only=True)
+    live = await service.artifact_references(
+        _principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST), active_only=True
+    )
 
     assert [reference.workload_id for reference in live] == [second.id]
 
@@ -434,7 +450,7 @@ async def test_references_for_an_unindexed_artifact_are_a_not_found_not_an_empty
     service = await _service()
 
     with pytest.raises(NotFoundError):
-        await service.artifact_references(_principal(), uri=callable_uri(_DIGEST))
+        await service.artifact_references(_principal(), org_id="acme", project_id="research", uri=callable_uri(_DIGEST))
 
 
 @pytest.mark.asyncio
@@ -476,12 +492,14 @@ async def test_reading_an_unindexed_artifact_is_not_an_error() -> None:
     assert await service.list_managed_artifacts(_principal(), org_id="acme", project_id="research") == []
 
 
-def test_a_reference_id_is_derived_from_the_pair_it_records() -> None:
-    first = artifact_reference_id(callable_uri(_DIGEST), "wl-1")
+def test_a_reference_id_is_derived_from_the_complete_scope_it_records() -> None:
+    first = artifact_reference_id("acme", "research", callable_uri(_DIGEST), "wl-1")
 
-    assert first == artifact_reference_id(callable_uri(_DIGEST), "wl-1")
-    assert first != artifact_reference_id(callable_uri(_DIGEST), "wl-2")
-    assert first != artifact_reference_id(result_uri("run-1"), "wl-1")
+    assert first == artifact_reference_id("acme", "research", callable_uri(_DIGEST), "wl-1")
+    assert first != artifact_reference_id("acme", "other", callable_uri(_DIGEST), "wl-1")
+    assert first != artifact_reference_id("other-org", "research", callable_uri(_DIGEST), "wl-1")
+    assert first != artifact_reference_id("acme", "research", callable_uri(_DIGEST), "wl-2")
+    assert first != artifact_reference_id("acme", "research", result_uri("run-1"), "wl-1")
 
 
 def test_the_records_reject_a_negative_size_and_a_blank_scope() -> None:
@@ -558,6 +576,11 @@ async def test_a_retry_claims_the_new_result_uri_its_generation_mints() -> None:
     assert isinstance(second_execution, CallableExecution)
     assert second_execution.result_uri != first_execution.result_uri
     async with service.repository.transaction() as tx:
-        claimed = {reference.uri for reference in await tx.list_artifact_references(workload_id=workload.id)}
+        claimed = {
+            reference.uri
+            for reference in await tx.list_artifact_references(
+                org_id="acme", project_id="research", workload_id=workload.id
+            )
+        }
     assert first_execution.result_uri in claimed
     assert second_execution.result_uri in claimed, "the retry's own result address is unindexed"
