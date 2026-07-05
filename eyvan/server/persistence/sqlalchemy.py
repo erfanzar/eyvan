@@ -23,7 +23,9 @@ from sqlalchemy import (
     Boolean,
     Connection,
     DateTime,
+    Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     UniqueConstraint,
     and_,
@@ -62,7 +64,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0011_quota_grants"
+SCHEMA_REVISION = "0012_scoped_artifact_identity"
 
 
 @tp.runtime_checkable
@@ -234,12 +236,18 @@ class QuotaGrantRow(Base):
 
 class ManagedArtifactRow(Base):
     __tablename__ = "managed_artifacts"
-    #: The URI is the natural key: the store addresses objects by it, and for
-    #: content-addressed kinds it already encodes the digest, so a re-upload
-    #: merges onto the same row rather than double-counting its bytes.
-    uri: Mapped[str] = mapped_column(String(512), primary_key=True)
-    org_id: Mapped[str | None] = mapped_column(String(128), index=True)
-    project_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    __table_args__ = (
+        PrimaryKeyConstraint("org_id", "project_id", "uri", name="pk_managed_artifacts_scoped"),
+        Index("ix_managed_artifacts_scope_bytes", "org_id", "project_id", "size_bytes"),
+        Index("ix_managed_artifacts_scope_created", "org_id", "project_id", "created_at", "uri"),
+    )
+    #: The physical and durable identity. A content-addressed URI can appear in
+    #: every project without merging ownership or quota accounting. The explicit
+    #: constraint name matches migration 0012, including create_schema databases
+    #: that are later conditionally downgraded.
+    org_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    uri: Mapped[str] = mapped_column(String(512))
     kind: Mapped[str | None] = mapped_column(String(32), index=True)
     #: A real column, not a field inside ``data``: the quota check SUMs it on
     #: the upload path, and a JSON extraction cannot use an index.
@@ -250,11 +258,25 @@ class ManagedArtifactRow(Base):
 
 class ArtifactReferenceRow(Base):
     __tablename__ = "artifact_references"
-    id: Mapped[str] = mapped_column(String(200), primary_key=True)
-    uri: Mapped[str] = mapped_column(String(512), index=True)
-    workload_id: Mapped[str] = mapped_column(String(96), index=True)
-    #: Indexed because the only interesting query is "does this URI still have
-    #: an unreleased reference", and that must not scan released history.
+    __table_args__ = (
+        PrimaryKeyConstraint("org_id", "project_id", "uri", "workload_id", name="pk_artifact_references_scoped"),
+        Index("ix_artifact_references_scope_uri", "org_id", "project_id", "uri"),
+        Index("ix_artifact_references_scope_workload", "org_id", "project_id", "workload_id"),
+        Index(
+            "ix_artifact_references_live",
+            "org_id",
+            "project_id",
+            "uri",
+            postgresql_where=text("released_at IS NULL"),
+            sqlite_where=text("released_at IS NULL"),
+        ),
+    )
+    #: Durable identity is explicit rather than delegated to the display hash.
+    org_id: Mapped[str] = mapped_column(String(128))
+    project_id: Mapped[str] = mapped_column(String(128))
+    uri: Mapped[str] = mapped_column(String(512))
+    workload_id: Mapped[str] = mapped_column(String(96))
+    id: Mapped[str] = mapped_column(String(200))
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
@@ -761,9 +783,15 @@ class SqlAlchemySession:
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(QuotaGrantRecord, rows, table="quota_grants")
 
-    async def get_managed_artifact(self, uri: str) -> ManagedArtifactRecord | None:
-        row = await self._get_locked(ManagedArtifactRow, uri)
-        return None if row is None else ManagedArtifactRecord.model_validate(row.data)
+    async def get_managed_artifact(self, org_id: str, project_id: str, uri: str) -> ManagedArtifactRecord | None:
+        row = await self._get_locked(ManagedArtifactRow, (org_id, project_id, uri))
+        if row is None:
+            return None
+        record = ManagedArtifactRecord.model_validate(row.data)
+        if (record.org_id, record.project_id, record.uri) != (org_id, project_id, uri):
+            logger.error("managed_artifacts typed identity disagrees with its JSON record for %r", uri)
+            return None
+        return record
 
     async def put_managed_artifact(self, record: ManagedArtifactRecord) -> None:
         await self.session.merge(
@@ -781,21 +809,46 @@ class SqlAlchemySession:
     async def list_managed_artifacts(
         self,
         *,
-        org_id: str | None = None,
-        project_id: str | None = None,
+        org_id: str,
+        project_id: str,
         kind: str | None = None,
         limit: int = 1000,
     ) -> list[ManagedArtifactRecord]:
-        statement = select(ManagedArtifactRow)
-        if org_id is not None:
-            statement = statement.where(ManagedArtifactRow.org_id == org_id)
-        if project_id is not None:
-            statement = statement.where(ManagedArtifactRow.project_id == project_id)
+        statement = select(ManagedArtifactRow).where(
+            ManagedArtifactRow.org_id == org_id,
+            ManagedArtifactRow.project_id == project_id,
+        )
         if kind is not None:
             statement = statement.where(ManagedArtifactRow.kind == kind)
         statement = statement.order_by(ManagedArtifactRow.created_at, ManagedArtifactRow.uri).limit(limit)
         rows = (await self.session.scalars(statement)).all()
-        return _decode_rows(ManagedArtifactRecord, rows, table="managed_artifacts")
+        records = _decode_rows(ManagedArtifactRecord, rows, table="managed_artifacts")
+        return [record for record in records if record.org_id == org_id and record.project_id == project_id]
+
+    async def list_managed_artifacts_page(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        after_uri: str | None,
+        limit: int,
+    ) -> list[ManagedArtifactRecord]:
+        statement = select(ManagedArtifactRow).where(
+            ManagedArtifactRow.org_id == org_id,
+            ManagedArtifactRow.project_id == project_id,
+        )
+        if after_uri is not None:
+            statement = statement.where(ManagedArtifactRow.uri > after_uri)
+        statement = statement.order_by(ManagedArtifactRow.uri).limit(limit)
+        rows = (await self.session.scalars(statement)).all()
+        records = _decode_rows(ManagedArtifactRecord, rows, table="managed_artifacts")
+        return [
+            record
+            for record in records
+            if record.org_id == org_id
+            and record.project_id == project_id
+            and (after_uri is None or record.uri > after_uri)
+        ]
 
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
         statement = select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)).where(
@@ -806,10 +859,23 @@ class SqlAlchemySession:
         total = await self.session.scalar(statement)
         return int(total or 0)
 
+    async def count_managed_artifacts(self, *, org_id: str, project_id: str | None = None) -> int:
+        statement = select(func.count()).select_from(ManagedArtifactRow).where(ManagedArtifactRow.org_id == org_id)
+        if project_id is not None:
+            statement = statement.where(ManagedArtifactRow.project_id == project_id)
+        total = await self.session.scalar(statement)
+        return int(total or 0)
+
+    async def sum_all_managed_artifact_bytes(self) -> int:
+        total = await self.session.scalar(select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)))
+        return int(total or 0)
+
     async def put_artifact_reference(self, record: ArtifactReferenceRecord) -> None:
         await self.session.merge(
             ArtifactReferenceRow(
                 id=record.id,
+                org_id=record.org_id,
+                project_id=record.project_id,
                 uri=record.uri,
                 workload_id=record.workload_id,
                 released_at=record.released_at,
@@ -821,11 +887,16 @@ class SqlAlchemySession:
     async def list_artifact_references(
         self,
         *,
+        org_id: str,
+        project_id: str,
         uri: str | None = None,
         workload_id: str | None = None,
         active_only: bool = False,
     ) -> list[ArtifactReferenceRecord]:
-        statement = select(ArtifactReferenceRow)
+        statement = select(ArtifactReferenceRow).where(
+            ArtifactReferenceRow.org_id == org_id,
+            ArtifactReferenceRow.project_id == project_id,
+        )
         if uri is not None:
             statement = statement.where(ArtifactReferenceRow.uri == uri)
         if workload_id is not None:
@@ -834,7 +905,8 @@ class SqlAlchemySession:
             statement = statement.where(ArtifactReferenceRow.released_at.is_(None))
         statement = statement.order_by(ArtifactReferenceRow.created_at, ArtifactReferenceRow.id)
         rows = (await self.session.scalars(statement)).all()
-        return _decode_rows(ArtifactReferenceRecord, rows, table="artifact_references")
+        records = _decode_rows(ArtifactReferenceRecord, rows, table="artifact_references")
+        return [record for record in records if record.org_id == org_id and record.project_id == project_id]
 
     async def get_idempotency(self, scope: str, operation: str, key: str) -> IdempotencyRecord | None:
         lock_key = f"{scope}\x1f{operation}\x1f{key}"
@@ -979,7 +1051,17 @@ class SqlAlchemySession:
     async def append_event(self, event: AuditEvent) -> AuditEvent:
         data = _dump(event)
         data["sequence"] = 0
+        sequence: int | None = None
+        if self.session.get_bind().dialect.name == "sqlite":
+            # SQLite auto-increments only a literal INTEGER PRIMARY KEY, while
+            # production uses BIGSERIAL/BIGINT. Its single-writer lock makes a
+            # max+1 allocation sufficient for the executable SQL contract tests;
+            # PostgreSQL keeps the database-owned sequence and concurrency proof.
+            sequence = int(
+                await self.session.scalar(select(func.coalesce(func.max(AuditEventRow.sequence), 0) + 1)) or 1
+            )
         row = AuditEventRow(
+            sequence=sequence,
             id=event.id,
             org_id=event.org_id,
             project_id=event.project_id,

@@ -72,6 +72,12 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "GET /api/v1/events/stream": "follow another org's audit trail",
     "GET /api/v1/artifacts": "list another org's artifacts",
     "GET /api/v1/artifacts/usage": "read another org's storage usage",
+    "GET /api/v1/artifacts/inventory": "inventory another org's physical namespace",
+    "POST /api/v1/artifacts/inventory/reindex": "reindex metadata into another org",
+    "GET /api/v1/artifacts/collectable": "read another org's collection candidates",
+    "GET /api/v1/artifacts/references": "read another org's artifact references",
+    "POST /api/v1/artifacts/holds": "hold another org's artifact",
+    "DELETE /api/v1/artifacts/holds": "release another org's artifact hold",
     "GET /api/v1/fleets": "list fleets runnable in another org's scope",
     "GET /api/v1/organizations/{org_id}": "read another tenant's registration",
     "GET /api/v1/organizations/{org_id}/projects": "enumerate another tenant's projects",
@@ -118,10 +124,6 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "DELETE /api/v1/federation/quota-grants/{grant_id}": "withdraw a peer's authority to place work",
     "GET /api/v1/system/invariants": "fleet-wide durability check",
     "POST /api/v1/system/reconcile": "force a scheduling pass",
-    "GET /api/v1/artifacts/collectable": "fleet-wide collectable artifacts",
-    "GET /api/v1/artifacts/references": "fleet-wide artifact references",
-    "POST /api/v1/artifacts/holds": "place a legal hold",
-    "DELETE /api/v1/artifacts/holds": "release a legal hold",
     "GET /api/v1/organizations": "tenant list, narrowed to the caller's own grants",
     "PUT /api/v1/organizations/{org_id}": "register a tenant",
     "GET /api/v1/grants": "grant list, narrowed to the caller's own scopes",
@@ -471,11 +473,28 @@ def test_the_audit_trail_is_not_readable_across_tenants(plane: TestClient) -> No
 def test_artifact_listings_stay_inside_a_tenant(plane: TestClient) -> None:
     """Object names carry model names, dataset names, and experiment structure."""
 
-    listing = plane.get("/api/v1/artifacts", params={"org_id": "acme", "project_id": "research"}, headers=RIVAL)
-    usage = plane.get("/api/v1/artifacts/usage", params={"org_id": "acme", "project_id": "research"}, headers=RIVAL)
+    scope = {"org_id": "acme", "project_id": "research"}
+    uri = "eyvan://results/private-result"
+    attempts = {
+        "listing": plane.get("/api/v1/artifacts", params=scope, headers=RIVAL),
+        "usage": plane.get("/api/v1/artifacts/usage", params=scope, headers=RIVAL),
+        "inventory": plane.get("/api/v1/artifacts/inventory", params=scope, headers=RIVAL),
+        "reindex": plane.post(
+            "/api/v1/artifacts/inventory/reindex",
+            json={**scope, "acknowledge_scope": "acme/research"},
+            headers=RIVAL,
+        ),
+        "collectable": plane.get("/api/v1/artifacts/collectable", params=scope, headers=RIVAL),
+        "references": plane.get("/api/v1/artifacts/references", params={**scope, "uri": uri}, headers=RIVAL),
+        "hold": plane.post(
+            "/api/v1/artifacts/holds",
+            json={**scope, "uri": uri, "reason": "probe"},
+            headers=RIVAL,
+        ),
+        "release": plane.delete("/api/v1/artifacts/holds", params={**scope, "uri": uri}, headers=RIVAL),
+    }
 
-    assert listing.status_code == 403
-    assert usage.status_code == 403
+    assert {name: response.status_code for name, response in attempts.items()} == {name: 403 for name in attempts}
 
 
 # --------------------------------------------------------------------------- tenancy itself

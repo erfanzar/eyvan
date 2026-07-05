@@ -1008,6 +1008,8 @@ async def test_logs_outlive_the_general_artifact_window(tmp_path) -> None:
     await _index(service, archived_log, age_days=10)
 
     collection = await service.collect_artifacts_once(
+        org_id="acme",
+        project_id="research",
         grace_period_s=7 * 24 * 3600,
         retention_by_kind={"logs": 30 * 24 * 3600},
         dry_run=True,
@@ -1027,6 +1029,8 @@ async def test_logs_are_collected_once_their_own_window_passes(tmp_path) -> None
     await _index(service, archived_log, age_days=45)
 
     collection = await service.collect_artifacts_once(
+        org_id="acme",
+        project_id="research",
         grace_period_s=7 * 24 * 3600,
         retention_by_kind={"logs": 30 * 24 * 3600},
         dry_run=True,
@@ -1050,6 +1054,8 @@ async def test_a_window_of_none_keeps_logs_forever(tmp_path) -> None:
     await _index(service, archived_log, age_days=4000)
 
     collection = await service.collect_artifacts_once(
+        org_id="acme",
+        project_id="research",
         grace_period_s=7 * 24 * 3600,
         retention_by_kind={"logs": None},
         dry_run=True,

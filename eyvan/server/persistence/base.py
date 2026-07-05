@@ -132,21 +132,32 @@ class RepositorySession(tp.Protocol):
 
     async def put_budget(self, budget: BudgetRecord) -> None: ...
 
-    async def get_managed_artifact(self, uri: str) -> ManagedArtifactRecord | None: ...
+    async def get_managed_artifact(self, org_id: str, project_id: str, uri: str) -> ManagedArtifactRecord | None: ...
 
     async def put_managed_artifact(self, record: ManagedArtifactRecord) -> None: ...
 
     async def list_managed_artifacts(
         self,
         *,
-        org_id: str | None = None,
-        project_id: str | None = None,
+        org_id: str,
+        project_id: str,
         kind: str | None = None,
         limit: int = 1000,
     ) -> list[ManagedArtifactRecord]: ...
 
+    async def list_managed_artifacts_page(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        after_uri: str | None,
+        limit: int,
+    ) -> list[ManagedArtifactRecord]:
+        """Return a URI-ordered bounded page for physical inventory comparison."""
+        ...
+
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
-        """Return total indexed bytes in one scope.
+        """Return total indexed bytes in an organization or project scope.
 
         An aggregate rather than a list because the quota check runs on the
         upload path: pulling every row to sum a column would make each upload
@@ -154,11 +165,21 @@ class RepositorySession(tp.Protocol):
         """
         ...
 
+    async def count_managed_artifacts(self, *, org_id: str, project_id: str | None = None) -> int:
+        """Return the number of indexed rows in an organization or project scope."""
+        ...
+
+    async def sum_all_managed_artifact_bytes(self) -> int:
+        """Return fleet-wide indexed bytes without exposing an unscoped row listing."""
+        ...
+
     async def put_artifact_reference(self, record: ArtifactReferenceRecord) -> None: ...
 
     async def list_artifact_references(
         self,
         *,
+        org_id: str,
+        project_id: str,
         uri: str | None = None,
         workload_id: str | None = None,
         active_only: bool = False,

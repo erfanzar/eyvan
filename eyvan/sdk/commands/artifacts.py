@@ -68,6 +68,61 @@ def artifact_usage(session: CliSession, org_id: str | None, project_id: str | No
     )
 
 
+@artifacts.command("inventory")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--cursor", help="Resume after the canonical managed URI returned as next_cursor.")
+@click.option("--limit", type=click.IntRange(1, 1000), default=100, show_default=True)
+@click.option(
+    "--reindex-missing",
+    is_flag=True,
+    help="Add metadata only for physical-only objects observed in this page; never delete or rewrite.",
+)
+@click.option(
+    "--acknowledge-scope",
+    help="Required with --reindex-missing; repeat the exact ORG/PROJECT being changed.",
+)
+@click.pass_obj
+def inventory(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    cursor: str | None,
+    limit: int,
+    reindex_missing: bool,
+    acknowledge_scope: str | None,
+) -> None:
+    """Compare physical objects with the scoped index, dry-run by default."""
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    if not reindex_missing:
+        if acknowledge_scope is not None:
+            raise click.UsageError("--acknowledge-scope is accepted only with --reindex-missing")
+        params: dict[str, str | int] = {
+            "org_id": scope.org_id,
+            "project_id": scope.project_id,
+            "limit": limit,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        _emit(session.client.request("GET", "/api/v1/artifacts/inventory", params=params))
+        return
+
+    expected = f"{scope.org_id}/{scope.project_id}"
+    if acknowledge_scope != expected:
+        raise click.UsageError(
+            f"--reindex-missing requires --acknowledge-scope {expected!r}; run the dry-run inventory first"
+        )
+    payload: dict[str, str | int | None] = {
+        "org_id": scope.org_id,
+        "project_id": scope.project_id,
+        "cursor": cursor,
+        "limit": limit,
+        "acknowledge_scope": acknowledge_scope,
+    }
+    _emit(session.client.request("POST", "/api/v1/artifacts/inventory/reindex", json=payload))
+
+
 @artifacts.command("collectable")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
@@ -89,24 +144,42 @@ def collectable(session: CliSession, org_id: str | None, project_id: str | None)
 
 
 @artifacts.command("references")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
 @click.option("--uri", required=True, help="The managed artifact URI to trace.")
 @click.pass_obj
-def references(session: CliSession, uri: str) -> None:
+def references(session: CliSession, org_id: str | None, project_id: str | None, uri: str) -> None:
     """List the workloads that reference one artifact.
 
     The question behind "is this safe to delete", answered from the reverse
     index rather than by scanning every spec.
     """
 
-    _emit(session.client.request("GET", "/api/v1/artifacts/references", params={"uri": uri}))
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    _emit(
+        session.client.request(
+            "GET",
+            "/api/v1/artifacts/references",
+            params={"org_id": scope.org_id, "project_id": scope.project_id, "uri": uri},
+        )
+    )
 
 
 @artifacts.command("hold")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
 @click.option("--uri", required=True)
 @click.option("--reason", required=True, help="Why this artifact must survive collection.")
 @click.option("--idempotency-key")
 @click.pass_obj
-def place_hold(session: CliSession, uri: str, reason: str, idempotency_key: str | None) -> None:
+def place_hold(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    uri: str,
+    reason: str,
+    idempotency_key: str | None,
+) -> None:
     """Stop the collector from removing one artifact.
 
     A reason is required because a hold outlives the incident that motivated it,
@@ -114,28 +187,38 @@ def place_hold(session: CliSession, uri: str, reason: str, idempotency_key: str 
     how holds accumulate until nothing is collectable at all.
     """
 
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
     _emit(
         session.client.request(
             "POST",
             "/api/v1/artifacts/holds",
-            json={"uri": uri, "reason": reason},
+            json={"org_id": scope.org_id, "project_id": scope.project_id, "uri": uri, "reason": reason},
             headers=({} if idempotency_key is None else {"Idempotency-Key": idempotency_key}),
         ),
     )
 
 
 @artifacts.command("release-hold")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
 @click.option("--uri", required=True)
 @click.option("--idempotency-key")
 @click.pass_obj
-def release_hold(session: CliSession, uri: str, idempotency_key: str | None) -> None:
+def release_hold(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    uri: str,
+    idempotency_key: str | None,
+) -> None:
     """Release a legal hold, making the artifact collectable again."""
 
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
     _emit(
         session.client.request(
             "DELETE",
             "/api/v1/artifacts/holds",
-            params={"uri": uri},
+            params={"org_id": scope.org_id, "project_id": scope.project_id, "uri": uri},
             headers=({} if idempotency_key is None else {"Idempotency-Key": idempotency_key}),
         ),
     )

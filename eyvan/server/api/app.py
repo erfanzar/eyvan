@@ -41,6 +41,8 @@ from eyvan.artifacts.managed import (
     ArtifactTokenSigner,
     InvalidArtifactToken,
     ManagedArtifactConflictError,
+    ManagedArtifactInventoryError,
+    ManagedArtifactInventoryStore,
     callable_uri,
     managed_artifact_store_from_uri,
     result_uri,
@@ -52,6 +54,7 @@ from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.records import (
+    ArtifactInventoryReport,
     ArtifactReferenceRecord,
     ArtifactUsage,
     AuditEvent,
@@ -88,6 +91,7 @@ from eyvan.secrets import SecretUnavailable, read_secret
 from eyvan.server.api.auth import OIDCTokenVerifier, RequestAuthenticator, TokenVerifier, authenticated_principal
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
+    ArtifactInventoryReindexRequest,
     BatchSubmitRequest,
     BatchSubmitResponse,
     BudgetGrantIssueRequest,
@@ -306,6 +310,16 @@ def create_app(
             token_ttl_seconds=settings.artifact_token_ttl_s,
         )
 
+    if service.inventory_store is not None and service.inventory_store is not artifact_access.store:
+        raise ValueError("the service inventory and transfer API must use the same managed artifact store")
+    # Inventory and transfer observe one physical namespace. Do not wire the
+    # deletion-capable artifact_store here: collection needs the later serialized
+    # deletion/upload state machine, and API inventory must not enable it early.
+    # Older injected transfer stores remain usable, but the inventory endpoint
+    # fails closed until they implement the bounded, scope-explicit protocol.
+    if service.inventory_store is None and isinstance(artifact_access.store, ManagedArtifactInventoryStore):
+        service.inventory_store = artifact_access.store
+
     if engine is not None:
         leader = PostgresAdvisoryLeader(engine)
     else:
@@ -440,8 +454,31 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        del request
         errors = [{key: value for key, value in error.items() if key not in {"input", "ctx"}} for error in exc.errors()]
+        path = request.scope["path"]
+        if path.startswith("/v1/"):
+            path = "/api" + path
+        legacy_scoped_endpoints = {
+            ("POST", "/api/v1/artifacts/holds"),
+            ("DELETE", "/api/v1/artifacts/holds"),
+            ("GET", "/api/v1/artifacts/references"),
+        }
+        missing = {
+            str(error["loc"][-1]) for error in exc.errors() if error.get("type") == "missing" and error.get("loc")
+        }
+        if (request.method, path) in legacy_scoped_endpoints and missing & {"org_id", "project_id"}:
+            return JSONResponse(
+                status_code=status.HTTP_426_UPGRADE_REQUIRED,
+                headers={"X-Eyvan-Required-Client-Feature": "scoped-artifact-identity"},
+                content={
+                    "detail": (
+                        "artifact hold, release, and reference requests now require explicit org_id and project_id; "
+                        "upgrade the Eyvan client or resend the request with both scope fields"
+                    ),
+                    "code": "artifact_scope_required",
+                    "context": {"required_fields": ["org_id", "project_id"]},
+                },
+            )
         return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": errors})
 
     @app.exception_handler(ValidationError)
@@ -466,6 +503,18 @@ def create_app(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             headers={"Retry-After": "5"},
             content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(ManagedArtifactInventoryError)
+    async def handle_artifact_inventory_error(request: Request, exc: ManagedArtifactInventoryError) -> JSONResponse:
+        del request
+        logger.warning("Managed artifact inventory was inconclusive: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": "managed artifact inventory was inconclusive; no metadata was changed",
+                "code": "artifact_inventory_inconclusive",
+            },
         )
 
     @app.exception_handler(TransientRepositoryError)
@@ -798,6 +847,53 @@ def create_app(
         )
 
     @app.get(
+        "/api/v1/artifacts/inventory",
+        response_model=ArtifactInventoryReport,
+        tags=["artifacts"],
+    )
+    async def inventory_managed_artifacts(
+        org_id: str,
+        project_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        cursor: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> ArtifactInventoryReport:
+        """Dry-run one bounded physical-versus-index inventory page."""
+
+        return await service.inventory_managed_artifacts(
+            principal,
+            org_id=org_id,
+            project_id=project_id,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    @app.post(
+        "/api/v1/artifacts/inventory/reindex",
+        response_model=ArtifactInventoryReport,
+        tags=["artifacts"],
+    )
+    async def reindex_managed_artifacts(
+        request: ArtifactInventoryReindexRequest,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> ArtifactInventoryReport:
+        """Add metadata for physical-only objects after explicit scope acknowledgement.
+
+        This endpoint never deletes bytes and never rewrites an existing index
+        row or discrepancy. Run the GET report first.
+        """
+
+        return await service.inventory_managed_artifacts(
+            principal,
+            org_id=request.org_id,
+            project_id=request.project_id,
+            cursor=request.cursor,
+            limit=request.limit,
+            reindex_missing=True,
+            acknowledge_scope=request.acknowledge_scope,
+        )
+
+    @app.get(
         "/api/v1/artifacts/collectable",
         response_model=list[ManagedArtifactRecord],
         tags=["artifacts"],
@@ -809,9 +905,9 @@ def create_app(
     ) -> list[ManagedArtifactRecord]:
         """List artifacts nothing currently protects.
 
-        A candidate list, not a deletion queue. Nothing in this build deletes an
-        artifact: being able to compare what a collector *would* take against what
-        you expected is how the index earns the trust a collector needs.
+        A candidate list, not a deletion queue or a race-free deletion claim.
+        Compare it with physical inventory; serialized, version-conditional
+        deletion belongs to the follow-up artifact state machine.
         """
 
         return await service.collectable_artifacts(principal, org_id=org_id, project_id=project_id)
@@ -828,17 +924,24 @@ def create_app(
         """
 
         return await service.hold_artifact(
-            principal, uri=request.uri, reason=request.reason, expires_at=request.expires_at
+            principal,
+            org_id=request.org_id,
+            project_id=request.project_id,
+            uri=request.uri,
+            reason=request.reason,
+            expires_at=request.expires_at,
         )
 
     @app.delete("/api/v1/artifacts/holds", response_model=ManagedArtifactRecord, tags=["artifacts"])
     async def release_artifact_hold(
+        org_id: str,
+        project_id: str,
         uri: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> ManagedArtifactRecord:
-        """Release the hold on one artifact, whoever placed it."""
+        """Release the hold on one scoped artifact, whoever placed it."""
 
-        return await service.release_artifact_hold(principal, uri=uri)
+        return await service.release_artifact_hold(principal, org_id=org_id, project_id=project_id, uri=uri)
 
     @app.get("/api/v1/artifacts/usage", response_model=ArtifactUsage, tags=["artifacts"])
     async def artifact_usage(
@@ -856,13 +959,21 @@ def create_app(
         tags=["artifacts"],
     )
     async def artifact_references(
+        org_id: str,
+        project_id: str,
         uri: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
         active_only: bool = False,
     ) -> list[ArtifactReferenceRecord]:
-        """List the workloads that claim one artifact."""
+        """List the workloads that claim one scoped artifact."""
 
-        return await service.artifact_references(principal, uri=uri, active_only=active_only)
+        return await service.artifact_references(
+            principal,
+            org_id=org_id,
+            project_id=project_id,
+            uri=uri,
+            active_only=active_only,
+        )
 
     @app.put("/api/v1/artifacts/callables/{digest}", tags=["artifacts"])
     async def upload_callable_artifact(

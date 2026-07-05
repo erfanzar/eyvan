@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
-from eyvan.artifacts.managed import ArtifactAction, InvalidArtifactToken, callable_uri, result_uri
+from eyvan.artifacts.managed import ArtifactAction, InvalidArtifactToken, callable_uri, result_uri, storage_scope
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.records import CallableExecution, WorkloadDefinition, WorkloadRecord, WorkloadState
 from eyvan.server.api.app import create_app
@@ -380,3 +380,123 @@ def test_a_stale_result_upload_is_audited_as_denied(tmp_path) -> None:
 
     assert refused.status_code == 403
     assert any(action == "artifact.write_denied" for _actor, action, _entity in _audit_actions(app))
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "request_kwargs"),
+    (
+        ("POST", "/api/v1/artifacts/holds", {"json": {"uri": result_uri("legacy"), "reason": "keep"}}),
+        ("DELETE", "/api/v1/artifacts/holds", {"params": {"uri": result_uri("legacy")}}),
+        ("GET", "/api/v1/artifacts/references", {"params": {"uri": result_uri("legacy")}}),
+    ),
+)
+def test_legacy_unscoped_artifact_lifecycle_calls_receive_actionable_upgrade_required(
+    tmp_path,
+    method: str,
+    path: str,
+    request_kwargs: dict[str, object],
+) -> None:
+    client = TestClient(_app(tmp_path))
+
+    response = client.request(method, path, headers=_headers(), **request_kwargs)
+
+    assert response.status_code == 426
+    assert response.json()["code"] == "artifact_scope_required"
+    assert response.json()["context"] == {"required_fields": ["org_id", "project_id"]}
+    assert "upgrade" in response.json()["detail"]
+    assert response.headers["X-Eyvan-Required-Client-Feature"] == "scoped-artifact-identity"
+
+
+def test_non_scope_validation_errors_remain_ordinary_422_responses(tmp_path) -> None:
+    client = TestClient(_app(tmp_path))
+
+    response = client.post(
+        "/api/v1/artifacts/holds",
+        headers=_headers(),
+        json={"org_id": "acme", "project_id": "research", "uri": result_uri("invalid-body")},
+    )
+
+    assert response.status_code == 422
+    assert "code" not in response.json()
+
+
+def test_inventory_api_is_dry_run_first_and_reindex_requires_scope_acknowledgement(tmp_path) -> None:
+    app = _app(tmp_path)
+    client = TestClient(app)
+    uri = result_uri("physical-only")
+    store = app.state.artifact_access.store
+    store.put(uri, b"physical", org_id="acme", project_id="research")
+
+    dry_run = client.get(
+        "/api/v1/artifacts/inventory",
+        params={"org_id": "acme", "project_id": "research"},
+        headers=_headers(),
+    )
+
+    assert dry_run.status_code == 200
+    assert dry_run.json()["dry_run"] is True
+    assert dry_run.json()["entries"] == [
+        {
+            "uri": uri,
+            "status": "physical_only",
+            "indexed_size_bytes": None,
+            "observed_size_bytes": len(b"physical"),
+            "observed_object_version": dry_run.json()["entries"][0]["observed_object_version"],
+            "reindexed": False,
+        }
+    ]
+
+    admin_headers = {**_headers(), "X-Eyvan-Roles": "project_admin"}
+    refused = client.post(
+        "/api/v1/artifacts/inventory/reindex",
+        headers=admin_headers,
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "limit": 100,
+            "acknowledge_scope": "acme/other",
+        },
+    )
+    assert refused.status_code == 400
+    assert "acknowledge_scope" in refused.json()["detail"]
+
+    repaired = client.post(
+        "/api/v1/artifacts/inventory/reindex",
+        headers=admin_headers,
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "limit": 100,
+            "acknowledge_scope": "acme/research",
+        },
+    )
+    assert repaired.status_code == 200
+    assert repaired.json()["reindexed_count"] == 1
+    assert repaired.json()["entries"][0]["reindexed"] is True
+    assert store.get(uri, org_id="acme", project_id="research") == b"physical"
+    assert any(action == "artifact.inventory_reindexed" for _actor, action, _entity in _audit_actions(app))
+
+
+def test_inventory_api_fails_closed_instead_of_treating_parse_failure_as_an_empty_scope(tmp_path) -> None:
+    app = _app(tmp_path)
+    client = TestClient(app)
+    uri = result_uri("valid")
+    store = app.state.artifact_access.store
+    store.put(uri, b"physical", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "unexpected.txt"
+    target.write_bytes(b"unknown")
+
+    response = client.get(
+        "/api/v1/artifacts/inventory",
+        params={"org_id": "acme", "project_id": "research"},
+        headers=_headers(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_inventory_inconclusive"
+
+    async def missing() -> bool:
+        async with app.state.service.repository.transaction() as transaction:
+            return await transaction.get_managed_artifact("acme", "research", uri) is None
+
+    assert asyncio.run(missing()) is True

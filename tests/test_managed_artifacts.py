@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 import threading
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -24,7 +26,9 @@ from eyvan.artifacts.managed import (
     InvalidManagedArtifactURI,
     LocalManagedArtifactStore,
     ManagedArtifactConflictError,
+    ManagedArtifactInventoryError,
     ManagedArtifactKind,
+    ManagedArtifactObjectMetadata,
     callable_uri,
     parse_managed_uri,
     result_uri,
@@ -355,3 +359,415 @@ def test_result_transfer_token_is_durable_but_generation_revocable(tmp_path: Pat
             project_id="research",
             workload_id="workload-1",
         )
+
+
+class FakeGCSInventoryAPI:
+    """Deterministic live/noncurrent model for the read-only GCS JSON API."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, list[tuple[int, int, bool]]] = {}
+        self.calls: list[dict[str, tp.Any]] = []
+        self.queued: list[tuple[int, bytes] | BaseException] = []
+        self.server_page_size: int | None = None
+
+    def add(self, name: str, *, size: int, generation: int, live: bool) -> None:
+        versions = self.objects.setdefault(name, [])
+        if live:
+            assert not any(existing_live for _generation, _size, existing_live in versions)
+        versions.append((generation, size, live))
+
+    def queue(self, response: tuple[int, bytes] | BaseException) -> None:
+        self.queued.append(response)
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]:
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        assert parsed.scheme == "https"
+        assert parsed.netloc == "storage.googleapis.com"
+        assert headers == {
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Authorization": "Bearer fake-access-token",
+        }
+        assert timeout_seconds == 30.0
+        assert maximum_response_bytes == 2 * 1024 * 1024
+        assert "fake-access-token" not in url
+        self.calls.append(
+            {
+                "url": url,
+                "path": parsed.path,
+                "query": query,
+                "timeout_seconds": timeout_seconds,
+                "maximum_response_bytes": maximum_response_bytes,
+            }
+        )
+        if self.queued:
+            response = self.queued.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        marker = "/storage/v1/b/eyvan-managed/o"
+        if parsed.path == marker:
+            return self._list(query)
+        if parsed.path.startswith(f"{marker}/"):
+            return self._get(unquote(parsed.path[len(marker) + 1 :]), query)
+        raise AssertionError(parsed.path)
+
+    def _list(self, query: dict[str, list[str]]) -> tuple[int, bytes]:
+        assert query["versions"] == ["false"]
+        assert query["softDeleted"] == ["false"]
+        assert query["projection"] == ["noAcl"]
+        assert query["fields"] == ["items(name,size,generation),nextPageToken"]
+        assert "pageToken" not in query
+        prefix = query["prefix"][0]
+        maximum = int(query["maxResults"][0])
+        live: list[tuple[str, int, int]] = []
+        for name, versions in self.objects.items():
+            if not name.startswith(prefix):
+                continue
+            current = next(
+                ((generation, size) for generation, size, is_live in versions if is_live),
+                None,
+            )
+            if current is not None:
+                live.append((name, current[1], current[0]))
+        live.sort(key=lambda item: item[0])
+        start_offset = query.get("startOffset", [None])[0]
+        if start_offset is not None:
+            live = [item for item in live if item[0] >= start_offset]
+        page_size = maximum if self.server_page_size is None else min(maximum, self.server_page_size)
+        selected = live[:page_size]
+        document: dict[str, tp.Any] = {}
+        if selected:
+            document["items"] = [
+                {"name": name, "size": str(size), "generation": str(generation)} for name, size, generation in selected
+            ]
+        if len(live) > len(selected):
+            document["nextPageToken"] = f"provider-page-{len(selected)}"
+        return 200, json.dumps(document, separators=(",", ":")).encode()
+
+    def _get(self, name: str, query: dict[str, list[str]]) -> tuple[int, bytes]:
+        assert query == {
+            "projection": ["noAcl"],
+            "softDeleted": ["false"],
+            "fields": ["name,size,generation"],
+        }
+        current = next(
+            ((generation, size) for generation, size, is_live in self.objects.get(name, []) if is_live),
+            None,
+        )
+        if current is None:
+            return 404, b'{"error":{"message":"not found"}}'
+        generation, size = current
+        return 200, json.dumps(
+            {"name": name, "size": str(size), "generation": str(generation)},
+            separators=(",", ":"),
+        ).encode()
+
+
+def _inventory_store(
+    api: FakeGCSInventoryAPI,
+    root_uri: str = "gs://eyvan-managed/artifacts",
+) -> GCSManagedArtifactStore:
+    return GCSManagedArtifactStore(
+        root_uri,
+        inventory_transport=api,
+        access_token_provider=lambda: "fake-access-token",
+    )
+
+
+def test_local_inventory_is_bounded_scoped_and_detects_replacement_identity(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uris = tuple(result_uri(f"run-{index}") for index in range(3))
+    for index, uri in enumerate(uris):
+        store.put(uri, b"x" * (index + 1), org_id="acme", project_id="research")
+    store.put(uris[0], b"foreign", org_id="acme", project_id="other")
+
+    first = store.list_scope(org_id="acme", project_id="research", limit=2)
+    second = store.list_scope(
+        org_id="acme",
+        project_id="research",
+        cursor=first.next_cursor,
+        limit=2,
+    )
+
+    assert [item.uri for item in first.objects] == list(uris[:2])
+    assert [item.size_bytes for item in first.objects] == [1, 2]
+    assert first.next_cursor == uris[1]
+    assert [item.uri for item in second.objects] == [uris[2]]
+    assert second.next_cursor is None
+    assert all(item.object_version.startswith("local:") for item in (*first.objects, *second.objects))
+
+    before = store.stat(uris[0], org_id="acme", project_id="research")
+    assert before is not None
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "run-0.result"
+    replacement = target.with_name("replacement.result")
+    replacement.write_bytes(b"replacement")
+    replacement.replace(target)
+    after = store.stat(uris[0], org_id="acme", project_id="research")
+
+    assert after is not None
+    assert after.size_bytes == len(b"replacement")
+    assert after.object_version != before.object_version
+    assert store.stat(uris[0], org_id="acme", project_id="missing") is None
+
+
+def test_local_inventory_fails_closed_on_an_unparseable_physical_entry(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("valid")
+    store.put(uri, b"result", org_id="acme", project_id="research")
+    kind_dir = store.root / "scopes" / storage_scope("acme", "research") / "results"
+    (kind_dir / "not-a-managed-object.txt").write_bytes(b"unknown")
+
+    with pytest.raises(ManagedArtifactInventoryError, match="unexpected file"):
+        store.list_scope(org_id="acme", project_id="research")
+
+
+def test_gcs_inventory_json_api_returns_only_the_current_live_generation() -> None:
+    api = FakeGCSInventoryAPI()
+    store = _inventory_store(api)
+    first_uri, second_uri, deleted_uri = result_uri("run-1"), result_uri("run-2"), result_uri("run-deleted")
+    prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/"
+    first_name = f"{prefix}results/run-1.result"
+    second_name = f"{prefix}results/run-2.result"
+    deleted_name = f"{prefix}results/run-deleted.result"
+    api.add(first_name, size=99, generation=9, live=False)
+    api.add(first_name, size=3, generation=41, live=True)
+    api.add(second_name, size=88, generation=10, live=False)
+    api.add(second_name, size=6, generation=42, live=True)
+    api.add(deleted_name, size=7, generation=11, live=False)
+    other_prefix = f"artifacts/scopes/{storage_scope('acme', 'other')}/"
+    api.add(f"{other_prefix}results/run-1.result", size=7, generation=99, live=True)
+
+    before = len(api.calls)
+    first = store.list_scope(org_id="acme", project_id="research", limit=1)
+    assert len(api.calls) == before + 1
+    second = store.list_scope(
+        org_id="acme",
+        project_id="research",
+        cursor=first.next_cursor,
+        limit=1,
+    )
+    described = store.stat(second_uri, org_id="acme", project_id="research")
+    deleted = store.stat(deleted_uri, org_id="acme", project_id="research")
+
+    assert first.objects == (ManagedArtifactObjectMetadata(uri=first_uri, size_bytes=3, object_version="gcs:41"),)
+    assert first.next_cursor == first_uri
+    assert second.objects == (ManagedArtifactObjectMetadata(uri=second_uri, size_bytes=6, object_version="gcs:42"),)
+    assert second.next_cursor is None
+    assert described == second.objects[0]
+    assert deleted is None
+    first_query = api.calls[0]["query"]
+    assert first_query["prefix"] == [prefix]
+    assert first_query["maxResults"] == ["2"]
+    assert first_query["versions"] == ["false"]
+    assert first_query["softDeleted"] == ["false"]
+    assert "startOffset" not in first_query
+    assert api.calls[1]["query"]["startOffset"] == [f"{first_name}!"]
+    stat_calls = api.calls[2:]
+    assert all(call["path"] != "/storage/v1/b/eyvan-managed/o" for call in stat_calls)
+    assert all("versions" not in call["query"] and "generation" not in call["query"] for call in stat_calls)
+
+
+def test_gcs_inventory_honors_bounded_page_tokens_and_resumes_with_start_offset() -> None:
+    api = FakeGCSInventoryAPI()
+    store = _inventory_store(api)
+    prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/"
+    uris = tuple(result_uri(f"run-{index}") for index in range(3))
+    names = tuple(f"{prefix}results/run-{index}.result" for index in range(3))
+    for index, name in enumerate(names):
+        api.add(name, size=index + 1, generation=100 + index, live=True)
+
+    # A provider may return fewer than maxResults. Each public request still
+    # advances even when the server emits one object plus a nextPageToken.
+    api.server_page_size = 1
+    first = store.list_scope(org_id="acme", project_id="research", limit=2)
+    assert [item.uri for item in first.objects] == [uris[0]]
+    assert first.next_cursor == uris[0]
+
+    second = store.list_scope(
+        org_id="acme",
+        project_id="research",
+        cursor=first.next_cursor,
+        limit=2,
+    )
+    assert [item.uri for item in second.objects] == [uris[1]]
+    assert second.next_cursor == uris[1]
+    assert api.calls[1]["query"]["startOffset"] == [f"{names[0]}!"]
+    assert "pageToken" not in api.calls[1]["query"]
+
+    third = store.list_scope(
+        org_id="acme",
+        project_id="research",
+        cursor=second.next_cursor,
+        limit=2,
+    )
+    assert [item.uri for item in third.objects] == [uris[2]]
+    assert third.next_cursor is None
+    assert api.calls[2]["query"]["startOffset"] == [f"{names[1]}!"]
+
+
+def test_gcs_inventory_cursor_does_not_skip_a_longer_canonical_filename() -> None:
+    api = FakeGCSInventoryAPI()
+    store = _inventory_store(api)
+    prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/results/"
+    uris = (result_uri("a"), result_uri("a.result-x"), result_uri("b"))
+    for generation, uri in enumerate(uris, start=1):
+        reference = parse_managed_uri(uri)
+        api.add(
+            f"{prefix}{reference.object_id}.result",
+            size=generation,
+            generation=generation,
+            live=True,
+        )
+    api.server_page_size = 1
+
+    observed: list[str] = []
+    cursor: str | None = None
+    while True:
+        page = store.list_scope(org_id="acme", project_id="research", cursor=cursor, limit=2)
+        observed.extend(item.uri for item in page.objects)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+
+    assert observed == list(uris)
+    assert api.calls[1]["query"]["startOffset"][0].endswith("a.result!")
+
+
+def test_gcs_inventory_consumes_exactly_one_bounded_request_for_a_large_prefix() -> None:
+    api = FakeGCSInventoryAPI()
+    store = _inventory_store(api)
+    prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/results/"
+    for index in range(5000):
+        api.add(f"{prefix}run-{index:05d}.result", size=index, generation=index + 1, live=True)
+
+    page = store.list_scope(org_id="acme", project_id="research", limit=4)
+
+    assert len(page.objects) == 4
+    assert page.next_cursor == result_uri("run-00003")
+    assert len(api.calls) == 1
+    assert api.calls[0]["query"]["maxResults"] == ["5"]
+    assert api.calls[0]["maximum_response_bytes"] == 2 * 1024 * 1024
+
+
+def test_gcs_inventory_percent_encodes_scope_prefix_and_exact_object_name() -> None:
+    api = FakeGCSInventoryAPI()
+    store = _inventory_store(api, "gs://eyvan-managed/root + blue=")
+    uri = result_uri("run-1")
+    prefix = f"root + blue=/scopes/{storage_scope('acme', 'research')}/"
+    name = f"{prefix}results/run-1.result"
+    api.add(name, size=3, generation=41, live=True)
+
+    page = store.list_scope(org_id="acme", project_id="research", limit=1)
+    metadata = store.stat(uri, org_id="acme", project_id="research")
+
+    assert page.objects == (metadata,)
+    assert api.calls[0]["query"]["prefix"] == [prefix]
+    assert "root%20%2B%20blue%3D%2Fscopes%2F" in api.calls[0]["url"]
+    assert "root%20%2B%20blue%3D%2Fscopes%2F" in api.calls[1]["path"]
+    assert api.calls[1]["query"] == {
+        "projection": ["noAcl"],
+        "softDeleted": ["false"],
+        "fields": ["name,size,generation"],
+    }
+
+
+def test_gcs_inventory_rejects_duplicate_items_and_malformed_or_unbounded_json() -> None:
+    prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/"
+    item = {"name": f"{prefix}results/run-1.result", "size": "3", "generation": "41"}
+    cases = (
+        (b"not-json", "malformed JSON"),
+        (b"[]", "invalid JSON document"),
+        (json.dumps({"items": [item], "unexpected": True}).encode(), "unexpected JSON fields"),
+        (json.dumps({"items": [item, item]}).encode(), "duplicate object names"),
+        (
+            json.dumps({"items": [{**item, "generation": "9" * 21}]}).encode(),
+            "invalid object generation",
+        ),
+        (json.dumps({"items": [item], "nextPageToken": "t" * (16 * 1024 + 1)}).encode(), "invalid page token"),
+        (b"x" * (2 * 1024 * 1024 + 1), "bounded body size"),
+    )
+    for payload, message in cases:
+        api = FakeGCSInventoryAPI()
+        api.queue((200, payload))
+        store = _inventory_store(api)
+        with pytest.raises(ManagedArtifactInventoryError, match=message):
+            store.list_scope(org_id="acme", project_id="research", limit=1)
+        assert len(api.calls) == 1
+
+
+def test_gcs_inventory_sanitizes_provider_failures_and_never_exposes_bearer_tokens() -> None:
+    provider_secret = "provider-body-secret"
+    api = FakeGCSInventoryAPI()
+    api.queue((403, f'{{"error":"{provider_secret}","url":"https://private.invalid"}}'.encode()))
+    store = _inventory_store(api)
+
+    with pytest.raises(ManagedArtifactInventoryError) as failure:
+        store.list_scope(org_id="acme", project_id="research")
+    message = str(failure.value)
+    assert message == "GCS inventory request failed with HTTP status 403"
+    assert provider_secret not in message
+    assert "private.invalid" not in message
+    assert "fake-access-token" not in message
+
+    timed_out = FakeGCSInventoryAPI()
+    timed_out.queue(TimeoutError("fake-access-token https://private.invalid"))
+    with pytest.raises(ManagedArtifactInventoryError) as timeout_failure:
+        _inventory_store(timed_out).list_scope(org_id="acme", project_id="research")
+    assert str(timeout_failure.value) == "GCS inventory request timed out"
+    assert timeout_failure.value.__cause__ is None
+
+
+def test_gcs_inventory_bounds_access_tokens_cursors_names_and_stalled_pages() -> None:
+    api = FakeGCSInventoryAPI()
+    oversized_token_store = GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        inventory_transport=api,
+        access_token_provider=lambda: "s" * (16 * 1024 + 1),
+    )
+    with pytest.raises(ManagedArtifactInventoryError, match="invalid access token"):
+        oversized_token_store.list_scope(org_id="acme", project_id="research")
+    assert api.calls == []
+
+    store = _inventory_store(api)
+    with pytest.raises(ValueError, match="cursor is too large"):
+        store.list_scope(
+            org_id="acme",
+            project_id="research",
+            cursor=f"eyvan://results/{'x' * 600}",
+        )
+    assert api.calls == []
+
+    api.queue((200, json.dumps({"nextPageToken": "valid-provider-token"}).encode()))
+    with pytest.raises(ManagedArtifactInventoryError, match="did not advance"):
+        store.list_scope(org_id="acme", project_id="research")
+
+    oversized_name = "x" * 1025
+    api.queue(
+        (
+            200,
+            json.dumps({"items": [{"name": oversized_name, "size": "1", "generation": "1"}]}).encode(),
+        )
+    )
+    with pytest.raises(ManagedArtifactInventoryError, match="oversized object name"):
+        store.list_scope(org_id="acme", project_id="research")
+
+    oversized_root = _inventory_store(FakeGCSInventoryAPI(), f"gs://eyvan-managed/{'x' * 1100}")
+    with pytest.raises(ManagedArtifactInventoryError, match="oversized scope prefix"):
+        oversized_root.list_scope(org_id="acme", project_id="research")
+
+
+def test_gcs_inventory_root_rejects_wildcards_that_could_escape_the_requested_prefix() -> None:
+    with pytest.raises(ValueError, match="non-wildcard"):
+        GCSManagedArtifactStore("gs://eyvan-managed/artifacts-*/tenant")
+    with pytest.raises(ValueError, match="control characters"):
+        GCSManagedArtifactStore("gs://eyvan-managed/artifacts/tenant\tother")

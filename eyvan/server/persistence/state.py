@@ -66,8 +66,10 @@ class ControlPlaneState:
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
-    managed_artifacts: dict[str, ManagedArtifactRecord] = field(default_factory=dict)
-    artifact_references: dict[str, ArtifactReferenceRecord] = field(default_factory=dict)
+    #: Both collections use their complete durable identities. A URI is only an
+    #: address inside one tenant scope, never a globally unique key.
+    managed_artifacts: dict[tuple[str, str, str], ManagedArtifactRecord] = field(default_factory=dict)
+    artifact_references: dict[tuple[str, str, str, str], ArtifactReferenceRecord] = field(default_factory=dict)
     idempotency: dict[tuple[str, str, str], IdempotencyRecord] = field(default_factory=dict)
     outbox: dict[str, OutboxRecord] = field(default_factory=dict)
     events: list[AuditEvent] = field(default_factory=list)
@@ -296,28 +298,46 @@ class StateSession(RepositorySession):
         ]
         return sorted(items, key=lambda item: (item.issued_at, item.id))
 
-    async def get_managed_artifact(self, uri: str) -> ManagedArtifactRecord | None:
-        return self._state.managed_artifacts.get(uri)
+    async def get_managed_artifact(self, org_id: str, project_id: str, uri: str) -> ManagedArtifactRecord | None:
+        return self._state.managed_artifacts.get((org_id, project_id, uri))
 
     async def put_managed_artifact(self, record: ManagedArtifactRecord) -> None:
-        self._state.managed_artifacts[record.uri] = record
+        self._state.managed_artifacts[(record.org_id, record.project_id, record.uri)] = record
 
     async def list_managed_artifacts(
         self,
         *,
-        org_id: str | None = None,
-        project_id: str | None = None,
+        org_id: str,
+        project_id: str,
         kind: str | None = None,
         limit: int = 1000,
     ) -> list[ManagedArtifactRecord]:
         items = [
             item
             for item in self._state.managed_artifacts.values()
-            if (org_id is None or item.org_id == org_id)
-            and (project_id is None or item.project_id == project_id)
-            and (kind is None or item.kind == kind)
+            if item.org_id == org_id and item.project_id == project_id and (kind is None or item.kind == kind)
         ]
         items.sort(key=lambda item: (item.created_at, item.uri))
+        return items[:limit]
+
+    async def list_managed_artifacts_page(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        after_uri: str | None,
+        limit: int,
+    ) -> list[ManagedArtifactRecord]:
+        items = sorted(
+            (
+                item
+                for item in self._state.managed_artifacts.values()
+                if item.org_id == org_id
+                and item.project_id == project_id
+                and (after_uri is None or item.uri > after_uri)
+            ),
+            key=lambda item: item.uri,
+        )
         return items[:limit]
 
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
@@ -327,12 +347,25 @@ class StateSession(RepositorySession):
             if item.org_id == org_id and (project_id is None or item.project_id == project_id)
         )
 
+    async def count_managed_artifacts(self, *, org_id: str, project_id: str | None = None) -> int:
+        return sum(
+            1
+            for item in self._state.managed_artifacts.values()
+            if item.org_id == org_id and (project_id is None or item.project_id == project_id)
+        )
+
+    async def sum_all_managed_artifact_bytes(self) -> int:
+        return sum(item.size_bytes for item in self._state.managed_artifacts.values())
+
     async def put_artifact_reference(self, record: ArtifactReferenceRecord) -> None:
-        self._state.artifact_references[record.id] = record
+        key = (record.org_id, record.project_id, record.uri, record.workload_id)
+        self._state.artifact_references[key] = record
 
     async def list_artifact_references(
         self,
         *,
+        org_id: str,
+        project_id: str,
         uri: str | None = None,
         workload_id: str | None = None,
         active_only: bool = False,
@@ -340,7 +373,9 @@ class StateSession(RepositorySession):
         items = [
             item
             for item in self._state.artifact_references.values()
-            if (uri is None or item.uri == uri)
+            if item.org_id == org_id
+            and item.project_id == project_id
+            and (uri is None or item.uri == uri)
             and (workload_id is None or item.workload_id == workload_id)
             and (not active_only or item.released_at is None)
         ]

@@ -2288,6 +2288,40 @@ class ArtifactUsage(EyvanModel):
     quota_bytes: int | None = Field(default=None, ge=0)
 
 
+class ArtifactInventoryStatus(StrEnum):
+    """Relationship between one scoped index row and one physical object."""
+
+    MATCHED = "matched"
+    PHYSICAL_ONLY = "physical_only"
+    INDEX_ONLY = "index_only"
+    SIZE_MISMATCH = "size_mismatch"
+
+
+class ArtifactInventoryEntry(EyvanModel):
+    """One non-destructive comparison at an explicit tenant-scoped URI."""
+
+    uri: str = Field(min_length=1, max_length=512)
+    status: ArtifactInventoryStatus
+    indexed_size_bytes: int | None = Field(default=None, ge=0)
+    observed_size_bytes: int | None = Field(default=None, ge=0)
+    #: GCS generation or local file identity captured with observed_size_bytes.
+    observed_object_version: str | None = Field(default=None, min_length=1, max_length=256)
+    #: True only when this call added a previously missing index row. Existing
+    #: rows, discrepancies, and missing bytes are never rewritten as repair.
+    reindexed: bool = False
+
+
+class ArtifactInventoryReport(EyvanModel):
+    """One bounded, scope-explicit inventory page."""
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    entries: tuple[ArtifactInventoryEntry, ...] = ()
+    next_cursor: str | None = Field(default=None, max_length=512)
+    dry_run: bool = True
+    reindexed_count: int = Field(default=0, ge=0)
+
+
 class ArtifactHold(EyvanModel):
     """An explicit claim that keeps one artifact out of any future collection.
 
@@ -2326,12 +2360,12 @@ class ManagedArtifactRecord(EyvanModel):
     ledger, and it deliberately holds no bytes: ``uri`` addresses the object in
     the store, which stays the only copy.
 
-    Content-addressed kinds are shared by construction -- two projects uploading
-    the same callable produce the same digest and therefore the same URI -- so a
-    re-upload *updates* this row rather than adding one. ``size_bytes`` is
-    recorded at store time because it cannot be recovered later without reading
-    the object back, and byte accounting that requires reading every object is
-    accounting nobody runs.
+    The durable identity is ``(org_id, project_id, uri)``, matching the physical
+    store namespace. Two projects may use the same content-addressed URI, but
+    each owns a distinct object and ledger row; a re-upload updates only the row
+    in the requested scope. ``size_bytes`` is recorded at store time because it
+    cannot be recovered later without reading the object back, and byte
+    accounting that requires reading every object is accounting nobody runs.
     """
 
     uri: str = Field(max_length=512)
@@ -2393,8 +2427,9 @@ class ArtifactReferenceRecord(EyvanModel):
     what makes a later deletion auditable.
     """
 
-    #: Deterministic: one workload referencing one URI is one row, so a replayed
-    #: submission cannot inflate the reference set.
+    #: Deterministic display identity over the complete scope. Durable uniqueness
+    #: is the four typed fields below, so correctness does not depend on this
+    #: truncated digest never colliding.
     id: str = Field(max_length=200)
     uri: str = Field(max_length=512)
     workload_id: str = Field(max_length=96)
@@ -2402,8 +2437,8 @@ class ArtifactReferenceRecord(EyvanModel):
     project_id: str = Field(max_length=128)
     created_at: datetime = Field(default_factory=utcnow)
     #: Set when the referencing workload became terminal. A URI with no
-    #: unreleased reference is a *candidate* for collection, never a target:
-    #: collection is out of scope here and this package deletes nothing.
+    #: unreleased reference is a *candidate* for collection, never a safety
+    #: proof. Serialized, version-conditional deletion is a later migration.
     released_at: datetime | None = None
 
     @model_validator(mode="after")
@@ -2416,14 +2451,15 @@ class ArtifactReferenceRecord(EyvanModel):
         return self
 
 
-def artifact_reference_id(uri: str, workload_id: str) -> str:
-    """Return the deterministic reference id for one (uri, workload) pair.
+def artifact_reference_id(org_id: str, project_id: str, uri: str, workload_id: str) -> str:
+    """Return the deterministic display id for one scoped artifact reference.
 
     Derived rather than generated so that a replayed submission produces the
-    same row: the reference set must count *workloads*, not submissions.
+    same value. Persistence is keyed by ``(org_id, project_id, uri,
+    workload_id)`` itself, so a digest collision cannot merge two references.
     """
 
-    digest = hashlib.sha256(f"{uri}\n{workload_id}".encode()).hexdigest()
+    digest = hashlib.sha256(f"{org_id}\n{project_id}\n{uri}\n{workload_id}".encode()).hexdigest()
     return f"ref-{digest[:40]}"
 
 
