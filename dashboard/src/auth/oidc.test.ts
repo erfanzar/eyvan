@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __resetRuntimeOidcConfigForTests,
   apiAuthHeaders,
+  beginLogin,
+  capabilitiesForPermissions,
   completeLogin,
   consumeSessionNotice,
   currentIdentity,
@@ -26,6 +28,11 @@ function memoryStorage(initial: Record<string, string> = {}): Storage {
     removeItem: (key) => { values.delete(key); },
     setItem: (key, value) => { values.set(key, value); },
   };
+}
+
+function unsignedToken(claims: Record<string, unknown>): string {
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  return `${encode({ alg: "none" })}.${encode(claims)}.`;
 }
 
 describe("OIDC browser authentication", () => {
@@ -111,6 +118,83 @@ describe("OIDC browser authentication", () => {
   });
 });
 
+describe("dashboard permission capabilities", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    [
+      ["read", "submit", "operate", "manage_project", "manage_own_capacity", "manage_fleet"],
+      { submitWorkloads: true, operateWorkloads: true, manageProject: true, manageFleet: true },
+    ],
+    [
+      ["read", "submit", "operate", "manage_project", "manage_own_capacity"],
+      { submitWorkloads: true, operateWorkloads: true, manageProject: true, manageFleet: false },
+    ],
+    [
+      ["read", "submit", "operate", "manage_project"],
+      { submitWorkloads: true, operateWorkloads: true, manageProject: true, manageFleet: false },
+    ],
+    [
+      ["read", "submit", "operate"],
+      { submitWorkloads: true, operateWorkloads: true, manageProject: false, manageFleet: false },
+    ],
+    [
+      ["submit"],
+      { submitWorkloads: true, operateWorkloads: false, manageProject: false, manageFleet: false },
+    ],
+    [
+      ["read"],
+      { submitWorkloads: false, operateWorkloads: false, manageProject: false, manageFleet: false },
+    ],
+  ] as const)("maps server permissions to presentation controls", (permissions, expected) => {
+    expect(capabilitiesForPermissions(permissions)).toEqual(expected);
+  });
+
+  it("never treats access-token grants as effective browser authority", () => {
+    vi.stubEnv("VITE_EYVAN_ORG", "acme");
+    vi.stubEnv("VITE_EYVAN_PROJECT", "research");
+    vi.stubGlobal("sessionStorage", memoryStorage({
+      "eyvan.oidc.access_token": unsignedToken({
+        sub: "alice",
+        eyvan_grants: [{ role: "fleet_admin" }],
+      }),
+    }));
+
+    expect(currentIdentity()).toMatchObject({
+      mode: "oidc",
+      roles: [],
+      capabilities: {
+        submitWorkloads: false,
+        operateWorkloads: false,
+        manageProject: false,
+        manageFleet: false,
+      },
+    });
+  });
+
+  it("does not use a development admin role when requests use a bearer session", () => {
+    vi.stubEnv("VITE_EYVAN_DEV_AUTH", "true");
+    vi.stubEnv("VITE_EYVAN_DEV_ROLE", "fleet_admin");
+    vi.stubGlobal("sessionStorage", memoryStorage({
+      "eyvan.oidc.access_token": unsignedToken({ sub: "alice" }),
+    }));
+
+    expect(currentIdentity()).toMatchObject({
+      mode: "oidc",
+      roles: [],
+      capabilities: {
+        submitWorkloads: false,
+        operateWorkloads: false,
+        manageProject: false,
+        manageFleet: false,
+      },
+    });
+  });
+});
+
 describe("runtime OIDC configuration", () => {
   afterEach(() => {
     __resetRuntimeOidcConfigForTests();
@@ -134,17 +218,65 @@ describe("runtime OIDC configuration", () => {
     expect(isOidcConfigured()).toBe(true);
   });
 
-  it("does not ask when the bundle already carries both values", async () => {
+  it("does not ask when the bundle deliberately carries every runtime value", async () => {
     // A round trip whose answer is discarded, on the critical path of every
     // page load. Existing images must behave exactly as they did.
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://baked.example.com");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "baked-client");
+    vi.stubEnv("VITE_EYVAN_OIDC_AUDIENCE", "baked-audience");
     const fetchImpl = vi.fn();
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(isOidcConfigured()).toBe(true);
+  });
+
+  it("requests the runtime API audience during authorization", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_AUDIENCE", "");
+    vi.stubGlobal("sessionStorage", memoryStorage());
+    const assign = vi.fn();
+    vi.stubGlobal("location", {
+      search: "",
+      origin: "https://eyvan.example.test",
+      pathname: "/",
+      hash: "",
+      assign,
+    });
+    vi.stubGlobal("crypto", {
+      getRandomValues: (bytes: Uint8Array) => bytes.fill(7),
+      subtle: { digest: async () => new Uint8Array(32).buffer },
+    });
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          issuer: "https://idp.example.test",
+          client_id: "eyvan-dashboard",
+          audience: "eyvan-api",
+        }),
+        { status: 200 },
+      ),
+    );
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            authorization_endpoint: "https://idp.example.test/authorize",
+            token_endpoint: "https://idp.example.test/token",
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await beginLogin();
+
+    expect(assign).toHaveBeenCalledOnce();
+    expect(String(assign.mock.calls[0][0])).toContain("audience=eyvan-api");
   });
 
   it("treats an unreachable control plane as unconfigured rather than as an auth error", async () => {

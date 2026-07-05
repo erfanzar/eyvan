@@ -397,9 +397,12 @@ class StateSession(RepositorySession):
         project_id: str | None = None,
         entity_type: str | None = None,
         entity_id: str | None = None,
+        occurred_at_or_after: datetime | None = None,
+        occurred_before: datetime | None = None,
+        newest_first: bool = False,
         limit: int = 100,
     ) -> list[AuditEvent]:
-        items = (
+        items = [
             event
             for event in self._state.events
             if event.sequence > after_sequence
@@ -407,8 +410,11 @@ class StateSession(RepositorySession):
             and (project_id is None or event.project_id == project_id)
             and (entity_type is None or event.entity_type == entity_type)
             and (entity_id is None or event.entity_id == entity_id)
-        )
-        return list(items)[:limit]
+            and (occurred_at_or_after is None or event.timestamp >= occurred_at_or_after)
+            and (occurred_before is None or event.timestamp < occurred_before)
+        ]
+        items.sort(key=lambda event: event.sequence, reverse=newest_first)
+        return items[:limit]
 
     async def prune_outbox(self, *, before: datetime, limit: int = 1000) -> int:
         """Delete settled outbox commands last updated before ``before``.

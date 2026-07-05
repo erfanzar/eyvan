@@ -17,6 +17,22 @@ from the `eyvan_grants` claim, and are scoped to an organization or a project.
 seventy-five call sites, and `test_two_tenants_on_one_plane` asserts that every
 route in the application either enforces that scope or states why it does not.
 
+The authenticated `GET /api/v1/session` response is the only browser authority
+introspection surface. It is computed after claim grants and unexpired durable
+grants are unioned and uses the same `Authorizer` as every service boundary.
+The dashboard may decode token claims for a display name, but never to expose an
+action. Project selection and action visibility come from this response; the API
+still enforces every request.
+
+| role | scope | effective permissions |
+|---|---|---|
+| `project_viewer` | project | read |
+| `project_submitter` | project | submit only |
+| `project_operator` | project | read, submit, operate |
+| `project_admin` | project | operator plus manage project |
+| `org_admin` | organization | project admin plus manage organization-owned capacity |
+| `fleet_admin` | global | every permission, including manage fleet |
+
 Development auth exists and is **refused on a non-loopback bind**. A control
 plane reachable from anywhere cannot be one that trusts a header.
 

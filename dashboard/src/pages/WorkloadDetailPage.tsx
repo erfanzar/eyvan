@@ -20,7 +20,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { apiClient } from "../api/client";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
@@ -32,9 +31,17 @@ interface WorkloadDetailPageProps {
   workload: WorkloadDetail;
   onBack: () => void;
   onAction: (action: "cancel" | "checkpoint" | "retry") => void;
+  canOperate: boolean;
+  loadExplanation: (id: string, signal: AbortSignal) => Promise<WorkloadExplanation>;
 }
 
-export function WorkloadDetailPage({ workload, onBack, onAction }: WorkloadDetailPageProps) {
+export function WorkloadDetailPage({
+  workload,
+  onBack,
+  onAction,
+  canOperate,
+  loadExplanation,
+}: WorkloadDetailPageProps) {
   const [tab, setTab] = useState<DetailTab>("overview");
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState("all");
@@ -47,24 +54,23 @@ export function WorkloadDetailPage({ workload, onBack, onAction }: WorkloadDetai
   const [explainError, setExplainError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     setExplanation(null);
     setExplainError(null);
-    apiClient
-      .explainWorkload(workload.id)
+    loadExplanation(workload.id, controller.signal)
       .then((result) => {
-        if (!cancelled) setExplanation(result);
+        if (!controller.signal.aborted) setExplanation(result);
       })
       .catch((error: unknown) => {
         // Reported, never swallowed. An empty panel reads as "nothing to
         // report", which is the one thing it must not say when the request
         // failed.
-        if (!cancelled) setExplainError(error instanceof Error ? error.message : "Unable to explain this workload");
+        if (!controller.signal.aborted) {
+          setExplainError(error instanceof Error ? error.message : "Unable to explain this workload");
+        }
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [workload.id]);
+    return () => controller.abort();
+  }, [loadExplanation, workload.id]);
   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
   const cancellable = !["completed", "failed", "cancelled", "preempting"].includes(workload.status);
@@ -100,26 +106,28 @@ export function WorkloadDetailPage({ workload, onBack, onAction }: WorkloadDetai
             <p>{workload.id} · {workload.project} · submitted by {workload.user}</p>
           </div>
         </div>
-        <div className="detail-actions">
-          {workload.status === "failed" && (
-            <button className="button button-primary" type="button" onClick={() => onAction("retry")}>
-              <RefreshCw size={16} aria-hidden="true" />
-              Retry
-            </button>
-          )}
-          {checkpointable && (
-            <button className="button button-primary" type="button" onClick={() => onAction("checkpoint")}>
-              <HardDrive size={16} aria-hidden="true" />
-              Checkpoint
-            </button>
-          )}
-          {cancellable && (
-            <button className="button button-secondary" type="button" onClick={() => onAction("cancel")}>
-              <Ban size={16} aria-hidden="true" />
-              Cancel
-            </button>
-          )}
-        </div>
+        {canOperate && (
+          <div className="detail-actions">
+            {workload.status === "failed" && (
+              <button className="button button-primary" type="button" onClick={() => onAction("retry")}>
+                <RefreshCw size={16} aria-hidden="true" />
+                Retry
+              </button>
+            )}
+            {checkpointable && (
+              <button className="button button-primary" type="button" onClick={() => onAction("checkpoint")}>
+                <HardDrive size={16} aria-hidden="true" />
+                Checkpoint
+              </button>
+            )}
+            {cancellable && (
+              <button className="button button-secondary" type="button" onClick={() => onAction("cancel")}>
+                <Ban size={16} aria-hidden="true" />
+                Cancel
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <section className="detail-metric-grid" aria-label="Workload metrics">

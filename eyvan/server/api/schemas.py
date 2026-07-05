@@ -25,10 +25,12 @@ from eyvan.records import (
     JsonDocument,
     NativeRuntimeConfig,
     OrganizationRecord,
+    Permission,
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
     ResourceLimits,
+    Role,
     RoleGrant,
     RoleGrantRecord,
     WarmWindow,
@@ -499,6 +501,37 @@ class QuotaPutRequest(ApiModel):
             limits=self.limits,
             **self.model_dump(exclude={"limits"}),
         )
+
+
+class EffectiveProjectScope(ApiModel):
+    """One project the authenticated principal can act in.
+
+    ``permissions`` is evaluated by the same :class:`Authorizer` used at every
+    service boundary after claim and durable grants have been unioned. It is not
+    a client-side interpretation of an access-token payload.
+    """
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(default="", max_length=200)
+    registered: bool = False
+    enabled: bool = True
+    #: Whether this scope accepts mutations that create or change tenant work.
+    #: Separate from ``enabled`` so disabled history remains selectable/readable,
+    #: while a legacy unregistered organization stays compatible.
+    accepts_new_work: bool = True
+    roles: tuple[Role, ...] = ()
+    permissions: tuple[Permission, ...] = ()
+
+
+class SessionResponse(ApiModel):
+    """Authenticated identity and its fully resolved effective authority."""
+
+    subject: str = Field(min_length=1, max_length=256)
+    display_name: str | None = None
+    grants: tuple[RoleGrant, ...] = ()
+    global_permissions: tuple[Permission, ...] = ()
+    scopes: tuple[EffectiveProjectScope, ...] = ()
 
 
 class HealthResponse(ApiModel):

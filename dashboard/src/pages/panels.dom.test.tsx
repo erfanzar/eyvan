@@ -43,6 +43,15 @@ function workload(): WorkloadDetail {
   return detail;
 }
 
+const loadExplanation = (id: string, signal: AbortSignal) =>
+  apiClient.explainWorkload(id, apiClient.getScope(), signal);
+
+const fleetLoaders = {
+  loadWarmth: (signal: AbortSignal) => apiClient.getWarmth(apiClient.getScope(), signal),
+  loadBilling: (signal: AbortSignal) => apiClient.getBilling(apiClient.getScope(), signal),
+  loadLaunchLatency: (signal: AbortSignal) => apiClient.getLaunchLatency(apiClient.getScope(), signal),
+};
+
 
 describe("the placement verdict panel", () => {
   it("shows the per-cell detail behind the flat reason", async () => {
@@ -59,7 +68,13 @@ describe("the placement verdict panel", () => {
       scheduling_reason: "waiting for capacity",
     });
 
-    render(<WorkloadDetailPage workload={workload()} onBack={() => {}} onAction={async () => {}} />);
+    render(<WorkloadDetailPage
+        workload={workload()}
+        onBack={() => {}}
+        onAction={async () => {}}
+        canOperate
+        loadExplanation={loadExplanation}
+      />);
 
     await waitFor(() => expect(screen.getByText("Placement verdict")).toBeDefined());
     expect(screen.getByText("no cell satisfies all hard workload constraints")).toBeDefined();
@@ -73,7 +88,13 @@ describe("the placement verdict panel", () => {
     // The claim the panel was added for, asserted where it is true or false.
     vi.spyOn(apiClient, "explainWorkload").mockRejectedValue(new Error("Eyvan API request timed out"));
 
-    render(<WorkloadDetailPage workload={workload()} onBack={() => {}} onAction={async () => {}} />);
+    render(<WorkloadDetailPage
+        workload={workload()}
+        onBack={() => {}}
+        onAction={async () => {}}
+        canOperate
+        loadExplanation={loadExplanation}
+      />);
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
   });
@@ -96,7 +117,7 @@ describe("the warm capacity and cost panel", () => {
       idle_cost: 30.25,
     });
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("Warm capacity and cost")).toBeDefined());
     expect(screen.getByText("research/v5p")).toBeDefined();
@@ -109,7 +130,7 @@ describe("the warm capacity and cost panel", () => {
     vi.spyOn(apiClient, "getWarmth").mockRejectedValue(new Error("Unable to reach Eyvan API"));
     vi.spyOn(apiClient, "getBilling").mockRejectedValue(new Error("Unable to reach Eyvan API"));
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("Unable to reach Eyvan API")).toBeDefined());
   });
@@ -124,7 +145,7 @@ describe("the warm capacity and cost panel", () => {
       idle_cost: 0,
     });
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("No pool declares a warm floor.")).toBeDefined());
   });
@@ -163,7 +184,7 @@ describe("the launch latency panel", () => {
       ],
     });
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("Launch latency")).toBeDefined());
     expect(screen.getByText("p95 412s over 37 provisions")).toBeDefined();
@@ -189,7 +210,7 @@ describe("the launch latency panel", () => {
       ],
     });
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("never provisioned - no measurement")).toBeDefined());
   });
@@ -211,7 +232,7 @@ describe("the launch latency panel", () => {
       ],
     });
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("p95 60s over 4 provisions, 3 in cooldown")).toBeDefined());
   });
@@ -220,7 +241,7 @@ describe("the launch latency panel", () => {
     quietCost();
     vi.spyOn(apiClient, "getLaunchLatency").mockRejectedValue(new Error("Eyvan API request timed out"));
 
-    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} />);
+    render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
   });

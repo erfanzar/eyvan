@@ -25,9 +25,10 @@ interface BudgetsPageProps {
   budgets: Budget[];
   policies: SchedulingPolicy[];
   onPolicyToggle: (policy: SchedulingPolicy, preemptionEnabled: boolean) => Promise<SchedulingPolicy>;
+  canManageProject: boolean;
 }
 
-export function BudgetsPage({ budgets, policies, onPolicyToggle }: BudgetsPageProps) {
+export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProject }: BudgetsPageProps) {
   const [pendingPolicy, setPendingPolicy] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const orgBudget = budgets.find((budget) => budget.scope === "organization") ?? budgets[0];
@@ -118,11 +119,15 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle }: BudgetsPagePr
                   <td>{policy.summary}</td>
                   <td>{formatDateTime(policy.updatedAt)}</td>
                   <td>
-                    <label className="switch-control">
-                      <input type="checkbox" checked={policy.preemptionEnabled} disabled={pendingPolicy === policy.id} onChange={() => void togglePolicy(policy)} />
-                      <span aria-hidden="true" />
-                      <span className="sr-only">Toggle {policy.name}</span>
-                    </label>
+                    {canManageProject ? (
+                      <label className="switch-control">
+                        <input type="checkbox" checked={policy.preemptionEnabled} disabled={pendingPolicy === policy.id} onChange={() => void togglePolicy(policy)} />
+                        <span aria-hidden="true" />
+                        <span className="sr-only">Toggle {policy.name}</span>
+                      </label>
+                    ) : (
+                      <span className="muted">Read only</span>
+                    )}
                   </td>
                 </tr>
               ))}

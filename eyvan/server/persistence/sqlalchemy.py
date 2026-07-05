@@ -23,6 +23,7 @@ from sqlalchemy import (
     Boolean,
     Connection,
     DateTime,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -62,7 +63,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0011_quota_grants"
+SCHEMA_REVISION = "0012_audit_event_time"
 
 
 @tp.runtime_checkable
@@ -304,12 +305,22 @@ def _claimable_outbox_clause(now: datetime) -> ColumnElement[bool]:
 
 class AuditEventRow(Base):
     __tablename__ = "audit_events"
+    __table_args__ = (
+        Index(
+            "ix_audit_events_scope_type_occurred_at",
+            "org_id",
+            "project_id",
+            "entity_type",
+            "occurred_at",
+        ),
+    )
     sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     id: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
     org_id: Mapped[str | None] = mapped_column(String(128), index=True)
     project_id: Mapped[str | None] = mapped_column(String(128), index=True)
     entity_type: Mapped[str] = mapped_column(String(64), index=True)
     entity_id: Mapped[str] = mapped_column(String(256), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -985,6 +996,7 @@ class SqlAlchemySession:
             project_id=event.project_id,
             entity_type=event.entity_type,
             entity_id=event.entity_id,
+            occurred_at=event.timestamp,
             data=data,
         )
         self.session.add(row)
@@ -1001,6 +1013,9 @@ class SqlAlchemySession:
         project_id: str | None = None,
         entity_type: str | None = None,
         entity_id: str | None = None,
+        occurred_at_or_after: datetime | None = None,
+        occurred_before: datetime | None = None,
+        newest_first: bool = False,
         limit: int = 100,
     ) -> list[AuditEvent]:
         statement = select(AuditEventRow).where(AuditEventRow.sequence > after_sequence)
@@ -1012,7 +1027,12 @@ class SqlAlchemySession:
             statement = statement.where(AuditEventRow.entity_type == entity_type)
         if entity_id is not None:
             statement = statement.where(AuditEventRow.entity_id == entity_id)
-        rows = (await self.session.scalars(statement.order_by(AuditEventRow.sequence).limit(limit))).all()
+        if occurred_at_or_after is not None:
+            statement = statement.where(AuditEventRow.occurred_at >= occurred_at_or_after)
+        if occurred_before is not None:
+            statement = statement.where(AuditEventRow.occurred_at < occurred_before)
+        ordering = AuditEventRow.sequence.desc() if newest_first else AuditEventRow.sequence
+        rows = (await self.session.scalars(statement.order_by(ordering).limit(limit))).all()
         return _decode_rows(AuditEvent, rows, table="audit_events")
 
 

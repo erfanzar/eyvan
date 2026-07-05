@@ -482,6 +482,7 @@ class Role(StrEnum):
     ORG_ADMIN = "org_admin"
     PROJECT_ADMIN = "project_admin"
     PROJECT_OPERATOR = "project_operator"
+    PROJECT_SUBMITTER = "project_submitter"
     PROJECT_VIEWER = "project_viewer"
 
 
@@ -573,7 +574,16 @@ class RoleGrant(EyvanModel):
             if self.project_id is not None:
                 object.__setattr__(self, "project_id", None)
             return self
-        if self.role in {Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_VIEWER} and not self.project_id:
+        if (
+            self.role
+            in {
+                Role.PROJECT_ADMIN,
+                Role.PROJECT_OPERATOR,
+                Role.PROJECT_SUBMITTER,
+                Role.PROJECT_VIEWER,
+            }
+            and not self.project_id
+        ):
             raise ValueError(f"{self.role.value} requires a project scope")
         return self
 

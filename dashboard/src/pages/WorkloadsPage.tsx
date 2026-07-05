@@ -16,9 +16,10 @@ interface WorkloadsPageProps {
   workloads: WorkloadSummary[];
   onOpenWorkload: (id: string) => void;
   onSubmit: () => void;
+  canSubmit: boolean;
 }
 
-export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit }: WorkloadsPageProps) {
+export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }: WorkloadsPageProps) {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const [priority, setPriority] = useState("all");
@@ -97,10 +98,12 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit }: Workloads
               </button>
             )}
           </div>
-          <button className="button button-secondary" type="button" onClick={onSubmit}>
-            <Plus size={16} aria-hidden="true" />
-            New workload
-          </button>
+          {canSubmit && (
+            <button className="button button-secondary" type="button" onClick={onSubmit}>
+              <Plus size={16} aria-hidden="true" />
+              New workload
+            </button>
+          )}
         </div>
 
         {filtered.length === 0 ? (

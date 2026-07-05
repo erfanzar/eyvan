@@ -14,8 +14,8 @@ import {
   mockPolicies,
   mockWorkloads,
 } from "./mockData";
-import { apiAuthHeaders, isDemoMode, rejectSession } from "../auth/oidc";
-import { followEventStream, type StreamEvent } from "../lib/eventStream";
+import { apiAuthHeaders, configuredScope, isDemoMode, rejectSession, type AuthScope } from "../auth/oidc";
+import { EventStreamHttpError, followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
   AuditEvent,
   BillingReport,
@@ -23,11 +23,14 @@ import type {
   CapacityLease,
   Cell,
   ControlPlaneHealth,
+  EffectiveProjectScope,
   LaunchLatencyReport,
   LogEntry,
   OverviewData,
   PriorityBand,
   SchedulingPolicy,
+  SessionAuthority,
+  SessionPermission,
   SubmitWorkloadInput,
   WarmthReport,
   WorkloadExplanation,
@@ -80,6 +83,7 @@ interface RawCell {
   accelerator_type?: string;
   capacity_class?: string;
   labels: Record<string, string>;
+  topology?: Record<string, string>;
   last_heartbeat_at?: string;
 }
 
@@ -110,6 +114,24 @@ interface RawQueueTrend {
   observed_at: string;
   bucket_seconds: number;
   points: Array<{ started_at: string; submitted: number; admitted: number }>;
+}
+
+interface RawSessionScope {
+  org_id: string;
+  project_id: string;
+  display_name: string;
+  registered: boolean;
+  enabled: boolean;
+  accepts_new_work: boolean;
+  roles: string[];
+  permissions: SessionPermission[];
+}
+
+interface RawSessionAuthority {
+  subject: string;
+  display_name?: string | null;
+  global_permissions: SessionPermission[];
+  scopes: RawSessionScope[];
 }
 
 interface RawBudgetStatus {
@@ -194,6 +216,7 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
   return {
     id: raw.id,
     name: raw.spec.name,
+    org: raw.org_id,
     project: raw.project_id,
     user: raw.created_by,
     status: workloadStatus(raw.state),
@@ -262,6 +285,11 @@ function resourceRows(raw: RawResources): Array<{ name: string; total: number }>
     ...Object.entries(raw.custom),
   ];
   return resources.filter(([, total]) => total > 0).map(([name, total]) => ({ name, total }));
+}
+
+function describeTopology(topology: Record<string, string> | undefined): string {
+  const entries = Object.entries(topology ?? {}).sort(([left], [right]) => left.localeCompare(right));
+  return entries.map(([key, value]) => `${key}=${value}`).join(", ") || "Unspecified";
 }
 
 function mapPolicy(policy: RawPolicy): SchedulingPolicy {
@@ -406,17 +434,32 @@ const CONTROL_PLANE_TIMEOUT_MS = 3_500;
 const WORKER_FORWARDED_TIMEOUT_MS = 30_000;
 
 export class EyvanApiClient {
-  private readonly org = import.meta.env.VITE_EYVAN_ORG ?? "acme";
-  private readonly project = import.meta.env.VITE_EYVAN_PROJECT ?? "research";
+  private activeScope: AuthScope;
 
   constructor(
     private readonly baseUrl = "/api/v1",
     private readonly forceDemo = isDemoMode(),
-  ) {}
+    initialScope: AuthScope = configuredScope(),
+  ) {
+    this.activeScope = { ...initialScope };
+  }
+
+  getScope(): AuthScope {
+    return { ...this.activeScope };
+  }
+
+  setScope(scope: AuthScope): void {
+    if (!scope.orgId || !scope.projectId) throw new Error("dashboard scope requires an organization and project");
+    this.activeScope = { ...scope };
+  }
 
   private async request<T>(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<T> {
     const controller = new AbortController();
-    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    const externalSignal = init.signal;
+    const cancel = () => controller.abort();
+    if (externalSignal?.aborted) cancel();
+    else externalSignal?.addEventListener("abort", cancel, { once: true });
+    const timeout = globalThis.setTimeout(cancel, timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
@@ -442,13 +485,21 @@ export class EyvanApiClient {
       if (controller.signal.aborted) throw new ApiError("Eyvan API request timed out");
       throw new ApiError(error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API");
     } finally {
+      externalSignal?.removeEventListener("abort", cancel);
       globalThis.clearTimeout(timeout);
     }
   }
 
-  private async requestText(path: string, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<string> {
+  private async requestText(
+    path: string,
+    timeoutMs = CONTROL_PLANE_TIMEOUT_MS,
+    externalSignal?: AbortSignal,
+  ): Promise<string> {
     const controller = new AbortController();
-    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    const cancel = () => controller.abort();
+    if (externalSignal?.aborted) cancel();
+    else externalSignal?.addEventListener("abort", cancel, { once: true });
+    const timeout = globalThis.setTimeout(cancel, timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}${path}`, { headers: apiAuthHeaders(), signal: controller.signal });
       if (!response.ok) {
@@ -463,13 +514,61 @@ export class EyvanApiClient {
       if (controller.signal.aborted) throw new ApiError("Eyvan API request timed out");
       throw new ApiError(error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API");
     } finally {
+      externalSignal?.removeEventListener("abort", cancel);
       globalThis.clearTimeout(timeout);
     }
   }
 
-  private scope(path: string): string {
+  private scopeSnapshot(scope: AuthScope = this.activeScope): AuthScope {
+    return { orgId: scope.orgId, projectId: scope.projectId };
+  }
+
+  private scope(path: string, scope: AuthScope): string {
     const join = path.includes("?") ? "&" : "?";
-    return `${path}${join}org_id=${encodeURIComponent(this.org)}&project_id=${encodeURIComponent(this.project)}`;
+    return `${path}${join}org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`;
+  }
+
+  async getSessionAuthority(
+    preferred: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<SessionAuthority> {
+    const preferredScope = this.scopeSnapshot(preferred);
+    if (this.forceDemo) {
+      const scope: EffectiveProjectScope = {
+        ...preferredScope,
+        displayName: "Demo project",
+        registered: true,
+        enabled: true,
+        acceptsNewWork: true,
+        roles: ["fleet_admin"],
+        permissions: ["read", "submit", "operate", "manage_project", "manage_own_capacity", "manage_fleet"],
+      };
+      return {
+        subject: "dashboard-demo",
+        displayName: "Demo dataset",
+        globalPermissions: ["read", "submit", "operate", "manage_project", "manage_own_capacity", "manage_fleet"],
+        scopes: [scope],
+      };
+    }
+    const raw = await this.request<RawSessionAuthority>(this.scope("/session", preferredScope), {
+      method: "GET",
+      signal,
+    });
+    return {
+      subject: raw.subject,
+      displayName: raw.display_name ?? undefined,
+      globalPermissions: raw.global_permissions,
+      scopes: raw.scopes.map((scope) => ({
+        orgId: scope.org_id,
+        projectId: scope.project_id,
+        displayName: scope.display_name,
+        registered: scope.registered,
+        enabled: scope.enabled,
+        acceptsNewWork: scope.accepts_new_work,
+        roles: scope.roles,
+        permissions: scope.permissions,
+      })),
+    };
   }
 
   /**
@@ -485,52 +584,80 @@ export class EyvanApiClient {
    * there is no plane to stream from, and pretending otherwise would show a
    * "live" indicator over mock data.
    */
-  async followEvents(onEvent: (event: StreamEvent) => void, signal: AbortSignal, onConnectionChange?: (connected: boolean) => void): Promise<void> {
+  async followEvents(
+    onEvent: (event: StreamEvent) => void,
+    signal: AbortSignal,
+    onConnectionChange?: (connected: boolean) => void,
+    scope: AuthScope = this.activeScope,
+  ): Promise<void> {
     if (this.forceDemo) return;
-    await followEventStream({
-      url: `${this.baseUrl}${this.scope("/events/stream")}`,
-      headers: apiAuthHeaders(),
-      signal,
-      onEvent,
-      onConnectionChange,
-    });
+    const requestScope = this.scopeSnapshot(scope);
+    try {
+      await followEventStream({
+        url: `${this.baseUrl}${this.scope("/events/stream", requestScope)}`,
+        headers: apiAuthHeaders(),
+        signal,
+        onEvent,
+        onConnectionChange,
+      });
+    } catch (streamError) {
+      if (streamError instanceof EventStreamHttpError) {
+        if (streamError.status === 401) rejectSession();
+        throw new ApiError(streamError.message, streamError.status);
+      }
+      throw streamError;
+    }
   }
 
-  async getHealth(): Promise<ControlPlaneHealth> {
+  async getHealth(signal?: AbortSignal): Promise<ControlPlaneHealth> {
     if (this.forceDemo) return { status: "demo", service: "eyvan" };
-    return this.request<ControlPlaneHealth>("/health");
+    return this.request<ControlPlaneHealth>("/health", { signal });
   }
 
-  async getOverview(): Promise<OverviewData> {
+  async getOverview(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<OverviewData> {
+    const requestScope = this.scopeSnapshot(scope);
     const [workloads, cells, budgets, queueTrend] = await Promise.all([
-      this.listWorkloads(),
-      this.listCells(),
-      this.listBudgets(),
-      this.getQueueTrend(),
+      this.listWorkloads({}, requestScope, signal),
+      this.listCells(undefined, requestScope, signal),
+      this.listBudgets(requestScope, signal),
+      this.getQueueTrend(requestScope, signal),
     ]);
     return computeOverview(workloads, cells, budgets, queueTrend);
   }
 
-  async getQueueTrend(): Promise<OverviewData["queueTrend"]> {
+  async getQueueTrend(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<OverviewData["queueTrend"]> {
     if (this.forceDemo) return [];
-    try {
-      const raw = await this.request<RawQueueTrend>(this.scope("/capacity/queue-trend"), { method: "GET" });
-      return raw.points.map((point) => ({
-        label: new Date(point.started_at).toISOString().slice(11, 16),
-        queued: point.submitted,
-        admitted: point.admitted,
-      }));
-    } catch {
-      // A missing trend must not blank the whole overview: every other panel on
-      // it is independent, and an empty chart is a smaller failure than none.
-      return [];
-    }
+    const requestScope = this.scopeSnapshot(scope);
+    // Seven explicit 24-hour buckets match the seven chart columns. These are
+    // submission/admission event counts, not instantaneous queue depth.
+    const raw = await this.request<RawQueueTrend>(
+      this.scope("/capacity/queue-trend?window_s=86400&buckets=7", requestScope),
+      { method: "GET", signal },
+    );
+    return raw.points.map((point) => ({
+      label: new Date(point.started_at).toISOString().slice(11, 16),
+      submitted: point.submitted,
+      admitted: point.admitted,
+    }));
   }
 
-  async listWorkloads(filters: WorkloadFilters = {}): Promise<WorkloadSummary[]> {
+  async listWorkloads(
+    filters: WorkloadFilters = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadSummary[]> {
+    const requestScope = this.scopeSnapshot(scope);
     const workloads: WorkloadSummary[] = this.forceDemo
       ? cloneMock(mockWorkloads)
-      : (await this.request<RawWorkload[]>(this.scope("/workloads"), { method: "GET" })).map(mapWorkload);
+      : (
+          await this.request<RawWorkload[]>(this.scope("/workloads", requestScope), {
+            method: "GET",
+            signal,
+          })
+        ).map(mapWorkload);
     const search = filters.search?.toLowerCase();
     return workloads
       .filter((workload) =>
@@ -548,34 +675,55 @@ export class EyvanApiClient {
       });
   }
 
-  async getWorkload(id: string): Promise<WorkloadDetail> {
+  async getWorkload(
+    id: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadDetail> {
+    // Capture the caller's UI scope before the first await. The resource route
+    // resolves its own immutable scope server-side; the snapshot fences this
+    // composition from a later project-switch mutating the active client.
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
     if (this.forceDemo) {
       const mock = getMockWorkload(id);
       if (!mock) throw new ApiError(`Workload ${id} was not found`, 404);
       return cloneMock(mock);
     }
-    const raw = await this.request<RawWorkload>(`/workloads/${encodeURIComponent(id)}`, { method: "GET" });
+    const raw = await this.request<RawWorkload>(`/workloads/${encodeURIComponent(id)}`, {
+      method: "GET",
+      signal,
+    });
     const detail = mapWorkload(raw);
+    const workloadScope = { orgId: raw.org_id, projectId: raw.project_id };
     const [events, logs, progress, leases] = await Promise.all([
       // Also best-effort. The timeline is context; losing it should cost the
       // timeline, not the page.
-      this.request<RawEvent[]>(this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`), {
+      this.request<RawEvent[]>(
+        this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`, workloadScope), {
         method: "GET",
+        signal,
       }).catch(() => [] as RawEvent[]),
       // Best-effort, and slow on purpose: this is forwarded to the worker. It
       // used to share the 3.5s control-plane budget *and* sit in this
       // `Promise.all` with no fallback, so one slow log fetch blanked a page
       // whose workload, events and progress had all answered in under half a
       // second. An empty detail page reads as "this workload does not exist".
-      this.requestText(`/workloads/${encodeURIComponent(id)}/logs`, WORKER_FORWARDED_TIMEOUT_MS).catch(
+      this.requestText(`/workloads/${encodeURIComponent(id)}/logs`, WORKER_FORWARDED_TIMEOUT_MS, signal).catch(
         (error: unknown) => `logs unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
       ),
       // Progress is best-effort: an older control plane without the endpoint must not break the detail page.
-      this.request<RawWorkloadProgress>(`/workloads/${encodeURIComponent(id)}/progress`, { method: "GET" }).catch(() => undefined),
+      this.request<RawWorkloadProgress>(`/workloads/${encodeURIComponent(id)}/progress`, {
+        method: "GET",
+        signal,
+      }).catch(() => undefined),
       // Allocation comes from this workload's own leases. It used to be hardcoded
       // to [], so the panel rendered nothing against a live server while the mock
       // data populated it — the page looked implemented and was not.
-      this.request<RawLease[]>(this.scope(`/leases?workload_id=${encodeURIComponent(id)}`), { method: "GET" }).catch(() => []),
+      this.request<RawLease[]>(
+        this.scope(`/leases?workload_id=${encodeURIComponent(id)}`, workloadScope),
+        { method: "GET", signal },
+      ).catch(() => []),
     ]);
     detail.allocation = leases.map((lease) => ({
       host: lease.cell_id,
@@ -601,8 +749,14 @@ export class EyvanApiClient {
    * built -- the difference between "waiting for capacity" and "can never be
    * placed", which the flat reason cannot express.
    */
-  async explainWorkload(id: string): Promise<WorkloadExplanation> {
-    return this.request<WorkloadExplanation>(`/workloads/${encodeURIComponent(id)}/explain`);
+  async explainWorkload(
+    id: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadExplanation> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    return this.request<WorkloadExplanation>(`/workloads/${encodeURIComponent(id)}/explain`, { signal });
   }
 
   /**
@@ -611,8 +765,14 @@ export class EyvanApiClient {
    * Answers "it says RUNNING and nothing is happening", which no other view
    * does: the control group and pids are what a diagnostic needs to attach to.
    */
-  async workloadProcessStatus(id: string): Promise<WorkloadProcessStatus> {
-    return this.request<WorkloadProcessStatus>(`/workloads/${encodeURIComponent(id)}/process-status`);
+  async workloadProcessStatus(
+    id: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadProcessStatus> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    return this.request<WorkloadProcessStatus>(`/workloads/${encodeURIComponent(id)}/process-status`, { signal });
   }
 
   /**
@@ -623,26 +783,40 @@ export class EyvanApiClient {
    * the warm floor -- undoing the fix that put it there.
    */
   /** Provisioning latency per pool, from the samples the scheduler ranks on. */
-  async getLaunchLatency(): Promise<LaunchLatencyReport> {
-    return this.request<LaunchLatencyReport>("/capacity/launch-latency");
+  async getLaunchLatency(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<LaunchLatencyReport> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    return this.request<LaunchLatencyReport>("/capacity/launch-latency", { signal });
   }
 
-  async getWarmth(): Promise<WarmthReport> {
-    return this.request<WarmthReport>("/capacity/warmth");
+  async getWarmth(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<WarmthReport> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    return this.request<WarmthReport>("/capacity/warmth", { signal });
   }
 
   /** Accrued and idle cell cost across the fleet. */
-  async getBilling(): Promise<BillingReport> {
-    return this.request<BillingReport>("/capacity/billing");
+  async getBilling(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<BillingReport> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    return this.request<BillingReport>("/capacity/billing", { signal });
   }
 
-  async listCells(knownLeases?: CapacityLease[]): Promise<Cell[]> {
+  async listCells(
+    knownLeases?: CapacityLease[],
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<Cell[]> {
     if (this.forceDemo) return cloneMock(mockCells);
+    const requestScope = this.scopeSnapshot(scope);
     const [raw, leases] = knownLeases
-      ? [await this.request<RawCell[]>("/cells", { method: "GET" }), knownLeases]
+      ? [await this.request<RawCell[]>("/cells", { method: "GET", signal }), knownLeases]
       : await Promise.all([
-          this.request<RawCell[]>("/cells", { method: "GET" }),
-          this.listLeases(),
+          this.request<RawCell[]>("/cells", { method: "GET", signal }),
+          this.listLeases(requestScope, signal, true),
         ]);
     // A deleted cell is capacity that no longer exists. The control plane keeps
     // the record for audit and replay, but listing it as fleet inventory means
@@ -651,45 +825,53 @@ export class EyvanApiClient {
     return raw
       .filter((cell) => cell.state !== "deleted")
       .map((cell) => {
-      const activeLeases = leases.filter(
-        (lease) => lease.cell === cell.id && ["active", "activating"].includes(lease.state),
-      );
-      const resources = resourceRows(cell.capacity).map((item) => ({
-        ...item,
-        used: activeLeases.reduce((sum, lease) => sum + (lease.resourceTotals?.[item.name] ?? 0), 0),
-      }));
-      const utilization = Math.round(
-        Math.max(0, ...resources.map((resource) => resource.total ? resource.used / resource.total * 100 : 0)),
-      );
-      return {
-        id: cell.id,
-        name: cell.id,
-        capacityClass: cell.capacity_class as Cell["capacityClass"],
-        backend: `${cell.provider}${cell.provider_project ? ` / ${cell.provider_project}` : ""}`,
-        region: cell.region,
-        zone: cell.zone ?? "-",
-        status: cellStatus(cell.state),
-        utilization,
-        activeWorkloads: new Set(activeLeases.map((lease) => lease.workloadId)).size,
-        topology: cell.accelerator_type ?? "TPU",
-        resources,
-        lastHeartbeat: cell.last_heartbeat_at ?? new Date(0).toISOString(),
-      };
-    });
+        const activeLeases = leases.filter(
+          (lease) => lease.cell === cell.id && ["active", "activating"].includes(lease.state),
+        );
+        const resources = resourceRows(cell.capacity).map((item) => ({
+          ...item,
+          used: activeLeases.reduce((sum, lease) => sum + (lease.resourceTotals?.[item.name] ?? 0), 0),
+        }));
+        const utilization = Math.round(
+          Math.max(0, ...resources.map((resource) => (resource.total ? (resource.used / resource.total) * 100 : 0))),
+        );
+        return {
+          id: cell.id,
+          name: cell.id,
+          capacityClass: cell.capacity_class as Cell["capacityClass"],
+          backend: `${cell.provider}${cell.provider_project ? ` / ${cell.provider_project}` : ""}`,
+          region: cell.region,
+          zone: cell.zone ?? "-",
+          status: cellStatus(cell.state),
+          utilization,
+          activeWorkloads: new Set(activeLeases.map((lease) => lease.workloadId)).size,
+          // Topology is the durable placement/failure-domain contract. The
+          // accelerator type is a resource model, not a topology, and presenting
+          // it here made distinct slices look interchangeable.
+          topology: describeTopology(cell.topology),
+          resources,
+          lastHeartbeat: cell.last_heartbeat_at ?? new Date(0).toISOString(),
+        };
+      });
   }
 
-  async listLeases(): Promise<CapacityLease[]> {
+  async listLeases(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+    includeFleetMetadata = true,
+  ): Promise<CapacityLease[]> {
     if (this.forceDemo) return cloneMock(mockLeases);
-    // Raw cells, not this.listCells(): that method resolves leases to compute
-    // utilization, so calling it from here would recurse. The join needs one
-    // field, which the raw record already carries.
+    const requestScope = this.scopeSnapshot(scope);
+    // Cell metadata is fleet-wide. Project readers must not probe that endpoint
+    // merely to decorate a scoped lease with an optional capacity class.
+    const cellsPromise = includeFleetMetadata
+      ? this.request<RawCell[]>("/cells", { method: "GET", signal })
+      : Promise.resolve([] as RawCell[]);
     const [raw, cells] = await Promise.all([
-      this.request<RawLease[]>(this.scope("/leases"), { method: "GET" }),
-      this.request<RawCell[]>("/cells", { method: "GET" }).catch(() => [] as RawCell[]),
+      this.request<RawLease[]>(this.scope("/leases", requestScope), { method: "GET", signal }),
+      cellsPromise,
     ]);
-    const cellClasses = new Map(
-      cells.map((cell) => [cell.id, cell.capacity_class as CapacityLease["class"]]),
-    );
+    const cellClasses = new Map(cells.map((cell) => [cell.id, cell.capacity_class as CapacityLease["class"]]));
     return raw.map((lease) => ({
       id: lease.id,
       workloadId: lease.workload_id,
@@ -697,7 +879,14 @@ export class EyvanApiClient {
       cell: lease.cell_id,
       resource: lease.resources.per_replica.tpu ? "TPU" : "CPU",
       amount: `${lease.resources.replicas} x ${lease.resources.per_replica.tpu || lease.resources.per_replica.cpu}`,
-      state: lease.state === "pending" ? "activating" : lease.state === "released" || lease.state === "expired" ? "expired" : lease.state === "quarantined" ? "revoking" : lease.state as CapacityLease["state"],
+      state:
+        lease.state === "pending"
+          ? "activating"
+          : lease.state === "released" || lease.state === "expired"
+            ? "expired"
+            : lease.state === "quarantined"
+              ? "revoking"
+              : (lease.state as CapacityLease["state"]),
       expiresAt: lease.expires_at,
       spendPerHour: lease.hourly_cost,
       resourceTotals: Object.fromEntries(
@@ -706,46 +895,81 @@ export class EyvanApiClient {
           resource.total * lease.resources.replicas,
         ]),
       ),
-      // Joined client-side from the cell the lease landed on. The server has no
-      // capacity class on a lease record, and the dashboard already holds both
-      // collections -- so this costs nothing and stops the borrowed-capacity
-      // count from being permanently zero.
       class: cellClasses.get(lease.cell_id),
     }));
   }
 
-  async listBudgets(): Promise<Budget[]> {
+  async listBudgets(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<Budget[]> {
     if (this.forceDemo) return cloneMock(mockBudgets);
-    const raw = await this.request<RawBudget[]>(`/budgets?org_id=${encodeURIComponent(this.org)}`, { method: "GET" });
-    // The forecast is derived server-side from active leases and the period
-    // window, so it needs one call per budget. Settled independently: a budget
-    // whose status is unavailable still renders with its spend and limit, which
-    // is strictly more than the previous behaviour of never showing a forecast.
+    const requestScope = this.scopeSnapshot(scope);
+    let raw: RawBudget[];
+    try {
+      raw = [
+        await this.request<RawBudget>(
+          `/budgets/${encodeURIComponent(requestScope.orgId)}/${encodeURIComponent(requestScope.projectId)}`,
+          { method: "GET", signal },
+        ),
+      ];
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) raw = [];
+      else throw error;
+    }
     const forecasts = await Promise.all(
       raw.map(async (budget) => {
         try {
           const status = await this.request<RawBudgetStatus>(
             `/budgets/${encodeURIComponent(budget.org_id)}/${encodeURIComponent(budget.project_id)}/status`,
-            { method: "GET" },
+            { method: "GET", signal },
           );
           return status.forecast ?? undefined;
-        } catch {
+        } catch (error) {
+          // A cancellation or authority denial must abort the coherent snapshot;
+          // only a genuinely unavailable forecast is optional decoration.
+          if (signal?.aborted || (error instanceof ApiError && error.status === 403)) throw error;
           return undefined;
         }
       }),
     );
-    return raw.map((budget, index) => ({ id: `${budget.org_id}/${budget.project_id}`, owner: budget.project_id, scope: "project", spent: budget.spent, limit: budget.limit, forecast: forecasts[index], period: budget.period, enforcement: budget.hard_limit ? "hard" : "soft" }));
+    return raw.map((budget, index) => ({
+      id: `${budget.org_id}/${budget.project_id}`,
+      owner: budget.project_id,
+      scope: "project",
+      spent: budget.spent,
+      limit: budget.limit,
+      forecast: forecasts[index],
+      period: budget.period,
+      enforcement: budget.hard_limit ? "hard" : "soft",
+    }));
   }
 
-  async listPolicies(): Promise<SchedulingPolicy[]> {
+  async listPolicies(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<SchedulingPolicy[]> {
     if (this.forceDemo) return cloneMock(mockPolicies);
-    const raw = await this.request<RawPolicy[]>(`/policies?org_id=${encodeURIComponent(this.org)}`, { method: "GET" });
-    return raw.map(mapPolicy);
+    const requestScope = this.scopeSnapshot(scope);
+    try {
+      const raw = await this.request<RawPolicy>(
+        `/policies/${encodeURIComponent(requestScope.orgId)}/${encodeURIComponent(requestScope.projectId)}`,
+        { method: "GET", signal },
+      );
+      return [mapPolicy(raw)];
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return [];
+      throw error;
+    }
   }
 
-  async listAuditEvents(): Promise<AuditEvent[]> {
+  async listAuditEvents(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<AuditEvent[]> {
     if (this.forceDemo) return cloneMock(mockAuditEvents);
-    const raw = await this.request<RawEvent[]>("/fleet/events", { method: "GET" });
+    const requestScope = this.scopeSnapshot(scope);
+    // Project audit is a project read. Calling /fleet/events first and degrading
+    // its inevitable 403 made every non-fleet reader generate a forbidden call
+    // and then presented an empty ledger as if the project had no history.
+    const raw = await this.request<RawEvent[]>(this.scope("/events?limit=1000", requestScope), {
+      method: "GET",
+      signal,
+    });
     return raw.map((event) => ({
       id: event.id,
       sequence: event.sequence,
@@ -753,24 +977,43 @@ export class EyvanApiClient {
       action: event.action,
       actor: event.actor,
       target: event.entity_id,
-      category: event.entity_type === "workload" ? "workload" : ["cell", "lease"].includes(event.entity_type) ? "capacity" : ["policy", "quota"].includes(event.entity_type) ? "policy" : event.entity_type === "budget" ? "budget" : "system",
+      category:
+        event.entity_type === "workload"
+          ? "workload"
+          : ["cell", "lease"].includes(event.entity_type)
+            ? "capacity"
+            : ["policy", "quota"].includes(event.entity_type)
+              ? "policy"
+              : event.entity_type === "budget"
+                ? "budget"
+                : "system",
       severity: event.action.includes("failed") ? "critical" : "info",
       detail: `${event.previous_state ?? "new"} -> ${event.new_state ?? "recorded"}`,
     }));
   }
 
-  async submitWorkload(input: SubmitWorkloadInput): Promise<WorkloadDetail> {
+  async submitWorkload(
+    input: SubmitWorkloadInput,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadDetail> {
     if (this.forceDemo) return createMockWorkload(input);
+    const requestScope = this.scopeSnapshot(scope);
     const accelerator = input.resources.accelerator;
     const payload = {
-      org_id: this.org,
-      project_id: input.project,
+      org_id: requestScope.orgId,
+      project_id: requestScope.projectId,
       spec: {
         name: input.name,
         execution: { kind: "command", command: input.command },
         gang: {
           replicas: input.resources.replicas,
-          per_replica: { cpu: input.resources.cpu, memory_gib: input.resources.memoryGb, gpu: 0, tpu: input.resources.acceleratorCount ?? 0 },
+          per_replica: {
+            cpu: input.resources.cpu,
+            memory_gib: input.resources.memoryGb,
+            gpu: 0,
+            tpu: input.resources.acceleratorCount ?? 0,
+          },
           required_topology: input.resources.topology ? { slice: input.resources.topology } : {},
         },
         provider: "gcp",
@@ -784,32 +1027,53 @@ export class EyvanApiClient {
         metadata: input.labels,
       },
     };
-    const raw = await this.request<RawWorkload>("/workloads", { method: "POST", headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` }, body: JSON.stringify(payload) });
+    const raw = await this.request<RawWorkload>("/workloads", {
+      method: "POST",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      body: JSON.stringify(payload),
+      signal,
+    });
     return mapWorkload(raw);
   }
 
-  async workloadAction(id: string, action: "cancel" | "checkpoint" | "retry"): Promise<WorkloadDetail> {
+  async workloadAction(
+    id: string,
+    action: "cancel" | "checkpoint" | "retry",
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadDetail> {
+    const requestScope = this.scopeSnapshot(scope);
     if (this.forceDemo) {
       const mock = getMockWorkload(id);
       if (!mock) throw new ApiError(`Workload ${id} was not found`, 404);
-      return { ...cloneMock(mock), status: action === "cancel" ? "preempting" : action === "checkpoint" ? "checkpointing" : "queued" };
+      return {
+        ...cloneMock(mock),
+        status: action === "cancel" ? "preempting" : action === "checkpoint" ? "checkpointing" : "queued",
+      };
     }
-    const raw = await this.request<RawWorkload>(
-      `/workloads/${encodeURIComponent(id)}/${action}`,
-      {
-        method: "POST",
-        headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
-      },
-    );
+    const raw = await this.request<RawWorkload>(`/workloads/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      signal,
+    });
+    if (raw.org_id !== requestScope.orgId || raw.project_id !== requestScope.projectId) {
+      throw new ApiError("Workload mutation returned a resource outside the immutable requested scope", 409);
+    }
     return mapWorkload(raw);
   }
 
-  async updatePolicy(policy: SchedulingPolicy, preemptionEnabled: boolean): Promise<SchedulingPolicy> {
+  async updatePolicy(
+    policy: SchedulingPolicy,
+    preemptionEnabled: boolean,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<SchedulingPolicy> {
     if (this.forceDemo) return { ...cloneMock(policy), preemptionEnabled, updatedAt: new Date().toISOString() };
+    const requestScope = this.scopeSnapshot(scope);
     const configuration = policy.configuration;
     if (!configuration) throw new ApiError(`Policy ${policy.id} is missing its editable configuration`);
     const raw = await this.request<RawPolicy>(
-      `/policies/${encodeURIComponent(this.org)}/${encodeURIComponent(policy.scope)}`,
+      `/policies/${encodeURIComponent(requestScope.orgId)}/${encodeURIComponent(requestScope.projectId)}`,
       {
         method: "PUT",
         headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
@@ -821,10 +1085,15 @@ export class EyvanApiClient {
           max_priority: configuration.maxPriority,
           preemption_enabled: preemptionEnabled,
         }),
+        signal,
       },
     );
+    if (raw.org_id !== requestScope.orgId || raw.project_id !== requestScope.projectId) {
+      throw new ApiError("Policy mutation returned a resource outside the immutable requested scope", 409);
+    }
     return mapPolicy(raw);
   }
+
 }
 
 export const apiClient = new EyvanApiClient();

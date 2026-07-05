@@ -73,6 +73,7 @@ from eyvan.records import (
     ProjectRecord,
     QueueTrend,
     QuotaRecord,
+    Role,
     RoleGrantRecord,
     UserProgressReport,
     WarmthReport,
@@ -99,6 +100,7 @@ from eyvan.server.api.schemas import (
     ChildWorkloadSubmitRequest,
     DagSubmitRequest,
     DagSubmitResponse,
+    EffectiveProjectScope,
     FleetApplyRequest,
     FleetStatusResponse,
     GroupSubmitRequest,
@@ -119,6 +121,7 @@ from eyvan.server.api.schemas import (
     QuotaPutRequest,
     RoleGrantIssueRequest,
     ServiceEndpointRequest,
+    SessionResponse,
     WorkloadEstimateRequest,
     WorkloadExecRequest,
     WorkloadSubmitRequest,
@@ -138,7 +141,12 @@ from eyvan.server.persistence.local import LocalJsonRepository
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.control_plane import ControlPlaneService
+from eyvan.server.service.control_plane import (
+    QUEUE_TREND_MAX_BUCKETS,
+    QUEUE_TREND_MAX_WINDOW_S,
+    QUEUE_TREND_MIN_WINDOW_S,
+    ControlPlaneService,
+)
 from eyvan.server.service.dag import DagNode
 from eyvan.server.service.errors import (
     AuthorizationError,
@@ -494,6 +502,92 @@ def create_app(
 
         return HealthResponse(controller=startup.controller_mode)
 
+    @app.get("/api/v1/session", response_model=SessionResponse, tags=["system"])
+    async def session_authority(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        org_id: tp.Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        project_id: tp.Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    ) -> SessionResponse:
+        """Return the caller's effective authority after all grants are resolved.
+
+        The dependency has already verified the request credential and unioned
+        its claim grants with unexpired durable grants. The dashboard consumes
+        this response rather than decoding an unverified JWT payload and
+        pretending that payload includes the server's durable authority.
+
+        Registered projects are returned only when this principal has at least
+        one permission there. ``org_id``/``project_id`` may name a preferred
+        legacy scope that predates the tenant registry; it is included only if
+        the same authorizer that guards API operations says it is effective.
+        """
+
+        if (org_id is None) != (project_id is None):
+            raise InputError("session scope requires both org_id and project_id")
+
+        authorizer = service.authorizer
+        candidates: dict[tuple[str, str], ProjectRecord | None] = {
+            (grant.org_id, grant.project_id): None
+            for grant in principal.grants
+            if grant.org_id is not None and grant.project_id is not None
+        }
+        async with repository.transaction() as tx:
+            organizations = {organization.id: organization for organization in await tx.list_organizations()}
+            registered_projects = await tx.list_projects()
+        for project in registered_projects:
+            if authorizer.permissions(principal, org_id=project.org_id, project_id=project.id):
+                candidates[project.key] = project
+        if org_id is not None and project_id is not None:
+            preferred = (org_id, project_id)
+            if authorizer.permissions(principal, org_id=org_id, project_id=project_id):
+                candidates.setdefault(preferred, None)
+
+        scopes: list[EffectiveProjectScope] = []
+        for (scope_org, scope_project), project in sorted(candidates.items()):
+            permissions = authorizer.permissions(principal, org_id=scope_org, project_id=scope_project)
+            if not permissions:
+                continue
+            roles = tuple(
+                sorted(
+                    {
+                        grant.role
+                        for grant in principal.grants
+                        if grant.role is Role.FLEET_ADMIN
+                        or (
+                            grant.org_id == scope_org
+                            and (grant.role is Role.ORG_ADMIN or grant.project_id == scope_project)
+                        )
+                    },
+                    key=lambda role: role.value,
+                )
+            )
+            organization = organizations.get(scope_org)
+            scopes.append(
+                EffectiveProjectScope(
+                    org_id=scope_org,
+                    project_id=scope_project,
+                    display_name="" if project is None else project.display_name,
+                    registered=project is not None,
+                    enabled=(organization is None or organization.enabled) and (project is None or project.enabled),
+                    # Registration is scoped per organization. A completely
+                    # unregistered org is the supported pre-registry world and
+                    # keeps accepting work; once the org exists, a missing or
+                    # disabled project is history-only even when the caller's
+                    # grant still authorizes reading it.
+                    accepts_new_work=(
+                        organization is None or (organization.enabled and project is not None and project.enabled)
+                    ),
+                    roles=roles,
+                    permissions=permissions,
+                )
+            )
+        return SessionResponse(
+            subject=principal.subject,
+            display_name=principal.display_name,
+            grants=principal.grants,
+            global_permissions=authorizer.permissions(principal),
+            scopes=tuple(scopes),
+        )
+
     @app.get("/readyz", response_model=HealthResponse, tags=["system"], include_in_schema=False)
     async def readiness(response: Response) -> HealthResponse:
         """Readiness: this replica can reach its database *now*.
@@ -707,8 +801,11 @@ def create_app(
         org_id: str,
         project_id: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
-        window_s: float = 86_400.0,
-        buckets: int = 24,
+        window_s: tp.Annotated[
+            float,
+            Query(ge=QUEUE_TREND_MIN_WINDOW_S, le=QUEUE_TREND_MAX_WINDOW_S),
+        ] = 86_400.0,
+        buckets: tp.Annotated[int, Query(ge=1, le=QUEUE_TREND_MAX_BUCKETS)] = 24,
     ) -> QueueTrend:
         """Report submitted-vs-admitted counts over recent time buckets.
 

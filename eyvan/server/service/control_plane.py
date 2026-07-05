@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import typing as tp
 import uuid
 from datetime import datetime, timedelta
@@ -297,6 +298,15 @@ _EXPLAIN_MAX_CELLS = 32
 #: panel that polls: an unbounded scan of the fastest-growing table in the system
 #: would make an idle browser tab the heaviest query the control plane serves.
 _QUEUE_TREND_MAX_EVENTS = 5_000
+#: Prevent one dashboard or CLI query from allocating an arbitrarily large
+#: response. Forty-eight half-hour buckets over a day is already denser than the
+#: shipped chart renders; callers that need raw time series should use metrics.
+QUEUE_TREND_MAX_BUCKETS = 48
+#: A sub-minute trend is scheduler jitter, not a useful operations window; a
+#: window wider than 31 days belongs in retained metrics rather than a polling
+#: audit-ledger query.
+QUEUE_TREND_MIN_WINDOW_S = 60.0
+QUEUE_TREND_MAX_WINDOW_S = 31 * 86_400.0
 
 #: How long an indexed artifact is protected from collection regardless of its
 #: references. Closes a race that is easy to miss: an upload indexes the object
@@ -4454,18 +4464,39 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
-        if buckets < 1 or window_s <= 0:
-            raise InputError("queue trend requires a positive window and at least one bucket")
+        if not math.isfinite(window_s) or window_s < QUEUE_TREND_MIN_WINDOW_S or window_s > QUEUE_TREND_MAX_WINDOW_S:
+            raise InputError(
+                "queue trend window must be finite and between "
+                f"{QUEUE_TREND_MIN_WINDOW_S:g} and {QUEUE_TREND_MAX_WINDOW_S:g} seconds"
+            )
+        if buckets < 1 or buckets > QUEUE_TREND_MAX_BUCKETS:
+            raise InputError(f"queue trend requires between 1 and {QUEUE_TREND_MAX_BUCKETS} buckets")
         moment = now or utcnow()
         start = moment - timedelta(seconds=window_s)
         width = window_s / buckets
         submitted = [0] * buckets
         admitted = [0] * buckets
         async with self.repository.transaction() as tx:
-            events = await tx.list_events(org_id=org_id, project_id=project_id, limit=_QUEUE_TREND_MAX_EVENTS)
+            # Filter the finite time range in storage and read newest-first. The
+            # old query asked for the first 5,000 sequences, so once a project
+            # crossed that lifetime count every current event disappeared from
+            # this chart forever. cap+1 makes overload explicit: returning a
+            # plausible partial chart would be worse than refusing it.
+            events = await tx.list_events(
+                org_id=org_id,
+                project_id=project_id,
+                entity_type="workload",
+                occurred_at_or_after=start,
+                occurred_before=moment,
+                newest_first=True,
+                limit=_QUEUE_TREND_MAX_EVENTS + 1,
+            )
+        if len(events) > _QUEUE_TREND_MAX_EVENTS:
+            raise InputError(
+                "queue trend is incomplete: the requested window contains more than "
+                f"{_QUEUE_TREND_MAX_EVENTS} workload events; request a shorter window"
+            )
         for event in events:
-            if event.entity_type != "workload" or event.timestamp < start:
-                continue
             index = min(buckets - 1, int((event.timestamp - start).total_seconds() / width))
             if event.action == "workload.submitted":
                 submitted[index] += 1

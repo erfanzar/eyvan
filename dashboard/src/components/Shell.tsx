@@ -18,8 +18,8 @@ import {
 } from "lucide-react";
 
 import type { AuthIdentity } from "../auth/oidc";
-import type { Route, Section } from "../routing";
-import type { ControlPlaneHealth } from "../types";
+import type { Route, Section, SectionAvailability } from "../routing";
+import type { ControlPlaneHealth, EffectiveProjectScope } from "../types";
 
 interface ShellProps {
   route: Route;
@@ -27,10 +27,14 @@ interface ShellProps {
   onMobileNavigationChange: (open: boolean) => void;
   onNavigate: (section: Section) => void;
   onSubmit: () => void;
+  sectionAvailability: SectionAvailability;
   health?: ControlPlaneHealth;
   /** Whether the change stream is attached; undefined in demo mode. */
   live?: boolean;
   identity?: AuthIdentity;
+  scopes: EffectiveProjectScope[];
+  selectedScope?: EffectiveProjectScope;
+  onScopeChange: (scope: EffectiveProjectScope) => void;
   onLogout?: () => void;
   children: ReactNode;
 }
@@ -61,9 +65,13 @@ export function Shell({
   onMobileNavigationChange,
   onNavigate,
   onSubmit,
+  sectionAvailability,
   health,
   live,
   identity,
+  scopes,
+  selectedScope,
+  onScopeChange,
   onLogout,
   children,
 }: ShellProps) {
@@ -123,16 +131,40 @@ export function Shell({
         </div>
 
         <div className="environment-switcher">
-          <span className={`environment-dot ${identity?.mode === "demo" ? "environment-dot-demo" : ""}`} aria-hidden="true" />
-          <span>
-            <small>Data source</small>
-            <strong>{identity?.mode === "demo" ? "Explicit demo" : "Live API"}</strong>
-          </span>
+          <span
+            className={`environment-dot ${identity?.mode === "demo" ? "environment-dot-demo" : ""}`}
+            aria-hidden="true"
+          />
+          <label>
+            <small>Project scope</small>
+            <select
+              aria-label="Project scope"
+              value={selectedScope ? JSON.stringify([selectedScope.orgId, selectedScope.projectId]) : ""}
+              disabled={scopes.length < 2}
+              onChange={(event) => {
+                const scope = scopes.find(
+                  (candidate) => JSON.stringify([candidate.orgId, candidate.projectId]) === event.target.value,
+                );
+                if (scope) onScopeChange(scope);
+              }}
+            >
+              {!selectedScope && <option value="">Authority pending</option>}
+              {scopes.map((scope) => (
+                <option
+                  key={JSON.stringify([scope.orgId, scope.projectId])}
+                  value={JSON.stringify([scope.orgId, scope.projectId])}
+                >
+                  {scope.displayName || `${scope.orgId}/${scope.projectId}`}
+                  {!scope.enabled ? " (disabled - history only)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <nav className="sidebar-nav">
           <span className="nav-label">Control plane</span>
-          {navigation.map(({ section, label, icon: Icon }) => (
+          {navigation.filter(({ section }) => sectionAvailability[section] !== false).map(({ section, label, icon: Icon }) => (
             <button
               key={section}
               className={`nav-item ${route.section === section ? "nav-item-active" : ""}`}
@@ -191,10 +223,12 @@ export function Shell({
             <p>{"workloadId" in route ? route.workloadId : meta.description}</p>
           </div>
           <div className="topbar-actions">
-            <button className="button button-primary" type="button" onClick={onSubmit}>
-              <Plus size={17} aria-hidden="true" />
-              <span className="button-label">Submit workload</span>
-            </button>
+            {identity?.capabilities.submitWorkloads && (
+              <button className="button button-primary" type="button" onClick={onSubmit}>
+                <Plus size={17} aria-hidden="true" />
+                <span className="button-label">Submit workload</span>
+              </button>
+            )}
           </div>
         </header>
         <main className="page-content">{children}</main>

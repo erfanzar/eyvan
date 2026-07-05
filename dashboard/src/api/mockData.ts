@@ -21,6 +21,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-9f31",
     name: "llama-70b-sft-v4",
+    org: "demo",
     project: "foundation-models",
     user: "maya.chen",
     status: "running",
@@ -43,6 +44,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-a284",
     name: "reward-model-sweep",
+    org: "demo",
     project: "alignment",
     user: "samir.patel",
     status: "queued",
@@ -63,6 +65,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-c711",
     name: "online-policy-eval",
+    org: "demo",
     project: "evals",
     user: "nora.haddad",
     status: "provisioning",
@@ -83,6 +86,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-1bd0",
     name: "nightly-tokenization",
+    org: "demo",
     project: "data-platform",
     user: "alex.kim",
     status: "completed",
@@ -98,6 +102,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-834c",
     name: "vision-pretrain-2b",
+    org: "demo",
     project: "multimodal",
     user: "irene.okafor",
     status: "checkpointing",
@@ -120,6 +125,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-57ee",
     name: "serve-canary-bench",
+    org: "demo",
     project: "inference",
     user: "liam.jones",
     status: "failed",
@@ -141,6 +147,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-2ae1",
     name: "safety-redteam-live",
+    org: "demo",
     project: "safety",
     user: "zoe.martin",
     status: "running",
@@ -163,6 +170,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-d409",
     name: "embedding-refresh",
+    org: "demo",
     project: "retrieval",
     user: "ravi.singh",
     status: "planning",
@@ -182,6 +190,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-7c92",
     name: "code-model-distill",
+    org: "demo",
     project: "foundation-models",
     user: "maya.chen",
     status: "preempting",
@@ -203,6 +212,7 @@ export const mockWorkloads: WorkloadSummary[] = [
   {
     id: "wrk-316f",
     name: "dataset-quality-map",
+    org: "demo",
     project: "data-platform",
     user: "alex.kim",
     status: "running",
@@ -637,13 +647,13 @@ export const mockDashboardData: DashboardData = {
     monthlyBudget: 180000,
     successRate: 97.8,
     queueTrend: [
-      { label: "02:00", queued: 7, admitted: 4 },
-      { label: "03:00", queued: 10, admitted: 6 },
-      { label: "04:00", queued: 8, admitted: 8 },
-      { label: "05:00", queued: 14, admitted: 7 },
-      { label: "06:00", queued: 12, admitted: 9 },
-      { label: "07:00", queued: 21, admitted: 11 },
-      { label: "08:00", queued: 18, admitted: 13 },
+      { label: "02:00", submitted: 7, admitted: 4 },
+      { label: "03:00", submitted: 10, admitted: 6 },
+      { label: "04:00", submitted: 8, admitted: 8 },
+      { label: "05:00", submitted: 14, admitted: 7 },
+      { label: "06:00", submitted: 12, admitted: 9 },
+      { label: "07:00", submitted: 21, admitted: 11 },
+      { label: "08:00", submitted: 18, admitted: 13 },
     ],
     priorityQueue: [
       { priority: "production", count: 1, oldestMinutes: 2 },
@@ -679,6 +689,7 @@ export const mockDashboardData: DashboardData = {
   budgets: mockBudgets,
   policies: mockPolicies,
   auditEvents: mockAuditEvents,
+  access: { fleetInventory: true, fleetAudit: true },
 };
 
 export function getMockWorkload(id: string): WorkloadDetail | undefined {
@@ -691,6 +702,7 @@ export function createMockWorkload(input: SubmitWorkloadInput): WorkloadDetail {
   const workload: WorkloadSummary = {
     id,
     name: input.name,
+    org: "demo",
     project: input.project,
     user: "dashboard",
     status: "planning",

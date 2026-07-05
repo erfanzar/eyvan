@@ -43,11 +43,12 @@ EXPECTED_WITHIN_SCOPE: dict[Role, frozenset[Permission]] = {
     ),
     Role.PROJECT_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
     Role.PROJECT_OPERATOR: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE}),
+    Role.PROJECT_SUBMITTER: frozenset({Permission.SUBMIT}),
     Role.PROJECT_VIEWER: frozenset({Permission.READ}),
 }
 
 _ORG_SCOPED = frozenset({Role.ORG_ADMIN})
-_PROJECT_SCOPED = frozenset({Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_VIEWER})
+_PROJECT_SCOPED = frozenset({Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_SUBMITTER, Role.PROJECT_VIEWER})
 
 
 def _principal(role: Role, *, org: str | None = "acme", project: str | None = "research") -> Principal:

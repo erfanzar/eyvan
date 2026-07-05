@@ -18,6 +18,33 @@ export type PriorityBand = "production" | "interactive" | "batch";
 
 export type Severity = "info" | "success" | "warning" | "critical";
 
+export type SessionPermission =
+  | "read"
+  | "submit"
+  | "operate"
+  | "manage_project"
+  | "manage_own_capacity"
+  | "manage_fleet";
+
+export interface EffectiveProjectScope {
+  orgId: string;
+  projectId: string;
+  displayName: string;
+  registered: boolean;
+  enabled: boolean;
+  /** Server truth: false for disabled or registry-invalid scopes, true for legacy scopes. */
+  acceptsNewWork: boolean;
+  roles: string[];
+  permissions: SessionPermission[];
+}
+
+export interface SessionAuthority {
+  subject: string;
+  displayName?: string;
+  globalPermissions: SessionPermission[];
+  scopes: EffectiveProjectScope[];
+}
+
 export interface ResourceRequest {
   cpu: number;
   memoryGb: number;
@@ -30,6 +57,7 @@ export interface ResourceRequest {
 export interface WorkloadSummary {
   id: string;
   name: string;
+  org: string;
   project: string;
   user: string;
   status: WorkloadStatus;
@@ -87,7 +115,7 @@ export interface OverviewData {
   monthlySpend: number;
   monthlyBudget: number;
   successRate?: number;
-  queueTrend: Array<{ label: string; queued: number; admitted: number }>;
+  queueTrend: Array<{ label: string; submitted: number; admitted: number }>;
   priorityQueue: Array<{ priority: PriorityBand; count: number; oldestMinutes: number }>;
   fleetBreakdown: Array<{
     resource: string;
@@ -223,6 +251,12 @@ export interface DashboardData {
   budgets: Budget[];
   policies: SchedulingPolicy[];
   auditEvents: AuditEvent[];
+  access: {
+    /** True only when the fleet-wide cell inventory answered successfully. */
+    fleetInventory: boolean;
+    /** True only when the fleet-wide audit ledger answered successfully. */
+    fleetAudit: boolean;
+  };
 }
 
 /** Per-cell placement detail behind a workload's flat scheduling reason. */

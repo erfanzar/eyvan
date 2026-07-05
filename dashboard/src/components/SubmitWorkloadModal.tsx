@@ -10,13 +10,13 @@ import type { PriorityBand, SubmitWorkloadInput, WorkloadDetail } from "../types
 
 interface SubmitWorkloadModalProps {
   open: boolean;
+  project: string;
   onClose: () => void;
   onSubmit: (input: SubmitWorkloadInput) => Promise<WorkloadDetail>;
 }
 
 const initialForm = {
   name: "",
-  project: "research",
   priority: "interactive" as PriorityBand,
   capacityClass: "spot" as "spot" | "on_demand",
   command: "python -m easydel.scripts.elarge --config configs/train.yaml",
@@ -33,7 +33,7 @@ const initialForm = {
   labels: "environment=production,team=research",
 };
 
-export function SubmitWorkloadModal({ open, onClose, onSubmit }: SubmitWorkloadModalProps) {
+export function SubmitWorkloadModal({ open, project, onClose, onSubmit }: SubmitWorkloadModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const [form, setForm] = useState(initialForm);
@@ -82,7 +82,7 @@ export function SubmitWorkloadModal({ open, onClose, onSubmit }: SubmitWorkloadM
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
-    if (!form.name.trim() || !form.project.trim() || !form.command.trim()) {
+    if (!form.name.trim() || !project.trim() || !form.command.trim()) {
       setError("Name, project, and command are required.");
       return;
     }
@@ -110,7 +110,7 @@ export function SubmitWorkloadModal({ open, onClose, onSubmit }: SubmitWorkloadM
     try {
       await onSubmit({
         name: form.name.trim(),
-        project: form.project.trim(),
+        project: project.trim(),
         priority: form.priority,
         capacityClass: form.capacityClass,
         command: form.command.trim(),
@@ -153,7 +153,7 @@ export function SubmitWorkloadModal({ open, onClose, onSubmit }: SubmitWorkloadM
               <legend>Identity and admission</legend>
               <div className="form-grid form-grid-two">
                 <label className="field field-wide"><span>Workload name</span><input value={form.name} onChange={(event) => set("name", event.target.value)} placeholder="llama-70b-sft-v5" required /></label>
-                <label className="field"><span>Project</span><input value={form.project} onChange={(event) => set("project", event.target.value)} required /></label>
+                <label className="field"><span>Project</span><input value={project} readOnly aria-readonly="true" /></label>
                 <label className="field"><span>Priority band</span><select value={form.priority} onChange={(event) => set("priority", event.target.value as PriorityBand)}><option value="production">Production</option><option value="interactive">Interactive</option><option value="batch">Batch</option></select></label>
                 <label className="field"><span>Capacity class</span><select value={form.capacityClass} onChange={(event) => set("capacityClass", event.target.value as "spot" | "on_demand")}><option value="spot">Spot</option><option value="on_demand">On-demand</option></select></label>
               </div>
