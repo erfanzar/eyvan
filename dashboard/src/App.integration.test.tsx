@@ -395,6 +395,147 @@ describe("App scope and authority race guards", () => {
     );
   });
 
+  it("closes and resets an A submission form when reconciliation automatically selects B", async () => {
+    const a = { orgId: "acme", projectId: "research" };
+    const b = { orgId: "other", projectId: "platform" };
+    const sessions = [
+      authority("project_operator", [
+        effectiveScope("project_operator", a),
+        effectiveScope("project_operator", b),
+      ]),
+      authority("project_operator", [effectiveScope("project_operator", b)]),
+    ];
+    let sessionCall = 0;
+    const { client, calls } = fakeClient(sessions[0], {
+      getSessionAuthority: async () => sessions[Math.min(sessionCall++, sessions.length - 1)],
+    });
+    renderApp(client);
+    await waitFor(() => expect(screen.getByText("acme-research-workload")).toBeDefined());
+
+    fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
+    const aDialog = screen.getByRole("dialog", { name: "Submit workload" });
+    fireEvent.change(within(aDialog).getByLabelText("Workload name"), { target: { value: "A draft" } });
+    expect((within(aDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(a.projectId);
+
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Project scope" }) as HTMLSelectElement).value).toBe(
+        JSON.stringify([b.orgId, b.projectId]),
+      ),
+    );
+    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+    expect(calls.submitWorkload).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
+    const bDialog = screen.getByRole("dialog", { name: "Submit workload" });
+    expect((within(bDialog).getByLabelText("Workload name") as HTMLInputElement).value).toBe("");
+    expect((within(bDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(b.projectId);
+    fireEvent.change(within(bDialog).getByLabelText("Workload name"), { target: { value: "B submission" } });
+    fireEvent.click(within(bDialog).getByRole("button", { name: "Submit workload" }));
+
+    await waitFor(() => expect(calls.submitWorkload).toHaveBeenCalledTimes(1));
+    expect(calls.submitWorkload.mock.calls[0][0]).toEqual(expect.objectContaining({ name: "B submission" }));
+    expect(calls.submitWorkload.mock.calls[0][1]).toEqual(b);
+  });
+
+  it("drops a pending A submission result without closing a newly opened B form", async () => {
+    const a = { orgId: "acme", projectId: "research" };
+    const b = { orgId: "other", projectId: "research" };
+    const sessions = [
+      authority("project_operator", [
+        effectiveScope("project_operator", a),
+        effectiveScope("project_operator", b),
+      ]),
+      authority("project_operator", [effectiveScope("project_operator", b)]),
+    ];
+    const pending = deferred<WorkloadDetail>();
+    let sessionCall = 0;
+    const { client, calls } = fakeClient(sessions[0], {
+      getSessionAuthority: async () => sessions[Math.min(sessionCall++, sessions.length - 1)],
+      submitWorkload: async () => pending.promise,
+    });
+    renderApp(client);
+    await waitFor(() => expect(screen.getByText("acme-research-workload")).toBeDefined());
+
+    fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
+    const aDialog = screen.getByRole("dialog", { name: "Submit workload" });
+    fireEvent.change(within(aDialog).getByLabelText("Workload name"), { target: { value: "A pending" } });
+    fireEvent.click(within(aDialog).getByRole("button", { name: "Submit workload" }));
+    await waitFor(() => expect(calls.submitWorkload).toHaveBeenCalledTimes(1));
+    expect(calls.submitWorkload.mock.calls[0][1]).toEqual(a);
+
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Project scope" }) as HTMLSelectElement).value).toBe(
+        JSON.stringify([b.orgId, b.projectId]),
+      ),
+    );
+    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
+    const bDialog = screen.getByRole("dialog", { name: "Submit workload" });
+    fireEvent.change(within(bDialog).getByLabelText("Workload name"), { target: { value: "B draft" } });
+
+    await act(async () => pending.resolve(scopedWorkload(a, "A pending")));
+    const currentDialog = screen.getByRole("dialog", { name: "Submit workload" });
+    expect((within(currentDialog).getByLabelText("Workload name") as HTMLInputElement).value).toBe("B draft");
+    expect((within(currentDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(b.projectId);
+    expect(screen.queryByText(/A pending submitted to/)).toBeNull();
+  });
+
+  it("settles an unauthorized cross-project deep link after exactly one fresh session reconciliation", async () => {
+    window.location.hash = "#/workloads/wl-outside-authority";
+    const operator = authority("project_operator");
+    const submitter = authority("project_submitter");
+    const reconciliation = deferred<SessionAuthority>();
+    let sessionCall = 0;
+    const { client, calls } = fakeClient(operator, {
+      getSessionAuthority: async () => {
+        sessionCall += 1;
+        return sessionCall === 1 ? operator : reconciliation.promise;
+      },
+      getWorkload: async () => {
+        throw new ApiError("Workload belongs to a project you cannot access", 403);
+      },
+    });
+    renderApp(client);
+
+    await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2));
+    // The denial fences all stale presentation authority before /session settles.
+    expect(screen.queryByRole("button", { name: "Submit workload" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+
+    await act(async () => reconciliation.resolve(structuredClone(submitter)));
+    await waitFor(() => expect(screen.getByText("Workload belongs to a project you cannot access")).toBeDefined());
+    await act(async () => {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 50));
+    });
+
+    expect(screen.queryByText("Loading control-plane state")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2);
+    expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a stale deep-link 403 after navigation without fencing the current scope", async () => {
+    window.location.hash = "#/workloads/wl-stale-denial";
+    const operator = authority("project_operator");
+    const staleDetail = deferred<WorkloadDetail>();
+    const { client, calls } = fakeClient(operator, {
+      getWorkload: async () => staleDetail.promise,
+    });
+    renderApp(client);
+    await waitFor(() => expect(calls.getWorkload).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Workloads" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Workloads" })).toBeDefined());
+    await act(async () => staleDetail.reject(new ApiError("stale cross-project denial", 403)));
+
+    expect(screen.queryByText("stale cross-project denial")).toBeNull();
+    expect(screen.getByRole("button", { name: "Submit workload" })).toBeDefined();
+    expect(calls.getSessionAuthority).toHaveBeenCalledTimes(1);
+  });
+
   it("re-resolves /session after a 403 before rendering any stale capability", async () => {
     const operator = authority("project_operator");
     const viewer = authority("project_viewer");

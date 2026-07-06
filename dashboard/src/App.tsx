@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertTriangle, CheckCircle2, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { ApiError, apiClient, computeOverview, type EyvanApiClient } from "./api/client";
 import {
@@ -218,6 +218,17 @@ interface SubmissionAcknowledgement {
   projectId: string;
 }
 
+interface DetailFailure {
+  workloadId: string;
+  error: Error;
+}
+
+interface SubmitInteraction {
+  id: number;
+  scope: AuthScope;
+  epoch: number;
+}
+
 export interface AppProps {
   client?: EyvanApiClient;
   identityProvider?: () => AuthIdentity | undefined;
@@ -230,8 +241,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const [detailAuthority, setDetailAuthority] = useState<SessionAuthority | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [submitOpen, setSubmitOpen] = useState(false);
+  const [detailFailure, setDetailFailure] = useState<DetailFailure | null>(null);
+  const [submitInteraction, setSubmitInteraction] = useState<SubmitInteraction | null>(null);
   const [submissionAcknowledgement, setSubmissionAcknowledgement] =
     useState<SubmissionAcknowledgement | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
@@ -249,6 +260,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const scopeEpochRef = useRef(0);
   const scopeOperationAbortRef = useRef<AbortController>(new AbortController());
   const detailRouteIdRef = useRef<string | undefined>(undefined);
+  const detailFailureRef = useRef<DetailFailure | null>(detailFailure);
+  detailFailureRef.current = detailFailure;
+  const submitInteractionRef = useRef<SubmitInteraction | null>(submitInteraction);
+  submitInteractionRef.current = submitInteraction;
+  const submitInteractionSequenceRef = useRef(0);
 
   const updateSnapshot = useCallback((update: (current: AppSnapshot) => AppSnapshot) => {
     setSnapshot((current) => {
@@ -256,6 +272,18 @@ export default function App({ client = apiClient, identityProvider = currentIden
       snapshotRef.current = next;
       return next;
     });
+  }, []);
+
+  const updateDetailFailure = useCallback((failure: DetailFailure | null) => {
+    detailFailureRef.current = failure;
+    setDetailFailure(failure);
+  }, []);
+
+  const closeSubmitInteraction = useCallback((interactionId?: number) => {
+    const current = submitInteractionRef.current;
+    if (interactionId !== undefined && current?.id !== interactionId) return;
+    submitInteractionRef.current = null;
+    setSubmitInteraction(null);
   }, []);
 
   const invalidateScopeOperations = useCallback(() => {
@@ -266,23 +294,28 @@ export default function App({ client = apiClient, identityProvider = currentIden
     detailRequestRef.current += 1;
   }, []);
 
-  const fencePresentationAuthority = useCallback(() => {
-    // A typed denial is server truth. Drop every presentation capability before
-    // starting reconciliation so a slow or failed /session request cannot leave
-    // stale mutation controls live over a loading/error state.
-    invalidateScopeOperations();
-    const fenced: AppSnapshot = { authority: null, selectedScope: null, data: null };
-    snapshotRef.current = fenced;
-    setSnapshot(fenced);
-    setSelectedWorkload(null);
-    setDetailAuthority(null);
-    setDetailError(null);
-    setSubmitOpen(false);
-    setSubmissionAcknowledgement(null);
-    setToast(null);
-    setRefreshWarning(null);
-    setError(null);
-  }, [invalidateScopeOperations]);
+  const fencePresentationAuthority = useCallback(
+    (preservedDetailFailure: DetailFailure | null = null) => {
+      // A typed denial is server truth. Drop every presentation capability and
+      // scope-bound interaction before starting reconciliation. A detail denial
+      // may remain as inert route state, but no authority or action survives.
+      invalidateScopeOperations();
+      const fenced: AppSnapshot = { authority: null, selectedScope: null, data: null };
+      snapshotRef.current = fenced;
+      setSnapshot(fenced);
+      setSelectedWorkload(null);
+      setDetailAuthority(null);
+      setLoadingDetail(false);
+      updateDetailFailure(preservedDetailFailure);
+      closeSubmitInteraction();
+      setSubmissionAcknowledgement(null);
+      setMobileNavigationOpen(false);
+      setToast(null);
+      setRefreshWarning(null);
+      setError(null);
+    },
+    [closeSubmitInteraction, invalidateScopeOperations, updateDetailFailure],
+  );
 
   const refreshDashboard = useCallback(
     async (preferred: AuthScope = desiredScopeRef.current, background = false): Promise<boolean> => {
@@ -313,7 +346,12 @@ export default function App({ client = apiClient, identityProvider = currentIden
             setSnapshot(next);
             setSelectedWorkload(null);
             setDetailAuthority(null);
-            setDetailError(null);
+            setLoadingDetail(false);
+            updateDetailFailure(null);
+            closeSubmitInteraction();
+            setSubmissionAcknowledgement(null);
+            setMobileNavigationOpen(false);
+            setToast(null);
             setError(noScopeMessage);
             setRefreshWarning(null);
             return false;
@@ -352,13 +390,22 @@ export default function App({ client = apiClient, identityProvider = currentIden
           previous.authority === null ||
           authorityFingerprint(previous.authority) !== authorityFingerprint(session);
         if (scopeChanged || authorityChanged) {
+          const pendingDetailFailure = detailFailureRef.current;
+          const preserveDetailFailure =
+            pendingDetailFailure !== null && pendingDetailFailure.workloadId === detailRouteIdRef.current;
           invalidateScopeOperations();
           // Resource-scoped authority is a separate server snapshot. Never let
-          // an old detail grant outlive a durable session change; clearing the
-          // pair makes the route reload workload + scoped /session atomically.
+          // an old detail grant or any open scope-bound interaction outlive a
+          // durable session change. A typed detail denial is inert route state
+          // and remains visible after the one reconciliation it requested.
           setSelectedWorkload(null);
           setDetailAuthority(null);
-          setDetailError(null);
+          setLoadingDetail(false);
+          updateDetailFailure(preserveDetailFailure ? pendingDetailFailure : null);
+          closeSubmitInteraction();
+          setSubmissionAcknowledgement(null);
+          setMobileNavigationOpen(false);
+          setToast(null);
         }
         desiredScopeRef.current = scopeSnapshot(selected);
         const next = { authority: session, selectedScope: selected, data };
@@ -386,7 +433,13 @@ export default function App({ client = apiClient, identityProvider = currentIden
         return false;
       }
     },
-    [client, fencePresentationAuthority, invalidateScopeOperations],
+    [
+      client,
+      closeSubmitInteraction,
+      fencePresentationAuthority,
+      invalidateScopeOperations,
+      updateDetailFailure,
+    ],
   );
 
   const refreshAuthorityAfterForbidden = useCallback(
@@ -434,7 +487,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
       detailAbortRef.current = controller;
       if (!background) {
         setLoadingDetail(true);
-        setDetailError(null);
+        updateDetailFailure(null);
       }
       const currentRequest = () =>
         mountedRef.current &&
@@ -459,18 +512,28 @@ export default function App({ client = apiClient, identityProvider = currentIden
         if (!permissions.includes("read")) throw new ApiError("Workload detail is no longer readable", 403);
         setDetailAuthority(resourceAuthority);
         setSelectedWorkload(workload);
-        setDetailError(null);
+        updateDetailFailure(null);
       } catch (loadError) {
         const relevant = currentRequest();
-        if (relevant && !background) {
-          setDetailError(loadError instanceof Error ? loadError.message : "Unable to load workload");
+        if (!relevant) return;
+        const failure: DetailFailure = {
+          workloadId: id,
+          error: loadError instanceof Error ? loadError : new Error("Unable to load workload"),
+        };
+        if (loadError instanceof ApiError && loadError.status === 403) {
+          // Preserve the typed denial as inert route state while fencing every
+          // stale action. One fresh dashboard/session reconciliation follows;
+          // this request is not automatically replayed into another 403 loop.
+          fencePresentationAuthority(failure);
+          await refreshDashboard(requestScope, false);
+        } else if (!background) {
+          updateDetailFailure(failure);
         }
-        await refreshAuthorityAfterForbidden(loadError, relevant);
       } finally {
         if (currentRequest() && !background) setLoadingDetail(false);
       }
     },
-    [client, refreshAuthorityAfterForbidden],
+    [client, fencePresentationAuthority, refreshDashboard, updateDetailFailure],
   );
 
   useEffect(() => {
@@ -546,24 +609,50 @@ export default function App({ client = apiClient, identityProvider = currentIden
   };
   const routed = accessibleRoute(route, sectionAvailability);
   // SUBMIT does not imply READ. A submit-only deep link must not mount the
-  // detail loader and accidentally issue get/explain/poll reads.
+  // detail loader and accidentally issue get/explain/poll reads. An already
+  // typed denial is inert and may remain visible without mounting those reads.
   const activeRoute: Route =
-    "workloadId" in routed && !hasAnyRead(authority) ? { section: "workloads" } : routed;
+    "workloadId" in routed &&
+    !hasAnyRead(authority) &&
+    detailFailure?.workloadId !== routed.workloadId
+      ? { section: "workloads" }
+      : routed;
+  const routeDetailId = "workloadId" in route ? route.workloadId : undefined;
   const detailRouteId = "workloadId" in activeRoute ? activeRoute.workloadId : undefined;
-  detailRouteIdRef.current = detailRouteId;
+  // Track the immutable URL target, not its temporarily inaccessible projection
+  // while a denial has fenced authority. This keeps the denial relevant through
+  // reconciliation while still rejecting it immediately after navigation.
+  detailRouteIdRef.current = routeDetailId;
+  const selectedScopeIdentity = selectedScope ? scopeKey(selectedScope) : "authority-pending";
 
   useEffect(() => {
     if (!detailRouteId || error) {
       detailAbortRef.current?.abort();
       detailRequestRef.current += 1;
-      setDetailError(null);
+      setLoadingDetail(false);
       setSelectedWorkload(null);
       setDetailAuthority(null);
+      if (!routeDetailId || detailFailureRef.current?.workloadId !== routeDetailId) {
+        updateDetailFailure(null);
+      }
+      return;
+    }
+    if (detailFailureRef.current?.workloadId === detailRouteId) {
+      setLoadingDetail(false);
       return;
     }
     if (selectedWorkload?.id === detailRouteId) return;
     void loadWorkloadDetail(detailRouteId);
-  }, [detailRouteId, error, loadWorkloadDetail, selectedWorkload?.id]);
+  }, [
+    detailFailure,
+    detailRouteId,
+    error,
+    loadWorkloadDetail,
+    routeDetailId,
+    selectedScopeIdentity,
+    selectedWorkload?.id,
+    updateDetailFailure,
+  ]);
 
   useVisibilityPolling(
     () => {
@@ -582,6 +671,25 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const goToSection = (section: Section) => navigate({ section });
   const openWorkload = (id: string) => navigate({ section: "workloads", workloadId: id });
 
+  const openSubmit = () => {
+    const current = snapshotRef.current;
+    if (!current.selectedScope) return;
+    const immutableScope = scopeSnapshot(current.selectedScope);
+    const currentCapabilities = capabilitiesForResource(
+      current.authority,
+      immutableScope.orgId,
+      immutableScope.projectId,
+    );
+    if (!currentCapabilities.submitWorkloads) return;
+    const interaction: SubmitInteraction = {
+      id: ++submitInteractionSequenceRef.current,
+      scope: immutableScope,
+      epoch: scopeEpochRef.current,
+    };
+    submitInteractionRef.current = interaction;
+    setSubmitInteraction(interaction);
+  };
+
   const selectScope = (scope: EffectiveProjectScope) => {
     if (!authority || scopeKey(scope) === (selectedScope ? scopeKey(selectedScope) : "")) return;
     const immutableScope = scopeSnapshot(scope);
@@ -594,9 +702,13 @@ export default function App({ client = apiClient, identityProvider = currentIden
     setSnapshot(next);
     setSelectedWorkload(null);
     setDetailAuthority(null);
-    setDetailError(null);
-    setSubmitOpen(false);
+    setLoadingDetail(false);
+    updateDetailFailure(null);
+    closeSubmitInteraction();
     setSubmissionAcknowledgement(null);
+    setMobileNavigationOpen(false);
+    setToast(null);
+    setRefreshWarning(null);
     setError(null);
     navigate({ section: "overview" });
     void refreshDashboard(immutableScope);
@@ -608,17 +720,27 @@ export default function App({ client = apiClient, identityProvider = currentIden
     snapshotRef.current.selectedScope !== null &&
     scopeKey(snapshotRef.current.selectedScope) === scopeKey(scope);
 
-  const submitWorkload = async (input: SubmitWorkloadInput) => {
+  const submitWorkload = async (input: SubmitWorkloadInput, interaction: SubmitInteraction) => {
     const current = snapshotRef.current;
-    if (!current.selectedScope) throw new ApiError("No project scope is selected");
-    const immutableScope = scopeSnapshot(current.selectedScope);
+    const activeInteraction = submitInteractionRef.current;
+    // The opening scope is part of the form identity. Never retarget a form by
+    // re-reading the selected scope when its submit event eventually runs.
+    const immutableScope = scopeSnapshot(interaction.scope);
+    if (
+      activeInteraction?.id !== interaction.id ||
+      interaction.epoch !== scopeEpochRef.current ||
+      !current.selectedScope ||
+      scopeKey(current.selectedScope) !== scopeKey(immutableScope)
+    ) {
+      throw new ApiError("The project scope changed; reopen the submission form", 409);
+    }
     const currentCapabilities = capabilitiesForResource(
       current.authority,
       immutableScope.orgId,
       immutableScope.projectId,
     );
     if (!currentCapabilities.submitWorkloads) throw new ApiError("This scope does not accept workload submissions", 403);
-    const epoch = scopeEpochRef.current;
+    const epoch = interaction.epoch;
     try {
       const workload = await client.submitWorkload(
         input,
@@ -823,12 +945,13 @@ export default function App({ client = apiClient, identityProvider = currentIden
   } else if (!data) {
     content = <LoadingState />;
   } else if ("workloadId" in activeRoute) {
-    if (detailError) {
+    if (detailFailure?.workloadId === activeRoute.workloadId) {
       content = (
         <ErrorState
-          message={detailError}
+          message={detailFailure.error.message}
           onRetry={() => {
             setSelectedWorkload(null);
+            updateDetailFailure(null);
             void loadWorkloadDetail(activeRoute.workloadId);
           }}
         />
@@ -853,7 +976,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
           <WorkloadsPage
             workloads={data.workloads}
             onOpenWorkload={openWorkload}
-            onSubmit={() => setSubmitOpen(true)}
+            onSubmit={openSubmit}
             canSubmit={capabilities.submitWorkloads}
           />
         );
@@ -903,7 +1026,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
         mobileNavigationOpen={mobileNavigationOpen}
         onMobileNavigationChange={setMobileNavigationOpen}
         onNavigate={goToSection}
-        onSubmit={() => setSubmitOpen(true)}
+        onSubmit={openSubmit}
         sectionAvailability={sectionAvailability}
         health={data?.health}
         live={canReadSelectedScope ? live : undefined}
@@ -913,41 +1036,48 @@ export default function App({ client = apiClient, identityProvider = currentIden
         onScopeChange={selectScope}
         onLogout={identity?.mode === "development" ? undefined : () => void logout()}
       >
-        {refreshWarning && (
-          <div className="inline-warning" role="status">
-            <AlertTriangle size={16} aria-hidden="true" />
-            <span>{refreshWarning}</span>
-          </div>
-        )}
-        {submissionAcknowledgement && (
-          <div className="submission-acknowledgement" role="status" aria-live="polite">
-            <CheckCircle2 size={18} aria-hidden="true" />
-            <span>
-              <strong>Workload submitted</strong>
-              {submissionAcknowledgement.name} ({submissionAcknowledgement.id}) was accepted for {" "}
-              {submissionAcknowledgement.orgId}/{submissionAcknowledgement.projectId}. This role cannot read
-              workload detail.
-            </span>
-            <button
-              className="icon-button icon-button-small"
-              type="button"
-              aria-label="Dismiss submission acknowledgement"
-              onClick={() => setSubmissionAcknowledgement(null)}
-            >
-              <X size={15} />
-            </button>
-          </div>
-        )}
-        {content}
+        {/* A scope commit remounts page-local filters, pending controls, and panels. */}
+        <Fragment key={selectedScopeIdentity}>
+          {refreshWarning && (
+            <div className="inline-warning" role="status">
+              <AlertTriangle size={16} aria-hidden="true" />
+              <span>{refreshWarning}</span>
+            </div>
+          )}
+          {submissionAcknowledgement && (
+            <div className="submission-acknowledgement" role="status" aria-live="polite">
+              <CheckCircle2 size={18} aria-hidden="true" />
+              <span>
+                <strong>Workload submitted</strong>
+                {submissionAcknowledgement.name} ({submissionAcknowledgement.id}) was accepted for {" "}
+                {submissionAcknowledgement.orgId}/{submissionAcknowledgement.projectId}. This role cannot read
+                workload detail.
+              </span>
+              <button
+                className="icon-button icon-button-small"
+                type="button"
+                aria-label="Dismiss submission acknowledgement"
+                onClick={() => setSubmissionAcknowledgement(null)}
+              >
+                <X size={15} />
+              </button>
+            </div>
+          )}
+          {content}
+        </Fragment>
       </Shell>
-      {capabilities.submitWorkloads && selectedScope && (
-        <SubmitWorkloadModal
-          open={submitOpen}
-          project={selectedScope.projectId}
-          onClose={() => setSubmitOpen(false)}
-          onSubmit={submitWorkload}
-        />
-      )}
+      {submitInteraction &&
+        capabilities.submitWorkloads &&
+        selectedScope &&
+        scopeKey(selectedScope) === scopeKey(submitInteraction.scope) && (
+          <SubmitWorkloadModal
+            key={`${scopeKey(submitInteraction.scope)}:${submitInteraction.id}`}
+            open
+            project={submitInteraction.scope.projectId}
+            onClose={() => closeSubmitInteraction(submitInteraction.id)}
+            onSubmit={(input) => submitWorkload(input, submitInteraction)}
+          />
+        )}
       {toast && (
         <div className={`toast ${toast.error ? "toast-error" : ""}`} role={toast.error ? "alert" : "status"}>
           {toast.error ? (
