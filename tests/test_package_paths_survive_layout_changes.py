@@ -12,7 +12,7 @@ from ``__file__``, which silently encodes how deep a module happens to sit.
     uv build failed: .../libs/eyvan/eyvan does not appear to be a Python project
     alembic: Path doesn't exist: .../eyvan/persistence/migrations
     could not read OCI callable runtime source .../eyvan/worker/workspace.py
-    the Eyvan dashboard sources are not present at .../eyvan/dashboard
+    `eyvan dashboard-dev` cannot find .../eyvan/dashboard in a source checkout
 
 These assert the resolved paths exist, so the next layout change fails here
 instead of at a live ``eyvan runtime init``.
@@ -64,8 +64,8 @@ def test_the_staged_workspace_extractor_resolves() -> None:
     assert source.name == OCI_WORKSPACE_FILENAME
 
 
-def test_the_dashboard_sources_resolve_from_a_source_checkout() -> None:
-    """``eyvan dashboard`` runs Vite from these sources."""
+def test_the_dashboard_dev_sources_resolve_from_a_source_checkout() -> None:
+    """``eyvan dashboard-dev`` runs Vite from these sources."""
 
     root = _dashboard_root()
 

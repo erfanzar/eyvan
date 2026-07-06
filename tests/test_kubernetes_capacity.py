@@ -19,6 +19,8 @@ a real kube-scheduler places the pods.
 
 from __future__ import annotations
 
+import base64
+import copy
 import json
 import typing as tp
 
@@ -32,10 +34,12 @@ from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.capacity.providers.kubernetes.api import JobStatus, capacity_state, interpret_job
 from eyvan.capacity.providers.kubernetes.kueue import foreign_workloads, inspect_cluster_queue
 from eyvan.capacity.providers.kubernetes.workers import (
+    CELL_ID_ANNOTATION,
     CELL_LABEL,
     FENCE_ANNOTATION,
     GENERATION_LABEL,
     MAX_OBJECT_NAME,
+    cell_label_value,
     fence_fingerprint,
     headless_service_manifest,
     job_manifest,
@@ -45,13 +49,14 @@ from eyvan.capacity.providers.kubernetes.workers import (
 )
 
 _TOKEN = "fencing-token-abcdef"
+_WORKER_IMAGE = "registry.test/worker@sha256:" + "a" * 64
 
 
 def _job(**overrides: object) -> JsonObject:
     arguments: dict[str, tp.Any] = {
         "cell_id": "cell-a",
         "namespace": "eyvan",
-        "image": "registry.test/worker:1",
+        "image": _WORKER_IMAGE,
         "worker_count": 2,
         "provider_generation": 3,
         "fencing_token": _TOKEN,
@@ -70,7 +75,7 @@ def test_object_names_are_deterministic_which_is_what_makes_create_idempotent() 
 
 
 def test_a_long_cell_id_is_truncated_to_a_valid_dns_label() -> None:
-    """Cell ids reach 88 characters; a DNS-1123 label may not exceed 63."""
+    """Cell IDs reach 96 characters; a DNS-1123 label may not exceed 63."""
 
     name = object_name("eyvan", "c" * 120)
 
@@ -92,6 +97,46 @@ def test_a_cell_id_with_illegal_characters_becomes_a_valid_label() -> None:
     name = object_name("eyvan", "Cell_A.1/x")
 
     assert all(character.isalnum() or character == "-" for character in name)
+
+
+def test_long_cell_id_uses_one_safe_token_and_preserves_the_full_annotation() -> None:
+    cell_id = "research-cell-" + "x" * 82
+    token = cell_label_value(cell_id)
+    job = _job(cell_id=cell_id)
+    service = headless_service_manifest(cell_id, "eyvan")
+    secret = secret_manifest(cell_id, "eyvan", "secret-token")
+
+    assert len(cell_id) == 96
+    assert len(token) <= 63
+    assert token[0].isalnum() and token[-1].isalnum()
+    assert all(character.isalnum() or character in "-_." for character in token)
+    assert job["metadata"]["labels"][CELL_LABEL] == token
+    assert job["spec"]["template"]["metadata"]["labels"][CELL_LABEL] == token
+    assert service["metadata"]["labels"][CELL_LABEL] == token
+    assert service["spec"]["selector"][CELL_LABEL] == token
+    assert secret["metadata"]["labels"][CELL_LABEL] == token
+    for manifest in (job, service, secret):
+        assert manifest["metadata"]["annotations"][CELL_ID_ANNOTATION] == cell_id
+
+
+def test_hashed_cell_label_tokens_resist_long_common_prefix_collisions() -> None:
+    first = cell_label_value("c" * 95 + "a")
+    second = cell_label_value("c" * 95 + "b")
+
+    assert first != second
+    assert first == cell_label_value("c" * 95 + "a")
+
+
+def test_the_job_refuses_a_mutable_worker_image() -> None:
+    with pytest.raises(ValueError, match="repository@sha256"):
+        _job(image="registry.test/worker:latest")
+
+
+def test_the_job_uses_the_dedicated_worker_account_without_an_api_token() -> None:
+    pod_spec = _job()["spec"]["template"]["spec"]
+
+    assert pod_spec["serviceAccountName"] == "eyvan-native-worker"
+    assert pod_spec["automountServiceAccountToken"] is False
 
 
 def test_the_job_is_indexed_with_parallelism_matching_the_worker_count() -> None:
@@ -335,36 +380,84 @@ def test_a_workload_without_the_cell_label_is_foreign() -> None:
 
 
 class _FakeApi:
-    """Record every API call and answer from an in-memory Job table."""
+    """Record calls and model exact named-object conflicts and GETs."""
 
     def __init__(self) -> None:
+        self.objects: dict[str, JsonObject] = {}
         self.jobs: dict[str, JsonObject] = {}
         self.created: list[tuple[str, JsonObject]] = []
         self.deleted: list[str] = []
+        self.delete_preconditions: list[tuple[str, str | None, str | None]] = []
+        self.deletion_pending: set[str] = set()
+        self.got: list[str] = []
+        self.get_overrides: dict[str, object] = {}
+        self._next_uid = 1
+
+    def _store(self, path: str, manifest: JsonObject) -> JsonObject:
+        stored = copy.deepcopy(manifest)
+        metadata = stored["metadata"]
+        assert isinstance(metadata, dict)
+        metadata.setdefault("uid", f"uid-{self._next_uid}")
+        metadata.setdefault("resourceVersion", str(self._next_uid))
+        self._next_uid += 1
+        if stored.get("kind") == "Secret":
+            string_data = stored.pop("stringData", {})
+            assert isinstance(string_data, dict)
+            stored["data"] = {key: base64.b64encode(str(value).encode()).decode() for key, value in string_data.items()}
+        if stored.get("kind") == "Job":
+            spec = stored["spec"]
+            assert isinstance(spec, dict)
+            stored["status"] = {"ready": spec["parallelism"]}
+            self.jobs[f"{metadata['namespace']}/{metadata['name']}"] = stored
+        self.objects[path] = stored
+        return stored
+
+    def seed(self, path: str, manifest: JsonObject) -> JsonObject:
+        """Install an already-existing API object with realistic fencing metadata."""
+
+        return self._store(path, manifest)
+
+    def get(self, path: str) -> JsonObject | None:
+        self.got.append(path)
+        if path in self.get_overrides:
+            return tp.cast(JsonObject | None, self.get_overrides[path])
+        return self.objects.get(path)
 
     def get_job(self, namespace: str, name: str) -> JsonObject | None:
-        return self.jobs.get(f"{namespace}/{name}")
+        return self.get(f"/apis/batch/v1/namespaces/{namespace}/jobs/{name}")
 
     def create(self, path: str, manifest: JsonObject) -> bool:
-        self.created.append((path, manifest))
-        if path.endswith("/jobs"):
-            metadata = manifest["metadata"]
-            key = f"{metadata['namespace']}/{metadata['name']}"
-            if key in self.jobs:
-                return False
-            spec = manifest["spec"]
-            self.jobs[key] = {
-                "metadata": metadata,
-                "spec": spec,
-                "status": {"ready": spec["parallelism"]},
-            }
+        self.created.append((path, copy.deepcopy(manifest)))
+        metadata = manifest["metadata"]
+        assert isinstance(metadata, dict)
+        object_path = f"{path}/{metadata['name']}"
+        if object_path in self.objects:
+            return False
+        self._store(object_path, manifest)
         return True
 
-    def delete(self, path: str) -> None:
+    def delete(
+        self,
+        path: str,
+        *,
+        uid: str | None = None,
+        resource_version: str | None = None,
+    ) -> None:
+        existing = self.objects.get(path)
+        if existing is not None and (uid is not None or resource_version is not None):
+            metadata = existing["metadata"]
+            assert isinstance(metadata, dict)
+            assert metadata.get("uid") == uid
+            assert metadata.get("resourceVersion") == resource_version
         self.deleted.append(path)
-        for key in list(self.jobs):
-            if path.endswith(key.split("/", 1)[1]) and "/jobs/" in path:
-                del self.jobs[key]
+        self.delete_preconditions.append((path, uid, resource_version))
+        if path in self.deletion_pending:
+            return
+        removed = self.objects.pop(path, None)
+        if removed is not None and removed.get("kind") == "Job":
+            metadata = removed["metadata"]
+            assert isinstance(metadata, dict)
+            self.jobs.pop(f"{metadata['namespace']}/{metadata['name']}", None)
 
 
 def _driver(tmp_path, api: _FakeApi) -> KubernetesCapacityDriver:
@@ -372,6 +465,7 @@ def _driver(tmp_path, api: _FakeApi) -> KubernetesCapacityDriver:
         FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
         api=api,
         namespace="eyvan",
+        image=_WORKER_IMAGE,
         shared_secret="agent-secret",
     )
 
@@ -446,6 +540,7 @@ def test_the_management_uid_is_derived_and_includes_the_namespace(tmp_path) -> N
         FleetStateStore(LocalBackend(tmp_path / "other.json")),
         api=_FakeApi(),
         namespace="other-namespace",
+        image=_WORKER_IMAGE,
         shared_secret="agent-secret",
     ).apply_capacity("cell-a", _desired(), _context())
 
@@ -462,6 +557,91 @@ def test_reapplying_the_same_request_does_not_bump_the_generation(tmp_path) -> N
     second = driver.apply_capacity("cell-a", _desired(), _context())
 
     assert second.metadata["provider_generation"] == first.metadata["provider_generation"]
+
+
+def test_an_exact_create_retry_gets_and_verifies_every_conflict(tmp_path) -> None:
+    """A deterministic name routes the GET; equality, not 409, proves replay."""
+
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    first = driver.apply_capacity("cell-a", _desired(), _context())
+    api.got.clear()
+    api.deleted.clear()
+
+    second = driver.apply_capacity("cell-a", _desired(), _context())
+
+    assert second.metadata["provider_generation"] == first.metadata["provider_generation"]
+    assert "/api/v1/namespaces/eyvan/services/eyvan-cell-a" in api.got
+    assert "/api/v1/namespaces/eyvan/secrets/eyvan-token-cell-a" in api.got
+    assert "/apis/batch/v1/namespaces/eyvan/jobs/eyvan-cell-a" in api.got
+    assert api.deleted == []
+
+
+def test_a_stale_secret_token_is_rotated_only_after_the_old_job_is_gone(tmp_path) -> None:
+    """The old pod must never observe the next generation's mounted credential."""
+
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+    secret_path = "/api/v1/namespaces/eyvan/secrets/eyvan-token-cell-a"
+    first_secret = copy.deepcopy(api.objects[secret_path])
+    api.deleted.clear()
+
+    observation = driver.apply_capacity("cell-a", _desired(), _context(generation=2, key="apply-2"))
+
+    job_delete = "/apis/batch/v1/namespaces/eyvan/jobs/eyvan-cell-a"
+    assert api.deleted.index(job_delete) < api.deleted.index(secret_path)
+    assert observation.metadata["provider_generation"] == 2
+    replacement = api.objects[secret_path]
+    assert replacement["data"] != first_secret["data"]
+    assert replacement["metadata"]["labels"][GENERATION_LABEL] == "2"
+    assert first_secret["data"]["token"] not in json.dumps(api.objects)
+
+
+def test_a_colliding_service_is_not_adopted_or_deleted(tmp_path) -> None:
+    api = _FakeApi()
+    service_path = "/api/v1/namespaces/eyvan/services/eyvan-cell-a"
+    collision = headless_service_manifest("cell-a", "eyvan")
+    collision["spec"]["selector"] = {CELL_LABEL: "another-cell"}
+    api.seed(service_path, collision)
+
+    with pytest.raises(CapacityProviderError, match="Service conflict") as raised:
+        _driver(tmp_path, api).apply_capacity("cell-a", _desired(), _context())
+
+    assert raised.value.retryable is False
+    assert api.deleted == []
+    assert all(not path.endswith(("/secrets", "/jobs")) for path, _manifest in api.created)
+
+
+def test_a_same_name_job_with_different_security_critical_spec_fails_closed(tmp_path) -> None:
+    api = _FakeApi()
+    job_path = "/apis/batch/v1/namespaces/eyvan/jobs/eyvan-cell-a"
+    collision = _job(
+        provider_generation=1,
+        secret_name="eyvan-token-cell-a",
+        image="registry.test/other@sha256:" + "b" * 64,
+    )
+    api.seed(job_path, collision)
+
+    with pytest.raises(CapacityProviderError, match="Job conflict") as raised:
+        _driver(tmp_path, api).apply_capacity("cell-a", _desired(), _context())
+
+    assert raised.value.retryable is False
+    assert api.deleted == []
+    assert api.objects[job_path]["spec"]["template"]["spec"]["containers"][0]["image"].endswith("b" * 64)
+
+
+def test_a_malformed_conflict_get_is_never_accepted_as_replay(tmp_path) -> None:
+    api = _FakeApi()
+    service_path = "/api/v1/namespaces/eyvan/services/eyvan-cell-a"
+    api.seed(service_path, headless_service_manifest("cell-a", "eyvan"))
+    api.get_overrides[service_path] = []
+
+    with pytest.raises(CapacityProviderError, match="non-object") as raised:
+        _driver(tmp_path, api).apply_capacity("cell-a", _desired(), _context())
+
+    assert raised.value.retryable is False
+    assert api.deleted == []
 
 
 def test_a_stale_generation_is_refused(tmp_path) -> None:
@@ -485,7 +665,23 @@ def test_a_job_from_a_previous_incarnation_is_not_adopted(tmp_path) -> None:
     observation = driver.observe("cell-a")
 
     assert observation.state is CapacityStatus.NEEDS_RECREATE
-    assert "previous incarnation" in observation.detail
+    assert "ownership metadata" in observation.detail
+
+
+def test_observe_fails_closed_when_job_ownership_metadata_is_missing(tmp_path) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+    job = next(iter(api.jobs.values()))
+    job["metadata"]["labels"] = {}
+    job["metadata"]["annotations"] = {}
+
+    observation = driver.observe("cell-a")
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.execution_endpoint is None
+    assert observation.metadata["native_worker_endpoints"] == []
+    assert api.deleted == []
 
 
 def test_release_deletes_the_job_first(tmp_path) -> None:
@@ -500,6 +696,84 @@ def test_release_deletes_the_job_first(tmp_path) -> None:
     assert "/jobs/" in api.deleted[0]
     assert any("/secrets/" in path for path in api.deleted)
     assert any("/services/" in path for path in api.deleted)
+    assert len(api.delete_preconditions) == 3
+    assert all(uid and resource_version for _path, uid, resource_version in api.delete_preconditions)
+
+
+def test_newer_generation_release_deletes_resources_owned_by_the_durable_predecessor(tmp_path) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1"))
+
+    observation = driver.release(
+        "cell-a",
+        MutationContext(idempotency_key="release-2", generation=2, fencing_token="new-owner-token"),
+    )
+
+    assert observation.state is CapacityStatus.RELEASED
+    assert api.objects == {}
+    assert all(uid and resource_version for _path, uid, resource_version in api.delete_preconditions)
+
+
+def test_stale_release_deletes_nothing(tmp_path) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1"))
+    driver.apply_capacity(
+        "cell-a",
+        _desired(),
+        MutationContext(idempotency_key="apply-2", generation=2, fencing_token="new-owner-token"),
+    )
+    api.deleted.clear()
+    api.delete_preconditions.clear()
+    before = copy.deepcopy(api.objects)
+
+    with pytest.raises(StaleMutationError):
+        driver.release("cell-a", _context(generation=1, key="stale-release"))
+
+    assert api.deleted == []
+    assert api.delete_preconditions == []
+    assert api.objects == before
+
+
+def test_release_collision_preflight_deletes_nothing(tmp_path) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+    service_path = "/api/v1/namespaces/eyvan/services/eyvan-cell-a"
+    api.objects[service_path]["metadata"]["annotations"].pop(CELL_ID_ANNOTATION)
+    api.deleted.clear()
+    api.delete_preconditions.clear()
+    before = copy.deepcopy(api.objects)
+
+    with pytest.raises(CapacityProviderError, match="Service conflict") as raised:
+        driver.release("cell-a", _context(key="release-collision"))
+
+    assert raised.value.retryable is False
+    assert api.deleted == []
+    assert api.delete_preconditions == []
+    assert api.objects == before
+
+
+def test_release_waits_for_foreground_job_absence_before_secret_and_service(tmp_path) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+    job_path = "/apis/batch/v1/namespaces/eyvan/jobs/eyvan-cell-a"
+    secret_path = "/api/v1/namespaces/eyvan/secrets/eyvan-token-cell-a"
+    service_path = "/api/v1/namespaces/eyvan/services/eyvan-cell-a"
+    api.deleted.clear()
+    api.delete_preconditions.clear()
+    api.deletion_pending.add(job_path)
+
+    with pytest.raises(CapacityProviderError, match="foreground deletion") as raised:
+        driver.release("cell-a", _context(key="release-pending"))
+
+    assert raised.value.retryable is True
+    assert api.deleted == [job_path]
+    assert secret_path in api.objects
+    assert service_path in api.objects
+    assert driver.state.get("cell-a") is not None
 
 
 def test_release_tombstones_the_record(tmp_path) -> None:

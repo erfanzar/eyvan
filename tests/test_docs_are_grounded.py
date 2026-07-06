@@ -269,7 +269,7 @@ def test_the_readme_points_at_the_split() -> None:
 
 
 def test_the_install_page_still_states_the_real_number_of_prerequisites() -> None:
-    """Thirteen separately-configured things, said out loud.
+    """Fifteen separately-configured things, said out loud.
 
     A quickstart that works locally and strands a reader at step nine is the
     documentation failure this page exists to avoid, and the honest count is
@@ -279,8 +279,8 @@ def test_the_install_page_still_states_the_real_number_of_prerequisites() -> Non
     install = (DOCS / "install.md").read_text(encoding="utf-8")
     rows = [line for line in install.splitlines() if re.match(r"^\| \d+ \|", line)]
 
-    assert len(rows) == 13
-    assert "thirteen" in install.lower()
+    assert len(rows) == 15
+    assert "fifteen" in install.lower()
 
 
 def test_the_proofs_page_states_a_criterion_and_a_shape_for_each_run() -> None:

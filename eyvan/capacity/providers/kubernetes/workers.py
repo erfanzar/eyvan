@@ -37,6 +37,7 @@ readable too.
 from __future__ import annotations
 
 import hashlib
+import re
 import typing as tp
 
 from eyvan._internal.json_types import JsonObject
@@ -47,14 +48,45 @@ from eyvan._internal.json_types import JsonObject
 #: truncation rule that could collide differently.
 MAX_OBJECT_NAME = 63
 
-#: Label carrying the Eyvan cell a Job belongs to. The Kueue precondition check
-#: reads it to prove every Workload in a ClusterQueue is Eyvan's.
+#: NetworkPolicy grant required for a worker to redeem its token and exchange
+#: managed artifacts, results, and progress with the control plane.
+API_CLIENT_LABEL = "eyvan.dev/api-client"
+#: Label carrying a Kubernetes-safe token for the Eyvan cell. The complete
+#: cell ID is retained separately as an annotation because label values are
+#: limited to 63 characters while valid Eyvan cell IDs can reach 96.
 CELL_LABEL = "eyvan.dev/cell-id"
+CELL_ID_ANNOTATION = "eyvan.dev/full-cell-id"
 GENERATION_LABEL = "eyvan.dev/provider-generation"
 #: Annotation carrying a *fingerprint* of the fencing token, never the token. An
 #: observed Job whose fingerprint disagrees with the durable record is a leaked
 #: previous incarnation -- the role ``management_uid`` plays on GCP.
 FENCE_ANNOTATION = "eyvan.dev/fence-fingerprint"
+_IMMUTABLE_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_KUBERNETES_LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+
+
+def cell_label_value(cell_id: str) -> str:
+    """Return a deterministic Kubernetes label value for a complete cell ID.
+
+    Existing short, valid IDs retain their readable spelling. Long or otherwise
+    invalid values use 232 bits of SHA-256 under a fixed prefix, which is both
+    label-safe and collision-resistant. The unhashed ID remains authoritative in
+    :data:`CELL_ID_ANNOTATION`.
+    """
+
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("Kubernetes capacity cell_id must be a non-empty string")
+    if len(cell_id) <= 63 and _KUBERNETES_LABEL_VALUE.fullmatch(cell_id) is not None:
+        return cell_id
+    return f"cell-{hashlib.sha256(cell_id.encode()).hexdigest()[:58]}"
+
+
+def require_immutable_worker_image(image: str) -> str:
+    """Return a qualified worker image or reject mutable tags and malformed refs."""
+
+    if not isinstance(image, str) or _IMMUTABLE_IMAGE.fullmatch(image) is None:
+        raise ValueError("Kubernetes native worker image must be repository@sha256:<64 lowercase hex characters>")
+    return image
 
 
 def object_name(prefix: str, cell_id: str) -> str:
@@ -96,14 +128,19 @@ def headless_service_manifest(cell_id: str, namespace: str) -> JsonObject:
     return {
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": name, "namespace": namespace, "labels": {CELL_LABEL: cell_id}},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {CELL_LABEL: cell_label_value(cell_id)},
+            "annotations": {CELL_ID_ANNOTATION: cell_id},
+        },
         "spec": {
             "clusterIP": "None",
             # Published before readiness so DNS resolves while the workers are
             # still starting; the control plane decides readiness from Job status,
             # not from whether a name resolves.
             "publishNotReadyAddresses": True,
-            "selector": {CELL_LABEL: cell_id},
+            "selector": {CELL_LABEL: cell_label_value(cell_id)},
             "ports": [{"name": "native-worker", "port": 8100, "targetPort": 8100}],
         },
     }
@@ -154,8 +191,17 @@ def job_manifest(
 
     if worker_count < 1:
         raise ValueError("a Kubernetes capacity cell needs at least one worker")
+    image = require_immutable_worker_image(image)
     name = object_name("eyvan", cell_id)
-    labels = {CELL_LABEL: cell_id, GENERATION_LABEL: str(provider_generation)}
+    labels = {
+        API_CLIENT_LABEL: "true",
+        CELL_LABEL: cell_label_value(cell_id),
+        GENERATION_LABEL: str(provider_generation),
+    }
+    annotations = {
+        CELL_ID_ANNOTATION: cell_id,
+        FENCE_ANNOTATION: fence_fingerprint(fencing_token),
+    }
     if queue_name:
         labels["kueue.x-k8s.io/queue-name"] = queue_name
     if priority_class:
@@ -163,11 +209,13 @@ def job_manifest(
     pod_spec: JsonObject = {
         "restartPolicy": "Never",
         "serviceAccountName": service_account,
+        "automountServiceAccountToken": False,
         "subdomain": name,
         "containers": [
             {
                 "name": "native-worker",
                 "image": image,
+                "imagePullPolicy": "IfNotPresent",
                 "ports": [{"name": "native-worker", "containerPort": 8100}],
                 "env": [
                     {"name": "EYVAN_CELL_ID", "value": cell_id},
@@ -206,7 +254,7 @@ def job_manifest(
             "name": name,
             "namespace": namespace,
             "labels": labels,
-            "annotations": {FENCE_ANNOTATION: fence_fingerprint(fencing_token)},
+            "annotations": annotations,
         },
         "spec": {
             "completionMode": "Indexed",
@@ -214,7 +262,7 @@ def job_manifest(
             "parallelism": worker_count,
             "backoffLimit": 0,
             **({"suspend": True} if queue_name else {}),
-            "template": {"metadata": {"labels": labels}, "spec": pod_spec},
+            "template": {"metadata": {"labels": labels, "annotations": {CELL_ID_ANNOTATION: cell_id}}, "spec": pod_spec},
         },
     }
     return manifest
@@ -235,7 +283,8 @@ def secret_manifest(cell_id: str, namespace: str, token: str) -> JsonObject:
         "metadata": {
             "name": object_name("eyvan-token", cell_id),
             "namespace": namespace,
-            "labels": {CELL_LABEL: cell_id},
+            "labels": {CELL_LABEL: cell_label_value(cell_id)},
+            "annotations": {CELL_ID_ANNOTATION: cell_id},
         },
         "type": "Opaque",
         "stringData": {"token": token},
@@ -243,14 +292,18 @@ def secret_manifest(cell_id: str, namespace: str, token: str) -> JsonObject:
 
 
 __all__ = (
+    "API_CLIENT_LABEL",
+    "CELL_ID_ANNOTATION",
     "CELL_LABEL",
     "FENCE_ANNOTATION",
     "GENERATION_LABEL",
     "MAX_OBJECT_NAME",
+    "cell_label_value",
     "fence_fingerprint",
     "headless_service_manifest",
     "job_manifest",
     "object_name",
+    "require_immutable_worker_image",
     "secret_manifest",
     "worker_endpoints",
 )

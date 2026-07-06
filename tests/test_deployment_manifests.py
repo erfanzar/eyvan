@@ -86,6 +86,13 @@ def test_the_agent_liveness_threshold_tolerates_a_long_provider_call() -> None:
     assert probe["failureThreshold"] * probe["periodSeconds"] >= 60
 
 
+def test_the_cell_agent_has_one_nonoverlapping_fleet_owner() -> None:
+    deployment = _kind("cell-agent.yaml", "Deployment")
+
+    assert deployment["spec"]["replicas"] == 1
+    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+
+
 # --------------------------------------------------------------------------- hardening
 
 
@@ -132,9 +139,9 @@ def test_a_read_only_root_still_leaves_a_writable_tmp() -> None:
 def test_the_network_policy_does_not_blanket_allow_the_api_port() -> None:
     """``/metrics`` exports every tenant's spend, labeled by org and project.
 
-    It is authenticated by a scrape token an operator may not have configured,
-    and this is the layer that holds when they have not. A rule with an empty
-    ``from`` allows the entire cluster and would silently undo that.
+    It is authenticated by a required scrape token, and the NetworkPolicy limits
+    which workloads can present that credential. A rule with an empty ``from``
+    allows the entire cluster and would silently undo that defense in depth.
     """
 
     policy = _kind("control-plane.yaml", "NetworkPolicy")
@@ -166,11 +173,49 @@ def test_reaching_the_api_requires_an_explicit_label() -> None:
     )
 
 
-def test_scraping_and_api_access_are_separate_grants() -> None:
-    """Neither should confer the other.
+def test_api_ingress_ands_namespace_and_pod_for_cross_namespace_clients() -> None:
+    policy = _kind("control-plane.yaml", "NetworkPolicy")
+    api_rule = next(
+        rule
+        for rule in policy["spec"]["ingress"]
+        if any(
+            peer.get("podSelector", {}).get("matchLabels", {}).get("eyvan.dev/api-client") == "true"
+            for peer in rule["from"]
+        )
+    )
 
-    A Prometheus that can call the API, or a client that can read every tenant's
-    spend, are both larger grants than anyone intended to make.
+    assert api_rule["from"] == [
+        {"podSelector": {"matchLabels": {"eyvan.dev/api-client": "true"}}},
+        {
+            "namespaceSelector": {"matchLabels": {"eyvan.dev/api-client": "true"}},
+            "podSelector": {"matchLabels": {"eyvan.dev/api-client": "true"}},
+        },
+    ]
+    assert not any(set(peer) == {"namespaceSelector"} for rule in policy["spec"]["ingress"] for peer in rule["from"])
+
+
+def test_dynamic_kubernetes_workers_receive_the_api_client_grant() -> None:
+    from eyvan.capacity.providers.kubernetes.workers import API_CLIENT_LABEL, job_manifest
+
+    manifest = job_manifest(
+        cell_id="cell-a",
+        namespace="worker-ns",
+        image="registry.example/worker@sha256:" + "a" * 64,
+        worker_count=1,
+        provider_generation=1,
+        fencing_token="fence",
+        resources={"cpu": "1"},
+    )
+
+    pod_labels = manifest["spec"]["template"]["metadata"]["labels"]
+    assert pod_labels[API_CLIENT_LABEL] == "true"
+
+
+def test_scraping_and_api_paths_keep_distinct_network_selectors() -> None:
+    """The selectors remain defense in depth even though both paths use TCP 8080.
+
+    NetworkPolicy cannot authorize an HTTP path; API and metrics credentials do
+    that. Distinct pod labels still avoid granting the socket to unrelated pods.
     """
 
     policy = _kind("control-plane.yaml", "NetworkPolicy")
@@ -183,6 +228,130 @@ def test_scraping_and_api_access_are_separate_grants() -> None:
 
     assert frozenset({("eyvan.dev/api-client", "true")}) in labels
     assert frozenset({("eyvan.dev/metrics-scraper", "true")}) in labels
+
+
+# --------------------------------------------------------------------------- startup prerequisites
+
+
+def test_the_raw_control_plane_receives_the_required_metrics_token() -> None:
+    """A network-bound server refuses to start without this exact setting."""
+
+    environment = {item["name"]: item for item in _container("control-plane.yaml")["env"]}
+
+    assert environment["EYVAN_METRICS_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "eyvan-secrets",
+        "key": "metrics-token",
+    }
+
+
+def test_raw_dashboard_client_id_is_non_secret_runtime_configuration() -> None:
+    environment = {item["name"]: item for item in _container("control-plane.yaml")["env"]}
+
+    client_id = environment["EYVAN_OIDC_DASHBOARD_CLIENT_ID"]
+    assert client_id["value"] == "eyvan-dashboard"
+    assert "valueFrom" not in client_id
+
+
+def test_the_raw_agent_is_a_distinct_image_and_entrypoint_with_its_root_secret() -> None:
+    """The control-plane entrypoint starts the wrong process and cannot bootstrap workers."""
+
+    control = _container("control-plane.yaml")
+    agent = _container("cell-agent.yaml")
+    environment = {item["name"]: item for item in agent["env"]}
+
+    assert agent["image"] != control["image"]
+    assert agent["command"] == ["eyvan-agent"]
+    assert environment["EYVAN_NATIVE_WORKER_ROOT_SECRET"]["valueFrom"]["secretKeyRef"] == {
+        "name": "eyvan-agent-secrets",
+        "key": "native-worker-root-secret",
+    }
+    assert environment["EYVAN_CAPACITY_BACKEND"]["value"] == "gcp"
+    for artifact in ("PACKAGE", "WHEELHOUSE"):
+        assert environment[f"EYVAN_NATIVE_WORKER_{artifact}_SHA256"]["value"] == ("REPLACE_WITH_64_LOWERCASE_HEX_SHA256")
+        assert environment[f"EYVAN_NATIVE_WORKER_{artifact}_GENERATION"]["value"] == ("REPLACE_WITH_GCS_GENERATION")
+
+
+def test_raw_image_markers_require_registry_digests_without_fabricating_one() -> None:
+    """Qualification must replace an obvious marker, never accidentally deploy `latest`."""
+
+    control = _container("control-plane.yaml")["image"]
+    agent = _container("cell-agent.yaml")["image"]
+    migration = _kind("migration-job.yaml", "Job")["spec"]["template"]["spec"]["containers"][0]["image"]
+
+    assert control == migration
+    assert agent != control
+    for image in (control, agent, migration):
+        assert ":latest" not in image
+        assert image.endswith("@sha256:REPLACE_WITH_PUBLISHED_DIGEST")
+
+
+def test_raw_prerequisites_exist_before_the_migration_and_deployments() -> None:
+    prerequisites = _documents("prerequisites.yaml")
+    prerequisite_kinds = [document["kind"] for document in prerequisites]
+
+    assert prerequisite_kinds == ["Namespace", "ConfigMap", "ServiceAccount", "ServiceAccount"]
+    assert {document["metadata"]["name"] for document in prerequisites if document["kind"] == "ServiceAccount"} == {
+        "eyvan-control-plane",
+        "eyvan-cell-agent",
+    }
+    assert not any(
+        document["kind"] in {"Namespace", "ConfigMap", "ServiceAccount"} for document in _documents("control-plane.yaml")
+    )
+    assert not any(document["kind"] == "ServiceAccount" for document in _documents("cell-agent.yaml"))
+    assert _kind("migration-job.yaml", "Job")["spec"]["template"]["spec"]["serviceAccountName"] == (
+        "eyvan-control-plane"
+    )
+
+
+def test_raw_control_plane_ksa_documents_its_gcs_workload_identity() -> None:
+    accounts = {
+        document["metadata"]["name"]: document
+        for document in _documents("prerequisites.yaml")
+        if document["kind"] == "ServiceAccount"
+    }
+
+    assert accounts["eyvan-control-plane"]["metadata"]["annotations"] == {
+        "iam.gke.io/gcp-service-account": "eyvan-control-plane@PROJECT_ID.iam.gserviceaccount.com"
+    }
+    assert accounts["eyvan-cell-agent"]["metadata"]["annotations"] == {
+        "iam.gke.io/gcp-service-account": "eyvan-cell-agent@PROJECT_ID.iam.gserviceaccount.com"
+    }
+
+
+def test_raw_platform_config_is_mounted_read_only_at_the_server_default() -> None:
+    config = _kind("prerequisites.yaml", "ConfigMap")
+    container = _container("control-plane.yaml")
+    mounts = {mount["name"]: mount for mount in container["volumeMounts"]}
+    volumes = {volume["name"]: volume for volume in _pod("control-plane.yaml")["volumes"]}
+
+    assert "platform.yaml" in config["data"]
+    assert mounts["platform-config"] == {
+        "name": "platform-config",
+        "mountPath": "/etc/eyvan/platform.yaml",
+        "subPath": "platform.yaml",
+        "readOnly": True,
+    }
+    assert volumes["platform-config"]["configMap"]["name"] == "eyvan-platform"
+
+
+def test_install_document_requires_a_rollout_after_raw_identity_or_config_changes() -> None:
+    install = (DEPLOY.parent / "docs" / "install.md").read_text(encoding="utf-8")
+
+    assert "platform ConfigMap does not restart" in install
+    assert "ServiceAccount annotation" in install
+    assert "changing the `eyvan-control-plane` WIF annotation" in install
+    assert "rollout restart deployment/eyvan-control-plane deployment/eyvan-cell-agent" in install
+
+
+def test_install_document_waits_for_raw_migration_before_deployments() -> None:
+    install = (DEPLOY.parent / "docs" / "install.md").read_text(encoding="utf-8")
+
+    prerequisites = install.index("kubectl apply -f deploy/prerequisites.yaml")
+    migration = install.index("kubectl apply -f deploy/migration-job.yaml")
+    wait = install.index("--for=condition=complete")
+    agent = install.index("kubectl apply -f deploy/cell-agent.yaml")
+    control = install.index("kubectl apply -f deploy/control-plane.yaml")
+    assert prerequisites < migration < wait < agent < control
 
 
 # --------------------------------------------------------------------------- availability
@@ -216,7 +385,7 @@ def test_the_disruption_budget_selects_the_deployment_it_protects() -> None:
 # --------------------------------------------------------------------------- shape
 
 
-@pytest.mark.parametrize("name", ["control-plane.yaml", "cell-agent.yaml", "migration-job.yaml"])
+@pytest.mark.parametrize("name", ["prerequisites.yaml", "control-plane.yaml", "cell-agent.yaml", "migration-job.yaml"])
 def test_every_shipped_manifest_parses(name: str) -> None:
     """A manifest that does not parse fails at ``kubectl apply``, mid-deploy.
 

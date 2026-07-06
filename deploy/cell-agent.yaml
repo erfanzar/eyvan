@@ -1,20 +1,17 @@
-# Deploy one agent in each network/project boundary and replace the placeholder
-# values for the target cell fleet. Production ingress should enforce mTLS.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: eyvan-cell-agent
-  namespace: eyvan-system
-  annotations:
-    iam.gke.io/gcp-service-account: eyvan-cell-agent@PROJECT_ID.iam.gserviceaccount.com
----
+# Apply deploy/prerequisites.yaml first. Deploy one agent in each network/project
+# boundary and replace the placeholder values for the target fleet. Production
+# ingress should enforce mTLS.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: eyvan-cell-agent
   namespace: eyvan-system
 spec:
+  # A one-replica RollingUpdate still overlaps old and new fleet owners. Recreate
+  # stops the old owner before the replacement starts against the same GCS object.
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: eyvan-cell-agent
@@ -26,7 +23,9 @@ spec:
       serviceAccountName: eyvan-cell-agent
       containers:
         - name: agent
-          image: eyvan-agent:latest
+          # Built from Dockerfile.agent, not the control-plane Dockerfile.
+          # Replace the marker with the registry-reported digest after publishing.
+          image: REGISTRY/eyvan-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST
           command: ["eyvan-agent"]
           args: ["--host", "0.0.0.0", "--port", "8090"]
           ports:
@@ -54,9 +53,18 @@ spec:
             - name: EYVAN_NATIVE_WORKER_PACKAGE
               # A pinned Eyvan wheel reachable by each worker VM.
               value: gs://replace-with-artifact-bucket/eyvan/eyvan-0.1.0-py3-none-any.whl
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_SHA256
+              value: REPLACE_WITH_64_LOWERCASE_HEX_SHA256
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_GENERATION
+              # Pin the immutable GCS object generation reported after upload.
+              value: "REPLACE_WITH_GCS_GENERATION"
             - name: EYVAN_NATIVE_WORKER_WHEELHOUSE
               # Required for private-google-access workers: a zip of all dependency wheels.
               value: gs://replace-with-artifact-bucket/eyvan/eyvan-wheelhouse.zip
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256
+              value: REPLACE_WITH_64_LOWERCASE_HEX_SHA256
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION
+              value: "REPLACE_WITH_GCS_GENERATION"
           readinessProbe:
             httpGet:
               path: /healthz

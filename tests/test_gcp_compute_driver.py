@@ -19,6 +19,8 @@ from eyvan.config import EyvanSettings
 from eyvan.worker.agent.service import CellAgentService
 from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
 
+_SHA256 = "a" * 64
+
 
 def metadata_object(record: FleetCellRecord, name: str) -> JsonObject:
     value = record.metadata[name]
@@ -226,7 +228,9 @@ def test_compute_native_worker_bootstrap_is_cell_scoped_and_uses_the_selected_wh
         execution_backend="eyvan-native",
         native_worker_port=8123,
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        native_worker_wheelhouse_sha256=_SHA256,
         native_worker_state_dir="/var/lib/eyvan/worker",
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
@@ -281,6 +285,7 @@ def test_compute_bootstrap_fences_a_missing_record_before_provider_capacity(tmp_
         provider=provider,
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
         native_worker_service_account_resolver=FakeNativeWorkerServiceAccountResolver(),
@@ -334,7 +339,9 @@ def test_compute_recreation_fences_record_loss_and_cleans_up_owned_resources(tmp
         provider=provider,
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        native_worker_wheelhouse_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
         native_worker_service_account_resolver=FakeNativeWorkerServiceAccountResolver(),
@@ -367,7 +374,9 @@ def test_compute_native_worker_uses_default_service_account_when_omitted(tmp_pat
         provider=FakeProvider(),
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        native_worker_wheelhouse_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
         native_worker_service_account_resolver=accounts,
@@ -397,6 +406,7 @@ def test_profile_managed_public_compute_ingress_precedes_capacity_and_adds_its_t
         provider=provider,
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=FakeNativeWorkerSecrets(),
         native_worker_service_account_resolver=FakeNativeWorkerServiceAccountResolver(),
@@ -432,6 +442,7 @@ def test_native_tpu_worker_configures_profile_artifact_access_before_capacity_pr
         provider=provider,
         execution_backend="eyvan-native",
         native_worker_package="gs://eyvan-artifacts/eyvan/eyvan-0.1.0-py3-none-any.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
         native_worker_service_account_resolver=accounts,
@@ -468,6 +479,7 @@ def test_native_tpu_worker_does_not_request_capacity_when_artifact_access_cannot
         provider=provider,
         execution_backend="eyvan-native",
         native_worker_package="gs://eyvan-artifacts/eyvan/eyvan-0.1.0-py3-none-any.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=secrets,
         native_worker_service_account_resolver=FakeNativeWorkerServiceAccountResolver(),
@@ -496,7 +508,9 @@ def test_compute_runtime_vm_image_and_setup_are_compiled_without_provider_option
         provider=FakeProvider(),
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        native_worker_wheelhouse_sha256=_SHA256,
         native_worker_shared_secret="agent-global-secret",
         native_worker_secrets=FakeNativeWorkerSecrets(),
     )
@@ -532,6 +546,7 @@ def test_private_google_access_requires_an_offline_native_worker_wheelhouse(tmp_
         provider=FakeProvider(),
         execution_backend="eyvan-native",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="native-worker-root-secret",
         native_worker_secrets=FakeNativeWorkerSecrets(),
     )
@@ -656,7 +671,9 @@ def test_compute_recreation_clears_a_stale_native_worker_endpoint(tmp_path) -> N
         execution_backend="eyvan-native",
         native_worker_shared_secret="agent-global-secret",
         native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
         native_worker_wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        native_worker_wheelhouse_sha256=_SHA256,
         native_worker_secrets=secrets,
     )
     driver.apply_capacity("cell", {**compute_desired(), "executor": "eyvan-native"}, context("create"))
@@ -789,6 +806,7 @@ def _native_driver(tmp_path, package: str) -> GcpTpuCapacityDriver:
         provider=FakeProvider(),
         execution_backend="eyvan-native",
         native_worker_package=package,
+        native_worker_package_sha256=_SHA256,
         native_worker_shared_secret="native-worker-root-secret",
         native_worker_secrets=FakeNativeWorkerSecrets(),
     )

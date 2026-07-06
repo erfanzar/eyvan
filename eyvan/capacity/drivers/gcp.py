@@ -180,7 +180,11 @@ class GcpTpuCapacityDriver:
         execution_backend: str | None = None,
         native_worker_port: int | None = None,
         native_worker_package: str | None = None,
+        native_worker_package_sha256: str | None = None,
+        native_worker_package_generation: str | None = None,
         native_worker_wheelhouse: str | None = None,
+        native_worker_wheelhouse_sha256: str | None = None,
+        native_worker_wheelhouse_generation: str | None = None,
         native_worker_state_dir: str | None = None,
         native_worker_shared_secret: str | None = None,
         native_worker_secrets: NativeWorkerSecretStore | None = None,
@@ -195,7 +199,17 @@ class GcpTpuCapacityDriver:
         self.execution_backend = canonical_execution_backend(execution_backend or settings.execution_backend)
         self.native_worker_port = native_worker_port if native_worker_port is not None else settings.native_worker_port
         self.native_worker_package = native_worker_package or settings.native_worker_package
+        self.native_worker_package_sha256 = native_worker_package_sha256 or settings.native_worker_package_sha256
+        self.native_worker_package_generation = (
+            native_worker_package_generation or settings.native_worker_package_generation
+        )
         self.native_worker_wheelhouse = native_worker_wheelhouse or settings.native_worker_wheelhouse
+        self.native_worker_wheelhouse_sha256 = (
+            native_worker_wheelhouse_sha256 or settings.native_worker_wheelhouse_sha256
+        )
+        self.native_worker_wheelhouse_generation = (
+            native_worker_wheelhouse_generation or settings.native_worker_wheelhouse_generation
+        )
         self.native_worker_state_dir = native_worker_state_dir or settings.native_worker_state_dir
         self.native_worker_shared_secret = (
             native_worker_shared_secret
@@ -708,13 +722,22 @@ class GcpTpuCapacityDriver:
         wheel for an entire day, and a "fix" that had been verified in the
         package was simply not on the machine.
 
-        Including the package URI makes a re-stage invalidate the bootstrap, so
-        the next reconcile rewrites the script. The URI is content-addressed, so
-        identical code produces an identical key and nothing churns.
+        The identity includes both artifact URIs, their verified content hashes,
+        and any GCS generation pins. Changing any supplied byte source rewrites
+        the script, while identical qualified artifacts do not churn the host.
         """
 
-        package = self.native_worker_package or ""
-        return f"{record.provider_generation}:{hashlib.sha256(package.encode()).hexdigest()[:16]}"
+        identity = "|".join(
+            (
+                self.native_worker_package or "",
+                self.native_worker_package_sha256 or "",
+                self.native_worker_package_generation or "",
+                self.native_worker_wheelhouse or "",
+                self.native_worker_wheelhouse_sha256 or "",
+                self.native_worker_wheelhouse_generation or "",
+            )
+        )
+        return f"{record.provider_generation}:{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
 
     def _finalize_provider_config(self, cell_id: str, context: MutationContext) -> None:
         """Finish any provider setup that must run outside durable-state CAS callbacks."""
@@ -887,7 +910,7 @@ class GcpTpuCapacityDriver:
         if not isinstance(self.native_worker_package, str) or not self.native_worker_package.strip():
             raise ValueError(
                 "eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_PACKAGE; "
-                "use a pinned gs:// wheel until Eyvan is released"
+                "use a gs:// wheel with its SHA-256 and object generation"
             )
         if not isinstance(record.project, str) or not record.project:
             raise ValueError("native TPU bootstrap requires a GCP project")
@@ -913,7 +936,7 @@ class GcpTpuCapacityDriver:
             if not self.native_worker_package.startswith("gs://"):
                 raise ValueError(
                     "private-google-access native TPU bootstrap requires "
-                    "EYVAN_NATIVE_WORKER_PACKAGE to be a pinned gs:// wheel"
+                    "EYVAN_NATIVE_WORKER_PACKAGE to be a verified gs:// wheel"
                 )
             if not isinstance(self.native_worker_wheelhouse, str) or not self.native_worker_wheelhouse.strip():
                 raise ValueError(
@@ -944,10 +967,14 @@ class GcpTpuCapacityDriver:
         )
         config["startup_script"] = build_native_worker_startup_script(
             package=self.native_worker_package,
+            package_sha256=self.native_worker_package_sha256,
+            package_generation=self.native_worker_package_generation,
             port=self.native_worker_port,
             state_dir=self.native_worker_state_dir,
             worker_secret_resource=secret_resource,
             wheelhouse=wheelhouse,
+            wheelhouse_sha256=self.native_worker_wheelhouse_sha256,
+            wheelhouse_generation=self.native_worker_wheelhouse_generation,
             before_start=before_start,
             runtime_setup=runtime_setup,
             runtime_env=runtime_env,
@@ -1082,7 +1109,11 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         execution_backend: str | None = None,
         native_worker_port: int | None = None,
         native_worker_package: str | None = None,
+        native_worker_package_sha256: str | None = None,
+        native_worker_package_generation: str | None = None,
         native_worker_wheelhouse: str | None = None,
+        native_worker_wheelhouse_sha256: str | None = None,
+        native_worker_wheelhouse_generation: str | None = None,
         native_worker_state_dir: str | None = None,
         native_worker_shared_secret: str | None = None,
         native_worker_secrets: NativeWorkerSecretStore | None = None,
@@ -1097,7 +1128,11 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             execution_backend=execution_backend,
             native_worker_port=native_worker_port,
             native_worker_package=native_worker_package,
+            native_worker_package_sha256=native_worker_package_sha256,
+            native_worker_package_generation=native_worker_package_generation,
             native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_wheelhouse_sha256=native_worker_wheelhouse_sha256,
+            native_worker_wheelhouse_generation=native_worker_wheelhouse_generation,
             native_worker_state_dir=native_worker_state_dir,
             native_worker_shared_secret=native_worker_shared_secret,
             native_worker_secrets=native_worker_secrets,
@@ -1243,7 +1278,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         if not isinstance(self.native_worker_package, str) or not self.native_worker_package.strip():
             raise ValueError(
                 "eyvan-native Compute capacity requires EYVAN_NATIVE_WORKER_PACKAGE; "
-                "use a pinned gs:// wheel until Eyvan is released"
+                "use a gs:// wheel with its SHA-256 and object generation"
             )
         if not isinstance(record.project, str) or not record.project:
             raise ValueError("native worker bootstrap requires a GCP project")
@@ -1269,7 +1304,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             if not self.native_worker_package.startswith("gs://"):
                 raise ValueError(
                     "private-google-access native bootstrap requires "
-                    "EYVAN_NATIVE_WORKER_PACKAGE to be a pinned gs:// wheel"
+                    "EYVAN_NATIVE_WORKER_PACKAGE to be a verified gs:// wheel"
                 )
             if not isinstance(self.native_worker_wheelhouse, str) or not self.native_worker_wheelhouse.strip():
                 raise ValueError(
@@ -1301,10 +1336,14 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         )
         config["startup_script"] = build_native_worker_startup_script(
             package=self.native_worker_package,
+            package_sha256=self.native_worker_package_sha256,
+            package_generation=self.native_worker_package_generation,
             port=self.native_worker_port,
             state_dir=self.native_worker_state_dir,
             worker_secret_resource=secret_resource,
             wheelhouse=wheelhouse,
+            wheelhouse_sha256=self.native_worker_wheelhouse_sha256,
+            wheelhouse_generation=self.native_worker_wheelhouse_generation,
             before_start=before_start,
             runtime_setup=runtime_setup,
             runtime_env=runtime_env,
@@ -1392,7 +1431,11 @@ class GcpCapacityDriver:
         execution_backend: str | None = None,
         native_worker_port: int | None = None,
         native_worker_package: str | None = None,
+        native_worker_package_sha256: str | None = None,
+        native_worker_package_generation: str | None = None,
         native_worker_wheelhouse: str | None = None,
+        native_worker_wheelhouse_sha256: str | None = None,
+        native_worker_wheelhouse_generation: str | None = None,
         native_worker_state_dir: str | None = None,
         native_worker_shared_secret: str | None = None,
         native_worker_secrets: NativeWorkerSecretStore | None = None,
@@ -1417,7 +1460,11 @@ class GcpCapacityDriver:
             execution_backend=selected_execution,
             native_worker_port=native_worker_port,
             native_worker_package=native_worker_package,
+            native_worker_package_sha256=native_worker_package_sha256,
+            native_worker_package_generation=native_worker_package_generation,
             native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_wheelhouse_sha256=native_worker_wheelhouse_sha256,
+            native_worker_wheelhouse_generation=native_worker_wheelhouse_generation,
             native_worker_state_dir=native_worker_state_dir,
             native_worker_shared_secret=native_worker_shared_secret,
             native_worker_secrets=native_worker_secrets,
@@ -1432,7 +1479,11 @@ class GcpCapacityDriver:
             execution_backend=selected_execution,
             native_worker_port=native_worker_port,
             native_worker_package=native_worker_package,
+            native_worker_package_sha256=native_worker_package_sha256,
+            native_worker_package_generation=native_worker_package_generation,
             native_worker_wheelhouse=native_worker_wheelhouse,
+            native_worker_wheelhouse_sha256=native_worker_wheelhouse_sha256,
+            native_worker_wheelhouse_generation=native_worker_wheelhouse_generation,
             native_worker_state_dir=native_worker_state_dir,
             native_worker_shared_secret=native_worker_shared_secret,
             native_worker_secrets=native_worker_secrets,

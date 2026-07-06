@@ -94,6 +94,21 @@ def test_from_env_accepts_each_documented_repository_backend(monkeypatch: pytest
         assert EyvanSettings.from_env().repository_backend is backend
 
 
+def test_from_env_carries_native_bootstrap_integrity_and_generation_pins(monkeypatch: pytest.MonkeyPatch) -> None:
+    digest = "a" * 64
+    monkeypatch.setenv("EYVAN_NATIVE_WORKER_PACKAGE_SHA256", digest)
+    monkeypatch.setenv("EYVAN_NATIVE_WORKER_PACKAGE_GENERATION", "123")
+    monkeypatch.setenv("EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256", digest)
+    monkeypatch.setenv("EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION", "456")
+
+    settings = EyvanSettings.from_env()
+
+    assert settings.native_worker_package_sha256 == digest
+    assert settings.native_worker_package_generation == "123"
+    assert settings.native_worker_wheelhouse_sha256 == digest
+    assert settings.native_worker_wheelhouse_generation == "456"
+
+
 def test_from_env_rejects_a_non_numeric_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EYVAN_LEASE_TTL_S", "soon")
 

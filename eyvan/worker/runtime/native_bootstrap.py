@@ -123,40 +123,106 @@ def render_native_runtime_setup(runtime: NativeRuntimeConfig) -> str | None:
     return "\n".join(lines)
 
 
-def _install_command(package: str, *, python: str, wheelhouse: str | None = None) -> str:
-    """Return an install command for a package spec or GCS wheel URI."""
+def _sha256(value: str | None, name: str, *, required: bool) -> str | None:
+    """Validate a lowercase SHA-256 used by a bootstrap integrity check."""
+
+    if value is None:
+        if required:
+            raise ValueError(f"native worker {name} SHA-256 is required")
+        return None
+    normalized = _required(value, f"{name} SHA-256")
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise ValueError(f"native worker {name} SHA-256 must be 64 lowercase hexadecimal characters")
+    return normalized
+
+
+def _content_address_from_uri(uri: str) -> str | None:
+    """Infer the digest from ``.../<sha256>/<filename>`` staging layouts."""
+
+    segments = uri.split("#", 1)[0].rstrip("/").split("/")
+    if len(segments) < 2:
+        return None
+    candidate = segments[-2]
+    return candidate if re.fullmatch(r"[0-9a-f]{64}", candidate) else None
+
+
+def _gcs_source(uri: str, generation: str | None, name: str) -> str:
+    """Return a generation-qualified GCS URI when the operator supplied one."""
+
+    if generation is None:
+        return uri
+    normalized = _required(generation, f"{name} GCS generation")
+    if not uri.startswith("gs://"):
+        raise ValueError(f"native worker {name} generation is supported only for gs:// artifacts")
+    if "#" in uri:
+        raise ValueError(f"native worker {name} URI must not include a generation fragment twice")
+    if re.fullmatch(r"[1-9][0-9]*", normalized) is None:
+        raise ValueError(f"native worker {name} GCS generation must be a positive decimal integer")
+    return f"{uri}#{normalized}"
+
+
+def _verify_sha256(path: str, digest: str, name: str) -> tuple[str, ...]:
+    """Render a fail-closed SHA-256 check before an artifact is consumed."""
+
+    record = shlex.quote(f"{digest}  {path}")
+    return (
+        "command -v sha256sum >/dev/null 2>&1 || "
+        f"{{ echo 'Eyvan {name} verification requires sha256sum' >&2; exit 1; }}",
+        f"printf '%s\n' {record} | sha256sum --check --strict -",
+    )
+
+
+def _install_command(
+    package: str,
+    *,
+    python: str,
+    package_sha256: str | None = None,
+    package_generation: str | None = None,
+    wheelhouse: str | None = None,
+    wheelhouse_sha256: str | None = None,
+    wheelhouse_generation: str | None = None,
+) -> str:
+    """Return an install command with verified wheel and wheelhouse content."""
 
     quoted = shlex.quote(package)
     wheelhouse_lines: tuple[str, ...] = ()
     pip_flags = "--no-cache-dir --upgrade"
     if wheelhouse is not None:
-        quoted_wheelhouse = shlex.quote(wheelhouse)
+        expected_wheelhouse = _sha256(wheelhouse_sha256, "wheelhouse", required=True)
+        assert expected_wheelhouse is not None
+        wheelhouse_source = _gcs_source(wheelhouse, wheelhouse_generation, "wheelhouse")
+        wheelhouse_path = "/var/lib/eyvan/bootstrap/wheelhouse.zip"
         wheelhouse_lines = (
-            f"gcloud storage cp {quoted_wheelhouse} /var/lib/eyvan/bootstrap/wheelhouse.zip",
+            f"gcloud storage cp {shlex.quote(wheelhouse_source)} {wheelhouse_path}",
+            *_verify_sha256(wheelhouse_path, expected_wheelhouse, "wheelhouse"),
             "rm -rf /var/lib/eyvan/bootstrap/wheels",
             "mkdir -p /var/lib/eyvan/bootstrap/wheels",
-            f"{python} -m zipfile -e /var/lib/eyvan/bootstrap/wheelhouse.zip /var/lib/eyvan/bootstrap/wheels",
+            f"{python} -m zipfile -e {wheelhouse_path} /var/lib/eyvan/bootstrap/wheels",
         )
         pip_flags = "--no-cache-dir --no-index --find-links /var/lib/eyvan/bootstrap/wheels --upgrade"
+    elif wheelhouse_sha256 is not None or wheelhouse_generation is not None:
+        raise ValueError("native worker wheelhouse digest/generation requires a wheelhouse URI")
     if package.startswith("gs://"):
-        wheel_name = package.rsplit("/", 1)[-1]
+        wheel_name = package.split("#", 1)[0].rsplit("/", 1)[-1]
         if not wheel_name.endswith(".whl") or wheel_name == ".whl":
             raise ValueError("native worker GCS package must name a .whl file")
+        expected_package = _sha256(
+            package_sha256 or _content_address_from_uri(package),
+            "package",
+            required=True,
+        )
+        assert expected_package is not None
+        package_source = _gcs_source(package, package_generation, "package")
         wheel_path = f"/var/lib/eyvan/bootstrap/{wheel_name}"
         quoted_wheel_path = shlex.quote(wheel_path)
-        # `--force-reinstall`, because the *URI* is content-addressed but the
-        # wheel's filename and version are not. `pip install --upgrade` on a
-        # direct path short-circuits when that version is already installed, so a
-        # rebuilt wheel at an unchanged version leaves the old package in place --
-        # while the sitecustomize heredoc below is rewritten every bootstrap.
-        # That skew is silent: Python swallows sitecustomize exceptions, so the
-        # host boots with the distributed-topology scrub never running. Observed
-        # live on 2026-08-01: "ImportError: cannot import name
-        # 'initialize_worker_runtime' from 'eyvan_multihost'" on a v5p-16 host.
+        # `--force-reinstall`, because a verified/content-addressed object may
+        # retain the same wheel filename and version. Ordinary --upgrade would
+        # silently keep an earlier build already installed on the VM.
         return "\n".join(
             (
                 "mkdir -p /var/lib/eyvan/bootstrap",
-                f"gcloud storage cp {quoted} {quoted_wheel_path}",
+                f"gcloud storage cp {shlex.quote(package_source)} {quoted_wheel_path}",
+                *_verify_sha256(wheel_path, expected_package, "package"),
                 *wheelhouse_lines,
                 f"{python} -m pip install {pip_flags} --force-reinstall --no-deps {quoted_wheel_path}",
                 # Dependencies are resolved separately so --force-reinstall does
@@ -164,6 +230,8 @@ def _install_command(package: str, *, python: str, wheelhouse: str | None = None
                 f"{python} -m pip install {pip_flags} {quoted_wheel_path}",
             )
         )
+    if package_sha256 is not None or package_generation is not None:
+        raise ValueError("native worker package digest/generation requires a gs:// wheel URI")
     return "\n".join((*wheelhouse_lines, f"{python} -m pip install {pip_flags} {quoted}"))
 
 
@@ -194,7 +262,11 @@ def build_native_worker_startup_script(
     port: int,
     state_dir: str,
     worker_secret_resource: str,
+    package_sha256: str | None = None,
+    package_generation: str | None = None,
     wheelhouse: str | None = None,
+    wheelhouse_sha256: str | None = None,
+    wheelhouse_generation: str | None = None,
     before_start: str | None = None,
     runtime_setup: str | None = None,
     runtime_env: tp.Mapping[str, str] | None = None,
@@ -378,7 +450,15 @@ def build_native_worker_startup_script(
             "  fi",
             f"  python3 -m venv --system-site-packages {venv_dir}",
             "fi",
-            _install_command(package, python=venv_python, wheelhouse=wheelhouse),
+            _install_command(
+                package,
+                python=venv_python,
+                package_sha256=package_sha256,
+                package_generation=package_generation,
+                wheelhouse=wheelhouse,
+                wheelhouse_sha256=wheelhouse_sha256,
+                wheelhouse_generation=wheelhouse_generation,
+            ),
             f"chmod -R a+rX {venv_dir}",
             f"install -d -m 0755 {multihost_site_directory}",
             f'multihost_module=$({venv_python} -c "import eyvan.worker.runtime._multihost_site as module; '

@@ -3,27 +3,13 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Launch the operations dashboard against the session's own control plane.
+"""Open the hosted dashboard, with a separate source-only Vite launcher.
 
-Every value the Vite dev server needs is already known to the CLI: the endpoint
-comes from ``--url`` or the saved context, the org and project come from the same
-place, the role is the one this session resolved, and the loopback credential is a
-file on disk that the browser cannot read for itself.
-
-Before this command, starting the dashboard meant exporting six variables by
-hand, and getting any of them wrong failed quietly rather than loudly:
-
-* a wrong ``EYVAN_DASHBOARD_API`` proxied to whatever owned port 8080 and
-  rendered an empty fleet, which reads as "nothing is running";
-* a missing ``VITE_EYVAN_DEV_AUTH`` made ``apiAuthHeaders()`` return ``{}``, so
-  the credential was dropped before any request and the page showed
-  "Authentication is not configured";
-* the default role is ``viewer``, and cells, pools and leases all require
-  ``manage_fleet``, so a correct setup still showed an empty Fleet page.
-
-Deliberately not a second source of truth: this reads the session and the
-existing credential file, and shells out to the package manager. It does not
-duplicate the dashboard's own configuration schema.
+The installed wheel cannot contain the repository's Node source tree. The
+ordinary ``eyvan dashboard`` command therefore has a wheel-safe contract: open
+the dashboard hosted by the configured control plane. Developers who are
+changing the frontend use ``eyvan dashboard-dev`` explicitly; that command owns
+the source lookup, npm requirement, loopback credential, and Vite environment.
 """
 
 from __future__ import annotations
@@ -44,13 +30,14 @@ DEFAULT_LOCAL_CREDENTIAL_PATH = Path("~/.eyvan/local-development-credential")
 
 
 def _dashboard_root() -> Path:
-    """Return the checked-in dashboard directory, or fail with what to do."""
+    """Return the checked-in dashboard directory for the development command."""
 
     root = Path(eyvan.__file__).resolve().parent.parent / "dashboard"
     if not (root / "package.json").is_file():
         raise click.ClickException(
             f"the Eyvan dashboard sources are not present at {root}; "
-            "this command runs the development server from a source checkout"
+            "'eyvan dashboard-dev' requires a source checkout, while "
+            "'eyvan dashboard' opens the hosted production UI"
         )
     return root
 
@@ -65,7 +52,19 @@ def _local_credential(path: Path) -> str | None:
 
 
 @click.command("dashboard")
-@click.option("--port", default=4173, show_default=True, help="Port for the dashboard dev server.")
+@click.option("--open/--no-open", "open_browser", default=True, help="Open the hosted dashboard in a browser.")
+@click.pass_obj
+def dashboard(session: CliSession, open_browser: bool) -> None:
+    """Open the dashboard hosted by the configured control plane."""
+
+    dashboard_url = f"{session.base_url.rstrip('/')}/"
+    click.echo(f"Eyvan dashboard: {dashboard_url}")
+    if open_browser:
+        click.launch(dashboard_url)
+
+
+@click.command("dashboard-dev")
+@click.option("--port", default=4173, show_default=True, help="Port for the dashboard Vite development server.")
 @click.option("--role", "role_override", help="Dashboard role; defaults to this session's role.")
 @click.option(
     "--credential-path",
@@ -74,10 +73,10 @@ def _local_credential(path: Path) -> str | None:
     show_default=True,
     help="Loopback development credential the browser cannot read itself.",
 )
-@click.option("--open/--no-open", "open_browser", default=True, help="Open the dashboard in a browser.")
-@click.option("--print-env", is_flag=True, help="Print the resolved environment and exit without starting.")
+@click.option("--open/--no-open", "open_browser", default=True, help="Open the development dashboard in a browser.")
+@click.option("--print-env", is_flag=True, help="Print the resolved Vite environment and exit without starting.")
 @click.pass_obj
-def dashboard(
+def dashboard_dev(
     session: CliSession,
     port: int,
     role_override: str | None,
@@ -85,7 +84,7 @@ def dashboard(
     open_browser: bool,
     print_env: bool,
 ) -> None:
-    """Run the operations dashboard against the active control plane."""
+    """Run the source-checkout-only Vite dashboard against this session."""
 
     root = _dashboard_root()
     roles = role_override or ",".join(session.identity.dev_roles) or "fleet_admin"
@@ -123,7 +122,7 @@ def dashboard(
     if npm is None:
         raise click.ClickException("npm is required to run the dashboard development server")
 
-    click.echo(f"Eyvan dashboard -> {session.base_url} as {roles}")
+    click.echo(f"Eyvan dashboard development server -> {session.base_url} as {roles}")
     click.echo(f"  http://localhost:{port}/")
     if open_browser:
         click.launch(f"http://localhost:{port}/")
@@ -141,9 +140,10 @@ def dashboard(
 
 
 def register_dashboard_commands(group: click.Group) -> None:
-    """Attach the dashboard command to the Eyvan CLI."""
+    """Attach hosted and source-development dashboard commands."""
 
     group.add_command(dashboard)
+    group.add_command(dashboard_dev)
 
 
-__all__ = ("dashboard", "register_dashboard_commands")
+__all__ = ("dashboard", "dashboard_dev", "register_dashboard_commands")

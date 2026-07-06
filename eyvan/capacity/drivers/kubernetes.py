@@ -42,6 +42,7 @@ Eyvan pool can sit WAITING while the cluster is full of non-Eyvan work.
 
 from __future__ import annotations
 
+import base64
 import typing as tp
 from datetime import datetime
 from threading import RLock
@@ -64,9 +65,15 @@ from eyvan.capacity.fleet_state import (
     FleetStateStore,
     StaleFenceError,
 )
-from eyvan.capacity.providers.kubernetes.api import KubernetesApi, capacity_state, interpret_job
+from eyvan.capacity.providers.kubernetes.api import JobStatus, KubernetesApi, capacity_state, interpret_job
 from eyvan.capacity.providers.kubernetes.kueue import inspect_cluster_queue
 from eyvan.capacity.providers.kubernetes.workers import (
+    API_CLIENT_LABEL,
+    CELL_ID_ANNOTATION,
+    CELL_LABEL,
+    FENCE_ANNOTATION,
+    GENERATION_LABEL,
+    cell_label_value,
     fence_fingerprint,
     headless_service_manifest,
     job_manifest,
@@ -98,7 +105,7 @@ class KubernetesCapacityDriver:
         *,
         api: KubernetesApi | None = None,
         namespace: str = "eyvan",
-        image: str = "ghcr.io/erfanzar/eyvan-native-worker:latest",
+        image: str = "",
         shared_secret: str | None = None,
     ):
         self.state = state or FleetStateStore.from_uri(None)
@@ -206,21 +213,42 @@ class KubernetesCapacityDriver:
             )
         payload = self.api.get_job(self.namespace, object_name("eyvan", cell_id))
         status = interpret_job(payload)
-        if status.exists and record.fencing_token is not None:
-            expected = fence_fingerprint(record.fencing_token)
-            if status.fence_fingerprint and status.fence_fingerprint != expected:
-                # A leaked previous incarnation. Not adopted: its workers hold a
-                # token derived from a generation this record has moved past, so
-                # anything they do is already unauthorized.
-                return self._observation(
-                    record,
-                    CapacityStatus.NEEDS_RECREATE,
-                    "a job from a previous incarnation owns this name",
-                    worker_count=status.parallelism,
-                    ready=0,
-                )
+        ownership_error = self._job_ownership_error(record, status)
+        if ownership_error is not None:
+            # Missing metadata is as unsafe as a mismatch. Adopting either would
+            # publish endpoints for a Job whose cell generation cannot be proven.
+            return self._observation(
+                record,
+                CapacityStatus.NEEDS_RECREATE,
+                ownership_error,
+                worker_count=status.parallelism,
+                ready=0,
+            )
         state, detail = capacity_state(status)
         return self._observation(record, state, detail, worker_count=status.parallelism, ready=status.ready)
+
+    def _job_ownership_error(self, record: FleetCellRecord, status: JobStatus) -> str | None:
+        """Return why an observed Job cannot be tied to the durable cell fence."""
+
+        if not status.exists:
+            return None
+        expected_fingerprint = fence_fingerprint(record.fencing_token) if isinstance(record.fencing_token, str) else ""
+        expected = (
+            status.api_version == "batch/v1"
+            and status.kind == "Job"
+            and status.name == object_name("eyvan", record.name)
+            and status.namespace == self.namespace
+            and bool(status.uid)
+            and bool(status.resource_version)
+            and status.cell_label == cell_label_value(record.name)
+            and status.cell_id_annotation == record.name
+            and status.generation_label == str(record.provider_generation)
+            and bool(expected_fingerprint)
+            and status.fence_fingerprint == expected_fingerprint
+        )
+        if expected:
+            return None
+        return "job ownership metadata is missing or does not match the durable cell fence"
 
     def _observation(
         self,
@@ -263,6 +291,431 @@ class KubernetesCapacityDriver:
 
     # ---- lifecycle ----------------------------------------------------------
 
+    @staticmethod
+    def _conflict(kind: str, detail: str) -> CapacityProviderError:
+        return CapacityProviderError(
+            f"Kubernetes {kind} conflict is not a verified Eyvan replay: {detail}",
+            code=CapacityProviderFailureCode.CONFIGURATION,
+            retryable=False,
+        )
+
+    @staticmethod
+    def _retry_reconcile(kind: str, detail: str) -> CapacityProviderError:
+        return CapacityProviderError(
+            f"Kubernetes {kind} reconciliation must be retried: {detail}",
+            code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE,
+            retryable=True,
+        )
+
+    @staticmethod
+    def _expected_subset(observed: object, expected: object) -> bool:
+        """Compare every requested field while tolerating API-server defaults."""
+
+        if isinstance(expected, dict):
+            return isinstance(observed, dict) and all(
+                key in observed and KubernetesCapacityDriver._expected_subset(observed[key], value)
+                for key, value in expected.items()
+            )
+        if isinstance(expected, list):
+            return (
+                isinstance(observed, list)
+                and len(observed) == len(expected)
+                and all(
+                    KubernetesCapacityDriver._expected_subset(actual, wanted)
+                    for actual, wanted in zip(observed, expected, strict=True)
+                )
+            )
+        return observed == expected
+
+    @classmethod
+    def _resource_identity(
+        cls,
+        payload: object,
+        desired: JsonObject,
+        kind: str,
+    ) -> tuple[JsonObject, str, str]:
+        """Validate an exact GET and return metadata plus delete preconditions."""
+
+        if not is_json_object(payload):
+            raise cls._conflict(kind, "GET returned a non-object payload")
+        expected_metadata = desired.get("metadata")
+        metadata = payload.get("metadata")
+        if not is_json_object(expected_metadata) or not is_json_object(metadata):
+            raise cls._conflict(kind, "GET omitted object metadata")
+        if payload.get("apiVersion") != desired.get("apiVersion") or payload.get("kind") != desired.get("kind"):
+            raise cls._conflict(kind, "GET returned the wrong resource kind")
+        for field in ("name", "namespace"):
+            expected = expected_metadata.get(field)
+            if not isinstance(expected, str) or not expected or metadata.get(field) != expected:
+                raise cls._conflict(kind, f"GET returned the wrong metadata.{field}")
+        uid = metadata.get("uid")
+        resource_version = metadata.get("resourceVersion")
+        if not isinstance(uid, str) or not uid or not isinstance(resource_version, str) or not resource_version:
+            raise cls._conflict(kind, "GET omitted uid/resourceVersion fencing metadata")
+        return metadata, uid, resource_version
+
+    @classmethod
+    def _metadata_matches(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        expected_metadata = desired.get("metadata")
+        actual_metadata = observed.get("metadata")
+        if not is_json_object(expected_metadata) or not is_json_object(actual_metadata):
+            return False
+        for field in ("name", "namespace"):
+            if actual_metadata.get(field) != expected_metadata.get(field):
+                return False
+        for field in ("labels", "annotations"):
+            expected = expected_metadata.get(field)
+            if expected is not None and not cls._expected_subset(actual_metadata.get(field), expected):
+                return False
+        return True
+
+    @classmethod
+    def _service_matches(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        if not cls._metadata_matches(observed, desired):
+            return False
+        expected_spec = desired.get("spec")
+        actual_spec = observed.get("spec")
+        if not is_json_object(expected_spec) or not is_json_object(actual_spec):
+            return False
+        if not cls._expected_subset(actual_spec, expected_spec):
+            return False
+        # A selector with extras silently selects no workers; unexpected exposure
+        # fields can turn a private headless Service into a public endpoint.
+        if actual_spec.get("selector") != expected_spec.get("selector"):
+            return False
+        if actual_spec.get("type") not in (None, "ClusterIP"):
+            return False
+        for field in ("externalIPs", "loadBalancerIP", "loadBalancerSourceRanges", "externalName"):
+            if actual_spec.get(field) not in (None, [], ""):
+                return False
+        return True
+
+    @staticmethod
+    def _secret_data(payload: JsonObject) -> JsonObject | None:
+        data = payload.get("data")
+        if is_json_object(data):
+            return data
+        # The real API returns data, but accepting stringData keeps strict fakes
+        # and admission-free fixtures representative without weakening equality.
+        string_data = payload.get("stringData")
+        if not is_json_object(string_data):
+            return None
+        encoded: JsonObject = {}
+        for key, value in string_data.items():
+            if not isinstance(value, str):
+                return None
+            encoded[key] = base64.b64encode(value.encode()).decode()
+        return encoded
+
+    @classmethod
+    def _secret_matches(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        if not cls._metadata_matches(observed, desired) or observed.get("type") != desired.get("type"):
+            return False
+        if observed.get("immutable") not in (None, False):
+            return False
+        expected = cls._secret_data(desired)
+        actual = cls._secret_data(observed)
+        return expected is not None and actual == expected
+
+    @classmethod
+    def _job_matches(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        if not cls._metadata_matches(observed, desired):
+            return False
+        expected_spec = desired.get("spec")
+        actual_spec = observed.get("spec")
+        if not is_json_object(expected_spec) or not is_json_object(actual_spec):
+            return False
+        if not cls._expected_subset(actual_spec, expected_spec):
+            return False
+        expected_template = expected_spec.get("template")
+        actual_template = actual_spec.get("template")
+        if not is_json_object(expected_template) or not is_json_object(actual_template):
+            return False
+        expected_pod = expected_template.get("spec")
+        actual_pod = actual_template.get("spec")
+        if not is_json_object(expected_pod) or not is_json_object(actual_pod):
+            return False
+        # Reject admission mutations that could execute different code, expose a
+        # host, or mount a different credential. Ordinary Kubernetes defaults
+        # (dnsPolicy, schedulerName, terminationGracePeriodSeconds, and generated
+        # selector labels) remain allowed.
+        for field in ("initContainers", "ephemeralContainers"):
+            if field not in expected_pod and actual_pod.get(field) not in (None, []):
+                return False
+        for field in ("hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace"):
+            if field not in expected_pod and actual_pod.get(field) not in (None, False):
+                return False
+        for field in ("nodeSelector", "affinity", "tolerations", "volumes", "imagePullSecrets", "runtimeClassName"):
+            if field not in expected_pod and actual_pod.get(field) not in (None, [], {}):
+                return False
+        expected_containers = expected_pod.get("containers")
+        actual_containers = actual_pod.get("containers")
+        if not isinstance(expected_containers, list) or not isinstance(actual_containers, list):
+            return False
+        if len(expected_containers) != len(actual_containers):
+            return False
+        for actual, expected in zip(actual_containers, expected_containers, strict=True):
+            if not is_json_object(actual) or not is_json_object(expected):
+                return False
+            for field in (
+                "command",
+                "args",
+                "workingDir",
+                "envFrom",
+                "securityContext",
+                "lifecycle",
+                "volumeMounts",
+                "volumeDevices",
+            ):
+                if field not in expected and actual.get(field) not in (None, [], {}):
+                    return False
+        return True
+
+    def _read_conflict(
+        self,
+        path: str,
+        desired: JsonObject,
+        kind: str,
+    ) -> tuple[JsonObject, str, str]:
+        payload = self.api.get(path)
+        if payload is None:
+            raise self._retry_reconcile(kind, "the conflicting object disappeared before GET")
+        _metadata, uid, resource_version = self._resource_identity(payload, desired, kind)
+        return payload, uid, resource_version
+
+    def _delete_fenced(
+        self,
+        path: str,
+        desired: JsonObject,
+        kind: str,
+        *,
+        uid: str,
+        resource_version: str,
+    ) -> None:
+        self.api.delete(path, uid=uid, resource_version=resource_version)
+        remaining = self.api.get(path)
+        if remaining is None:
+            return
+        _metadata, remaining_uid, _remaining_version = self._resource_identity(remaining, desired, kind)
+        if remaining_uid != uid:
+            raise self._conflict(kind, "a replacement acquired the name during fenced deletion")
+        raise self._retry_reconcile(kind, "foreground deletion is still in progress")
+
+    @staticmethod
+    def _release_ownership_manifest(
+        kind: str,
+        cell_id: str,
+        namespace: str,
+        *,
+        provider_generation: int,
+        fencing_token: str,
+    ) -> JsonObject:
+        """Return the complete metadata release must prove before deleting."""
+
+        if kind == "Service":
+            return headless_service_manifest(cell_id, namespace)
+        if kind == "Job":
+            api_version = "batch/v1"
+            name = object_name("eyvan", cell_id)
+            labels = {
+                API_CLIENT_LABEL: "true",
+                CELL_LABEL: cell_label_value(cell_id),
+                GENERATION_LABEL: str(provider_generation),
+            }
+        elif kind == "Secret":
+            api_version = "v1"
+            name = object_name("eyvan-token", cell_id)
+            labels = {
+                CELL_LABEL: cell_label_value(cell_id),
+                GENERATION_LABEL: str(provider_generation),
+            }
+        else:  # pragma: no cover - closed internal call surface
+            raise ValueError(f"unsupported Kubernetes release kind {kind!r}")
+        return {
+            "apiVersion": api_version,
+            "kind": kind,
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": labels,
+                "annotations": {
+                    CELL_ID_ANNOTATION: cell_id,
+                    FENCE_ANNOTATION: fence_fingerprint(fencing_token),
+                },
+            },
+        }
+
+    def _read_release_resource(
+        self,
+        path: str,
+        desired: JsonObject,
+        kind: str,
+    ) -> tuple[str, str] | None:
+        """Exact-GET and prove one object's ownership before any delete starts."""
+
+        observed = self.api.get(path)
+        if observed is None:
+            return None
+        _metadata, uid, resource_version = self._resource_identity(observed, desired, kind)
+        matches = (
+            self._service_matches(observed, desired) if kind == "Service" else self._metadata_matches(observed, desired)
+        )
+        if not matches:
+            raise self._conflict(kind, "ownership metadata is missing or differs from the durable cell fence")
+        return uid, resource_version
+
+    @classmethod
+    def _has_cell_ownership(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        actual_metadata = observed.get("metadata")
+        expected_metadata = desired.get("metadata")
+        if not is_json_object(actual_metadata) or not is_json_object(expected_metadata):
+            return False
+        actual_labels = actual_metadata.get("labels")
+        expected_labels = expected_metadata.get("labels")
+        actual_annotations = actual_metadata.get("annotations")
+        expected_annotations = expected_metadata.get("annotations")
+        return (
+            is_json_object(actual_labels)
+            and is_json_object(expected_labels)
+            and is_json_object(actual_annotations)
+            and is_json_object(expected_annotations)
+            and isinstance(expected_labels.get(CELL_LABEL), str)
+            and isinstance(expected_annotations.get(CELL_ID_ANNOTATION), str)
+            and actual_labels.get(CELL_LABEL) == expected_labels.get(CELL_LABEL)
+            and actual_annotations.get(CELL_ID_ANNOTATION) == expected_annotations.get(CELL_ID_ANNOTATION)
+        )
+
+    @classmethod
+    def _stale_secret_token(cls, observed: JsonObject, desired: JsonObject) -> bool:
+        if not cls._has_cell_ownership(observed, desired) or observed.get("type") != "Opaque":
+            return False
+        if observed.get("immutable") not in (None, False):
+            return False
+        data = cls._secret_data(observed)
+        if not is_json_object(data) or set(data) != {"token"} or not isinstance(data.get("token"), str):
+            return False
+        actual_metadata = observed.get("metadata")
+        expected_metadata = desired.get("metadata")
+        assert is_json_object(actual_metadata) and is_json_object(expected_metadata)
+        actual_labels = actual_metadata.get("labels")
+        expected_labels = expected_metadata.get("labels")
+        actual_annotations = actual_metadata.get("annotations")
+        expected_annotations = expected_metadata.get("annotations")
+        if not is_json_object(actual_labels) or not is_json_object(expected_labels):
+            return False
+        actual_generation = actual_labels.get(GENERATION_LABEL)
+        expected_generation = expected_labels.get(GENERATION_LABEL)
+        actual_fingerprint = actual_annotations.get(FENCE_ANNOTATION) if is_json_object(actual_annotations) else None
+        expected_fingerprint = (
+            expected_annotations.get(FENCE_ANNOTATION) if is_json_object(expected_annotations) else None
+        )
+        # Early Secrets with the complete cell ID but no generation fence are
+        # repairable, but only after any owned Job is deleted below.
+        if actual_generation is None and actual_fingerprint is None:
+            return True
+        if not isinstance(actual_generation, str) or not actual_generation.isdecimal():
+            return False
+        if not isinstance(expected_generation, str) or not expected_generation.isdecimal():
+            return False
+        valid_fingerprint = (
+            isinstance(actual_fingerprint, str)
+            and len(actual_fingerprint) == 32
+            and all(character in "0123456789abcdef" for character in actual_fingerprint)
+        )
+        if not valid_fingerprint:
+            return False
+        return int(actual_generation) < int(expected_generation) or (
+            actual_generation == expected_generation and actual_fingerprint == expected_fingerprint
+        )
+
+    @classmethod
+    def _job_disposition(cls, observed: JsonObject, desired: JsonObject) -> str:
+        if cls._job_matches(observed, desired):
+            return "exact"
+        if not cls._has_cell_ownership(observed, desired):
+            return "collision"
+        actual_metadata = observed.get("metadata")
+        expected_metadata = desired.get("metadata")
+        assert is_json_object(actual_metadata) and is_json_object(expected_metadata)
+        actual_labels = actual_metadata.get("labels")
+        expected_labels = expected_metadata.get("labels")
+        annotations = actual_metadata.get("annotations")
+        if not is_json_object(actual_labels) or not is_json_object(expected_labels) or not is_json_object(annotations):
+            return "collision"
+        actual_generation = actual_labels.get(GENERATION_LABEL)
+        expected_generation = expected_labels.get(GENERATION_LABEL)
+        fingerprint = annotations.get(FENCE_ANNOTATION)
+        if not isinstance(actual_generation, str) or not actual_generation.isdecimal():
+            return "collision"
+        if not isinstance(expected_generation, str) or not expected_generation.isdecimal():
+            return "collision"
+        if (
+            int(actual_generation) < int(expected_generation)
+            and isinstance(fingerprint, str)
+            and len(fingerprint) == 32
+            and all(character in "0123456789abcdef" for character in fingerprint)
+        ):
+            return "stale"
+        return "collision"
+
+    def _remove_job_before_secret_rotation(self, path: str, desired: JsonObject) -> None:
+        existing = self.api.get(path)
+        if existing is None:
+            return
+        _metadata, uid, resource_version = self._resource_identity(existing, desired, "Job")
+        disposition = self._job_disposition(existing, desired)
+        if disposition == "collision":
+            raise self._conflict("Job", "a colliding Job prevents safe Secret rotation")
+        self._delete_fenced(path, desired, "Job", uid=uid, resource_version=resource_version)
+
+    def _ensure_service(self, collection_path: str, object_path: str, desired: JsonObject) -> None:
+        if self.api.create(collection_path, desired):
+            return
+        existing, _uid, _resource_version = self._read_conflict(object_path, desired, "Service")
+        if not self._service_matches(existing, desired):
+            raise self._conflict("Service", "ownership or security-critical spec differs")
+
+    def _ensure_secret(
+        self,
+        collection_path: str,
+        object_path: str,
+        job_path: str,
+        desired: JsonObject,
+        desired_job: JsonObject,
+    ) -> None:
+        if self.api.create(collection_path, desired):
+            return
+        existing, uid, resource_version = self._read_conflict(object_path, desired, "Secret")
+        if self._secret_matches(existing, desired):
+            return
+        if not self._stale_secret_token(existing, desired):
+            raise self._conflict("Secret", "ownership, type, or data shape differs")
+        # Never replace a mounted Secret under a running old Job: projected
+        # volumes would hand the new credential to the old incarnation.
+        self._remove_job_before_secret_rotation(job_path, desired_job)
+        self._delete_fenced(object_path, desired, "Secret", uid=uid, resource_version=resource_version)
+        if self.api.create(collection_path, desired):
+            return
+        replacement, _uid, _resource_version = self._read_conflict(object_path, desired, "Secret")
+        if not self._secret_matches(replacement, desired):
+            raise self._retry_reconcile("Secret", "the fenced replacement did not converge")
+
+    def _ensure_job(self, collection_path: str, object_path: str, desired: JsonObject) -> None:
+        if self.api.create(collection_path, desired):
+            return
+        existing, uid, resource_version = self._read_conflict(object_path, desired, "Job")
+        disposition = self._job_disposition(existing, desired)
+        if disposition == "exact":
+            return
+        if disposition != "stale":
+            raise self._conflict("Job", "cell, generation, fence, or security-critical spec differs")
+        self._delete_fenced(object_path, desired, "Job", uid=uid, resource_version=resource_version)
+        if self.api.create(collection_path, desired):
+            return
+        replacement, _uid, _resource_version = self._read_conflict(object_path, desired, "Job")
+        if not self._job_matches(replacement, desired):
+            raise self._retry_reconcile("Job", "the fenced replacement did not converge")
+
     def apply_capacity(
         self,
         cell_id: str,
@@ -276,9 +729,10 @@ class KubernetesCapacityDriver:
         so a pod does not start, fail to mount, and burn the ``backoffLimit: 0``
         budget on a race.
 
-        Creates are idempotent by construction: names are derived from
-        ``cell_id``, so a 409 is this cell's own earlier create -- exactly the
-        replay an at-least-once outbox produces.
+        Deterministic names make a retry find the same objects, but do not
+        prove ownership. Every 409 is followed by an exact GET and comparison of
+        Eyvan ownership plus the complete security-critical manifest. A stale
+        credential is rotated only after its old Job is fenced and gone.
         """
 
         accelerator_type, capacity_class, worker_count, options = self._validate_desired(desired)
@@ -287,7 +741,12 @@ class KubernetesCapacityDriver:
 
             def mutate(record: FleetCellRecord) -> None:
                 if not self._accept_mutation(record, context):
-                    captured["skip"] = True
+                    # The durable stamp can commit before any Kubernetes POST.
+                    # Replays must resume reconciliation without bumping the
+                    # provider generation or rotating the worker token again.
+                    captured["replay"] = True
+                    captured["generation"] = record.provider_generation
+                    captured["management_uid"] = record.metadata.get("management_uid", record.name)
                     return
                 record.accelerator_type = accelerator_type
                 record.capacity_class = capacity_class
@@ -313,36 +772,54 @@ class KubernetesCapacityDriver:
             except StaleFenceError as exc:
                 raise StaleMutationError(str(exc)) from exc
 
-        if captured.get("skip"):
-            return self.observe(cell_id)
-
         generation = int(captured.get("generation", record.provider_generation))
         namespace = self.namespace
-        self._require_safe_queue(self._optional_option(options, "queue_name"))
-        self.api.create(f"/api/v1/namespaces/{namespace}/services", headless_service_manifest(cell_id, namespace))
+        queue_name = self._optional_option(options, "queue_name")
+        self._require_safe_queue(queue_name)
+
+        service = headless_service_manifest(cell_id, namespace)
+        service_name = object_name("eyvan", cell_id)
+        service_collection = f"/api/v1/namespaces/{namespace}/services"
+        service_path = f"{service_collection}/{service_name}"
+
         token = self._worker_token(record, generation)
+        secret: JsonObject | None = None
         secret_name: str | None = None
+        secret_collection = f"/api/v1/namespaces/{namespace}/secrets"
+        secret_path = f"{secret_collection}/{object_name('eyvan-token', cell_id)}"
         if token is not None:
             secret = secret_manifest(cell_id, namespace, token=token)
-            self.api.create(f"/api/v1/namespaces/{namespace}/secrets", secret)
-            secret_name = str(secret["metadata"]["name"])  # type: ignore[index]
-        self.api.create(
-            f"/apis/batch/v1/namespaces/{namespace}/jobs",
-            job_manifest(
-                cell_id=cell_id,
-                namespace=namespace,
-                image=str(options.get("image", self.image)),
-                worker_count=worker_count,
-                provider_generation=generation,
-                fencing_token=context.fencing_token,
-                resources=self._resources(options),
-                secret_name=secret_name,
-                queue_name=self._optional_option(options, "queue_name"),
-                priority_class=self._optional_option(options, "priority_class"),
-                node_selector=self._mapping_option(options, "node_selector"),
-                tolerations=self._sequence_option(options, "tolerations"),
-            ),
+            secret_metadata = secret.get("metadata")
+            assert is_json_object(secret_metadata)
+            labels = secret_metadata.get("labels")
+            assert is_json_object(labels)
+            labels[GENERATION_LABEL] = str(generation)
+            annotations = secret_metadata.get("annotations")
+            assert is_json_object(annotations)
+            annotations[FENCE_ANNOTATION] = fence_fingerprint(context.fencing_token)
+            secret_name = str(secret_metadata["name"])
+
+        job = job_manifest(
+            cell_id=cell_id,
+            namespace=namespace,
+            image=str(options.get("image", self.image)),
+            worker_count=worker_count,
+            provider_generation=generation,
+            fencing_token=context.fencing_token,
+            resources=self._resources(options),
+            secret_name=secret_name,
+            queue_name=queue_name,
+            priority_class=self._optional_option(options, "priority_class"),
+            node_selector=self._mapping_option(options, "node_selector"),
+            tolerations=self._sequence_option(options, "tolerations"),
         )
+        job_collection = f"/apis/batch/v1/namespaces/{namespace}/jobs"
+        job_path = f"{job_collection}/{service_name}"
+
+        self._ensure_service(service_collection, service_path, service)
+        if secret is not None:
+            self._ensure_secret(secret_collection, secret_path, job_path, secret, job)
+        self._ensure_job(job_collection, job_path, job)
         return self.observe(cell_id)
 
     def _require_safe_queue(self, queue_name: str | None) -> None:
@@ -477,22 +954,90 @@ class KubernetesCapacityDriver:
         return self._observation(record, CapacityStatus.DRAINING, "draining", worker_count=0, ready=0)
 
     def release(self, cell_id: str, context: MutationContext) -> CellObservation:
-        """Delete the Job, Service, and Secret, then tombstone the record.
+        """Fenced-delete the Job, Secret, and Service, then tombstone the cell.
 
-        The Job goes first and with foreground propagation, so its pods are gone
-        before anything else is removed. Deleting the Secret first would leave
-        running pods with a mounted volume whose backing object no longer exists.
+        Every object is exact-GET and ownership-checked before the first DELETE,
+        so a stale mutation or same-name collision has no provider side effect.
+        The fleet lease remains held through foreground Job deletion: only after
+        the Job object (and therefore its dependent pods) is absent may the
+        mounted Secret and stable-DNS Service be removed.
         """
 
         namespace = self.namespace
-        self.api.delete(f"/apis/batch/v1/namespaces/{namespace}/jobs/{object_name('eyvan', cell_id)}")
-        self.api.delete(f"/api/v1/namespaces/{namespace}/secrets/{object_name('eyvan-token', cell_id)}")
-        self.api.delete(f"/api/v1/namespaces/{namespace}/services/{object_name('eyvan', cell_id)}")
         with self._mutation_lock, self.state.exclusive():
+            if self.state.get(cell_id) is None:
+                # A completed-release replay must never probe/delete a replacement
+                # that later acquired the deterministic Kubernetes names.
+                return CellObservation(
+                    cell_id=cell_id,
+                    state=CapacityStatus.RELEASED,
+                    generation=context.generation,
+                    observed_at=datetime.now(UTC),
+                )
+
+            captured: dict[str, object] = {}
+
+            def validate_owner(record: FleetCellRecord) -> None:
+                self._accept_mutation(record, context)  # raises before any Kubernetes call when stale
+                if not isinstance(record.fencing_token, str) or not record.fencing_token:
+                    raise StaleMutationError(f"cell {cell_id!r} has no durable Kubernetes ownership fence")
+                captured["provider_generation"] = record.provider_generation
+                captured["fencing_token"] = record.fencing_token
+
+            try:
+                self.state.mutate_record(cell_id, validate_owner, generation=context.generation)
+            except FleetCellNotRegisteredError:
+                return CellObservation(
+                    cell_id=cell_id,
+                    state=CapacityStatus.RELEASED,
+                    generation=context.generation,
+                    observed_at=datetime.now(UTC),
+                )
+            except StaleFenceError as exc:
+                raise StaleMutationError(str(exc)) from exc
+
+            provider_generation = int(captured["provider_generation"])
+            resource_fencing_token = str(captured["fencing_token"])
+            resources = (
+                (
+                    "Job",
+                    f"/apis/batch/v1/namespaces/{namespace}/jobs/{object_name('eyvan', cell_id)}",
+                ),
+                (
+                    "Secret",
+                    f"/api/v1/namespaces/{namespace}/secrets/{object_name('eyvan-token', cell_id)}",
+                ),
+                (
+                    "Service",
+                    f"/api/v1/namespaces/{namespace}/services/{object_name('eyvan', cell_id)}",
+                ),
+            )
+            preflight: list[tuple[str, str, JsonObject, tuple[str, str] | None]] = []
+            for kind, path in resources:
+                desired = self._release_ownership_manifest(
+                    kind,
+                    cell_id,
+                    namespace,
+                    provider_generation=provider_generation,
+                    fencing_token=resource_fencing_token,
+                )
+                preflight.append((kind, path, desired, self._read_release_resource(path, desired, kind)))
+
+            for kind, path, desired, identity in preflight:
+                if identity is None:
+                    continue
+                uid, resource_version = identity
+                self._delete_fenced(
+                    path,
+                    desired,
+                    kind,
+                    uid=uid,
+                    resource_version=resource_version,
+                )
 
             def owned(record: FleetCellRecord) -> bool:
-                if self._accept_mutation(record, context):
-                    self._stamp(record, context)
+                self._accept_mutation(record, context)
+                self._stamp(record, context)
                 if record.generation != context.generation or record.fencing_token != context.fencing_token:
                     raise StaleMutationError(f"cell {cell_id!r} changed ownership before kubernetes release")
                 return True
