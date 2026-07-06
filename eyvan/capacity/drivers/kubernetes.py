@@ -90,6 +90,8 @@ _KUEUE_API = "/apis/kueue.x-k8s.io/v1beta1"
 #: bounds this: past it, a single failure unit is too large to reason about.
 MAX_WORKERS = 512
 
+_Revalidate = tp.Callable[[str], None]
+
 
 class KubernetesCapacityDriver:
     """Provision one Indexed Job per Eyvan capacity cell."""
@@ -307,6 +309,52 @@ class KubernetesCapacityDriver:
             retryable=True,
         )
 
+    def _revalidate_record_owner(
+        self,
+        cell_id: str,
+        *,
+        generation: int,
+        fencing_token: str,
+        provider_generation: int,
+        phase: str,
+        desired_state: str | None = None,
+    ) -> None:
+        """Require the live fleet lease and the exact durable cell incarnation.
+
+        A renewable lease is useful only while callers notice losing it. Check
+        immediately around Kubernetes mutations, and check the durable record in
+        between two lease reads so an ownership change cannot be mistaken for a
+        successful provider reconciliation.
+        """
+
+        try:
+            self.state.require_lease()
+            record = self.state.get(cell_id)
+            self.state.require_lease()
+        except StaleFenceError as exc:
+            raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease {phase}") from exc
+        expected = (
+            record is not None
+            and record.generation == generation
+            and record.fencing_token == fencing_token
+            and record.provider_generation == provider_generation
+            and (desired_state is None or record.desired_state == desired_state)
+        )
+        if not expected:
+            raise StaleMutationError(f"cell {cell_id!r} changed durable ownership {phase}")
+
+    def _create_revalidated(
+        self,
+        collection_path: str,
+        desired: JsonObject,
+        kind: str,
+        revalidate: _Revalidate,
+    ) -> bool:
+        revalidate(f"before {kind} create")
+        created = self.api.create(collection_path, desired)
+        revalidate(f"after {kind} create")
+        return created
+
     @staticmethod
     def _expected_subset(observed: object, expected: object) -> bool:
         """Compare every requested field while tolerating API-server defaults."""
@@ -491,9 +539,13 @@ class KubernetesCapacityDriver:
         *,
         uid: str,
         resource_version: str,
+        revalidate: _Revalidate,
     ) -> None:
+        revalidate(f"before {kind} delete")
         self.api.delete(path, uid=uid, resource_version=resource_version)
+        revalidate(f"after {kind} delete")
         remaining = self.api.get(path)
+        revalidate(f"after {kind} deletion observation")
         if remaining is None:
             return
         _metadata, remaining_uid, _remaining_version = self._resource_identity(remaining, desired, kind)
@@ -658,20 +710,40 @@ class KubernetesCapacityDriver:
             return "stale"
         return "collision"
 
-    def _remove_job_before_secret_rotation(self, path: str, desired: JsonObject) -> None:
+    def _remove_job_before_secret_rotation(
+        self,
+        path: str,
+        desired: JsonObject,
+        revalidate: _Revalidate,
+    ) -> None:
         existing = self.api.get(path)
+        revalidate("after Job rotation preflight")
         if existing is None:
             return
         _metadata, uid, resource_version = self._resource_identity(existing, desired, "Job")
         disposition = self._job_disposition(existing, desired)
         if disposition == "collision":
             raise self._conflict("Job", "a colliding Job prevents safe Secret rotation")
-        self._delete_fenced(path, desired, "Job", uid=uid, resource_version=resource_version)
+        self._delete_fenced(
+            path,
+            desired,
+            "Job",
+            uid=uid,
+            resource_version=resource_version,
+            revalidate=revalidate,
+        )
 
-    def _ensure_service(self, collection_path: str, object_path: str, desired: JsonObject) -> None:
-        if self.api.create(collection_path, desired):
+    def _ensure_service(
+        self,
+        collection_path: str,
+        object_path: str,
+        desired: JsonObject,
+        revalidate: _Revalidate,
+    ) -> None:
+        if self._create_revalidated(collection_path, desired, "Service", revalidate):
             return
         existing, _uid, _resource_version = self._read_conflict(object_path, desired, "Service")
+        revalidate("after Service conflict observation")
         if not self._service_matches(existing, desired):
             raise self._conflict("Service", "ownership or security-critical spec differs")
 
@@ -682,37 +754,62 @@ class KubernetesCapacityDriver:
         job_path: str,
         desired: JsonObject,
         desired_job: JsonObject,
+        revalidate: _Revalidate,
     ) -> None:
-        if self.api.create(collection_path, desired):
+        if self._create_revalidated(collection_path, desired, "Secret", revalidate):
             return
         existing, uid, resource_version = self._read_conflict(object_path, desired, "Secret")
+        revalidate("after Secret conflict observation")
         if self._secret_matches(existing, desired):
             return
         if not self._stale_secret_token(existing, desired):
             raise self._conflict("Secret", "ownership, type, or data shape differs")
         # Never replace a mounted Secret under a running old Job: projected
         # volumes would hand the new credential to the old incarnation.
-        self._remove_job_before_secret_rotation(job_path, desired_job)
-        self._delete_fenced(object_path, desired, "Secret", uid=uid, resource_version=resource_version)
-        if self.api.create(collection_path, desired):
+        self._remove_job_before_secret_rotation(job_path, desired_job, revalidate)
+        self._delete_fenced(
+            object_path,
+            desired,
+            "Secret",
+            uid=uid,
+            resource_version=resource_version,
+            revalidate=revalidate,
+        )
+        if self._create_revalidated(collection_path, desired, "Secret", revalidate):
             return
         replacement, _uid, _resource_version = self._read_conflict(object_path, desired, "Secret")
+        revalidate("after Secret replacement observation")
         if not self._secret_matches(replacement, desired):
             raise self._retry_reconcile("Secret", "the fenced replacement did not converge")
 
-    def _ensure_job(self, collection_path: str, object_path: str, desired: JsonObject) -> None:
-        if self.api.create(collection_path, desired):
+    def _ensure_job(
+        self,
+        collection_path: str,
+        object_path: str,
+        desired: JsonObject,
+        revalidate: _Revalidate,
+    ) -> None:
+        if self._create_revalidated(collection_path, desired, "Job", revalidate):
             return
         existing, uid, resource_version = self._read_conflict(object_path, desired, "Job")
+        revalidate("after Job conflict observation")
         disposition = self._job_disposition(existing, desired)
         if disposition == "exact":
             return
         if disposition != "stale":
             raise self._conflict("Job", "cell, generation, fence, or security-critical spec differs")
-        self._delete_fenced(object_path, desired, "Job", uid=uid, resource_version=resource_version)
-        if self.api.create(collection_path, desired):
+        self._delete_fenced(
+            object_path,
+            desired,
+            "Job",
+            uid=uid,
+            resource_version=resource_version,
+            revalidate=revalidate,
+        )
+        if self._create_revalidated(collection_path, desired, "Job", revalidate):
             return
         replacement, _uid, _resource_version = self._read_conflict(object_path, desired, "Job")
+        revalidate("after Job replacement observation")
         if not self._job_matches(replacement, desired):
             raise self._retry_reconcile("Job", "the fenced replacement did not converge")
 
@@ -732,95 +829,113 @@ class KubernetesCapacityDriver:
         Deterministic names make a retry find the same objects, but do not
         prove ownership. Every 409 is followed by an exact GET and comparison of
         Eyvan ownership plus the complete security-critical manifest. A stale
-        credential is rotated only after its old Job is fenced and gone.
+        credential is rotated only after its old Job is fenced and gone. The
+        driver lock and renewable fleet lease cover the durable write and every
+        provider mutation, so release cannot pass an apply that is still capable
+        of creating resources.
         """
 
         accelerator_type, capacity_class, worker_count, options = self._validate_desired(desired)
-        with self._mutation_lock, self.state.exclusive():
-            captured: dict[str, object] = {}
+        try:
+            with self._mutation_lock, self.state.exclusive():
+                captured: dict[str, object] = {}
 
-            def mutate(record: FleetCellRecord) -> None:
-                if not self._accept_mutation(record, context):
-                    # The durable stamp can commit before any Kubernetes POST.
-                    # Replays must resume reconciliation without bumping the
-                    # provider generation or rotating the worker token again.
-                    captured["replay"] = True
+                def mutate(record: FleetCellRecord) -> None:
+                    if not self._accept_mutation(record, context):
+                        # The durable stamp can commit before any Kubernetes POST.
+                        # Replays must resume reconciliation without bumping the
+                        # provider generation or rotating the worker token again.
+                        captured["generation"] = record.provider_generation
+                        return
+                    record.accelerator_type = accelerator_type
+                    record.capacity_class = capacity_class
+                    record.desired_state = "up"
+                    record.state = CapacityStatus.PROVISIONING
+                    # Bumped on every apply that is not a replay, and the Secret is
+                    # rewritten below -- ``derive_native_worker_token`` hashes
+                    # (management_uid, provider_generation), so a stale Secret would
+                    # authenticate workers of an incarnation this one replaced.
+                    record.provider_generation = record.provider_generation + 1
+                    record.metadata["capacity_backend"] = self.provider_name
+                    record.metadata["worker_count"] = worker_count
+                    record.metadata["namespace"] = self.namespace
+                    # Namespace included so one cell_id in two clusters cannot
+                    # collide on a derived token.
+                    record.metadata["management_uid"] = stable_id("kubernetes", self.namespace, cell_id)
+                    self._stamp(record, context)
                     captured["generation"] = record.provider_generation
-                    captured["management_uid"] = record.metadata.get("management_uid", record.name)
-                    return
-                record.accelerator_type = accelerator_type
-                record.capacity_class = capacity_class
-                record.desired_state = "up"
-                record.state = CapacityStatus.PROVISIONING
-                # Bumped on every apply that is not a replay, and the Secret is
-                # rewritten below -- ``derive_native_worker_token`` hashes
-                # (management_uid, provider_generation), so a stale Secret would
-                # authenticate workers of an incarnation this one replaced.
-                record.provider_generation = record.provider_generation + 1
-                record.metadata["capacity_backend"] = self.provider_name
-                record.metadata["worker_count"] = worker_count
-                record.metadata["namespace"] = self.namespace
-                # Namespace included so one cell_id in two clusters cannot
-                # collide on a derived token.
-                record.metadata["management_uid"] = stable_id("kubernetes", self.namespace, cell_id)
-                self._stamp(record, context)
-                captured["generation"] = record.provider_generation
-                captured["management_uid"] = record.metadata["management_uid"]
 
-            try:
-                record = self.state.mutate_or_create_record(cell_id, mutate, generation=context.generation)
-            except StaleFenceError as exc:
-                raise StaleMutationError(str(exc)) from exc
+                try:
+                    record = self.state.mutate_or_create_record(cell_id, mutate, generation=context.generation)
+                except StaleFenceError as exc:
+                    raise StaleMutationError(str(exc)) from exc
+                generation = int(captured.get("generation", record.provider_generation))
 
-        generation = int(captured.get("generation", record.provider_generation))
-        namespace = self.namespace
-        queue_name = self._optional_option(options, "queue_name")
-        self._require_safe_queue(queue_name)
+                def revalidate(phase: str) -> None:
+                    self._revalidate_record_owner(
+                        cell_id,
+                        generation=context.generation,
+                        fencing_token=context.fencing_token,
+                        provider_generation=generation,
+                        phase=phase,
+                        desired_state="up",
+                    )
 
-        service = headless_service_manifest(cell_id, namespace)
-        service_name = object_name("eyvan", cell_id)
-        service_collection = f"/api/v1/namespaces/{namespace}/services"
-        service_path = f"{service_collection}/{service_name}"
+                namespace = self.namespace
+                queue_name = self._optional_option(options, "queue_name")
+                revalidate("before ClusterQueue validation")
+                self._require_safe_queue(queue_name)
+                revalidate("after ClusterQueue validation")
 
-        token = self._worker_token(record, generation)
-        secret: JsonObject | None = None
-        secret_name: str | None = None
-        secret_collection = f"/api/v1/namespaces/{namespace}/secrets"
-        secret_path = f"{secret_collection}/{object_name('eyvan-token', cell_id)}"
-        if token is not None:
-            secret = secret_manifest(cell_id, namespace, token=token)
-            secret_metadata = secret.get("metadata")
-            assert is_json_object(secret_metadata)
-            labels = secret_metadata.get("labels")
-            assert is_json_object(labels)
-            labels[GENERATION_LABEL] = str(generation)
-            annotations = secret_metadata.get("annotations")
-            assert is_json_object(annotations)
-            annotations[FENCE_ANNOTATION] = fence_fingerprint(context.fencing_token)
-            secret_name = str(secret_metadata["name"])
+                service = headless_service_manifest(cell_id, namespace)
+                service_name = object_name("eyvan", cell_id)
+                service_collection = f"/api/v1/namespaces/{namespace}/services"
+                service_path = f"{service_collection}/{service_name}"
 
-        job = job_manifest(
-            cell_id=cell_id,
-            namespace=namespace,
-            image=str(options.get("image", self.image)),
-            worker_count=worker_count,
-            provider_generation=generation,
-            fencing_token=context.fencing_token,
-            resources=self._resources(options),
-            secret_name=secret_name,
-            queue_name=queue_name,
-            priority_class=self._optional_option(options, "priority_class"),
-            node_selector=self._mapping_option(options, "node_selector"),
-            tolerations=self._sequence_option(options, "tolerations"),
-        )
-        job_collection = f"/apis/batch/v1/namespaces/{namespace}/jobs"
-        job_path = f"{job_collection}/{service_name}"
+                token = self._worker_token(record, generation)
+                secret: JsonObject | None = None
+                secret_name: str | None = None
+                secret_collection = f"/api/v1/namespaces/{namespace}/secrets"
+                secret_path = f"{secret_collection}/{object_name('eyvan-token', cell_id)}"
+                if token is not None:
+                    secret = secret_manifest(cell_id, namespace, token=token)
+                    secret_metadata = secret.get("metadata")
+                    assert is_json_object(secret_metadata)
+                    labels = secret_metadata.get("labels")
+                    assert is_json_object(labels)
+                    labels[GENERATION_LABEL] = str(generation)
+                    annotations = secret_metadata.get("annotations")
+                    assert is_json_object(annotations)
+                    annotations[FENCE_ANNOTATION] = fence_fingerprint(context.fencing_token)
+                    secret_name = str(secret_metadata["name"])
 
-        self._ensure_service(service_collection, service_path, service)
-        if secret is not None:
-            self._ensure_secret(secret_collection, secret_path, job_path, secret, job)
-        self._ensure_job(job_collection, job_path, job)
-        return self.observe(cell_id)
+                job = job_manifest(
+                    cell_id=cell_id,
+                    namespace=namespace,
+                    image=str(options.get("image", self.image)),
+                    worker_count=worker_count,
+                    provider_generation=generation,
+                    fencing_token=context.fencing_token,
+                    resources=self._resources(options),
+                    secret_name=secret_name,
+                    queue_name=queue_name,
+                    priority_class=self._optional_option(options, "priority_class"),
+                    node_selector=self._mapping_option(options, "node_selector"),
+                    tolerations=self._sequence_option(options, "tolerations"),
+                )
+                job_collection = f"/apis/batch/v1/namespaces/{namespace}/jobs"
+                job_path = f"{job_collection}/{service_name}"
+
+                self._ensure_service(service_collection, service_path, service, revalidate)
+                if secret is not None:
+                    self._ensure_secret(secret_collection, secret_path, job_path, secret, job, revalidate)
+                self._ensure_job(job_collection, job_path, job, revalidate)
+                revalidate("before final observation")
+                observation = self.observe(cell_id)
+                revalidate("after final observation")
+                return observation
+        except StaleFenceError as exc:
+            raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease during apply") from exc
 
     def _require_safe_queue(self, queue_name: str | None) -> None:
         """Refuse a ClusterQueue that could evict Eyvan's work.
@@ -958,100 +1073,122 @@ class KubernetesCapacityDriver:
 
         Every object is exact-GET and ownership-checked before the first DELETE,
         so a stale mutation or same-name collision has no provider side effect.
-        The fleet lease remains held through foreground Job deletion: only after
-        the Job object (and therefore its dependent pods) is absent may the
-        mounted Secret and stable-DNS Service be removed.
+        The driver lock and fleet lease remain held through foreground Job
+        deletion: only after the Job object (and therefore its dependent pods) is
+        absent may the mounted Secret and stable-DNS Service be removed.
         """
 
         namespace = self.namespace
-        with self._mutation_lock, self.state.exclusive():
-            if self.state.get(cell_id) is None:
-                # A completed-release replay must never probe/delete a replacement
-                # that later acquired the deterministic Kubernetes names.
+        try:
+            with self._mutation_lock, self.state.exclusive():
+                if self.state.get(cell_id) is None:
+                    # A completed-release replay must never probe/delete a replacement
+                    # that later acquired the deterministic Kubernetes names.
+                    return CellObservation(
+                        cell_id=cell_id,
+                        state=CapacityStatus.RELEASED,
+                        generation=context.generation,
+                        observed_at=datetime.now(UTC),
+                    )
+
+                captured: dict[str, object] = {}
+
+                def validate_owner(record: FleetCellRecord) -> None:
+                    self._accept_mutation(record, context)  # raises before any Kubernetes call when stale
+                    if not isinstance(record.fencing_token, str) or not record.fencing_token:
+                        raise StaleMutationError(f"cell {cell_id!r} has no durable Kubernetes ownership fence")
+                    captured["generation"] = record.generation
+                    captured["provider_generation"] = record.provider_generation
+                    captured["fencing_token"] = record.fencing_token
+
+                try:
+                    self.state.mutate_record(cell_id, validate_owner, generation=context.generation)
+                except FleetCellNotRegisteredError:
+                    return CellObservation(
+                        cell_id=cell_id,
+                        state=CapacityStatus.RELEASED,
+                        generation=context.generation,
+                        observed_at=datetime.now(UTC),
+                    )
+                except StaleFenceError as exc:
+                    raise StaleMutationError(str(exc)) from exc
+
+                durable_generation = int(captured["generation"])
+                provider_generation = int(captured["provider_generation"])
+                resource_fencing_token = str(captured["fencing_token"])
+
+                def revalidate(phase: str) -> None:
+                    self._revalidate_record_owner(
+                        cell_id,
+                        generation=durable_generation,
+                        fencing_token=resource_fencing_token,
+                        provider_generation=provider_generation,
+                        phase=phase,
+                    )
+
+                resources = (
+                    (
+                        "Job",
+                        f"/apis/batch/v1/namespaces/{namespace}/jobs/{object_name('eyvan', cell_id)}",
+                    ),
+                    (
+                        "Secret",
+                        f"/api/v1/namespaces/{namespace}/secrets/{object_name('eyvan-token', cell_id)}",
+                    ),
+                    (
+                        "Service",
+                        f"/api/v1/namespaces/{namespace}/services/{object_name('eyvan', cell_id)}",
+                    ),
+                )
+                preflight: list[tuple[str, str, JsonObject, tuple[str, str] | None]] = []
+                for kind, path in resources:
+                    revalidate(f"before {kind} release preflight")
+                    desired = self._release_ownership_manifest(
+                        kind,
+                        cell_id,
+                        namespace,
+                        provider_generation=provider_generation,
+                        fencing_token=resource_fencing_token,
+                    )
+                    identity = self._read_release_resource(path, desired, kind)
+                    revalidate(f"after {kind} release preflight")
+                    preflight.append((kind, path, desired, identity))
+
+                for kind, path, desired, identity in preflight:
+                    if identity is None:
+                        continue
+                    uid, resource_version = identity
+                    self._delete_fenced(
+                        path,
+                        desired,
+                        kind,
+                        uid=uid,
+                        resource_version=resource_version,
+                        revalidate=revalidate,
+                    )
+
+                revalidate("before durable release tombstone")
+
+                def owned(record: FleetCellRecord) -> bool:
+                    self._accept_mutation(record, context)
+                    self._stamp(record, context)
+                    if record.generation != context.generation or record.fencing_token != context.fencing_token:
+                        raise StaleMutationError(f"cell {cell_id!r} changed ownership before kubernetes release")
+                    return True
+
+                try:
+                    self.state.tombstone_record(cell_id, context.generation, context.fencing_token, owned)
+                except StaleFenceError as exc:
+                    raise StaleMutationError(str(exc)) from exc
+                self.state.require_lease()
                 return CellObservation(
                     cell_id=cell_id,
                     state=CapacityStatus.RELEASED,
                     generation=context.generation,
                     observed_at=datetime.now(UTC),
                 )
-
-            captured: dict[str, object] = {}
-
-            def validate_owner(record: FleetCellRecord) -> None:
-                self._accept_mutation(record, context)  # raises before any Kubernetes call when stale
-                if not isinstance(record.fencing_token, str) or not record.fencing_token:
-                    raise StaleMutationError(f"cell {cell_id!r} has no durable Kubernetes ownership fence")
-                captured["provider_generation"] = record.provider_generation
-                captured["fencing_token"] = record.fencing_token
-
-            try:
-                self.state.mutate_record(cell_id, validate_owner, generation=context.generation)
-            except FleetCellNotRegisteredError:
-                return CellObservation(
-                    cell_id=cell_id,
-                    state=CapacityStatus.RELEASED,
-                    generation=context.generation,
-                    observed_at=datetime.now(UTC),
-                )
-            except StaleFenceError as exc:
-                raise StaleMutationError(str(exc)) from exc
-
-            provider_generation = int(captured["provider_generation"])
-            resource_fencing_token = str(captured["fencing_token"])
-            resources = (
-                (
-                    "Job",
-                    f"/apis/batch/v1/namespaces/{namespace}/jobs/{object_name('eyvan', cell_id)}",
-                ),
-                (
-                    "Secret",
-                    f"/api/v1/namespaces/{namespace}/secrets/{object_name('eyvan-token', cell_id)}",
-                ),
-                (
-                    "Service",
-                    f"/api/v1/namespaces/{namespace}/services/{object_name('eyvan', cell_id)}",
-                ),
-            )
-            preflight: list[tuple[str, str, JsonObject, tuple[str, str] | None]] = []
-            for kind, path in resources:
-                desired = self._release_ownership_manifest(
-                    kind,
-                    cell_id,
-                    namespace,
-                    provider_generation=provider_generation,
-                    fencing_token=resource_fencing_token,
-                )
-                preflight.append((kind, path, desired, self._read_release_resource(path, desired, kind)))
-
-            for kind, path, desired, identity in preflight:
-                if identity is None:
-                    continue
-                uid, resource_version = identity
-                self._delete_fenced(
-                    path,
-                    desired,
-                    kind,
-                    uid=uid,
-                    resource_version=resource_version,
-                )
-
-            def owned(record: FleetCellRecord) -> bool:
-                self._accept_mutation(record, context)
-                self._stamp(record, context)
-                if record.generation != context.generation or record.fencing_token != context.fencing_token:
-                    raise StaleMutationError(f"cell {cell_id!r} changed ownership before kubernetes release")
-                return True
-
-            try:
-                self.state.tombstone_record(cell_id, context.generation, context.fencing_token, owned)
-            except StaleFenceError as exc:
-                raise StaleMutationError(str(exc)) from exc
-        return CellObservation(
-            cell_id=cell_id,
-            state=CapacityStatus.RELEASED,
-            generation=context.generation,
-            observed_at=datetime.now(UTC),
-        )
+        except StaleFenceError as exc:
+            raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease during release") from exc
 
 
 __all__ = ("MAX_WORKERS", "KubernetesCapacityDriver")

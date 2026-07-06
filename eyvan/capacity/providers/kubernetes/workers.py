@@ -43,10 +43,15 @@ import typing as tp
 from eyvan._internal.json_types import JsonObject
 
 #: Kubernetes object names are DNS-1123 labels, at most 63 characters. Eyvan cell
-#: ids can reach 88, so long names are truncated and disambiguated by a digest --
+#: ids can reach 96, so long names are truncated and disambiguated by a digest --
 #: the same shape ``autoscale_fleet_name`` already uses, rather than a second
 #: truncation rule that could collide differently.
 MAX_OBJECT_NAME = 63
+
+#: The only characters Kubernetes DNS-1123 names and Eyvan's cell selector
+#: tokens may contain. Keep this explicit: :meth:`str.isalnum` accepts Unicode
+#: letters such as ``é``, while the Kubernetes API admits lowercase ASCII only.
+_DNS_1123_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 #: NetworkPolicy grant required for a worker to redeem its token and exchange
 #: managed artifacts, results, and progress with the control plane.
@@ -62,21 +67,31 @@ GENERATION_LABEL = "eyvan.dev/provider-generation"
 #: previous incarnation -- the role ``management_uid`` plays on GCP.
 FENCE_ANNOTATION = "eyvan.dev/fence-fingerprint"
 _IMMUTABLE_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
-_KUBERNETES_LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+
+
+def _is_dns_1123_label(value: str) -> bool:
+    """Return whether ``value`` is one lowercase-ASCII DNS-1123 label."""
+
+    return (
+        0 < len(value) <= MAX_OBJECT_NAME
+        and value[0] != "-"
+        and value[-1] != "-"
+        and all(character in _DNS_1123_CHARACTERS for character in value)
+    )
 
 
 def cell_label_value(cell_id: str) -> str:
-    """Return a deterministic Kubernetes label value for a complete cell ID.
+    """Return a deterministic lowercase-ASCII selector token for a cell ID.
 
-    Existing short, valid IDs retain their readable spelling. Long or otherwise
-    invalid values use 232 bits of SHA-256 under a fixed prefix, which is both
-    label-safe and collision-resistant. The unhashed ID remains authoritative in
-    :data:`CELL_ID_ANNOTATION`.
+    Existing short DNS-1123 IDs retain their readable spelling. Long or
+    otherwise invalid values use 232 bits of SHA-256 under a fixed prefix, which
+    is both DNS-safe and collision-resistant. The unhashed ID remains
+    authoritative in :data:`CELL_ID_ANNOTATION`.
     """
 
     if not isinstance(cell_id, str) or not cell_id:
         raise ValueError("Kubernetes capacity cell_id must be a non-empty string")
-    if len(cell_id) <= 63 and _KUBERNETES_LABEL_VALUE.fullmatch(cell_id) is not None:
+    if _is_dns_1123_label(cell_id):
         return cell_id
     return f"cell-{hashlib.sha256(cell_id.encode()).hexdigest()[:58]}"
 
@@ -90,19 +105,26 @@ def require_immutable_worker_image(image: str) -> str:
 
 
 def object_name(prefix: str, cell_id: str) -> str:
-    """Return a DNS-1123 name for one cell's object.
+    """Return a collision-resistant DNS-1123 name for one cell's object.
 
     Deterministic: the same cell always produces the same name, which is what
-    makes ``create`` idempotent and a 409 a replay rather than a conflict.
+    makes ``create`` idempotent and a 409 a replay rather than a conflict. A
+    digest is added whenever case-folding, replacement, or truncation is needed;
+    otherwise distinct public cell IDs such as ``cell/a`` and ``cell_a`` would
+    collapse onto the same Kubernetes object.
     """
 
-    base = f"{prefix}-{cell_id}".lower().replace("_", "-").replace(".", "-")
-    base = "".join(character if character.isalnum() or character == "-" else "-" for character in base)
-    base = base.strip("-") or prefix
-    if len(base) <= MAX_OBJECT_NAME:
-        return base
+    if not isinstance(prefix, str) or not _is_dns_1123_label(prefix):
+        raise ValueError("Kubernetes capacity object prefix must be a lowercase ASCII DNS-1123 label")
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("Kubernetes capacity cell_id must be a non-empty string")
+    raw = f"{prefix}-{cell_id}"
+    if _is_dns_1123_label(raw):
+        return raw
+    base = "".join(character if character in _DNS_1123_CHARACTERS else "-" for character in raw.lower()).strip("-")
     suffix = f"-{hashlib.sha256(cell_id.encode()).hexdigest()[:8]}"
-    return f"{base[: MAX_OBJECT_NAME - len(suffix)].rstrip('-')}{suffix}"
+    stem = base[: MAX_OBJECT_NAME - len(suffix)].rstrip("-") or prefix
+    return f"{stem}{suffix}"
 
 
 def fence_fingerprint(fencing_token: str) -> str:

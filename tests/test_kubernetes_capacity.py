@@ -22,6 +22,8 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import re
+import threading
 import typing as tp
 
 import pytest
@@ -47,9 +49,11 @@ from eyvan.capacity.providers.kubernetes.workers import (
     secret_manifest,
     worker_endpoints,
 )
+from eyvan.server.api.schemas import CellUpsertRequest
 
 _TOKEN = "fencing-token-abcdef"
 _WORKER_IMAGE = "registry.test/worker@sha256:" + "a" * 64
+_DNS_1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$", re.ASCII)
 
 
 def _job(**overrides: object) -> JsonObject:
@@ -79,9 +83,8 @@ def test_a_long_cell_id_is_truncated_to_a_valid_dns_label() -> None:
 
     name = object_name("eyvan", "c" * 120)
 
+    assert _DNS_1123_LABEL.fullmatch(name) is not None
     assert len(name) <= MAX_OBJECT_NAME
-    assert name == name.lower()
-    assert not name.startswith("-") and not name.endswith("-")
 
 
 def test_two_long_cell_ids_sharing_a_prefix_do_not_collide() -> None:
@@ -93,10 +96,48 @@ def test_two_long_cell_ids_sharing_a_prefix_do_not_collide() -> None:
     assert first != second
 
 
-def test_a_cell_id_with_illegal_characters_becomes_a_valid_label() -> None:
-    name = object_name("eyvan", "Cell_A.1/x")
+def test_normalized_cell_ids_do_not_collapse_onto_one_object_or_selector() -> None:
+    """Replacement and case-folding need a digest just as truncation does."""
 
-    assert all(character.isalnum() or character == "-" for character in name)
+    cell_ids = ("cell-a", "Cell-A", "cell_a", "cell.a", "cell/a")
+    names = {object_name("eyvan", cell_id) for cell_id in cell_ids}
+    tokens = {cell_label_value(cell_id) for cell_id in cell_ids}
+
+    assert len(names) == len(cell_ids)
+    assert len(tokens) == len(cell_ids)
+    assert all(_DNS_1123_LABEL.fullmatch(name) is not None for name in names)
+    assert all(_DNS_1123_LABEL.fullmatch(token) is not None for token in tokens)
+
+
+def test_a_schema_valid_unicode_cell_id_maps_to_admissible_ascii_names_and_labels() -> None:
+    cell_id = "é" * 96
+    request = CellUpsertRequest(
+        id=cell_id,
+        provider="kubernetes",
+        region="us-east5",
+        capacity={},
+        allocatable={},
+    )
+
+    name = object_name("eyvan", request.id)
+    token = cell_label_value(request.id)
+    job = _job(cell_id=request.id)
+    service = headless_service_manifest(request.id, "eyvan")
+    secret = secret_manifest(request.id, "eyvan", "secret-token")
+
+    assert request.id == cell_id
+    assert name == object_name("eyvan", cell_id)
+    assert token == cell_label_value(cell_id)
+    assert _DNS_1123_LABEL.fullmatch(name) is not None
+    assert _DNS_1123_LABEL.fullmatch(token) is not None
+    assert all(ord(character) < 128 for character in name + token)
+    assert job["metadata"]["name"] == service["metadata"]["name"] == name
+    assert job["spec"]["template"]["spec"]["subdomain"] == name
+    assert _DNS_1123_LABEL.fullmatch(str(secret["metadata"]["name"])) is not None
+    assert job["metadata"]["labels"][CELL_LABEL] == token
+    assert job["spec"]["template"]["metadata"]["labels"][CELL_LABEL] == token
+    assert service["spec"]["selector"][CELL_LABEL] == token
+    assert secret["metadata"]["labels"][CELL_LABEL] == token
 
 
 def test_long_cell_id_uses_one_safe_token_and_preserves_the_full_annotation() -> None:
@@ -107,9 +148,7 @@ def test_long_cell_id_uses_one_safe_token_and_preserves_the_full_annotation() ->
     secret = secret_manifest(cell_id, "eyvan", "secret-token")
 
     assert len(cell_id) == 96
-    assert len(token) <= 63
-    assert token[0].isalnum() and token[-1].isalnum()
-    assert all(character.isalnum() or character in "-_." for character in token)
+    assert _DNS_1123_LABEL.fullmatch(token) is not None
     assert job["metadata"]["labels"][CELL_LABEL] == token
     assert job["spec"]["template"]["metadata"]["labels"][CELL_LABEL] == token
     assert service["metadata"]["labels"][CELL_LABEL] == token
@@ -508,6 +547,136 @@ def test_apply_creates_the_secret_before_the_job(tmp_path) -> None:
     assert paths.index("/api/v1/namespaces/eyvan/secrets") < paths.index("/apis/batch/v1/namespaces/eyvan/jobs")
 
 
+def test_newer_release_cannot_pass_an_apply_paused_before_service_create(tmp_path) -> None:
+    """The durable tombstone and deterministic provider names are one mutation window."""
+
+    class ServiceCreateBarrierApi(_FakeApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.before_service_create = threading.Barrier(2)
+            self.resume_service_create = threading.Event()
+            self.paused = False
+
+        def create(self, path: str, manifest: JsonObject) -> bool:
+            if path.endswith("/services") and not self.paused:
+                self.paused = True
+                self.before_service_create.wait(timeout=5)
+                assert self.resume_service_create.wait(timeout=5)
+            return super().create(path, manifest)
+
+    api = ServiceCreateBarrierApi()
+    driver = _driver(tmp_path, api)
+    observations: dict[str, tp.Any] = {}
+    errors: list[BaseException] = []
+    release_returned = threading.Event()
+
+    def apply_generation_one() -> None:
+        try:
+            observations["apply"] = driver.apply_capacity(
+                "cell-a",
+                _desired(),
+                _context(generation=1, key="apply-1"),
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def release_generation_two() -> None:
+        try:
+            observations["release"] = driver.release(
+                "cell-a",
+                MutationContext(
+                    idempotency_key="release-2",
+                    generation=2,
+                    fencing_token="generation-two-token",
+                ),
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            release_returned.set()
+
+    apply_thread = threading.Thread(target=apply_generation_one)
+    apply_thread.start()
+    api.before_service_create.wait(timeout=5)
+
+    contender = FleetStateStore(LocalBackend(tmp_path / "fleet.json"), owner="competing-agent")
+    lease_covers_service_create = not contender.acquire_lease()
+    if not lease_covers_service_create:  # keep a broken implementation from stranding the test
+        contender.release_lease()
+
+    release_thread = threading.Thread(target=release_generation_two)
+    release_thread.start()
+    returned_before_apply_resumed = release_returned.wait(timeout=0.25)
+    api.resume_service_create.set()
+    apply_thread.join(timeout=5)
+    release_thread.join(timeout=5)
+
+    assert lease_covers_service_create is True
+    assert returned_before_apply_resumed is False
+    assert not apply_thread.is_alive() and not release_thread.is_alive()
+    assert errors == []
+    assert observations["apply"].state is CapacityStatus.HEALTHY
+    assert observations["release"].state is CapacityStatus.RELEASED
+    assert driver.state.get("cell-a") is None
+    assert api.objects == {}
+
+    with pytest.raises(StaleMutationError):
+        driver.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1-replayed"))
+    assert api.objects == {}
+
+
+def test_apply_reports_lease_loss_and_a_newer_release_cleans_partial_resources(tmp_path) -> None:
+    class LeaseLosingApi(_FakeApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lose_lease: tp.Callable[[], None] | None = None
+
+        def create(self, path: str, manifest: JsonObject) -> bool:
+            if path.endswith("/services") and self.lose_lease is not None:
+                lose_lease, self.lose_lease = self.lose_lease, None
+                lose_lease()
+            return super().create(path, manifest)
+
+    api = LeaseLosingApi()
+    driver = _driver(tmp_path, api)
+    api.lose_lease = driver.state.release_lease
+
+    with pytest.raises(StaleMutationError, match="fleet mutation lease"):
+        driver.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1"))
+
+    assert driver.state.lease_holder() is None
+    assert list(api.objects) == ["/api/v1/namespaces/eyvan/services/eyvan-cell-a"]
+
+    observation = driver.release(
+        "cell-a",
+        MutationContext(
+            idempotency_key="release-2",
+            generation=2,
+            fencing_token="generation-two-token",
+        ),
+    )
+
+    assert observation.state is CapacityStatus.RELEASED
+    assert driver.state.get("cell-a") is None
+    assert api.objects == {}
+    assert driver.state.lease_holder() is None
+
+
+def test_provider_failure_releases_the_fleet_lease(tmp_path) -> None:
+    class FailingApi(_FakeApi):
+        def create(self, path: str, manifest: JsonObject) -> bool:
+            if path.endswith("/services"):
+                raise RuntimeError("injected Service create failure")
+            return super().create(path, manifest)
+
+    driver = _driver(tmp_path, FailingApi())
+
+    with pytest.raises(RuntimeError, match="injected Service create failure"):
+        driver.apply_capacity("cell-a", _desired(), _context())
+
+    assert driver.state.lease_holder() is None
+
+
 def test_a_ready_cell_publishes_one_endpoint_per_worker(tmp_path) -> None:
     api = _FakeApi()
     observation = _driver(tmp_path, api).apply_capacity("cell-a", _desired(), _context())
@@ -698,6 +867,38 @@ def test_release_deletes_the_job_first(tmp_path) -> None:
     assert any("/services/" in path for path in api.deleted)
     assert len(api.delete_preconditions) == 3
     assert all(uid and resource_version for _path, uid, resource_version in api.delete_preconditions)
+
+
+def test_release_provider_failure_keeps_the_record_and_releases_the_fleet_lease(tmp_path) -> None:
+    class FailingDeleteApi(_FakeApi):
+        fail_delete = False
+
+        def delete(
+            self,
+            path: str,
+            *,
+            uid: str | None = None,
+            resource_version: str | None = None,
+        ) -> None:
+            if self.fail_delete:
+                raise RuntimeError("injected Job delete failure")
+            super().delete(path, uid=uid, resource_version=resource_version)
+
+    api = FailingDeleteApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+    api.fail_delete = True
+
+    with pytest.raises(RuntimeError, match="injected Job delete failure"):
+        driver.release("cell-a", _context(key="release-fails"))
+
+    assert driver.state.get("cell-a") is not None
+    assert driver.state.lease_holder() is None
+
+    api.fail_delete = False
+    observation = driver.release("cell-a", _context(key="release-retry"))
+    assert observation.state is CapacityStatus.RELEASED
+    assert api.objects == {}
 
 
 def test_newer_generation_release_deletes_resources_owned_by_the_durable_predecessor(tmp_path) -> None:
