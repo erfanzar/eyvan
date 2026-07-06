@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -26,9 +27,12 @@ from eyvan.artifacts.managed import (
     InvalidManagedArtifactURI,
     LocalManagedArtifactStore,
     ManagedArtifactConflictError,
+    ManagedArtifactDeleteInconclusiveError,
+    ManagedArtifactDeleteStatus,
     ManagedArtifactInventoryError,
     ManagedArtifactKind,
     ManagedArtifactObjectMetadata,
+    ManagedArtifactVersionMismatchError,
     callable_uri,
     parse_managed_uri,
     result_uri,
@@ -153,10 +157,139 @@ def test_local_store_rejects_symlink_escape_before_writing(tmp_path: Path) -> No
     assert list(outside.iterdir()) == []
 
 
+def test_local_versioned_store_retries_one_inode_and_deletes_only_that_version(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("run-versioned")
+
+    first = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+    retried = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+    exact = store.get_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=first.metadata.object_version,
+    )
+
+    assert first.created is True
+    assert retried.created is False
+    assert retried.metadata == first.metadata
+    assert exact.payload == b"first"
+    assert exact.metadata == first.metadata
+    assert first.metadata.object_version.startswith("local:")
+    assert list((store.root / ".locks").glob("*.lock"))
+    assert not list((store.root / "scopes").rglob("*.lock"))
+
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "run-versioned.result"
+    replacement = target.with_name("replacement.result")
+    replacement.write_bytes(b"replacement")
+    replacement.replace(target)
+
+    with pytest.raises(ManagedArtifactVersionMismatchError):
+        store.get_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=first.metadata.object_version,
+        )
+    mismatch = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=first.metadata.object_version,
+    )
+    assert mismatch.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert mismatch.current_metadata is not None
+    assert mismatch.current_metadata.object_version != first.metadata.object_version
+    assert target.read_bytes() == b"replacement"
+
+    deleted = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=mismatch.current_metadata.object_version,
+    )
+    absent = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=mismatch.current_metadata.object_version,
+    )
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert absent.status is ManagedArtifactDeleteStatus.ABSENT
+
+
+class _BlockingLocalManagedArtifactStore(LocalManagedArtifactStore):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.pause_next_lock = False
+        self.lock_entered = threading.Event()
+        self.release_lock = threading.Event()
+
+    @contextlib.contextmanager
+    def _object_lock(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Iterator[None]:
+        with super()._object_lock(*args, **kwargs):
+            if self.pause_next_lock:
+                self.pause_next_lock = False
+                self.lock_entered.set()
+                assert self.release_lock.wait(timeout=5)
+            yield
+
+
+def test_local_cross_store_lock_serializes_conditional_delete_and_put(tmp_path: Path) -> None:
+    root = tmp_path / "managed"
+    deleting_store = _BlockingLocalManagedArtifactStore(root)
+    writing_store = LocalManagedArtifactStore(root)
+    uri = result_uri("serialized")
+    initial = deleting_store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    deleting_store.pause_next_lock = True
+    write_started = threading.Event()
+
+    def rewrite() -> tp.Any:
+        write_started.set()
+        return writing_store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        delete_future = executor.submit(
+            deleting_store.delete_versioned,
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=initial.metadata.object_version,
+        )
+        assert deleting_store.lock_entered.wait(timeout=5)
+        write_future = executor.submit(rewrite)
+        assert write_started.wait(timeout=5)
+        assert not write_future.done()
+        deleting_store.release_lock.set()
+        deleted = delete_future.result(timeout=5)
+        rewritten = write_future.result(timeout=5)
+
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert rewritten.created is True
+    assert rewritten.metadata.object_version != initial.metadata.object_version
+    assert writing_store.get(uri, org_id="acme", project_id="research") == b"payload"
+
+
 class FakeGcloudRunner:
+    """Generation-aware gcloud and exact-current JSON API fake."""
+
     def __init__(self):
-        self.objects: dict[str, bytes] = {}
+        self.objects: dict[str, tuple[bytes, int]] = {}
         self.calls: list[list[str]] = []
+        self.inventory_calls: list[str] = []
+        self.inventory_failures: list[tuple[int, bytes] | Exception] = []
+        self.cp_barrier: threading.Barrier | None = None
+        self.cat_observed: threading.Event | None = None
+        self.cat_release: threading.Event | None = None
+        self.rm_failure: str | None = None
+        self._next_generation = 40
+        self._lock = threading.Lock()
+
+    def replace(self, uri: str, payload: bytes) -> int:
+        with self._lock:
+            self._next_generation += 1
+            self.objects[uri] = (payload, self._next_generation)
+            return self._next_generation
 
     def __call__(
         self,
@@ -165,37 +298,262 @@ class FakeGcloudRunner:
         check: bool,
         capture_output: bool,
     ) -> subprocess.CompletedProcess[bytes]:
+        del check, capture_output
         command = list(args)
         self.calls.append(command)
         uri = command[-1]
-        if command[2:4] == ["objects", "describe"]:
-            return subprocess.CompletedProcess(command, 0 if uri in self.objects else 1, stdout=b"", stderr=b"")
         if command[2] == "cp":
-            if uri in self.objects:
-                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"already exists")
-            self.objects[uri] = Path(command[-2]).read_bytes()
+            assert "--if-generation-match=0" in command
+            assert "--no-clobber" not in command
+            if self.cp_barrier is not None:
+                self.cp_barrier.wait()
+            with self._lock:
+                if uri in self.objects:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+                self._next_generation += 1
+                self.objects[uri] = (Path(command[-2]).read_bytes(), self._next_generation)
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         if command[2] == "cat":
-            if uri not in self.objects and check:
-                raise subprocess.CalledProcessError(1, command)
-            return subprocess.CompletedProcess(command, 0, stdout=self.objects[uri], stderr=b"")
+            with self._lock:
+                current = self.objects.get(uri)
+            if current is None:
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+            if self.cat_observed is not None:
+                self.cat_observed.set()
+                assert self.cat_release is not None and self.cat_release.wait(timeout=5)
+            return subprocess.CompletedProcess(command, 0, stdout=current[0], stderr=b"")
+        if command[2] == "rm":
+            assert any(argument.startswith("--if-generation-match=") for argument in command)
+            if self.rm_failure == "permission":
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+            if self.rm_failure == "timeout":
+                raise TimeoutError("provider-secret")
+            expected = int(next(argument.split("=", 1)[1] for argument in command if argument.startswith("--if-")))
+            with self._lock:
+                current = self.objects.get(uri)
+                if current is None or current[1] != expected:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+                del self.objects[uri]
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         raise AssertionError(command)
 
+    def inventory(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]:
+        del headers, timeout_seconds, maximum_response_bytes
+        self.inventory_calls.append(url)
+        if self.inventory_failures:
+            failure = self.inventory_failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        parsed = urlsplit(url)
+        encoded_bucket, separator, encoded_name = parsed.path.partition("/o/")
+        assert separator
+        bucket = unquote(encoded_bucket.rsplit("/b/", 1)[1])
+        name = unquote(encoded_name)
+        uri = f"gs://{bucket}/{name}"
+        with self._lock:
+            current = self.objects.get(uri)
+        if current is None:
+            return 404, b'{"error":{"message":"not found"}}'
+        payload, generation = current
+        return 200, json.dumps(
+            {"name": name, "size": str(len(payload)), "generation": str(generation)},
+            separators=(",", ":"),
+        ).encode()
 
-def test_gcs_store_uses_scoped_no_clobber_objects() -> None:
+    def store(self) -> GCSManagedArtifactStore:
+        return GCSManagedArtifactStore(
+            "gs://eyvan-managed/artifacts",
+            runner=self,
+            inventory_transport=self.inventory,
+            access_token_provider=lambda: "fake-access-token",
+        )
+
+
+def test_gcs_store_uses_conditional_create_and_returns_the_stable_generation() -> None:
     runner = FakeGcloudRunner()
-    store = GCSManagedArtifactStore("gs://eyvan-managed/artifacts", runner=runner)
+    store = runner.store()
     uri = result_uri("run-1")
 
-    store.put(uri, b"result", org_id="acme", project_id="research")
-    store.put(uri, b"result", org_id="acme", project_id="research")
+    created = store.put_versioned(uri, b"result", org_id="acme", project_id="research")
+    retried = store.put_versioned(uri, b"result", org_id="acme", project_id="research")
 
     object_uri = next(iter(runner.objects))
     assert object_uri == f"gs://eyvan-managed/artifacts/scopes/{storage_scope('acme', 'research')}/results/run-1.result"
-    assert "--no-clobber" in next(command for command in runner.calls if command[2] == "cp")
+    assert created.created is True
+    assert retried.created is False
+    assert retried.metadata == created.metadata
+    cp = next(command for command in runner.calls if command[2] == "cp")
+    assert "--if-generation-match=0" in cp
+    assert "--no-clobber" not in cp
     assert not store.exists(uri, org_id="acme", project_id="other")
     with pytest.raises(ManagedArtifactConflictError):
         store.put(uri, b"changed", org_id="acme", project_id="research")
+
+
+def test_gcs_conditional_create_race_accepts_only_the_identical_current_generation() -> None:
+    runner = FakeGcloudRunner()
+    runner.cp_barrier = threading.Barrier(2)
+    store = runner.store()
+    uri = result_uri("race")
+
+    def write() -> tp.Any:
+        return store.put_versioned(uri, b"same", org_id="acme", project_id="research")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writes = tuple(executor.map(lambda _index: write(), range(2)))
+
+    assert {write.created for write in writes} == {True, None}
+    assert writes[0].metadata == writes[1].metadata
+    cp_calls = [command for command in runner.calls if command[2] == "cp"]
+    assert len(cp_calls) == 2
+    assert all("--if-generation-match=0" in command and "--no-clobber" not in command for command in cp_calls)
+
+
+def test_gcs_exact_read_detects_a_replacement_during_the_byte_read() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("read-race")
+    written = store.put_versioned(uri, b"original", org_id="acme", project_id="research")
+    object_uri = next(iter(runner.objects))
+    runner.cat_observed = threading.Event()
+    runner.cat_release = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reading = executor.submit(
+            store.get_versioned,
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert runner.cat_observed.wait(timeout=5)
+        new_generation = runner.replace(object_uri, b"replacement")
+        runner.cat_release.set()
+        with pytest.raises(ManagedArtifactVersionMismatchError):
+            reading.result(timeout=5)
+
+    runner.cat_observed = None
+    runner.cat_release = None
+    current = store.get_versioned(uri, org_id="acme", project_id="research")
+    assert current.payload == b"replacement"
+    assert current.metadata.object_version == f"gcs:{new_generation}"
+
+
+def test_gcs_conditional_delete_classifies_deleted_absent_and_version_mismatch() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("delete")
+    original = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+
+    deleted = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    absent = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert absent.status is ManagedArtifactDeleteStatus.ABSENT
+
+    replacement = store.put_versioned(uri, b"second", org_id="acme", project_id="research")
+    mismatch = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    assert mismatch.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert mismatch.current_metadata == replacement.metadata
+    assert store.get(uri, org_id="acme", project_id="research") == b"second"
+    assert store.delete(uri, org_id="acme", project_id="research") is True
+    rm_calls = [command for command in runner.calls if command[2] == "rm"]
+    assert rm_calls
+    assert all(any(argument.startswith("--if-generation-match=") for argument in command) for command in rm_calls)
+
+
+@pytest.mark.parametrize("failure", ("permission", "timeout"))
+def test_gcs_conditional_delete_does_not_translate_permission_or_timeout_to_absent(failure: str) -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri(f"delete-{failure}")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_failure = failure
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError) as inconclusive:
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert "provider-secret" not in str(inconclusive.value)
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+    rm = next(command for command in runner.calls if command[2] == "rm")
+    assert any(argument.startswith("--if-generation-match=") for argument in rm)
+
+
+def test_gcs_conditional_delete_propagates_an_inconclusive_stat() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("delete-stat-permission")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_failure = "permission"
+    runner.inventory_failures.append((403, b'{"error":"provider-secret"}'))
+
+    with pytest.raises(ManagedArtifactInventoryError) as inconclusive:
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert str(inconclusive.value) == "GCS inventory request failed with HTTP status 403"
+    assert "provider-secret" not in str(inconclusive.value)
+    rm = next(command for command in runner.calls if command[2] == "rm")
+    assert any(argument.startswith("--if-generation-match=") for argument in rm)
+
+
+@pytest.mark.parametrize(
+    "object_version",
+    (
+        "local:1:2:3",
+        "gcs:0",
+        "gcs:01",
+        "gcs:18446744073709551616",
+    ),
+)
+def test_gcs_versioned_operations_reject_wrong_or_out_of_range_versions(object_version: str) -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("bad-version")
+
+    with pytest.raises(ValueError):
+        store.get_versioned(uri, org_id="acme", project_id="research", object_version=object_version)
+    with pytest.raises(ValueError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=object_version,
+        )
+
+    assert runner.calls == []
+    assert runner.inventory_calls == []
 
 
 def test_transfer_token_is_url_safe_time_bounded_and_fully_scoped() -> None:
