@@ -19,7 +19,7 @@ import time
 import typing as tp
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
 import click
@@ -145,12 +145,16 @@ def _decimal_value(
         raise ValueError(f"{name} must be a bounded finite decimal")
     try:
         parsed = value if isinstance(value, Decimal) else Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError) as error:
+    except (ArithmeticError, ValueError, TypeError) as error:
         raise ValueError(f"{name} must be a finite decimal") from error
     if not parsed.is_finite():
         raise ValueError(f"{name} is outside its finite bound")
-    minimum_ok = parsed >= 0 if allow_zero else parsed > 0
-    if not minimum_ok or parsed > maximum:
+    try:
+        minimum_ok = parsed >= 0 if allow_zero else parsed > 0
+        outside_maximum = parsed > maximum
+    except ArithmeticError as error:
+        raise ValueError(f"{name} is outside its finite bound") from error
+    if not minimum_ok or outside_maximum:
         raise ValueError(f"{name} is outside its finite bound")
     return parsed
 
@@ -178,7 +182,10 @@ def observation_slot_count(duration_s: object, interval_s: object) -> int:
 
     duration = _decimal_value(duration_s, name="duration_s", maximum=MAX_SOAK_DURATION_S)
     interval = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
-    slots = max(1, int((duration / interval).to_integral_value(rounding=ROUND_CEILING)))
+    try:
+        slots = max(1, int((duration / interval).to_integral_value(rounding=ROUND_CEILING)))
+    except (ArithmeticError, ValueError) as error:
+        raise ValueError("the requested observation grid is not representable") from error
     if slots > MAX_OBSERVATION_SLOTS:
         raise ValueError("the requested observation grid exceeds its fixed bound")
     return slots
@@ -1739,7 +1746,7 @@ def soak(
             name="max_artifact_net_growth_bytes",
             allow_none=True,
         )
-    except ValueError:
+    except (ArithmeticError, ValueError):
         _write_and_emit_preflight(output, ("invalid_numeric_input",))
 
     output_aliases_input = False

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, Inexact, Overflow, Underflow, localcontext
 from pathlib import Path
 
 import pytest
@@ -689,6 +689,43 @@ def test_decimal_grid_two_point_one_over_point_three_is_exactly_seven() -> None:
     assert clock.elapsed == pytest.approx(2.1)
 
 
+def test_decimal_grid_translates_extreme_exponent_overflow_to_value_error() -> None:
+    for interval_s in ("1e-999999", "1e-1000000", "1e-999999999"):
+        with pytest.raises(ValueError, match="observation grid") as caught:
+            observation_slot_count("252", interval_s)
+        assert isinstance(caught.value.__cause__, ArithmeticError)
+
+
+def test_decimal_grid_translates_untrapped_overflow_to_value_error() -> None:
+    with localcontext() as context:
+        context.traps[Overflow] = False
+        with pytest.raises(ValueError, match="observation grid") as caught:
+            observation_slot_count("252", "1e-999999")
+    assert isinstance(caught.value.__cause__, OverflowError)
+
+
+@pytest.mark.parametrize(
+    ("duration_s", "interval_s", "signal"),
+    [
+        ("0.001", "3", Underflow),
+        ("2", "3", Inexact),
+    ],
+)
+def test_decimal_grid_translates_trapped_division_signals_to_value_error(
+    duration_s: str,
+    interval_s: str,
+    signal: type[ArithmeticError],
+) -> None:
+    with localcontext() as context:
+        context.prec = 2
+        context.Emin = -2
+        context.Emax = 2
+        context.traps[signal] = True
+        with pytest.raises(ValueError, match="observation grid") as caught:
+            observation_slot_count(duration_s, interval_s)
+    assert isinstance(caught.value.__cause__, signal)
+
+
 def test_final_receipt_atomically_replaces_a_stale_pass(tmp_path: Path) -> None:
     clock = _FakeClock()
     payloads = _qualifying_payloads()
@@ -863,6 +900,25 @@ def test_every_invalid_numeric_preflight_atomically_replaces_stale_pass(
     assert persisted["verdict"] == "inconclusive"
     assert persisted["reasons"] == ["invalid_numeric_input"]
     assert "stale" not in persisted
+    json.dumps(persisted, allow_nan=False)
+
+
+def test_extreme_decimal_interval_replaces_stale_pass_without_traceback(tmp_path: Path) -> None:
+    from eyvan.sdk import cli
+
+    args, output = _cli_base(tmp_path)
+    output.write_text('{"verdict":"pass","stale":true}')
+    result = CliRunner().invoke(cli.main, [*args, "--hours", "0.07", "--interval-s", "1e-999999"])
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, ArithmeticError)
+    persisted = json.loads(output.read_text())
+    assert persisted["status"] == "not_started"
+    assert persisted["verdict"] == "inconclusive"
+    assert persisted["exit_code"] == 2
+    assert persisted["reasons"] == ["invalid_numeric_input"]
+    assert "stale" not in persisted
+    assert list(tmp_path.glob(".soak.json.*.tmp")) == []
     json.dumps(persisted, allow_nan=False)
 
 
