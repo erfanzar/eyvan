@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import { ApiError, type EyvanApiClient } from "./api/client";
+import { COALESCE_MS } from "./lib/useLiveRefresh";
 import {
   getMockWorkload,
   mockAuditEvents,
@@ -219,6 +220,7 @@ afterEach(() => {
   cleanup();
   window.history.replaceState(null, "", "/");
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("App composes server session authority", () => {
@@ -515,6 +517,119 @@ describe("App scope and authority race guards", () => {
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
     expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2);
     expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a typed detail denial inert across retained and fresh follower events", async () => {
+    window.location.hash = "#/workloads/wl-retained-denial";
+    const operator = authority("project_operator");
+    const reconciliation = deferred<SessionAuthority>();
+    const followerEvents: Array<Parameters<EyvanApiClient["followEvents"]>[0]> = [];
+    let sessionCall = 0;
+    let detailCall = 0;
+    const followEvents = vi.fn(
+      async (
+        onEvent: Parameters<EyvanApiClient["followEvents"]>[0],
+        signal: AbortSignal,
+        onConnectionChange?: Parameters<EyvanApiClient["followEvents"]>[2],
+      ) => {
+        followerEvents.push(onEvent);
+        onConnectionChange?.(true);
+        // A new follower receives retained history before any fresh event.
+        onEvent({ id: `retained-${followerEvents.length}`, event: "workload.submitted", data: {} });
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    );
+    const { client, calls } = fakeClient(operator, {
+      getSessionAuthority: async () => {
+        sessionCall += 1;
+        if (sessionCall === 2) return reconciliation.promise;
+        return structuredClone(operator);
+      },
+      getWorkload: async () => {
+        detailCall += 1;
+        if (detailCall === 1) throw new ApiError("retained detail denial", 403);
+        return { ...scopedWorkload({ orgId: "acme", projectId: "research" }), id: "wl-retained-denial" };
+      },
+      followEvents,
+    });
+    renderApp(client);
+
+    await waitFor(() => {
+      expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2);
+      expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+      expect(followEvents).toHaveBeenCalledTimes(1);
+    });
+    // Keep reconciliation pending past the live-refresh coalescer. The retained
+    // event from the now-fenced follower must not survive its abort.
+    await act(async () => {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, COALESCE_MS + 50));
+    });
+    expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2);
+    expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+    expect(followEvents).toHaveBeenCalledTimes(1);
+
+    await act(async () => reconciliation.resolve(structuredClone(operator)));
+    await waitFor(() => expect(screen.getByText("retained detail denial")).toBeDefined());
+    await waitFor(() => expect(followEvents).toHaveBeenCalledTimes(2));
+    // The replacement follower immediately replays retained history. It may
+    // reconcile the dashboard once, but it must not replay the denied detail.
+    await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(3), { timeout: 1_500 });
+    await waitFor(() => expect(calls.listWorkloads).toHaveBeenCalledTimes(3));
+    expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+    expect(followEvents).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      followerEvents.at(-1)?.({ id: "fresh-1", event: "workload.updated", data: {} });
+    });
+    await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(4), { timeout: 1_500 });
+    await waitFor(() => expect(calls.listWorkloads).toHaveBeenCalledTimes(4));
+    await act(async () => {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, COALESCE_MS + 50));
+    });
+
+    expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+    expect(calls.getSessionAuthority).toHaveBeenCalledTimes(4);
+    expect(followEvents).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("retained detail denial")).toBeDefined();
+
+    // Retry is the sole operation that clears the preserved denial.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(calls.getWorkload).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Workload detail" })).toBeDefined());
+  });
+
+  it("does not replay a denied detail from the 30-second fallback poll", async () => {
+    vi.useFakeTimers();
+    window.location.hash = "#/workloads/wl-poll-denial";
+    const operator = authority("project_operator");
+    const { client, calls } = fakeClient(operator, {
+      getSessionAuthority: async () => structuredClone(operator),
+      getWorkload: async () => {
+        throw new ApiError("poll detail denial", 403);
+      },
+    });
+    renderApp(client);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText("poll detail denial")).toBeDefined();
+      expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+      expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2);
+      expect(calls.followEvents).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+
+    // The dashboard sweep still reconciles /session; the paired detail poll is
+    // inert until the user explicitly retries the preserved denial.
+    expect(calls.getSessionAuthority).toHaveBeenCalledTimes(3);
+    expect(calls.getWorkload).toHaveBeenCalledTimes(1);
+    expect(calls.followEvents).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("poll detail denial")).toBeDefined();
   });
 
   it("ignores a stale deep-link 403 after navigation without fencing the current scope", async () => {

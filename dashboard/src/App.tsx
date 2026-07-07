@@ -536,6 +536,14 @@ export default function App({ client = apiClient, identityProvider = currentIden
     [client, fencePresentationAuthority, refreshDashboard, updateDetailFailure],
   );
 
+  const refreshCurrentDetailAutomatically = useCallback(() => {
+    const workloadId = detailRouteIdRef.current;
+    // A typed denial is stable while its route remains current. Only the visible
+    // Retry action clears it; retained SSE events and polls stay dashboard-only.
+    if (!workloadId || detailFailureRef.current?.workloadId === workloadId) return;
+    void loadWorkloadDetail(workloadId, true);
+  }, [loadWorkloadDetail]);
+
   useEffect(() => {
     mountedRef.current = true;
     void refreshDashboard(configuredScope());
@@ -597,7 +605,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     active: canReadSelectedScope,
     onChange: () => {
       void refreshDashboard(desiredScopeRef.current, true);
-      if (detailRouteIdRef.current) void loadWorkloadDetail(detailRouteIdRef.current, true);
+      refreshCurrentDetailAutomatically();
     },
   });
 
@@ -655,9 +663,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
   ]);
 
   useVisibilityPolling(
-    () => {
-      if (detailRouteId) void loadWorkloadDetail(detailRouteId, true);
-    },
+    refreshCurrentDetailAutomatically,
     REFRESH_INTERVAL_MS,
     detailRouteId !== undefined && error === null && hasAnyRead(authority),
   );
@@ -952,7 +958,6 @@ export default function App({ client = apiClient, identityProvider = currentIden
           onRetry={() => {
             setSelectedWorkload(null);
             updateDetailFailure(null);
-            void loadWorkloadDetail(activeRoute.workloadId);
           }}
         />
       );
