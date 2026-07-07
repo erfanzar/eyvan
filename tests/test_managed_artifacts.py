@@ -8,8 +8,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
 import threading
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +34,9 @@ from eyvan.artifacts.managed import (
     ManagedArtifactInventoryError,
     ManagedArtifactKind,
     ManagedArtifactObjectMetadata,
+    ManagedArtifactOperationInconclusiveError,
     ManagedArtifactVersionMismatchError,
+    ManagedArtifactWriteInconclusiveError,
     callable_uri,
     parse_managed_uri,
     result_uri,
@@ -175,8 +179,10 @@ def test_local_versioned_store_retries_one_inode_and_deletes_only_that_version(t
     assert retried.metadata == first.metadata
     assert exact.payload == b"first"
     assert exact.metadata == first.metadata
-    assert first.metadata.object_version.startswith("local:")
+    assert first.metadata.object_version.startswith("local:2:")
+    assert first.metadata.sha256 == hashlib.sha256(b"first").hexdigest()
     assert list((store.root / ".locks").glob("*.lock"))
+    assert list((store.root / ".generations").rglob("*.artifact"))
     assert not list((store.root / "scopes").rglob("*.lock"))
 
     target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "run-versioned.result"
@@ -216,6 +222,247 @@ def test_local_versioned_store_retries_one_inode_and_deletes_only_that_version(t
     )
     assert deleted.status is ManagedArtifactDeleteStatus.DELETED
     assert absent.status is ManagedArtifactDeleteStatus.ABSENT
+
+
+def test_local_conditional_delete_never_unlinks_a_rename_at_detach_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("rename-at-delete")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "rename-at-delete.result"
+    replacement = target.with_name("replacement.result")
+    replacement.write_bytes(b"generation-b")
+    original_rename = os.rename
+    replacement_installed = False
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replacement_installed
+        if source == target.name and not replacement_installed:
+            replacement_installed = True
+            assert src_dir_fd is not None
+            original_rename(
+                replacement.name,
+                target.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=src_dir_fd,
+            )
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert replacement_installed
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    assert target.read_bytes() == b"generation-b"
+
+
+def test_local_delete_unlink_boundary_cannot_remove_a_new_canonical_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replace-at-unlink")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replace-at-unlink.result"
+    replacement = target.with_name("replacement-at-unlink.result")
+    replacement.write_bytes(b"generation-b")
+    original_unlink = os.unlink
+    original_rename = os.rename
+    installed = False
+    unlinked_names: list[str] = []
+
+    def adversarial_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal installed
+        unlinked_names.append(os.fspath(path))
+        if os.fspath(path).startswith(".eyvan-delete-") and not installed:
+            installed = True
+            assert dir_fd is not None
+            original_rename(
+                replacement.name,
+                target.name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", adversarial_unlink)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert installed
+    assert target.name not in unlinked_names
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    assert target.read_bytes() == b"generation-b"
+
+
+def test_local_special_file_opens_are_nonblocking_and_type_safe_in_a_bounded_subprocess(tmp_path: Path) -> None:
+    script = r"""
+import os
+import socket
+import stat
+import sys
+from pathlib import Path
+
+from eyvan.artifacts.managed import (
+    InvalidManagedArtifactURI,
+    LocalManagedArtifactStore,
+    ManagedArtifactDeleteInconclusiveError,
+    result_uri,
+    storage_scope,
+)
+
+root = Path(sys.argv[1])
+store = LocalManagedArtifactStore(root)
+uri = result_uri("special")
+store.put(uri, b"payload", org_id="acme", project_id="research")
+target = root / "scopes" / storage_scope("acme", "research") / "results" / "special.result"
+
+target.unlink()
+os.mkfifo(target)
+try:
+    store.stat(uri, org_id="acme", project_id="research")
+except InvalidManagedArtifactURI:
+    pass
+else:
+    raise AssertionError("FIFO was accepted")
+target.unlink()
+
+store.put(uri, b"payload", org_id="acme", project_id="research")
+target.unlink()
+previous = Path.cwd()
+os.chdir(target.parent)
+listener = socket.socket(socket.AF_UNIX)
+try:
+    listener.bind(target.name)
+finally:
+    os.chdir(previous)
+try:
+    store.stat(uri, org_id="acme", project_id="research")
+except InvalidManagedArtifactURI:
+    pass
+else:
+    raise AssertionError("socket was accepted")
+listener.close()
+target.unlink()
+
+store.put(uri, b"payload", org_id="acme", project_id="research")
+original_open = os.open
+
+def replace_open_with_device(path, flags, *args, **kwargs):
+    if path == target.name and kwargs.get("dir_fd") is not None:
+        return original_open(os.devnull, flags)
+    return original_open(path, flags, *args, **kwargs)
+
+os.open = replace_open_with_device
+try:
+    try:
+        store.stat(uri, org_id="acme", project_id="research")
+    except InvalidManagedArtifactURI:
+        pass
+    else:
+        raise AssertionError("device was accepted")
+finally:
+    os.open = original_open
+
+race_uri = result_uri("race-special")
+race_write = store.put_versioned(race_uri, b"payload", org_id="acme", project_id="research")
+race_target = root / "scopes" / storage_scope("acme", "research") / "results" / "race-special.result"
+race_fifo = race_target.with_name("race-special.fifo")
+os.mkfifo(race_fifo)
+original_rename = os.rename
+replaced = False
+
+def replace_before_detach(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+    global replaced
+    if source == race_target.name and not replaced:
+        replaced = True
+        original_rename(
+            race_fifo.name,
+            race_target.name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
+        )
+    original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+os.rename = replace_before_detach
+try:
+    try:
+        store.delete_versioned(
+            race_uri,
+            org_id="acme",
+            project_id="research",
+            object_version=race_write.metadata.object_version,
+        )
+    except ManagedArtifactDeleteInconclusiveError:
+        pass
+    else:
+        raise AssertionError("racing FIFO was accepted or deleted")
+finally:
+    os.rename = original_rename
+assert replaced and stat.S_ISFIFO(os.lstat(race_target).st_mode)
+print("bounded")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "special-root")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        cwd=Path(__file__).parents[1],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "bounded"
+
+
+def test_local_store_rejects_an_unrecognized_hardlink_without_deleting_it(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("hardlink")
+    written = store.put_versioned(uri, b"managed", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "hardlink.result"
+    outside = target.with_name("outside")
+    target.unlink()
+    outside.write_bytes(b"replacement")
+    os.link(outside, target)
+
+    with pytest.raises(InvalidManagedArtifactURI, match="unrecognized hard link"):
+        store.stat(uri, org_id="acme", project_id="research")
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert target.read_bytes() == b"replacement"
+    assert outside.read_bytes() == b"replacement"
 
 
 class _BlockingLocalManagedArtifactStore(LocalManagedArtifactStore):
@@ -276,12 +523,18 @@ class FakeGcloudRunner:
     def __init__(self):
         self.objects: dict[str, tuple[bytes, int]] = {}
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.inventory_calls: list[str] = []
         self.inventory_failures: list[tuple[int, bytes] | Exception] = []
         self.cp_barrier: threading.Barrier | None = None
+        self.cp_timeout_after_commit = False
+        self.cp_post_stat_failure = False
         self.cat_observed: threading.Event | None = None
         self.cat_release: threading.Event | None = None
+        self.cat_post_stat_failure = False
+        self.cat_timeout = False
         self.rm_failure: str | None = None
+        self.rm_timeout_after_delete = False
         self._next_generation = 40
         self._lock = threading.Lock()
 
@@ -297,10 +550,12 @@ class FakeGcloudRunner:
         *,
         check: bool,
         capture_output: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
         del check, capture_output
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout)
         uri = command[-1]
         if command[2] == "cp":
             assert "--if-generation-match=0" in command
@@ -312,8 +567,14 @@ class FakeGcloudRunner:
                     return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
                 self._next_generation += 1
                 self.objects[uri] = (Path(command[-2]).read_bytes(), self._next_generation)
+            if self.cp_post_stat_failure:
+                self.inventory_failures.append((403, b'{"error":"provider-secret"}'))
+            if self.cp_timeout_after_commit:
+                raise subprocess.TimeoutExpired(command, timeout)
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         if command[2] == "cat":
+            if self.cat_timeout:
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
             with self._lock:
                 current = self.objects.get(uri)
             if current is None:
@@ -321,19 +582,23 @@ class FakeGcloudRunner:
             if self.cat_observed is not None:
                 self.cat_observed.set()
                 assert self.cat_release is not None and self.cat_release.wait(timeout=5)
+            if self.cat_post_stat_failure:
+                self.inventory_failures.append((403, b'{"error":"provider-secret"}'))
             return subprocess.CompletedProcess(command, 0, stdout=current[0], stderr=b"")
         if command[2] == "rm":
             assert any(argument.startswith("--if-generation-match=") for argument in command)
             if self.rm_failure == "permission":
                 return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
             if self.rm_failure == "timeout":
-                raise TimeoutError("provider-secret")
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
             expected = int(next(argument.split("=", 1)[1] for argument in command if argument.startswith("--if-")))
             with self._lock:
                 current = self.objects.get(uri)
                 if current is None or current[1] != expected:
                     return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
                 del self.objects[uri]
+            if self.rm_timeout_after_delete:
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         raise AssertionError(command)
 
@@ -390,12 +655,67 @@ def test_gcs_store_uses_conditional_create_and_returns_the_stable_generation() -
     assert created.created is True
     assert retried.created is False
     assert retried.metadata == created.metadata
+    assert created.metadata.sha256 == hashlib.sha256(b"result").hexdigest()
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
     cp = next(command for command in runner.calls if command[2] == "cp")
     assert "--if-generation-match=0" in cp
     assert "--no-clobber" not in cp
     assert not store.exists(uri, org_id="acme", project_id="other")
     with pytest.raises(ManagedArtifactConflictError):
         store.put(uri, b"changed", org_id="acme", project_id="research")
+
+
+def test_gcs_cp_timeout_after_commit_is_resolved_by_an_exact_digest_read() -> None:
+    runner = FakeGcloudRunner()
+    runner.cp_timeout_after_commit = True
+    store = runner.store()
+    uri = result_uri("cp-timeout-after-commit")
+
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    assert written.created is None
+    assert written.metadata.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert 30.0 in runner.timeouts
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+
+
+def test_gcs_cat_timeout_is_bounded_and_sanitized() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("cat-timeout")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.cat_timeout = True
+
+    with pytest.raises(ManagedArtifactOperationInconclusiveError) as inconclusive:
+        store.get_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert str(inconclusive.value) == "GCS managed artifact read failed"
+    assert "provider-secret" not in str(inconclusive.value)
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+
+
+@pytest.mark.parametrize("failure_point", ("post_cp_stat", "post_cat_stat"))
+def test_gcs_write_normalizes_every_post_cp_verification_failure(failure_point: str) -> None:
+    runner = FakeGcloudRunner()
+    if failure_point == "post_cp_stat":
+        runner.cp_post_stat_failure = True
+    else:
+        runner.cat_post_stat_failure = True
+    store = runner.store()
+    uri = result_uri(f"write-{failure_point}")
+
+    with pytest.raises(ManagedArtifactWriteInconclusiveError) as inconclusive:
+        store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    assert str(inconclusive.value) == "GCS managed artifact write was inconclusive"
+    assert "provider-secret" not in str(inconclusive.value)
+    assert any(command[2] == "cp" for command in runner.calls)
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
 
 
 def test_gcs_conditional_create_race_accepts_only_the_identical_current_generation() -> None:
@@ -445,6 +765,7 @@ def test_gcs_exact_read_detects_a_replacement_during_the_byte_read() -> None:
     current = store.get_versioned(uri, org_id="acme", project_id="research")
     assert current.payload == b"replacement"
     assert current.metadata.object_version == f"gcs:{new_generation}"
+    assert current.metadata.sha256 == hashlib.sha256(b"replacement").hexdigest()
 
 
 def test_gcs_conditional_delete_classifies_deleted_absent_and_version_mismatch() -> None:
@@ -484,6 +805,24 @@ def test_gcs_conditional_delete_classifies_deleted_absent_and_version_mismatch()
     assert all(any(argument.startswith("--if-generation-match=") for argument in command) for command in rm_calls)
 
 
+def test_gcs_rm_timeout_after_delete_is_resolved_as_absent() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("rm-timeout-after-delete")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_timeout_after_delete = True
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.ABSENT
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+
+
 @pytest.mark.parametrize("failure", ("permission", "timeout"))
 def test_gcs_conditional_delete_does_not_translate_permission_or_timeout_to_absent(failure: str) -> None:
     runner = FakeGcloudRunner()
@@ -506,7 +845,7 @@ def test_gcs_conditional_delete_does_not_translate_permission_or_timeout_to_abse
     assert any(argument.startswith("--if-generation-match=") for argument in rm)
 
 
-def test_gcs_conditional_delete_propagates_an_inconclusive_stat() -> None:
+def test_gcs_conditional_delete_normalizes_an_inconclusive_post_rm_stat() -> None:
     runner = FakeGcloudRunner()
     store = runner.store()
     uri = result_uri("delete-stat-permission")
@@ -514,7 +853,7 @@ def test_gcs_conditional_delete_propagates_an_inconclusive_stat() -> None:
     runner.rm_failure = "permission"
     runner.inventory_failures.append((403, b'{"error":"provider-secret"}'))
 
-    with pytest.raises(ManagedArtifactInventoryError) as inconclusive:
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError) as inconclusive:
         store.delete_versioned(
             uri,
             org_id="acme",
@@ -522,7 +861,7 @@ def test_gcs_conditional_delete_propagates_an_inconclusive_stat() -> None:
             object_version=written.metadata.object_version,
         )
 
-    assert str(inconclusive.value) == "GCS inventory request failed with HTTP status 403"
+    assert str(inconclusive.value) == "GCS managed artifact deletion was inconclusive"
     assert "provider-secret" not in str(inconclusive.value)
     rm = next(command for command in runner.calls if command[2] == "rm")
     assert any(argument.startswith("--if-generation-match=") for argument in rm)
@@ -859,6 +1198,10 @@ def test_local_inventory_is_bounded_scoped_and_detects_replacement_identity(tmp_
 
     assert [item.uri for item in first.objects] == list(uris[:2])
     assert [item.size_bytes for item in first.objects] == [1, 2]
+    assert [item.sha256 for item in first.objects] == [
+        hashlib.sha256(b"x").hexdigest(),
+        hashlib.sha256(b"xx").hexdigest(),
+    ]
     assert first.next_cursor == uris[1]
     assert [item.uri for item in second.objects] == [uris[2]]
     assert second.next_cursor is None

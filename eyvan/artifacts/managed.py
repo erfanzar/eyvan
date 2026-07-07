@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import heapq
 import hmac
+import inspect
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import subprocess
 import tempfile
 import time
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import url2pathname
@@ -104,6 +105,7 @@ _GCS_STAT_FIELDS = "name,size,generation"
 _GCS_INVENTORY_TIMEOUT_SECONDS = 30.0
 _GCS_ACCESS_TOKEN_TIMEOUT_SECONDS = 10.0
 _GCS_METADATA_TOKEN_TIMEOUT_SECONDS = 2.0
+_GCS_TRANSFER_TIMEOUT_SECONDS = 30.0
 _GCS_METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 _MAX_INVENTORY_CURSOR_BYTES = 512
 _MAX_GCS_ACCESS_TOKEN_BYTES = 16 * 1024
@@ -183,20 +185,24 @@ class ManagedArtifactObjectMetadata:
     """Authoritative metadata captured from one physical object observation.
 
     ``object_version`` identifies the exact provider generation or local file
-    instance observed alongside ``size_bytes``. The version can be persisted by
-    a state machine and later supplied to an exact read or conditional delete.
+    instance observed alongside ``size_bytes``. ``sha256`` is present when the
+    backend observed the bytes through the exact descriptor/generation (writes
+    and exact reads); provider metadata-only inventory may leave it ``None``.
     """
 
     uri: str
     size_bytes: int
     object_version: str
+    sha256: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         parse_managed_uri(self.uri)
-        if self.size_bytes < 0:
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes < 0:
             raise ValueError("managed artifact inventory size must be non-negative")
-        if not self.object_version.strip():
+        if not isinstance(self.object_version, str) or not self.object_version.strip():
             raise ValueError("managed artifact inventory object version must not be blank")
+        if self.sha256 is not None and (not isinstance(self.sha256, str) or not _CALLABLE_ID.fullmatch(self.sha256)):
+            raise ValueError("managed artifact observed digest must be a lowercase SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +220,8 @@ class ManagedArtifactWrite:
     def __post_init__(self) -> None:
         if self.created is not None and not isinstance(self.created, bool):
             raise TypeError("managed artifact write created must be a boolean or None")
+        if self.metadata.sha256 is None:
+            raise ValueError("managed artifact writes require a backend-observed SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +236,9 @@ class ManagedArtifactRead:
             raise TypeError("managed artifact read payload must be bytes")
         if len(self.payload) != self.metadata.size_bytes:
             raise ValueError("managed artifact read payload size does not match its metadata")
+        digest = hashlib.sha256(self.payload).hexdigest()
+        if self.metadata.sha256 is None or not hmac.compare_digest(digest, self.metadata.sha256):
+            raise ValueError("managed artifact read digest does not match its metadata")
 
 
 class ManagedArtifactDeleteStatus(StrEnum):
@@ -361,6 +372,7 @@ class CommandRunner(tp.Protocol):
         *,
         check: bool,
         capture_output: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]: ...
 
 
@@ -644,18 +656,35 @@ def _parse_canonical_uint64(value: str, *, description: str, minimum: int) -> in
     return parsed
 
 
-def _parse_local_object_version(object_version: str) -> tuple[int, int, int]:
+@dataclass(frozen=True, slots=True)
+class _LocalObjectVersion:
+    device: int
+    inode: int
+    ctime_ns: int
+    generation_digest: str | None = None
+
+
+def _parse_local_object_version(object_version: str) -> _LocalObjectVersion:
     if not isinstance(object_version, str) or not object_version.startswith("local:"):
         raise ValueError("local managed artifact version must use the local: prefix")
     components = object_version.split(":")
-    if len(components) != 4:
-        raise ValueError("local managed artifact version must contain device, inode, and ctime")
-    return tp.cast(
-        tuple[int, int, int],
-        tuple(
-            _parse_canonical_uint64(component, description="local managed artifact version", minimum=0)
-            for component in components[1:]
-        ),
+    if len(components) == 4:
+        numeric = components[1:]
+        generation_digest = None
+    elif len(components) == 6 and components[1] == "2" and _CALLABLE_ID.fullmatch(components[2]):
+        numeric = components[3:]
+        generation_digest = components[2]
+    else:
+        raise ValueError("local managed artifact version must contain a supported immutable file identity")
+    device, inode, ctime_ns = (
+        _parse_canonical_uint64(component, description="local managed artifact version", minimum=0)
+        for component in numeric
+    )
+    return _LocalObjectVersion(
+        device=device,
+        inode=inode,
+        ctime_ns=ctime_ns,
+        generation_digest=generation_digest,
     )
 
 
@@ -673,9 +702,25 @@ def _parse_gcs_object_version(object_version: str) -> int:
 
 
 class LocalManagedArtifactStore:
-    """Immutable managed artifact storage rooted in a local directory."""
+    """Immutable local storage with a generation anchor per current object.
+
+    Canonical object paths remain regular files for compatibility. New writes
+    also create an owner-only hard-link anchor outside ``scopes``. Conditional
+    deletion atomically renames the canonical link to a private staging name,
+    verifies the detached inode, and only then removes that link and its exact
+    anchor. A replacement installed at the canonical name is therefore never
+    the pathname passed to ``unlink``. Existing pre-anchor files remain readable
+    and use the same detach-and-verify primitive until rewritten or deleted.
+
+    The configured root and the hidden control directories are a trusted
+    operator boundary. Canonical entries are still treated as hostile: opens are
+    no-follow/nonblocking, every descriptor must be regular, and unrecognized
+    hard links fail closed because an unseen alias defeats deletion accounting.
+    """
 
     _LOCK_DIRECTORY = ".locks"
+    _GENERATION_DIRECTORY = ".generations"
+    _QUARANTINE_DIRECTORY = ".quarantine"
 
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root).expanduser().resolve()
@@ -687,13 +732,25 @@ class LocalManagedArtifactStore:
 
     @staticmethod
     def _object_open_flags() -> int:
-        return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        return (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
 
     @staticmethod
     def _translate_unsafe_path(exc: OSError) -> tp.NoReturn:
-        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        if exc.errno in {
+            errno.ELOOP,
+            errno.ENOTDIR,
+            errno.ENXIO,
+            errno.ENODEV,
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }:
             raise InvalidManagedArtifactURI(
-                "managed artifact storage path cannot contain symbolic links or non-directories"
+                "managed artifact storage path cannot contain symbolic links, special files, or non-directories"
             ) from exc
         raise exc
 
@@ -707,6 +764,7 @@ class LocalManagedArtifactStore:
                 descriptors.append(os.open(self.root, self._directory_open_flags()))
             except OSError as exc:
                 self._translate_unsafe_path(exc)
+            self._validate_control_directory(descriptors[-1])
             for component in components:
                 if not component or component in {".", ".."} or "/" in component:
                     raise InvalidManagedArtifactURI("managed artifact storage path contains an unsafe component")
@@ -725,6 +783,35 @@ class LocalManagedArtifactStore:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
+    @staticmethod
+    def _validate_control_directory(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        effective_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
+        if (
+            not stat_module.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != effective_uid
+            or metadata.st_mode & (stat_module.S_IWGRP | stat_module.S_IWOTH)
+        ):
+            raise InvalidManagedArtifactURI("managed artifact control directories must be owner-only real directories")
+
+    @contextlib.contextmanager
+    def _open_control_directory(self, name: str, *, create: bool) -> tp.Iterator[int]:
+        with self._open_directory((name,), create=create) as descriptor:
+            self._validate_control_directory(descriptor)
+            yield descriptor
+
+    @staticmethod
+    def _object_key(relative: Path) -> str:
+        return hashlib.sha256(relative.as_posix().encode("ascii")).hexdigest()
+
+    @contextlib.contextmanager
+    def _open_generation_directory(self, relative: Path, *, create: bool) -> tp.Iterator[int]:
+        key = self._object_key(relative)
+        with self._open_control_directory(self._GENERATION_DIRECTORY, create=create):
+            with self._open_directory((self._GENERATION_DIRECTORY, key), create=create) as descriptor:
+                self._validate_control_directory(descriptor)
+                yield descriptor
+
     def _relative_object(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> Path:
         return _relative_object_path(reference, org_id, project_id)
 
@@ -735,18 +822,18 @@ class LocalManagedArtifactStore:
         org_id: str,
         project_id: str,
     ) -> tp.Iterator[None]:
-        """Serialize one scoped object's writers across processes.
-
-        Lock files deliberately live outside ``scopes`` so bounded inventory can
-        never mistake synchronization state for physical artifact bytes. They
-        are persistent: unlinking a flock file permits two processes to lock
-        different inodes under the same name.
-        """
+        """Serialize cooperating writers while pathname safety remains independent."""
 
         relative = self._relative_object(reference, org_id, project_id).as_posix().encode("ascii")
         lock_name = f"{hashlib.sha256(relative).hexdigest()}.lock"
-        with self._open_directory((self._LOCK_DIRECTORY,), create=True) as lock_directory_fd:
-            common_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        with self._open_control_directory(self._LOCK_DIRECTORY, create=True) as lock_directory_fd:
+            common_flags = (
+                os.O_RDWR
+                | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOCTTY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
             while True:
                 try:
                     descriptor = os.open(lock_name, common_flags, dir_fd=lock_directory_fd)
@@ -768,8 +855,8 @@ class LocalManagedArtifactStore:
                     self._translate_unsafe_path(exc)
             try:
                 metadata = os.fstat(descriptor)
-                if not stat_module.S_ISREG(metadata.st_mode):
-                    raise InvalidManagedArtifactURI("managed artifact lock must be a regular file")
+                if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise InvalidManagedArtifactURI("managed artifact lock must be an unlinked regular file")
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 try:
                     yield
@@ -779,43 +866,56 @@ class LocalManagedArtifactStore:
                 os.close(descriptor)
 
     @staticmethod
-    def _metadata_from_descriptor(
+    def _regular_stat(
         descriptor: int,
-        uri: str,
         *,
         conflict_on_non_file: bool = False,
-    ) -> ManagedArtifactObjectMetadata:
+    ) -> os.stat_result:
         metadata = os.fstat(descriptor)
         if not stat_module.S_ISREG(metadata.st_mode):
             if conflict_on_non_file:
                 raise ManagedArtifactConflictError("managed artifact target is not a regular file")
             raise InvalidManagedArtifactURI("managed artifact object must be a regular file")
-        version = f"local:{metadata.st_dev}:{metadata.st_ino}:{metadata.st_ctime_ns}"
-        return ManagedArtifactObjectMetadata(uri=uri, size_bytes=metadata.st_size, object_version=version)
+        if metadata.st_nlink < 1:
+            raise ManagedArtifactVersionMismatchError("managed artifact object was unlinked while observed")
+        return metadata
+
+    @staticmethod
+    def _stable_stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_mode,
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
 
     @classmethod
-    def _read_descriptor(
+    def _read_regular_descriptor(
         cls,
         descriptor: int,
-        uri: str,
         *,
-        object_version: str | None = None,
+        retain_payload: bool,
         conflict_on_non_file: bool = False,
-    ) -> ManagedArtifactRead:
-        before = cls._metadata_from_descriptor(descriptor, uri, conflict_on_non_file=conflict_on_non_file)
-        if object_version is not None and before.object_version != object_version:
-            raise ManagedArtifactVersionMismatchError("managed artifact object version does not match")
+    ) -> tuple[bytes | None, str, os.stat_result]:
+        before = cls._regular_stat(descriptor, conflict_on_non_file=conflict_on_non_file)
         os.lseek(descriptor, 0, os.SEEK_SET)
-        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if retain_payload else None
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
-            chunks.append(chunk)
-        after = cls._metadata_from_descriptor(descriptor, uri, conflict_on_non_file=conflict_on_non_file)
-        if after != before:
+            digest.update(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+        after = cls._regular_stat(descriptor, conflict_on_non_file=conflict_on_non_file)
+        if cls._stable_stat_identity(after) != cls._stable_stat_identity(before):
             raise ManagedArtifactVersionMismatchError("managed artifact object changed while it was read")
-        return ManagedArtifactRead(payload=b"".join(chunks), metadata=after)
+        payload = b"".join(chunks) if chunks is not None else None
+        return payload, digest.hexdigest(), after
 
     @classmethod
     def _open_object(cls, directory_fd: int, filename: str) -> int:
@@ -830,39 +930,206 @@ class LocalManagedArtifactStore:
         while remaining:
             written = os.write(descriptor, remaining)
             if written <= 0:
-                raise OSError("managed artifact temporary write made no progress")
+                raise OSError("managed artifact generation write made no progress")
             remaining = remaining[written:]
         os.fsync(descriptor)
 
     @staticmethod
-    def _temporary_descriptor(directory_fd: int) -> tuple[str, int]:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        for _attempt in range(128):
-            name = f".eyvan-{os.getpid()}-{os.urandom(16).hex()}"
-            try:
-                return name, os.open(name, flags, 0o600, dir_fd=directory_fd)
-            except FileExistsError:
-                continue
-        raise OSError("could not allocate a unique managed artifact temporary file")
+    def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+        return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+    def _has_exact_generation_anchor(
+        self,
+        relative: Path,
+        digest: str,
+        metadata: os.stat_result,
+        *,
+        conflict_on_unsafe: bool,
+    ) -> bool:
+        try:
+            with self._open_generation_directory(relative, create=False) as generation_fd:
+                descriptor = self._open_object(generation_fd, f"{digest}.artifact")
+                try:
+                    anchor = self._regular_stat(descriptor, conflict_on_non_file=conflict_on_unsafe)
+                finally:
+                    os.close(descriptor)
+        except FileNotFoundError:
+            anchor = None
+        except InvalidManagedArtifactURI:
+            if conflict_on_unsafe:
+                raise ManagedArtifactConflictError("managed artifact generation anchor is unsafe") from None
+            raise
+
+        if anchor is not None and self._same_inode(anchor, metadata):
+            if metadata.st_nlink != 2:
+                message = "managed artifact generation has unexpected hard links"
+                if conflict_on_unsafe:
+                    raise ManagedArtifactConflictError(message)
+                raise InvalidManagedArtifactURI(message)
+            return True
+        if metadata.st_nlink != 1:
+            message = "managed artifact object has an unrecognized hard link"
+            if conflict_on_unsafe:
+                raise ManagedArtifactConflictError(message)
+            raise InvalidManagedArtifactURI(message)
+        return False
+
+    def _metadata_from_observation(
+        self,
+        uri: str,
+        relative: Path,
+        digest: str,
+        metadata: os.stat_result,
+        *,
+        conflict_on_unsafe: bool = False,
+    ) -> ManagedArtifactObjectMetadata:
+        anchored = self._has_exact_generation_anchor(
+            relative,
+            digest,
+            metadata,
+            conflict_on_unsafe=conflict_on_unsafe,
+        )
+        if anchored:
+            version = f"local:2:{digest}:{metadata.st_dev}:{metadata.st_ino}:{metadata.st_ctime_ns}"
+        else:
+            version = f"local:{metadata.st_dev}:{metadata.st_ino}:{metadata.st_ctime_ns}"
+        return ManagedArtifactObjectMetadata(
+            uri=uri,
+            size_bytes=metadata.st_size,
+            object_version=version,
+            sha256=digest,
+        )
+
+    def _read_descriptor(
+        self,
+        descriptor: int,
+        uri: str,
+        relative: Path,
+        *,
+        object_version: str | None = None,
+        conflict_on_unsafe: bool = False,
+    ) -> ManagedArtifactRead:
+        raw_payload, digest, metadata = self._read_regular_descriptor(
+            descriptor,
+            retain_payload=True,
+            conflict_on_non_file=conflict_on_unsafe,
+        )
+        assert raw_payload is not None
+        observed = self._metadata_from_observation(
+            uri,
+            relative,
+            digest,
+            metadata,
+            conflict_on_unsafe=conflict_on_unsafe,
+        )
+        if object_version is not None and observed.object_version != object_version:
+            raise ManagedArtifactVersionMismatchError("managed artifact object version does not match")
+        return ManagedArtifactRead(payload=raw_payload, metadata=observed)
+
+    def _observe_descriptor(
+        self,
+        descriptor: int,
+        uri: str,
+        relative: Path,
+    ) -> ManagedArtifactObjectMetadata:
+        _payload, digest, metadata = self._read_regular_descriptor(descriptor, retain_payload=False)
+        return self._metadata_from_observation(uri, relative, digest, metadata)
 
     def _existing_write(
         self,
         directory_fd: int,
-        filename: str,
+        relative: Path,
         uri: str,
         payload: bytes,
+        *,
+        created: bool | None = False,
     ) -> ManagedArtifactWrite | None:
         try:
-            descriptor = self._open_object(directory_fd, filename)
+            descriptor = self._open_object(directory_fd, relative.name)
         except FileNotFoundError:
             return None
         try:
-            existing = self._read_descriptor(descriptor, uri, conflict_on_non_file=True)
+            existing = self._read_descriptor(
+                descriptor,
+                uri,
+                relative,
+                conflict_on_unsafe=True,
+            )
         finally:
             os.close(descriptor)
         if not _payloads_match(existing.payload, payload):
             raise ManagedArtifactConflictError("managed object already contains different bytes")
-        return ManagedArtifactWrite(metadata=existing.metadata, created=False)
+        return ManagedArtifactWrite(metadata=existing.metadata, created=created)
+
+    def _open_or_create_generation(
+        self,
+        generation_fd: int,
+        filename: str,
+        payload: bytes,
+    ) -> tuple[int, bool]:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        created = False
+        try:
+            descriptor = os.open(filename, flags, 0o600, dir_fd=generation_fd)
+            created = True
+            try:
+                self._write_descriptor(descriptor, payload)
+                os.fchmod(descriptor, 0o400)
+                os.fsync(descriptor)
+                os.fsync(generation_fd)
+            except Exception:
+                os.close(descriptor)
+                raise
+        except FileExistsError:
+            descriptor = self._open_object(generation_fd, filename)
+        except OSError as exc:
+            self._translate_unsafe_path(exc)
+        try:
+            observed_payload, observed_digest, metadata = self._read_regular_descriptor(
+                descriptor,
+                retain_payload=True,
+                conflict_on_non_file=True,
+            )
+            assert observed_payload is not None
+            if not _payloads_match(observed_payload, payload):
+                raise ManagedArtifactConflictError("managed artifact generation contains different bytes")
+            if filename != f"{observed_digest}.artifact":
+                raise ManagedArtifactConflictError("managed artifact generation digest does not match its name")
+            if metadata.st_nlink not in {1, 2}:
+                raise ManagedArtifactConflictError("managed artifact generation has unexpected hard links")
+            return descriptor, created
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _remove_generation_if_orphaned(
+        self,
+        generation_fd: int,
+        filename: str,
+        expected: os.stat_result,
+    ) -> None:
+        try:
+            descriptor = self._open_object(generation_fd, filename)
+        except FileNotFoundError:
+            return
+        try:
+            current = self._regular_stat(descriptor)
+            if not self._same_inode(current, expected):
+                raise ManagedArtifactWriteInconclusiveError("local generation cleanup found a replacement")
+            if current.st_nlink != 1:
+                return
+            os.unlink(filename, dir_fd=generation_fd)
+            os.fsync(generation_fd)
+        finally:
+            os.close(descriptor)
 
     def put_versioned(
         self,
@@ -872,47 +1139,86 @@ class LocalManagedArtifactStore:
         org_id: str,
         project_id: str,
     ) -> ManagedArtifactWrite:
-        """Create a scoped object and return its authoritative file identity."""
+        """Create a scoped immutable generation and return its observed digest."""
 
         reference = parse_managed_uri(uri)
         payload = _validate_payload(reference, payload)
         relative = self._relative_object(reference, org_id, project_id)
+        digest = hashlib.sha256(payload).hexdigest()
         with self._object_lock(reference, org_id, project_id):
             with self._open_directory(relative.parts[:-1], create=True) as directory_fd:
-                existing = self._existing_write(directory_fd, relative.name, reference.uri, payload)
+                existing = self._existing_write(directory_fd, relative, reference.uri, payload)
                 if existing is not None:
                     return existing
 
-                temporary_name, temporary_fd = self._temporary_descriptor(directory_fd)
-                try:
-                    self._write_descriptor(temporary_fd, payload)
+                with self._open_generation_directory(relative, create=True) as generation_fd:
+                    generation_name = f"{digest}.artifact"
+                    generation_descriptor, _anchor_created = self._open_or_create_generation(
+                        generation_fd,
+                        generation_name,
+                        payload,
+                    )
                     try:
-                        os.link(
-                            temporary_name,
-                            relative.name,
-                            src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd,
-                            follow_symlinks=False,
+                        generation_stat = self._regular_stat(
+                            generation_descriptor,
+                            conflict_on_non_file=True,
                         )
-                    except FileExistsError:
-                        existing = self._existing_write(directory_fd, relative.name, reference.uri, payload)
-                        if existing is None:
+                        try:
+                            os.link(
+                                generation_name,
+                                relative.name,
+                                src_dir_fd=generation_fd,
+                                dst_dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileExistsError:
+                            existing = self._existing_write(directory_fd, relative, reference.uri, payload)
+                            self._remove_generation_if_orphaned(
+                                generation_fd,
+                                generation_name,
+                                generation_stat,
+                            )
+                            if existing is None:
+                                raise ManagedArtifactWriteInconclusiveError(
+                                    "local managed artifact create was inconclusive"
+                                ) from None
+                            return existing
+                        except OSError as exc:
                             raise ManagedArtifactWriteInconclusiveError(
                                 "local managed artifact create was inconclusive"
-                            ) from None
-                        return existing
-                    os.unlink(temporary_name, dir_fd=directory_fd)
-                    temporary_name = ""
-                    os.fsync(directory_fd)
-                    metadata = self._metadata_from_descriptor(temporary_fd, reference.uri)
-                    return ManagedArtifactWrite(metadata=metadata, created=True)
-                finally:
-                    if temporary_name:
+                            ) from exc
+
                         try:
-                            os.unlink(temporary_name, dir_fd=directory_fd)
-                        except FileNotFoundError:
-                            pass
-                    os.close(temporary_fd)
+                            os.fsync(directory_fd)
+                            descriptor = self._open_object(directory_fd, relative.name)
+                            try:
+                                current_stat = self._regular_stat(descriptor, conflict_on_non_file=True)
+                                if not self._same_inode(current_stat, generation_stat):
+                                    raise ManagedArtifactWriteInconclusiveError(
+                                        "local managed artifact was replaced during create"
+                                    )
+                                observed = self._read_descriptor(
+                                    descriptor,
+                                    reference.uri,
+                                    relative,
+                                    conflict_on_unsafe=True,
+                                )
+                            finally:
+                                os.close(descriptor)
+                        except Exception as exc:
+                            self._remove_generation_if_orphaned(
+                                generation_fd,
+                                generation_name,
+                                generation_stat,
+                            )
+                            if isinstance(exc, (ManagedArtifactConflictError, ManagedArtifactWriteInconclusiveError)):
+                                raise
+                            raise ManagedArtifactWriteInconclusiveError(
+                                "local managed artifact create was inconclusive"
+                            ) from exc
+                        return ManagedArtifactWrite(metadata=observed.metadata, created=True)
+                    finally:
+                        os.close(generation_descriptor)
 
     def get_versioned(
         self,
@@ -932,7 +1238,12 @@ class LocalManagedArtifactStore:
             with self._open_directory(relative.parts[:-1], create=False) as directory_fd:
                 descriptor = self._open_object(directory_fd, relative.name)
                 try:
-                    observed = self._read_descriptor(descriptor, reference.uri, object_version=object_version)
+                    observed = self._read_descriptor(
+                        descriptor,
+                        reference.uri,
+                        relative,
+                        object_version=object_version,
+                    )
                 finally:
                     os.close(descriptor)
         except FileNotFoundError:
@@ -951,7 +1262,7 @@ class LocalManagedArtifactStore:
         return self.get_versioned(uri, org_id=org_id, project_id=project_id).payload
 
     def exists(self, uri: str, *, org_id: str, project_id: str) -> bool:
-        """Return whether a regular scoped local object exists."""
+        """Return whether a regular, safely linked scoped local object exists."""
 
         parse_managed_uri(uri)
         return self.stat(uri, org_id=org_id, project_id=project_id) is not None
@@ -981,25 +1292,25 @@ class LocalManagedArtifactStore:
                 )
         return current
 
-    @staticmethod
-    def _local_inventory_metadata(target: Path, uri: str) -> ManagedArtifactObjectMetadata | None:
-        """Observe size and replacement identity from one no-follow descriptor."""
+    def _local_inventory_metadata(
+        self,
+        target: Path,
+        uri: str,
+        relative: Path,
+    ) -> ManagedArtifactObjectMetadata | None:
+        """Observe digest, size, and identity from one nonblocking descriptor."""
 
         try:
-            descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+            descriptor = os.open(target, self._object_open_flags())
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise ManagedArtifactInventoryError(f"could not open managed artifact inventory object: {exc}") from exc
+            raise ManagedArtifactInventoryError("could not open managed artifact inventory object") from exc
         try:
-            metadata = os.fstat(descriptor)
-            if not stat_module.S_ISREG(metadata.st_mode):
-                raise ManagedArtifactInventoryError("managed artifact inventory object must be a regular file")
-            # dev+inode identifies the live file instance. ctime protects against
-            # inode reuse and changes on in-place mutation; size is captured by
-            # the same fstat call, so a report never pairs two observations.
-            version = f"local:{metadata.st_dev}:{metadata.st_ino}:{metadata.st_ctime_ns}"
-            return ManagedArtifactObjectMetadata(uri=uri, size_bytes=metadata.st_size, object_version=version)
+            try:
+                return self._observe_descriptor(descriptor, uri, relative)
+            except (InvalidManagedArtifactURI, ManagedArtifactVersionMismatchError) as exc:
+                raise ManagedArtifactInventoryError("managed artifact inventory object was unsafe or unstable") from exc
         finally:
             os.close(descriptor)
 
@@ -1061,15 +1372,14 @@ class LocalManagedArtifactStore:
                         reference = self._reference_from_local_entry(kind, child.name)
                         if cursor is not None and reference.uri <= cursor:
                             continue
-                        metadata = self._local_inventory_metadata(Path(child.path), reference.uri)
+                        relative = self._relative_object(reference, org_id, project_id)
+                        metadata = self._local_inventory_metadata(Path(child.path), reference.uri, relative)
                         if metadata is None:
                             raise ManagedArtifactInventoryError(
                                 "managed artifact disappeared while its inventory page was being observed"
                             )
                         yield metadata
 
-        # nsmallest keeps memory bounded to one page even when a local scope has
-        # millions of objects. Invalid entries are still visited and fail closed.
         page = heapq.nsmallest(limit + 1, observed(), key=lambda item: item.uri)
         has_more = len(page) > limit
         selected = tuple(page[:limit])
@@ -1085,7 +1395,7 @@ class LocalManagedArtifactStore:
         org_id: str,
         project_id: str,
     ) -> ManagedArtifactObjectMetadata | None:
-        """Observe one scoped local object's authoritative size and file identity."""
+        """Observe one current local object's exact digest, size, and identity."""
 
         reference = parse_managed_uri(uri)
         relative = self._relative_object(reference, org_id, project_id)
@@ -1093,13 +1403,115 @@ class LocalManagedArtifactStore:
             with self._open_directory(relative.parts[:-1], create=False) as directory_fd:
                 descriptor = self._open_object(directory_fd, relative.name)
                 try:
-                    return self._metadata_from_descriptor(descriptor, reference.uri)
+                    return self._observe_descriptor(descriptor, reference.uri, relative)
                 finally:
                     os.close(descriptor)
         except FileNotFoundError:
             return None
+        except ManagedArtifactVersionMismatchError as exc:
+            raise ManagedArtifactInventoryError("managed artifact changed during metadata observation") from exc
         except OSError as exc:
             raise ManagedArtifactInventoryError("could not observe managed artifact inventory object") from exc
+
+    def _remove_absent_generation(self, relative: Path, expected: _LocalObjectVersion) -> None:
+        if expected.generation_digest is None:
+            return
+        try:
+            with self._open_generation_directory(relative, create=False) as generation_fd:
+                name = f"{expected.generation_digest}.artifact"
+                descriptor = self._open_object(generation_fd, name)
+                try:
+                    metadata = self._regular_stat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode):
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local generation anchor no longer names the requested version"
+                        )
+                    if metadata.st_nlink != 1:
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local generation anchor has an unrecognized surviving link"
+                        )
+                    os.unlink(name, dir_fd=generation_fd)
+                    os.fsync(generation_fd)
+                finally:
+                    os.close(descriptor)
+        except FileNotFoundError:
+            return
+        except ManagedArtifactDeleteInconclusiveError:
+            raise
+        except Exception:
+            raise ManagedArtifactDeleteInconclusiveError("local managed artifact deletion was inconclusive") from None
+
+    def _preserve_detached_entry(self, directory_fd: int, staging_name: str) -> None:
+        try:
+            with self._open_control_directory(self._QUARANTINE_DIRECTORY, create=True) as quarantine_fd:
+                for _attempt in range(128):
+                    quarantine_name = f"detached-{os.getpid()}-{os.urandom(16).hex()}"
+                    try:
+                        os.stat(quarantine_name, dir_fd=quarantine_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        continue
+                    try:
+                        os.rename(
+                            staging_name,
+                            quarantine_name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=quarantine_fd,
+                        )
+                    except FileNotFoundError:
+                        return
+                    os.fsync(quarantine_fd)
+                    os.fsync(directory_fd)
+                    return
+        except OSError:
+            # Leaving a random staging entry makes inventory fail closed but is
+            # still preferable to deleting an entry whose identity is unknown.
+            return
+
+    def _restore_detached_entry(self, directory_fd: int, staging_name: str, canonical_name: str) -> bool:
+        """Restore without overwriting a later current entry; never delete the detached bytes."""
+
+        try:
+            os.link(
+                staging_name,
+                canonical_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            self._preserve_detached_entry(directory_fd, staging_name)
+            return False
+        except OSError:
+            self._preserve_detached_entry(directory_fd, staging_name)
+            return False
+        try:
+            os.unlink(staging_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except OSError:
+            return False
+        return True
+
+    def _current_mismatch_result(
+        self,
+        uri: str,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> ManagedArtifactDeleteResult:
+        try:
+            current = self.stat(uri, org_id=org_id, project_id=project_id)
+        except (InvalidManagedArtifactURI, ManagedArtifactInventoryError):
+            raise ManagedArtifactDeleteInconclusiveError(
+                "local managed artifact replacement could not be observed safely"
+            ) from None
+        if current is None:
+            raise ManagedArtifactDeleteInconclusiveError("local managed artifact replacement could not be restored")
+        return ManagedArtifactDeleteResult(
+            ManagedArtifactDeleteStatus.VERSION_MISMATCH,
+            current_metadata=current,
+        )
 
     def delete_versioned(
         self,
@@ -1109,10 +1521,10 @@ class LocalManagedArtifactStore:
         project_id: str,
         object_version: str,
     ) -> ManagedArtifactDeleteResult:
-        """Unlink only the exact scoped local file identity supplied by the caller."""
+        """Delete an exact inode without ever unlinking the canonical pathname."""
 
         reference = parse_managed_uri(uri)
-        _parse_local_object_version(object_version)
+        expected = _parse_local_object_version(object_version)
         relative = self._relative_object(reference, org_id, project_id)
         with self._object_lock(reference, org_id, project_id):
             try:
@@ -1120,24 +1532,105 @@ class LocalManagedArtifactStore:
                     try:
                         descriptor = self._open_object(directory_fd, relative.name)
                     except FileNotFoundError:
+                        self._remove_absent_generation(relative, expected)
                         return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
+                    staging_name = f".eyvan-delete-{os.getpid()}-{os.urandom(16).hex()}"
+                    detached = False
                     try:
-                        current = self._metadata_from_descriptor(descriptor, reference.uri)
-                        if current.object_version != object_version:
+                        current = self._read_descriptor(
+                            descriptor,
+                            reference.uri,
+                            relative,
+                            conflict_on_unsafe=True,
+                        )
+                        if current.metadata.object_version != object_version:
                             return ManagedArtifactDeleteResult(
                                 ManagedArtifactDeleteStatus.VERSION_MISMATCH,
-                                current_metadata=current,
+                                current_metadata=current.metadata,
                             )
+                        expected_stat = self._regular_stat(descriptor, conflict_on_non_file=True)
                         try:
-                            os.unlink(relative.name, dir_fd=directory_fd)
+                            os.rename(
+                                relative.name,
+                                staging_name,
+                                src_dir_fd=directory_fd,
+                                dst_dir_fd=directory_fd,
+                            )
                         except FileNotFoundError:
+                            self._remove_absent_generation(relative, expected)
                             return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
+                        detached = True
+
+                        try:
+                            staged_lstat = os.stat(staging_name, dir_fd=directory_fd, follow_symlinks=False)
+                        except OSError:
+                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                            detached = False
+                            raise ManagedArtifactDeleteInconclusiveError(
+                                "local managed artifact deletion was inconclusive"
+                            ) from None
+                        if not self._same_inode(staged_lstat, expected_stat):
+                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                            detached = False
+                            return self._current_mismatch_result(
+                                reference.uri,
+                                org_id=org_id,
+                                project_id=project_id,
+                            )
+
+                        staged_descriptor = self._open_object(directory_fd, staging_name)
+                        try:
+                            staged_stat = self._regular_stat(staged_descriptor, conflict_on_non_file=True)
+                            if not self._same_inode(staged_stat, expected_stat):
+                                self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                                detached = False
+                                return self._current_mismatch_result(
+                                    reference.uri,
+                                    org_id=org_id,
+                                    project_id=project_id,
+                                )
+                            expected_links = 2 if expected.generation_digest is not None else 1
+                            if staged_stat.st_nlink != expected_links:
+                                self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                                detached = False
+                                raise ManagedArtifactDeleteInconclusiveError(
+                                    "local managed artifact has an unrecognized hard link"
+                                )
+                        finally:
+                            os.close(staged_descriptor)
+
+                        os.unlink(staging_name, dir_fd=directory_fd)
+                        detached = False
                         os.fsync(directory_fd)
-                        return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.DELETED)
+                        self._remove_absent_generation(relative, expected)
+                    except ManagedArtifactDeleteInconclusiveError:
+                        if detached:
+                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                        raise
+                    except Exception:
+                        if detached:
+                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local managed artifact deletion was inconclusive"
+                        ) from None
                     finally:
                         os.close(descriptor)
             except FileNotFoundError:
+                self._remove_absent_generation(relative, expected)
                 return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
+
+            try:
+                replacement = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+            except (InvalidManagedArtifactURI, ManagedArtifactInventoryError):
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "local managed artifact post-delete observation was inconclusive"
+                ) from None
+            if replacement is not None:
+                return ManagedArtifactDeleteResult(
+                    ManagedArtifactDeleteStatus.VERSION_MISMATCH,
+                    current_metadata=replacement,
+                )
+            return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.DELETED)
 
     def delete(self, uri: str, *, org_id: str, project_id: str) -> bool:
         """Compatibility wrapper that conditionally removes the observed object."""
@@ -1187,9 +1680,17 @@ class GCSManagedArtifactStore:
         self.root_uri = f"gs://{parsed.netloc}{suffix}"
         self._bucket = parsed.netloc
         self._root_object_prefix = "/".join(components)
+        if not callable(runner) or not callable(inventory_transport) or not callable(access_token_provider):
+            raise TypeError("GCS command runner, inventory transport, and access token provider must be callable")
         self._runner = runner
-        if not callable(inventory_transport) or not callable(access_token_provider):
-            raise TypeError("GCS inventory transport and access token provider must be callable")
+        try:
+            runner_signature = inspect.signature(runner)
+        except (TypeError, ValueError):
+            self._runner_accepts_timeout = runner is subprocess.run
+        else:
+            self._runner_accepts_timeout = "timeout" in runner_signature.parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in runner_signature.parameters.values()
+            )
         if (
             isinstance(inventory_timeout_seconds, bool)
             or not isinstance(inventory_timeout_seconds, (int, float))
@@ -1200,17 +1701,26 @@ class GCSManagedArtifactStore:
         self._access_token_provider = access_token_provider
         self._inventory_timeout_seconds = float(inventory_timeout_seconds)
 
+    def _run_gcloud(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+        """Run one transfer command with a production deadline.
+
+        The timeout keyword is omitted only for legacy injected runners whose
+        inspected signature predates the additive runner contract. The default
+        ``subprocess.run`` path and all conforming runners always receive it.
+        """
+
+        arguments: dict[str, tp.Any] = {"check": False, "capture_output": True}
+        if self._runner_accepts_timeout:
+            arguments["timeout"] = _GCS_TRANSFER_TIMEOUT_SECONDS
+        return self._runner(args, **arguments)
+
     def _object_uri(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> str:
         relative = _relative_object_path(reference, org_id, project_id).as_posix()
         return f"{self.root_uri}/{relative}"
 
     def _get_object(self, object_uri: str) -> bytes:
         try:
-            completed = self._runner(
-                ["gcloud", "storage", "cat", object_uri],
-                check=False,
-                capture_output=True,
-            )
+            completed = self._run_gcloud(["gcloud", "storage", "cat", object_uri])
         except Exception:
             raise ManagedArtifactOperationInconclusiveError("GCS managed artifact read failed") from None
         if completed.returncode != 0 or not isinstance(completed.stdout, bytes):
@@ -1238,21 +1748,37 @@ class GCSManagedArtifactStore:
         try:
             payload = self._get_object(self._object_uri(reference, org_id, project_id))
         except ManagedArtifactOperationInconclusiveError:
-            current = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+            try:
+                current = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+            except ManagedArtifactInventoryError:
+                raise ManagedArtifactOperationInconclusiveError(
+                    "GCS managed artifact read verification failed"
+                ) from None
             if current is None:
                 raise FileNotFoundError("managed artifact object is absent") from None
             if current.object_version != before.object_version:
                 raise ManagedArtifactVersionMismatchError("managed artifact object changed while it was read") from None
             raise
-        after = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+        try:
+            after = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+        except ManagedArtifactInventoryError:
+            raise ManagedArtifactOperationInconclusiveError("GCS managed artifact read verification failed") from None
         if after is None:
             raise FileNotFoundError("managed artifact object is absent")
         if after.object_version != before.object_version:
             raise ManagedArtifactVersionMismatchError("managed artifact object changed while it was read")
         if after != before:
-            raise ManagedArtifactInventoryError("GCS returned inconsistent metadata for one object generation")
+            raise ManagedArtifactOperationInconclusiveError(
+                "GCS returned inconsistent metadata for one object generation"
+            )
         payload = _validate_loaded_payload(reference, payload)
-        return ManagedArtifactRead(payload=payload, metadata=after)
+        observed_metadata = ManagedArtifactObjectMetadata(
+            uri=after.uri,
+            size_bytes=after.size_bytes,
+            object_version=after.object_version,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        return ManagedArtifactRead(payload=payload, metadata=observed_metadata)
 
     def _matching_current_write(
         self,
@@ -1323,13 +1849,16 @@ class GCSManagedArtifactStore:
                 object_uri,
             ]
             try:
-                completed = self._runner(command, check=False, capture_output=True)
+                completed = self._run_gcloud(command)
                 command_succeeded = completed.returncode == 0
             except Exception:
                 command_succeeded = False
         finally:
             if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         try:
             observed = self._matching_current_write(
@@ -1339,7 +1868,9 @@ class GCSManagedArtifactStore:
                 project_id=project_id,
                 created=True if command_succeeded else None,
             )
-        except ManagedArtifactOperationInconclusiveError:
+        except ManagedArtifactConflictError:
+            raise
+        except (ManagedArtifactInventoryError, ManagedArtifactOperationInconclusiveError, OSError, ValueError):
             raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write was inconclusive") from None
         if observed is not None:
             return observed
@@ -1700,20 +2231,39 @@ class GCSManagedArtifactStore:
             self._object_uri(reference, org_id, project_id),
         ]
         try:
-            completed = self._runner(command, check=False, capture_output=True)
+            completed = self._run_gcloud(command)
             command_succeeded = completed.returncode == 0
         except Exception:
             command_succeeded = False
         if command_succeeded:
             return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.DELETED)
 
-        current = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+        try:
+            current = self.stat(reference.uri, org_id=org_id, project_id=project_id)
+        except (ManagedArtifactInventoryError, ManagedArtifactOperationInconclusiveError):
+            raise ManagedArtifactDeleteInconclusiveError("GCS managed artifact deletion was inconclusive") from None
         if current is None:
             return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
         if current.object_version != object_version:
+            try:
+                replacement = self.get_versioned(
+                    reference.uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                    object_version=current.object_version,
+                )
+            except (
+                FileNotFoundError,
+                ManagedArtifactInventoryError,
+                ManagedArtifactOperationInconclusiveError,
+                ManagedArtifactVersionMismatchError,
+                OSError,
+                ValueError,
+            ):
+                raise ManagedArtifactDeleteInconclusiveError("GCS managed artifact deletion was inconclusive") from None
             return ManagedArtifactDeleteResult(
                 ManagedArtifactDeleteStatus.VERSION_MISMATCH,
-                current_metadata=current,
+                current_metadata=replacement.metadata,
             )
         raise ManagedArtifactDeleteInconclusiveError("GCS managed artifact deletion was inconclusive")
 
