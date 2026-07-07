@@ -37,12 +37,35 @@ from datetime import datetime, timedelta
 from eyvan._internal.compat import StrEnum
 from eyvan.records import (
     CellState,
+    LeaseState,
     OutboxState,
     WorkloadState,
     utcnow,
 )
 from eyvan.server.persistence.base import Repository
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.soak_contract import (
+    MAX_PARTICIPANTS,
+    SAFE_CAPACITY_BACKENDS,
+    SAFE_CAPACITY_CLASSES,
+    SAFE_COORDINATION_KINDS,
+    SAFE_EXECUTION_KINDS,
+    SAFE_EXECUTORS,
+    SAFE_PROVIDERS,
+    SOAK_CONFIG_METADATA_KEY,
+    SOAK_PROOF_METADATA_KEY,
+    BackendIdentity,
+    CapabilityIdentity,
+    ExecutionIdentity,
+    ParticipantBinding,
+    ParticipantExecutionIdentity,
+    ProviderIdentity,
+    is_opaque_id,
+    participant_manifest_sha256,
+    require_opaque_id,
+    safe_enum,
+    safe_period_id,
+)
 
 #: Workload states that mean "this workload holds capacity right now".
 #:
@@ -128,40 +151,203 @@ class Violation:
 
 
 @dataclass(frozen=True, slots=True)
-class FleetSnapshot:
-    """What one observation of the fleet recorded, for the over-time checks.
+class BudgetObservation:
+    """One budget value with revision and stable period identity kept separate."""
 
-    Deliberately small. A snapshot that carried whole records would make a soak
-    run's memory grow with its duration -- and the thing being watched for is
-    unbounded growth.
-    """
+    spent: float
+    revision: int
+    period_id: str
+    period_started_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class FleetSnapshot:
+    """Bounded durable state used by longitudinal and qualification checks."""
 
     observed_at: datetime
-    #: Spend per ``(org, project)``, and the budget period it was measured in.
-    #: The period matters: a roll resets ``spent``, and calling that a
-    #: monotonicity violation would fire on correct behaviour once a month.
-    budget_spend: dict[tuple[str, str], tuple[float, int]] = field(default_factory=dict)
-    #: Total managed-artifact bytes.
+    budget_spend: dict[tuple[str, str], BudgetObservation] = field(default_factory=dict)
     artifact_bytes: int = 0
     workload_count: int = 0
     cell_count: int = 0
+    #: Diagnostic global counts used by the operator endpoint. They are never P8
+    #: qualification coverage because unrelated fleet traffic can advance them.
+    execution_lease_counts: dict[ExecutionIdentity, int] = field(default_factory=dict)
+    #: Exact proof-scoped participants. Keys contain only opaque IDs and closed
+    #: identities; raw workload/lease/cell IDs remain request-local.
+    participant_execution_counts: dict[ParticipantExecutionIdentity, int] = field(default_factory=dict)
+    participant_manifest_sha256: str | None = None
 
 
-async def snapshot_fleet(repository: Repository, *, now: datetime | None = None) -> FleetSnapshot:
-    """Record the small set of figures the over-time invariants compare."""
+_EXECUTION_VALID_CELL_STATES: tp.Final[frozenset[CellState]] = frozenset({CellState.READY, CellState.DRAINING})
 
+
+def _execution_identity(workload: tp.Any, lease: tp.Any, cell: tp.Any) -> ExecutionIdentity:
+    executor_aliases = {
+        "local": "native-local",
+        "local-process": "native-local",
+        "native": "eyvan-native",
+        "native-remote": "eyvan-native",
+        "native-worker": "eyvan-native",
+        "eyvan": "eyvan-native",
+        "ray": "ray-jobs",
+        "rayjobs": "ray-jobs",
+    }
+    backend_aliases = {"k8s": "kubernetes", "compute": "gcp-compute", "tpu": "gcp-tpu"}
+    provider_aliases = {"k8s": "kubernetes", "gcp-compute": "gcp", "gcp-tpu": "gcp"}
+    resources = lease.resources.per_replica
+    if resources.tpu > 0:
+        resource_class = "tpu"
+    elif resources.gpu > 0:
+        resource_class = "gpu"
+    elif resources.cpu > 0:
+        resource_class = "cpu"
+    else:
+        resource_class = "other"
+    return ExecutionIdentity(
+        capability=CapabilityIdentity(
+            execution=safe_enum(workload.spec.execution.kind, SAFE_EXECUTION_KINDS),
+            checkpointable=workload.spec.checkpointable,
+            coordination=safe_enum(workload.coordination_kind, SAFE_COORDINATION_KINDS, missing="none"),
+            required_executor=safe_enum(
+                workload.spec.required_executor,
+                SAFE_EXECUTORS,
+                aliases=executor_aliases,
+                missing="any",
+            ),
+        ),
+        backend=BackendIdentity(
+            capacity_backend=safe_enum(
+                cell.capacity_backend or cell.provider,
+                SAFE_CAPACITY_BACKENDS,
+                aliases=backend_aliases,
+            ),
+            executor=safe_enum(cell.executor, SAFE_EXECUTORS, aliases=executor_aliases),
+        ),
+        provider=ProviderIdentity(
+            provider=safe_enum(cell.provider, SAFE_PROVIDERS, aliases=provider_aliases),
+            resource_class=resource_class,
+            capacity_class=safe_enum(cell.capacity_class, SAFE_CAPACITY_CLASSES),
+        ),
+    )
+
+
+async def snapshot_fleet(
+    repository: Repository,
+    *,
+    now: datetime | None = None,
+    proof_id: str | None = None,
+    config_sha256: str | None = None,
+    participants: tp.Iterable[ParticipantBinding] = (),
+) -> FleetSnapshot:
+    """Record bounded counters, optionally scoped to one immutable proof manifest.
+
+    Qualification coverage is present only when all three raw record IDs match
+    the frozen manifest, the workload is durably past queueing and carries the
+    proof/config binding, the lease crossed ``run_started_at``, and the exact cell
+    generation is currently valid for execution.
+    """
+
+    participant_tuple = tuple(sorted(set(participants)))
+    scoped = proof_id is not None or config_sha256 is not None or bool(participant_tuple)
+    if scoped:
+        require_opaque_id("proof_id", proof_id)
+        if not is_opaque_id(config_sha256):
+            raise ValueError("config_sha256 must be a lowercase sha256 identifier")
+        if not participant_tuple or len(participant_tuple) > MAX_PARTICIPANTS:
+            raise ValueError("a proof snapshot requires a bounded non-empty participant manifest")
     moment = now or utcnow()
     async with repository.transaction() as tx:
         budgets = await tx.list_budgets()
         artifacts = await tx.list_managed_artifacts()
+        artifact_references = await tx.list_artifact_references()
         workloads = await tx.list_workloads()
         cells = await tx.list_cells()
+        leases = await tx.list_leases()
+
+    workload_by_id = {workload.id: workload for workload in workloads}
+    cell_by_id = {cell.id: cell for cell in cells}
+    lease_by_id = {lease.id: lease for lease in leases}
+    execution_counts: dict[ExecutionIdentity, int] = {}
+
+    for lease in leases:
+        if lease.state is LeaseState.PENDING or lease.run_started_at is None:
+            continue
+        workload = workload_by_id.get(lease.workload_id)
+        cell = cell_by_id.get(lease.cell_id)
+        if workload is None or cell is None:
+            continue
+        if workload.state in {WorkloadState.PENDING, WorkloadState.ADMITTED}:
+            continue
+        if cell.state not in _EXECUTION_VALID_CELL_STATES or cell.generation != lease.cell_generation:
+            continue
+        identity = _execution_identity(workload, lease, cell)
+        execution_counts[identity] = execution_counts.get(identity, 0) + 1
+
+    participant_counts: dict[ParticipantExecutionIdentity, int] = {}
+    manifest_hash: str | None = None
+    if scoped:
+        assert proof_id is not None
+        assert config_sha256 is not None
+        manifest_hash = participant_manifest_sha256(proof_id, participant_tuple)
+        for participant in participant_tuple:
+            workload = workload_by_id.get(participant.workload_id)
+            lease = lease_by_id.get(participant.lease_id)
+            cell = cell_by_id.get(participant.cell_id)
+            if workload is None or lease is None or cell is None:
+                continue
+            if lease.workload_id != workload.id or lease.cell_id != cell.id:
+                continue
+            if workload.state in {WorkloadState.PENDING, WorkloadState.ADMITTED}:
+                continue
+            if lease.state is LeaseState.PENDING or lease.run_started_at is None:
+                continue
+            if cell.state not in _EXECUTION_VALID_CELL_STATES or cell.generation != lease.cell_generation:
+                continue
+            if workload.spec.metadata.get(SOAK_PROOF_METADATA_KEY) != proof_id:
+                continue
+            if workload.spec.metadata.get(SOAK_CONFIG_METADATA_KEY) != config_sha256:
+                continue
+            observed = ParticipantExecutionIdentity(
+                participant_id=participant.opaque_id(proof_id),
+                identity=_execution_identity(workload, lease, cell),
+            )
+            participant_counts[observed] = 1
+
+    selected_budgets = budgets
+    selected_artifacts = artifacts
+    selected_workloads = workloads
+    selected_cells = cells
+    if scoped:
+        participant_workload_ids = {participant.workload_id for participant in participant_tuple}
+        selected_workloads = [workload for workload in workloads if workload.id in participant_workload_ids]
+        selected_scopes = {(workload.org_id, workload.project_id) for workload in selected_workloads}
+        selected_budgets = [budget for budget in budgets if (budget.org_id, budget.project_id) in selected_scopes]
+        participant_cell_ids = {participant.cell_id for participant in participant_tuple}
+        selected_cells = [cell for cell in cells if cell.id in participant_cell_ids]
+        participant_uris = {
+            reference.uri for reference in artifact_references if reference.workload_id in participant_workload_ids
+        }
+        selected_artifacts = [artifact for artifact in artifacts if artifact.uri in participant_uris]
+
     return FleetSnapshot(
         observed_at=moment,
-        budget_spend={(budget.org_id, budget.project_id): (budget.spent, budget.revision) for budget in budgets},
-        artifact_bytes=sum(artifact.size_bytes for artifact in artifacts),
-        workload_count=len(workloads),
-        cell_count=len([cell for cell in cells if cell.state is not CellState.DELETED]),
+        budget_spend={
+            (budget.org_id, budget.project_id): BudgetObservation(
+                spent=budget.spent,
+                revision=budget.revision,
+                period_id=safe_period_id(
+                    budget.period_started_at.isoformat() if budget.period_started_at is not None else None
+                ),
+                period_started_at=budget.period_started_at,
+            )
+            for budget in selected_budgets
+        },
+        artifact_bytes=sum(artifact.size_bytes for artifact in selected_artifacts),
+        workload_count=len(selected_workloads),
+        cell_count=len([cell for cell in selected_cells if cell.state is not CellState.DELETED]),
+        execution_lease_counts=execution_counts,
+        participant_execution_counts=participant_counts,
+        participant_manifest_sha256=manifest_hash,
     )
 
 
@@ -316,22 +502,33 @@ def compare_snapshots(
     """
 
     violations: list[Violation] = []
-    for scope, (spent, revision) in current.budget_spend.items():
+    for scope, current_budget in current.budget_spend.items():
         before = previous.budget_spend.get(scope)
         if before is None:
             continue
-        previous_spent, previous_revision = before
-        if revision != previous_revision:
-            # A period roll resets ``spent`` deliberately. Calling that a
-            # monotonicity violation would fire on correct behaviour once a
-            # month, which is how an invariant gets muted.
-            continue
-        if spent < previous_spent:
+        finding: str | None = None
+        if current_budget.revision < before.revision:
+            finding = "revision regressed"
+        elif current_budget.period_id == before.period_id:
+            if current_budget.period_started_at != before.period_started_at:
+                finding = "period identity conflicted with its start"
+            elif current_budget.spent < before.spent:
+                finding = "spend decreased within one period"
+        else:
+            proved_advance = (
+                before.period_started_at is not None
+                and current_budget.period_started_at is not None
+                and current_budget.period_started_at > before.period_started_at
+                and current_budget.revision > before.revision
+            )
+            if not proved_advance:
+                finding = "spend period changed without a proved forward period transition"
+        if finding is not None:
             violations.append(
                 Violation(
                     Invariant.BUDGET_SPEND_IS_MONOTONE,
                     f"{scope[0]}/{scope[1]}",
-                    f"budget {scope[0]}/{scope[1]} spend fell from {previous_spent} to {spent} without a period roll",
+                    f"budget {scope[0]}/{scope[1]} {finding}",
                 )
             )
     if max_artifact_bytes is not None and current.artifact_bytes > max_artifact_bytes:
@@ -352,6 +549,7 @@ __all__ = (
     "LIVE_CELL_STATES",
     "RETENTION_SLACK_FACTOR",
     "STUCK_OUTBOX_AFTER_S",
+    "BudgetObservation",
     "FleetSnapshot",
     "Invariant",
     "Violation",

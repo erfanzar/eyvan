@@ -110,23 +110,96 @@ fire, so silence means the checks ran and found nothing. The two invariants
 about *change over time* -- budget monotonicity and storage growth -- cannot be
 settled by one call and are not reported here.
 
-## The unattended run
+## The unattended evaluator
+
+The soak command is a fail-closed **host-side evaluator**, not a provider or
+hardware attestation. A proof run supplies one opaque 256-bit proof ID, a frozen
+configuration snapshot, and the exact workload/lease/cell joins whose durable
+run transitions it expects:
 
 ```
-eyvan soak --hours 72 --interval-s 60 --output soak.json
+eyvan soak \
+  --candidate-sha <full-candidate-sha> \
+  --source-sha <full-source-commit-sha> \
+  --proof-id sha256:<64-lowercase-hex> \
+  --config <sanitized-cpu-run-config.yaml> \
+  --config <sanitized-tpu-run-config.yaml> \
+  --config-snapshot-dir <durable-local-snapshot-directory> \
+  --expect-execution <cpu-workload>,<cpu-lease>,<cpu-cell>,command,false,none,eyvan-native,gcp-compute,eyvan-native,gcp,cpu,spot \
+  --expect-execution <tpu-workload>,<tpu-lease>,<tpu-cell>,callable,true,none,eyvan-native,gcp-tpu,eyvan-native,gcp,tpu,spot \
+  --max-rss-growth-bytes <bound> \
+  --max-fd-growth <bound> \
+  --max-database-growth-bytes <bound> \
+  --max-artifact-net-growth-bytes <bound> \
+  --hours 72 --interval-s 60 --output soak.json
 ```
 
-Polls the invariants, keeps each tick's snapshot so the over-time properties can
-be decided at all, and exits non-zero if anything was violated *persistently*. A
-violation seen once is not a finding: the point-in-time checks race with the
-sweeps that fix them, and a run that failed on that race would fail every time
-while proving nothing.
+All numeric options are parsed as bounded decimal/integer text inside the
+command, after the output path is known. `nan`, `inf`, decimal overflow, counter
+overflow, and an excessive observation grid produce an atomic
+`not_started`/`inconclusive` receipt. In particular, `--hours 0.07
+--interval-s 0.1` means exactly 252 seconds and 2,520 slots; no binary-float
+rounding invents a 2,521st slot.
 
-It does not stop on the first problem, and an unreachable control plane does not
-end it. Surviving a restart is among the things the run exists to observe.
+The command reads each `--config` once, bounds the total bytes/file count, and
+atomically materializes those captured bytes under their combined digest in
+`--config-snapshot-dir`. It never polls the mutable source paths afterwards.
+The workloads used by the run must be launched from that frozen snapshot and
+must persist both bindings in `WorkloadDefinition.metadata`:
 
-This is the evidence no code change substitutes for. Everything else Eyvan
-claims was proven with a human watching, over minutes.
+- `eyvan.soak.proof_id` = the exact `--proof-id`; and
+- `eyvan.soak.config_sha256` = the running receipt's `config_hash`.
+
+A matching string is durable state evidence, not proof that a remote process
+actually read those bytes. Keep the frozen snapshot and provider-side evidence
+with the qualification bundle. Start observation before the listed leases cross
+their durable run boundary. Coverage advances only for an exact manifest join
+where the workload is past queueing, `run_started_at` is set, the workload/lease/
+cell IDs agree, the cell generation is current and READY/DRAINING, and the two
+metadata bindings match. Unrelated fleet traffic, a PENDING workload, a stale
+cell generation, or three independently matching capability/backend/provider
+projections cannot satisfy one expected **joint** identity. The evaluator
+requires at least one CPU and one TPU joint path. Provider/resource fields come
+from durable records and are explicitly reported as
+`durable_control_plane_state`; `hardware_attested` remains false.
+
+Only `timeout` and transport `unreachable` failures may consume the two explicit
+availability limits. Authorization, server, request/schema/counter overflow,
+filesystem, and internal failures always block pass even when the availability
+limits are non-zero. Budget samples carry stable period identity and
+`period_started_at` separately from revision. Revision may advance during
+ordinary settlement and spend is still compared; a reset is accepted only when
+both period time and revision prove a forward period transition.
+
+Receipts have a closed export schema. Reasons are fixed codes with counts;
+violation subjects are domain-separated `sha256:` IDs; detail text is discarded.
+Invalid candidates, sources, participant specs, arbitrary extra reasons,
+exception text, tenant/project names, URIs, buckets, and secrets are never
+copied into the receipt. The output is fsynced and atomically replaced with a
+blocking receipt before the first request and after every attempt.
+
+The evaluator also requires bounded RSS peak growth, FD peak growth, database
+peak growth and artifact net growth; reconciled spend; and final cleanup with an
+empty provider inventory. These values must arrive as proof-bound
+`eyvan.soak.external-evidence.v1` samples. The current control-plane invariant
+endpoint deliberately returns `p8_evidence: null`: it cannot truthfully infer
+process/DB size or provider inventory from durable cell rows. Therefore a run
+against the current endpoint exits **2 / inconclusive** with explicit
+`*_evidence_missing` codes. It must not be called a P8 result.
+
+Verdicts are:
+
+- **1 / fail** — a persistent invariant, monotonicity defect, exceeded growth
+  bound, unreconciled spend, residual provider inventory, or incomplete cleanup
+  was observed;
+- **2 / inconclusive** — the run/input/evidence/coverage is incomplete or a
+  non-transient observation error occurred; and
+- **0 / pass** — reserved for the evaluator only when every closed criterion is
+  supplied and satisfied. It is still not hardware attestation by itself.
+
+No receipt in this repository claims a provider, TPU, GPU, or P8 qualification
+run has completed; see [proofs.md](proofs.md).
+
 
 ## Debugging one workload
 
