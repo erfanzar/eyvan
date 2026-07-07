@@ -31,18 +31,23 @@ from eyvan.records import (
     NativeContainerMount,
     native_container_mount_targets_overlap,
 )
+from eyvan.secrets import redact_secret_material
 from eyvan.worker.runtime.oci_callable_stager import (
     OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY,
     OCI_CALLABLE_RUNNER_FILENAME,
     stage_oci_callable_runner,
 )
 from eyvan.worker.runtime.systemd_transient import (
+    _OUTPUT_SUPPRESSED,
     SystemdCommandRunner,
     SystemdTransientServiceExecutor,
+    _durable_unlink,
+    _ensure_private_directory,
     _environment,
     _file_lock,
     _load_json,
     _record_lock_path,
+    _record_secret_bearing,
     _write_environment_file,
 )
 
@@ -135,7 +140,13 @@ def _container_state(payload: tp.Mapping[str, JsonValue]) -> tuple[_ContainerSta
     raw_exit_code = raw_state.get("ExitCode")
     if raw_exit_code is not None and (isinstance(raw_exit_code, bool) or not isinstance(raw_exit_code, int)):
         return None, "Docker inspection State has a non-integer ExitCode"
-    return _ContainerState(name=raw_name.strip().lower(), error=raw_error.strip(), exit_code=raw_exit_code), ""
+    return _ContainerState(
+        name=raw_name.strip().lower(),
+        # Docker's OCI error can quote environment-expanded command fragments.
+        # Presence is useful; its untrusted text is not safe to return.
+        error="Docker reported a container error" if raw_error.strip() else "",
+        exit_code=raw_exit_code,
+    ), ""
 
 
 def docker_container_name(remote_id: str) -> str:
@@ -272,13 +283,16 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             workload_directory=None,
             base_environment=base_environment,
             command_timeout_s=command_timeout_s,
+            _defer_startup_recovery=True,
         )
+        self.containers_dir = self.state_dir / "containers"
+        _ensure_private_directory(self.containers_dir)
+        # Sweep Docker's plaintext atomic temporaries before staging any helper:
+        # even a later construction failure must not strand a prior crash's value.
+        self._recover_startup()
         self._oci_callable_runner_directory = self.state_dir / _OCI_CALLABLE_RUNNER_DIRECTORY_NAME
         self._oci_callable_runner = stage_oci_callable_runner(self._oci_callable_runner_directory)
         self._automatic_mounts = self._build_automatic_mounts()
-        self.containers_dir = self.state_dir / "containers"
-        self.containers_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.containers_dir.chmod(0o700)
         if verify_docker:
             self._verify_docker()
 
@@ -334,8 +348,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
     def _verify_docker(self) -> None:
         result = self._run(("docker", "version", "--format", "{{.Server.Version}}"))
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "Docker daemon is unavailable"
-            raise RuntimeError(f"native OCI runtime requires a working Docker daemon: {detail}")
+            raise RuntimeError("native OCI runtime requires a working Docker daemon")
         if not result.stdout.strip():
             raise RuntimeError("native OCI runtime could not determine the Docker server version")
 
@@ -347,6 +360,16 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
 
     def _container_env_file_path(self, remote_id: str) -> Path:
         return self.containers_dir / f"{hashlib.sha256(remote_id.encode('utf-8')).hexdigest()}.env"
+
+    def _environment_file_paths(self, remote_id: str) -> tuple[Path, ...]:
+        # Include the base path for upgrade cleanup even though this executor
+        # writes only Docker's env file today. Missing paths are idempotent.
+        return (*super()._environment_file_paths(remote_id), self._container_env_file_path(remote_id))
+
+    def _environment_temporary_directories(self) -> tuple[Path, ...]:
+        """Include Docker's owner-only env directory in construction recovery."""
+
+        return (*super()._environment_temporary_directories(), self.containers_dir)
 
     def _record_fields(
         self,
@@ -389,10 +412,10 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             if not is_json_object(payload):
                 return "unavailable", None, "Docker returned a non-object container inspection"
             return "present", payload, ""
-        detail = result.stderr.strip() or result.stdout.strip()
-        if "no such container" in detail.lower() or "no such object" in detail.lower():
-            return "missing", None, detail
-        return "unavailable", None, detail or "Docker container inspect failed"
+        raw_detail = result.stderr.strip() or result.stdout.strip()
+        if "no such container" in raw_detail.lower() or "no such object" in raw_detail.lower():
+            return "missing", None, "Docker container is absent"
+        return "unavailable", None, "Docker container inspect failed"
 
     def _container_record_reference(self, record: tp.Mapping[str, JsonValue]) -> tuple[str, ...]:
         references: list[str] = []
@@ -441,18 +464,16 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         if not isinstance(cidfile, str) or not cidfile:
             raise RuntimeError("native OCI execution record has no container cidfile")
         try:
-            Path(cidfile).unlink(missing_ok=True)
-        except OSError as exc:
-            raise RuntimeError(f"could not clear stale native OCI cidfile: {exc}") from exc
+            _durable_unlink(Path(cidfile))
+        except OSError:
+            raise RuntimeError("could not clear stale native OCI cidfile") from None
         remote_id = record.get("remote_id")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("native OCI execution record has no remote ID")
         # The container environment travels as one owner-only 0600 env file so
         # neither the unit argv nor the Docker command line exposes values.
-        _write_environment_file(
-            self._container_env_file_path(remote_id),
-            self._container_environment(_environment(spec)),
-        )
+        launch_environment = self._resolved_launch_environment(self._container_environment(_environment(spec)))
+        _write_environment_file(self._container_env_file_path(remote_id), launch_environment)
 
     def _launch_command(
         self,
@@ -558,6 +579,14 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             record = _load_json(record_path)
         if record is None:
             return {"remote_id": remote_id, "observed": False, "detail": "no durable execution record"}
+        if _record_secret_bearing(record):
+            return {
+                "remote_id": remote_id,
+                "runtime": "native-container",
+                "observed": False,
+                "detail": _OUTPUT_SUPPRESSED,
+                "output_suppressed": True,
+            }
 
         outcome, payload, detail = self._observed_container(record)
         if outcome != "present" or payload is None:
@@ -652,20 +681,18 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         reference = references[0]
         if state.name == "created":
             result = self._run(("docker", "rm", "--force", reference))
-            verify_outcome, _verify_payload, verify_detail = self._observed_container(mutable_record)
+            verify_outcome, _verify_payload, _verify_detail = self._observed_container(mutable_record)
             if verify_outcome == "missing":
                 return
             if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or verify_detail or "docker rm failed"
-                raise RuntimeError(detail)
+                raise RuntimeError("Docker could not remove the native OCI container")
             raise RuntimeError("Docker remove returned successfully but the created native OCI container still exists")
         result = self._run(("docker", "stop", "--time", str(self._docker_stop_timeout_s), reference))
-        settled, verify_detail = self._container_settled_after_stop(mutable_record)
+        settled, _verify_detail = self._container_settled_after_stop(mutable_record)
         if settled:
             return
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or verify_detail or "docker stop failed"
-            raise RuntimeError(detail)
+            raise RuntimeError("Docker could not stop the native OCI container")
         raise RuntimeError("Docker stop returned successfully but the native OCI container is still active")
 
     def _container_settled_after_stop(self, record: JsonObject) -> tuple[bool, str]:
@@ -712,12 +739,11 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         if not references:
             raise RuntimeError("native OCI execution record has no container reference")
         result = self._run(("docker", "rm", "--force", references[0]))
-        verify_outcome, _verify_payload, verify_detail = self._observed_container(mutable_record)
+        verify_outcome, _verify_payload, _verify_detail = self._observed_container(mutable_record)
         if verify_outcome == "missing":
             return
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or verify_detail or "docker rm failed"
-            raise RuntimeError(detail)
+            raise RuntimeError("Docker could not remove the native OCI container")
         raise RuntimeError("Docker remove returned successfully but the native OCI container still exists")
 
     def _after_systemd_stop(self, record: tp.Mapping[str, JsonValue]) -> None:
@@ -735,7 +761,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         if not references:
             return None
         result = self._run(("docker", "logs", references[0]))
-        return result.stdout if result.returncode == 0 else None
+        return redact_secret_material(result.stdout) if result.returncode == 0 else None
 
 
 __all__ = ("DockerContainerExecutor", "docker_container_name")

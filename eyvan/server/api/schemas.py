@@ -11,7 +11,7 @@ import typing as tp
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan.records import (
     DEFAULT_MAX_RETRIES,
@@ -35,6 +35,7 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadRecord,
     WorkspaceRef,
+    validate_secret_mount_contract,
 )
 from eyvan.server.api.server_startup import ServerControllerMode
 from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
@@ -193,6 +194,13 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: separately to the content-addressed workspace route, then referenced here.
     workspace: WorkspaceRef | None = None
 
+    @model_validator(mode="after")
+    def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
+        """Reject mount names the resulting workload environment cannot hold."""
+
+        validate_secret_mount_contract(self.environment, self.secret_mounts)
+        return self
+
 
 class PoolCallableSubmitRequest(ApiModel):
     """Callable intent whose TPU placement is derived from an enabled Spot fleet pool."""
@@ -213,6 +221,13 @@ class PoolCallableSubmitRequest(ApiModel):
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
     max_preemption_retries: int = Field(default=10, ge=0)
+
+    @model_validator(mode="after")
+    def validate_secret_mounts(self) -> PoolCallableSubmitRequest:
+        """Reject mount names the resulting workload environment cannot hold."""
+
+        validate_secret_mount_contract(self.environment, self.secret_mounts)
+        return self
 
 
 class PreemptionForceFinalizeRequest(ApiModel):

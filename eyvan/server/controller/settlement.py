@@ -106,7 +106,10 @@ class _ControllerSettlement:
         on the same machine anyway.
         """
 
-        if self.artifact_access is None or workload.remote_id is None:
+        if self.artifact_access is None or workload.remote_id is None or workload.spec.secret_mounts:
+            # Durable secret-bearing executions intentionally have no archived
+            # output: exact streaming redaction cannot be reconstructed after a
+            # worker restart without persisting the plaintext values themselves.
             return
         try:
             page = await self.workload_log_page(workload.id, limit=_LOG_ARCHIVE_LINE_LIMIT)

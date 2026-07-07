@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from datetime import timedelta
 
 import pytest
 
@@ -34,6 +35,7 @@ from eyvan.artifacts.secret_capability import (
     SecretCapabilitySigner,
 )
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
+from eyvan.secrets import MAX_SECRET_BYTES
 from eyvan.worker.runtime.secret_materialization import (
     SecretMaterializationError,
     materialize_secrets,
@@ -41,18 +43,28 @@ from eyvan.worker.runtime.secret_materialization import (
 )
 
 SECRET = b"k" * 32
+DISPATCH_FENCE = "dispatch_test_fence"
 
 
 def _signer(*, ttl_seconds: float = 3600, clock=time.time) -> SecretCapabilitySigner:
     return SecretCapabilitySigner(SECRET, ttl_seconds=ttl_seconds, clock=clock)
 
 
-def _issue(signer: SecretCapabilitySigner, *, attempt: int = 1, name: str = "HF_TOKEN") -> str:
+def _issue(
+    signer: SecretCapabilitySigner,
+    *,
+    attempt: int = 1,
+    generation: int = 1,
+    dispatch_fence: str = DISPATCH_FENCE,
+    name: str = "HF_TOKEN",
+) -> str:
     return signer.issue(
         workload_id="wl-1",
         org_id="acme",
         project_id="research",
         attempt=attempt,
+        generation=generation,
+        dispatch_fence=dispatch_fence,
         name=name,
     )
 
@@ -170,6 +182,9 @@ async def test_a_workload_with_mounts_receives_capabilities_at_dispatch(tmp_path
         project_id="research",
     )
     assert claims.attempt == workload.attempt
+    assert claims.generation == workload.generation
+    assert workload.dispatch_reservation is not None
+    assert claims.dispatch_fence == workload.dispatch_reservation.fence
 
 
 async def test_the_capability_carries_the_attempt_being_dispatched(tmp_path) -> None:
@@ -215,11 +230,11 @@ async def test_a_workload_without_mounts_receives_no_scaffolding(tmp_path) -> No
 
 
 async def test_dispatch_records_which_mounts_were_granted(tmp_path) -> None:
-    """One issuance event per attempt, in the dispatch transaction.
+    """One issuance event per fenced dispatch, before the agent RPC.
 
-    It is the pairing that carries the signal: a ``secret.read`` for an attempt
+    It is the pairing that carries the signal: a ``secret.read`` for a dispatch
     with no matching ``secret.issued`` is a capability being used outside the
-    dispatch that minted it.
+    reservation that minted it.
     """
 
     _environment, workload, _signer = await _dispatch_with_mounts(tmp_path)
@@ -251,6 +266,134 @@ def test_the_agent_resolves_declared_mounts_into_the_launch_environment() -> Non
     )
 
     assert resolved == {"HF_TOKEN": "value-for-HF_TOKEN", "WANDB_KEY": "value-for-WANDB_KEY"}
+
+
+def test_the_worker_accepts_exactly_one_mibibyte_and_rejects_one_byte_more() -> None:
+    environment = {
+        "EYVAN_SECRET_COUNT": "1",
+        "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+        "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+        "EYVAN_SECRET_0_TOKEN": "eyvs1.capability.signature",
+    }
+
+    exact = materialize_secrets(environment, fetch=lambda _url, _token: b"x" * MAX_SECRET_BYTES)
+    assert exact["HF_TOKEN"] == "x" * MAX_SECRET_BYTES
+
+    with pytest.raises(SecretMaterializationError, match="exceeds") as captured:
+        materialize_secrets(environment, fetch=lambda _url, _token: b"x" * (MAX_SECRET_BYTES + 1))
+    assert "x" * 64 not in str(captured.value)
+
+
+def test_the_worker_reads_one_byte_past_the_limit_instead_of_slicing(monkeypatch) -> None:
+    from eyvan.worker.runtime import secret_materialization
+
+    requested: list[int] = []
+
+    class OversizedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, amount):
+            requested.append(amount)
+            return b"s" * amount
+
+    monkeypatch.setattr(secret_materialization.urllib.request, "urlopen", lambda *_args, **_kwargs: OversizedResponse())
+
+    with pytest.raises(SecretMaterializationError, match="exceeds"):
+        materialize_secrets(
+            {
+                "EYVAN_SECRET_COUNT": "1",
+                "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+                "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+                "EYVAN_SECRET_0_TOKEN": "eyvs1.capability.signature",
+            }
+        )
+
+    assert requested == [MAX_SECRET_BYTES + 1]
+
+
+def test_resolver_exceptions_cannot_reflect_a_value_or_capability() -> None:
+    value = "hf_adversarial_value"
+    capability = "eyvs1.adversarial.signature"
+
+    def fetch(_url, _token):
+        raise RuntimeError(f"provider reflected {value} and {capability}")
+
+    with pytest.raises(SecretMaterializationError) as captured:
+        materialize_secrets(
+            {
+                "EYVAN_SECRET_COUNT": "1",
+                "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+                "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+                "EYVAN_SECRET_0_TOKEN": capability,
+            },
+            fetch=fetch,
+        )
+
+    assert value not in str(captured.value)
+    assert capability not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "BAD-NAME",
+        "PATH",
+        "JAX_PROCESS_ID",
+        "EYVAN_SECRET_9_TOKEN",
+        "EYVAN_CONTAINER_RUNTIME",
+        "EYVAN_CHECKPOINT_URI",
+        "EYVAN_PROFILE_URI",
+        "EYVAN_SOURCE_JOB_ID",
+        "EYVAN_MANAGED_CALLABLE_TOKEN",
+        "EYVAN_MANAGED_WORKSPACE_TOKEN",
+        "EYVAN_MANAGED_RESULT_TOKEN",
+        "EYVAN_WORKLOAD_TOKEN",
+        "EYVAN_FUTURE_RUNTIME_FIELD",
+    ],
+)
+def test_worker_defensively_rejects_invalid_or_reserved_mount_names(name: str) -> None:
+    environment = {
+        "EYVAN_SECRET_COUNT": "1",
+        "EYVAN_SECRET_0_NAME": name,
+        "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+        "EYVAN_SECRET_0_TOKEN": "eyvs1.name.capability",
+    }
+
+    with pytest.raises(SecretMaterializationError):
+        materialize_secrets(environment, fetch=lambda _url, _token: b"value")
+
+
+@pytest.mark.parametrize("payload", [b"value\nINJECTED=1", b"value\rINJECTED=1", b"value\x00suffix"])
+def test_worker_rejects_env_file_injection_bytes(payload: bytes) -> None:
+    environment = {
+        "EYVAN_SECRET_COUNT": "1",
+        "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+        "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+        "EYVAN_SECRET_0_TOKEN": "eyvs1.injection.capability",
+    }
+
+    with pytest.raises(SecretMaterializationError, match="cannot be represented") as captured:
+        materialize_secrets(environment, fetch=lambda _url, _token: payload)
+
+    assert payload.decode(errors="ignore") not in str(captured.value)
+
+
+def test_worker_rejects_a_secret_name_colliding_with_the_launch_environment() -> None:
+    environment = {
+        "HF_TOKEN": "ordinary-value",
+        "EYVAN_SECRET_COUNT": "1",
+        "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+        "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+        "EYVAN_SECRET_0_TOKEN": "eyvs1.collision.capability",
+    }
+
+    with pytest.raises(SecretMaterializationError, match="collides"):
+        materialize_secrets(environment, fetch=lambda _url, _token: b"secret-value")
 
 
 def test_the_capability_does_not_survive_into_the_job() -> None:
@@ -406,7 +549,7 @@ async def _dispatch_with_mounts(tmp_path, mounts: dict[str, str] | None = None, 
         PolicyRecord(
             org_id="acme",
             project_id="research",
-            allowed_secret_references=("gcp-secret://my-project/training-",),
+            allowed_secret_references=("gcp-secret://my-project/training-hf-token",),
             updated_by="root",
         ),
         idempotency_key="policy",
@@ -478,12 +621,16 @@ async def _live_workload(app, mounts: dict[str, str], prefixes: tuple[str, ...] 
 
     from eyvan.records import (
         CommandExecution,
+        LeaseRecord,
+        LeaseState,
         PolicyRecord,
         Principal,
         Role,
         RoleGrant,
         WorkloadDefinition,
+        WorkloadDispatchReservation,
         WorkloadState,
+        utcnow,
     )
 
     service = app.state.service
@@ -513,8 +660,39 @@ async def _live_workload(app, mounts: dict[str, str], prefixes: tuple[str, ...] 
         ),
         idempotency_key="trainer",
     )
+    lease_id = f"lease-{workload.id}"
+    reservation = WorkloadDispatchReservation(
+        fence=DISPATCH_FENCE,
+        outbox_id=f"dispatch-{workload.id}",
+        outbox_attempt=1,
+        generation=workload.generation,
+        workload_attempt=workload.attempt,
+        lease_ids=(lease_id,),
+    )
     async with service.repository.transaction() as tx:
-        running = workload.model_copy(update={"state": WorkloadState.RUNNING})
+        await tx.put_lease(
+            LeaseRecord(
+                id=lease_id,
+                workload_id=workload.id,
+                cell_id="cell-test",
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                state=LeaseState.ACTIVE,
+                resources=workload.spec.gang,
+                generation=workload.generation,
+                fencing_token="test-fence",
+                expires_at=utcnow() + timedelta(hours=1),
+            )
+        )
+        running = workload.model_copy(
+            update={
+                "state": WorkloadState.RUNNING,
+                "lease_id": lease_id,
+                "lease_ids": (lease_id,),
+                "dispatch_reservation": reservation,
+                "remote_id": f"remote-{workload.id}",
+            }
+        )
         await tx.put_workload(running)
     return running
 
@@ -525,6 +703,10 @@ def _read(client, app, workload, *, name="HF_TOKEN", token=None, attempt=None):
         org_id="acme",
         project_id="research",
         attempt=workload.attempt if attempt is None else attempt,
+        generation=workload.generation,
+        dispatch_fence=(
+            workload.dispatch_reservation.fence if workload.dispatch_reservation is not None else DISPATCH_FENCE
+        ),
         name=name,
     )
     return client.get(
@@ -532,6 +714,49 @@ def _read(client, app, workload, *, name="HF_TOKEN", token=None, attempt=None):
         params={"org_id": "acme", "project_id": "research", "workload_id": workload.id, "name": name},
         headers={"X-Eyvan-Secret-Token": capability},
     )
+
+
+def test_injected_artifact_access_does_not_disable_secret_delivery(tmp_path, monkeypatch) -> None:
+    import anyio
+    from fastapi.testclient import TestClient
+
+    from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
+    from eyvan.artifacts.transfers import ManagedArtifactAccess
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api import app as app_module
+    from eyvan.server.api.app import create_app
+
+    key = b"z" * 32
+    access = ManagedArtifactAccess(
+        store=LocalManagedArtifactStore(tmp_path / "injected-artifacts"),
+        signer=ArtifactTokenSigner(key, default_ttl_seconds=3600, max_ttl_seconds=3600),
+        public_url="https://eyvan.test",
+        token_ttl_seconds=3600,
+    )
+    app = create_app(
+        settings=EyvanSettings(
+            dev_auth_enabled=True,
+            artifact_token_key=key.decode(),
+            artifact_store_uri=str(tmp_path / "unused-artifacts"),
+            public_url="https://eyvan.test",
+        ),
+        artifact_access=access,
+    )
+    assert app.state.artifact_access is access
+    assert app.state.secret_capability is not None
+    assert app.state.controller.secret_capability is app.state.secret_capability
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": "file:///run/secrets/hf"},
+        ("file:///run/secrets",),
+    )
+    monkeypatch.setattr(app_module, "read_secret", lambda _reference, **_kwargs: b"resolved")
+
+    response = _read(TestClient(app), app, workload)
+
+    assert response.status_code == 200
+    assert response.content == b"resolved"
 
 
 def test_a_live_attempt_reads_its_declared_secret(tmp_path, monkeypatch) -> None:
@@ -543,14 +768,89 @@ def test_a_live_attempt_reads_its_declared_secret(tmp_path, monkeypatch) -> None
 
     client, app = _plane(tmp_path)
     workload = anyio.from_thread.BlockingPortal
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"hf_abcdef")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"hf_abcdef")
 
     response = _read(client, app, workload)
 
     assert response.status_code == 200, response.text
     assert response.content == b"hf_abcdef"
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_api_passes_the_matched_file_root_into_the_race_safe_open(tmp_path) -> None:
+    import anyio
+
+    root = tmp_path / "allowed"
+    root.mkdir()
+    secret = root / "token"
+    secret.write_bytes(b"from-file-store")
+    client, app = _plane(tmp_path)
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": f"file://{secret}"},
+        (f"file://{root}",),
+    )
+
+    response = _read(client, app, workload)
+
+    assert response.status_code == 200
+    assert response.content == b"from-file-store"
+
+
+def test_the_api_accepts_exactly_one_mibibyte(tmp_path, monkeypatch) -> None:
+    import anyio
+
+    from eyvan.server.api import app as app_module
+
+    client, app = _plane(tmp_path)
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda _reference, **_kwargs: b"x" * MAX_SECRET_BYTES)
+
+    response = _read(client, app, workload)
+
+    assert response.status_code == 200, response.text
+    assert len(response.content) == MAX_SECRET_BYTES
+
+
+def test_the_api_rejects_one_byte_over_the_limit_without_emitting_it(tmp_path, monkeypatch, caplog) -> None:
+    import anyio
+
+    from eyvan.server.api import app as app_module
+
+    marker = b"oversized-secret-marker"
+    client, app = _plane(tmp_path)
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    value = marker + b"x" * (MAX_SECRET_BYTES + 1 - len(marker))
+    capability = app.state.secret_capability.issue(
+        workload_id=workload.id,
+        org_id="acme",
+        project_id="research",
+        attempt=workload.attempt,
+        generation=workload.generation,
+        dispatch_fence=DISPATCH_FENCE,
+        name="HF_TOKEN",
+    )
+    monkeypatch.setattr(app_module, "read_secret", lambda _reference, **_kwargs: value)
+
+    response = _read(client, app, workload, token=capability)
+
+    assert response.status_code == 413, response.text
+    assert marker not in response.content
+    assert capability not in response.text
+    assert marker.decode() not in caplog.text
+    assert capability not in caplog.text
+
+    async def secret_events():
+        async with app.state.service.repository.transaction() as tx:
+            return [event for event in await tx.list_events(limit=200) if event.action.startswith("secret.")]
+
+    events = anyio.run(secret_events)
+    assert any(event.action == "secret.read" for event in events)
+    serialized = json.dumps([event.payload for event in events])
+    assert marker.decode() not in serialized
+    assert capability not in serialized
 
 
 def test_a_token_from_a_finished_attempt_is_refused(tmp_path, monkeypatch) -> None:
@@ -566,8 +866,8 @@ def test_a_token_from_a_finished_attempt_is_refused(tmp_path, monkeypatch) -> No
     from eyvan.server.api import app as app_module
 
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"hf_abcdef")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"hf_abcdef")
 
     stale = _read(client, app, workload, attempt=workload.attempt + 1)
 
@@ -587,8 +887,8 @@ def test_a_mount_the_policy_no_longer_allows_is_refused(tmp_path, monkeypatch) -
     from eyvan.server.api import app as app_module
 
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"hf_abcdef")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"hf_abcdef")
     assert _read(client, app, workload).status_code == 200
 
     async def narrow():
@@ -626,14 +926,16 @@ def test_a_capability_cannot_be_redirected_to_another_mount(tmp_path, monkeypatc
         _live_workload,
         app,
         {"HF_TOKEN": "file:///run/secrets/hf", "DB_PASSWORD": "file:///run/secrets/db"},
-        ("file:///run/secrets/",),
+        ("file:///run/secrets",),
     )
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"value")
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"value")
     capability = app.state.secret_capability.issue(
         workload_id=workload.id,
         org_id="acme",
         project_id="research",
         attempt=workload.attempt,
+        generation=workload.generation,
+        dispatch_fence=DISPATCH_FENCE,
         name="HF_TOKEN",
     )
 
@@ -662,8 +964,8 @@ def test_an_undeclared_mount_is_refused(tmp_path, monkeypatch) -> None:
     from eyvan.server.api import app as app_module
 
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"value")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"value")
 
     assert _read(client, app, workload, name="NOT_DECLARED").status_code == 403
 
@@ -680,22 +982,171 @@ def test_both_outcomes_of_a_secret_read_are_audited(tmp_path, monkeypatch) -> No
     from eyvan.server.api import app as app_module
 
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"hf_abcdef")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"hf_abcdef")
 
+    forged = "eyvs1.forged.signature"
     assert _read(client, app, workload).status_code == 200
     assert _read(client, app, workload, name="NOT_DECLARED").status_code == 403
-    assert _read(client, app, workload, token="eyvs1.forged.signature").status_code == 403
+    rejected = _read(client, app, workload, token=forged)
+    assert rejected.status_code == 403
+    assert forged not in rejected.text
 
-    async def actions():
+    async def secret_events():
         async with app.state.service.repository.transaction() as tx:
-            return [event.action for event in await tx.list_events(limit=200) if event.action.startswith("secret.")]
+            return [event for event in await tx.list_events(limit=200) if event.action.startswith("secret.")]
 
-    recorded = anyio.run(actions)
+    events = anyio.run(secret_events)
+    recorded = [event.action for event in events]
 
     assert "secret.read" in recorded
     assert "secret.read_denied" in recorded
     assert "secret.token_rejected" in recorded
+    assert forged not in json.dumps([event.payload for event in events])
+    rejected_event = next(event for event in events if event.action == "secret.token_rejected")
+    assert rejected_event.payload["reason"] == "invalid_capability"
+
+
+def test_invalid_capability_audit_uses_only_a_resolved_workload_scope(tmp_path) -> None:
+    import anyio
+
+    client, app = _plane(tmp_path)
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": "file:///run/secrets/hf"},
+        ("file:///run/secrets",),
+    )
+    attacker = "attacker\ncontrolled"
+    forged = "eyvs1.attacker.controlled"
+
+    response = client.get(
+        "/api/v1/secrets/content",
+        params={
+            "org_id": attacker,
+            "project_id": attacker,
+            "workload_id": workload.id,
+            "name": attacker,
+        },
+        headers={"X-Eyvan-Secret-Token": forged},
+    )
+    assert response.status_code == 403
+
+    async def rejection_events():
+        async with app.state.service.repository.transaction() as tx:
+            return [event for event in await tx.list_events(limit=200) if event.action == "secret.token_rejected"]
+
+    events = anyio.run(rejection_events)
+    event = events[-1]
+    serialized = json.dumps(event.model_dump(mode="json"))
+    assert event.org_id == "acme"
+    assert event.project_id == "research"
+    assert event.entity_id == workload.id
+    assert event.payload == {"workload_id": workload.id, "reason": "invalid_capability"}
+    assert attacker not in serialized
+    assert forged not in serialized
+
+
+def test_nonexistent_workload_does_not_create_an_attacker_owned_audit_event(tmp_path) -> None:
+    import anyio
+
+    client, app = _plane(tmp_path)
+    marker = "attacker-controlled-audit-field"
+    response = client.get(
+        "/api/v1/secrets/content",
+        params={"org_id": marker, "project_id": marker, "workload_id": marker, "name": marker},
+        headers={"X-Eyvan-Secret-Token": "eyvs1.attacker.controlled"},
+    )
+    assert response.status_code == 403
+
+    async def events():
+        async with app.state.service.repository.transaction() as tx:
+            return await tx.list_events(limit=200)
+
+    assert marker not in json.dumps([event.model_dump(mode="json") for event in anyio.run(events)])
+
+
+def test_mount_mismatch_audit_uses_the_verified_claim_name(tmp_path) -> None:
+    import anyio
+
+    client, app = _plane(tmp_path)
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": "file:///run/secrets/hf"},
+        ("file:///run/secrets",),
+    )
+    token = app.state.secret_capability.issue(
+        workload_id=workload.id,
+        org_id="acme",
+        project_id="research",
+        attempt=workload.attempt,
+        generation=workload.generation,
+        dispatch_fence=DISPATCH_FENCE,
+        name="HF_TOKEN",
+    )
+    attacker_name = "ATTACKER_QUERY_NAME"
+    response = client.get(
+        "/api/v1/secrets/content",
+        params={
+            "org_id": "acme",
+            "project_id": "research",
+            "workload_id": workload.id,
+            "name": attacker_name,
+        },
+        headers={"X-Eyvan-Secret-Token": token},
+    )
+    assert response.status_code == 403
+
+    async def rejection():
+        async with app.state.service.repository.transaction() as tx:
+            events = [event for event in await tx.list_events(limit=200) if event.action == "secret.token_rejected"]
+            return events[-1]
+
+    event = anyio.run(rejection)
+    assert event.payload["reason"] == "mount_mismatch"
+    assert event.payload["name"] == "HF_TOKEN"
+    assert attacker_name not in json.dumps(event.payload)
+    assert token not in json.dumps(event.payload)
+
+
+def test_query_scope_mismatch_is_audited_under_the_verified_workload(tmp_path) -> None:
+    import anyio
+
+    client, app = _plane(tmp_path)
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": "file:///run/secrets/hf"},
+        ("file:///run/secrets",),
+    )
+    token = app.state.secret_capability.issue(
+        workload_id=workload.id,
+        org_id="acme",
+        project_id="research",
+        attempt=workload.attempt,
+        generation=workload.generation,
+        dispatch_fence=DISPATCH_FENCE,
+        name="HF_TOKEN",
+    )
+    marker = "attacker-scope"
+    response = client.get(
+        "/api/v1/secrets/content",
+        params={"org_id": marker, "project_id": marker, "workload_id": workload.id, "name": "HF_TOKEN"},
+        headers={"X-Eyvan-Secret-Token": token},
+    )
+    assert response.status_code == 403
+
+    async def rejection():
+        async with app.state.service.repository.transaction() as tx:
+            events = [event for event in await tx.list_events(limit=200) if event.action == "secret.token_rejected"]
+            return events[-1]
+
+    event = anyio.run(rejection)
+    assert event.org_id == "acme"
+    assert event.project_id == "research"
+    assert event.payload == {"workload_id": workload.id, "reason": "out_of_scope", "name": "HF_TOKEN"}
+    assert marker not in json.dumps(event.model_dump(mode="json"))
 
 
 def test_no_secret_value_appears_in_the_audit_trail(tmp_path, monkeypatch) -> None:
@@ -709,8 +1160,8 @@ def test_no_secret_value_appears_in_the_audit_trail(tmp_path, monkeypatch) -> No
     from eyvan.server.api import app as app_module
 
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
-    monkeypatch.setattr(app_module, "read_secret", lambda reference: b"hf_abcdef")
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
+    monkeypatch.setattr(app_module, "read_secret", lambda reference, **_kwargs: b"hf_abcdef")
     assert _read(client, app, workload).status_code == 200
 
     async def payloads():
@@ -726,22 +1177,21 @@ def test_no_secret_value_appears_in_the_audit_trail(tmp_path, monkeypatch) -> No
     assert "/run/secrets/hf" not in recorded
 
 
-def test_an_unreachable_store_is_retryable_not_a_bad_request(tmp_path, monkeypatch) -> None:
-    """A store that cannot be reached is an incident, not the caller's mistake.
-
-    A 4xx would make an agent give up on a launch that a retry would complete.
-    """
+def test_an_unreachable_store_is_retryable_without_reflecting_provider_output(tmp_path, monkeypatch, caplog) -> None:
+    """A store outage stays retryable, but its exception is not a safe response."""
 
     import anyio
 
     from eyvan.secrets import SecretUnavailable
     from eyvan.server.api import app as app_module
 
+    value = "hf_provider_reflected_value"
+    capability = "eyvs1.provider.reflection"
     client, app = _plane(tmp_path)
-    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets/",))
+    workload = anyio.run(_live_workload, app, {"HF_TOKEN": "file:///run/secrets/hf"}, ("file:///run/secrets",))
 
-    def unavailable(reference):
-        raise SecretUnavailable(f"could not read {reference!r}: PERMISSION_DENIED")
+    def unavailable(_reference, **_kwargs):
+        raise SecretUnavailable(f"provider reflected {value} and {capability}")
 
     monkeypatch.setattr(app_module, "read_secret", unavailable)
 
@@ -749,7 +1199,37 @@ def test_an_unreachable_store_is_retryable_not_a_bad_request(tmp_path, monkeypat
 
     assert response.status_code == 503, response.text
     assert response.headers["Retry-After"] == "5"
-    assert "PERMISSION_DENIED" in response.json()["detail"]
+    assert response.json()["detail"] == "secret mount could not be resolved"
+    assert value not in response.text
+    assert capability not in response.text
+    assert value not in caplog.text
+    assert capability not in caplog.text
+
+
+def test_unknown_resolver_exception_is_the_same_constant_retryable_503(tmp_path, monkeypatch, caplog) -> None:
+    import anyio
+
+    from eyvan.server.api import app as app_module
+
+    marker = "unknown-resolver-reflected-secret"
+    client, app = _plane(tmp_path)
+    workload = anyio.run(
+        _live_workload,
+        app,
+        {"HF_TOKEN": "file:///run/secrets/hf"},
+        ("file:///run/secrets",),
+    )
+
+    def fail(_reference, **_kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(app_module, "read_secret", fail)
+    response = _read(client, app, workload)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "secret mount could not be resolved"
+    assert marker not in response.text
+    assert marker not in caplog.text
 
 
 # --------------------------------------------------------------------------- the SDK

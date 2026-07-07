@@ -14,6 +14,8 @@ import uuid
 from datetime import timedelta
 from urllib.parse import urlencode, urlparse
 
+from pydantic import ValidationError
+
 from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
 )
@@ -24,6 +26,8 @@ from eyvan.records import (
     LeaseRecord,
     LeaseState,
     OutboxRecord,
+    OutboxState,
+    WorkloadDispatchReservation,
     WorkloadRecord,
     WorkloadState,
     WorkspaceRef,
@@ -60,6 +64,12 @@ _LOCAL_PROVIDERS = frozenset({"local"})
 #: KeyError somewhere in user code. Only ``systemd_transient`` calls
 #: ``materialize_secrets``; add a name here when another runtime learns to.
 _SECRET_MATERIALIZING_EXECUTORS = frozenset({"eyvan-native"})
+
+#: Stored on the outbox row in the same transaction as the workload marker.
+#: Keeping both copies makes the response writeback prove ownership of the
+#: aggregate *and* of the exact at-least-once delivery that contacted the agent.
+_DISPATCH_RESERVATION_KEY = "dispatch_reservation"
+_RETRIABLE_DISPATCH_OUTBOX_STATES = frozenset({OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED})
 
 
 class _ControllerWorkloadCommands:
@@ -201,6 +211,8 @@ class _ControllerWorkloadCommands:
         is the whole development topology and must keep working.
         """
 
+        if workload.spec.secret_mounts and (self.secret_capability is None or self.artifact_access is None):
+            raise RuntimeError("secret delivery is not configured on this control-plane replica")
         if workload.spec.secret_mounts and cell.executor not in _SECRET_MATERIALIZING_EXECUTORS:
             # Refused rather than run without them. The control plane has already
             # minted a per-attempt capability and written ``secret.issued``, so a
@@ -249,12 +261,16 @@ class _ControllerWorkloadCommands:
         """
 
         mounts = workload.spec.secret_mounts
-        if not mounts or self.secret_capability is None or self.artifact_access is None:
-            # Silently empty rather than raising. A replica configured without
-            # managed artifacts has no signing key, and refusing the dispatch
-            # would turn a misconfiguration into an unschedulable workload; the
-            # job fails on the missing variable instead, naming what it wanted.
+        if not mounts:
             return {}
+        if self.secret_capability is None or self.artifact_access is None:
+            # Fail before contacting the cell.  Launching without a declared
+            # mount is a successful-looking privilege/configuration failure and
+            # is never an acceptable fallback.
+            raise RuntimeError("secret delivery is not configured on this control-plane replica")
+        reservation = workload.dispatch_reservation
+        if reservation is None:
+            raise RuntimeError("secret capabilities require a committed dispatch reservation")
         environment = {"EYVAN_SECRET_COUNT": str(len(mounts))}
         for index, name in enumerate(sorted(mounts)):
             environment[f"EYVAN_SECRET_{index}_NAME"] = name
@@ -264,6 +280,8 @@ class _ControllerWorkloadCommands:
                 org_id=workload.org_id,
                 project_id=workload.project_id,
                 attempt=workload.attempt,
+                generation=workload.generation,
+                dispatch_fence=reservation.fence,
                 name=name,
             )
         return environment
@@ -275,7 +293,9 @@ class _ControllerWorkloadCommands:
         knowledge of how to build the rest makes the route exist in two places.
         """
 
-        base = "" if self.artifact_access is None else self.artifact_access.public_url
+        if self.artifact_access is None:
+            raise RuntimeError("secret delivery is not configured on this control-plane replica")
+        base = self.artifact_access.public_url
         query = urlencode(
             {
                 "org_id": workload.org_id,
@@ -297,13 +317,17 @@ class _ControllerWorkloadCommands:
         """
 
         mounts = workload.spec.secret_mounts
-        if not mounts or self.secret_capability is None or self.artifact_access is None:
+        if not mounts:
             return
+        if self.secret_capability is None or self.artifact_access is None:
+            raise RuntimeError("secret delivery is not configured on this control-plane replica")
         await self.service.record_secret_issuance(
             org_id=workload.org_id,
             project_id=workload.project_id,
             workload_id=workload.id,
             attempt=workload.attempt,
+            generation=workload.generation,
+            dispatch_reservation=workload.dispatch_reservation,
             names=tuple(sorted(mounts)),
             tx=transaction,
         )
@@ -463,99 +487,255 @@ class _ControllerWorkloadCommands:
             environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
         return shlex.join(parts), environment
 
-    async def _dispatch_workload(self, command: OutboxRecord) -> None:
-        lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
-        if len(lease_ids) > 1:
-            await self._dispatch_workload_gang(command, lease_ids)
-            return
+    @staticmethod
+    def _outbox_dispatch_reservation(command: OutboxRecord) -> WorkloadDispatchReservation | None:
+        """Decode the strict reservation stored on one dispatch command."""
+
+        raw = command.payload.get(_DISPATCH_RESERVATION_KEY)
+        if raw is None:
+            return None
+        try:
+            return WorkloadDispatchReservation.model_validate(raw)
+        except ValidationError:
+            return None
+
+    async def _owned_dispatch_command(
+        self,
+        transaction: RepositorySession,
+        command: OutboxRecord,
+    ) -> OutboxRecord:
+        """Load the exact live outbox claim allowed to enter a submit RPC."""
+
+        current = await transaction.get_outbox(command.id)
+        now = utcnow()
+        if (
+            current is None
+            or current.topic != "workload.dispatch"
+            or current.aggregate_type != "workload"
+            or current.aggregate_id != command.aggregate_id
+            or current.generation != command.generation
+            or current.attempts != command.attempts
+            or current.state is not OutboxState.PROCESSING
+            or current.claimed_by != self.worker_id
+            or current.claimed_until is None
+            or current.claimed_until <= now
+        ):
+            raise StaleOutboxCommand(f"dispatch command {command.id!r} claim expired or moved to another worker")
+        return current
+
+    @staticmethod
+    def _same_dispatch_reservation(
+        command: OutboxRecord,
+        reservation: WorkloadDispatchReservation,
+    ) -> bool:
+        return _ControllerWorkloadCommands._outbox_dispatch_reservation(command) == reservation
+
+    @staticmethod
+    def _dispatch_is_already_finalized(
+        workload: WorkloadRecord,
+        leases: tp.Sequence[LeaseRecord],
+        reservation_command_id: str,
+    ) -> bool:
+        """Return whether a replay only needs to retire its outbox command."""
+
+        reservation = workload.dispatch_reservation
+        return bool(
+            reservation is not None
+            and reservation.outbox_id == reservation_command_id
+            and reservation.generation == workload.generation
+            and reservation.workload_attempt == workload.attempt
+            and reservation.lease_ids == _ControllerWorkloadCommands._workload_lease_ids(workload)
+            and workload.remote_id
+            and workload.state in {WorkloadState.DISPATCHING, WorkloadState.RUNNING, WorkloadState.CANCELLING}
+            and leases
+            and all(lease.state is LeaseState.ACTIVE for lease in leases)
+        )
+
+    async def _quarantined_dispatch_cells(
+        self,
+        command: OutboxRecord,
+        lease_ids: tuple[str, ...],
+    ) -> tuple[CellRecord, ...]:
+        """Snapshot cells whose pending leases need an out-of-transaction probe."""
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(command.aggregate_id)
+            leases = tuple([await transaction.get_lease(lease_id) for lease_id in lease_ids])
+            members = tuple(lease for lease in leases if lease is not None)
+            if workload is None or len(members) != len(leases):
+                raise StaleOutboxCommand("dispatch command references a missing workload or lease")
+            cells = tuple([await transaction.get_cell(lease.cell_id) for lease in members])
+            await self._owned_dispatch_command(transaction, command)
+            if self._dispatch_is_already_finalized(workload, members, command.id):
+                return ()
+            if workload.generation != command.generation or self._workload_lease_ids(workload) != lease_ids:
+                raise StaleOutboxCommand("dispatch command no longer owns the workload lease generation")
+        concrete_cells = tuple(cell for cell in cells if cell is not None)
+        if len(concrete_cells) != len(cells):
+            raise StaleOutboxCommand("dispatch command references a missing execution cell")
+        return tuple(
+            cell for lease, cell in zip(members, concrete_cells, strict=True) if lease.state is LeaseState.QUARANTINED
+        )
+
+    async def _recover_quarantined_dispatch_cells(
+        self,
+        command: OutboxRecord,
+        lease_ids: tuple[str, ...],
+    ) -> frozenset[str]:
+        """Probe quarantined members without retaining any repository lock."""
+
+        recovered: set[str] = set()
+        for cell in await self._quarantined_dispatch_cells(command, lease_ids):
+            observation = await asyncio.to_thread(self._agent_factory(cell).observe, cell.id)
+            if observation.state not in READY_CAPACITY_STATUSES:
+                raise RuntimeError(f"cell {cell.id!r} has not recovered the quarantined lease")
+            recovered.add(cell.id)
+        return frozenset(recovered)
+
+    @staticmethod
+    def _new_dispatch_reservation(
+        command: OutboxRecord,
+        workload: WorkloadRecord,
+        lease_ids: tuple[str, ...],
+    ) -> WorkloadDispatchReservation:
+        return WorkloadDispatchReservation(
+            fence=f"dispatch_{uuid.uuid4().hex}",
+            outbox_id=command.id,
+            outbox_attempt=command.attempts,
+            generation=command.generation,
+            workload_attempt=workload.attempt,
+            lease_ids=lease_ids,
+        )
+
+    async def _persist_dispatch_reservation(
+        self,
+        transaction: RepositorySession,
+        command: OutboxRecord,
+        current_command: OutboxRecord,
+        workload: WorkloadRecord,
+        reservation: WorkloadDispatchReservation,
+    ) -> WorkloadRecord:
+        """Atomically persist workload/outbox fences and issuance audit."""
+
+        reserved = workload.model_copy(update={"dispatch_reservation": reservation, "updated_at": utcnow()})
+        payload = dict(current_command.payload)
+        payload[_DISPATCH_RESERVATION_KEY] = reservation.model_dump(mode="json")
+        await transaction.put_outbox(
+            current_command.model_copy(
+                update={
+                    "payload": payload,
+                    "last_error": None,
+                    "failure_code": None,
+                    "updated_at": utcnow(),
+                }
+            )
+        )
+        await transaction.put_workload(reserved)
+        await transaction.append_event(
+            AuditEvent(
+                id=f"evt_{uuid.uuid4().hex}",
+                actor=self._principal.subject,
+                org_id=reserved.org_id,
+                project_id=reserved.project_id,
+                entity_type="workload",
+                entity_id=reserved.id,
+                action="workload.dispatch_reserved",
+                previous_state=workload.state.value,
+                new_state=reserved.state.value,
+                payload={
+                    "outbox_id": reservation.outbox_id,
+                    "outbox_attempt": reservation.outbox_attempt,
+                    "attempt": reservation.workload_attempt,
+                    "generation": reservation.generation,
+                    "lease_ids": list(reservation.lease_ids),
+                },
+            )
+        )
+        await self._audit_secret_issuance(transaction, reserved)
+        return reserved
+
+    async def _prepare_single_dispatch(
+        self,
+        command: OutboxRecord,
+        *,
+        recovered_cells: frozenset[str],
+    ) -> tuple[WorkloadRecord, LeaseRecord, CellRecord, WorkloadRequest, WorkloadDispatchReservation] | None:
+        """Validate and reserve one single-cell submit in one short transaction."""
+
         async with self.repository.transaction() as transaction:
             workload = await transaction.get_workload(command.aggregate_id)
             lease = await transaction.get_lease(str(command.payload["lease_id"]))
             cell = await transaction.get_cell(str(command.payload["cell_id"]))
             if workload is None or lease is None or cell is None:
                 raise StaleOutboxCommand("dispatch command references a missing workload, lease, or cell")
+            current_command = await self._owned_dispatch_command(transaction, command)
             self._validate_workload_command(command, workload, lease, cell)
-            if workload.state is not WorkloadState.LEASED:
+            if self._dispatch_is_already_finalized(workload, (lease,), command.id):
+                return None
+            if workload.state is WorkloadState.CANCELLING:
+                prior = workload.dispatch_reservation
+                if prior is None or prior.outbox_id != command.id:
+                    raise StaleOutboxCommand("cancelled workload has no possibly-started dispatch to recover")
+            elif workload.state is not WorkloadState.LEASED:
                 raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
             if lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED}:
                 raise StaleOutboxCommand(f"lease is {lease.state.value}, not pending")
             if cell.state is not CellState.READY:
                 raise RuntimeError(f"cell {cell.id!r} is {cell.state.value}, not ready for dispatch")
-            if lease.state is LeaseState.QUARANTINED:
-                observation = await asyncio.to_thread(self._agent_factory(cell).observe, cell.id)
-                if observation.state not in READY_CAPACITY_STATUSES:
-                    raise RuntimeError(f"cell {cell.id!r} has not recovered the quarantined lease")
+            if lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells:
+                raise RuntimeError(f"cell {cell.id!r} quarantine recovery was not proven before dispatch")
 
             self._refuse_unreachable_callback(workload, cell)
-            entrypoint, environment = self._render_execution(workload, runtime_environment=cell.runtime.env)
-            await self._audit_secret_issuance(transaction, workload)
+            reservation = self._new_dispatch_reservation(command, workload, (lease.id,))
+            reserved = await self._persist_dispatch_reservation(
+                transaction,
+                command,
+                current_command,
+                workload,
+                reservation,
+            )
+            entrypoint, environment = self._render_execution(reserved, runtime_environment=cell.runtime.env)
             request = WorkloadRequest(
                 mutation=self._mutation(command, lease.fencing_token),
                 spec={
                     "entrypoint": entrypoint,
-                    "submission_id": f"{workload.id}-a{workload.attempt}-g{workload.generation}",
+                    "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
                     "environment": environment,
-                    "backend_options": workload.spec.backend_options,
+                    "backend_options": reserved.spec.backend_options,
                     "gang": {
-                        **workload.spec.gang.model_dump(mode="json"),
+                        **reserved.spec.gang.model_dump(mode="json"),
                         "placement_strategy": "PACK",
                     },
                     "metadata": {
-                        **workload.spec.metadata,
-                        "eyvan_workload_id": workload.id,
-                        "eyvan_org_id": workload.org_id,
-                        "eyvan_project_id": workload.project_id,
+                        **reserved.spec.metadata,
+                        "eyvan_workload_id": reserved.id,
+                        "eyvan_org_id": reserved.org_id,
+                        "eyvan_project_id": reserved.project_id,
                         "eyvan_lease_id": lease.id,
                     },
                 },
             )
-            remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
-            now = utcnow()
-            active_lease = lease.model_copy(
-                update={
-                    "state": LeaseState.ACTIVE,
-                    "expires_at": now + timedelta(seconds=self.settings.lease_ttl_s),
-                    # Write-once: a lease re-entering ACTIVE after a quarantine
-                    # recovery is the same run, so its start must not move.
-                    "run_started_at": lease.run_started_at or now,
-                    "updated_at": now,
-                }
-            )
-            dispatched = workload.model_copy(
-                update={"state": WorkloadState.DISPATCHING, "remote_id": remote.remote_id, "updated_at": now}
-            )
-            await transaction.put_lease(active_lease)
-            await transaction.put_workload(dispatched)
-            await transaction.append_event(
-                AuditEvent(
-                    id=f"evt_{uuid.uuid4().hex}",
-                    actor=self._principal.subject,
-                    org_id=lease.org_id,
-                    project_id=lease.project_id,
-                    entity_type="lease",
-                    entity_id=lease.id,
-                    action="lease.activated",
-                    previous_state=lease.state.value,
-                    new_state=active_lease.state.value,
-                )
-            )
-            await transaction.append_event(
-                AuditEvent(
-                    id=f"evt_{uuid.uuid4().hex}",
-                    actor=self._principal.subject,
-                    org_id=workload.org_id,
-                    project_id=workload.project_id,
-                    entity_type="workload",
-                    entity_id=workload.id,
-                    action="workload.dispatched",
-                    previous_state=workload.state.value,
-                    new_state=dispatched.state.value,
-                    payload={"remote_id": remote.remote_id},
-                )
-            )
+            return reserved, lease, cell, request, reservation
 
-    async def _dispatch_workload_gang(self, command: OutboxRecord, lease_ids: tuple[str, ...]) -> None:
-        """Launch one no-Ray native JAX job across independently leased cells."""
+    async def _prepare_gang_dispatch(
+        self,
+        command: OutboxRecord,
+        lease_ids: tuple[str, ...],
+        *,
+        recovered_cells: frozenset[str],
+    ) -> (
+        tuple[
+            WorkloadRecord,
+            tuple[LeaseRecord, ...],
+            tuple[CellRecord, ...],
+            LeaseRecord,
+            CellRecord,
+            GangWorkloadRequest,
+            WorkloadDispatchReservation,
+        ]
+        | None
+    ):
+        """Validate and reserve an all-or-nothing native gang submit."""
 
         async with self.repository.transaction() as transaction:
             workload = await transaction.get_workload(command.aggregate_id)
@@ -563,7 +743,14 @@ class _ControllerWorkloadCommands:
             members = tuple(lease for lease in leases if lease is not None)
             if workload is None or len(members) != len(leases):
                 raise StaleOutboxCommand("gang dispatch command references a missing workload or lease")
-            if workload.state is not WorkloadState.LEASED:
+            current_command = await self._owned_dispatch_command(transaction, command)
+            if self._dispatch_is_already_finalized(workload, members, command.id):
+                return None
+            if workload.state is WorkloadState.CANCELLING:
+                prior = workload.dispatch_reservation
+                if prior is None or prior.outbox_id != command.id:
+                    raise StaleOutboxCommand("cancelled workload has no possibly-started gang dispatch to recover")
+            elif workload.state is not WorkloadState.LEASED:
                 raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
             if workload.lease_ids != lease_ids or workload.lease_id != lease_ids[0]:
                 raise StaleOutboxCommand("gang dispatch command no longer owns the workload lease group")
@@ -582,6 +769,11 @@ class _ControllerWorkloadCommands:
                 lease.cell_generation != cell.generation for lease, cell in zip(members, concrete_cells, strict=True)
             ):
                 raise StaleOutboxCommand("gang dispatch cell generation changed after placement")
+            if any(
+                lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells
+                for lease, cell in zip(members, concrete_cells, strict=True)
+            ):
+                raise RuntimeError("gang dispatch quarantine recovery was not proven for every member")
             if workload.spec.required_executor != "eyvan-native":
                 raise RuntimeError("multi-cell pod groups currently require the eyvan-native executor")
             endpoints = {cell.endpoint for cell in concrete_cells}
@@ -591,30 +783,36 @@ class _ControllerWorkloadCommands:
             leader_lease = members[0]
             leader_cell = concrete_cells[0]
             self._refuse_unreachable_callback(workload, leader_cell)
-            entrypoint, environment = self._render_execution(workload, runtime_environment=leader_cell.runtime.env)
-            await self._audit_secret_issuance(transaction, workload)
-
+            reservation = self._new_dispatch_reservation(command, workload, lease_ids)
+            reserved = await self._persist_dispatch_reservation(
+                transaction,
+                command,
+                current_command,
+                workload,
+                reservation,
+            )
+            entrypoint, environment = self._render_execution(reserved, runtime_environment=leader_cell.runtime.env)
             spec = {
                 "entrypoint": entrypoint,
-                "submission_id": f"{workload.id}-a{workload.attempt}-g{workload.generation}",
+                "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
                 "environment": environment,
-                "backend_options": workload.spec.backend_options,
+                "backend_options": reserved.spec.backend_options,
                 "gang": {
-                    **workload.spec.gang.model_dump(mode="json"),
+                    **reserved.spec.gang.model_dump(mode="json"),
                     "placement_strategy": "PACK",
                 },
                 "metadata": {
-                    **workload.spec.metadata,
-                    "eyvan_workload_id": workload.id,
-                    "eyvan_org_id": workload.org_id,
-                    "eyvan_project_id": workload.project_id,
+                    **reserved.spec.metadata,
+                    "eyvan_workload_id": reserved.id,
+                    "eyvan_org_id": reserved.org_id,
+                    "eyvan_project_id": reserved.project_id,
                     "eyvan_lease_id": leader_lease.id,
                     "eyvan_lease_ids": ",".join(lease.id for lease in members),
                 },
             }
             paired = tuple(sorted(zip(members, concrete_cells, strict=True), key=lambda item: item[0].cell_id))
             coordinator_lease, coordinator_cell = paired[0]
-            gang_request = GangWorkloadRequest(
+            request = GangWorkloadRequest(
                 members=tuple(
                     GangWorkloadMember(
                         cell_id=lease.cell_id,
@@ -629,28 +827,122 @@ class _ControllerWorkloadCommands:
                 ),
                 spec=spec,
             )
-            remote = await asyncio.to_thread(
-                self._agent_factory(coordinator_cell).submit_gang,
-                coordinator_lease.cell_id,
-                gang_request,
-            )
-            now = utcnow()
-            for lease in members:
-                await transaction.put_lease(
-                    lease.model_copy(
-                        update={
-                            "state": LeaseState.ACTIVE,
-                            "expires_at": now + timedelta(seconds=self.settings.lease_ttl_s),
-                            "run_started_at": lease.run_started_at or now,
-                            "updated_at": now,
-                        }
-                    )
+            return reserved, members, concrete_cells, coordinator_lease, coordinator_cell, request, reservation
+
+    async def _release_dispatch_reservation(
+        self,
+        command: OutboxRecord,
+        reservation: WorkloadDispatchReservation,
+    ) -> bool:
+        """Revoke one failed submit's capabilities while its exact fence is owned."""
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(command.aggregate_id)
+            if (
+                workload is None
+                or workload.dispatch_reservation != reservation
+                or workload.generation != reservation.generation
+                or workload.attempt != reservation.workload_attempt
+                or self._workload_lease_ids(workload) != reservation.lease_ids
+                or workload.state not in {WorkloadState.LEASED, WorkloadState.CANCELLING}
+            ):
+                return False
+            leases = tuple([await transaction.get_lease(lease_id) for lease_id in reservation.lease_ids])
+            if any(
+                lease is None
+                or lease.workload_id != workload.id
+                or lease.generation != reservation.generation
+                or lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED}
+                for lease in leases
+            ):
+                return False
+            try:
+                current_command = await self._owned_dispatch_command(transaction, command)
+            except StaleOutboxCommand:
+                return False
+            if not self._same_dispatch_reservation(current_command, reservation):
+                return False
+            payload = dict(current_command.payload)
+            payload.pop(_DISPATCH_RESERVATION_KEY, None)
+            await transaction.put_outbox(current_command.model_copy(update={"payload": payload, "updated_at": utcnow()}))
+            released = workload.model_copy(update={"dispatch_reservation": None, "updated_at": utcnow()})
+            await transaction.put_workload(released)
+            await transaction.append_event(
+                AuditEvent(
+                    id=f"evt_{uuid.uuid4().hex}",
+                    actor=self._principal.subject,
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    entity_type="workload",
+                    entity_id=workload.id,
+                    action="workload.dispatch_reservation_failed",
+                    previous_state=workload.state.value,
+                    new_state=released.state.value,
+                    payload={
+                        "outbox_id": reservation.outbox_id,
+                        "outbox_attempt": reservation.outbox_attempt,
+                        "attempt": reservation.workload_attempt,
+                        "generation": reservation.generation,
+                        "lease_ids": list(reservation.lease_ids),
+                    },
                 )
-            dispatched = workload.model_copy(
-                update={"state": WorkloadState.DISPATCHING, "remote_id": remote.remote_id, "updated_at": now}
             )
+            return True
+
+    async def _finalize_dispatch_response(
+        self,
+        command: OutboxRecord,
+        reservation: WorkloadDispatchReservation,
+        remote_id: str,
+    ) -> None:
+        """Atomically activate every member after revalidating all dispatch fences."""
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(command.aggregate_id)
+            if (
+                workload is None
+                or workload.dispatch_reservation != reservation
+                or workload.generation != reservation.generation
+                or workload.attempt != reservation.workload_attempt
+                or self._workload_lease_ids(workload) != reservation.lease_ids
+            ):
+                raise StaleOutboxCommand("dispatch response no longer owns its workload reservation")
+            leases = tuple([await transaction.get_lease(lease_id) for lease_id in reservation.lease_ids])
+            members = tuple(lease for lease in leases if lease is not None)
+            if len(members) != len(leases) or any(
+                lease.workload_id != workload.id or lease.generation != reservation.generation for lease in members
+            ):
+                raise StaleOutboxCommand("dispatch response no longer owns every lease generation")
+            current_command = await self._owned_dispatch_command(transaction, command)
+            if not self._same_dispatch_reservation(current_command, reservation):
+                raise StaleOutboxCommand("dispatch response no longer owns its outbox reservation")
+            if self._dispatch_is_already_finalized(workload, members, command.id):
+                if workload.remote_id != remote_id:
+                    raise StaleOutboxCommand("dispatch replay returned a different remote workload id")
+                return
+            if workload.state not in {WorkloadState.LEASED, WorkloadState.CANCELLING}:
+                raise StaleOutboxCommand(f"dispatch response found workload {workload.state.value}")
+            if any(lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED} for lease in members):
+                raise StaleOutboxCommand("dispatch response found a lease that is no longer pending")
+
+            now = utcnow()
+            active_leases = tuple(
+                lease.model_copy(
+                    update={
+                        "state": LeaseState.ACTIVE,
+                        "expires_at": now + timedelta(seconds=self.settings.lease_ttl_s),
+                        "run_started_at": lease.run_started_at or now,
+                        "updated_at": now,
+                    }
+                )
+                for lease in members
+            )
+            for active in active_leases:
+                await transaction.put_lease(active)
+            next_state = WorkloadState.DISPATCHING if workload.state is WorkloadState.LEASED else workload.state
+            dispatched = workload.model_copy(update={"state": next_state, "remote_id": remote_id, "updated_at": now})
             await transaction.put_workload(dispatched)
-            for lease in members:
+            for lease, active in zip(members, active_leases, strict=True):
                 await transaction.append_event(
                     AuditEvent(
                         id=f"evt_{uuid.uuid4().hex}",
@@ -661,7 +953,7 @@ class _ControllerWorkloadCommands:
                         entity_id=lease.id,
                         action="lease.activated",
                         previous_state=lease.state.value,
-                        new_state=LeaseState.ACTIVE.value,
+                        new_state=active.state.value,
                     )
                 )
             await transaction.append_event(
@@ -675,9 +967,46 @@ class _ControllerWorkloadCommands:
                     action="workload.dispatched",
                     previous_state=workload.state.value,
                     new_state=dispatched.state.value,
-                    payload={"remote_id": remote.remote_id, "lease_ids": list(lease_ids)},
+                    payload={"remote_id": remote_id, "lease_ids": list(reservation.lease_ids)},
                 )
             )
+
+    async def _dispatch_workload(self, command: OutboxRecord) -> None:
+        lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
+        if len(lease_ids) > 1:
+            await self._dispatch_workload_gang(command, lease_ids)
+            return
+        lease_id = str(command.payload["lease_id"])
+        recovered_cells = await self._recover_quarantined_dispatch_cells(command, (lease_id,))
+        prepared = await self._prepare_single_dispatch(command, recovered_cells=recovered_cells)
+        if prepared is None:
+            return
+        _workload, _lease, cell, request, reservation = prepared
+        try:
+            remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
+        except Exception:
+            await self._release_dispatch_reservation(command, reservation)
+            raise
+        await self._finalize_dispatch_response(command, reservation, remote.remote_id)
+
+    async def _dispatch_workload_gang(self, command: OutboxRecord, lease_ids: tuple[str, ...]) -> None:
+        """Launch one no-Ray native JAX job across independently leased cells."""
+
+        recovered_cells = await self._recover_quarantined_dispatch_cells(command, lease_ids)
+        prepared = await self._prepare_gang_dispatch(command, lease_ids, recovered_cells=recovered_cells)
+        if prepared is None:
+            return
+        _workload, _members, _cells, coordinator_lease, coordinator_cell, request, reservation = prepared
+        try:
+            remote = await asyncio.to_thread(
+                self._agent_factory(coordinator_cell).submit_gang,
+                coordinator_lease.cell_id,
+                request,
+            )
+        except Exception:
+            await self._release_dispatch_reservation(command, reservation)
+            raise
+        await self._finalize_dispatch_response(command, reservation, remote.remote_id)
 
     @staticmethod
     def _validate_workload_command(
@@ -721,6 +1050,39 @@ class _ControllerWorkloadCommands:
             raise StaleOutboxCommand(f"lease is {lease.state.value}, expected one of {lease_states}")
         return workload, lease, cell
 
+    async def _dispatch_reservation_may_have_started(self, workload_id: str) -> bool:
+        """Return whether cancellation must wait for a submit outcome.
+
+        The reservation is written before the RPC, so its presence is
+        conservative: after a controller crash the agent may have accepted the
+        request even when no response was recorded.  A cancel must let the
+        idempotent dispatch replay recover the remote id rather than releasing
+        its lease and orphaning that process.
+        """
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+            if workload is None or workload.remote_id is not None:
+                return False
+            reservation = workload.dispatch_reservation
+            if (
+                reservation is None
+                or reservation.generation != workload.generation
+                or reservation.workload_attempt != workload.attempt
+                or reservation.lease_ids != self._workload_lease_ids(workload)
+            ):
+                return False
+            command = await transaction.get_outbox(reservation.outbox_id)
+            return bool(
+                command is not None
+                and command.topic == "workload.dispatch"
+                and command.aggregate_type == "workload"
+                and command.aggregate_id == workload.id
+                and command.generation == reservation.generation
+                and command.state in _RETRIABLE_DISPATCH_OUTBOX_STATES
+                and self._same_dispatch_reservation(command, reservation)
+            )
+
     async def _dispatch_cancel(self, command: OutboxRecord) -> None:
         lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
         if len(lease_ids) > 1:
@@ -732,6 +1094,8 @@ class _ControllerWorkloadCommands:
             lease_states={LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING, LeaseState.QUARANTINED},
         )
         remote_id = workload.remote_id or command.payload.get("remote_id")
+        if not remote_id and await self._dispatch_reservation_may_have_started(workload.id):
+            raise RuntimeError("workload dispatch is still resolving its remote id; cancellation will retry")
         if remote_id:
             request = WorkloadMutationRequest(mutation=self._mutation(command, lease.fencing_token))
             await asyncio.to_thread(self._agent_factory(cell).stop, cell.id, str(remote_id), request)
@@ -764,6 +1128,8 @@ class _ControllerWorkloadCommands:
             pairs = tuple(zip(members, concrete_cells, strict=True))
 
         remote_id = workload.remote_id or command.payload.get("remote_id")
+        if not remote_id and await self._dispatch_reservation_may_have_started(workload.id):
+            raise RuntimeError("gang dispatch is still resolving its remote id; cancellation will retry")
         if remote_id:
             ordered = self._ordered_gang_member_pairs(pairs)
             request = GangWorkloadMutationRequest(

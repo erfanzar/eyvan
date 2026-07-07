@@ -18,12 +18,12 @@ capability hands back a *value*: once read, no later revocation can un-read it,
 so the window in which a leaked token is useful should be bounded by something
 that does not depend on anything else working.
 
-The TTL is nonetheless the weaker of the two controls here. The stronger one is
-the attempt binding -- ``authorize_current_secret_mount`` refuses a token whose
-attempt is not the workload's current one, and every path that retries or
-resumes a workload bumps ``attempt`` (``control_plane.py:1567``, ``:1863``,
-``:1960``, ``controller/preemption.py:689``). So a token stops working the
-moment the attempt it was minted for is over, whether or not it has expired.
+The TTL is nonetheless the weaker of the controls here.  The live
+workload check binds a token to its attempt, generation, and the exact durable
+dispatch reservation that minted it.  Replaying an outbox command replaces that
+reservation before contacting the agent, so a capability from a failed or
+abandoned RPC never becomes valid again merely because the same workload
+attempt is retried.
 """
 
 from __future__ import annotations
@@ -46,7 +46,19 @@ SECRET_TOKEN_VERSION = "eyvs1"
 READ_SECRET = "read_secret"
 
 _CLAIM_KEYS = frozenset(
-    {"action", "attempt", "expires_at", "issued_at", "name", "org_id", "project_id", "version", "workload_id"}
+    {
+        "action",
+        "attempt",
+        "dispatch_fence",
+        "expires_at",
+        "generation",
+        "issued_at",
+        "name",
+        "org_id",
+        "project_id",
+        "version",
+        "workload_id",
+    }
 )
 
 
@@ -69,6 +81,8 @@ class SecretTokenClaims:
     org_id: str
     project_id: str
     attempt: int
+    generation: int
+    dispatch_fence: str
     name: str
     issued_at: int
     expires_at: int
@@ -84,13 +98,27 @@ class SecretCapabilitySigner:
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
 
-    def issue(self, *, workload_id: str, org_id: str, project_id: str, attempt: int, name: str) -> str:
-        """Mint a capability for one mount of one attempt."""
+    def issue(
+        self,
+        *,
+        workload_id: str,
+        org_id: str,
+        project_id: str,
+        attempt: int,
+        generation: int,
+        dispatch_fence: str,
+        name: str,
+    ) -> str:
+        """Mint a capability for one mount of one fenced dispatch."""
 
-        if not workload_id or not org_id or not project_id or not name:
-            raise ValueError("a secret capability requires a workload, organization, project, and mount name")
+        if not workload_id or not org_id or not project_id or not dispatch_fence or not name:
+            raise ValueError(
+                "a secret capability requires a workload, organization, project, dispatch fence, and mount name"
+            )
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise ValueError("a secret capability requires a positive attempt")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("a secret capability requires a positive generation")
         issued_at = int(self._clock())
         return sign_claims(
             self._secret,
@@ -98,12 +126,14 @@ class SecretCapabilitySigner:
             {
                 "action": READ_SECRET,
                 "attempt": attempt,
+                "dispatch_fence": dispatch_fence,
                 "expires_at": issued_at + int(self._ttl_seconds),
+                "generation": generation,
                 "issued_at": issued_at,
                 "name": name,
                 "org_id": org_id,
                 "project_id": project_id,
-                "version": 1,
+                "version": 2,
                 "workload_id": workload_id,
             },
         )
@@ -123,16 +153,21 @@ class SecretCapabilitySigner:
             # build does not fully understand, and honoring the parts it does
             # understand is how a capability quietly widens.
             raise InvalidSecretToken("secret capability has unexpected claims")
-        if claims.get("version") != 1 or claims.get("action") != READ_SECRET:
+        if claims.get("version") != 2 or claims.get("action") != READ_SECRET:
             raise InvalidSecretToken("secret capability does not grant a secret read")
         if claims.get("workload_id") != workload_id:
             raise InvalidSecretToken("secret capability belongs to a different workload")
         if claims.get("org_id") != org_id or claims.get("project_id") != project_id:
             raise InvalidSecretToken("secret capability was issued for a different project")
-        attempt, name = claims.get("attempt"), claims.get("name")
+        attempt, generation = claims.get("attempt"), claims.get("generation")
+        dispatch_fence, name = claims.get("dispatch_fence"), claims.get("name")
         issued_at, expires_at = claims.get("issued_at"), claims.get("expires_at")
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise InvalidSecretToken("secret capability has an invalid attempt")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise InvalidSecretToken("secret capability has an invalid generation")
+        if not isinstance(dispatch_fence, str) or not dispatch_fence:
+            raise InvalidSecretToken("secret capability has no dispatch fence")
         if not isinstance(name, str) or not name:
             raise InvalidSecretToken("secret capability names no mount")
         if not isinstance(issued_at, int) or not isinstance(expires_at, int):
@@ -144,6 +179,8 @@ class SecretCapabilitySigner:
             org_id=org_id,
             project_id=project_id,
             attempt=attempt,
+            generation=generation,
+            dispatch_fence=dispatch_fence,
             name=name,
             issued_at=issued_at,
             expires_at=expires_at,

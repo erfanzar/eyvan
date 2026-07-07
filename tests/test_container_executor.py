@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -214,6 +217,49 @@ def _record(executor: DockerContainerExecutor, remote_id: str) -> dict:
     return json.loads(executor._record_path(remote_id).read_text(encoding="utf-8"))
 
 
+def test_docker_startup_durably_sweeps_a_crash_orphan_plaintext_environment_temporary(tmp_path: Path) -> None:
+    containers = tmp_path / "containers"
+    digest = hashlib.sha256(b"crashed-container-attempt").hexdigest()
+    final = containers / f"{digest}.env"
+    marker = "docker-crash-orphan-secret"
+    script = r"""
+import os
+import sys
+from pathlib import Path
+from eyvan.worker.runtime import systemd_transient
+
+path = Path(sys.argv[1])
+marker = sys.argv[2]
+
+
+def crash_before_publish(_source, _destination):
+    os._exit(74)
+
+
+systemd_transient.os.replace = crash_before_publish
+systemd_transient._write_environment_file(path, {"TOKEN": marker})
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(final), marker],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 74, completed.stderr
+    temporaries = list(containers.glob(f".{final.name}.*"))
+    assert len(temporaries) == 1
+    assert marker.encode() in temporaries[0].read_bytes()
+
+    executor = _executor(tmp_path, FakeDockerSystemd(images={"registry.example/easydel:latest"}))
+
+    assert executor.containers_dir == containers
+    assert list(containers.glob(f".{final.name}.*")) == []
+    assert not any(marker.encode() in candidate.read_bytes() for candidate in tmp_path.rglob("*") if candidate.is_file())
+
+
 def test_container_name_is_deterministic_sanitized_and_collision_resistant() -> None:
     remote_id = "training/team-a/run 1/with:unsafe!characters"
 
@@ -292,6 +338,91 @@ def test_container_launch_mounts_runtime_and_preserves_only_container_safe_envir
     assert executor.status(remote_id).status is ExecutionWorkloadStatus.RUNNING
     assert _record(executor, remote_id)["container_id"] == daemon.containers[record["container_name"]]["Id"]
     assert executor.logs(remote_id) == f"{record['container_name']} output\n"
+
+
+def test_container_constructor_recovers_n_minus_one_env_without_status_call(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    capability = "eyvs1.container-legacy.capability"
+    value = "container-secret-value"
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    first = _executor(tmp_path, daemon)
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": capability,
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+    remote_id = first.submit(spec, _context())
+    record = _record(first, remote_id)
+    env_path = first._container_env_file_path(remote_id)
+    assert value in env_path.read_text(encoding="utf-8")
+
+    record.pop("secret_bearing")
+    record["environment"]["EYVAN_SECRET_0_TOKEN"] = capability
+    first._record_path(remote_id).write_text(json.dumps(record), encoding="utf-8")
+    daemon.containers.pop(record["container_name"])
+    daemon.units.pop(record["unit_name"])
+
+    second = _executor(tmp_path, daemon)
+
+    recovered_text = second._record_path(remote_id).read_text(encoding="utf-8")
+    recovered = json.loads(recovered_text)
+    assert recovered["status"] == ExecutionWorkloadStatus.INDETERMINATE.value
+    assert recovered["secret_bearing"] is True
+    assert not env_path.exists()
+    assert capability not in recovered_text
+    assert value not in recovered_text
+
+
+def test_container_secret_output_and_docker_errors_are_suppressed_across_restart(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    value = "embedded-container-secret"
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    first = _executor(tmp_path, daemon)
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": "eyvs1.container-output.capability",
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+    remote_id = first.submit(spec, _context())
+    record = _record(first, remote_id)
+    container = daemon.containers[record["container_name"]]
+    container["Logs"] = f"prefix-{value}-suffix\n"
+
+    assert first.logs(remote_id) == ""
+    assert first.log_page(remote_id).unavailable is True
+    assert first.exec_in_workload(remote_id, ["print-secret"], timeout_s=1)["output_suppressed"] is True
+    assert first.process_status(remote_id)["output_suppressed"] is True
+
+    container["State"].update({"Status": "dead", "ExitCode": 1, "Error": f"runtime-prefix-{value}-suffix"})
+    terminal = first.status(remote_id)
+    assert terminal.status is ExecutionWorkloadStatus.FAILED
+    assert value not in terminal.message
+    assert not first._container_env_file_path(remote_id).exists()
+
+    second = _executor(tmp_path, daemon)
+    surfaces = {
+        "logs": second.logs(remote_id),
+        "page": second.log_page(remote_id).detail,
+        "exec": second.exec_in_workload(remote_id, ["print-secret"], timeout_s=1),
+        "process": second.process_status(remote_id),
+        "status": second.status(remote_id).message,
+        "record": second._record_path(remote_id).read_text(encoding="utf-8"),
+    }
+    assert value not in json.dumps(surfaces, default=str)
+    assert surfaces["logs"] == ""
+    assert surfaces["exec"]["output_suppressed"] is True
 
 
 def test_container_rewrites_a_controller_callable_to_the_staged_oci_runner(tmp_path: Path) -> None:

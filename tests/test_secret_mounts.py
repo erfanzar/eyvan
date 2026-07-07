@@ -23,6 +23,8 @@ write a spec.
 
 from __future__ import annotations
 
+import base64
+import os
 import subprocess
 
 import pytest
@@ -91,7 +93,7 @@ async def test_an_unlisted_secret_reference_is_refused_at_submission() -> None:
     """
 
     service = _service()
-    await _policy(service, "gcp-secret://my-project/training-")
+    await _policy(service, "gcp-secret://my-project/training-hf-token")
 
     with pytest.raises(AuthorizationError, match="not permitted in this project"):
         await service.submit_workload(
@@ -103,11 +105,11 @@ async def test_an_unlisted_secret_reference_is_refused_at_submission() -> None:
         )
 
 
-async def test_a_listed_prefix_is_admitted() -> None:
+async def test_a_listed_segment_root_is_admitted() -> None:
     """The gate must not block the configuration it exists to permit."""
 
     service = _service()
-    await _policy(service, "gcp-secret://my-project/training-")
+    await _policy(service, "gcp-secret://my-project/training-hf-token")
 
     workload, _ = await service.submit_workload(
         OPERATOR,
@@ -165,7 +167,7 @@ async def test_every_mount_is_checked_not_just_the_first() -> None:
     """
 
     service = _service()
-    await _policy(service, "gcp-secret://my-project/training-")
+    await _policy(service, "gcp-secret://my-project/training-hf-token")
 
     with pytest.raises(AuthorizationError, match="production-database"):
         await service.submit_workload(
@@ -180,7 +182,7 @@ async def test_every_mount_is_checked_not_just_the_first() -> None:
         )
 
 
-async def test_a_prefix_does_not_leak_across_projects() -> None:
+async def test_a_root_does_not_leak_across_projects() -> None:
     """One project's allow-list must not admit another's submissions.
 
     Both projects have a policy, so this distinguishes "read *this* project's
@@ -189,8 +191,8 @@ async def test_a_prefix_does_not_leak_across_projects() -> None:
     """
 
     service = _service()
-    await _policy(service, "gcp-secret://my-project/training-")
-    await _policy(service, "gcp-secret://my-project/platform-", project="platform")
+    await _policy(service, "gcp-secret://my-project/training-hf-token")
+    await _policy(service, "gcp-secret://my-project/platform-hf-token", project="platform")
 
     other = Principal(
         subject="mallory",
@@ -204,6 +206,76 @@ async def test_a_prefix_does_not_leak_across_projects() -> None:
             project_id="platform",
             spec=_spec(HF_TOKEN="gcp-secret://my-project/training-hf-token"),
             idempotency_key="w1",
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "BAD-NAME",
+        "PATH",
+        "JAX_PROCESS_ID",
+        "EYVAN_SECRET_0_TOKEN",
+        "EYVAN_CONTAINER_RUNTIME",
+        "EYVAN_WORKLOAD_TOKEN",
+        "EYVAN_CHILDREN_URL",
+        "EYVAN_MANAGED_CALLABLE_URL",
+        "EYVAN_MANAGED_CALLABLE_TOKEN",
+        "EYVAN_MANAGED_WORKSPACE_URL",
+        "EYVAN_MANAGED_WORKSPACE_TOKEN",
+        "EYVAN_MANAGED_RESULT_URL",
+        "EYVAN_MANAGED_RESULT_TOKEN",
+        "EYVAN_PROGRESS_URL",
+        "EYVAN_CHECKPOINT_RANK",
+        "EYVAN_CHECKPOINT_URI",
+        "EYVAN_CHECKPOINT_BASE_URI",
+        "EYVAN_PROFILE_URI",
+        "EYVAN_SOURCE_JOB_ID",
+        "EYVAN_SOURCE_CONTROL_GROUP",
+        "EYVAN_CALL_ARGS_JSON",
+        "EYVAN_CALL_KWARGS_JSON",
+        "EYVAN_RESOURCE_BUNDLES",
+        "EYVAN_PLACEMENT_STRATEGY",
+        "EYVAN_FUTURE_RUNTIME_FIELD",
+    ],
+)
+def test_secret_mount_names_follow_the_workload_environment_contract(name: str) -> None:
+    with pytest.raises(ValueError):
+        _spec(**{name: "gcp-secret://my-project/training-hf-token"})
+
+
+def test_secret_mount_cannot_collide_with_an_ordinary_environment_value() -> None:
+    with pytest.raises(ValueError, match="collides"):
+        WorkloadDefinition(
+            name="train",
+            execution=CommandExecution(command="python train.py"),
+            environment={"HF_TOKEN": "ordinary"},
+            secret_mounts={"HF_TOKEN": "gcp-secret://my-project/training-hf-token"},
+        )
+
+
+def test_pool_api_schema_rejects_secret_mount_name_and_line_injection() -> None:
+    from pydantic import ValidationError
+
+    from eyvan.server.api.schemas import PoolWorkloadSubmitRequest
+
+    with pytest.raises(ValidationError):
+        PoolWorkloadSubmitRequest.model_validate(
+            {
+                "org_id": "acme",
+                "project_id": "research",
+                "command": "python train.py",
+                "secret_mounts": {"PATH": "gcp-secret://my-project/training-hf-token"},
+            }
+        )
+    with pytest.raises(ValidationError):
+        PoolWorkloadSubmitRequest.model_validate(
+            {
+                "org_id": "acme",
+                "project_id": "research",
+                "command": "python train.py",
+                "secret_mounts": {"HF_TOKEN": "gcp-secret://my-project/training-hf-token\nINJECTED=1"},
+            }
         )
 
 
@@ -224,7 +296,7 @@ def test_an_unknown_scheme_is_refused_rather_than_read_as_a_path() -> None:
     file nobody meant to create.
     """
 
-    with pytest.raises(SecretUnavailable, match="unknown secret scheme"):
+    with pytest.raises(SecretUnavailable, match="unknown scheme"):
         secret_store_from_reference("gcpsecret://p/name")
 
 
@@ -234,14 +306,47 @@ def test_a_file_secret_is_read(tmp_path) -> None:
     path = tmp_path / "token"
     path.write_bytes(b"s3cret")
 
-    assert read_secret(f"file://{path}") == b"s3cret"
+    assert read_secret(f"file://{path}", allowed_roots=(f"file://{tmp_path}",)) == b"s3cret"
 
 
-def test_an_unreadable_file_names_the_reference(tmp_path) -> None:
-    """A resolution failure with no reference in it is a support ticket."""
+@pytest.mark.parametrize(
+    "spelling",
+    ["short", "extra-slash", "upper-scheme", "empty-query", "trailing-slash", "root-slash"],
+)
+def test_file_uri_spelling_is_canonical_at_policy_and_value_boundaries(tmp_path, spelling: str) -> None:
+    token = tmp_path / "token"
+    if spelling == "short":
+        reference = f"file:{token}"
+    elif spelling == "extra-slash":
+        reference = f"file:///{token}"
+    elif spelling == "upper-scheme":
+        reference = f"FILE://{token}"
+    elif spelling == "empty-query":
+        reference = f"file://{token}?"
+    elif spelling == "trailing-slash":
+        reference = f"file://{token}/"
+    else:
+        reference = "file:///"
 
-    with pytest.raises(SecretUnavailable, match="could not read"):
-        read_secret(f"file://{tmp_path / 'absent'}")
+    with pytest.raises(ValueError, match="canonical file"):
+        _spec(HF_TOKEN=reference)
+    with pytest.raises(ValueError, match="canonical file"):
+        PolicyRecord(
+            org_id="acme",
+            project_id="research",
+            allowed_secret_references=(reference,),
+            updated_by="root",
+        )
+
+
+def test_an_unreadable_file_returns_only_a_stable_category(tmp_path) -> None:
+    reference = f"file://{tmp_path / 'sensitive-absent-name'}"
+
+    with pytest.raises(SecretUnavailable, match="could not be read safely") as captured:
+        read_secret(reference, allowed_roots=(f"file://{tmp_path}",))
+
+    assert reference not in str(captured.value)
+    assert captured.value.__cause__ is None
 
 
 def test_a_gcp_reference_is_resolved_through_gcloud() -> None:
@@ -253,15 +358,56 @@ def test_a_gcp_reference_is_resolved_through_gcloud() -> None:
 
     seen: list[tuple[str, ...]] = []
 
+    value = b"\x00binary\xff\nvalue"
+
     def runner(command):
         seen.append(tuple(command))
-        return subprocess.CompletedProcess(command, 0, "value", "")
+        wire = base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii") + "\n"
+        return subprocess.CompletedProcess(command, 0, wire, "")
 
-    assert GcpSecretManagerStore(runner=runner).read("gcp-secret://my-project/hf-token") == b"value"
+    assert GcpSecretManagerStore(runner=runner).read("gcp-secret://my-project/hf-token") == value
     joined = " ".join(seen[0])
     assert "--secret=hf-token" in joined
     assert "--project=my-project" in joined
     assert "access latest" in joined
+
+
+@pytest.mark.parametrize(
+    ("value", "wire"),
+    [
+        (b"", ""),
+        (b"f", "Zg"),
+        (b"f", "Zg=="),
+        (b"fo", "Zm8"),
+        (b"fo", "Zm8="),
+        (b"foo", "Zm9v"),
+        (b"\xfb\xff", "-_8"),
+        (b"\xfb\xff", "-_8="),
+    ],
+)
+def test_gcloud_accepts_unpadded_or_exactly_padded_canonical_base64url(value: bytes, wire: str) -> None:
+    store = GcpSecretManagerStore(runner=lambda command: subprocess.CompletedProcess(command, 0, f"{wire}\n", ""))
+
+    assert store.read("gcp-secret://my-project/hf-token") == value
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        "Zg=",  # partial: one byte requires two padding characters
+        "Zg===",  # excess
+        "Zm8==",  # excess: two bytes require one
+        "Zm9v=",  # needless: three bytes require none
+        "=",  # padding without data
+        "Z=g=",  # misplaced
+        "Zh==",  # non-zero discarded bits, not a canonical encoding of b'f'
+    ],
+)
+def test_gcloud_rejects_noncanonical_base64url_padding(wire: str) -> None:
+    store = GcpSecretManagerStore(runner=lambda command: subprocess.CompletedProcess(command, 0, f"{wire}\n", ""))
+
+    with pytest.raises(SecretUnavailable):
+        store.read("gcp-secret://my-project/hf-token")
 
 
 def test_a_pinned_version_is_honored() -> None:
@@ -271,24 +417,24 @@ def test_a_pinned_version_is_honored() -> None:
 
     def runner(command):
         seen.append(tuple(command))
-        return subprocess.CompletedProcess(command, 0, "value", "")
+        return subprocess.CompletedProcess(command, 0, "dmFsdWU=\n", "")
 
     GcpSecretManagerStore(runner=runner).read("gcp-secret://my-project/hf-token/7")
 
     assert "access 7" in " ".join(seen[0])
 
 
-def test_a_denied_read_surfaces_the_reason() -> None:
-    """The useful half is almost always "permission denied for service account X".
-
-    That names the exact grant an operator has to add, so it is kept.
-    """
+def test_a_denied_read_does_not_reflect_provider_output() -> None:
+    marker = "provider-reflected-secret-value"
 
     def runner(command):
-        return subprocess.CompletedProcess(command, 1, "", "PERMISSION_DENIED: caller lacks secretAccessor")
+        return subprocess.CompletedProcess(command, 1, marker, f"PERMISSION_DENIED: {marker}")
 
-    with pytest.raises(SecretUnavailable, match="secretAccessor"):
+    with pytest.raises(SecretUnavailable, match="secret provider could not resolve") as captured:
         GcpSecretManagerStore(runner=runner).read("gcp-secret://my-project/hf-token")
+
+    assert marker not in str(captured.value)
+    assert captured.value.__cause__ is None
 
 
 def test_a_malformed_gcp_reference_is_refused() -> None:
@@ -298,10 +444,118 @@ def test_a_malformed_gcp_reference_is_refused() -> None:
     nothing to indicate the mistake.
     """
 
-    with pytest.raises(SecretUnavailable, match="not a gcp-secret"):
+    with pytest.raises(SecretUnavailable, match="secret provider could not resolve"):
         GcpSecretManagerStore(runner=lambda command: subprocess.CompletedProcess(command, 0, "", "")).read(
             "gcp-secret:///name"
         )
+
+
+def test_gcloud_malformed_wire_output_is_refused_without_reflection() -> None:
+    marker = "wire-secret-marker"
+    malformed = (
+        f"{marker}!\n",
+        "dmFs\ndWU=\n",
+        "A\n",
+        "dmFsdWU=\n\n",
+        "dmFsdWU===\n",
+    )
+    for output in malformed:
+        store = GcpSecretManagerStore(
+            runner=lambda command, output=output: subprocess.CompletedProcess(command, 0, output, "")
+        )
+        with pytest.raises(SecretUnavailable) as captured:
+            store.read("gcp-secret://my-project/hf-token")
+        assert marker not in str(captured.value)
+        assert captured.value.__cause__ is None
+
+
+def test_gcloud_runner_exceptions_are_normalized() -> None:
+    marker = "subprocess-reflected-secret"
+
+    def runner(_command):
+        raise RuntimeError(marker)
+
+    with pytest.raises(SecretUnavailable, match="secret provider could not resolve") as captured:
+        GcpSecretManagerStore(runner=runner).read("gcp-secret://my-project/hf-token")
+
+    assert marker not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+async def test_raw_prefixes_do_not_cross_a_path_segment_boundary() -> None:
+    service = _service()
+    await _policy(service, "gcp-secret://my-project/training")
+
+    with pytest.raises(AuthorizationError):
+        await service.submit_workload(
+            OPERATOR,
+            org_id="acme",
+            project_id="research",
+            spec=_spec(HF_TOKEN="gcp-secret://my-project/training-prod"),
+            idempotency_key="segment-boundary",
+        )
+
+
+def test_file_store_rejects_dot_encoded_nul_and_authority_escapes(tmp_path) -> None:
+    root = f"file://{tmp_path}"
+    references = (
+        f"file://{tmp_path}/../outside",
+        f"file://{tmp_path}/%2e%2e/outside",
+        f"file://{tmp_path}/%2Foutside",
+        f"file://{tmp_path}/token\x00suffix",
+        f"file://attacker{tmp_path}/token",
+    )
+    store = FileSecretStore(allowed_roots=(root,))
+
+    for reference in references:
+        with pytest.raises(SecretUnavailable):
+            store.read(reference)
+
+
+def test_file_store_rejects_inside_outside_and_root_symlinks(tmp_path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "token").write_bytes(b"outside")
+    (root / "inside-link").symlink_to(outside / "token")
+    (root / "outside-directory").symlink_to(outside, target_is_directory=True)
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(root, target_is_directory=True)
+
+    store = FileSecretStore(allowed_roots=(f"file://{root}",))
+    with pytest.raises(SecretUnavailable):
+        store.read(f"file://{root / 'inside-link'}")
+    with pytest.raises(SecretUnavailable):
+        store.read(f"file://{root / 'outside-directory' / 'token'}")
+    with pytest.raises(SecretUnavailable):
+        FileSecretStore(allowed_roots=(f"file://{root_link}",)).read(f"file://{root_link / 'token'}")
+
+
+def test_file_store_reads_from_the_open_descriptor_across_a_swap(tmp_path, monkeypatch) -> None:
+    """Replacing the pathname after open cannot replace the bytes being read."""
+
+    root = tmp_path / "root"
+    root.mkdir()
+    token = root / "token"
+    displaced = root / "opened-token"
+    token.write_bytes(b"authorized-value")
+    real_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "token" and dir_fd is not None and not swapped:
+            swapped = True
+            token.rename(displaced)
+            token.write_bytes(b"attacker-replacement")
+        return descriptor
+
+    monkeypatch.setattr(os, "open", racing_open)
+
+    assert FileSecretStore(allowed_roots=(f"file://{root}",)).read(f"file://{token}") == b"authorized-value"
+    assert token.read_bytes() == b"attacker-replacement"
 
 
 # --------------------------------------------------------------------------- the surfaces
@@ -361,11 +615,11 @@ def test_an_operator_can_open_the_allow_list_from_the_cli(monkeypatch) -> None:
     fake = FakeClient()
 
     result = _invoke(
-        fake, monkeypatch, ["policy", "set", "--allow-secret-reference", "gcp-secret://my-project/training-"]
+        fake, monkeypatch, ["policy", "set", "--allow-secret-reference", "gcp-secret://my-project/training-hf-token"]
     )
 
     assert result.exit_code == 0, result.output
-    assert _json_argument(fake.calls[0])["allowed_secret_references"] == ["gcp-secret://my-project/training-"]
+    assert _json_argument(fake.calls[0])["allowed_secret_references"] == ["gcp-secret://my-project/training-hf-token"]
 
 
 def test_an_omitted_secret_allow_list_forbids_rather_than_permits(monkeypatch) -> None:

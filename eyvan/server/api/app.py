@@ -84,7 +84,7 @@ from eyvan.records import (
 )
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
-from eyvan.secrets import SecretUnavailable, read_secret
+from eyvan.secrets import MAX_SECRET_BYTES, SecretUnavailable, read_secret
 from eyvan.server.api.auth import OIDCTokenVerifier, RequestAuthenticator, TokenVerifier, authenticated_principal
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
@@ -281,19 +281,18 @@ def create_app(
         )
     registry = metrics_registry or CollectorRegistry(auto_describe=True)
     metrics = metrics or EyvanMetrics(registry=registry)
-    workload_capability: WorkloadCapabilitySigner | None = None
-    secret_capability: SecretCapabilitySigner | None = None
+    if settings.secret_token_ttl_s <= 0:
+        raise ValueError("EYVAN_SECRET_TOKEN_TTL_S must be positive")
+    token_key = _artifact_token_key(settings)
+    # Secret and child capabilities are control-plane delivery mechanisms, not
+    # properties of the injected artifact-store adapter.  Constructing them only
+    # while constructing that adapter made an otherwise valid injection silently
+    # launch declared mounts as missing variables.
+    workload_capability = WorkloadCapabilitySigner(token_key)
+    secret_capability = SecretCapabilitySigner(token_key, ttl_seconds=settings.secret_token_ttl_s)
     if artifact_access is None:
         if settings.artifact_token_ttl_s <= 0:
             raise ValueError("EYVAN_ARTIFACT_TOKEN_TTL_S must be positive")
-        if settings.secret_token_ttl_s <= 0:
-            raise ValueError("EYVAN_SECRET_TOKEN_TTL_S must be positive")
-        token_key = _artifact_token_key(settings)
-        # The same deployment secret, a different capability. Audience
-        # separation lives in the signed version prefix rather than in a second
-        # key an operator would have to rotate in step with the first.
-        workload_capability = WorkloadCapabilitySigner(token_key)
-        secret_capability = SecretCapabilitySigner(token_key, ttl_seconds=settings.secret_token_ttl_s)
         artifact_access = ManagedArtifactAccess(
             store=managed_artifact_store_from_uri(settings.artifact_store_uri),
             signer=ArtifactTokenSigner(
@@ -452,20 +451,20 @@ def create_app(
 
     @app.exception_handler(SecretUnavailable)
     async def handle_secret_unavailable(request: Request, exc: SecretUnavailable) -> JSONResponse:
-        """A secret store that cannot be reached is retryable, not a bad request.
+        """Report a retryable store failure without reflecting resolver output.
 
-        The message carries the *reference* and the store's own reason -- almost
-        always "permission denied for service account X", which names the exact
-        grant an operator has to add. It never carries a value, because a
-        resolver that failed never had one.
+        Provider and custom-store exceptions are an untrusted diagnostic
+        boundary: some clients include response fragments or request headers in
+        their text. The detailed cause stays attached for local debugging, but
+        neither logs nor the worker-facing response may receive it.
         """
 
-        del request
-        logger.warning("Eyvan secret resolution failed: %s", exc)
+        del request, exc
+        logger.warning("Eyvan secret resolution failed")
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             headers={"Retry-After": "5"},
-            content={"detail": str(exc)},
+            content={"detail": "secret mount could not be resolved"},
         )
 
     @app.exception_handler(TransientRepositoryError)
@@ -1054,53 +1053,68 @@ def create_app(
 
         if secret_capability is None:
             raise AuthorizationError("secret mounts are not configured on this control-plane replica")
+        resolved_scope = await service.secret_redemption_scope(workload_id)
+        if resolved_scope is None:
+            # There is no authenticated entity to own an audit event.  In
+            # particular, do not persist the caller's query scope/name merely
+            # because it presented an invalid capability.
+            raise AuthorizationError("invalid secret capability")
+        actual_org_id, actual_project_id = resolved_scope
         try:
             claims = secret_capability.verify(
                 token,
                 workload_id=workload_id,
-                org_id=org_id,
-                project_id=project_id,
+                org_id=actual_org_id,
+                project_id=actual_project_id,
             )
-        except InvalidCapabilityToken as exc:
-            # The base class, not ``InvalidSecretToken``. A forged prefix, bad
-            # base64 or wrong signature is refused by the shared primitive before
-            # this signer's claim rules run, so catching only the narrow type
-            # would turn the most suspicious input on this route into a 500 --
-            # unaudited, and reported to the caller as the server's fault.
-            #
-            # Audited even though the token was never valid: a rejected
-            # capability presented against a live workload is the clearest signal
-            # that one leaked, and it is invisible if only refusals that reach the
-            # authorization read are recorded.
+        except InvalidCapabilityToken:
             await service.record_secret_rejection(
-                org_id=org_id,
-                project_id=project_id,
                 workload_id=workload_id,
-                name=name,
-                reason=str(exc),
+                reason="invalid_capability",
             )
-            raise AuthorizationError(str(exc)) from exc
+            raise AuthorizationError("invalid secret capability") from None
+        if org_id != actual_org_id or project_id != actual_project_id:
+            await service.record_secret_rejection(
+                workload_id=workload_id,
+                verified_name=claims.name,
+                reason="out_of_scope",
+            )
+            raise AuthorizationError("secret capability was issued for a different project")
         if claims.name != name:
+            await service.record_secret_rejection(
+                workload_id=workload_id,
+                verified_name=claims.name,
+                reason="mount_mismatch",
+            )
             raise AuthorizationError("secret capability was issued for a different mount")
-        reference = await service.authorize_secret_mount(
-            org_id=org_id,
-            project_id=project_id,
+        reference, allowed_root = await service.authorize_secret_mount(
+            org_id=actual_org_id,
+            project_id=actual_project_id,
             workload_id=workload_id,
             attempt=claims.attempt,
-            name=name,
+            generation=claims.generation,
+            dispatch_fence=claims.dispatch_fence,
+            name=claims.name,
         )
         try:
             # Off the event loop: resolving a reference shells out to the
-            # provider's CLI, and a control-plane replica that stops answering
-            # every other request while one secret resolves is a worse outage
-            # than the one slow fetch.
-            value = await asyncio.to_thread(read_secret, reference)
-        except SecretUnavailable as exc:
-            # Deliberately not re-raised as a repository error just to reach a
-            # 503. A store that cannot be reached is a different incident from a
-            # database that cannot be reached, and collapsing them sends an
-            # operator to the wrong dashboard.
-            raise SecretUnavailable(f"secret mount {name!r} could not be resolved: {exc}") from exc
+            # provider's CLI, and file resolution repeats the matched policy root
+            # in the same dirfd walk that obtains the file descriptor.
+            value = await asyncio.to_thread(read_secret, reference, allowed_roots=(allowed_root,))
+        except Exception:
+            # Provider and custom resolver exceptions are untrusted diagnostics;
+            # ordinary failures all become the same retryable response.
+            raise SecretUnavailable("secret mount could not be resolved") from None
+        if not isinstance(value, bytes):
+            raise SecretUnavailable("secret mount returned an invalid payload")
+        if len(value) > MAX_SECRET_BYTES:
+            # Enforce the limit here as well as on the current worker. Otherwise
+            # an older agent would still receive (and launch with) an oversized
+            # value even after the worker-side hardening rolls out.
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"secret mount exceeds the {MAX_SECRET_BYTES}-byte environment limit",
+            )
         return Response(
             value,
             media_type="application/octet-stream",

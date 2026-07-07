@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -35,9 +36,14 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
+from eyvan.secrets import redact_secret_material
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime.log_records import LogPage, parse_journal_json
-from eyvan.worker.runtime.secret_materialization import materialize_secrets, secret_environment_keys
+from eyvan.worker.runtime.secret_materialization import (
+    SecretMaterializationError,
+    materialize_secrets,
+    secret_environment_keys,
+)
 
 _TERMINAL_STATES = frozenset(
     {
@@ -94,6 +100,12 @@ def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
 _UNIT_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SYSTEMD_IDENTITY = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
+_ATOMIC_ENV_TEMPORARY = re.compile(r"\.(?P<digest>[0-9a-f]{64})\.env\.[A-Za-z0-9_-]+\Z")
+_ATOMIC_JSON_TEMPORARY = re.compile(r"\.(?P<digest>[0-9a-f]{64})\.json\.[A-Za-z0-9_-]+\Z")
+_STARTUP_LOCK_NAME = ".startup.lock"
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +131,8 @@ class SystemdLogsUnavailableError(RuntimeError):
 
     def __init__(self, unit_name: str, stderr: str) -> None:
         self.unit_name = unit_name
-        self.stderr = stderr
-        detail = stderr or "journalctl failed"
+        self.stderr = redact_secret_material(stderr)
+        detail = self.stderr or "journalctl failed"
         super().__init__(f"cannot read systemd journal for unit {unit_name!r}: {detail}")
 
 
@@ -166,49 +178,204 @@ def systemd_unit_name(remote_id: str) -> str:
     return f"eyvan-{normalized}-{digest}.service"
 
 
-def _atomic_write_json(path: Path, value: tp.Mapping[str, JsonValue]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
+_DURABLE_DIAGNOSTIC_FIELDS = frozenset({"detail", "error", "message", "stderr", "stdout", "unit_collection_error"})
+_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+
+
+def _contains_secret_scaffolding(value: JsonValue) -> bool:
+    if isinstance(value, dict):
+        return any(
+            (isinstance(key, str) and key.startswith("EYVAN_SECRET_")) or _contains_secret_scaffolding(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_secret_scaffolding(item) for item in value)
+    return False
+
+
+def _record_secret_bearing(record: tp.Mapping[str, JsonValue]) -> bool:
+    """Fail closed for malformed flags and detect N-1 dispatch records."""
+
+    flag = record.get("secret_bearing")
+    return (
+        flag is True or (flag is not None and not isinstance(flag, bool)) or _contains_secret_scaffolding(dict(record))
+    )
+
+
+def _upgrade_legacy_secret_record(record: JsonObject) -> None:
+    """Persist the N-1 scaffolding signal before removing capability fields."""
+
+    record["secret_bearing"] = _record_secret_bearing(record)
+
+
+def _sanitize_durable_value(
+    value: JsonValue,
+    *,
+    field: str | None = None,
+    suppress_diagnostics: bool = False,
+) -> JsonValue:
+    """Return JSON with secret dispatch scaffolding and diagnostics removed."""
+
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_durable_value(item, field=key, suppress_diagnostics=suppress_diagnostics)
+            for key, item in value.items()
+            if not key.startswith("EYVAN_SECRET_")
+        }
+    if isinstance(value, list):
+        return [_sanitize_durable_value(item, field=field, suppress_diagnostics=suppress_diagnostics) for item in value]
+    if isinstance(value, str) and field in _DURABLE_DIAGNOSTIC_FIELDS:
+        return _OUTPUT_SUPPRESSED if suppress_diagnostics else redact_secret_material(value)
+    return value
+
+
+def _sanitize_durable_record(value: tp.Mapping[str, JsonValue]) -> JsonObject:
+    copied: JsonObject = dict(value)
+    _upgrade_legacy_secret_record(copied)
+    return tp.cast(
+        "JsonObject",
+        _sanitize_durable_value(copied, suppress_diagnostics=_record_secret_bearing(copied)),
+    )
+
+
+def _open_directory_no_follow(directory: Path) -> int:
+    """Open one directory without resolving a final-component symlink."""
+
+    descriptor = os.open(directory, _DIRECTORY_OPEN_FLAGS)
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError("runtime state path is not a directory")
+    return descriptor
+
+
+def _ensure_private_directory(directory: Path) -> None:
+    """Create or tighten one process-owned runtime-state directory safely."""
+
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+        descriptor = _open_directory_no_follow(directory)
+    except OSError:
+        raise RuntimeError("runtime state directory is unsafe") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.geteuid():
+            raise RuntimeError("runtime state directory is not owned by this process identity")
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = _open_directory_no_follow(directory)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_unlink(path: Path) -> bool:
+    """Unlink one file and make the directory entry removal crash-durable."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    _fsync_directory(path.parent)
+    return True
+
+
+def _startup_lock_path(path: Path) -> Path:
+    """Return the state-wide lock shared by atomic writers and startup."""
+
+    return path.parent.parent / _STARTUP_LOCK_NAME
+
+
+@contextmanager
+def _atomic_writer_exclusion(path: Path) -> tp.Iterator[None]:
+    """Keep startup's exclusive sweep outside one complete temp lifecycle."""
+
+    # Production callers already hold the job or workload lock. Successful
+    # acquisition of this shared lock is the writer lifecycle's linearization
+    # boundary: it happens before temp creation and remains held through publish
+    # or cleanup. Startup takes the same lock exclusively only while sweeping and
+    # releases it before acquiring any record lock.
+    with _file_lock(_startup_lock_path(path), shared=True):
+        yield
+
+
+def _atomic_write_json(path: Path, value: tp.Mapping[str, JsonValue]) -> None:
+    _ensure_private_directory(path.parent)
+    with _atomic_writer_exclusion(path):
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        published = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            stream = os.fdopen(descriptor, "w", encoding="utf-8")
+            descriptor = -1
+            with stream:
+                json.dump(_sanitize_durable_record(value), stream, sort_keys=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            published = True
+            _fsync_directory(path.parent)
+        except BaseException:
+            if not published:
+                try:
+                    _durable_unlink(temporary)
+                except BaseException as cleanup_error:
+                    raise RuntimeError("could not durably remove an atomic JSON temporary file") from cleanup_error
+            # Once replace succeeds this path is a complete, fsynced JSON document.
+            # Removing it after a directory-fsync error could erase the last usable
+            # lifecycle record; leave that valid record in place and fail the caller.
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _write_environment_file(path: Path, environment: tp.Mapping[str, str]) -> None:
-    """Atomically write one owner-only environment file for systemd or Docker.
-
-    Both systemd ``EnvironmentFile=`` units and ``docker run --env-file``
-    parse one ``NAME=value`` assignment per line, so values cannot span
-    lines. The file keeps the workload environment out of unit argv, which
-    ``systemctl show``, ``ps``, and the journal expose to every host user.
-    """
+    """Atomically write one owner-only env file without line injection."""
 
     lines: list[str] = []
     for name, value in sorted(environment.items()):
-        if "\n" in value or "\r" in value:
-            raise ValueError(f"environment variable {name!r} must not contain a newline")
+        if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
+            raise ValueError("environment variable names must be valid shell identifiers")
+        if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"environment variable {name!r} must be a NUL- and newline-free string")
         lines.append(f"{name}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write("".join(f"{line}\n" for line in lines))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    _ensure_private_directory(path.parent)
+    with _atomic_writer_exclusion(path):
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        published = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            stream = os.fdopen(descriptor, "w", encoding="utf-8")
+            descriptor = -1
+            with stream:
+                stream.write("".join(f"{line}\n" for line in lines))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            published = True
+            _fsync_directory(path.parent)
+        except BaseException:
+            # Unlike a JSON lifecycle record, this file may contain plaintext. A
+            # failed post-rename durability barrier must not leave the published
+            # path available to a workload or across the next process restart.
+            cleanup_path = path if published else temporary
+            try:
+                _durable_unlink(cleanup_path)
+            except BaseException as cleanup_error:
+                # The unlink may already be visible but not crash-durable. Never
+                # allow launch to continue on that ambiguity.
+                raise RuntimeError("could not durably remove a failed workload environment file") from cleanup_error
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _load_json(path: Path) -> JsonObject | None:
@@ -250,7 +417,7 @@ def _persisted_message(remote_id: str, record: tp.Mapping[str, JsonValue]) -> st
         raise _InvalidDurableRecord(f"systemd execution {remote_id!r} has no persisted message") from exc
     if not isinstance(message, str):
         raise _InvalidDurableRecord(f"systemd execution {remote_id!r} has a non-string persisted message")
-    return message
+    return _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else redact_secret_material(message)
 
 
 def _persisted_remote_id(expected_remote_id: str, record: tp.Mapping[str, JsonValue]) -> None:
@@ -315,20 +482,83 @@ def _required_record_string(record: tp.Mapping[str, JsonValue], field: str) -> s
 
 
 @contextmanager
-def _file_lock(path: Path) -> tp.Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+def _file_lock(path: Path, *, shared: bool = False) -> tp.Iterator[None]:
+    _ensure_private_directory(path.parent)
+    descriptor = os.open(
+        path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    locked = False
     try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
+            raise RuntimeError("runtime state lock is unsafe")
         os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        locked = True
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
 def _record_lock_path(record_path: Path) -> Path:
     return record_path.with_suffix(".lock")
+
+
+def _sweep_atomic_temporary_directory(
+    directory: Path,
+    *,
+    pattern: re.Pattern[str],
+) -> None:
+    """Crash-durably remove exact orphan temp names without following entries.
+
+    The caller holds the state-wide startup lock exclusively, while every
+    conforming atomic writer holds it shared for its whole temporary-file
+    lifecycle. No writer can therefore create a matching entry after this
+    snapshot and before the startup phase declares the directory clean. Hidden
+    names outside the exact atomic-writer grammar fail closed.
+    """
+
+    descriptor = _open_directory_no_follow(directory)
+    removed = False
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise RuntimeError("runtime temporary directory is not private")
+        with os.scandir(descriptor) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            if pattern.fullmatch(name) is None:
+                if name.startswith("."):
+                    raise RuntimeError("runtime temporary directory contains an unexpected hidden entry")
+                continue
+            try:
+                entry_metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(entry_metadata.st_mode)
+                or entry_metadata.st_uid != os.geteuid()
+                or entry_metadata.st_nlink != 1
+            ):
+                raise RuntimeError("runtime atomic temporary entry is unsafe")
+            try:
+                os.unlink(name, dir_fd=descriptor)
+            except FileNotFoundError:
+                continue
+            removed = True
+    finally:
+        try:
+            # Also persist removals made before a later unexpected entry made
+            # startup fail closed; every unlink this invocation performed must
+            # have the same crash-durability guarantee.
+            if removed:
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _read_boot_id() -> str | None:
@@ -492,9 +722,12 @@ class SystemdTransientServiceExecutor:
         workload_directory: str | os.PathLike[str] | None = None,
         base_environment: tp.Mapping[str, str] | None = None,
         command_timeout_s: float = 315.0,
+        _defer_startup_recovery: bool = False,
     ) -> None:
         if command_timeout_s <= 0:
             raise ValueError("systemd command timeout must be positive")
+        if not isinstance(_defer_startup_recovery, bool):
+            raise ValueError("systemd startup recovery deferral must be a boolean")
         if not isinstance(use_exit_type_cgroup, bool):
             raise ValueError("systemd ExitType cgroup setting must be a boolean")
         for label, identity in (("workload user", workload_user), ("workload group", workload_group)):
@@ -509,15 +742,16 @@ class SystemdTransientServiceExecutor:
             for name, value in base_environment.items():
                 if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
                     raise ValueError("systemd base environment variable names must be valid shell identifiers")
-                if not isinstance(value, str) or "\x00" in value:
-                    raise ValueError(f"systemd base environment variable {name!r} must be a NUL-free string")
+                if not isinstance(value, str) or any(character in value for character in ("\x00", "\n", "\r")):
+                    raise ValueError(
+                        f"systemd base environment variable {name!r} must be a NUL- and newline-free string"
+                    )
         self.state_dir = Path(state_dir).expanduser() if state_dir is not None else _default_state_dir()
         self.jobs_dir = self.state_dir / "jobs"
         self.workloads_dir = self.state_dir / "workloads"
         self.env_dir = self.state_dir / "env"
         for directory in (self.state_dir, self.jobs_dir, self.workloads_dir, self.env_dir):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory.chmod(0o700)
+            _ensure_private_directory(directory)
         self._command_timeout_s = command_timeout_s
         self._command_runner = command_runner or (
             lambda command: _systemd_runner(command, timeout_s=self._command_timeout_s)
@@ -536,6 +770,8 @@ class SystemdTransientServiceExecutor:
         self._workload_group = workload_group
         self._workload_directory = str(workload_directory) if workload_directory is not None else None
         self._base_environment = dict(base_environment or {})
+        if not _defer_startup_recovery:
+            self._recover_startup()
 
     def _record_path(self, remote_id: str) -> Path:
         return self.jobs_dir / f"{_record_name(remote_id)}.json"
@@ -545,6 +781,111 @@ class SystemdTransientServiceExecutor:
 
     def _environment_file_path(self, remote_id: str) -> Path:
         return self.env_dir / f"{_record_name(remote_id)}.env"
+
+    def _environment_file_paths(self, remote_id: str) -> tuple[Path, ...]:
+        """Return every owner-only plaintext environment file for one run."""
+
+        return (self._environment_file_path(remote_id),)
+
+    def _environment_temporary_directories(self) -> tuple[Path, ...]:
+        """Return managed directories containing atomic plaintext env writes."""
+
+        return (self.env_dir,)
+
+    def _sweep_startup_temporaries(self) -> None:
+        """Remove exact crash-orphan atomic writes before record recovery."""
+
+        for directory in self._environment_temporary_directories():
+            _sweep_atomic_temporary_directory(directory, pattern=_ATOMIC_ENV_TEMPORARY)
+        _sweep_atomic_temporary_directory(self.jobs_dir, pattern=_ATOMIC_JSON_TEMPORARY)
+        _sweep_atomic_temporary_directory(self.workloads_dir, pattern=_ATOMIC_JSON_TEMPORARY)
+
+    def _recover_startup(self) -> None:
+        """Eagerly sweep atomic orphans, then recover every durable job.
+
+        Construction is the startup boundary. Requiring a later status request
+        left plaintext indefinitely on idle workers after a restart. Startup
+        takes the state-wide lock exclusively for the exact-name sweep; every
+        atomic writer holds it shared from before temp creation through publish
+        or cleanup. The global lock is released before any per-record lock is
+        acquired, preserving the ordinary record-then-global lock order.
+        """
+
+        try:
+            with _file_lock(self.state_dir / _STARTUP_LOCK_NAME):
+                self._sweep_startup_temporaries()
+        except Exception:
+            raise RuntimeError("could not safely recover atomic runtime temporary files") from None
+
+        for record_path in sorted(self.jobs_dir.glob("*.json")):
+            if record_path.is_symlink():
+                raise RuntimeError("could not safely recover a systemd execution record")
+            with _file_lock(_record_lock_path(record_path)):
+                try:
+                    record = _load_json(record_path)
+                except Exception:
+                    raise RuntimeError("could not safely recover a systemd execution record") from None
+                if record is None:
+                    continue
+                _upgrade_legacy_secret_record(record)
+                remote_id = record.get("remote_id")
+                if (
+                    not isinstance(remote_id, str)
+                    or not remote_id
+                    or self._record_path(remote_id).name != record_path.name
+                ):
+                    # Sanitization still happens before failing startup, so an
+                    # N-1 capability is not left merely because its owner record
+                    # is malformed.
+                    _atomic_write_json(record_path, record)
+                    raise RuntimeError("could not safely recover a systemd execution record")
+                _atomic_write_json(record_path, record)
+            # ``status`` takes the same lock itself. Never nest flock calls:
+            # on some platforms that would release the process-wide lock early.
+            self.status(remote_id)
+
+    def _remove_environment_files(
+        self,
+        record: JsonObject,
+        *,
+        runtime_absent: bool = False,
+        environment_consumed: bool = False,
+    ) -> None:
+        """Crash-durably unlink plaintext when runtime evidence makes it safe.
+
+        A durable terminal outcome, a positively absent runtime, or a positively
+        running runtime (which has consumed its launch environment) is enough.
+        An unavailable inspection is not.  This distinction permits cleanup
+        while the workload result remains semantically INDETERMINATE without
+        guessing that an unobservable process is gone.
+        """
+
+        status = _known_persisted_status(record)
+        if status not in _TERMINAL_STATES and not runtime_absent and not environment_consumed:
+            return
+        remote_id = record.get("remote_id")
+        if not isinstance(remote_id, str) or not remote_id:
+            raise RuntimeError("cannot remove workload environment for a record without a remote ID")
+        for path in self._environment_file_paths(remote_id):
+            try:
+                _durable_unlink(path)
+            except OSError:
+                raise RuntimeError("could not remove owner-only workload environment file") from None
+        # Do not trust this flag to skip a later unlink: a stale file restored
+        # beside a durable record must be removed again after a restart.
+        record["environment_collected"] = True
+        record["updated_at"] = _utcnow()
+
+    @staticmethod
+    def _resolved_launch_environment(environment: tp.Mapping[str, str]) -> dict[str, str]:
+        """Replace capability scaffolding with resolved values in memory only."""
+
+        resolved = materialize_secrets(environment)
+        launch_environment = dict(environment)
+        for key in secret_environment_keys(launch_environment):
+            launch_environment.pop(key, None)
+        launch_environment.update(resolved)
+        return launch_environment
 
     @staticmethod
     def _validate_fence(remote_id: str, record: tp.Mapping[str, JsonValue], context: MutationContext) -> None:
@@ -601,7 +942,7 @@ class SystemdTransientServiceExecutor:
             )
         )
         properties = _parse_properties(result.stdout)
-        detail = result.stderr.strip()
+        detail = redact_secret_material(result.stderr.strip())
         if properties.get("LoadState") == "not-found" or result.returncode == 4:
             return "missing", None, detail or "systemd unit is absent"
         if result.returncode != 0:
@@ -739,7 +1080,59 @@ class SystemdTransientServiceExecutor:
             record.pop("unit_collection_error", None)
             return
         detail = stop.stderr.strip() or reset.stderr.strip() or "systemd did not collect terminal unit"
-        record["unit_collection_error"] = detail
+        record["unit_collection_error"] = redact_secret_material(detail)
+
+    def _secure_terminal_collection(
+        self,
+        record_path: Path,
+        record: JsonObject,
+        *,
+        runtime_absent: bool = False,
+        environment_consumed: bool = False,
+    ) -> None:
+        """Remove plaintext before persisting and collecting runtime state."""
+
+        try:
+            self._remove_environment_files(
+                record,
+                runtime_absent=runtime_absent,
+                environment_consumed=environment_consumed,
+            )
+            self._collect_terminal_unit(record)
+        finally:
+            # Persist sanitization and successful cleanup markers even if a
+            # filesystem error makes the caller fail closed and retry.
+            _atomic_write_json(record_path, record)
+
+    def _recover_latched_indeterminate_environment(self, record_path: Path, record: JsonObject) -> None:
+        """Clean plaintext on positive runtime evidence without changing outcome.
+
+        INDETERMINATE remains semantically latched.  This probe answers only the
+        narrower question of whether the launch environment is still needed.
+        """
+
+        runtime_observation = self._runtime_status(record)
+        if runtime_observation is not None:
+            status, _message = runtime_observation
+            if status in _TERMINAL_STATES or status is ExecutionWorkloadStatus.RUNNING:
+                self._secure_terminal_collection(record_path, record, environment_consumed=True)
+            else:
+                _atomic_write_json(record_path, record)
+            return
+        unit_name = record.get("unit_name")
+        if not isinstance(unit_name, str) or not unit_name:
+            _atomic_write_json(record_path, record)
+            return
+        outcome, properties, _detail = self._show_unit(unit_name)
+        if outcome == "missing":
+            self._secure_terminal_collection(record_path, record, runtime_absent=True)
+            return
+        if outcome == "present" and properties is not None:
+            status, _message = self._status_from_properties(record, properties)
+            if status in _TERMINAL_STATES or status is ExecutionWorkloadStatus.RUNNING:
+                self._secure_terminal_collection(record_path, record, environment_consumed=True)
+                return
+        _atomic_write_json(record_path, record)
 
     def _boot_changed(self, record: tp.Mapping[str, JsonValue]) -> bool:
         recorded = record.get("boot_id")
@@ -857,11 +1250,7 @@ class SystemdTransientServiceExecutor:
         remote_id = record.get("remote_id")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
-        launch_environment = {**self._base_environment, **_environment(spec)}
-        secrets = materialize_secrets(launch_environment)
-        for key in secret_environment_keys(launch_environment):
-            launch_environment.pop(key, None)
-        launch_environment.update(secrets)
+        launch_environment = self._resolved_launch_environment({**self._base_environment, **_environment(spec)})
         _write_environment_file(self._environment_file_path(remote_id), launch_environment)
 
     def _launch_command(
@@ -946,6 +1335,10 @@ class SystemdTransientServiceExecutor:
             raise ValueError("native-systemd workloads require a non-empty entrypoint")
         _validate_gang(spec)
         environment = _environment(spec)
+        secret_bearing = bool(secret_environment_keys(environment))
+        durable_environment = {
+            name: value for name, value in environment.items() if not name.startswith("EYVAN_SECRET_")
+        }
         submitted_remote_id = spec.get("submission_id")
         if submitted_remote_id is None:
             remote_id = context.idempotency_key.strip()
@@ -970,6 +1363,10 @@ class SystemdTransientServiceExecutor:
             existing = _load_json(record_path)
             if existing is not None:
                 self._validate_fence(remote_id, existing, context)
+                # Rewrite records from older agents without their secret
+                # scaffolding. Terminal replays also retry plaintext cleanup.
+                self._remove_environment_files(existing)
+                _atomic_write_json(record_path, existing)
                 return remote_id
 
         def reserve_and_launch() -> str:
@@ -979,13 +1376,18 @@ class SystemdTransientServiceExecutor:
                 existing = _load_json(record_path)
                 if existing is not None:
                     self._validate_fence(remote_id, existing, context)
+                    self._remove_environment_files(existing)
+                    _atomic_write_json(record_path, existing)
                     return remote_id
                 now = _utcnow()
                 try:
                     boot_id = self._boot_id_reader()
                 except OSError:
                     boot_id = None
-                record_fields = dict(self._record_fields(spec, remote_id, environment))
+                # Runtime hooks receive only the durable subset. Capability
+                # scaffolding remains in ``spec`` just long enough for
+                # ``_prepare_launch`` to redeem it in memory.
+                record_fields = dict(self._record_fields(spec, remote_id, durable_environment))
                 unit_name = systemd_unit_name(remote_id)
                 protected_fields = {
                     "remote_id",
@@ -998,6 +1400,7 @@ class SystemdTransientServiceExecutor:
                     "entrypoint",
                     "environment",
                     "metadata",
+                    "secret_bearing",
                     "exit_type_cgroup",
                     "boot_id",
                     "stop_requested",
@@ -1020,8 +1423,9 @@ class SystemdTransientServiceExecutor:
                     "fencing_token": context.fencing_token,
                     "idempotency_key": context.idempotency_key,
                     "entrypoint": entrypoint,
-                    "environment": environment,
+                    "environment": durable_environment,
                     "metadata": dict(metadata),
+                    "secret_bearing": secret_bearing,
                     "exit_type_cgroup": self._use_exit_type_cgroup,
                     "boot_id": boot_id if isinstance(boot_id, str) and boot_id else None,
                     "stop_requested": False,
@@ -1035,23 +1439,51 @@ class SystemdTransientServiceExecutor:
                 try:
                     self._prepare_launch(record, spec)
                 except Exception as exc:
-                    self._set_status(record, ExecutionWorkloadStatus.FAILED, f"failed to prepare native runtime: {exc}")
+                    detail = (
+                        _OUTPUT_SUPPRESSED
+                        if _record_secret_bearing(record)
+                        else str(exc)
+                        if isinstance(exc, SecretMaterializationError)
+                        else "native runtime preparation failed"
+                    )
+                    self._set_status(
+                        record,
+                        ExecutionWorkloadStatus.FAILED,
+                        f"failed to prepare native runtime: {detail}",
+                    )
                     _atomic_write_json(record_path, record)
-                    raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {exc}") from exc
-                result = self._run(
-                    self._launch_command(
+                    try:
+                        self._remove_environment_files(record)
+                    finally:
+                        _atomic_write_json(record_path, record)
+                    raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {detail}") from None
+                try:
+                    launch_command = self._launch_command(
                         unit_name,
                         entrypoint,
-                        environment,
+                        durable_environment,
                         record=record,
                         spec=spec,
                     )
-                )
+                except Exception:
+                    detail = "native runtime launch command could not be constructed"
+                    self._set_status(record, ExecutionWorkloadStatus.FAILED, detail)
+                    _atomic_write_json(record_path, record)
+                    try:
+                        self._remove_environment_files(record)
+                    finally:
+                        _atomic_write_json(record_path, record)
+                    raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {detail}") from None
+                result = self._run(launch_command)
                 if result.returncode == 0:
                     return remote_id
 
                 outcome, _properties, detail = self._show_unit(unit_name)
-                launch_detail = result.stderr.strip() or detail or "systemd-run failed"
+                launch_detail = (
+                    _OUTPUT_SUPPRESSED
+                    if _record_secret_bearing(record)
+                    else redact_secret_material(result.stderr.strip() or detail or "systemd-run failed")
+                )
                 if outcome == "missing":
                     self._set_status(
                         record,
@@ -1070,6 +1502,11 @@ class SystemdTransientServiceExecutor:
                 _atomic_write_json(record_path, record)
                 if outcome == "present":
                     return remote_id
+                if outcome == "missing":
+                    try:
+                        self._remove_environment_files(record)
+                    finally:
+                        _atomic_write_json(record_path, record)
             raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {launch_detail}")
 
         if workload_id is None:
@@ -1083,7 +1520,7 @@ class SystemdTransientServiceExecutor:
             return reserve_and_launch()
 
     def status(self, remote_id: str) -> ExecutionWorkloadObservation:
-        """Return durable status, failing closed when systemd ownership is lost."""
+        """Return durable status, failing closed when runtime ownership is lost."""
 
         record_path = self._record_path(remote_id)
         with _file_lock(_record_lock_path(record_path)):
@@ -1094,10 +1531,11 @@ class SystemdTransientServiceExecutor:
                     status=ExecutionWorkloadStatus.NOT_FOUND,
                     message="systemd execution is absent",
                 )
+            _upgrade_legacy_secret_record(record)
             try:
                 durable = _durable_observation(remote_id, record)
             except _InvalidDurableRecord as exc:
-                message = f"invalid durable record: {exc}"
+                message = _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else f"invalid durable record: {exc}"
                 self._set_status(record, ExecutionWorkloadStatus.INDETERMINATE, message)
                 _atomic_write_json(record_path, record)
                 return ExecutionWorkloadObservation(
@@ -1106,16 +1544,19 @@ class SystemdTransientServiceExecutor:
                     message=message,
                 )
 
-            # A cgroup probe can be transiently unavailable on systemd 249.
-            # Recheck precisely that ambiguity: a later empty ControlGroup is
-            # positive evidence that every workload process exited. Other
-            # indeterminate outcomes remain terminal and fail closed.
-            recoverable_cgroup_indeterminate = (
+            recoverable_indeterminate = (
                 durable.status is ExecutionWorkloadStatus.INDETERMINATE and _is_recoverable_indeterminate(record)
             )
-            if self._is_final(durable.status) and not recoverable_cgroup_indeterminate:
-                self._collect_terminal_unit(record)
-                _atomic_write_json(record_path, record)
+            if durable.status in _TERMINAL_STATES:
+                self._secure_terminal_collection(record_path, record)
+                return durable
+            if durable.status is ExecutionWorkloadStatus.INDETERMINATE and not recoverable_indeterminate:
+                try:
+                    self._recover_latched_indeterminate_environment(record_path, record)
+                except Exception:
+                    # Failure to prove absence/consumption retains plaintext and
+                    # the conservative outcome; startup does not guess.
+                    _atomic_write_json(record_path, record)
                 return durable
             if self._boot_changed(record):
                 self._set_status(
@@ -1123,20 +1564,29 @@ class SystemdTransientServiceExecutor:
                     ExecutionWorkloadStatus.LOST,
                     "host boot ID changed; transient systemd service was lost",
                 )
-                _atomic_write_json(record_path, record)
+                self._secure_terminal_collection(record_path, record, runtime_absent=True)
                 return _durable_observation(remote_id, record)
 
+            runtime_absent = False
+            environment_consumed = False
             try:
                 runtime_observation = self._runtime_status(record)
                 if runtime_observation is not None:
                     status, message = runtime_observation
+                    if _record_secret_bearing(record):
+                        message = _OUTPUT_SUPPRESSED
+                    else:
+                        message = redact_secret_material(message)
                     if status is ExecutionWorkloadStatus.INDETERMINATE:
                         self._mark_indeterminate(record, message)
                     else:
                         self._set_status(record, status, message)
-                    _atomic_write_json(record_path, record)
-                    self._collect_terminal_unit(record)
-                    _atomic_write_json(record_path, record)
+                    environment_consumed = status is ExecutionWorkloadStatus.RUNNING or status in _TERMINAL_STATES
+                    self._secure_terminal_collection(
+                        record_path,
+                        record,
+                        environment_consumed=environment_consumed,
+                    )
                     return _durable_observation(remote_id, record)
 
                 unit_name = record.get("unit_name")
@@ -1151,19 +1601,33 @@ class SystemdTransientServiceExecutor:
                         "systemd service disappeared before a terminal state was recorded",
                         recoverable=False,
                     )
+                    runtime_absent = True
                 elif outcome == "unavailable" or properties is None:
-                    self._mark_indeterminate(record, f"cannot observe systemd service: {detail}")
+                    message = (
+                        _OUTPUT_SUPPRESSED
+                        if _record_secret_bearing(record)
+                        else f"cannot observe systemd service: {redact_secret_material(detail)}"
+                    )
+                    self._mark_indeterminate(record, message)
                 else:
                     status, message = self._status_from_properties(record, properties)
+                    if _record_secret_bearing(record):
+                        message = _OUTPUT_SUPPRESSED
                     if status is ExecutionWorkloadStatus.INDETERMINATE:
                         self._mark_indeterminate(record, message)
                     else:
                         self._set_status(record, status, message)
+                    environment_consumed = status is ExecutionWorkloadStatus.RUNNING or status in _TERMINAL_STATES
             except _InvalidDurableRecord as exc:
-                self._mark_indeterminate(record, f"invalid durable record: {exc}", recoverable=False)
+                message = _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else f"invalid durable record: {exc}"
+                self._mark_indeterminate(record, message, recoverable=False)
             _atomic_write_json(record_path, record)
-            self._collect_terminal_unit(record)
-            _atomic_write_json(record_path, record)
+            self._secure_terminal_collection(
+                record_path,
+                record,
+                runtime_absent=runtime_absent,
+                environment_consumed=environment_consumed,
+            )
             return _durable_observation(remote_id, record)
 
     def stop(self, remote_id: str, context: MutationContext) -> None:
@@ -1182,6 +1646,7 @@ class SystemdTransientServiceExecutor:
                 _atomic_write_json(record_path, record)
                 raise RuntimeError(f"cannot safely stop ambiguous systemd execution {remote_id!r}") from exc
             if durable.status in _TERMINAL_STATES:
+                self._secure_terminal_collection(record_path, record)
                 return
             # What makes a stop unsafe is not knowing *what* to stop, so the unit
             # name is the gate -- not the status.  An INDETERMINATE record with a
@@ -1204,23 +1669,25 @@ class SystemdTransientServiceExecutor:
         try:
             self._stop_runtime(record)
         except Exception as exc:
+            detail = _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else redact_secret_material(str(exc))
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to stop native runtime: {exc}")
+                    self._mark_indeterminate(current, f"failed to stop native runtime: {detail}")
                     _atomic_write_json(record_path, current)
-            raise RuntimeError(f"failed to stop native runtime for {remote_id!r}: {exc}") from exc
+            raise RuntimeError(f"failed to stop native runtime for {remote_id!r}: {detail}") from None
 
         result = self._run(("systemctl", "stop", "--no-pager", unit_name))
         try:
             self._after_systemd_stop(record)
         except Exception as exc:
+            detail = _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else redact_secret_material(str(exc))
             with _file_lock(_record_lock_path(record_path)):
                 current = _load_json(record_path)
                 if current is not None and _known_persisted_status(current) not in _FINAL_STATES:
-                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {exc}")
+                    self._mark_indeterminate(current, f"failed to finish native runtime stop: {detail}")
                     _atomic_write_json(record_path, current)
-            raise RuntimeError(f"failed to finish native runtime stop for {remote_id!r}: {exc}") from exc
+            raise RuntimeError(f"failed to finish native runtime stop for {remote_id!r}: {detail}") from None
 
         # Both stop stages have now succeeded, which is direct positive evidence
         # about a workload whose record may still carry an INDETERMINATE latched
@@ -1238,9 +1705,12 @@ class SystemdTransientServiceExecutor:
         if observed.status is ExecutionWorkloadStatus.INDETERMINATE:
             raise RuntimeError(f"cannot safely verify that systemd execution {remote_id!r} stopped")
         if result.returncode != 0 and observed.status not in _TERMINAL_STATES:
-            raise RuntimeError(
-                f"systemctl stop failed for {remote_id!r}: {result.stderr.strip() or 'unknown systemd error'}"
+            detail = (
+                _OUTPUT_SUPPRESSED
+                if _record_secret_bearing(record)
+                else redact_secret_material(result.stderr.strip()) or "unknown systemd error"
             )
+            raise RuntimeError(f"systemctl stop failed for {remote_id!r}: {detail}")
 
     def retire(self, remote_id: str, context: MutationContext) -> None:
         """Stop a superseded cgroup and wait for a verified terminal record."""
@@ -1268,7 +1738,13 @@ class SystemdTransientServiceExecutor:
                     record = _load_json(record_path)
                     if record is not None:
                         self._validate_fence(remote_id, record, context)
-                        self._retire_terminal_runtime(record)
+                        try:
+                            self._retire_terminal_runtime(record)
+                        finally:
+                            try:
+                                self._remove_environment_files(record)
+                            finally:
+                                _atomic_write_json(record_path, record)
                 return
             if observed.status is ExecutionWorkloadStatus.INDETERMINATE and not self._indeterminacy_is_recoverable(
                 record_path
@@ -1390,16 +1866,18 @@ class SystemdTransientServiceExecutor:
             record = _load_json(record_path)
             if record is None:
                 return ""
+            if _record_secret_bearing(record):
+                return ""
             unit_name = record.get("unit_name")
             if not isinstance(unit_name, str) or not unit_name:
                 return ""
             runtime_logs = self._runtime_logs(record)
             if runtime_logs is not None:
-                return runtime_logs
+                return redact_secret_material(runtime_logs)
         result = self._run(("journalctl", "--no-pager", "--output=cat", f"--unit={unit_name}"))
         if result.returncode != 0:
             raise SystemdLogsUnavailableError(unit_name, result.stderr.strip())
-        return result.stdout
+        return redact_secret_material(result.stdout)
 
     def exec_in_workload(
         self,
@@ -1435,6 +1913,16 @@ class SystemdTransientServiceExecutor:
         if source is None:
             raise RuntimeError(f"systemd execution {remote_id!r} is absent")
         unit_name = source.get("unit_name")
+        if _record_secret_bearing(source):
+            return {
+                "remote_id": remote_id,
+                "unit_name": unit_name if isinstance(unit_name, str) else None,
+                "command": [],
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "output_suppressed": True,
+            }
         inherited = source.get("environment")
         source_environment = (
             {name: value for name, value in (inherited or {}).items() if isinstance(value, str)}
@@ -1472,8 +1960,8 @@ class SystemdTransientServiceExecutor:
             "unit_name": unit_name if isinstance(unit_name, str) else None,
             "command": arguments,
             "exit_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": redact_secret_material(result.stdout),
+            "stderr": redact_secret_material(result.stderr),
         }
         return document
 
@@ -1497,6 +1985,8 @@ class SystemdTransientServiceExecutor:
             record = _load_json(record_path)
             if record is None:
                 return LogPage(unavailable=True, detail="no durable execution record")
+            if _record_secret_bearing(record):
+                return LogPage(unavailable=True, detail=_OUTPUT_SUPPRESSED)
             unit_name = record.get("unit_name")
             if not isinstance(unit_name, str) or not unit_name:
                 return LogPage(unavailable=True, detail="execution record has no unit")
@@ -1507,8 +1997,11 @@ class SystemdTransientServiceExecutor:
             arguments.extend((f"--after-cursor={after}", "--lines=all"))
         result = self._run(tuple(arguments))
         if result.returncode != 0:
-            return LogPage(unavailable=True, detail=result.stderr.strip() or "journalctl failed")
-        return parse_journal_json(result.stdout)
+            return LogPage(
+                unavailable=True,
+                detail=redact_secret_material(result.stderr.strip()) or "journalctl failed",
+            )
+        return parse_journal_json(redact_secret_material(result.stdout))
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return live process detail for one workload attempt.
@@ -1528,6 +2021,13 @@ class SystemdTransientServiceExecutor:
             record = _load_json(record_path)
         if record is None:
             return {"remote_id": remote_id, "observed": False, "detail": "no durable execution record"}
+        if _record_secret_bearing(record):
+            return {
+                "remote_id": remote_id,
+                "observed": False,
+                "detail": _OUTPUT_SUPPRESSED,
+                "output_suppressed": True,
+            }
         unit_name = record.get("unit_name")
         if not isinstance(unit_name, str) or not unit_name:
             return {"remote_id": remote_id, "observed": False, "detail": "execution record has no unit"}
@@ -1554,7 +2054,7 @@ class SystemdTransientServiceExecutor:
             "control_group": control_group,
             "pids": None if pids is None else list(pids),
             "process_count": None if pids is None else len(pids),
-            "detail": detail,
+            "detail": redact_secret_material(detail),
         }
 
 

@@ -24,9 +24,11 @@ from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, canonical_execution_backend
 from eyvan.domain import costing
 from eyvan.domain.models import InfeasibilityCode, WorkerResourceScope
+from eyvan.secrets import validate_secret_reference
 from eyvan.worker.distributed_environment import (
     DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES,
     is_distributed_topology_environment_name,
+    is_runtime_owned_environment_name,
 )
 
 JsonDocument: tp.TypeAlias = dict[str, PydanticJsonValue]
@@ -135,6 +137,35 @@ def _validate_string_map(
 def _validate_strings(values: tp.Iterable[str], *, field_name: str) -> None:
     if any(not value or value != value.strip() for value in values):
         raise ValueError(f"{field_name} values must be non-empty and trimmed")
+
+
+def _environment_name_is_reserved(name: str) -> bool:
+    """Return whether Eyvan rather than a workload owns an environment name."""
+
+    return (
+        name in _RESERVED_RUNTIME_ENVIRONMENT_NAMES
+        or name.startswith("EYVAN_SECRET_")
+        or is_distributed_topology_environment_name(name)
+    )
+
+
+def validate_secret_mount_contract(
+    environment: tp.Mapping[str, str],
+    secret_mounts: tp.Mapping[str, str],
+) -> None:
+    """Apply the ordinary workload-environment contract to secret mounts."""
+
+    _validate_string_map(secret_mounts, field_name="secret mounts")
+    for name, reference in secret_mounts.items():
+        if not _ENVIRONMENT_NAME.fullmatch(name):
+            raise ValueError("secret mount names must be valid shell identifiers")
+        if is_runtime_owned_environment_name(name):
+            raise ValueError(f"secret mount name {name!r} is reserved by Eyvan")
+        if name in environment:
+            raise ValueError(f"secret mount name {name!r} collides with the workload environment")
+        if "\x00" in reference or "\n" in reference or "\r" in reference:
+            raise ValueError(f"secret mount reference for {name!r} must not contain NUL bytes or newlines")
+        validate_secret_reference(reference)
 
 
 def _validate_string(value: str | None, *, field_name: str, optional: bool = False) -> None:
@@ -943,10 +974,11 @@ class WorkloadDefinition(EyvanModel):
         for name, value in self.environment.items():
             if not _ENVIRONMENT_NAME.fullmatch(name):
                 raise ValueError("workload environment names must be valid shell identifiers")
-            if name in _RESERVED_RUNTIME_ENVIRONMENT_NAMES or is_distributed_topology_environment_name(name):
+            if _environment_name_is_reserved(name):
                 raise ValueError(f"workload environment variable {name!r} is reserved by Eyvan")
-            if "\x00" in value:
-                raise ValueError(f"workload environment variable {name!r} must not contain NUL bytes")
+            if "\x00" in value or "\n" in value or "\r" in value:
+                raise ValueError(f"workload environment variable {name!r} must not contain NUL bytes or newlines")
+        validate_secret_mount_contract(self.environment, self.secret_mounts)
         _validate_strings(self.preferred_cells, field_name="preferred cells")
         if len(self.preferred_cells) != len(set(self.preferred_cells)):
             raise ValueError("preferred cells must not contain duplicates")
@@ -1062,6 +1094,31 @@ class WorkloadExplanation(EyvanModel):
         return max(0, self.considered_cell_count - len(self.cells))
 
 
+class WorkloadDispatchReservation(EyvanModel):
+    """Durable fence around one possibly-started cell-agent submission.
+
+    The reservation is committed before the controller calls the agent and is
+    compared again when the response is written back.  ``fence`` also binds
+    secret capabilities to this exact delivery: retrying the same outbox command
+    replaces it, so capabilities from an abandoned RPC never become live again.
+    """
+
+    fence: str = Field(min_length=1, max_length=96)
+    outbox_id: str = Field(min_length=1, max_length=96)
+    outbox_attempt: int = Field(ge=1)
+    generation: int = Field(ge=0)
+    workload_attempt: int = Field(ge=1)
+    lease_ids: tuple[str, ...] = Field(min_length=1)
+    reserved_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_membership(self) -> WorkloadDispatchReservation:
+        _validate_strings(self.lease_ids, field_name="dispatch reservation lease ids")
+        if len(self.lease_ids) != len(set(self.lease_ids)):
+            raise ValueError("dispatch reservation lease ids must not contain duplicates")
+        return self
+
+
 class WorkloadRecord(EyvanModel):
     """Persisted workload aggregate."""
 
@@ -1079,6 +1136,10 @@ class WorkloadRecord(EyvanModel):
     generation: int = 1
     lease_id: str | None = None
     lease_ids: tuple[str, ...] = ()
+    #: A short-lived, durable boundary around a possibly-started dispatch RPC.
+    #: It is intentionally not a secret: possession does not authenticate a
+    #: caller, while signed secret capabilities must carry the exact same fence.
+    dispatch_reservation: WorkloadDispatchReservation | None = None
     remote_id: str | None = None
     #: Where this replica says it can be reached, once it says so.
     #:
@@ -1668,8 +1729,8 @@ class PolicyRecord(EyvanModel):
     allowed_capacity_classes: tuple[CanonicalCapacityClass, ...] = ()
     denied_accelerator_types: tuple[str, ...] = ()
     max_priority: int = Field(default=1000, ge=0, le=1000)
-    #: Reference prefixes this project's workloads may mount. Empty means none,
-    #: which is the safe default and not the permissive one.
+    #: Scheme/authority/path-segment roots this project's workloads may mount.
+    #: Empty means none, which is the safe default and not the permissive one.
     #:
     #: This is the security-critical field. Without it, any submitter in a
     #: project can name any secret the *agent's* identity can read -- and the
@@ -1691,6 +1752,9 @@ class PolicyRecord(EyvanModel):
         _validate_strings(self.allowed_providers, field_name="allowed providers")
         _validate_strings(self.allowed_regions, field_name="allowed regions")
         _validate_strings(self.denied_accelerator_types, field_name="denied accelerator types")
+        _validate_strings(self.allowed_secret_references, field_name="allowed secret references")
+        for reference in self.allowed_secret_references:
+            validate_secret_reference(reference, policy_root=True)
         return self
 
 

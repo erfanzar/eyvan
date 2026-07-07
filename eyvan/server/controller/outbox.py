@@ -24,6 +24,7 @@ from eyvan.records import (
     WorkloadState,
     utcnow,
 )
+from eyvan.secrets import redact_secret_material
 from eyvan.server.controller._support import (
     _RETRIABLE_OUTBOX_STATES,
     CapacityApplySuperseded,
@@ -39,6 +40,8 @@ from eyvan.worker.agent.client import (
     CellAgentStaleMutationError,
     CellAgentUnsupportedCapabilityError,
 )
+
+_SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
 
 
 class _ControllerOutbox:
@@ -90,8 +93,8 @@ class _ControllerOutbox:
             logger.info("discarding stale outbox command %s: %s", command.id, exc)
             await self._finish_outbox(command)
         except CellAgentStaleMutationError as exc:
-            logger.info("discarding cell-agent stale mutation %s: %s", command.id, exc)
-            diagnostic = str(exc)
+            diagnostic = await self._safe_outbox_diagnostic(command, str(exc))
+            logger.info("discarding cell-agent stale mutation %s: %s", command.id, diagnostic)
             if command.topic == "capacity.apply":
                 await self._record_cell_agent_fence_conflict(
                     cell_id=command.aggregate_id,
@@ -137,21 +140,24 @@ class _ControllerOutbox:
             await self._finish_outbox(command, error=str(exc), transient=True)
         except CellAgentUnsupportedCapabilityError as exc:
             # The backend does not implement this operation; retrying cannot
-            # change that. Settle it for good with the diagnostic intact rather
-            # than backing off against a permanent 501.
+            # change that. Secret-bearing diagnostics are suppressed before
+            # either logging or durable settlement.
+            diagnostic = await self._safe_outbox_diagnostic(command, str(exc))
             logger.warning(
                 "cell agent does not support %s for command %s: %s",
                 command.topic,
                 command.id,
-                exc,
+                diagnostic,
             )
-            await self._finish_outbox(command, error=f"unsupported by cell agent backend: {exc}", terminal=True)
+            await self._finish_outbox(
+                command,
+                error=f"unsupported by cell agent backend: {diagnostic}",
+                terminal=True,
+            )
         except CellAgentInvalidConfigurationError as exc:
-            # A rejected provider option cannot start working on a retry, so
-            # settle it terminally with the agent's own sentence -- which names
-            # the exact contradiction and is usually one line of YAML to fix.
-            logger.warning("cell agent rejected the configuration for command %s: %s", command.id, exc)
-            await self._finish_outbox(command, error=f"invalid configuration: {exc}", terminal=True)
+            diagnostic = await self._safe_outbox_diagnostic(command, str(exc))
+            logger.warning("cell agent rejected the configuration for command %s: %s", command.id, diagnostic)
+            await self._finish_outbox(command, error=f"invalid configuration: {diagnostic}", terminal=True)
         except CellAgentCapacityProviderError as exc:
             await self._finish_outbox(command, error=str(exc), failure_code=exc.code)
         except Exception as exc:
@@ -386,6 +392,16 @@ class _ControllerOutbox:
                 return True
         return False
 
+    async def _safe_outbox_diagnostic(self, command: OutboxRecord, error: str) -> str:
+        """Suppress agent/provider output for a declared-secret workload."""
+
+        if command.aggregate_type == "workload":
+            async with self.repository.transaction() as transaction:
+                workload = await transaction.get_workload(command.aggregate_id)
+            if workload is not None and workload.spec.secret_mounts:
+                return _SECRET_OUTPUT_SUPPRESSED
+        return redact_secret_material(error)
+
     async def _finish_outbox(
         self,
         command: OutboxRecord,
@@ -414,6 +430,16 @@ class _ControllerOutbox:
                 or current.claimed_until <= now
             ):
                 return False
+            if error is not None:
+                if current.aggregate_type == "workload":
+                    workload = await transaction.get_workload(current.aggregate_id)
+                    error = (
+                        _SECRET_OUTPUT_SUPPRESSED
+                        if workload is not None and workload.spec.secret_mounts
+                        else redact_secret_material(error)
+                    )
+                else:
+                    error = redact_secret_material(error)
             if error is None:
                 updated = current.model_copy(
                     update={
