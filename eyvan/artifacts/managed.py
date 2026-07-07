@@ -664,6 +664,67 @@ class _LocalObjectVersion:
     generation_digest: str | None = None
 
 
+_LOCAL_DELETE_TRANSACTION = re.compile(
+    r"^\.delete-v1-(?P<layout>[12])-(?P<digest>[0-9a-f]{64})-"
+    r"(?P<device>0|[1-9][0-9]*)-(?P<inode>0|[1-9][0-9]*)-(?P<ctime_ns>0|[1-9][0-9]*)$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalDeleteIntent:
+    """Self-describing identity of one durable local deletion transaction."""
+
+    layout: int
+    digest: str
+    device: int
+    inode: int
+    ctime_ns: int
+
+    @property
+    def directory_name(self) -> str:
+        return f".delete-v1-{self.layout}-{self.digest}-{self.device}-{self.inode}-{self.ctime_ns}"
+
+    @property
+    def trash_directory_name(self) -> str:
+        return self.directory_name.replace(".delete-", ".trash-", 1)
+
+    @property
+    def anchored(self) -> bool:
+        return self.layout == 2
+
+    def matches_version(self, version: _LocalObjectVersion) -> bool:
+        return (
+            self.device == version.device
+            and self.inode == version.inode
+            and self.ctime_ns == version.ctime_ns
+            and (version.generation_digest is None or self.digest == version.generation_digest)
+            and self.anchored == (version.generation_digest is not None)
+        )
+
+
+def _parse_local_delete_intent(directory_name: str) -> _LocalDeleteIntent:
+    match = _LOCAL_DELETE_TRANSACTION.fullmatch(directory_name)
+    if match is None:
+        raise ValueError("local deletion transaction name is invalid")
+    layout = int(match.group("layout"))
+    digest = match.group("digest")
+    device, inode, ctime_ns = (
+        _parse_canonical_uint64(
+            match.group(component),
+            description="local deletion transaction",
+            minimum=0,
+        )
+        for component in ("device", "inode", "ctime_ns")
+    )
+    return _LocalDeleteIntent(
+        layout=layout,
+        digest=digest,
+        device=device,
+        inode=inode,
+        ctime_ns=ctime_ns,
+    )
+
+
 def _parse_local_object_version(object_version: str) -> _LocalObjectVersion:
     if not isinstance(object_version, str) or not object_version.startswith("local:"):
         raise ValueError("local managed artifact version must use the local: prefix")
@@ -702,25 +763,30 @@ def _parse_gcs_object_version(object_version: str) -> int:
 
 
 class LocalManagedArtifactStore:
-    """Immutable local storage with a generation anchor per current object.
+    """Immutable local storage with durable generation deletion transactions.
 
     Canonical object paths remain regular files for compatibility. New writes
     also create an owner-only hard-link anchor outside ``scopes``. Conditional
-    deletion atomically renames the canonical link to a private staging name,
-    verifies the detached inode, and only then removes that link and its exact
-    anchor. A replacement installed at the canonical name is therefore never
-    the pathname passed to ``unlink``. Existing pre-anchor files remain readable
-    and use the same detach-and-verify primitive until rewritten or deleted.
+    deletion renames the canonical entry into a deterministic transaction
+    directory below that anchor, rehashes the exact detached descriptor, durably
+    marks validation, and destroys the selected inode through ``ftruncate`` on
+    that descriptor. It never unlinks the detached pathname. The zero-length
+    links and markers remain as a private crash receipt, while a path replacement
+    observed at any boundary is preserved there and, when valid, copied back as
+    the new current generation.
 
-    The configured root and the hidden control directories are a trusted
-    operator boundary. Canonical entries are still treated as hostile: opens are
-    no-follow/nonblocking, every descriptor must be regular, and unrecognized
-    hard links fail closed because an unseen alias defeats deletion accounting.
+    The configured root, ``.locks``, and ``.generations`` are a trusted operator
+    boundary: processes able to write those hidden directories can forge store
+    transactions and are therefore administrators, not artifact writers. Entries
+    below ``scopes`` are still treated as hostile even when changed by the same
+    UID. Opens are no-follow/nonblocking, every descriptor must be regular, and
+    unrecognized hard links fail closed because an unseen alias defeats deletion
+    accounting. Existing pre-anchor files remain readable and use the same
+    descriptor-bound transaction when deleted.
     """
 
     _LOCK_DIRECTORY = ".locks"
     _GENERATION_DIRECTORY = ".generations"
-    _QUARANTINE_DIRECTORY = ".quarantine"
 
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root).expanduser().resolve()
@@ -771,6 +837,7 @@ class LocalManagedArtifactStore:
                 if create:
                     try:
                         os.mkdir(component, mode=0o700, dir_fd=descriptors[-1])
+                        os.fsync(descriptors[-1])
                     except FileExistsError:
                         pass
                 try:
@@ -1147,11 +1214,22 @@ class LocalManagedArtifactStore:
         digest = hashlib.sha256(payload).hexdigest()
         with self._object_lock(reference, org_id, project_id):
             with self._open_directory(relative.parts[:-1], create=True) as directory_fd:
-                existing = self._existing_write(directory_fd, relative, reference.uri, payload)
-                if existing is not None:
-                    return existing
-
                 with self._open_generation_directory(relative, create=True) as generation_fd:
+                    try:
+                        self._recover_delete_transactions(
+                            generation_fd,
+                            directory_fd,
+                            relative,
+                            reference,
+                        )
+                    except ManagedArtifactDeleteInconclusiveError as exc:
+                        raise ManagedArtifactWriteInconclusiveError(
+                            "local deletion recovery blocked the managed artifact write"
+                        ) from exc
+                    existing = self._existing_write(directory_fd, relative, reference.uri, payload)
+                    if existing is not None:
+                        return existing
+
                     generation_name = f"{digest}.artifact"
                     generation_descriptor, _anchor_created = self._open_or_create_generation(
                         generation_fd,
@@ -1413,105 +1491,692 @@ class LocalManagedArtifactStore:
         except OSError as exc:
             raise ManagedArtifactInventoryError("could not observe managed artifact inventory object") from exc
 
-    def _remove_absent_generation(self, relative: Path, expected: _LocalObjectVersion) -> None:
-        if expected.generation_digest is None:
-            return
+    @contextlib.contextmanager
+    def _open_delete_transaction(
+        self,
+        generation_fd: int,
+        intent: _LocalDeleteIntent,
+        *,
+        create: bool,
+    ) -> tp.Iterator[int]:
+        name = intent.directory_name
+        if create:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=generation_fd)
+                os.fsync(generation_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                self._translate_unsafe_path(exc)
         try:
-            with self._open_generation_directory(relative, create=False) as generation_fd:
-                name = f"{expected.generation_digest}.artifact"
-                descriptor = self._open_object(generation_fd, name)
-                try:
-                    metadata = self._regular_stat(descriptor)
-                    if (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode):
-                        raise ManagedArtifactDeleteInconclusiveError(
-                            "local generation anchor no longer names the requested version"
-                        )
-                    if metadata.st_nlink != 1:
-                        raise ManagedArtifactDeleteInconclusiveError(
-                            "local generation anchor has an unrecognized surviving link"
-                        )
-                    os.unlink(name, dir_fd=generation_fd)
-                    os.fsync(generation_fd)
-                finally:
-                    os.close(descriptor)
+            descriptor = os.open(name, self._directory_open_flags(), dir_fd=generation_fd)
+        except OSError as exc:
+            self._translate_unsafe_path(exc)
+        try:
+            self._validate_control_directory(descriptor)
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _archive_delete_transaction(self, generation_fd: int, intent: _LocalDeleteIntent) -> None:
+        source = intent.directory_name
+        destination = intent.trash_directory_name
+        try:
+            destination_stat = os.stat(destination, dir_fd=generation_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            destination_stat = None
+        if destination_stat is not None:
+            if not stat_module.S_ISDIR(destination_stat.st_mode):
+                raise ManagedArtifactDeleteInconclusiveError("local deletion trash receipt is unsafe")
+            try:
+                os.stat(source, dir_fd=generation_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise ManagedArtifactDeleteInconclusiveError(
+                "local deletion transaction collides with an existing trash receipt"
+            )
+        try:
+            os.rename(source, destination, src_dir_fd=generation_fd, dst_dir_fd=generation_fd)
         except FileNotFoundError:
             return
-        except ManagedArtifactDeleteInconclusiveError:
-            raise
-        except Exception:
-            raise ManagedArtifactDeleteInconclusiveError("local managed artifact deletion was inconclusive") from None
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion transaction could not be archived") from exc
+        os.fsync(generation_fd)
 
-    def _preserve_detached_entry(self, directory_fd: int, staging_name: str) -> None:
+    @staticmethod
+    def _matches_delete_intent(metadata: os.stat_result, intent: _LocalDeleteIntent) -> bool:
+        return (metadata.st_dev, metadata.st_ino) == (intent.device, intent.inode)
+
+    def _matching_transaction_entry(
+        self,
+        directory_fd: int,
+        name: str,
+        intent: _LocalDeleteIntent,
+    ) -> os.stat_result | None:
         try:
-            with self._open_control_directory(self._QUARANTINE_DIRECTORY, create=True) as quarantine_fd:
-                for _attempt in range(128):
-                    quarantine_name = f"detached-{os.getpid()}-{os.urandom(16).hex()}"
-                    try:
-                        os.stat(quarantine_name, dir_fd=quarantine_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        continue
-                    try:
-                        os.rename(
-                            staging_name,
-                            quarantine_name,
-                            src_dir_fd=directory_fd,
-                            dst_dir_fd=quarantine_fd,
-                        )
-                    except FileNotFoundError:
-                        return
-                    os.fsync(quarantine_fd)
-                    os.fsync(directory_fd)
-                    return
-        except OSError:
-            # Leaving a random staging entry makes inventory fail closed but is
-            # still preferable to deleting an entry whose identity is unknown.
+            descriptor = self._open_object(directory_fd, name)
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                metadata = self._regular_stat(descriptor)
+            except InvalidManagedArtifactURI:
+                return None
+            if not self._matches_delete_intent(metadata, intent):
+                return None
+            return metadata
+        finally:
+            os.close(descriptor)
+
+    def _transaction_marker_exists(self, transaction_fd: int, name: str) -> bool:
+        try:
+            descriptor = self._open_object(transaction_fd, name)
+        except FileNotFoundError:
+            return False
+        try:
+            metadata = self._regular_stat(descriptor)
+            if metadata.st_nlink != 1 or metadata.st_size != 0:
+                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction marker is unsafe")
+            return True
+        finally:
+            os.close(descriptor)
+
+    def _create_transaction_marker(self, transaction_fd: int, name: str) -> None:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=transaction_fd)
+        except FileExistsError:
+            if not self._transaction_marker_exists(transaction_fd, name):
+                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction marker disappeared") from None
+            return
+        except OSError as exc:
+            self._translate_unsafe_path(exc)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(transaction_fd)
+
+    def _current_read_from_directory(
+        self,
+        directory_fd: int,
+        relative: Path,
+        uri: str,
+    ) -> ManagedArtifactRead | None:
+        try:
+            descriptor = self._open_object(directory_fd, relative.name)
+        except FileNotFoundError:
+            return None
+        try:
+            return self._read_descriptor(
+                descriptor,
+                uri,
+                relative,
+                conflict_on_unsafe=True,
+            )
+        finally:
+            os.close(descriptor)
+
+    def _canonical_matches_delete_intent(
+        self,
+        directory_fd: int,
+        relative: Path,
+        intent: _LocalDeleteIntent,
+    ) -> bool:
+        try:
+            descriptor = self._open_object(directory_fd, relative.name)
+        except FileNotFoundError:
+            return False
+        try:
+            metadata = self._regular_stat(descriptor, conflict_on_non_file=True)
+            return self._matches_delete_intent(metadata, intent)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _writable_object_open_flags() -> int:
+        return (
+            os.O_RDWR
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
+    def _open_writable_transaction_entry(
+        self,
+        directory_fd: int,
+        name: str,
+        intent: _LocalDeleteIntent,
+    ) -> tuple[int, str, os.stat_result] | None:
+        try:
+            read_descriptor = self._open_object(directory_fd, name)
+        except FileNotFoundError:
+            return None
+        try:
+            before = self._regular_stat(read_descriptor)
+            if not self._matches_delete_intent(before, intent):
+                return None
+            os.fchmod(read_descriptor, 0o600)
+            try:
+                descriptor = os.open(
+                    name,
+                    self._writable_object_open_flags(),
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                self._translate_unsafe_path(exc)
+        finally:
+            os.close(read_descriptor)
+        try:
+            _payload, digest, metadata = self._read_regular_descriptor(
+                descriptor,
+                retain_payload=False,
+            )
+            if not self._matches_delete_intent(metadata, intent):
+                os.close(descriptor)
+                return None
+            return descriptor, digest, metadata
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _move_expected_anchor_into_transaction(
+        self,
+        generation_fd: int,
+        transaction_fd: int,
+        intent: _LocalDeleteIntent,
+        destination: str,
+    ) -> bool:
+        if not intent.anchored:
+            return False
+        anchor_name = f"{intent.digest}.artifact"
+        destination_stat = self._matching_transaction_entry(transaction_fd, destination, intent)
+        if destination_stat is not None:
+            source_stat = self._matching_transaction_entry(generation_fd, anchor_name, intent)
+            if source_stat is not None:
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "local deletion transaction retained duplicate generation anchors"
+                )
+            return True
+        try:
+            destination_lstat = os.stat(destination, dir_fd=transaction_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            destination_lstat = None
+        if destination_lstat is not None:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion transaction anchor receipt is unsafe")
+        source_stat = self._matching_transaction_entry(generation_fd, anchor_name, intent)
+        if source_stat is None:
+            return False
+        try:
+            os.rename(
+                anchor_name,
+                destination,
+                src_dir_fd=generation_fd,
+                dst_dir_fd=transaction_fd,
+            )
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError("local generation anchor could not be retired durably") from exc
+        os.fsync(generation_fd)
+        os.fsync(transaction_fd)
+        return True
+
+    def _move_replacement_anchor_into_transaction(
+        self,
+        generation_fd: int,
+        transaction_fd: int,
+        digest: str,
+        metadata: os.stat_result,
+    ) -> None:
+        anchor_name = f"{digest}.artifact"
+        destination = "replacement-anchor"
+        try:
+            destination_descriptor = self._open_object(transaction_fd, destination)
+        except FileNotFoundError:
+            destination_descriptor = None
+        if destination_descriptor is not None:
+            try:
+                destination_stat = self._regular_stat(destination_descriptor)
+                if not self._same_inode(destination_stat, metadata):
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local replacement anchor receipt has a different identity"
+                    )
+            finally:
+                os.close(destination_descriptor)
+            try:
+                source_descriptor = self._open_object(generation_fd, anchor_name)
+            except FileNotFoundError:
+                return
+            try:
+                source_stat = self._regular_stat(source_descriptor)
+                if self._same_inode(source_stat, metadata):
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local replacement retained duplicate generation anchors"
+                    )
+            finally:
+                os.close(source_descriptor)
+            # A different inode is the replacement copy created by an earlier
+            # recovery attempt that crashed before recording completion.
             return
 
-    def _restore_detached_entry(self, directory_fd: int, staging_name: str, canonical_name: str) -> bool:
-        """Restore without overwriting a later current entry; never delete the detached bytes."""
+        try:
+            source_descriptor = self._open_object(generation_fd, anchor_name)
+        except FileNotFoundError:
+            return
+        try:
+            source_stat = self._regular_stat(source_descriptor)
+            if not self._same_inode(source_stat, metadata):
+                return
+        finally:
+            os.close(source_descriptor)
+        try:
+            os.rename(
+                anchor_name,
+                destination,
+                src_dir_fd=generation_fd,
+                dst_dir_fd=transaction_fd,
+            )
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError(
+                "local replacement generation anchor could not be quarantined"
+            ) from exc
+        os.fsync(generation_fd)
+        os.fsync(transaction_fd)
 
+    def _read_detached_transaction_entry(
+        self,
+        transaction_fd: int,
+    ) -> tuple[bytes, str, os.stat_result] | None:
+        try:
+            descriptor = self._open_object(transaction_fd, "detached")
+        except FileNotFoundError:
+            return None
+        try:
+            raw_payload, digest, metadata = self._read_regular_descriptor(
+                descriptor,
+                retain_payload=True,
+            )
+            assert raw_payload is not None
+            return raw_payload, digest, metadata
+        finally:
+            os.close(descriptor)
+
+    def _install_preserved_replacement(
+        self,
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+        payload: bytes,
+    ) -> ManagedArtifactObjectMetadata | None:
+        try:
+            payload = _validate_loaded_payload(reference, payload)
+        except ValueError:
+            return None
+        current = self._current_read_from_directory(directory_fd, relative, reference.uri)
+        if current is not None:
+            return current.metadata
+
+        digest = hashlib.sha256(payload).hexdigest()
+        generation_name = f"{digest}.artifact"
+        generation_descriptor, _created = self._open_or_create_generation(
+            generation_fd,
+            generation_name,
+            payload,
+        )
+        try:
+            generation_stat = self._regular_stat(
+                generation_descriptor,
+                conflict_on_non_file=True,
+            )
+            if generation_stat.st_nlink != 1:
+                current = self._current_read_from_directory(directory_fd, relative, reference.uri)
+                if current is not None and (
+                    current.metadata.sha256 == digest and _payloads_match(current.payload, payload)
+                ):
+                    return current.metadata
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "preserved local replacement has an ambiguous generation anchor"
+                )
+            try:
+                os.link(
+                    generation_name,
+                    relative.name,
+                    src_dir_fd=generation_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                current = self._current_read_from_directory(directory_fd, relative, reference.uri)
+                if current is None:
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local replacement appeared without an observable current object"
+                    ) from None
+                return current.metadata
+            except OSError as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local replacement could not be restored") from exc
+            os.fsync(directory_fd)
+            os.fsync(generation_fd)
+            current = self._current_read_from_directory(directory_fd, relative, reference.uri)
+            if current is None:
+                raise ManagedArtifactDeleteInconclusiveError("restored local replacement disappeared")
+            return current.metadata
+        finally:
+            os.close(generation_descriptor)
+
+    def _preserve_special_detached_entry(
+        self,
+        transaction_fd: int,
+        directory_fd: int,
+        relative: Path,
+    ) -> None:
+        try:
+            metadata = os.stat("detached", dir_fd=transaction_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat_module.S_ISLNK(metadata.st_mode) or stat_module.S_ISDIR(metadata.st_mode):
+            return
         try:
             os.link(
-                staging_name,
-                canonical_name,
-                src_dir_fd=directory_fd,
+                "detached",
+                relative.name,
+                src_dir_fd=transaction_fd,
                 dst_dir_fd=directory_fd,
                 follow_symlinks=False,
             )
         except FileExistsError:
-            self._preserve_detached_entry(directory_fd, staging_name)
-            return False
+            return
         except OSError:
-            self._preserve_detached_entry(directory_fd, staging_name)
-            return False
+            return
+        os.fsync(directory_fd)
+        os.fsync(transaction_fd)
+
+    def _restore_detached_replacement(
+        self,
+        generation_fd: int,
+        transaction_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+        intent: _LocalDeleteIntent,
+        *,
+        force: bool,
+    ) -> ManagedArtifactObjectMetadata | None:
         try:
-            os.unlink(staging_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        except OSError:
+            detached_lstat = os.stat("detached", dir_fd=transaction_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat_module.S_ISREG(detached_lstat.st_mode):
+            self._preserve_special_detached_entry(transaction_fd, directory_fd, relative)
+            return None
+        observed = self._read_detached_transaction_entry(transaction_fd)
+        if observed is None:
+            return None
+        payload, digest, metadata = observed
+        if not force and self._matches_delete_intent(metadata, intent):
+            return None
+        self._move_replacement_anchor_into_transaction(
+            generation_fd,
+            transaction_fd,
+            digest,
+            metadata,
+        )
+        return self._install_preserved_replacement(
+            generation_fd,
+            directory_fd,
+            relative,
+            reference,
+            payload,
+        )
+
+    def _complete_unvalidated_transaction(
+        self,
+        generation_fd: int,
+        transaction_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+        intent: _LocalDeleteIntent,
+    ) -> None:
+        self._move_expected_anchor_into_transaction(
+            generation_fd,
+            transaction_fd,
+            intent,
+            "preserved-anchor",
+        )
+        self._restore_detached_replacement(
+            generation_fd,
+            transaction_fd,
+            directory_fd,
+            relative,
+            reference,
+            intent,
+            force=True,
+        )
+        self._create_transaction_marker(transaction_fd, "complete")
+
+    def _recover_delete_transaction(
+        self,
+        generation_fd: int,
+        transaction_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+        intent: _LocalDeleteIntent,
+    ) -> bool:
+        """Finish one self-describing deletion intent without pathname deletion.
+
+        Before ``validated`` exists, detached bytes must still hash to the
+        intended generation (or its exact anchor must). Once that marker is
+        durable, descriptor truncation may be repeated after any crash. A
+        mismatched detached entry is never truncated: its bytes stay in the
+        transaction receipt and a valid regular payload is copied back through
+        the normal anchored-generation layout.
+        """
+
+        if self._transaction_marker_exists(transaction_fd, "complete"):
             return False
+
+        validated = self._transaction_marker_exists(transaction_fd, "validated")
+        candidate: tuple[int, str, os.stat_result] | None = None
+        detached_stat = self._matching_transaction_entry(transaction_fd, "detached", intent)
+        canonical_matches = self._canonical_matches_delete_intent(directory_fd, relative, intent)
+
+        if not validated:
+            candidate_directory_fd: int | None = None
+            candidate_name: str | None = None
+            required_links: int | None = None
+            if detached_stat is not None:
+                candidate_directory_fd = transaction_fd
+                candidate_name = "detached"
+                required_links = 2 if intent.anchored else 1
+                if intent.anchored:
+                    anchor_stat = self._matching_transaction_entry(
+                        generation_fd,
+                        f"{intent.digest}.artifact",
+                        intent,
+                    )
+                    if anchor_stat is None or not self._same_inode(anchor_stat, detached_stat):
+                        candidate_directory_fd = None
+            elif intent.anchored and not canonical_matches:
+                anchor_stat = self._matching_transaction_entry(
+                    generation_fd,
+                    f"{intent.digest}.artifact",
+                    intent,
+                )
+                if anchor_stat is not None:
+                    candidate_directory_fd = generation_fd
+                    candidate_name = f"{intent.digest}.artifact"
+                    required_links = 1
+            elif canonical_matches:
+                # The durable directory was created, but the canonical rename did
+                # not commit. The caller can retry the detach with this intent.
+                return False
+
+            if candidate_directory_fd is not None and candidate_name is not None:
+                candidate = self._open_writable_transaction_entry(
+                    candidate_directory_fd,
+                    candidate_name,
+                    intent,
+                )
+                if candidate is not None:
+                    descriptor, digest, metadata = candidate
+                    if digest != intent.digest or metadata.st_nlink != required_links:
+                        os.close(descriptor)
+                        candidate = None
+                    else:
+                        self._create_transaction_marker(transaction_fd, "validated")
+                        validated = True
+
+            if not validated:
+                self._complete_unvalidated_transaction(
+                    generation_fd,
+                    transaction_fd,
+                    directory_fd,
+                    relative,
+                    reference,
+                    intent,
+                )
+                return True
+
+        if candidate is None:
+            candidates = (
+                (generation_fd, f"{intent.digest}.artifact"),
+                (transaction_fd, "detached"),
+                (transaction_fd, "destroyed-anchor"),
+            )
+            for candidate_directory_fd, candidate_name in candidates:
+                candidate = self._open_writable_transaction_entry(
+                    candidate_directory_fd,
+                    candidate_name,
+                    intent,
+                )
+                if candidate is not None:
+                    break
+
+        if candidate is not None:
+            descriptor, _digest, _metadata = candidate
+            try:
+                # This is the deletion primitive: it operates on the descriptor
+                # validated after detachment, not on a pathname that can be
+                # replaced between an fstat and unlink.
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        self._move_expected_anchor_into_transaction(
+            generation_fd,
+            transaction_fd,
+            intent,
+            "destroyed-anchor",
+        )
+        self._restore_detached_replacement(
+            generation_fd,
+            transaction_fd,
+            directory_fd,
+            relative,
+            reference,
+            intent,
+            force=False,
+        )
+        self._create_transaction_marker(transaction_fd, "complete")
         return True
 
-    def _current_mismatch_result(
-        self,
-        uri: str,
-        *,
-        org_id: str,
-        project_id: str,
-    ) -> ManagedArtifactDeleteResult:
+    def _delete_transaction_intents(self, generation_fd: int) -> tuple[_LocalDeleteIntent, ...]:
         try:
-            current = self.stat(uri, org_id=org_id, project_id=project_id)
-        except (InvalidManagedArtifactURI, ManagedArtifactInventoryError):
-            raise ManagedArtifactDeleteInconclusiveError(
-                "local managed artifact replacement could not be observed safely"
-            ) from None
-        if current is None:
-            raise ManagedArtifactDeleteInconclusiveError("local managed artifact replacement could not be restored")
-        return ManagedArtifactDeleteResult(
-            ManagedArtifactDeleteStatus.VERSION_MISMATCH,
-            current_metadata=current,
+            names = os.listdir(generation_fd)
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion transactions could not be listed") from exc
+        intents: list[_LocalDeleteIntent] = []
+        for name in sorted(names):
+            if not name.startswith(".delete-"):
+                continue
+            try:
+                intent = _parse_local_delete_intent(name)
+            except ValueError as exc:
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "local deletion transaction has an invalid identity"
+                ) from exc
+            try:
+                metadata = os.stat(name, dir_fd=generation_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction could not be observed") from exc
+            if not stat_module.S_ISDIR(metadata.st_mode):
+                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction is not a directory")
+            intents.append(intent)
+        return tuple(intents)
+
+    def _recover_delete_transactions(
+        self,
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+    ) -> tuple[_LocalDeleteIntent, ...]:
+        completed: list[_LocalDeleteIntent] = []
+        for intent in self._delete_transaction_intents(generation_fd):
+            with self._open_delete_transaction(generation_fd, intent, create=False) as transaction_fd:
+                recovered = self._recover_delete_transaction(
+                    generation_fd,
+                    transaction_fd,
+                    directory_fd,
+                    relative,
+                    reference,
+                    intent,
+                )
+                is_complete = self._transaction_marker_exists(transaction_fd, "complete")
+            if is_complete:
+                self._archive_delete_transaction(generation_fd, intent)
+            if recovered:
+                completed.append(intent)
+        return tuple(completed)
+
+    def _retire_absent_generation(
+        self,
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference: ManagedArtifactRef,
+        expected: _LocalObjectVersion,
+    ) -> _LocalDeleteIntent | None:
+        if expected.generation_digest is None:
+            return None
+        intent = _LocalDeleteIntent(
+            layout=2,
+            digest=expected.generation_digest,
+            device=expected.device,
+            inode=expected.inode,
+            ctime_ns=expected.ctime_ns,
         )
+        anchor = self._matching_transaction_entry(
+            generation_fd,
+            f"{intent.digest}.artifact",
+            intent,
+        )
+        if anchor is None:
+            return None
+        with self._open_delete_transaction(generation_fd, intent, create=True) as transaction_fd:
+            recovered = self._recover_delete_transaction(
+                generation_fd,
+                transaction_fd,
+                directory_fd,
+                relative,
+                reference,
+                intent,
+            )
+            is_complete = self._transaction_marker_exists(transaction_fd, "complete")
+        if is_complete:
+            self._archive_delete_transaction(generation_fd, intent)
+        return intent if recovered else None
 
     def delete_versioned(
         self,
@@ -1521,116 +2186,127 @@ class LocalManagedArtifactStore:
         project_id: str,
         object_version: str,
     ) -> ManagedArtifactDeleteResult:
-        """Delete an exact inode without ever unlinking the canonical pathname."""
+        """Delete only one descriptor-verified local generation."""
 
         reference = parse_managed_uri(uri)
         expected = _parse_local_object_version(object_version)
         relative = self._relative_object(reference, org_id, project_id)
         with self._object_lock(reference, org_id, project_id):
             try:
-                with self._open_directory(relative.parts[:-1], create=False) as directory_fd:
-                    try:
-                        descriptor = self._open_object(directory_fd, relative.name)
-                    except FileNotFoundError:
-                        self._remove_absent_generation(relative, expected)
-                        return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
-                    staging_name = f".eyvan-delete-{os.getpid()}-{os.urandom(16).hex()}"
-                    detached = False
-                    try:
-                        current = self._read_descriptor(
-                            descriptor,
-                            reference.uri,
-                            relative,
-                            conflict_on_unsafe=True,
+                with self._open_directory(relative.parts[:-1], create=True) as directory_fd:
+                    with self._open_generation_directory(relative, create=True) as generation_fd:
+                        completed = list(
+                            self._recover_delete_transactions(
+                                generation_fd,
+                                directory_fd,
+                                relative,
+                                reference,
+                            )
                         )
+                        current = self._current_read_from_directory(
+                            directory_fd,
+                            relative,
+                            reference.uri,
+                        )
+                        if current is None:
+                            retired = self._retire_absent_generation(
+                                generation_fd,
+                                directory_fd,
+                                relative,
+                                reference,
+                                expected,
+                            )
+                            if retired is not None:
+                                completed.append(retired)
+                            status = (
+                                ManagedArtifactDeleteStatus.DELETED
+                                if any(intent.matches_version(expected) for intent in completed)
+                                else ManagedArtifactDeleteStatus.ABSENT
+                            )
+                            return ManagedArtifactDeleteResult(status)
                         if current.metadata.object_version != object_version:
                             return ManagedArtifactDeleteResult(
                                 ManagedArtifactDeleteStatus.VERSION_MISMATCH,
                                 current_metadata=current.metadata,
                             )
-                        expected_stat = self._regular_stat(descriptor, conflict_on_non_file=True)
-                        try:
-                            os.rename(
-                                relative.name,
-                                staging_name,
-                                src_dir_fd=directory_fd,
-                                dst_dir_fd=directory_fd,
-                            )
-                        except FileNotFoundError:
-                            self._remove_absent_generation(relative, expected)
-                            return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
-                        detached = True
-
-                        try:
-                            staged_lstat = os.stat(staging_name, dir_fd=directory_fd, follow_symlinks=False)
-                        except OSError:
-                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                            detached = False
+                        assert current.metadata.sha256 is not None
+                        intent = _LocalDeleteIntent(
+                            layout=2 if expected.generation_digest is not None else 1,
+                            digest=current.metadata.sha256,
+                            device=expected.device,
+                            inode=expected.inode,
+                            ctime_ns=expected.ctime_ns,
+                        )
+                        if expected.generation_digest is not None and intent.digest != expected.generation_digest:
                             raise ManagedArtifactDeleteInconclusiveError(
-                                "local managed artifact deletion was inconclusive"
-                            ) from None
-                        if not self._same_inode(staged_lstat, expected_stat):
-                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                            detached = False
-                            return self._current_mismatch_result(
-                                reference.uri,
-                                org_id=org_id,
-                                project_id=project_id,
+                                "local generation digest does not match its version"
                             )
-
-                        staged_descriptor = self._open_object(directory_fd, staging_name)
-                        try:
-                            staged_stat = self._regular_stat(staged_descriptor, conflict_on_non_file=True)
-                            if not self._same_inode(staged_stat, expected_stat):
-                                self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                                detached = False
-                                return self._current_mismatch_result(
-                                    reference.uri,
-                                    org_id=org_id,
-                                    project_id=project_id,
-                                )
-                            expected_links = 2 if expected.generation_digest is not None else 1
-                            if staged_stat.st_nlink != expected_links:
-                                self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                                detached = False
+                        with self._open_delete_transaction(
+                            generation_fd,
+                            intent,
+                            create=True,
+                        ) as transaction_fd:
+                            if self._transaction_marker_exists(transaction_fd, "complete"):
                                 raise ManagedArtifactDeleteInconclusiveError(
-                                    "local managed artifact has an unrecognized hard link"
+                                    "local deletion transaction identity was reused"
                                 )
-                        finally:
-                            os.close(staged_descriptor)
+                            try:
+                                os.stat("detached", dir_fd=transaction_fd, follow_symlinks=False)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                raise ManagedArtifactDeleteInconclusiveError(
+                                    "local deletion transaction already has a detached entry"
+                                )
+                            try:
+                                os.rename(
+                                    relative.name,
+                                    "detached",
+                                    src_dir_fd=directory_fd,
+                                    dst_dir_fd=transaction_fd,
+                                )
+                            except FileNotFoundError:
+                                completed.extend(
+                                    self._recover_delete_transactions(
+                                        generation_fd,
+                                        directory_fd,
+                                        relative,
+                                        reference,
+                                    )
+                                )
+                            else:
+                                os.fsync(directory_fd)
+                                os.fsync(transaction_fd)
+                                if self._recover_delete_transaction(
+                                    generation_fd,
+                                    transaction_fd,
+                                    directory_fd,
+                                    relative,
+                                    reference,
+                                    intent,
+                                ):
+                                    completed.append(intent)
+                            transaction_complete = self._transaction_marker_exists(transaction_fd, "complete")
+                        if transaction_complete:
+                            self._archive_delete_transaction(generation_fd, intent)
 
-                        os.unlink(staging_name, dir_fd=directory_fd)
-                        detached = False
-                        os.fsync(directory_fd)
-                        self._remove_absent_generation(relative, expected)
-                    except ManagedArtifactDeleteInconclusiveError:
-                        if detached:
-                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                        raise
-                    except Exception:
-                        if detached:
-                            self._restore_detached_entry(directory_fd, staging_name, relative.name)
-                        raise ManagedArtifactDeleteInconclusiveError(
-                            "local managed artifact deletion was inconclusive"
-                        ) from None
-                    finally:
-                        os.close(descriptor)
-            except FileNotFoundError:
-                self._remove_absent_generation(relative, expected)
-                return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.ABSENT)
-
-            try:
-                replacement = self.stat(reference.uri, org_id=org_id, project_id=project_id)
-            except (InvalidManagedArtifactURI, ManagedArtifactInventoryError):
-                raise ManagedArtifactDeleteInconclusiveError(
-                    "local managed artifact post-delete observation was inconclusive"
-                ) from None
-            if replacement is not None:
-                return ManagedArtifactDeleteResult(
-                    ManagedArtifactDeleteStatus.VERSION_MISMATCH,
-                    current_metadata=replacement,
-                )
-            return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.DELETED)
+                        replacement = self._current_read_from_directory(
+                            directory_fd,
+                            relative,
+                            reference.uri,
+                        )
+                        if replacement is not None:
+                            return ManagedArtifactDeleteResult(
+                                ManagedArtifactDeleteStatus.VERSION_MISMATCH,
+                                current_metadata=replacement.metadata,
+                            )
+                        return ManagedArtifactDeleteResult(ManagedArtifactDeleteStatus.DELETED)
+            except ManagedArtifactDeleteInconclusiveError:
+                raise
+            except (InvalidManagedArtifactURI, ManagedArtifactConflictError, ManagedArtifactVersionMismatchError) as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local managed artifact deletion was inconclusive") from exc
+            except OSError as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local managed artifact deletion was inconclusive") from exc
 
     def delete(self, uri: str, *, org_id: str, project_id: str) -> bool:
         """Compatibility wrapper that conditionally removes the observed object."""

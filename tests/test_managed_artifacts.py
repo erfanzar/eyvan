@@ -276,36 +276,43 @@ def test_local_conditional_delete_never_unlinks_a_rename_at_detach_replacement(
     assert target.read_bytes() == b"generation-b"
 
 
-def test_local_delete_unlink_boundary_cannot_remove_a_new_canonical_generation(
+def test_local_delete_raw_detached_path_replacement_is_preserved_not_unlinked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = LocalManagedArtifactStore(tmp_path / "managed")
-    uri = result_uri("replace-at-unlink")
+    uri = result_uri("replace-detached-raw")
     written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
-    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replace-at-unlink.result"
-    replacement = target.with_name("replacement-at-unlink.result")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replace-detached-raw.result"
+    replacement = target.with_name("replacement-detached-raw.result")
     replacement.write_bytes(b"generation-b")
-    original_unlink = os.unlink
+    original_ftruncate = os.ftruncate
     original_rename = os.rename
-    installed = False
+    original_unlink = os.unlink
     unlinked_names: list[str] = []
+    installed = False
 
-    def adversarial_unlink(path: str, *, dir_fd: int | None = None) -> None:
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
         nonlocal installed
-        unlinked_names.append(os.fspath(path))
-        if os.fspath(path).startswith(".eyvan-delete-") and not installed:
+        if length == 0 and not installed:
             installed = True
-            assert dir_fd is not None
-            original_rename(
-                replacement.name,
-                target.name,
-                src_dir_fd=dir_fd,
-                dst_dir_fd=dir_fd,
-            )
+            detached = next((store.root / ".generations").rglob("detached"))
+            # Deliberately bypass every store helper: first install B at the
+            # canonical name, then rename that raw path over the verified
+            # staging entry. The truncate must still hit generation A's fd,
+            # while this generation B entry survives.
+            original_rename(replacement, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def record_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlinked_names.append(os.fspath(path))
         original_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "unlink", adversarial_unlink)
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(os, "unlink", record_unlink)
     outcome = store.delete_versioned(
         uri,
         org_id="acme",
@@ -314,7 +321,245 @@ def test_local_delete_unlink_boundary_cannot_remove_a_new_canonical_generation(
     )
 
     assert installed
-    assert target.name not in unlinked_names
+    assert "detached" not in unlinked_names
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    assert target.read_bytes() == b"generation-b"
+    preserved = [path.read_bytes() for path in (store.root / ".generations").rglob("detached")]
+    assert b"generation-b" in preserved
+    replacement_anchor = next((store.root / ".generations").rglob("replacement-anchor"))
+    assert replacement_anchor.read_bytes() == b"generation-b"
+
+
+def test_local_delete_rehashes_same_inode_mutated_during_detach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("mutated-during-detach")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "mutated-during-detach.result"
+    original_rename = os.rename
+    mutated = False
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated
+        if source == target.name and destination == "detached" and not mutated:
+            mutated = True
+            inode = target.stat().st_ino
+            os.chmod(target, 0o600)
+            target.write_bytes(b"generation-b-expanded")
+            assert target.stat().st_ino == inode
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert mutated
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b-expanded").hexdigest()
+    assert target.read_bytes() == b"generation-b-expanded"
+    assert target.stat().st_ino != int(written.metadata.object_version.split(":")[-2])
+
+
+@pytest.mark.parametrize("crash_boundary", ("detached", "truncated", "anchor-retired"))
+def test_local_delete_crash_residue_is_private_and_retry_put_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = tmp_path / f"managed-{crash_boundary}"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri(f"crash-{crash_boundary}")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    original_ftruncate = os.ftruncate
+    crashed = False
+
+    def crash_after_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal crashed
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        should_crash = (crash_boundary == "detached" and destination == "detached") or (
+            crash_boundary == "anchor-retired" and destination == "destroyed-anchor"
+        )
+        if should_crash and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    def crash_after_truncate(descriptor: int, length: int) -> None:
+        nonlocal crashed
+        original_ftruncate(descriptor, length)
+        if crash_boundary == "truncated" and length == 0 and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_rename)
+    monkeypatch.setattr(os, "ftruncate", crash_after_truncate)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+    assert crashed
+
+    target = root / "scopes" / storage_scope("acme", "research") / "results" / f"crash-{crash_boundary}.result"
+    assert not target.exists()
+    transactions = list((root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    assert (transactions[0] / "detached").stat().st_nlink == 2
+    assert not list((root / "scopes").rglob(".eyvan-delete-*"))
+    inventory = store.list_scope(org_id="acme", project_id="research")
+    assert inventory.objects == ()
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    monkeypatch.setattr(os, "ftruncate", original_ftruncate)
+    restarted = LocalManagedArtifactStore(root)
+    rewritten = restarted.put_versioned(uri, b"generation-b", org_id="acme", project_id="research")
+
+    assert rewritten.created is True
+    assert rewritten.metadata.object_version != written.metadata.object_version
+    assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
+    receipt = next((root / ".generations").glob("*/.trash-v1-*"))
+    assert (receipt / "complete").is_file()
+
+
+def test_local_delete_retry_finishes_a_post_detach_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("retry-post-detach")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    crashed = False
+
+    def crash_after_detach(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal crashed
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == "detached" and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_detach)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    outcome = LocalManagedArtifactStore(store.root).delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.DELETED
+    receipt = next((store.root / ".generations").glob("*/.trash-v1-*"))
+    assert (receipt / "validated").is_file()
+    assert (receipt / "complete").is_file()
+    assert (receipt / "detached").read_bytes() == b""
+    assert (receipt / "destroyed-anchor").read_bytes() == b""
+
+
+def test_local_delete_recovery_never_removes_a_later_canonical_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("crash-then-replacement")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "crash-then-replacement.result"
+    original_rename = os.rename
+
+    def crash_after_detach(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == "detached":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_detach)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    target.write_bytes(b"generation-b")
+    outcome = LocalManagedArtifactStore(store.root).delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
     assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
     assert outcome.current_metadata is not None
     assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
