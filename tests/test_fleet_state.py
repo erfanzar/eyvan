@@ -464,6 +464,70 @@ def test_a_genuinely_absent_object_is_still_an_empty_fleet() -> None:
     assert document.get("cells") == {}
 
 
+def test_unrelated_fleet_scopes_do_not_wait_behind_one_process_lock(tmp_path) -> None:
+    """Long provider I/O for one fleet must not stop an unrelated fleet."""
+
+    first = FleetStateStore(LocalBackend(tmp_path / "fleet-a.json"))
+    second = FleetStateStore(LocalBackend(tmp_path / "fleet-b.json"))
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def hold_first() -> None:
+        with first.exclusive():
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+
+    def enter_second() -> None:
+        with second.exclusive():
+            second_entered.set()
+
+    first_thread = threading.Thread(target=hold_first)
+    second_thread = threading.Thread(target=enter_second)
+    first_thread.start()
+    assert first_entered.wait(timeout=2)
+    second_thread.start()
+
+    assert second_entered.wait(timeout=2), "an unrelated durable document shared the first fleet's process lock"
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+
+
+def test_same_fleet_scope_still_serializes_default_owned_stores(tmp_path) -> None:
+    """Same-process stores share a lease identity, so the scoped lock excludes them."""
+
+    path = tmp_path / "fleet.json"
+    first = FleetStateStore(LocalBackend(path))
+    second = FleetStateStore(LocalBackend(path))
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def hold_first() -> None:
+        with first.exclusive():
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+
+    def enter_second() -> None:
+        with second.exclusive():
+            second_entered.set()
+
+    first_thread = threading.Thread(target=hold_first)
+    second_thread = threading.Thread(target=enter_second)
+    first_thread.start()
+    assert first_entered.wait(timeout=2)
+    second_thread.start()
+    assert not second_entered.wait(timeout=0.1)
+
+    release_first.set()
+    assert second_entered.wait(timeout=2)
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+
+
 def test_two_stores_in_one_agent_are_one_writer(tmp_path) -> None:
     """Found live on 2026-08-01: an agent deadlocked against its own lease.
 

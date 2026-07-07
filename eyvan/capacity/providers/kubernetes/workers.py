@@ -48,6 +48,14 @@ from eyvan._internal.json_types import JsonObject
 #: truncation rule that could collide differently.
 MAX_OBJECT_NAME = 63
 
+#: Indexed Jobs append ``-<completion_index>`` to the Job name to form each
+#: Pod hostname. Reserve the largest supported suffix in the deterministic Job
+#: name even for smaller cells: changing a Job's provider name when worker_count
+#: crosses 10 or 100 would strand the previous incarnation during reconciliation.
+MAX_INDEXED_JOB_WORKERS = 512
+_MAX_INDEX_SUFFIX = f"-{MAX_INDEXED_JOB_WORKERS - 1}"
+MAX_INDEXED_JOB_NAME = MAX_OBJECT_NAME - len(_MAX_INDEX_SUFFIX)
+
 #: The only characters Kubernetes DNS-1123 names and Eyvan's cell selector
 #: tokens may contain. Keep this explicit: :meth:`str.isalnum` accepts Unicode
 #: letters such as ``é``, while the Kubernetes API admits lowercase ASCII only.
@@ -104,27 +112,49 @@ def require_immutable_worker_image(image: str) -> str:
     return image
 
 
-def object_name(prefix: str, cell_id: str) -> str:
+def object_name(prefix: str, cell_id: str, *, max_length: int = MAX_OBJECT_NAME) -> str:
     """Return a collision-resistant DNS-1123 name for one cell's object.
 
     Deterministic: the same cell always produces the same name, which is what
     makes ``create`` idempotent and a 409 a replay rather than a conflict. A
     digest is added whenever case-folding, replacement, or truncation is needed;
     otherwise distinct public cell IDs such as ``cell/a`` and ``cell_a`` would
-    collapse onto the same Kubernetes object.
+    collapse onto the same Kubernetes object. ``max_length`` reserves controller-
+    generated suffixes such as an Indexed Job's completion index.
     """
 
     if not isinstance(prefix, str) or not _is_dns_1123_label(prefix):
         raise ValueError("Kubernetes capacity object prefix must be a lowercase ASCII DNS-1123 label")
+    if isinstance(max_length, bool) or not isinstance(max_length, int) or not 1 <= max_length <= MAX_OBJECT_NAME:
+        raise ValueError(f"Kubernetes capacity object max_length must be between 1 and {MAX_OBJECT_NAME}")
     if not isinstance(cell_id, str) or not cell_id:
         raise ValueError("Kubernetes capacity cell_id must be a non-empty string")
     raw = f"{prefix}-{cell_id}"
-    if _is_dns_1123_label(raw):
+    if len(raw) <= max_length and _is_dns_1123_label(raw):
         return raw
     base = "".join(character if character in _DNS_1123_CHARACTERS else "-" for character in raw.lower()).strip("-")
     suffix = f"-{hashlib.sha256(cell_id.encode()).hexdigest()[:8]}"
-    stem = base[: MAX_OBJECT_NAME - len(suffix)].rstrip("-") or prefix
+    if max_length <= len(suffix):
+        raise ValueError("Kubernetes capacity object max_length is too short for its collision hash")
+    stem = base[: max_length - len(suffix)].rstrip("-") or prefix[: max_length - len(suffix)].rstrip("-")
+    if not stem:
+        raise ValueError("Kubernetes capacity object max_length is too short for its prefix")
     return f"{stem}{suffix}"
+
+
+def indexed_job_name(cell_id: str) -> str:
+    """Return a stable Job name with room for every supported Pod index."""
+
+    return object_name("eyvan", cell_id, max_length=MAX_INDEXED_JOB_NAME)
+
+
+def _indexed_pod_hostname(job_name: str, completion_index: int) -> str:
+    """Build and validate the hostname Kubernetes gives one Indexed Job Pod."""
+
+    hostname = f"{job_name}-{completion_index}"
+    if not _is_dns_1123_label(hostname):  # pragma: no cover - invariant guard
+        raise ValueError(f"Indexed Job Pod hostname {hostname!r} is not a DNS-1123 label")
+    return hostname
 
 
 def fence_fingerprint(fencing_token: str) -> str:
@@ -138,14 +168,29 @@ def fence_fingerprint(fencing_token: str) -> str:
     return hashlib.sha256(fencing_token.encode()).hexdigest()[:32]
 
 
-def headless_service_manifest(cell_id: str, namespace: str) -> JsonObject:
+def headless_service_manifest(
+    cell_id: str,
+    namespace: str,
+    *,
+    provider_generation: int | None = None,
+    fence: str | None = None,
+) -> JsonObject:
     """Return the headless Service that gives Indexed Job pods stable DNS.
 
     ``clusterIP: None`` plus the pods' ``subdomain`` yields
     ``<job>-<index>.<service>.<namespace>.svc`` -- an address that survives a pod
-    restart, which pod IPs do not.
+    restart, which pod IPs do not. Provider reconciliation supplies generation
+    and fence together so a stale post-check can distinguish its Service from a
+    replacement before issuing a UID/resourceVersion-fenced cleanup.
     """
 
+    if (provider_generation is None) != (fence is None):
+        raise ValueError("a fenced Kubernetes Service requires both provider_generation and fence")
+    labels = {CELL_LABEL: cell_label_value(cell_id)}
+    annotations = {CELL_ID_ANNOTATION: cell_id}
+    if provider_generation is not None and fence is not None:
+        labels[GENERATION_LABEL] = str(provider_generation)
+        annotations[FENCE_ANNOTATION] = fence
     name = object_name("eyvan", cell_id)
     return {
         "apiVersion": "v1",
@@ -153,8 +198,8 @@ def headless_service_manifest(cell_id: str, namespace: str) -> JsonObject:
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "labels": {CELL_LABEL: cell_label_value(cell_id)},
-            "annotations": {CELL_ID_ANNOTATION: cell_id},
+            "labels": labels,
+            "annotations": annotations,
         },
         "spec": {
             "clusterIP": "None",
@@ -176,10 +221,16 @@ def worker_endpoints(cell_id: str, namespace: str, worker_count: int, *, port: i
     would silently repoint rank 1's checkpoint at rank 2's.
     """
 
-    if worker_count < 1:
+    if isinstance(worker_count, bool) or not isinstance(worker_count, int) or worker_count < 1:
         raise ValueError("a Kubernetes capacity cell needs at least one worker")
-    name = object_name("eyvan", cell_id)
-    return tuple(f"http://{name}-{index}.{name}.{namespace}.svc:{port}" for index in range(worker_count))
+    if worker_count > MAX_INDEXED_JOB_WORKERS:
+        raise ValueError(f"a Kubernetes capacity cell supports at most {MAX_INDEXED_JOB_WORKERS} workers")
+    job_name = indexed_job_name(cell_id)
+    service_name = object_name("eyvan", cell_id)
+    return tuple(
+        f"http://{_indexed_pod_hostname(job_name, index)}.{service_name}.{namespace}.svc:{port}"
+        for index in range(worker_count)
+    )
 
 
 def job_manifest(
@@ -211,10 +262,14 @@ def job_manifest(
     autoscaler place the pods and ``provisioning_timeout_s`` is the only bound.
     """
 
-    if worker_count < 1:
+    if isinstance(worker_count, bool) or not isinstance(worker_count, int) or worker_count < 1:
         raise ValueError("a Kubernetes capacity cell needs at least one worker")
+    if worker_count > MAX_INDEXED_JOB_WORKERS:
+        raise ValueError(f"a Kubernetes capacity cell supports at most {MAX_INDEXED_JOB_WORKERS} workers")
     image = require_immutable_worker_image(image)
-    name = object_name("eyvan", cell_id)
+    name = indexed_job_name(cell_id)
+    service_name = object_name("eyvan", cell_id)
+    _indexed_pod_hostname(name, worker_count - 1)
     labels = {
         API_CLIENT_LABEL: "true",
         CELL_LABEL: cell_label_value(cell_id),
@@ -232,7 +287,7 @@ def job_manifest(
         "restartPolicy": "Never",
         "serviceAccountName": service_account,
         "automountServiceAccountToken": False,
-        "subdomain": name,
+        "subdomain": service_name,
         "containers": [
             {
                 "name": "native-worker",
@@ -319,10 +374,13 @@ __all__ = (
     "CELL_LABEL",
     "FENCE_ANNOTATION",
     "GENERATION_LABEL",
+    "MAX_INDEXED_JOB_NAME",
+    "MAX_INDEXED_JOB_WORKERS",
     "MAX_OBJECT_NAME",
     "cell_label_value",
     "fence_fingerprint",
     "headless_service_manifest",
+    "indexed_job_name",
     "job_manifest",
     "object_name",
     "require_immutable_worker_image",

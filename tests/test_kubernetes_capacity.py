@@ -40,10 +40,12 @@ from eyvan.capacity.providers.kubernetes.workers import (
     CELL_LABEL,
     FENCE_ANNOTATION,
     GENERATION_LABEL,
+    MAX_INDEXED_JOB_NAME,
     MAX_OBJECT_NAME,
     cell_label_value,
     fence_fingerprint,
     headless_service_manifest,
+    indexed_job_name,
     job_manifest,
     object_name,
     secret_manifest,
@@ -90,10 +92,13 @@ def test_a_long_cell_id_is_truncated_to_a_valid_dns_label() -> None:
 def test_two_long_cell_ids_sharing_a_prefix_do_not_collide() -> None:
     """Truncation alone would map every long id with the same prefix to one name."""
 
-    first = object_name("eyvan", "c" * 100 + "-alpha")
-    second = object_name("eyvan", "c" * 100 + "-beta")
+    first_id = "c" * 100 + "-alpha"
+    second_id = "c" * 100 + "-beta"
+    first = object_name("eyvan", first_id)
+    second = object_name("eyvan", second_id)
 
     assert first != second
+    assert indexed_job_name(first_id) != indexed_job_name(second_id)
 
 
 def test_normalized_cell_ids_do_not_collapse_onto_one_object_or_selector() -> None:
@@ -131,7 +136,8 @@ def test_a_schema_valid_unicode_cell_id_maps_to_admissible_ascii_names_and_label
     assert _DNS_1123_LABEL.fullmatch(name) is not None
     assert _DNS_1123_LABEL.fullmatch(token) is not None
     assert all(ord(character) < 128 for character in name + token)
-    assert job["metadata"]["name"] == service["metadata"]["name"] == name
+    assert job["metadata"]["name"] == indexed_job_name(cell_id)
+    assert service["metadata"]["name"] == name
     assert job["spec"]["template"]["spec"]["subdomain"] == name
     assert _DNS_1123_LABEL.fullmatch(str(secret["metadata"]["name"])) is not None
     assert job["metadata"]["labels"][CELL_LABEL] == token
@@ -156,6 +162,42 @@ def test_long_cell_id_uses_one_safe_token_and_preserves_the_full_annotation() ->
     assert secret["metadata"]["labels"][CELL_LABEL] == token
     for manifest in (job, service, secret):
         assert manifest["metadata"]["annotations"][CELL_ID_ANNOTATION] == cell_id
+
+
+@pytest.mark.parametrize(
+    "cell_id",
+    (
+        "é" * 96,
+        "ResearchCell" * 8,
+        "cell_/.:+" * 10 + "cell_/",
+        "a" * 96,
+    ),
+    ids=("unicode", "mixed-case", "punctuation", "long-ascii"),
+)
+@pytest.mark.parametrize("worker_count", (1, 2, 10, 100, MAX_WORKERS))
+def test_indexed_job_names_reserve_every_supported_completion_suffix(cell_id: str, worker_count: int) -> None:
+    """The Job controller appends ``-<index>`` and validates the result as one label."""
+
+    request = CellUpsertRequest(
+        id=cell_id,
+        provider="kubernetes",
+        region="us-east5",
+        capacity={},
+        allocatable={},
+    )
+    job = _job(cell_id=request.id, worker_count=worker_count)
+    job_name = str(job["metadata"]["name"])
+    service_name = str(headless_service_manifest(cell_id, "eyvan")["metadata"]["name"])
+    last_hostname = f"{job_name}-{worker_count - 1}"
+    endpoints = worker_endpoints(cell_id, "eyvan", worker_count)
+
+    assert job_name == indexed_job_name(cell_id)
+    assert len(job_name) <= MAX_INDEXED_JOB_NAME
+    assert len(last_hostname) <= MAX_OBJECT_NAME
+    assert _DNS_1123_LABEL.fullmatch(last_hostname) is not None
+    assert endpoints[-1].startswith(f"http://{last_hostname}.{service_name}.")
+    assert job["spec"]["template"]["spec"]["subdomain"] == service_name
+    assert job["metadata"]["annotations"][CELL_ID_ANNOTATION] == cell_id
 
 
 def test_hashed_cell_label_tokens_resist_long_common_prefix_collisions() -> None:
@@ -234,6 +276,14 @@ def test_the_pod_subdomain_matches_the_service_name() -> None:
     service = headless_service_manifest("cell-a", "eyvan")
 
     assert manifest["spec"]["template"]["spec"]["subdomain"] == service["metadata"]["name"]
+
+
+def test_a_provider_owned_service_carries_the_exact_generation_fence() -> None:
+    fingerprint = fence_fingerprint(_TOKEN)
+    service = headless_service_manifest("cell-a", "eyvan", provider_generation=3, fence=fingerprint)
+
+    assert service["metadata"]["labels"][GENERATION_LABEL] == "3"
+    assert service["metadata"]["annotations"][FENCE_ANNOTATION] == fingerprint
 
 
 def test_the_service_is_headless_and_publishes_before_readiness() -> None:
@@ -645,7 +695,9 @@ def test_apply_reports_lease_loss_and_a_newer_release_cleans_partial_resources(t
         driver.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1"))
 
     assert driver.state.lease_holder() is None
-    assert list(api.objects) == ["/api/v1/namespaces/eyvan/services/eyvan-cell-a"]
+    assert api.objects == {}, "the settled stale POST must clean its exact UID/resourceVersion"
+    record = driver.state.get("cell-a")
+    assert record is not None and "kubernetes_pending_creates" not in record.metadata
 
     observation = driver.release(
         "cell-a",
@@ -660,6 +712,123 @@ def test_apply_reports_lease_loss_and_a_newer_release_cleans_partial_resources(t
     assert driver.state.get("cell-a") is None
     assert api.objects == {}
     assert driver.state.lease_holder() is None
+
+
+def test_release_retries_an_inflight_post_then_tombstone_replay_cleans_only_the_predecessor(tmp_path) -> None:
+    """Inject lease loss after intent persistence but immediately before API storage."""
+
+    class PauseBeforeServiceStoreApi(_FakeApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lose_lease: tp.Callable[[], None] | None = None
+            self.before_store = threading.Event()
+            self.resume_store = threading.Event()
+
+        def create(self, path: str, manifest: JsonObject) -> bool:
+            if path.endswith("/services") and self.lose_lease is not None:
+                lose_lease, self.lose_lease = self.lose_lease, None
+                lose_lease()
+                self.before_store.set()
+                assert self.resume_store.wait(timeout=5)
+            return super().create(path, manifest)
+
+    path = tmp_path / "fleet.json"
+    api = PauseBeforeServiceStoreApi()
+    generation_one = KubernetesCapacityDriver(
+        FleetStateStore(LocalBackend(path), owner="generation-one-agent"),
+        api=api,
+        namespace="eyvan",
+        image=_WORKER_IMAGE,
+        shared_secret="agent-secret",
+    )
+    generation_two = KubernetesCapacityDriver(
+        FleetStateStore(LocalBackend(path), owner="generation-two-agent"),
+        api=api,
+        namespace="eyvan",
+        image=_WORKER_IMAGE,
+        shared_secret="agent-secret",
+    )
+    api.lose_lease = generation_one.state.release_lease
+    apply_errors: list[BaseException] = []
+
+    def apply_generation_one() -> None:
+        try:
+            generation_one.apply_capacity("cell-a", _desired(), _context(generation=1, key="apply-1"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            apply_errors.append(exc)
+
+    apply_thread = threading.Thread(target=apply_generation_one)
+    apply_thread.start()
+    assert api.before_store.wait(timeout=5)
+    release_context = MutationContext(
+        idempotency_key="release-2",
+        generation=2,
+        fencing_token="generation-two-token",
+    )
+
+    with pytest.raises(CapacityProviderError, match="POST is still inflight") as raised:
+        generation_two.release("cell-a", release_context)
+
+    assert raised.value.retryable is True
+    assert api.objects == {}
+    assert api.got == [] and api.deleted == []
+    assert generation_two.state.get("cell-a") is not None
+
+    api.resume_store.set()
+    apply_thread.join(timeout=5)
+    assert not apply_thread.is_alive()
+    assert len(apply_errors) == 1 and isinstance(apply_errors[0], StaleMutationError)
+    assert api.objects == {}, "the returned stale POST must delete only its exact object"
+
+    released = generation_two.release("cell-a", release_context)
+    assert released.state is CapacityStatus.RELEASED
+    assert generation_two.state.get("cell-a") is None
+    tombstone = generation_two.state.cell_tombstone("cell-a")
+    assert tombstone is not None and "kubernetes_cleanup" in tombstone
+
+    # Reproduce a process dying after the API stored the old response but before
+    # its post-check could clean it. A record-absent replay must still GET and
+    # UID/resourceVersion-fenced delete that exact predecessor.
+    stale_service = headless_service_manifest(
+        "cell-a",
+        "eyvan",
+        provider_generation=1,
+        fence=fence_fingerprint(_TOKEN),
+    )
+    service_path = "/api/v1/namespaces/eyvan/services/eyvan-cell-a"
+    stored_stale_service = api.seed(service_path, stale_service)
+    stored_stale_metadata = stored_stale_service["metadata"]
+    assert isinstance(stored_stale_metadata, dict)
+    stale_uid = str(stored_stale_metadata["uid"])
+    stale_resource_version = str(stored_stale_metadata["resourceVersion"])
+    api.got.clear()
+    api.deleted.clear()
+    api.delete_preconditions.clear()
+
+    replayed = generation_two.release("cell-a", release_context)
+
+    assert replayed.state is CapacityStatus.RELEASED
+    assert service_path in api.got
+    assert api.objects == {}
+    assert api.delete_preconditions == [(service_path, stale_uid, stale_resource_version)]
+
+    # The same deterministic name with a newer generation/fence is a collision,
+    # not cleanup authority. The all-object preflight prevents any partial delete.
+    newer_service = headless_service_manifest(
+        "cell-a",
+        "eyvan",
+        provider_generation=2,
+        fence=fence_fingerprint("newer-provider-owner"),
+    )
+    api.seed(service_path, newer_service)
+    api.deleted.clear()
+    api.delete_preconditions.clear()
+
+    with pytest.raises(CapacityProviderError, match="Service conflict"):
+        generation_two.release("cell-a", release_context)
+
+    assert api.objects[service_path]["metadata"]["labels"][GENERATION_LABEL] == "2"
+    assert api.deleted == [] and api.delete_preconditions == []
 
 
 def test_provider_failure_releases_the_fleet_lease(tmp_path) -> None:

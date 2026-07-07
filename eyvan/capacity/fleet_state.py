@@ -48,19 +48,21 @@ DocumentToken: tp.TypeAlias = int | None
 #: holder was the live agent's own PID.
 _PROCESS_OWNER = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
 
-#: One lock per *owner*, so mutual exclusion tracks identity exactly. Stores
-#: sharing an owner are one writer and must share a lock; stores with distinct
-#: owners are distinct agents and must contend through the durable lease
-#: instead. A per-instance lock got this wrong in both directions.
-_EXCLUSIVE_LOCKS: dict[str, RLock] = {}
+#: One lock per process owner *and durable document*. Stores sharing both are
+#: one writer and must share a lock; an unrelated fleet-state document must not
+#: wait behind long provider I/O merely because the same agent process owns it.
+#: Stores with distinct owners represent distinct agents and contend through the
+#: durable lease instead. A per-instance lock gets same-document aliases wrong;
+#: an owner-only lock serializes every fleet in the process.
+_EXCLUSIVE_LOCKS: dict[tuple[str, str], RLock] = {}
 _EXCLUSIVE_LOCKS_GUARD = RLock()
 
 
-def _lock_for(owner: str) -> RLock:
-    """Return the process-wide lock guarding one owner's mutations."""
+def _lock_for(owner: str, scope: str) -> RLock:
+    """Return the process-wide lock guarding one owner's durable fleet scope."""
 
     with _EXCLUSIVE_LOCKS_GUARD:
-        return _EXCLUSIVE_LOCKS.setdefault(owner, RLock())
+        return _EXCLUSIVE_LOCKS.setdefault((owner, scope), RLock())
 
 
 def _holder_is_this_host(holder: str) -> tuple[bool, int | None]:
@@ -193,6 +195,12 @@ def _predecessors(fence: JsonObject) -> tuple[JsonObject, ...]:
 class DocumentBackend(tp.Protocol):
     """Atomic JSON document storage used by :class:`FleetStateStore`."""
 
+    @property
+    def mutation_scope(self) -> str:
+        """Return a stable identity for the durable document this backend mutates."""
+
+        ...
+
     def read(self) -> tuple[JsonObject, DocumentToken]: ...
 
     def update(self, mutate: tp.Callable[[JsonObject], None]) -> JsonObject: ...
@@ -204,6 +212,12 @@ class LocalBackend:
     def __init__(self, path: Path | str = DEFAULT_LOCAL_PATH):
         self.path = Path(path).expanduser()
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+
+    @property
+    def mutation_scope(self) -> str:
+        """Identify aliases of the same local fleet-state document."""
+
+        return f"local:{self.path.resolve(strict=False)}"
 
     def read(self) -> tuple[JsonObject, None]:
         if not self.path.exists():
@@ -260,6 +274,12 @@ class GcsBackend:
             raise ValueError("fleet state URI must be a gs:// object path")
         self.uri = uri
         self._runner = runner
+
+    @property
+    def mutation_scope(self) -> str:
+        """Identify all backend instances targeting the same GCS object."""
+
+        return f"gcs:{self.uri}"
 
     @staticmethod
     def _missing(result: subprocess.CompletedProcess[str]) -> bool:
@@ -464,7 +484,7 @@ class FleetStateStore:
         #: An explicit owner is how a *different* agent is represented, including
         #: when a test needs to simulate one.
         self._owner = owner or _PROCESS_OWNER
-        self._exclusive_lock = _lock_for(self._owner)
+        self._exclusive_lock = _lock_for(self._owner, backend.mutation_scope)
 
     @classmethod
     def from_uri(cls, uri: str | None, *, lease_ttl_s: float = 3600, owner: str | None = None) -> FleetStateStore:
@@ -597,6 +617,8 @@ class FleetStateStore:
         generation: int,
         fencing_token: str,
         predicate: tp.Callable[[FleetCellRecord], bool],
+        *,
+        metadata: tp.Mapping[str, JsonValue] | None = None,
     ) -> bool:
         result: dict[str, bool] = {}
 
@@ -609,7 +631,10 @@ class FleetStateStore:
                 result["removed"] = False
                 return
             cells.pop(name, None)
-            tombstones[name] = {"generation": generation, "fencing_token": fencing_token}
+            extra = dict(metadata or {})
+            if {"generation", "fencing_token"} & extra.keys():
+                raise ValueError("cell tombstone metadata cannot replace its generation fence")
+            tombstones[name] = {"generation": generation, "fencing_token": fencing_token, **extra}
             result["removed"] = True
 
         self.backend.update(update)
