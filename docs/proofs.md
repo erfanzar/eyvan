@@ -356,10 +356,12 @@ or exception messages. It contains only closed reason codes/counts, opaque
 subject/participant/scope IDs, closed identity enums, and bounded numeric
 summaries. Only timeout/unreachable windows may consume availability budget;
 auth, server, request/schema/overflow, filesystem, and internal errors make the
-result inconclusive regardless of that budget. Decimal CLI text is retained
-through scheduling (`0.07h / 0.1s = 2520` slots). Budget spend remains monotone
-across normal revision increments and may reset only after a separately proved
-forward period transition.
+result inconclusive regardless of that budget. Bounded Decimal CLI text is
+reduced to integer coefficient/exponent ratios, so process-wide Decimal
+precision cannot change scheduling (`0.07h / 0.1s = 2520` slots); input whose
+shortest float rendering does not round-trip to the same Decimal is rejected.
+Budget spend remains monotone across normal revision increments and
+may reset only after a separately proved forward period transition.
 
 A real P8 evaluator additionally needs a proof-bound sample at every successful
 observation with:

@@ -19,7 +19,7 @@ import time
 import typing as tp
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import ROUND_CEILING, Decimal
+from decimal import Decimal
 from pathlib import Path
 
 import click
@@ -64,9 +64,17 @@ MAX_TRANSIENT_DETAILS = 100
 MAX_RECEIPT_REASONS = 128
 MAX_CONFIG_FILES = 64
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
-MAX_SOAK_DURATION_S = Decimal(31 * 24 * 60 * 60)
+MAX_SOAK_DURATION_S = 31 * 24 * 60 * 60
+MAX_SOAK_HOURS = MAX_SOAK_DURATION_S // 3600
 MAX_INTERVAL_S = MAX_SOAK_DURATION_S
 MAX_OBSERVATION_SLOTS = 10_000_000
+
+# Decimal input is proof material, so its resource bounds cannot depend on the
+# process-wide Decimal context. These limits are checked on Decimal.as_tuple()
+# before a power of ten or coefficient is constructed.
+MAX_DECIMAL_TEXT_LENGTH = 128
+MAX_DECIMAL_DIGITS = 128
+MAX_DECIMAL_ABS_EXPONENT = 128
 
 # Every persisted reason is one closed code. No exception text, CLI value,
 # tenant identifier, object path, provider detail, or arbitrary extension is
@@ -132,29 +140,177 @@ REASON_CODES: tp.Final[frozenset[str]] = frozenset(
 )
 
 
+def _decimal_parts(value: Decimal, *, name: str) -> tuple[int, int]:
+    """Return a signed integer coefficient and base-10 exponent.
+
+    ``Decimal`` construction and :meth:`Decimal.as_tuple` are context-free. The
+    explicit bounds are checked before accumulating the coefficient or creating
+    ``10**exponent``, so hostile ``Decimal`` objects cannot bypass the CLI text
+    limit and trigger unbounded integer work.
+    """
+
+    if not value.is_finite():
+        raise ValueError(f"{name} is outside its finite bound")
+    decimal_tuple = value.as_tuple()
+    exponent = decimal_tuple.exponent
+    digits = decimal_tuple.digits
+    if (
+        not isinstance(exponent, int)
+        or not digits
+        or len(digits) > MAX_DECIMAL_DIGITS
+        or abs(exponent) > MAX_DECIMAL_ABS_EXPONENT
+    ):
+        raise ValueError(f"{name} must be a bounded finite decimal")
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    if decimal_tuple.sign:
+        coefficient = -coefficient
+    return coefficient, exponent
+
+
+def _decimal_ratio(value: Decimal, *, name: str) -> tuple[int, int]:
+    """Return the exact ``numerator, denominator`` using bounded Python ints."""
+
+    coefficient, exponent = _decimal_parts(value, name=name)
+    if exponent >= 0:
+        return coefficient * 10**exponent, 1
+    return coefficient, 10 ** (-exponent)
+
+
+def _decimal_from_parts(coefficient: int, exponent: int, *, name: str) -> Decimal:
+    """Build one exact finite Decimal without consulting the ambient context."""
+
+    sign = int(coefficient < 0)
+    coefficient = abs(coefficient)
+    if coefficient == 0:
+        return Decimal(0)
+    while coefficient % 10 == 0:
+        coefficient //= 10
+        exponent += 1
+    digits_text = str(coefficient)
+    if len(digits_text) > MAX_DECIMAL_DIGITS or abs(exponent) > MAX_DECIMAL_ABS_EXPONENT:
+        raise ValueError(f"{name} must be a bounded finite decimal")
+    return Decimal((sign, tuple(int(digit) for digit in digits_text), exponent))
+
+
+def _scale_decimal_exact(value: Decimal, factor: int, *, name: str) -> Decimal:
+    """Multiply a finite decimal by a positive integer using Python integers."""
+
+    if isinstance(factor, bool) or not isinstance(factor, int) or factor <= 0:
+        raise ValueError("decimal scale factor must be a positive integer")
+    coefficient, exponent = _decimal_parts(value, name=name)
+    return _decimal_from_parts(coefficient * factor, exponent, name=name)
+
+
+def _decimal_quotient_parts(dividend: Decimal, divisor: Decimal) -> tuple[int, int]:
+    """Return the positive exact quotient as an integer numerator/denominator."""
+
+    dividend_numerator, dividend_denominator = _decimal_ratio(dividend, name="dividend")
+    divisor_numerator, divisor_denominator = _decimal_ratio(divisor, name="divisor")
+    if dividend_numerator <= 0 or divisor_numerator <= 0:
+        raise ValueError("decimal quotient operands must be positive")
+    return (
+        dividend_numerator * divisor_denominator,
+        dividend_denominator * divisor_numerator,
+    )
+
+
+def _decimal_quotient_floor(dividend: Decimal, divisor: Decimal) -> int:
+    numerator, denominator = _decimal_quotient_parts(dividend, divisor)
+    return numerator // denominator
+
+
+def _decimal_to_roundtrip_float(value: Decimal, *, name: str) -> float:
+    """Return a float only if its shortest decimal rendering keeps the value.
+
+    Receipts encode these values as Python JSON numbers and the scheduler hands
+    them to a float monotonic-clock interface. A Decimal whose distinguishing
+    digits disappear from the float's shortest decimal rendering is rejected
+    instead of being persisted as different proof evidence.
+    """
+
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} cannot be represented as a finite runtime number")
+    if value.is_zero():
+        return 0.0
+    round_trip = Decimal(str(converted))
+    value_numerator, value_denominator = _decimal_ratio(value, name=name)
+    round_trip_numerator, round_trip_denominator = _decimal_ratio(round_trip, name=name)
+    if value_numerator * round_trip_denominator != round_trip_numerator * value_denominator:
+        raise ValueError(f"{name} cannot be represented without changing its decimal value")
+    return converted
+
+
+def _rational_to_finite_float(numerator: int, denominator: int, *, name: str) -> float:
+    try:
+        converted = numerator / denominator
+    except OverflowError as error:
+        raise ValueError(f"{name} cannot be represented by the monotonic clock") from error
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} cannot be represented by the monotonic clock")
+    return converted
+
+
+def _runtime_grid_parts(
+    duration: Decimal,
+    interval: Decimal,
+    slots: int,
+) -> tuple[float, float, int, int]:
+    """Validate the exact grid at the receipt/float-clock representation seam."""
+
+    duration_float = _decimal_to_roundtrip_float(duration, name="duration_s")
+    interval_float = _decimal_to_roundtrip_float(interval, name="interval_s")
+    interval_numerator, interval_denominator = _decimal_ratio(interval, name="interval_s")
+    if slots > 1:
+        last_offset = _rational_to_finite_float(
+            interval_numerator * (slots - 1),
+            interval_denominator,
+            name="observation grid",
+        )
+        if last_offset >= duration_float:
+            raise ValueError("the observation grid cannot be represented by the monotonic clock")
+    return duration_float, interval_float, interval_numerator, interval_denominator
+
+
+def _decimal_nonnegative_difference(left: Decimal, right: Decimal, *, name: str) -> Decimal:
+    """Return ``max(0, left - right)`` exactly, without Decimal arithmetic."""
+
+    left_coefficient, left_exponent = _decimal_parts(left, name=name)
+    right_coefficient, right_exponent = _decimal_parts(right, name=name)
+    common_exponent = min(left_exponent, right_exponent)
+    difference = left_coefficient * 10 ** (left_exponent - common_exponent) - right_coefficient * 10 ** (
+        right_exponent - common_exponent
+    )
+    return _decimal_from_parts(max(0, difference), common_exponent, name=name)
+
+
 def _decimal_value(
     value: object,
     *,
     name: str,
-    maximum: Decimal,
+    maximum: int,
     allow_zero: bool = False,
 ) -> Decimal:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite decimal")
-    if isinstance(value, str) and len(value) > 128:
-        raise ValueError(f"{name} must be a bounded finite decimal")
-    try:
-        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
-    except (ArithmeticError, ValueError, TypeError) as error:
-        raise ValueError(f"{name} must be a finite decimal") from error
-    if not parsed.is_finite():
-        raise ValueError(f"{name} is outside its finite bound")
-    try:
-        minimum_ok = parsed >= 0 if allow_zero else parsed > 0
-        outside_maximum = parsed > maximum
-    except ArithmeticError as error:
-        raise ValueError(f"{name} is outside its finite bound") from error
-    if not minimum_ok or outside_maximum:
+    if isinstance(value, Decimal):
+        parsed = value
+    else:
+        try:
+            rendered = str(value)
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"{name} must be a finite decimal") from error
+        if len(rendered) > MAX_DECIMAL_TEXT_LENGTH:
+            raise ValueError(f"{name} must be a bounded finite decimal")
+        try:
+            parsed = Decimal(rendered)
+        except (ArithmeticError, ValueError, TypeError) as error:
+            raise ValueError(f"{name} must be a finite decimal") from error
+    numerator, denominator = _decimal_ratio(parsed, name=name)
+    minimum_ok = numerator >= 0 if allow_zero else numerator > 0
+    if not minimum_ok or numerator > maximum * denominator:
         raise ValueError(f"{name} is outside its finite bound")
     return parsed
 
@@ -182,10 +338,8 @@ def observation_slot_count(duration_s: object, interval_s: object) -> int:
 
     duration = _decimal_value(duration_s, name="duration_s", maximum=MAX_SOAK_DURATION_S)
     interval = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
-    try:
-        slots = max(1, int((duration / interval).to_integral_value(rounding=ROUND_CEILING)))
-    except (ArithmeticError, ValueError) as error:
-        raise ValueError("the requested observation grid is not representable") from error
+    numerator, denominator = _decimal_quotient_parts(duration, interval)
+    slots = (numerator + denominator - 1) // denominator
     if slots > MAX_OBSERVATION_SLOTS:
         raise ValueError("the requested observation grid exceeds its fixed bound")
     return slots
@@ -352,11 +506,22 @@ class SoakRunInputs:
             maximum=MAX_SOAK_DURATION_S,
         )
         interval = _decimal_value(self.interval_decimal, name="interval_s", maximum=MAX_INTERVAL_S)
-        if not math.isfinite(self.requested_duration_s) or float(duration) != self.requested_duration_s:
+        slots = observation_slot_count(duration, interval)
+        duration_float, interval_float, _, _ = _runtime_grid_parts(duration, interval, slots)
+        if (
+            isinstance(self.requested_duration_s, bool)
+            or not isinstance(self.requested_duration_s, (int, float))
+            or not math.isfinite(self.requested_duration_s)
+            or duration_float != self.requested_duration_s
+        ):
             raise ValueError("requested duration decimal and numeric values disagree")
-        if not math.isfinite(self.interval_s) or float(interval) != self.interval_s:
+        if (
+            isinstance(self.interval_s, bool)
+            or not isinstance(self.interval_s, (int, float))
+            or not math.isfinite(self.interval_s)
+            or interval_float != self.interval_s
+        ):
             raise ValueError("interval decimal and numeric values disagree")
-        observation_slot_count(duration, interval)
         if (
             isinstance(self.config_file_count, bool)
             or not isinstance(self.config_file_count, int)
@@ -406,7 +571,8 @@ class SoakRunInputs:
     ) -> SoakRunInputs:
         duration = _decimal_value(requested_duration_s, name="requested_duration_s", maximum=MAX_SOAK_DURATION_S)
         interval = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
-        observation_slot_count(duration, interval)
+        slots = observation_slot_count(duration, interval)
+        duration_float, interval_float, _, _ = _runtime_grid_parts(duration, interval, slots)
 
         def normalized(value: str | None) -> str | None:
             if value is None:
@@ -422,8 +588,8 @@ class SoakRunInputs:
             config_file_count=config_file_count,
             config_snapshot_materialized=config_snapshot_materialized,
             proof_id=normalized(proof_id),
-            requested_duration_s=float(duration),
-            interval_s=float(interval),
+            requested_duration_s=duration_float,
+            interval_s=interval_float,
             requested_duration_decimal=str(duration),
             interval_decimal=str(interval),
             expected_executions=unique,
@@ -1127,14 +1293,27 @@ def run_soak_for_duration(
     duration = _decimal_value(duration_s, name="duration_s", maximum=MAX_SOAK_DURATION_S)
     interval = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
     total_slots = observation_slot_count(duration, interval)
+    duration_float, _, interval_numerator, interval_denominator = _runtime_grid_parts(
+        duration,
+        interval,
+        total_slots,
+    )
+
+    def slot_offset(index: int) -> float:
+        return _rational_to_finite_float(
+            interval_numerator * index,
+            interval_denominator,
+            name="observation grid",
+        )
+
     current = state or SoakState()
     started = _finite_monotonic(monotonic)
-    deadline = started + float(duration)
+    deadline = started + duration_float
     if not math.isfinite(deadline):
         raise ValueError("the monotonic deadline overflowed")
     slot = 0
     while slot < total_slots:
-        scheduled = started + float(interval * slot)
+        scheduled = started + slot_offset(slot)
         now = _finite_monotonic(monotonic)
         if now < scheduled:
             sleep(scheduled - now)
@@ -1145,7 +1324,7 @@ def run_soak_for_duration(
         high = total_slots
         while low < high:
             middle = (low + high) // 2
-            if started + float(interval * middle) <= now:
+            if started + slot_offset(middle) <= now:
                 low = middle + 1
             else:
                 high = middle
@@ -1267,6 +1446,7 @@ def build_soak_receipt(
     if status not in {"not_started", "running", "completed", "interrupted"}:
         raise ValueError("unsupported soak status")
     numeric_invalid = False
+    shortfall_exceeded = False
     try:
         actual_decimal = _decimal_value(
             actual_duration_s,
@@ -1274,11 +1454,29 @@ def build_soak_receipt(
             maximum=MAX_SOAK_DURATION_S,
             allow_zero=True,
         )
+        actual = _decimal_to_roundtrip_float(actual_decimal, name="actual_duration_s")
+        requested_decimal = _decimal_value(
+            inputs.requested_duration_decimal,
+            name="requested_duration_s",
+            maximum=MAX_SOAK_DURATION_S,
+        )
+        shortfall_decimal = _decimal_nonnegative_difference(
+            requested_decimal,
+            actual_decimal,
+            name="duration_shortfall_s",
+        )
+        shortfall = _decimal_to_roundtrip_float(shortfall_decimal, name="duration_shortfall_s")
+        shortfall_numerator, shortfall_denominator = _decimal_ratio(
+            shortfall_decimal,
+            name="duration_shortfall_s",
+        )
+        shortfall_exceeded = shortfall_numerator * 1_000_000_000 > shortfall_denominator
     except ValueError:
-        actual_decimal = Decimal(0)
+        # An unsafe numeric value is not rounded into proof evidence. Replace it
+        # with closed finite placeholders and mark the receipt inconclusive.
+        actual = 0.0
+        shortfall = inputs.requested_duration_s
         numeric_invalid = True
-    actual = float(actual_decimal)
-    shortfall = max(0.0, inputs.requested_duration_s - actual)
     report = state.report(inputs.availability_policy)
     artifact = state.artifact_report()
     p8 = state.p8_evidence_report()
@@ -1298,7 +1496,7 @@ def build_soak_receipt(
         _add_reason(inconclusive, "run_interrupted")
     if numeric_invalid:
         _add_reason(inconclusive, "duration_evidence_invalid")
-    elif shortfall > 1e-9:
+    elif shortfall_exceeded:
         _add_reason(inconclusive, "duration_shortfall")
     if state.attempts < inputs.requested_observations:
         _add_reason(inconclusive, "observation_slot_shortfall", inputs.requested_observations - state.attempts)
@@ -1716,11 +1914,19 @@ def soak(
         hours_decimal = _decimal_value(
             hours,
             name="hours",
-            maximum=MAX_SOAK_DURATION_S / Decimal(3600),
+            maximum=MAX_SOAK_HOURS,
         )
-        duration_decimal = hours_decimal * Decimal(3600)
+        duration_decimal = _scale_decimal_exact(hours_decimal, 3600, name="requested_duration_s")
+        duration_decimal = _decimal_value(
+            duration_decimal,
+            name="requested_duration_s",
+            maximum=MAX_SOAK_DURATION_S,
+        )
         interval_decimal = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
-        observation_slot_count(duration_decimal, interval_decimal)
+        slots = observation_slot_count(duration_decimal, interval_decimal)
+        _runtime_grid_parts(duration_decimal, interval_decimal, slots)
+        hour_decimal = _decimal_value(3600, name="one_hour_s", maximum=MAX_SOAK_DURATION_S)
+        observations_per_hour = max(1, _decimal_quotient_floor(hour_decimal, interval_decimal))
         policy = AvailabilityPolicy(
             max_failed_observations=tp.cast(
                 int,
@@ -1824,7 +2030,6 @@ def soak(
         return dict(payload)
 
     def announce(_tick: int, state: SoakState) -> None:
-        observations_per_hour = max(1, int(Decimal(3600) / interval_decimal))
         if state.attempts and state.attempts % observations_per_hour == 0:
             click.echo(
                 f"[{state.ticks} successful/{state.attempts} attempted observations] "

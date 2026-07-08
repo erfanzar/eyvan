@@ -135,11 +135,16 @@ eyvan soak \
 ```
 
 All numeric options are parsed as bounded decimal/integer text inside the
-command, after the output path is known. `nan`, `inf`, decimal overflow, counter
-overflow, and an excessive observation grid produce an atomic
-`not_started`/`inconclusive` receipt. In particular, `--hours 0.07
---interval-s 0.1` means exactly 252 seconds and 2,520 slots; no binary-float
-rounding invents a 2,521st slot.
+command, after the output path is known. Decimal coefficients, digit counts and
+base-10 exponents are bounded explicitly; hours-to-seconds scaling and slot
+ceiling use Python integers and do not consult the process-wide Decimal context.
+`nan`, `inf`, out-of-bound exponents or coefficients, counter overflow, and an
+excessive observation grid produce an atomic `not_started`/`inconclusive`
+receipt. A duration or interval whose shortest float rendering does not
+round-trip to the same Decimal is rejected rather than rounded into different
+proof evidence. In particular, `--hours 0.07 --interval-s 0.1` means exactly
+252 seconds and 2,520 slots even when the ambient Decimal precision is one; no
+binary-float or Decimal-context rounding changes that grid.
 
 The command reads each `--config` once, bounds the total bytes/file count, and
 atomically materializes those captured bytes under their combined digest in

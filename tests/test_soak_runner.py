@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, Inexact, Overflow, Underflow, localcontext
+from decimal import Decimal, Inexact, Overflow, Rounded, Underflow, localcontext
 from pathlib import Path
 
 import pytest
@@ -653,6 +656,17 @@ def test_actual_duration_nan_inf_and_overflow_are_finite_inconclusive_receipts()
         json.dumps(receipt, allow_nan=False)
 
 
+def test_actual_duration_that_would_round_in_json_is_rejected_as_evidence() -> None:
+    receipt = _build_receipt(
+        _run(_qualifying_payloads()),
+        actual_s=Decimal("1.0000000000000000000000000001"),
+    )
+    assert receipt["actual_duration_s"] == 0.0
+    assert receipt["verdict"] == "inconclusive"
+    assert "duration_evidence_invalid" in receipt["reasons"]
+    json.dumps(receipt, allow_nan=False)
+
+
 # --------------------------------------------------------------------------- fixed decimal scheduling and atomic files
 
 
@@ -689,41 +703,64 @@ def test_decimal_grid_two_point_one_over_point_three_is_exactly_seven() -> None:
     assert clock.elapsed == pytest.approx(2.1)
 
 
-def test_decimal_grid_translates_extreme_exponent_overflow_to_value_error() -> None:
-    for interval_s in ("1e-999999", "1e-1000000", "1e-999999999"):
-        with pytest.raises(ValueError, match="observation grid") as caught:
-            observation_slot_count("252", interval_s)
-        assert isinstance(caught.value.__cause__, ArithmeticError)
-
-
-def test_decimal_grid_translates_untrapped_overflow_to_value_error() -> None:
+def test_decimal_grid_rejects_extreme_exponents_before_integer_expansion() -> None:
     with localcontext() as context:
-        context.traps[Overflow] = False
-        with pytest.raises(ValueError, match="observation grid") as caught:
-            observation_slot_count("252", "1e-999999")
-    assert isinstance(caught.value.__cause__, OverflowError)
+        context.prec = 1
+        for signal in (Inexact, Rounded, Overflow, Underflow):
+            context.traps[signal] = False
+        for interval_s in ("1e-129", "1e-999999", "1e-1000000", "1e-999999999"):
+            with pytest.raises(ValueError, match="bounded finite decimal"):
+                observation_slot_count("252", interval_s)
+
+
+def test_decimal_grid_rejects_decimal_objects_that_bypass_the_text_digit_bound() -> None:
+    too_many_digits = Decimal((0, (1,) * 129, -128))
+    with pytest.raises(ValueError, match="bounded finite decimal"):
+        observation_slot_count(too_many_digits, "1")
 
 
 @pytest.mark.parametrize(
-    ("duration_s", "interval_s", "signal"),
+    ("duration_s", "interval_s", "expected"),
     [
-        ("0.001", "3", Underflow),
-        ("2", "3", Inexact),
+        ("0.001", "3", 1),
+        ("2", "3", 1),
+        ("252", "0.1", 2520),
     ],
 )
-def test_decimal_grid_translates_trapped_division_signals_to_value_error(
+def test_decimal_grid_is_independent_of_trapped_ambient_context_signals(
     duration_s: str,
     interval_s: str,
-    signal: type[ArithmeticError],
+    expected: int,
 ) -> None:
     with localcontext() as context:
-        context.prec = 2
+        context.prec = 1
         context.Emin = -2
         context.Emax = 2
-        context.traps[signal] = True
-        with pytest.raises(ValueError, match="observation grid") as caught:
-            observation_slot_count(duration_s, interval_s)
-    assert isinstance(caught.value.__cause__, signal)
+        for signal in (Inexact, Rounded, Overflow, Underflow):
+            context.traps[signal] = True
+        assert observation_slot_count(duration_s, interval_s) == expected
+
+
+def test_long_finite_decimal_ratio_uses_the_exact_integer_ceiling() -> None:
+    # Exact seconds for 1.0000000000000000000000000001 hours. The final
+    # observation is just beyond 3600 seconds, so a rounded Decimal quotient
+    # incorrectly returns ten while the exact half-open grid contains eleven.
+    duration_s = "3600.00000000000000000000000036"
+    assert observation_slot_count(duration_s, "360") == 11
+
+
+def test_grid_that_collapses_only_at_the_float_clock_boundary_is_rejected() -> None:
+    duration_s = "0.3"
+    interval_s = "0.09999999999999999"
+    assert observation_slot_count(duration_s, interval_s) == 4
+    with pytest.raises(ValueError, match="monotonic clock"):
+        run_soak_for_duration(
+            lambda: _payload(),
+            duration_s=duration_s,
+            interval_s=interval_s,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 0.0,
+        )
 
 
 def test_final_receipt_atomically_replaces_a_stale_pass(tmp_path: Path) -> None:
@@ -932,6 +969,75 @@ def test_click_preserves_decimal_hours_text_through_seconds_and_slot_count(tmp_p
     assert receipt["requested_duration_s"] == 252.0
     assert receipt["observation_counts"]["requested"] == 2520
     assert receipt["candidate_sha"] is None
+
+
+@pytest.mark.parametrize("precision", [1, 2])
+def test_real_cli_ignores_untrapped_low_precision_sitecustomize_decimal_context(
+    tmp_path: Path,
+    precision: int,
+) -> None:
+    site_directory = tmp_path / "site"
+    site_directory.mkdir()
+    marker = tmp_path / "sitecustomize-loaded"
+    (site_directory / "sitecustomize.py").write_text(
+        f"""import os
+from decimal import getcontext
+
+context = getcontext()
+context.prec = {precision}
+for signal in context.traps:
+    context.traps[signal] = False
+with open(os.environ["EYVAN_TEST_DECIMAL_CONTEXT_MARKER"], "w", encoding="utf-8") as handle:
+    handle.write(str(context.prec))
+""",
+        encoding="utf-8",
+    )
+    args, output = _cli_base(tmp_path, candidate="invalid-so-the-run-does-not-poll")
+    output.write_text('{"verdict":"pass","stale":true}', encoding="utf-8")
+    environment = os.environ.copy()
+    environment["EYVAN_TEST_DECIMAL_CONTEXT_MARKER"] = str(marker)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(site_directory), environment.get("PYTHONPATH")) if part
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", "eyvan.sdk.cli", *args, "--hours", "0.07", "--interval-s", "0.1"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert marker.read_text(encoding="utf-8") == str(precision)
+    assert completed.returncode == 2, (completed.stdout, completed.stderr)
+    assert "Traceback" not in completed.stdout
+    assert "Traceback" not in completed.stderr
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["status"] == "not_started"
+    assert receipt["requested_duration_s"] == 252.0
+    assert receipt["duration"]["requested_s"] == 252.0
+    assert receipt["observation_counts"]["requested"] == 2520
+    assert "stale" not in receipt
+    json.dumps(receipt, allow_nan=False)
+
+
+def test_cli_rejects_duration_that_cannot_survive_receipt_and_clock_float_conversion(tmp_path: Path) -> None:
+    from eyvan.sdk import cli
+
+    args, output = _cli_base(tmp_path)
+    output.write_text('{"verdict":"pass","stale":true}', encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.main,
+        [*args, "--hours", "1.0000000000000000000000000001", "--interval-s", "360"],
+    )
+    assert result.exit_code == 2, result.output
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["status"] == "not_started"
+    assert receipt["reasons"] == ["invalid_numeric_input"]
+    assert "requested_duration_s" not in receipt
+    assert "stale" not in receipt
 
 
 @pytest.mark.parametrize("mode", ["missing_config", "snapshot_path_is_file"])
