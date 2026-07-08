@@ -670,6 +670,7 @@ _LOCAL_DELETE_TRANSACTION = re.compile(
 )
 _LOCAL_DELETE_RECEIPT_ENTRIES = frozenset(
     {
+        "cleanup-safe",
         "complete",
         "destroyed-anchor",
         "detached",
@@ -1622,7 +1623,27 @@ class LocalManagedArtifactStore:
                             "local deletion trash receipt contains a nested directory"
                         )
 
-                for name in names:
+                # ``complete`` alone may describe a deliberately retained,
+                # unvalidated inode. Only the stronger durable marker proves
+                # that every payload-bearing receipt entry is either truncated
+                # or has a validated replacement in the normal object layout.
+                # The marker is unlinked last. If a crash has already removed
+                # it, an empty/marker-only receipt is a partial safe cleanup;
+                # any remaining payload-bearing name is retained instead.
+                cleanup_safe = self._transaction_marker_exists(receipt_fd, "cleanup-safe")
+                payload_entries = {
+                    "destroyed-anchor",
+                    "detached",
+                    "preserved-anchor",
+                    "replacement-anchor",
+                }.intersection(names)
+                if not cleanup_safe and payload_entries:
+                    return
+                cleanup_order = tuple(name for name in names if name != "cleanup-safe")
+                if cleanup_safe:
+                    cleanup_order += ("cleanup-safe",)
+
+                for name in cleanup_order:
                     try:
                         os.unlink(name, dir_fd=receipt_fd)
                     except FileNotFoundError:
@@ -1986,11 +2007,54 @@ class LocalManagedArtifactStore:
             payload = _validate_loaded_payload(reference, payload)
         except ValueError:
             return None
+        digest = hashlib.sha256(payload).hexdigest()
         current = self._current_read_from_directory(directory_fd, relative, reference.uri)
         if current is not None:
-            return current.metadata
+            if current.metadata.sha256 != digest or not _payloads_match(current.payload, payload):
+                return None
+            # A raw scope entry is not itself durable replacement proof. Link
+            # that exact pathname into the trusted generation directory, then
+            # re-open and revalidate the same inode before cleanup may retire
+            # the transaction copy. A concurrent C either remains canonical or
+            # is anchored too; detached B is retained unless the exact B inode
+            # has the normal two-link layout.
+            generation_name = f"{digest}.artifact"
+            try:
+                os.link(
+                    relative.name,
+                    generation_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=generation_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "preserved local replacement could not be anchored"
+                ) from exc
+            descriptor = self._open_object(directory_fd, relative.name)
+            try:
+                anchored = self._read_descriptor(
+                    descriptor,
+                    reference.uri,
+                    relative,
+                    conflict_on_unsafe=True,
+                )
+                if (
+                    anchored.metadata.sha256 != digest
+                    or not _payloads_match(anchored.payload, payload)
+                    or not anchored.metadata.object_version.startswith(f"local:2:{digest}:")
+                ):
+                    return None
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            # Persist file contents before either directory entry.
+            os.fsync(generation_fd)
+            os.fsync(directory_fd)
+            return anchored.metadata
 
-        digest = hashlib.sha256(payload).hexdigest()
         generation_name = f"{digest}.artifact"
         generation_descriptor, _created = self._open_or_create_generation(
             generation_fd,
@@ -2081,7 +2145,9 @@ class LocalManagedArtifactStore:
             return None
         if not stat_module.S_ISREG(detached_lstat.st_mode):
             self._preserve_special_detached_entry(transaction_fd, directory_fd, relative)
-            return None
+            raise ManagedArtifactDeleteInconclusiveError(
+                "unvalidated local replacement was retained in the deletion transaction"
+            )
         observed = self._read_detached_transaction_entry(transaction_fd)
         if observed is None:
             return None
@@ -2094,13 +2160,18 @@ class LocalManagedArtifactStore:
             digest,
             metadata,
         )
-        return self._install_preserved_replacement(
+        restored = self._install_preserved_replacement(
             generation_fd,
             directory_fd,
             relative,
             reference,
             payload,
         )
+        if restored is None:
+            raise ManagedArtifactDeleteInconclusiveError(
+                "unvalidated local replacement was retained in the deletion transaction"
+            )
+        return restored
 
     def _complete_unvalidated_transaction(
         self,
@@ -2253,6 +2324,11 @@ class LocalManagedArtifactStore:
             intent,
             force=False,
         )
+        # ``complete`` also describes conservative transactions that retain an
+        # unvalidated payload. Cleanup requires this stronger marker, written
+        # only after the selected inode was descriptor-truncated and every
+        # observed replacement was durably restored through the normal layout.
+        self._create_transaction_marker(transaction_fd, "cleanup-safe")
         self._create_transaction_marker(transaction_fd, "complete")
         return True
 

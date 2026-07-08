@@ -385,6 +385,198 @@ def test_local_delete_rehashes_same_inode_mutated_during_detach(
     assert target.stat().st_ino != int(written.metadata.object_version.split(":")[-2])
 
 
+def test_local_delete_retains_an_invalid_content_addressed_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    original_payload = b"callable-generation-a"
+    replacement_payload = b"callable-generation-b-invalid-for-uri"
+    digest = hashlib.sha256(original_payload).hexdigest()
+    uri = callable_uri(digest)
+    written = store.put_versioned(uri, original_payload, org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "callables" / f"{digest}.pkl"
+    original_rename = os.rename
+    original_unlink = os.unlink
+    mutated = False
+    unlinked_receipt_entries: list[str] = []
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated
+        if source == target.name and destination == "detached" and not mutated:
+            mutated = True
+            inode = target.stat().st_ino
+            os.chmod(target, 0o600)
+            target.write_bytes(replacement_payload)
+            assert target.stat().st_ino == inode
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    def record_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlinked_receipt_entries.append(os.fspath(path))
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    monkeypatch.setattr(os, "unlink", record_unlink)
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert mutated
+    transactions = list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    retained_payloads = [target.read_bytes()] if target.exists() and target.is_file() else []
+    retained_payloads.extend(
+        path.read_bytes()
+        for path in transactions[0].iterdir()
+        if path.is_file() and not path.is_symlink() and path.stat().st_size
+    )
+    assert replacement_payload in retained_payloads
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+    assert not {"detached", "preserved-anchor"}.intersection(unlinked_receipt_entries)
+
+
+def test_local_delete_retains_detached_b_when_a_different_c_becomes_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replacement-b-versus-current-c")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = (
+        store.root / "scopes" / storage_scope("acme", "research") / "results" / "replacement-b-versus-current-c.result"
+    )
+    staging_b = target.with_name("staging-generation-b.result")
+    staging_b.write_bytes(b"generation-b")
+    original_ftruncate = os.ftruncate
+    original_rename = os.rename
+    original_install = store._install_preserved_replacement
+    installed_b = False
+    installed_c = False
+
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal installed_b
+        if length == 0 and not installed_b:
+            installed_b = True
+            detached = next((store.root / ".generations").rglob("detached"))
+            original_rename(staging_b, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def install_after_c_appears(
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference,
+        payload: bytes,
+    ):
+        nonlocal installed_c
+        if not installed_c:
+            installed_c = True
+            target.write_bytes(b"generation-c")
+            target.chmod(0o400)
+        return original_install(generation_fd, directory_fd, relative, reference, payload)
+
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(store, "_install_preserved_replacement", install_after_c_appears)
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert installed_b and installed_c
+    assert target.read_bytes() == b"generation-c"
+    transactions = list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    assert any(
+        path.is_file() and not path.is_symlink() and path.read_bytes() == b"generation-b"
+        for path in transactions[0].iterdir()
+    )
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+
+
+def test_local_delete_anchors_an_exact_current_b_before_receipt_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replacement-b-is-current-b")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replacement-b-is-current-b.result"
+    staging_b = target.with_name("staging-current-generation-b.result")
+    staging_b.write_bytes(b"generation-b")
+    original_ftruncate = os.ftruncate
+    original_rename = os.rename
+    original_install = store._install_preserved_replacement
+    installed_b = False
+    current_b = False
+
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal installed_b
+        if length == 0 and not installed_b:
+            installed_b = True
+            detached = next((store.root / ".generations").rglob("detached"))
+            original_rename(staging_b, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def install_after_same_b_appears(
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference,
+        payload: bytes,
+    ):
+        nonlocal current_b
+        if not current_b:
+            current_b = True
+            target.write_bytes(b"generation-b")
+            target.chmod(0o400)
+        return original_install(generation_fd, directory_fd, relative, reference, payload)
+
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(store, "_install_preserved_replacement", install_after_same_b_appears)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert installed_b and current_b
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert target.read_bytes() == b"generation-b"
+    observed = store.stat(uri, org_id="acme", project_id="research")
+    assert observed is not None
+    replacement_digest = hashlib.sha256(b"generation-b").hexdigest()
+    assert observed.object_version.startswith(f"local:2:{replacement_digest}:")
+    anchor = next((store.root / ".generations").glob(f"*/{replacement_digest}.artifact"))
+    assert anchor.samefile(target)
+    assert not list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+
+
 @pytest.mark.parametrize("crash_boundary", ("detached", "truncated", "anchor-retired"))
 def test_local_delete_crash_residue_is_private_and_retry_put_recovers(
     tmp_path: Path,
@@ -547,6 +739,7 @@ def test_local_delete_reuse_keeps_inode_consumption_bounded(tmp_path: Path) -> N
     (
         "archive-renamed",
         "archive-synced",
+        "cleanup-safe-unlinked",
         "complete-unlinked",
         "destroyed-anchor-unlinked",
         "detached-unlinked",
@@ -720,6 +913,30 @@ def _leave_archived_local_delete_receipt(
     receipts = list((store.root / ".generations").glob("*/.trash-v1-*"))
     assert len(receipts) == 1
     return receipts[0]
+
+
+def test_local_delete_cleanup_retains_payload_receipts_without_cleanup_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("legacy-unvalidated-receipt")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+    (receipt / "cleanup-safe").unlink()
+    retained = receipt / "preserved-anchor"
+    retained.write_bytes(b"unvalidated-scope-replacement")
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.DELETED
+    assert receipt.is_dir()
+    assert retained.read_bytes() == b"unvalidated-scope-replacement"
 
 
 @pytest.mark.parametrize(
