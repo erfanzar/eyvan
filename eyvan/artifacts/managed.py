@@ -668,6 +668,18 @@ _LOCAL_DELETE_TRANSACTION = re.compile(
     r"^\.delete-v1-(?P<layout>[12])-(?P<digest>[0-9a-f]{64})-"
     r"(?P<device>0|[1-9][0-9]*)-(?P<inode>0|[1-9][0-9]*)-(?P<ctime_ns>0|[1-9][0-9]*)$"
 )
+_LOCAL_DELETE_RECEIPT_ENTRIES = frozenset(
+    {
+        "complete",
+        "destroyed-anchor",
+        "detached",
+        "preserved-anchor",
+        "replacement-anchor",
+        "validated",
+    }
+)
+_MAX_LOCAL_GENERATION_DIRECTORY_ENTRIES = 256
+_MAX_LOCAL_DELETE_RECEIPT_ENTRIES = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,6 +737,15 @@ def _parse_local_delete_intent(directory_name: str) -> _LocalDeleteIntent:
     )
 
 
+def _parse_local_trash_intent(directory_name: str) -> _LocalDeleteIntent:
+    if not directory_name.startswith(".trash-"):
+        raise ValueError("local deletion trash receipt name is invalid")
+    intent = _parse_local_delete_intent(directory_name.replace(".trash-", ".delete-", 1))
+    if intent.trash_directory_name != directory_name:
+        raise ValueError("local deletion trash receipt name is invalid")
+    return intent
+
+
 def _parse_local_object_version(object_version: str) -> _LocalObjectVersion:
     if not isinstance(object_version, str) or not object_version.startswith("local:"):
         raise ValueError("local managed artifact version must use the local: prefix")
@@ -770,10 +791,13 @@ class LocalManagedArtifactStore:
     deletion renames the canonical entry into a deterministic transaction
     directory below that anchor, rehashes the exact detached descriptor, durably
     marks validation, and destroys the selected inode through ``ftruncate`` on
-    that descriptor. It never unlinks the detached pathname. The zero-length
-    links and markers remain as a private crash receipt, while a path replacement
-    observed at any boundary is preserved there and, when valid, copied back as
-    the new current generation.
+    that descriptor. It never unlinks the detached pathname while the transaction
+    is active. A completed transaction is first archived under a private
+    ``.trash-*`` name, then its fixed set of receipt links and markers is removed
+    through no-follow directory-relative operations. A crash leaves only a
+    resumable bounded receipt. A path replacement observed at any boundary is
+    preserved before archival and, when valid, copied back as the new current
+    generation.
 
     The configured root, ``.locks``, and ``.generations`` are a trusted operator
     boundary: processes able to write those hidden directories can forge store
@@ -1224,7 +1248,7 @@ class LocalManagedArtifactStore:
                         )
                     except ManagedArtifactDeleteInconclusiveError as exc:
                         raise ManagedArtifactWriteInconclusiveError(
-                            "local deletion recovery blocked the managed artifact write"
+                            f"local deletion recovery blocked the managed artifact write: {exc}"
                         ) from exc
                     existing = self._existing_write(directory_fd, relative, reference.uri, payload)
                     if existing is not None:
@@ -1518,6 +1542,141 @@ class LocalManagedArtifactStore:
         finally:
             os.close(descriptor)
 
+    @contextlib.contextmanager
+    def _open_archived_delete_receipt(
+        self,
+        generation_fd: int,
+        intent: _LocalDeleteIntent,
+    ) -> tp.Iterator[int]:
+        try:
+            descriptor = os.open(
+                intent.trash_directory_name,
+                self._directory_open_flags(),
+                dir_fd=generation_fd,
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion trash receipt could not be opened") from exc
+        try:
+            try:
+                self._validate_control_directory(descriptor)
+            except InvalidManagedArtifactURI as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local deletion trash receipt is unsafe") from exc
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _bounded_local_directory_names(
+        directory_fd: int,
+        *,
+        limit: int,
+        description: str,
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        try:
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    if len(names) >= limit:
+                        raise ManagedArtifactDeleteInconclusiveError(f"{description} exceeded its bounded scan limit")
+                    names.append(entry.name)
+        except ManagedArtifactDeleteInconclusiveError:
+            raise
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError(f"{description} could not be listed") from exc
+        return tuple(sorted(names))
+
+    def _cleanup_archived_delete_receipt(self, generation_fd: int, intent: _LocalDeleteIntent) -> None:
+        """Remove one completed receipt without opening or traversing its entries."""
+
+        receipt_name = intent.trash_directory_name
+        try:
+            receipt_context = self._open_archived_delete_receipt(generation_fd, intent)
+            with receipt_context as receipt_fd:
+                names = self._bounded_local_directory_names(
+                    receipt_fd,
+                    limit=_MAX_LOCAL_DELETE_RECEIPT_ENTRIES,
+                    description="local deletion trash receipt",
+                )
+                if any(name not in _LOCAL_DELETE_RECEIPT_ENTRIES for name in names):
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local deletion trash receipt contains an unexpected entry"
+                    )
+
+                # Preflight the complete bounded set before removing anything. A
+                # known name may be a symlink, FIFO, socket, or device: unlinkat
+                # removes that directory entry itself and never opens or follows
+                # it. Directories are retained because cleanup never recurses.
+                for name in names:
+                    try:
+                        metadata = os.stat(name, dir_fd=receipt_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local deletion trash receipt entry could not be observed"
+                        ) from exc
+                    if stat_module.S_ISDIR(metadata.st_mode):
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local deletion trash receipt contains a nested directory"
+                        )
+
+                for name in names:
+                    try:
+                        os.unlink(name, dir_fd=receipt_fd)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local deletion trash receipt entry could not be removed"
+                        ) from exc
+                try:
+                    os.fsync(receipt_fd)
+                except OSError as exc:
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local deletion trash receipt cleanup could not be persisted"
+                    ) from exc
+
+                try:
+                    opened_receipt = os.fstat(receipt_fd)
+                except OSError as exc:
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local deletion trash receipt descriptor could not be re-observed"
+                    ) from exc
+                try:
+                    current_receipt = os.stat(receipt_name, dir_fd=generation_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    current_receipt = None
+                except OSError as exc:
+                    raise ManagedArtifactDeleteInconclusiveError(
+                        "local deletion trash receipt could not be re-observed"
+                    ) from exc
+                if current_receipt is not None:
+                    if not stat_module.S_ISDIR(current_receipt.st_mode) or not self._same_inode(
+                        opened_receipt,
+                        current_receipt,
+                    ):
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local deletion trash receipt was replaced during cleanup"
+                        )
+                    try:
+                        os.rmdir(receipt_name, dir_fd=generation_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise ManagedArtifactDeleteInconclusiveError(
+                            "local deletion trash receipt could not be removed"
+                        ) from exc
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(generation_fd)
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError(
+                "local deletion trash receipt retirement could not be persisted"
+            ) from exc
+
     def _archive_delete_transaction(self, generation_fd: int, intent: _LocalDeleteIntent) -> None:
         source = intent.directory_name
         destination = intent.trash_directory_name
@@ -1525,23 +1684,29 @@ class LocalManagedArtifactStore:
             destination_stat = os.stat(destination, dir_fd=generation_fd, follow_symlinks=False)
         except FileNotFoundError:
             destination_stat = None
+        except OSError as exc:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion trash receipt could not be observed") from exc
         if destination_stat is not None:
             if not stat_module.S_ISDIR(destination_stat.st_mode):
                 raise ManagedArtifactDeleteInconclusiveError("local deletion trash receipt is unsafe")
             try:
                 os.stat(source, dir_fd=generation_fd, follow_symlinks=False)
             except FileNotFoundError:
+                self._cleanup_archived_delete_receipt(generation_fd, intent)
                 return
+            except OSError as exc:
+                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction could not be observed") from exc
             raise ManagedArtifactDeleteInconclusiveError(
                 "local deletion transaction collides with an existing trash receipt"
             )
         try:
             os.rename(source, destination, src_dir_fd=generation_fd, dst_dir_fd=generation_fd)
+            os.fsync(generation_fd)
         except FileNotFoundError:
             return
         except OSError as exc:
             raise ManagedArtifactDeleteInconclusiveError("local deletion transaction could not be archived") from exc
-        os.fsync(generation_fd)
+        self._cleanup_archived_delete_receipt(generation_fd, intent)
 
     @staticmethod
     def _matches_delete_intent(metadata: os.stat_result, intent: _LocalDeleteIntent) -> bool:
@@ -2091,29 +2256,44 @@ class LocalManagedArtifactStore:
         self._create_transaction_marker(transaction_fd, "complete")
         return True
 
-    def _delete_transaction_intents(self, generation_fd: int) -> tuple[_LocalDeleteIntent, ...]:
-        try:
-            names = os.listdir(generation_fd)
-        except OSError as exc:
-            raise ManagedArtifactDeleteInconclusiveError("local deletion transactions could not be listed") from exc
-        intents: list[_LocalDeleteIntent] = []
-        for name in sorted(names):
-            if not name.startswith(".delete-"):
+    def _delete_transaction_intents(
+        self,
+        generation_fd: int,
+    ) -> tuple[tuple[_LocalDeleteIntent, ...], tuple[_LocalDeleteIntent, ...]]:
+        names = self._bounded_local_directory_names(
+            generation_fd,
+            limit=_MAX_LOCAL_GENERATION_DIRECTORY_ENTRIES,
+            description="local generation directory",
+        )
+        active: list[_LocalDeleteIntent] = []
+        archived: list[_LocalDeleteIntent] = []
+        for name in names:
+            if name.startswith(".delete-"):
+                parser = _parse_local_delete_intent
+                destination = active
+                description = "local deletion transaction"
+            elif name.startswith(".trash-"):
+                parser = _parse_local_trash_intent
+                destination = archived
+                description = "local deletion trash receipt"
+            else:
                 continue
             try:
-                intent = _parse_local_delete_intent(name)
+                intent = parser(name)
             except ValueError as exc:
-                raise ManagedArtifactDeleteInconclusiveError(
-                    "local deletion transaction has an invalid identity"
-                ) from exc
+                raise ManagedArtifactDeleteInconclusiveError(f"{description} has an invalid identity") from exc
             try:
                 metadata = os.stat(name, dir_fd=generation_fd, follow_symlinks=False)
             except OSError as exc:
-                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction could not be observed") from exc
+                raise ManagedArtifactDeleteInconclusiveError(f"{description} could not be observed") from exc
             if not stat_module.S_ISDIR(metadata.st_mode):
-                raise ManagedArtifactDeleteInconclusiveError("local deletion transaction is not a directory")
-            intents.append(intent)
-        return tuple(intents)
+                raise ManagedArtifactDeleteInconclusiveError(f"{description} is not a directory")
+            destination.append(intent)
+        if set(active).intersection(archived):
+            raise ManagedArtifactDeleteInconclusiveError(
+                "local deletion transaction collides with an existing trash receipt"
+            )
+        return tuple(active), tuple(archived)
 
     def _recover_delete_transactions(
         self,
@@ -2122,8 +2302,12 @@ class LocalManagedArtifactStore:
         relative: Path,
         reference: ManagedArtifactRef,
     ) -> tuple[_LocalDeleteIntent, ...]:
+        active, archived = self._delete_transaction_intents(generation_fd)
         completed: list[_LocalDeleteIntent] = []
-        for intent in self._delete_transaction_intents(generation_fd):
+        for intent in archived:
+            self._cleanup_archived_delete_receipt(generation_fd, intent)
+            completed.append(intent)
+        for intent in active:
             with self._open_delete_transaction(generation_fd, intent, create=False) as transaction_fd:
                 recovered = self._recover_delete_transaction(
                     generation_fd,
@@ -2134,9 +2318,12 @@ class LocalManagedArtifactStore:
                     intent,
                 )
                 is_complete = self._transaction_marker_exists(transaction_fd, "complete")
+            if recovered and not is_complete:
+                raise ManagedArtifactDeleteInconclusiveError(
+                    "local deletion transaction recovery was not durably completed"
+                )
             if is_complete:
                 self._archive_delete_transaction(generation_fd, intent)
-            if recovered:
                 completed.append(intent)
         return tuple(completed)
 
@@ -2174,9 +2361,12 @@ class LocalManagedArtifactStore:
                 intent,
             )
             is_complete = self._transaction_marker_exists(transaction_fd, "complete")
+        if recovered and not is_complete:
+            raise ManagedArtifactDeleteInconclusiveError("local deletion transaction recovery was not durably completed")
         if is_complete:
             self._archive_delete_transaction(generation_fd, intent)
-        return intent if recovered else None
+            return intent
+        return None
 
     def delete_versioned(
         self,

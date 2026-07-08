@@ -276,7 +276,7 @@ def test_local_conditional_delete_never_unlinks_a_rename_at_detach_replacement(
     assert target.read_bytes() == b"generation-b"
 
 
-def test_local_delete_raw_detached_path_replacement_is_preserved_not_unlinked(
+def test_local_delete_raw_detached_replacement_is_preserved_before_receipt_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -289,7 +289,7 @@ def test_local_delete_raw_detached_path_replacement_is_preserved_not_unlinked(
     original_ftruncate = os.ftruncate
     original_rename = os.rename
     original_unlink = os.unlink
-    unlinked_names: list[str] = []
+    unlinked_names: list[tuple[str, int | None]] = []
     installed = False
 
     def adversarial_ftruncate(descriptor: int, length: int) -> None:
@@ -308,7 +308,7 @@ def test_local_delete_raw_detached_path_replacement_is_preserved_not_unlinked(
         original_ftruncate(descriptor, length)
 
     def record_unlink(path: str, *, dir_fd: int | None = None) -> None:
-        unlinked_names.append(os.fspath(path))
+        unlinked_names.append((os.fspath(path), dir_fd))
         original_unlink(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
@@ -321,15 +321,20 @@ def test_local_delete_raw_detached_path_replacement_is_preserved_not_unlinked(
     )
 
     assert installed
-    assert "detached" not in unlinked_names
+    detached_unlinks = [directory_fd for name, directory_fd in unlinked_names if name == "detached"]
+    assert detached_unlinks
+    assert all(directory_fd is not None for _name, directory_fd in unlinked_names)
     assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
     assert outcome.current_metadata is not None
-    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    replacement_digest = hashlib.sha256(b"generation-b").hexdigest()
+    assert outcome.current_metadata.sha256 == replacement_digest
     assert target.read_bytes() == b"generation-b"
-    preserved = [path.read_bytes() for path in (store.root / ".generations").rglob("detached")]
-    assert b"generation-b" in preserved
-    replacement_anchor = next((store.root / ".generations").rglob("replacement-anchor"))
-    assert replacement_anchor.read_bytes() == b"generation-b"
+    generation_directory = next((store.root / ".generations").iterdir())
+    replacement_anchor = generation_directory / f"{replacement_digest}.artifact"
+    assert replacement_anchor.samefile(target)
+    assert target.stat().st_nlink == 2
+    assert not list(generation_directory.glob(".delete-*"))
+    assert not list(generation_directory.glob(".trash-*"))
 
 
 def test_local_delete_rehashes_same_inode_mutated_during_detach(
@@ -453,8 +458,8 @@ def test_local_delete_crash_residue_is_private_and_retry_put_recovers(
     assert rewritten.created is True
     assert rewritten.metadata.object_version != written.metadata.object_version
     assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
-    receipt = next((root / ".generations").glob("*/.trash-v1-*"))
-    assert (receipt / "complete").is_file()
+    assert not list((root / ".generations").glob("*/.delete-v1-*"))
+    assert not list((root / ".generations").glob("*/.trash-v1-*"))
 
 
 def test_local_delete_retry_finishes_a_post_detach_crash(
@@ -506,11 +511,312 @@ def test_local_delete_retry_finishes_a_post_detach_crash(
     )
 
     assert outcome.status is ManagedArtifactDeleteStatus.DELETED
-    receipt = next((store.root / ".generations").glob("*/.trash-v1-*"))
-    assert (receipt / "validated").is_file()
-    assert (receipt / "complete").is_file()
-    assert (receipt / "detached").read_bytes() == b""
-    assert (receipt / "destroyed-anchor").read_bytes() == b""
+    generation_directory = next((store.root / ".generations").iterdir())
+    assert list(generation_directory.iterdir()) == []
+
+
+def test_local_delete_reuse_keeps_inode_consumption_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "managed"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri("bounded-receipts")
+
+    for cycle in range(100):
+        written = store.put_versioned(
+            uri,
+            f"generation-{cycle}".encode(),
+            org_id="acme",
+            project_id="research",
+        )
+        deleted = store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+
+    generation_directory = next((root / ".generations").iterdir())
+    assert list(generation_directory.iterdir()) == []
+    physical_entries = (root, *root.rglob("*"))
+    allocated_inodes = {(entry.lstat().st_dev, entry.lstat().st_ino) for entry in physical_entries}
+    assert len(allocated_inodes) <= 8
+
+
+@pytest.mark.parametrize(
+    "crash_boundary",
+    (
+        "archive-renamed",
+        "archive-synced",
+        "complete-unlinked",
+        "destroyed-anchor-unlinked",
+        "detached-unlinked",
+        "validated-unlinked",
+        "receipt-synced",
+        "receipt-removed",
+        "generation-synced",
+    ),
+)
+@pytest.mark.parametrize("retry_operation", ("delete", "put"))
+def test_local_delete_cleanup_recovers_after_every_durable_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+    retry_operation: str,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = tmp_path / f"managed-{crash_boundary}-{retry_operation}"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri("cleanup-crash")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    original_unlink = os.unlink
+    original_rmdir = os.rmdir
+    original_fsync = os.fsync
+    archived = False
+    archive_synced = False
+    receipt_removed = False
+    crashed = False
+
+    def crash(event: str) -> None:
+        nonlocal crashed
+        if event == crash_boundary and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    def boundary_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal archived
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination.startswith(".trash-"):
+            archived = True
+            crash("archive-renamed")
+
+    def boundary_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        original_unlink(path, dir_fd=dir_fd)
+        if archived:
+            crash(f"{os.fspath(path)}-unlinked")
+
+    def boundary_rmdir(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal receipt_removed
+        original_rmdir(path, dir_fd=dir_fd)
+        if archived and os.fspath(path).startswith(".trash-"):
+            receipt_removed = True
+            crash("receipt-removed")
+
+    def boundary_fsync(descriptor: int) -> None:
+        nonlocal archive_synced
+        original_fsync(descriptor)
+        if receipt_removed:
+            crash("generation-synced")
+        elif archived and not archive_synced:
+            archive_synced = True
+            crash("archive-synced")
+        elif archived:
+            crash("receipt-synced")
+
+    monkeypatch.setattr(os, "rename", boundary_rename)
+    monkeypatch.setattr(os, "unlink", boundary_unlink)
+    monkeypatch.setattr(os, "rmdir", boundary_rmdir)
+    monkeypatch.setattr(os, "fsync", boundary_fsync)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+    assert crashed
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    monkeypatch.setattr(os, "rmdir", original_rmdir)
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    restarted = LocalManagedArtifactStore(root)
+    if retry_operation == "delete":
+        retried = restarted.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        expected = (
+            ManagedArtifactDeleteStatus.ABSENT
+            if crash_boundary in {"receipt-removed", "generation-synced"}
+            else ManagedArtifactDeleteStatus.DELETED
+        )
+        assert retried.status is expected
+    else:
+        replacement = restarted.put_versioned(
+            uri,
+            b"generation-b",
+            org_id="acme",
+            project_id="research",
+        )
+        assert replacement.created is True
+        stale_delete = restarted.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert stale_delete.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+        assert stale_delete.current_metadata == replacement.metadata
+        assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
+
+    generation_directory = next((root / ".generations").iterdir())
+    assert not list(generation_directory.glob(".delete-*"))
+    assert not list(generation_directory.glob(".trash-*"))
+
+
+class _SimulatedArchivedReceiptCrash(BaseException):
+    pass
+
+
+def _leave_archived_local_delete_receipt(
+    store: LocalManagedArtifactStore,
+    uri: str,
+    object_version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    original_rename = os.rename
+
+    def crash_after_archive(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination.startswith(".trash-"):
+            raise _SimulatedArchivedReceiptCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_archive)
+    with pytest.raises(_SimulatedArchivedReceiptCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=object_version,
+        )
+    monkeypatch.setattr(os, "rename", original_rename)
+    receipts = list((store.root / ".generations").glob("*/.trash-v1-*"))
+    assert len(receipts) == 1
+    return receipts[0]
+
+
+@pytest.mark.parametrize(
+    "unexpected_kind",
+    ("unknown-file", "unknown-directory", "unknown-symlink", "known-directory"),
+)
+def test_local_delete_cleanup_retains_unexpected_receipt_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unexpected_kind: str,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri(f"unexpected-receipt-{unexpected_kind}")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+
+    if unexpected_kind == "unknown-file":
+        unexpected = receipt / "unknown"
+        unexpected.write_bytes(b"retain")
+    elif unexpected_kind == "unknown-directory":
+        unexpected = receipt / "unknown"
+        unexpected.mkdir()
+        (unexpected / "do-not-traverse").write_bytes(b"retain")
+    elif unexpected_kind == "unknown-symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"retain")
+        unexpected = receipt / "unknown"
+        unexpected.symlink_to(outside)
+    else:
+        unexpected = receipt / "detached"
+        unexpected.unlink()
+        unexpected.mkdir()
+        (unexpected / "do-not-traverse").write_bytes(b"retain")
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError, match=r"unexpected entry|nested directory"):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert receipt.is_dir()
+    assert os.path.lexists(unexpected)
+    if unexpected_kind == "unknown-symlink":
+        assert outside.read_bytes() == b"retain"
+    else:
+        assert (receipt / "complete").is_file()
+
+
+@pytest.mark.parametrize("operation", ("delete", "put"))
+def test_local_generation_recovery_has_an_explicit_fixed_scan_cap(tmp_path: Path, operation: str) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("bounded-generation-scan")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    generation_directory = next((store.root / ".generations").iterdir())
+    for index in range(256):
+        (generation_directory / f"ignored-{index:03d}").touch()
+
+    expected_error = (
+        ManagedArtifactDeleteInconclusiveError if operation == "delete" else ManagedArtifactWriteInconclusiveError
+    )
+    with pytest.raises(expected_error, match="bounded scan limit"):
+        if operation == "delete":
+            store.delete_versioned(
+                uri,
+                org_id="acme",
+                project_id="research",
+                object_version=written.metadata.object_version,
+            )
+        else:
+            store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+
+    assert store.get(uri, org_id="acme", project_id="research") == b"generation-a"
+
+
+def test_local_delete_receipt_recovery_has_an_explicit_fixed_scan_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("bounded-receipt-scan")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+    for index in range(17 - len(list(receipt.iterdir()))):
+        (receipt / f"unknown-{index:02d}").touch()
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError, match="bounded scan limit"):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert receipt.is_dir()
+    assert len(list(receipt.iterdir())) == 17
 
 
 def test_local_delete_recovery_never_removes_a_later_canonical_entry(
@@ -564,6 +870,107 @@ def test_local_delete_recovery_never_removes_a_later_canonical_entry(
     assert outcome.current_metadata is not None
     assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
     assert target.read_bytes() == b"generation-b"
+
+
+def test_local_delete_receipt_special_entries_are_unlinked_nonblocking_in_a_bounded_subprocess(
+    tmp_path: Path,
+) -> None:
+    script = r"""
+import os
+import socket
+import sys
+from pathlib import Path
+
+from eyvan.artifacts.managed import LocalManagedArtifactStore, ManagedArtifactDeleteStatus, result_uri
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+root = Path(sys.argv[1])
+store = LocalManagedArtifactStore(root)
+
+
+def leave_receipt(name, payload):
+    uri = result_uri(name)
+    written = store.put_versioned(uri, payload, org_id="acme", project_id="research")
+    original_rename = os.rename
+
+    def crash_after_archive(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+        original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        if destination.startswith(".trash-"):
+            raise SimulatedCrash
+
+    os.rename = crash_after_archive
+    try:
+        try:
+            store.delete_versioned(
+                uri,
+                org_id="acme",
+                project_id="research",
+                object_version=written.metadata.object_version,
+            )
+        except SimulatedCrash:
+            pass
+        else:
+            raise AssertionError("delete reached past the archived receipt boundary")
+    finally:
+        os.rename = original_rename
+    receipts = list(root.glob(".generations/*/.trash-v1-*"))
+    if len(receipts) != 1:
+        raise AssertionError(f"expected one receipt, found {len(receipts)}")
+    return uri, written.metadata.object_version, receipts[0]
+
+
+for kind in ("fifo", "socket", "symlink"):
+    uri, object_version, receipt = leave_receipt(f"special-receipt-{kind}", kind.encode())
+    detached = receipt / "detached"
+    detached.unlink()
+    listener = None
+    outside = root / f"outside-{kind}"
+    if kind == "fifo":
+        os.mkfifo(detached)
+    elif kind == "socket":
+        listener = socket.socket(socket.AF_UNIX)
+        previous = Path.cwd()
+        os.chdir(receipt)
+        try:
+            listener.bind("detached")
+        finally:
+            os.chdir(previous)
+    else:
+        outside.write_bytes(b"retain")
+        detached.symlink_to(outside)
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=object_version,
+    )
+    if outcome.status is not ManagedArtifactDeleteStatus.DELETED:
+        raise AssertionError(f"unexpected retry outcome: {outcome.status}")
+    if receipt.exists():
+        raise AssertionError("special receipt was retained")
+    if kind == "symlink" and outside.read_bytes() != b"retain":
+        raise AssertionError("receipt symlink target was followed")
+    if listener is not None:
+        listener.close()
+
+print("bounded")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "special-receipts")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        cwd=Path(__file__).parents[1],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "bounded"
 
 
 def test_local_special_file_opens_are_nonblocking_and_type_safe_in_a_bounded_subprocess(tmp_path: Path) -> None:
