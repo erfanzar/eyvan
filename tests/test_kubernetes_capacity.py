@@ -56,6 +56,12 @@ from eyvan.server.api.schemas import CellUpsertRequest
 _TOKEN = "fencing-token-abcdef"
 _WORKER_IMAGE = "registry.test/worker@sha256:" + "a" * 64
 _DNS_1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$", re.ASCII)
+_MAX_LENGTH_CELL_IDS = (
+    pytest.param("é" * 96, id="unicode"),
+    pytest.param("ResearchCell" * 8, id="mixed-case"),
+    pytest.param("cell_/.:+" * 10 + "cell_/", id="punctuation"),
+    pytest.param("a" * 96, id="long-ascii"),
+)
 
 
 def _job(**overrides: object) -> JsonObject:
@@ -164,16 +170,7 @@ def test_long_cell_id_uses_one_safe_token_and_preserves_the_full_annotation() ->
         assert manifest["metadata"]["annotations"][CELL_ID_ANNOTATION] == cell_id
 
 
-@pytest.mark.parametrize(
-    "cell_id",
-    (
-        "é" * 96,
-        "ResearchCell" * 8,
-        "cell_/.:+" * 10 + "cell_/",
-        "a" * 96,
-    ),
-    ids=("unicode", "mixed-case", "punctuation", "long-ascii"),
-)
+@pytest.mark.parametrize("cell_id", _MAX_LENGTH_CELL_IDS)
 @pytest.mark.parametrize("worker_count", (1, 2, 10, 100, MAX_WORKERS))
 def test_indexed_job_names_reserve_every_supported_completion_suffix(cell_id: str, worker_count: int) -> None:
     """The Job controller appends ``-<index>`` and validates the result as one label."""
@@ -852,6 +849,76 @@ def test_a_ready_cell_publishes_one_endpoint_per_worker(tmp_path) -> None:
 
     assert observation.state is CapacityStatus.HEALTHY
     assert len(observation.metadata["native_worker_endpoints"]) == 2
+
+
+@pytest.mark.parametrize("cell_id", _MAX_LENGTH_CELL_IDS)
+def test_driver_apply_replay_and_observe_use_the_indexed_job_name_at_maximum_scale(tmp_path, cell_id: str) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    desired = _desired(
+        provider_options={"worker_count": MAX_WORKERS, "resources": {"google.com/tpu": "4"}},
+    )
+    job_name = indexed_job_name(cell_id)
+    service_name = object_name("eyvan", cell_id)
+    job_path = f"/apis/batch/v1/namespaces/eyvan/jobs/{job_name}"
+    legacy_job_path = f"/apis/batch/v1/namespaces/eyvan/jobs/{service_name}"
+    service_path = f"/api/v1/namespaces/eyvan/services/{service_name}"
+
+    applied = driver.apply_capacity(cell_id, desired, _context())
+    api.got.clear()
+    replayed = driver.apply_capacity(cell_id, desired, _context())
+    observed = driver.observe(cell_id)
+
+    assert len(cell_id) == 96
+    assert applied.state is CapacityStatus.HEALTHY
+    assert replayed.state is CapacityStatus.HEALTHY
+    assert observed.state is CapacityStatus.HEALTHY
+    assert observed.metadata["resource_id"] == f"kubernetes:eyvan/{job_name}"
+    assert len(observed.metadata["native_worker_endpoints"]) == MAX_WORKERS
+    assert observed.metadata["native_worker_endpoints"][-1] == (
+        f"http://{job_name}-{MAX_WORKERS - 1}.{service_name}.eyvan.svc:8100"
+    )
+    assert job_path in api.objects
+    assert service_path in api.objects
+    assert job_path in api.got
+    if legacy_job_path != job_path:
+        assert legacy_job_path not in api.got
+
+
+@pytest.mark.parametrize("cell_id", _MAX_LENGTH_CELL_IDS)
+def test_driver_release_and_its_replay_use_the_indexed_job_name_at_maximum_scale(tmp_path, cell_id: str) -> None:
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    desired = _desired(
+        provider_options={"worker_count": MAX_WORKERS, "resources": {"google.com/tpu": "4"}},
+    )
+    driver.apply_capacity(cell_id, desired, _context())
+    job_path = f"/apis/batch/v1/namespaces/eyvan/jobs/{indexed_job_name(cell_id)}"
+    legacy_job_path = f"/apis/batch/v1/namespaces/eyvan/jobs/{object_name('eyvan', cell_id)}"
+    service_path = f"/api/v1/namespaces/eyvan/services/{object_name('eyvan', cell_id)}"
+    api.got.clear()
+    api.deleted.clear()
+
+    released = driver.release(cell_id, _context())
+
+    assert released.state is CapacityStatus.RELEASED
+    assert job_path in api.got
+    assert job_path in api.deleted
+    assert service_path in api.got
+    assert service_path in api.deleted
+    if legacy_job_path != job_path:
+        assert legacy_job_path not in api.got
+        assert legacy_job_path not in api.deleted
+    assert api.objects == {}
+
+    api.got.clear()
+    replayed = driver.release(cell_id, _context())
+
+    assert replayed.state is CapacityStatus.RELEASED
+    assert job_path in api.got
+    assert service_path in api.got
+    if legacy_job_path != job_path:
+        assert legacy_job_path not in api.got
 
 
 def test_endpoints_are_withheld_until_every_worker_is_ready(tmp_path) -> None:

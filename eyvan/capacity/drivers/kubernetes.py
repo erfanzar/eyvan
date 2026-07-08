@@ -227,7 +227,7 @@ class KubernetesCapacityDriver:
                 generation=0,
                 observed_at=datetime.now(UTC),
             )
-        payload = self.api.get_job(self.namespace, object_name("eyvan", cell_id))
+        payload = self.api.get_job(self.namespace, indexed_job_name(cell_id))
         status = interpret_job(payload)
         ownership_error = self._job_ownership_error(record, status)
         if ownership_error is not None:
