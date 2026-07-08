@@ -1,0 +1,498 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Dispatch/secret integration at the repository transaction boundary."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+from datetime import timedelta
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
+from eyvan.artifacts.secret_capability import SecretCapabilitySigner, SecretTokenClaims
+from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+from eyvan.config import EyvanSettings
+from eyvan.records import (
+    CellRecord,
+    CellState,
+    CommandExecution,
+    LeaseRecord,
+    LeaseState,
+    OutboxRecord,
+    OutboxState,
+    PolicyRecord,
+    Principal,
+    ResourceGang,
+    ResourceVector,
+    Role,
+    RoleGrant,
+    WorkloadDefinition,
+    WorkloadRecord,
+    WorkloadState,
+    utcnow,
+)
+from eyvan.server.controller import EyvanController
+from eyvan.server.persistence.memory import InMemoryRepository
+from eyvan.server.service.control_plane import ControlPlaneService
+from eyvan.server.service.errors import AuthorizationError, ConflictError
+from eyvan.worker.agent.models import WorkloadObservation
+from eyvan.worker.runtime.secret_materialization import materialize_secrets
+
+_KEY = b"d" * 32
+_VALUE = b"dispatch-only-secret-value"
+_REFERENCE = "file:///operator/secrets/hf-token"
+_ROOT = "file:///operator/secrets"
+_ADMIN = Principal(subject="root", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+_OPERATOR = Principal(
+    subject="alice",
+    grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+)
+
+
+class _ReentrantSecretAgent:
+    """Redeem the submitted capability synchronously, just like the real runtime."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        service: ControlPlaneService,
+        signer: SecretCapabilitySigner,
+        *,
+        fail_after_materialization: bool = False,
+        block_after_materialization: bool = False,
+    ) -> None:
+        self.loop = loop
+        self.service = service
+        self.signer = signer
+        self.fail_after_materialization = fail_after_materialization
+        self.block_after_materialization = block_after_materialization
+        self.materialized = threading.Event()
+        self.release = threading.Event()
+        self.values: list[dict[str, str]] = []
+        self.tokens: list[str] = []
+        self.claims: list[SecretTokenClaims] = []
+        self.submissions = 0
+        self.gang_submissions = 0
+        self.stops: list[str] = []
+        self.gang_stops: list[str] = []
+
+    def _await(self, coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=2)
+
+    def _materialize(self, request) -> None:
+        environment = request.spec["environment"]
+
+        def fetch(url: str, token: str) -> bytes:
+            query = parse_qs(urlsplit(url).query)
+            workload_id = query["workload_id"][0]
+            scope = self._await(self.service.secret_redemption_scope(workload_id))
+            assert scope == ("acme", "research")
+            claims = self.signer.verify(
+                token,
+                workload_id=workload_id,
+                org_id=scope[0],
+                project_id=scope[1],
+            )
+            reference, root = self._await(
+                self.service.authorize_secret_mount(
+                    org_id=scope[0],
+                    project_id=scope[1],
+                    workload_id=workload_id,
+                    attempt=claims.attempt,
+                    generation=claims.generation,
+                    dispatch_fence=claims.dispatch_fence,
+                    name=claims.name,
+                )
+            )
+            assert (reference, root) == (_REFERENCE, _ROOT)
+            self.tokens.append(token)
+            self.claims.append(claims)
+            return _VALUE
+
+        self.values.append(materialize_secrets(environment, fetch=fetch))
+        self.materialized.set()
+        if self.block_after_materialization and not self.release.wait(timeout=3):
+            raise TimeoutError("test did not release reentrant submit")
+        if self.fail_after_materialization:
+            token = self.tokens[-1]
+            raise RuntimeError(f"provider reflected {_VALUE.decode()} and {token}")
+
+    def submit(self, cell_id, request):
+        del cell_id
+        self.submissions += 1
+        self._materialize(request)
+        return WorkloadObservation(
+            remote_id=request.spec["submission_id"],
+            status=ExecutionWorkloadStatus.SUBMITTED,
+        )
+
+    def submit_gang(self, coordinator_cell_id, request):
+        del coordinator_cell_id
+        self.gang_submissions += 1
+        self._materialize(request)
+        return WorkloadObservation(
+            remote_id=request.spec["submission_id"],
+            status=ExecutionWorkloadStatus.SUBMITTED,
+        )
+
+    def stop(self, cell_id, remote_id, request):
+        del cell_id, request
+        self.stops.append(remote_id)
+        return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.STOPPING)
+
+    def stop_gang(self, coordinator_cell_id, workload_id, remote_id, request):
+        del coordinator_cell_id, workload_id, request
+        self.gang_stops.append(remote_id)
+        return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.STOPPING)
+
+
+async def _plane(repository, tmp_path, *, fail: bool = False, block: bool = False):
+    service = ControlPlaneService(repository)
+    signer = SecretCapabilitySigner(_KEY, ttl_seconds=3600)
+    access = ManagedArtifactAccess(
+        store=LocalManagedArtifactStore(tmp_path / "artifacts"),
+        signer=ArtifactTokenSigner(_KEY, default_ttl_seconds=3600, max_ttl_seconds=3600),
+        public_url="http://127.0.0.1:8000",
+        token_ttl_seconds=3600,
+    )
+    agent = _ReentrantSecretAgent(
+        asyncio.get_running_loop(),
+        service,
+        signer,
+        fail_after_materialization=fail,
+        block_after_materialization=block,
+    )
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(dev_auth_enabled=True, lease_ttl_s=60),
+        agent_factory=lambda _cell: agent,
+        artifact_access=access,
+        secret_capability=signer,
+    )
+    return service, signer, agent, controller
+
+
+async def _seed_dispatch(
+    repository,
+    *,
+    gang: bool = False,
+) -> tuple[WorkloadRecord, tuple[LeaseRecord, ...], OutboxRecord]:
+    lease_ids = ("lease-a", "lease-b") if gang else ("lease-a",)
+    cell_ids = ("cell-a", "cell-b") if gang else ("cell-a",)
+    spec = WorkloadDefinition(
+        name="secret-job",
+        execution=CommandExecution(command="python train.py"),
+        gang=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1, memory_gib=1)),
+        required_executor="eyvan-native",
+        cell_group_count=len(cell_ids),
+        secret_mounts={"HF_TOKEN": _REFERENCE},
+    )
+    workload = WorkloadRecord(
+        id="wl-secret-dispatch",
+        org_id="acme",
+        project_id="research",
+        spec=spec,
+        state=WorkloadState.LEASED,
+        lease_id=lease_ids[0],
+        lease_ids=lease_ids,
+        created_by="alice",
+    )
+    leases = tuple(
+        LeaseRecord(
+            id=lease_id,
+            workload_id=workload.id,
+            cell_id=cell_id,
+            cell_generation=1,
+            org_id=workload.org_id,
+            project_id=workload.project_id,
+            state=LeaseState.PENDING,
+            resources=spec.gang,
+            generation=workload.generation,
+            fencing_token=f"fence-{cell_id}",
+            group_id="gang-a" if gang else None,
+            group_index=index,
+            expires_at=utcnow() + timedelta(minutes=5),
+        )
+        for index, (lease_id, cell_id) in enumerate(zip(lease_ids, cell_ids, strict=True))
+    )
+    command = OutboxRecord(
+        id="cmd-secret-dispatch",
+        topic="workload.dispatch",
+        aggregate_type="workload",
+        aggregate_id=workload.id,
+        idempotency_key="dispatch-secret-job",
+        generation=workload.generation,
+        payload={
+            "workload_id": workload.id,
+            "lease_id": lease_ids[0],
+            "lease_ids": list(lease_ids),
+            "cell_id": cell_ids[0],
+        },
+    )
+    async with repository.transaction() as tx:
+        await tx.put_policy(
+            PolicyRecord(
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                allowed_secret_references=(_ROOT,),
+                updated_by="root",
+            )
+        )
+        for cell_id in cell_ids:
+            await tx.put_cell(
+                CellRecord(
+                    id=cell_id,
+                    provider="local",
+                    region="local",
+                    state=CellState.READY,
+                    capacity=ResourceVector(cpu=4, memory_gib=16),
+                    allocatable=ResourceVector(cpu=4, memory_gib=16),
+                    executor="eyvan-native",
+                    endpoint="http://agent:8090",
+                )
+            )
+        await tx.put_workload(workload)
+        for lease in leases:
+            await tx.put_lease(lease)
+        await tx.put_outbox(command)
+    return workload, leases, command
+
+
+async def _snapshot(repository, workload_id: str):
+    async with repository.transaction() as tx:
+        workload = await tx.get_workload(workload_id)
+        leases = await tx.list_leases(workload_id=workload_id)
+        commands = await tx.list_outbox(limit=100)
+        events = await tx.list_events(limit=200)
+    assert workload is not None
+    return workload, leases, commands, events
+
+
+async def _assert_success(repository, tmp_path, *, gang: bool = False) -> None:
+    service, _signer, agent, controller = await _plane(repository, tmp_path)
+    seeded, _leases, _command = await _seed_dispatch(repository, gang=gang)
+
+    assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
+
+    workload, leases, commands, events = await _snapshot(repository, seeded.id)
+    assert workload.state is WorkloadState.DISPATCHING
+    assert workload.remote_id == f"{seeded.id}-a1-g1"
+    assert workload.dispatch_reservation is not None
+    assert all(lease.state is LeaseState.ACTIVE for lease in leases)
+    assert agent.values == [{"HF_TOKEN": _VALUE.decode()}]
+    assert agent.gang_submissions == int(gang)
+    assert agent.submissions == int(not gang)
+    dispatch = next(command for command in commands if command.topic == "workload.dispatch")
+    assert dispatch.state is OutboxState.SUCCEEDED
+
+    actions = [event.action for event in events]
+    assert actions.index("workload.dispatch_reserved") < actions.index("secret.issued")
+    assert actions.index("secret.issued") < actions.index("secret.read")
+    assert actions.index("secret.read") < actions.index("workload.dispatched")
+    assert actions.count("lease.activated") == len(leases)
+
+    durable = json.dumps(
+        {
+            "workload": workload.model_dump(mode="json"),
+            "leases": [lease.model_dump(mode="json") for lease in leases],
+            "commands": [command.model_dump(mode="json") for command in commands],
+            "events": [event.model_dump(mode="json") for event in events],
+        },
+        sort_keys=True,
+    )
+    assert _VALUE.decode() not in durable
+    assert agent.tokens[0] not in durable
+    assert not any(_VALUE.decode() in str(event.payload) for event in events)
+
+    claims = agent.claims[0]
+    assert claims.generation == workload.generation
+    assert claims.dispatch_fence == workload.dispatch_reservation.fence
+    assert await service.secret_redemption_scope(workload.id) == ("acme", "research")
+
+
+async def test_reentrant_secret_materialization_does_not_deadlock_memory(tmp_path) -> None:
+    await _assert_success(InMemoryRepository(), tmp_path)
+
+
+async def test_reentrant_gang_dispatch_commits_every_member_atomically(tmp_path) -> None:
+    await _assert_success(InMemoryRepository(), tmp_path, gang=True)
+
+
+async def test_failed_submit_revokes_the_issuance_and_retry_refences_it(tmp_path) -> None:
+    repository = InMemoryRepository()
+    service, _signer, agent, controller = await _plane(repository, tmp_path, fail=True)
+    seeded, leases, _command = await _seed_dispatch(repository)
+
+    assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
+    failed_workload, failed_leases, commands, events = await _snapshot(repository, seeded.id)
+    failed_command = next(command for command in commands if command.topic == "workload.dispatch")
+    old_claims = agent.claims[0]
+    old_token = agent.tokens[0]
+
+    assert failed_workload.state is WorkloadState.LEASED
+    assert failed_workload.dispatch_reservation is None
+    assert all(lease.state is LeaseState.PENDING for lease in failed_leases)
+    assert failed_command.state is OutboxState.FAILED
+    assert "dispatch_reservation" not in failed_command.payload
+    assert failed_command.last_error == "output suppressed for secret-bearing execution"
+    assert "workload.dispatch_reservation_failed" in [event.action for event in events]
+    with pytest.raises(AuthorizationError):
+        await service.authorize_secret_mount(
+            org_id="acme",
+            project_id="research",
+            workload_id=seeded.id,
+            attempt=old_claims.attempt,
+            generation=old_claims.generation,
+            dispatch_fence=old_claims.dispatch_fence,
+            name=old_claims.name,
+        )
+
+    durable_failure = json.dumps(
+        {
+            "command": failed_command.model_dump(mode="json"),
+            "events": [event.model_dump(mode="json") for event in events],
+        }
+    )
+    assert _VALUE.decode() not in durable_failure
+    assert old_token not in durable_failure
+
+    async with repository.transaction() as tx:
+        current = await tx.get_outbox(failed_command.id)
+        assert current is not None
+        await tx.put_outbox(current.model_copy(update={"available_at": utcnow()}))
+    agent.fail_after_materialization = False
+    assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
+
+    retried_workload, retried_leases, commands, events = await _snapshot(repository, seeded.id)
+    assert retried_workload.state is WorkloadState.DISPATCHING
+    assert all(lease.state is LeaseState.ACTIVE for lease in retried_leases)
+    assert len(agent.claims) == 2
+    assert agent.claims[1].dispatch_fence != old_claims.dispatch_fence
+    assert agent.claims[1].attempt == old_claims.attempt
+    assert agent.claims[1].generation == old_claims.generation
+    with pytest.raises(AuthorizationError):
+        await service.authorize_secret_mount(
+            org_id="acme",
+            project_id="research",
+            workload_id=seeded.id,
+            attempt=old_claims.attempt,
+            generation=old_claims.generation,
+            dispatch_fence=old_claims.dispatch_fence,
+            name=old_claims.name,
+        )
+    issuances = [event for event in events if event.action == "secret.issued"]
+    assert [event.payload["outbox_attempt"] for event in issuances] == [1, 2]
+    assert next(command for command in commands if command.topic == "workload.dispatch").state is OutboxState.SUCCEEDED
+    assert [lease.id for lease in retried_leases] == [lease.id for lease in leases]
+
+
+async def test_failed_gang_submit_keeps_every_member_pending(tmp_path) -> None:
+    repository = InMemoryRepository()
+    _service, _signer, agent, controller = await _plane(repository, tmp_path, fail=True)
+    seeded, _leases, _command = await _seed_dispatch(repository, gang=True)
+
+    assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
+
+    workload, leases, commands, events = await _snapshot(repository, seeded.id)
+    dispatch = next(command for command in commands if command.topic == "workload.dispatch")
+    assert workload.state is WorkloadState.LEASED
+    assert workload.dispatch_reservation is None
+    assert [lease.state for lease in leases] == [LeaseState.PENDING, LeaseState.PENDING]
+    assert dispatch.state is OutboxState.FAILED
+    assert "dispatch_reservation" not in dispatch.payload
+    assert agent.gang_submissions == 1
+    assert [event.action for event in events].count("lease.activated") == 0
+
+
+async def test_cancellation_and_requeue_cannot_overtake_an_inflight_submit(tmp_path) -> None:
+    repository = InMemoryRepository()
+    service, _signer, agent, controller = await _plane(repository, tmp_path, block=True)
+    seeded, leases, _command = await _seed_dispatch(repository)
+    lease = leases[0]
+
+    delivery = asyncio.create_task(controller.dispatch_outbox_once())
+    assert await asyncio.to_thread(agent.materialized.wait, 2)
+
+    with pytest.raises(ConflictError, match="dispatch may have started"):
+        await service.requeue_unstarted_workload(
+            _ADMIN,
+            seeded.id,
+            scheduling_reason="cell changed while dispatching",
+            expected_generation=seeded.generation,
+            expected_lease_id=lease.id,
+            expected_cell_generation=lease.cell_generation,
+            expected_cell_state=CellState.READY,
+            expected_unavailable_reason=None,
+            expected_cell_id=lease.cell_id,
+        )
+
+    cancelling, _ = await service.cancel_workload(
+        _OPERATOR,
+        seeded.id,
+        idempotency_key="cancel-inflight-dispatch",
+    )
+    assert cancelling.state is WorkloadState.CANCELLING
+    second_controller = EyvanController(
+        repository,
+        service,
+        settings=controller.settings,
+        agent_factory=lambda _cell: agent,
+        artifact_access=controller.artifact_access,
+        secret_capability=controller.secret_capability,
+    )
+    assert await second_controller.dispatch_outbox_once() == 1
+    during_cancel, during_leases, commands, _events = await _snapshot(repository, seeded.id)
+    cancel_command = next(command for command in commands if command.topic == "workload.cancel")
+    assert during_cancel.state is WorkloadState.CANCELLING
+    assert during_cancel.remote_id is None
+    assert during_cancel.dispatch_reservation is not None
+    assert all(candidate.state is LeaseState.PENDING for candidate in during_leases)
+    assert cancel_command.state is OutboxState.FAILED
+    assert not agent.stops
+
+    agent.release.set()
+    assert await asyncio.wait_for(delivery, timeout=3) == 1
+    resolved, active_leases, commands, _events = await _snapshot(repository, seeded.id)
+    assert resolved.state is WorkloadState.CANCELLING
+    assert resolved.remote_id == f"{seeded.id}-a1-g1"
+    assert all(candidate.state is LeaseState.ACTIVE for candidate in active_leases)
+
+    async with repository.transaction() as tx:
+        current_cancel = await tx.get_outbox(cancel_command.id)
+        assert current_cancel is not None
+        await tx.put_outbox(current_cancel.model_copy(update={"available_at": utcnow()}))
+    assert await second_controller.dispatch_outbox_once() == 1
+    cancelled, released_leases, _commands, _events = await _snapshot(repository, seeded.id)
+    assert cancelled.state is WorkloadState.CANCELLED
+    assert cancelled.dispatch_reservation is None
+    assert all(candidate.state is LeaseState.RELEASED for candidate in released_leases)
+    assert agent.stops == [f"{seeded.id}-a1-g1"]
+
+
+async def test_reentrant_secret_materialization_does_not_deadlock_postgres(postgres_url: str, tmp_path) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
+
+    engine = create_async_engine(postgres_url, poolclass=None)
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        await connection.execute(text("CREATE SCHEMA public"))
+    await create_schema(engine)
+    repository = SqlAlchemyRepository(engine)
+    await repository.open()
+    try:
+        await _assert_success(repository, tmp_path)
+    finally:
+        await repository.close()
+        await engine.dispose()

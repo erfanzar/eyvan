@@ -37,11 +37,44 @@ DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES = frozenset(
     }
 )
 
+# These host identity and launch-path values are assigned by the native runtime.
+# The complete ``EYVAN_`` namespace is reserved below as well: controller
+# dispatch, callable/workspace transfer, checkpoint/profile collection, Docker,
+# and future runtime features must be able to inject their own variables without
+# a secret mount being silently overwritten after its value is materialized.
+RUNTIME_OWNED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "HOME",
+        "LOGNAME",
+        "PATH",
+        "USER",
+        "VIRTUAL_ENV",
+        "XDG_CACHE_HOME",
+    }
+    | DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES
+)
+
 
 def is_distributed_topology_environment_name(name: str) -> bool:
     """Return whether Eyvan, JAX, or GCP owns a topology variable."""
 
     return name in DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES or name.startswith(("EYVAN_JAX_", "MEGASCALE_"))
+
+
+def is_runtime_owned_environment_name(name: str) -> bool:
+    """Return whether a secret mount would collide with runtime-owned state.
+
+    Eyvan owns its entire environment namespace rather than an enumerated
+    snapshot. This keeps a newly injected checkpoint, callable, source, or
+    container variable from becoming an overwrite of an already-materialized
+    secret in older submission code.
+    """
+
+    return (
+        name in RUNTIME_OWNED_ENVIRONMENT_NAMES
+        or name.startswith("EYVAN_")
+        or is_distributed_topology_environment_name(name)
+    )
 
 
 def without_distributed_topology_overrides(environment: tp.Mapping[str, str]) -> dict[str, str]:
@@ -60,7 +93,9 @@ def remove_gce_tpu_topology_overrides(environment: tp.MutableMapping[str, str]) 
 
 __all__ = (
     "DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES",
+    "RUNTIME_OWNED_ENVIRONMENT_NAMES",
     "is_distributed_topology_environment_name",
+    "is_runtime_owned_environment_name",
     "remove_gce_tpu_topology_overrides",
     "without_distributed_topology_overrides",
 )

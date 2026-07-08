@@ -694,6 +694,7 @@ class _ControllerPreemption:
                             generation=next_generation,
                         ),
                         "lease_id": None,
+                        "dispatch_reservation": None,
                         "remote_id": None,
                         "checkpoint_uri": checkpoint_uri,
                         "scheduling_reason": "preempted; waiting to resume",

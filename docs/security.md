@@ -45,7 +45,7 @@ another even if a claim check were wrong.
 |---|---|---|---|
 | artifact read/write | `v1` | yes, `artifact_token_ttl_s` | the result URI moving on the spec |
 | child submission | `eyvw1` | no | the workload's generation advancing |
-| secret read | `eyvs1` | yes, `secret_token_ttl_s` | the workload's *attempt* advancing |
+| secret read | `eyvs1` | yes, `secret_token_ttl_s` | its exact dispatch reservation, attempt, or generation changing |
 
 The submit capability does not expire deliberately: revocation is a state check
 that is strictly stronger than a TTL, and an expiring one would inherit seven
@@ -58,19 +58,49 @@ The secret capability does expire, for the opposite reason. It hands back a
 ## Secrets
 
 A spec carries a *reference*, never a value. `PolicyRecord.allowed_secret_references`
-is a per-project prefix allow-list checked at submission, and it is the
-security-critical piece: without it any submitter can name any secret the
-control plane's own identity can read, which turns "may submit jobs" into "may
-read every secret in the project".
+is a per-project scheme/authority/path-segment root allow-list checked at
+submission and redemption, and it is the security-critical piece: without it
+any submitter can name any secret the control plane's own identity can read,
+which turns "may submit jobs" into "may read every secret in the project". The
+comparison is not a raw string prefix: `gcp-secret://p/training` does not admit
+`gcp-secret://p/training-prod`, and `file:///run/secrets` admits only canonical
+children of that directory. File references have one accepted spelling,
+`file:///absolute/path`; equivalent `file:/` and extra-slash spellings are
+refused at both policy and value validation. File reads repeat the matched root
+in a dirfd component walk with `O_NOFOLLOW`; dot segments, encoded paths, and
+symlinks are refused by the same operation that opens the file.
+
+A file allow-list root is therefore a **trusted, operator-owned directory**. It
+must not be writable by a workload or any other untrusted principal. POSIX
+`O_NOFOLLOW` prevents symlink traversal but cannot distinguish a hard link from
+the file's original directory entry; an attacker allowed to create hard links
+inside a root could expose another file on the same filesystem. Eyvan relies on
+the root ownership/write-permission boundary instead of an inode owner or link
+count rule, because projected secret volumes and ordinary operator-managed
+secret files do not share one portable ownership/link-count contract.
 
 Its empty value means **none**, inverting the convention its neighbours in the
 same command follow. Every other allow-list there means "no restriction" when
 empty.
 
-Every fetch is audited twice over -- one issuance event per attempt naming the
-mounts granted, and one event per redemption, granted or refused, written in the
-same transaction as the authorization read. A `secret.read` for an attempt with
-no matching `secret.issued` is the signal that a capability leaked.
+Every fetch is audited twice over -- one issuance event per fenced dispatch
+reservation naming the mounts granted, and one event per redemption, granted or
+refused, written in the same transaction as the authorization read. The
+reservation and issuance audit commit before the cell-agent RPC; that transaction
+is released before the agent synchronously redeems the capability. The response
+then activates the lease only after a fresh transaction revalidates workload,
+lease, generation, and outbox fences. A retry replaces the reservation even when
+attempt and generation stay unchanged, immediately killing capabilities from the
+abandoned RPC. A `secret.read` with no matching `secret.issued` fence is the
+signal that a capability leaked.
+
+A durable execution that declares a secret mount intentionally exposes no
+workload logs, structured log pages, archived logs, exec output, or process
+error detail. Exact streaming redaction cannot be reconstructed after a worker
+restart or env-file cleanup without retaining the plaintext value solely for
+redaction, which Eyvan refuses to do. The durable record stores only a boolean
+`secret_bearing` marker and output is suppressed fail-closed for the whole
+attempt, including after restart and terminal collection.
 
 ## What jobs can do
 

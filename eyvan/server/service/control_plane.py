@@ -97,6 +97,7 @@ from eyvan.records import (
     WarmthReport,
     WorkerResourceScope,
     WorkloadDefinition,
+    WorkloadDispatchReservation,
     WorkloadEstimate,
     WorkloadExplanation,
     WorkloadRecord,
@@ -107,6 +108,7 @@ from eyvan.records import (
     utcnow,
     validate_capacity_pool_quota_groups,
 )
+from eyvan.secrets import matching_secret_reference_root
 from eyvan.server.persistence.base import Repository, RepositorySession
 from eyvan.server.service.authz import Authorizer
 from eyvan.server.service.batch import (
@@ -700,6 +702,7 @@ class ControlPlaneService:
                 "command": command,
                 "name": name,
                 "environment": dict(environment or {}),
+                "secret_mounts": dict(secret_mounts or {}),
                 "metadata": dict(metadata or {}),
                 "max_retries": max_retries,
                 "max_failure_retries": max_failure_retries,
@@ -810,6 +813,7 @@ class ControlPlaneService:
                 "execution": execution.model_dump(mode="json"),
                 "name": name,
                 "environment": dict(environment or {}),
+                "secret_mounts": dict(secret_mounts or {}),
                 "metadata": dict(metadata or {}),
                 "max_retries": max_retries,
                 "max_failure_retries": max_failure_retries,
@@ -1677,6 +1681,7 @@ class ControlPlaneService:
                     ),
                     "lease_id": None,
                     "lease_ids": (),
+                    "dispatch_reservation": None,
                     "remote_id": None,
                     "failure_reason": None,
                     "autoscale_block_reason": None,
@@ -1786,6 +1791,7 @@ class ControlPlaneService:
             settled = workload.model_copy(
                 update={
                     "state": WorkloadState.CANCELLED,
+                    "dispatch_reservation": None,
                     "failure_reason": f"force-finalized after an unconfirmed stop: {reason}",
                     "updated_at": moment,
                 }
@@ -2052,6 +2058,8 @@ class ControlPlaneService:
             )
             if workload.state is WorkloadState.PENDING and workload.lease_id is None:
                 return workload, None, await tx.get_budget(workload.org_id, workload.project_id)
+            if await self._dispatch_reservation_may_have_started(tx, workload):
+                raise ConflictError("cannot requeue while a workload dispatch may have started")
             if workload.state not in {
                 WorkloadState.LEASED,
                 WorkloadState.DISPATCHING,
@@ -2095,6 +2103,7 @@ class ControlPlaneService:
                     ),
                     "lease_id": None,
                     "lease_ids": (),
+                    "dispatch_reservation": None,
                     "remote_id": None,
                     "checkpoint_uri": checkpoint_uri,
                     "autoscale_block_reason": None,
@@ -2154,6 +2163,8 @@ class ControlPlaneService:
             )
             if workload.state is WorkloadState.PENDING and workload.lease_id is None:
                 return workload, None, await tx.get_budget(workload.org_id, workload.project_id)
+            if await self._dispatch_reservation_may_have_started(tx, workload):
+                raise ConflictError("cannot requeue while a workload dispatch may have started")
             if workload.state not in {
                 WorkloadState.LEASED,
                 WorkloadState.DISPATCHING,
@@ -2192,6 +2203,7 @@ class ControlPlaneService:
                     ),
                     "lease_id": None,
                     "lease_ids": (),
+                    "dispatch_reservation": None,
                     "remote_id": None,
                     "checkpoint_uri": checkpoint_uri,
                     "autoscale_block_reason": None,
@@ -2246,6 +2258,8 @@ class ControlPlaneService:
                 expected_unavailable_reason,
                 expected_cell_id,
             )
+            if await self._dispatch_reservation_may_have_started(tx, workload):
+                raise ConflictError("cannot requeue while a workload dispatch may have started")
             if workload.state is not WorkloadState.LEASED or workload.remote_id is not None:
                 raise ConflictError("only an undispatched leased workload can be requeued without settlement")
             leases = await self._current_leases(tx, workload)
@@ -2275,6 +2289,7 @@ class ControlPlaneService:
                     ),
                     "lease_id": None,
                     "lease_ids": (),
+                    "dispatch_reservation": None,
                     "remote_id": None,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
@@ -3284,6 +3299,7 @@ class ControlPlaneService:
                 update={
                     "state": WorkloadState.LEASED,
                     "lease_id": lease.id,
+                    "dispatch_reservation": None,
                     "preemption_id": None,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
@@ -3483,6 +3499,7 @@ class ControlPlaneService:
                     "state": WorkloadState.LEASED,
                     "lease_id": leader.id,
                     "lease_ids": tuple(member.id for member in members),
+                    "dispatch_reservation": None,
                     "preemption_id": None,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
@@ -4186,10 +4203,10 @@ class ControlPlaneService:
             return
         allowed = () if policy is None else policy.allowed_secret_references
         for name, reference in sorted(spec.secret_mounts.items()):
-            if not any(reference.startswith(prefix) for prefix in allowed):
+            if matching_secret_reference_root(reference, allowed) is None:
                 raise AuthorizationError(
                     f"secret reference {reference!r} for {name} is not permitted in this project; "
-                    "add a prefix to the project policy's allowed_secret_references"
+                    "add a scheme-aware root to the project policy's allowed_secret_references"
                 )
 
     async def submit_service(
@@ -5558,7 +5575,10 @@ class ControlPlaneService:
         except InvalidTransition as exc:
             raise ConflictError(str(exc)) from exc
         now = utcnow()
-        updated = workload.model_copy(update={"state": target, "updated_at": now, **(updates or {})})
+        transition_updates: dict[str, tp.Any] = {"state": target, "updated_at": now, **(updates or {})}
+        if target in TERMINAL_WORKLOAD_STATES:
+            transition_updates["dispatch_reservation"] = None
+        updated = workload.model_copy(update=transition_updates)
         await tx.put_workload(updated)
         if target in TERMINAL_WORKLOAD_STATES:
             # Every terminal path funnels through here -- ordinary settlement,
@@ -5588,6 +5608,39 @@ class ControlPlaneService:
         if existing is not None and existing.fingerprint != fingerprint:
             raise ConflictError("Idempotency-Key was already used with a different request")
         return existing
+
+    @staticmethod
+    async def _dispatch_reservation_may_have_started(
+        tx: RepositorySession,
+        workload: WorkloadRecord,
+    ) -> bool:
+        """Return whether requeueing could orphan a cell-agent submission."""
+
+        reservation = workload.dispatch_reservation
+        lease_ids = workload.lease_ids or (() if workload.lease_id is None else (workload.lease_id,))
+        if (
+            reservation is None
+            or reservation.generation != workload.generation
+            or reservation.workload_attempt != workload.attempt
+            or reservation.lease_ids != lease_ids
+        ):
+            return False
+        command = await tx.get_outbox(reservation.outbox_id)
+        persisted: WorkloadDispatchReservation | None = None
+        if command is not None:
+            try:
+                persisted = WorkloadDispatchReservation.model_validate(command.payload.get("dispatch_reservation"))
+            except Exception:
+                persisted = None
+        return bool(
+            command is not None
+            and command.topic == "workload.dispatch"
+            and command.aggregate_type == "workload"
+            and command.aggregate_id == workload.id
+            and command.generation == workload.generation
+            and command.state in {OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED}
+            and persisted == reservation
+        )
 
     @staticmethod
     async def _preemption_execution_started(tx: RepositorySession, workload: WorkloadRecord) -> bool:
@@ -6678,6 +6731,8 @@ class ControlPlaneService:
         project_id: str,
         workload_id: str,
         attempt: int,
+        generation: int,
+        dispatch_reservation: WorkloadDispatchReservation | None,
         names: tuple[str, ...],
         tx: RepositorySession | None = None,
     ) -> None:
@@ -6694,6 +6749,8 @@ class ControlPlaneService:
         is.
         """
 
+        if names and dispatch_reservation is None:
+            raise RuntimeError("secret issuance requires a durable dispatch reservation")
         event = AuditEvent(
             id=_new_id("evt"),
             # A workload, not a principal: the dispatch that mints these
@@ -6706,7 +6763,14 @@ class ControlPlaneService:
             entity_type="workload",
             entity_id=workload_id,
             action="secret.issued",
-            payload={"workload_id": workload_id, "attempt": attempt, "names": list(names)},
+            payload={
+                "workload_id": workload_id,
+                "attempt": attempt,
+                "generation": generation,
+                "outbox_id": None if dispatch_reservation is None else dispatch_reservation.outbox_id,
+                "outbox_attempt": None if dispatch_reservation is None else dispatch_reservation.outbox_attempt,
+                "names": list(names),
+            },
         )
         if tx is not None:
             await tx.append_event(event)
@@ -6714,35 +6778,54 @@ class ControlPlaneService:
         async with self.repository.transaction() as transaction:
             await transaction.append_event(event)
 
-    async def record_secret_rejection(
-        self,
-        *,
-        org_id: str,
-        project_id: str,
-        workload_id: str,
-        name: str,
-        reason: str,
-    ) -> None:
-        """Record a secret capability that failed verification outright.
+    async def secret_redemption_scope(self, workload_id: str) -> tuple[str, str] | None:
+        """Resolve an audit/verification scope from a durable workload.
 
-        Distinct from ``secret.read_denied``, which means a *valid* capability
-        was refused by live state -- an ordinary race with a retry. This one
-        means a token that is expired, forged, or issued for something else was
-        presented, which is the shape a leak takes, and it never reaches the
-        authorization read that would otherwise have recorded it.
+        Query-string scope is unauthenticated on the capability endpoint.  It
+        must never become an audit scope merely because a caller supplied it.
         """
 
         async with self.repository.transaction() as tx:
+            workload = await tx.get_workload(workload_id)
+        if workload is None:
+            return None
+        return workload.org_id, workload.project_id
+
+    async def record_secret_rejection(
+        self,
+        *,
+        workload_id: str,
+        reason: str,
+        verified_name: str | None = None,
+    ) -> None:
+        """Audit a rejected capability only against a real workload record.
+
+        ``verified_name`` may come only from signed claims.  Invalid tokens have
+        no trustworthy mount name, so their event intentionally omits one.
+        """
+
+        safe_reason = (
+            reason
+            if reason in {"expired", "invalid_capability", "mount_mismatch", "out_of_scope"}
+            else "invalid_capability"
+        )
+        async with self.repository.transaction() as tx:
+            workload = await tx.get_workload(workload_id)
+            if workload is None:
+                return
+            payload: JsonObject = {"workload_id": workload.id, "reason": safe_reason}
+            if verified_name is not None:
+                payload["name"] = verified_name
             await tx.append_event(
                 AuditEvent(
                     id=_new_id("evt"),
-                    actor=f"workload:{workload_id}",
-                    org_id=org_id,
-                    project_id=project_id,
+                    actor=f"workload:{workload.id}",
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
                     entity_type="workload",
-                    entity_id=workload_id,
+                    entity_id=workload.id,
                     action="secret.token_rejected",
-                    payload={"workload_id": workload_id, "name": name, "reason": reason[:512]},
+                    payload=payload,
                 )
             )
 
@@ -6753,67 +6836,109 @@ class ControlPlaneService:
         project_id: str,
         workload_id: str,
         attempt: int,
+        generation: int,
+        dispatch_fence: str,
         name: str,
-    ) -> str:
-        """Return the reference one live attempt may currently read, or refuse.
+    ) -> tuple[str, str]:
+        """Return ``(reference, matched policy root)`` for one issued dispatch.
 
-        This is what makes a secret capability per-*attempt* rather than merely
-        short-lived, and it is the whole authorization decision:
-
-        * the workload is in this project, and running rather than finished;
-        * the attempt is the workload's **current** one, so a capability minted
-          for a preempted or retried attempt is dead the moment the next one
-          starts, without waiting for a TTL;
-        * the mount is still declared, at whatever reference the spec names
-          *now* -- so correcting a mount takes effect immediately rather than
-          when outstanding tokens expire; and
-        * the reference is still permitted by the project's policy, so narrowing
-          ``allowed_secret_references`` after a leak is a real revocation and not
-          merely a bar on future submissions.
-
-        The audit event is written in the **same transaction** as the reads that
-        decide it, so a granted secret read cannot be committed unaudited.
+        A workload id and attempt are not enough: an outbox retry can mint a
+        second set of capabilities without advancing either.  The signed fence
+        must match the exact durable reservation currently attached to the
+        workload, its generation, and every lease in that reservation.  While
+        the workload is still LEASED (the synchronous submit callback window),
+        the originating outbox claim must also remain live.
         """
 
         async with self.repository.transaction() as tx:
             workload = await tx.get_workload(workload_id)
+            if workload is None:
+                raise AuthorizationError("secret mount is not current for this workload dispatch")
             reference = ""
+            allowed_root: str | None = None
             granted = False
-            if (
-                workload is not None
-                and workload.org_id == org_id
-                and workload.project_id == project_id
-                and workload.attempt == attempt
-                and workload.state
-                in {
-                    WorkloadState.LEASED,
+            reservation = workload.dispatch_reservation
+            lease_ids = workload.lease_ids or (() if workload.lease_id is None else (workload.lease_id,))
+            exact_reservation = bool(
+                reservation is not None
+                and reservation.fence == dispatch_fence
+                and reservation.generation == generation == workload.generation
+                and reservation.workload_attempt == attempt == workload.attempt
+                and reservation.lease_ids == lease_ids
+            )
+            leases = tuple([await tx.get_lease(lease_id) for lease_id in lease_ids]) if exact_reservation else ()
+            exact_leases = bool(
+                leases
+                and all(
+                    lease is not None and lease.workload_id == workload.id and lease.generation == workload.generation
+                    for lease in leases
+                )
+            )
+            live_state = False
+            if exact_reservation and exact_leases and reservation is not None:
+                if workload.state is WorkloadState.LEASED:
+                    command = await tx.get_outbox(reservation.outbox_id)
+                    persisted_reservation: WorkloadDispatchReservation | None = None
+                    if command is not None:
+                        try:
+                            persisted_reservation = WorkloadDispatchReservation.model_validate(
+                                command.payload.get("dispatch_reservation")
+                            )
+                        except Exception:
+                            persisted_reservation = None
+                    live_state = bool(
+                        command is not None
+                        and command.topic == "workload.dispatch"
+                        and command.aggregate_type == "workload"
+                        and command.aggregate_id == workload.id
+                        and command.generation == workload.generation
+                        and command.attempts == reservation.outbox_attempt
+                        and command.state is OutboxState.PROCESSING
+                        and command.claimed_until is not None
+                        and command.claimed_until > utcnow()
+                        and persisted_reservation == reservation
+                        and all(
+                            lease is not None and lease.state in {LeaseState.PENDING, LeaseState.QUARANTINED}
+                            for lease in leases
+                        )
+                    )
+                elif workload.state in {
                     WorkloadState.DISPATCHING,
                     WorkloadState.RUNNING,
                     WorkloadState.CHECKPOINTING,
-                    WorkloadState.CANCELLING,
-                }
-            ):
+                }:
+                    live_state = bool(
+                        workload.remote_id
+                        and all(lease is not None and lease.state is LeaseState.ACTIVE for lease in leases)
+                    )
+            if workload.org_id == org_id and workload.project_id == project_id and live_state:
                 candidate = workload.spec.secret_mounts.get(name, "")
                 if candidate:
-                    policy = await tx.get_policy(org_id, project_id)
+                    policy = await tx.get_policy(workload.org_id, workload.project_id)
                     allowed = () if policy is None else policy.allowed_secret_references
-                    if any(candidate.startswith(prefix) for prefix in allowed):
+                    allowed_root = matching_secret_reference_root(candidate, allowed)
+                    if allowed_root is not None:
                         reference, granted = candidate, True
             await tx.append_event(
                 AuditEvent(
                     id=_new_id("evt"),
-                    actor=f"workload:{workload_id}",
-                    org_id=org_id,
-                    project_id=project_id,
+                    actor=f"workload:{workload.id}",
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
                     entity_type="workload",
-                    entity_id=workload_id,
+                    entity_id=workload.id,
                     action="secret.read" if granted else "secret.read_denied",
-                    payload={"workload_id": workload_id, "attempt": attempt, "name": name},
+                    payload={
+                        "workload_id": workload.id,
+                        "attempt": attempt,
+                        "generation": generation,
+                        "name": name,
+                    },
                 )
             )
-        if not granted:
-            raise AuthorizationError("secret mount is not current for this workload attempt")
-        return reference
+        if not granted or allowed_root is None:
+            raise AuthorizationError("secret mount is not current for this workload dispatch")
+        return reference, allowed_root
 
     @staticmethod
     async def _touch_artifact(

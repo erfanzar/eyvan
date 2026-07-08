@@ -301,11 +301,11 @@ def get_policy(session: CliSession, org_id: str | None, project_id: str | None) 
     "--allow-secret-reference",
     "allowed_secret_references",
     multiple=True,
-    metavar="PREFIX",
+    metavar="ROOT",
     help=(
-        "Reference prefixes this project's workloads may mount with --secret. Unlike every other allow-list here, "
-        "omitting this permits NOTHING: naming a secret grants the reader the control plane's own identity, so the "
-        "safe default is the closed one. Repeat to allow several prefixes."
+        "Scheme/authority/path-segment roots this project's workloads may mount with --secret. Unlike every other "
+        "allow-list here, omitting this permits NOTHING: naming a secret grants the reader the control plane's own "
+        "identity, so the safe default is closed. Repeat to allow several roots."
     ),
 )
 @click.option("--max-priority", type=int, default=1000, show_default=True)

@@ -629,6 +629,27 @@ def _artifact_access(tmp_path):
     )
 
 
+async def test_secret_bearing_workload_output_is_not_streamed_or_archived(tmp_path) -> None:
+    marker = "embedded-control-plane-secret"
+    agent = _PagingAgent(message=f"prefix-{marker}-suffix")
+    controller = await _controller_with(agent)
+    controller.artifact_access = _artifact_access(tmp_path)
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+        secret_spec = workload.spec.model_copy(update={"secret_mounts": {"HF_TOKEN": "gcp-secret://project/token"}})
+        workload = workload.model_copy(update={"spec": secret_spec})
+        await transaction.put_workload(workload)
+
+    page = await controller.workload_log_page(workload.id)
+    await controller._archive_terminal_logs(workload)
+
+    assert page["records"] == []
+    assert page["unavailable"] is True
+    assert marker not in json.dumps(page)
+    assert agent.calls == []
+    assert not any((tmp_path / "artifacts").rglob("*"))
+
+
 async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:
     """The failure this archive exists for.
 

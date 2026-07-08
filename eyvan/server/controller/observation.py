@@ -79,6 +79,7 @@ from eyvan.worker.runtime.log_records import (
 #: How many contiguous ranks a pre-manifest archive read probes. New archives
 #: carry their exact rank set and do not use this compatibility ceiling.
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
+_SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int, runtime_process_count: int = 1) -> LogPage:
@@ -319,7 +320,8 @@ class _ControllerObservation:
                 else:
                     remote = await asyncio.to_thread(self._agent_factory(cell).workload, cell.id, workload.remote_id)
             except Exception as exc:
-                logger.warning("workload %s observation failed: %s", workload.id, exc)
+                detail = _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else str(exc)
+                logger.warning("workload %s observation failed: %s", workload.id, detail)
                 continue
             try:
                 if is_group:
@@ -375,6 +377,8 @@ class _ControllerObservation:
         status: ExecutionWorkloadStatus,
         message: str | None,
     ) -> None:
+        if workload.spec.secret_mounts:
+            message = _SECRET_OUTPUT_SUPPRESSED
         if status is ExecutionWorkloadStatus.INDETERMINATE:
             await self._escalate_unreadable_execution(workload, cell, message)
             return
@@ -510,7 +514,7 @@ class _ControllerObservation:
                     "workload %s reported %s and group peer stop was incomplete: %s",
                     workload.id,
                     status.value,
-                    exc,
+                    _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else exc,
                 )
             return
         request = WorkloadMutationRequest(
@@ -527,7 +531,7 @@ class _ControllerObservation:
                 "workload %s reported %s and peer stop was incomplete: %s",
                 workload.id,
                 status.value,
-                exc,
+                _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else exc,
             )
 
     async def _escalate_unreadable_execution(
@@ -1075,7 +1079,7 @@ class _ControllerObservation:
             workload = await transaction.get_workload(workload_id)
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
-        if workload.remote_id is None:
+        if workload.spec.secret_mounts or workload.remote_id is None:
             return ""
         members = await self._load_workload_members(workload)
         if len(members) > 1:
@@ -1115,6 +1119,11 @@ class _ControllerObservation:
             workload = await transaction.get_workload(workload_id)
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
+        if workload.spec.secret_mounts:
+            return _log_page_document(
+                LogPage(unavailable=True, detail=_SECRET_OUTPUT_SUPPRESSED),
+                attempt=workload.attempt,
+            )
         if workload.remote_id is None:
             return _log_page_document(LogPage(), attempt=workload.attempt)
 
@@ -1319,6 +1328,13 @@ class _ControllerObservation:
             workload = await transaction.get_workload(workload_id)
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
+        if workload.spec.secret_mounts:
+            return {
+                "workload_id": workload.id,
+                "attempt": workload.attempt,
+                "results": [],
+                "output_suppressed": True,
+            }
         if workload.remote_id is None:
             raise ConflictError(f"workload {workload_id!r} is not running on any cell")
         try:
@@ -1367,6 +1383,13 @@ class _ControllerObservation:
             workload = await transaction.get_workload(workload_id)
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
+        if workload.spec.secret_mounts:
+            return {
+                "workload_id": workload.id,
+                "observed": False,
+                "detail": _SECRET_OUTPUT_SUPPRESSED,
+                "output_suppressed": True,
+            }
         if workload.remote_id is None:
             return {"workload_id": workload_id, "observed": False, "detail": "workload has no dispatched attempt"}
         members = await self._load_workload_members(workload)

@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -139,6 +143,418 @@ def _environment_from_launch(launch: tuple[str, ...]) -> dict[str, str]:
     return dict(line.split("=", 1) for line in env_path.read_text(encoding="utf-8").splitlines() if line)
 
 
+def _write_crash_temporary(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_startup_durably_sweeps_exact_crash_orphan_environment_and_record_temporaries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    digest = hashlib.sha256(b"crashed-attempt").hexdigest()
+    environment_temporary = tmp_path / "env" / f".{digest}.env.crash"
+    job_temporary = tmp_path / "jobs" / f".{digest}.json.crash"
+    workload_temporary = tmp_path / "workloads" / f".{digest}.json.crash"
+    marker = b"crash-orphan-secret-plaintext"
+    for temporary in (environment_temporary, job_temporary, workload_temporary):
+        _write_crash_temporary(temporary, marker)
+
+    real_fsync = os.fsync
+    fsynced_directories: set[tuple[int, int]] = set()
+
+    def tracking_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            fsynced_directories.add((metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(systemd_transient.os, "fsync", tracking_fsync)
+    SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=FakeSystemd(),
+        boot_id_reader=lambda: "boot-a",
+    )
+
+    assert not environment_temporary.exists()
+    assert not job_temporary.exists()
+    assert not workload_temporary.exists()
+    expected_directories = {
+        (directory.stat().st_dev, directory.stat().st_ino)
+        for directory in (tmp_path / "env", tmp_path / "jobs", tmp_path / "workloads")
+    }
+    assert expected_directories <= fsynced_directories
+    assert not any(marker in candidate.read_bytes() for candidate in tmp_path.rglob("*") if candidate.is_file())
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "unexpected-name"])
+def test_startup_refuses_unsafe_or_unrecognized_hidden_atomic_entries(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    digest = hashlib.sha256(b"unsafe-attempt").hexdigest()
+    env_dir = tmp_path / "env"
+    env_dir.mkdir(parents=True, mode=0o700)
+    if unsafe_kind == "symlink":
+        victim = tmp_path / "must-not-follow"
+        victim.write_text("victim-value", encoding="utf-8")
+        candidate = env_dir / f".{digest}.env.crash"
+        candidate.symlink_to(victim)
+    else:
+        candidate = env_dir / f".{digest}.env.crash.extra"
+        _write_crash_temporary(candidate, b"unknown-writer-plaintext")
+        victim = None
+
+    with pytest.raises(RuntimeError, match="atomic runtime temporary"):
+        SystemdTransientServiceExecutor(
+            tmp_path,
+            command_runner=FakeSystemd(),
+            boot_id_reader=lambda: "boot-a",
+        )
+
+    assert candidate.exists() or candidate.is_symlink()
+    if victim is not None:
+        assert victim.read_text(encoding="utf-8") == "victim-value"
+
+
+def test_startup_waits_for_a_writer_linearized_before_temporary_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    digest = hashlib.sha256(b"active-attempt").hexdigest()
+    final = tmp_path / "env" / f"{digest}.env"
+    writer_holds_startup_lock = threading.Event()
+    release_writer = threading.Event()
+    constructor_waiting = threading.Event()
+    scan_started = threading.Event()
+    writer_errors: list[BaseException] = []
+    constructor_errors: list[BaseException] = []
+    real_mkstemp = systemd_transient.tempfile.mkstemp
+    real_flock = systemd_transient.fcntl.flock
+    real_sweep = systemd_transient._sweep_atomic_temporary_directory
+
+    def blocking_mkstemp(*args, **kwargs):
+        if threading.current_thread().name == "atomic-writer":
+            # _atomic_writer_exclusion has acquired LOCK_SH before mkstemp.
+            writer_holds_startup_lock.set()
+            if not release_writer.wait(timeout=2):
+                raise RuntimeError("writer barrier timed out")
+        return real_mkstemp(*args, **kwargs)
+
+    def observing_flock(descriptor: int, operation: int) -> None:
+        if threading.current_thread().name == "startup-constructor" and operation == systemd_transient.fcntl.LOCK_EX:
+            constructor_waiting.set()
+        real_flock(descriptor, operation)
+
+    def observing_sweep(directory: Path, *, pattern) -> None:
+        scan_started.set()
+        real_sweep(directory, pattern=pattern)
+
+    monkeypatch.setattr(systemd_transient.tempfile, "mkstemp", blocking_mkstemp)
+    monkeypatch.setattr(systemd_transient.fcntl, "flock", observing_flock)
+    monkeypatch.setattr(systemd_transient, "_sweep_atomic_temporary_directory", observing_sweep)
+
+    def write() -> None:
+        try:
+            systemd_transient._write_environment_file(final, {"TOKEN": "active-writer-value"})
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    def construct() -> None:
+        try:
+            SystemdTransientServiceExecutor(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+        except BaseException as exc:
+            constructor_errors.append(exc)
+
+    writer = threading.Thread(target=write, name="atomic-writer", daemon=True)
+    writer.start()
+    assert writer_holds_startup_lock.wait(timeout=2)
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+
+    constructor = threading.Thread(target=construct, name="startup-constructor", daemon=True)
+    constructor.start()
+    assert constructor_waiting.wait(timeout=2)
+    assert constructor.is_alive()
+    assert not scan_started.is_set()
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+
+    release_writer.set()
+    writer.join(timeout=2)
+    constructor.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert not constructor.is_alive()
+    assert writer_errors == []
+    assert constructor_errors == []
+    assert scan_started.is_set()
+    assert final.read_text(encoding="utf-8") == "TOKEN=active-writer-value\n"
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+
+
+def test_writer_attempting_after_the_startup_snapshot_cannot_create_a_late_temporary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    digest = hashlib.sha256(b"after-snapshot-attempt").hexdigest()
+    final = tmp_path / "env" / f"{digest}.env"
+    snapshot_complete = threading.Event()
+    release_snapshot = threading.Event()
+    writer_waiting = threading.Event()
+    writer_errors: list[BaseException] = []
+    constructor_errors: list[BaseException] = []
+    real_flock = systemd_transient.fcntl.flock
+    real_sweep = systemd_transient._sweep_atomic_temporary_directory
+
+    def snapshot_barrier(directory: Path, *, pattern) -> None:
+        real_sweep(directory, pattern=pattern)
+        if directory == tmp_path / "env":
+            snapshot_complete.set()
+            if not release_snapshot.wait(timeout=2):
+                raise RuntimeError("startup snapshot barrier timed out")
+
+    def observing_flock(descriptor: int, operation: int) -> None:
+        if threading.current_thread().name == "after-snapshot-writer" and operation == systemd_transient.fcntl.LOCK_SH:
+            writer_waiting.set()
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(systemd_transient, "_sweep_atomic_temporary_directory", snapshot_barrier)
+    monkeypatch.setattr(systemd_transient.fcntl, "flock", observing_flock)
+
+    def construct() -> None:
+        try:
+            SystemdTransientServiceExecutor(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+        except BaseException as exc:
+            constructor_errors.append(exc)
+
+    def write() -> None:
+        try:
+            systemd_transient._write_environment_file(final, {"TOKEN": "after-snapshot-value"})
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    constructor = threading.Thread(target=construct, name="snapshot-constructor", daemon=True)
+    constructor.start()
+    assert snapshot_complete.wait(timeout=2)
+
+    writer = threading.Thread(target=write, name="after-snapshot-writer", daemon=True)
+    writer.start()
+    assert writer_waiting.wait(timeout=2)
+    assert writer.is_alive()
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+
+    release_snapshot.set()
+    writer.join(timeout=2)
+    constructor.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert not constructor.is_alive()
+    assert writer_errors == []
+    assert constructor_errors == []
+    assert final.read_text(encoding="utf-8") == "TOKEN=after-snapshot-value\n"
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+
+
+def test_concurrent_constructors_serialize_the_global_sweep_without_record_lock_deadlock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    first_inside_sweep = threading.Event()
+    release_first = threading.Event()
+    second_waiting = threading.Event()
+    second_inside_sweep = threading.Event()
+    errors: list[BaseException] = []
+    active_sweeps = 0
+    maximum_active_sweeps = 0
+    counter_lock = threading.Lock()
+    real_flock = systemd_transient.fcntl.flock
+    real_sweep = systemd_transient._sweep_atomic_temporary_directory
+
+    def observing_flock(descriptor: int, operation: int) -> None:
+        if threading.current_thread().name == "constructor-two" and operation == systemd_transient.fcntl.LOCK_EX:
+            second_waiting.set()
+        real_flock(descriptor, operation)
+
+    def sweep_barrier(directory: Path, *, pattern) -> None:
+        nonlocal active_sweeps, maximum_active_sweeps
+        if directory == tmp_path / "env":
+            with counter_lock:
+                active_sweeps += 1
+                maximum_active_sweeps = max(maximum_active_sweeps, active_sweeps)
+            try:
+                if threading.current_thread().name == "constructor-one":
+                    first_inside_sweep.set()
+                    if not release_first.wait(timeout=2):
+                        raise RuntimeError("constructor barrier timed out")
+                else:
+                    second_inside_sweep.set()
+                real_sweep(directory, pattern=pattern)
+            finally:
+                with counter_lock:
+                    active_sweeps -= 1
+            return
+        real_sweep(directory, pattern=pattern)
+
+    monkeypatch.setattr(systemd_transient.fcntl, "flock", observing_flock)
+    monkeypatch.setattr(systemd_transient, "_sweep_atomic_temporary_directory", sweep_barrier)
+
+    def construct() -> None:
+        try:
+            SystemdTransientServiceExecutor(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=construct, name="constructor-one", daemon=True)
+    second = threading.Thread(target=construct, name="constructor-two", daemon=True)
+    first.start()
+    assert first_inside_sweep.wait(timeout=2)
+    second.start()
+    assert second_waiting.wait(timeout=2)
+    assert second.is_alive()
+    assert not second_inside_sweep.is_set()
+    assert maximum_active_sweeps == 1
+
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert second_inside_sweep.is_set()
+    assert maximum_active_sweeps == 1
+
+
+@pytest.mark.parametrize(
+    ("directory_name", "extension", "writer_kind"),
+    [("env", "env", "environment"), ("jobs", "json", "json"), ("workloads", "json", "json")],
+)
+def test_constructor_sweeps_a_temporary_left_by_a_crashed_atomic_writer(
+    tmp_path: Path,
+    directory_name: str,
+    extension: str,
+    writer_kind: str,
+) -> None:
+    digest = hashlib.sha256(f"crashed-{directory_name}-writer".encode()).hexdigest()
+    final = tmp_path / directory_name / f"{digest}.{extension}"
+    marker = f"crashed-{directory_name}-atomic-writer-secret"
+    script = r"""
+import os
+import sys
+from pathlib import Path
+from eyvan.worker.runtime import systemd_transient
+
+path = Path(sys.argv[1])
+kind = sys.argv[2]
+marker = sys.argv[3]
+
+
+def crash_before_publish(_source, _destination):
+    os._exit(73)
+
+
+systemd_transient.os.replace = crash_before_publish
+if kind == "environment":
+    systemd_transient._write_environment_file(path, {"TOKEN": marker})
+else:
+    systemd_transient._atomic_write_json(path, {"remote_id": "crashed-writer", "status": "pending", "marker": marker})
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(final), writer_kind, marker],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 73, completed.stderr
+    temporaries = list(final.parent.glob(f".{final.name}.*"))
+    assert len(temporaries) == 1
+    assert marker.encode() in temporaries[0].read_bytes()
+
+    SystemdTransientServiceExecutor(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+
+    assert list(final.parent.glob(f".{final.name}.*")) == []
+    assert not any(marker.encode() in candidate.read_bytes() for candidate in tmp_path.rglob("*") if candidate.is_file())
+
+
+def test_environment_writer_unlinks_the_final_path_when_post_rename_fsync_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    path = tmp_path / "env" / f"{'a' * 64}.env"
+    real_fsync_directory = systemd_transient._fsync_directory
+    calls = 0
+
+    def fail_publish_once(directory: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("publish directory fsync failed")
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(systemd_transient, "_fsync_directory", fail_publish_once)
+    with pytest.raises(OSError, match="publish directory fsync failed"):
+        systemd_transient._write_environment_file(path, {"TOKEN": "post-rename-secret"})
+
+    assert calls == 2
+    assert not path.exists()
+    assert list(path.parent.glob(f".{path.name}.*")) == []
+
+
+def test_environment_writer_fails_closed_when_cleanup_fsync_also_fails(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    path = tmp_path / "env" / f"{'b' * 64}.env"
+    calls = 0
+
+    def fail_every_directory_fsync(_directory: Path) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("directory fsync unavailable")
+
+    monkeypatch.setattr(systemd_transient, "_fsync_directory", fail_every_directory_fsync)
+    with pytest.raises(RuntimeError, match="durably remove a failed workload environment"):
+        systemd_transient._write_environment_file(path, {"TOKEN": "cleanup-fsync-secret"})
+
+    assert calls == 2
+    assert not path.exists()
+    assert list(path.parent.glob(f".{path.name}.*")) == []
+
+
+def test_json_writer_keeps_a_complete_record_when_post_rename_fsync_fails(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    path = tmp_path / "jobs" / f"{'c' * 64}.json"
+    systemd_transient._atomic_write_json(path, {"remote_id": "last-good", "status": "pending"})
+
+    def fail_directory_fsync(_directory: Path) -> None:
+        raise OSError("record directory fsync failed")
+
+    monkeypatch.setattr(systemd_transient, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(OSError, match="record directory fsync failed"):
+        systemd_transient._atomic_write_json(path, {"remote_id": "new-complete", "status": "running"})
+
+    assert json.loads(path.read_text(encoding="utf-8"))["remote_id"] == "new-complete"
+    assert list(path.parent.glob(f".{path.name}.*")) == []
+
+
 def test_unit_names_are_deterministic_sanitized_and_collision_resistant() -> None:
     remote_id = "training/team-a/run 1/with:unsafe!characters"
     unit_name = systemd_unit_name(remote_id)
@@ -210,6 +626,211 @@ def test_submit_launches_a_contained_systemd_cgroup_and_stop_kills_background_ch
     assert ("systemctl", "stop", "--no-pager", unit_name) in systemd.commands
     assert systemd.background_children[unit_name] is False
     assert executor.status(remote_id).status is ExecutionWorkloadStatus.STOPPED
+    assert not env_path.exists()
+
+
+def test_secret_scaffolding_never_reaches_the_durable_record(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    capability = "eyvs1.durable.capability"
+    value = "hf_durable_secret_value"
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": capability,
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+
+    remote_id = executor.submit(spec, _context())
+
+    serialized = executor._record_path(remote_id).read_text(encoding="utf-8")
+    assert "EYVAN_SECRET_" not in serialized
+    assert capability not in serialized
+    assert value not in serialized
+    launch = next(command for command in systemd.commands if command[0] == "systemd-run")
+    environment = _environment_from_launch(launch)
+    assert environment["HF_TOKEN"] == value
+    assert not [name for name in environment if name.startswith("EYVAN_SECRET_")]
+
+    # Idempotent replay also upgrades a record written by an older worker.
+    legacy = _record(executor, remote_id)
+    legacy["environment"]["EYVAN_SECRET_0_TOKEN"] = capability
+    executor._record_path(remote_id).write_text(json.dumps(legacy), encoding="utf-8")
+    assert executor.submit(spec, _context()) == remote_id
+    assert "EYVAN_SECRET_" not in executor._record_path(remote_id).read_text(encoding="utf-8")
+
+
+def test_terminal_recovery_unlinks_the_owner_only_environment_idempotently(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    systemd = FakeSystemd()
+    first = SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=systemd,
+        boot_id_reader=lambda: "boot-a",
+        use_exit_type_cgroup=True,
+    )
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": "eyvs1.recovery.capability",
+        }
+    )
+    monkeypatch.setattr(
+        systemd_transient,
+        "materialize_secrets",
+        lambda _environment: {"HF_TOKEN": "hf_recovery_secret"},
+    )
+    remote_id = first.submit(spec, _context())
+    environment_path = first._environment_file_path(remote_id)
+    assert stat.S_IMODE(environment_path.stat().st_mode) == 0o600
+    systemd.complete(_record(first, remote_id)["unit_name"])
+
+    # A fresh executor models the worker restarting before collecting terminal
+    # state. The first recovery removes the file; later recoveries stay safe.
+    second = SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=systemd,
+        boot_id_reader=lambda: "boot-a",
+        use_exit_type_cgroup=True,
+    )
+    # Constructor recovery is eager; no status call is needed to remove it.
+    assert not environment_path.exists()
+    assert second.status(remote_id).status is ExecutionWorkloadStatus.SUCCEEDED
+    third = SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=systemd,
+        boot_id_reader=lambda: "boot-a",
+        use_exit_type_cgroup=True,
+    )
+    assert third.status(remote_id).status is ExecutionWorkloadStatus.SUCCEEDED
+    assert not environment_path.exists()
+
+
+def test_secret_bearing_output_is_suppressed_before_and_after_cleanup_and_restart(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    value = "embedded-systemd-secret"
+    systemd = FakeSystemd()
+    first = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": "eyvs1.output.capability",
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+    remote_id = first.submit(spec, _context())
+    record = _record(first, remote_id)
+    environment_path = first._environment_file_path(remote_id)
+    systemd.journal[record["unit_name"]] = f"prefix-{value}-suffix\n"
+
+    assert first.logs(remote_id) == ""
+    assert first.log_page(remote_id).records == ()
+    assert first.log_page(remote_id).unavailable is True
+    assert first.exec_in_workload(remote_id, ["print-secret"], timeout_s=1)["stdout"] == ""
+    assert first.process_status(remote_id)["output_suppressed"] is True
+    observation = first.status(remote_id)
+    assert observation.status is ExecutionWorkloadStatus.RUNNING
+    assert value not in observation.message
+    assert not environment_path.exists()
+
+    # The durable boolean, not retained plaintext, keeps restart behavior closed.
+    second = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    surfaces = {
+        "logs": second.logs(remote_id),
+        "page": second.log_page(remote_id).detail,
+        "exec": second.exec_in_workload(remote_id, ["print-secret"], timeout_s=1),
+        "process": second.process_status(remote_id),
+        "status": second.status(remote_id).message,
+        "record": second._record_path(remote_id).read_text(encoding="utf-8"),
+    }
+    assert value not in json.dumps(surfaces, default=str)
+    assert surfaces["logs"] == ""
+    assert surfaces["exec"]["output_suppressed"] is True
+    assert value not in surfaces["record"]
+
+
+def test_constructor_upgrades_n_minus_one_record_and_cleans_absent_indeterminate_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    capability = "eyvs1.legacy.capability"
+    value = "hf_legacy_plaintext"
+    systemd = FakeSystemd()
+    first = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": capability,
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+    remote_id = first.submit(spec, _context())
+    record_path = first._record_path(remote_id)
+    environment_path = first._environment_file_path(remote_id)
+    legacy = _record(first, remote_id)
+    legacy.pop("secret_bearing")
+    legacy["environment"]["EYVAN_SECRET_COUNT"] = "1"
+    legacy["environment"]["EYVAN_SECRET_0_TOKEN"] = capability
+    record_path.write_text(json.dumps(legacy), encoding="utf-8")
+    systemd.remove(legacy["unit_name"])
+
+    SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+
+    recovered_text = record_path.read_text(encoding="utf-8")
+    recovered = json.loads(recovered_text)
+    assert recovered["status"] == ExecutionWorkloadStatus.INDETERMINATE.value
+    assert recovered["secret_bearing"] is True
+    assert not environment_path.exists()
+    assert capability not in recovered_text
+    assert value not in recovered_text
+
+
+def test_failed_secret_launch_removes_plaintext_and_redacts_the_record(tmp_path: Path, monkeypatch) -> None:
+    from eyvan.worker.runtime import systemd_transient
+
+    capability = "eyvs1.failure.capability"
+    value = "hf_failed_launch_secret"
+    systemd = FakeSystemd()
+    systemd.fail_launch = True
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    spec = _spec()
+    spec["environment"].update(
+        {
+            "EYVAN_SECRET_COUNT": "1",
+            "EYVAN_SECRET_0_NAME": "HF_TOKEN",
+            "EYVAN_SECRET_0_URL": "https://eyvan.test/api/v1/secrets/content",
+            "EYVAN_SECRET_0_TOKEN": capability,
+        }
+    )
+    monkeypatch.setattr(systemd_transient, "materialize_secrets", lambda _environment: {"HF_TOKEN": value})
+
+    with pytest.raises(RuntimeError, match="failed to launch systemd execution") as captured:
+        executor.submit(spec, _context())
+
+    record_text = executor._record_path("workload-1").read_text(encoding="utf-8")
+    assert not executor._environment_file_path("workload-1").exists()
+    assert capability not in record_text
+    assert value not in record_text
+    assert capability not in str(captured.value)
+    assert value not in str(captured.value)
 
 
 def test_systemd_249_fallback_observes_the_cgroup_before_marking_an_exited_main_process_complete(tmp_path: Path) -> None:

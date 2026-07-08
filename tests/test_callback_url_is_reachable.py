@@ -44,6 +44,7 @@ class _Dispatcher:
 
     def __init__(self, public_url: str | None) -> None:
         self.artifact_access = None if public_url is None else _Access(public_url)
+        self.secret_capability = None if public_url is None else object()
 
 
 def _cell(provider: str = "gcp") -> CellRecord:
@@ -159,6 +160,16 @@ def test_local_providers_are_stated_rather_than_guessed() -> None:
 
 def _cell_with(executor: str, provider: str = "local") -> CellRecord:
     return _cell(provider).model_copy(update={"executor": executor})
+
+
+def test_missing_secret_delivery_fails_closed_before_launch() -> None:
+    dispatcher = _Dispatcher(None)
+
+    with pytest.raises(RuntimeError, match="secret delivery is not configured"):
+        dispatcher._refuse_unreachable_callback(
+            _workload(secret_mounts={"T": "gcp-secret://p/t"}),
+            _cell_with("eyvan-native", "local"),
+        )
 
 
 def test_an_executor_that_ignores_secret_mounts_is_refused() -> None:
