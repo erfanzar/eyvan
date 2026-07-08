@@ -144,7 +144,13 @@ async def test_nobody_but_a_fleet_admin_grants_fleet_administration() -> None:
 
     service = _service()
 
-    for role in (Role.ORG_ADMIN, Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_VIEWER):
+    for role in (
+        Role.ORG_ADMIN,
+        Role.PROJECT_ADMIN,
+        Role.PROJECT_OPERATOR,
+        Role.PROJECT_SUBMITTER,
+        Role.PROJECT_VIEWER,
+    ):
         with pytest.raises(AuthorizationError):
             await service.issue_role_grant(
                 _principal(role),

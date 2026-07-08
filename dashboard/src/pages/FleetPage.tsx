@@ -17,7 +17,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { apiClient } from "../api/client";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -28,9 +27,19 @@ interface FleetPageProps {
   cells: Cell[];
   leases: CapacityLease[];
   onRefresh: () => Promise<void>;
+  loadWarmth: (signal: AbortSignal) => Promise<WarmthReport>;
+  loadBilling: (signal: AbortSignal) => Promise<BillingReport>;
+  loadLaunchLatency: (signal: AbortSignal) => Promise<LaunchLatencyReport>;
 }
 
-export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
+export function FleetPage({
+  cells,
+  leases,
+  onRefresh,
+  loadWarmth,
+  loadBilling,
+  loadLaunchLatency,
+}: FleetPageProps) {
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
@@ -63,10 +72,10 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
   };
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([apiClient.getWarmth(), apiClient.getBilling()])
+    const controller = new AbortController();
+    Promise.all([loadWarmth(controller.signal), loadBilling(controller.signal)])
       .then(([warmthReport, billingReport]) => {
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
         setWarmth(warmthReport);
         setBilling(billingReport);
       })
@@ -74,23 +83,24 @@ export function FleetPage({ cells, leases, onRefresh }: FleetPageProps) {
         // Named, not swallowed. A cost panel that silently shows nothing reads
         // as "nothing is being spent", which is the most expensive possible
         // thing for it to say incorrectly.
-        if (!cancelled) setCostError(error instanceof Error ? error.message : "Unable to read fleet cost");
+        if (!controller.signal.aborted) {
+          setCostError(error instanceof Error ? error.message : "Unable to read fleet cost");
+        }
       });
-    apiClient
-      .getLaunchLatency()
+    loadLaunchLatency(controller.signal)
       .then((report) => {
-        if (!cancelled) setLatency(report);
+        if (!controller.signal.aborted) setLatency(report);
       })
       .catch((error: unknown) => {
         // Named for the same reason the cost error is: an empty latency panel
         // reads as "every pool is instant", which is the most misleading thing
         // it could say.
-        if (!cancelled) setLatencyError(error instanceof Error ? error.message : "Unable to read launch latency");
+        if (!controller.signal.aborted) {
+          setLatencyError(error instanceof Error ? error.message : "Unable to read launch latency");
+        }
       });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    return () => controller.abort();
+  }, [loadBilling, loadLaunchLatency, loadWarmth]);
 
   const warmHourlyCost = (warmth?.pools ?? []).reduce((total, pool) => total + pool.hourly_cost, 0);
 

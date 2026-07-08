@@ -104,6 +104,7 @@ def principal_from_claims(claims: tp.Mapping[str, JsonValue]) -> Principal:
 _DEV_ROLE_ALIASES = {
     "admin": Role.PROJECT_ADMIN,
     "operator": Role.PROJECT_OPERATOR,
+    "submitter": Role.PROJECT_SUBMITTER,
     "viewer": Role.PROJECT_VIEWER,
 }
 

@@ -3,6 +3,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { SessionPermission } from "../types";
+
 const ACCESS_TOKEN_KEY = "eyvan.oidc.access_token";
 const ID_TOKEN_KEY = "eyvan.oidc.id_token";
 const EXPIRES_AT_KEY = "eyvan.oidc.expires_at";
@@ -24,10 +26,59 @@ interface TokenResponse {
   token_type: string;
 }
 
+export interface AuthCapabilities {
+  submitWorkloads: boolean;
+  operateWorkloads: boolean;
+  manageProject: boolean;
+  manageFleet: boolean;
+}
+
+export interface AuthScope {
+  orgId: string;
+  projectId: string;
+}
+
 export interface AuthIdentity {
   displayName: string;
   detail: string;
   mode: "oidc" | "development" | "demo";
+  /** Server-resolved roles applicable to the selected dashboard scope. */
+  roles: string[];
+  scope: AuthScope;
+  /** Presentation derived only from the authenticated server authority response. */
+  capabilities: AuthCapabilities;
+}
+
+export const NO_AUTH_CAPABILITIES: AuthCapabilities = Object.freeze({
+  submitWorkloads: false,
+  operateWorkloads: false,
+  manageProject: false,
+  manageFleet: false,
+});
+
+/** Derive presentation controls from permissions evaluated by the server Authorizer. */
+export function capabilitiesForPermissions(
+  permissionNames: Iterable<SessionPermission>,
+  acceptsNewWork = true,
+): AuthCapabilities {
+  const permissions = new Set(permissionNames);
+  return {
+    // A grant can outlive tenant registration. Server-reported permissions say
+    // what the principal may do; acceptsNewWork says whether this registered
+    // scope currently accepts any tenant mutation. Reads remain independent so
+    // disabled projects keep their durable history visible.
+    submitWorkloads: acceptsNewWork && permissions.has("submit"),
+    operateWorkloads: acceptsNewWork && permissions.has("operate"),
+    manageProject: acceptsNewWork && permissions.has("manage_project"),
+    manageFleet: permissions.has("manage_fleet"),
+  };
+}
+
+export function configuredScope(): AuthScope {
+  return {
+    orgId: import.meta.env.VITE_EYVAN_ORG ?? "acme",
+    projectId: import.meta.env.VITE_EYVAN_PROJECT ?? "research",
+  };
 }
 
 export function isDemoMode(): boolean {
@@ -78,13 +129,12 @@ function redirectUri(): string {
  * Build-time values still win when present, so every existing image behaves
  * identically. This only fills the gap they leave.
  */
-let runtimeConfig: { issuer?: string | null; client_id?: string | null } | undefined;
+let runtimeConfig: { issuer?: string | null; client_id?: string | null; audience?: string | null } | undefined;
 
 export async function loadRuntimeOidcConfig(fetchImpl: typeof fetch = fetch): Promise<void> {
   if (runtimeConfig !== undefined) return;
-  if (bakedIssuer() && bakedClientId()) {
-    // Nothing to ask for. A request here would be a round trip whose answer is
-    // discarded, on the critical path of every page load.
+  if (bakedIssuer() && bakedClientId() && bakedAudience()) {
+    // Every runtime value is deliberately overridden by this build.
     runtimeConfig = {};
     return;
   }
@@ -117,6 +167,14 @@ function bakedIssuer(): string | undefined {
 
 function bakedClientId(): string | undefined {
   return import.meta.env.VITE_EYVAN_OIDC_CLIENT_ID || undefined;
+}
+
+function bakedAudience(): string | undefined {
+  return import.meta.env.VITE_EYVAN_OIDC_AUDIENCE || undefined;
+}
+
+function audience(): string | undefined {
+  return bakedAudience() ?? runtimeConfig?.audience ?? undefined;
 }
 
 function issuer(): string | undefined {
@@ -222,9 +280,8 @@ export async function beginLogin(): Promise<void> {
     code_challenge: base64Url(new Uint8Array(digest)),
     code_challenge_method: "S256",
   });
-  if (import.meta.env.VITE_EYVAN_OIDC_AUDIENCE) {
-    parameters.set("audience", import.meta.env.VITE_EYVAN_OIDC_AUDIENCE);
-  }
+  const configuredAudience = audience();
+  if (configuredAudience) parameters.set("audience", configuredAudience);
   globalThis.location.assign(`${oidcMetadata.authorization_endpoint}?${parameters.toString()}`);
 }
 
@@ -289,19 +346,72 @@ function decodeClaims(token: string | null): Record<string, unknown> {
 }
 
 export function currentIdentity(): AuthIdentity | undefined {
-  if (isDemoMode()) return { displayName: "Demo dataset", detail: "Local sample data", mode: "demo" };
+  const scope = configuredScope();
+  if (isDemoMode()) {
+    const permissions: SessionPermission[] = [
+      "read",
+      "submit",
+      "operate",
+      "manage_project",
+      "manage_own_capacity",
+      "manage_fleet",
+    ];
+    return {
+      displayName: "Demo dataset",
+      detail: "Local sample data",
+      mode: "demo",
+      roles: ["fleet_admin"],
+      scope,
+      capabilities: capabilitiesForPermissions(permissions),
+    };
+  }
+
+  // Claims are decoded only for display. Role grants and action authority come
+  // exclusively from GET /api/v1/session after server authentication and
+  // durable-grant unioning.
+  const accessToken = getAccessToken();
+  if (accessToken) {
+    const accessClaims = decodeClaims(accessToken);
+    const idClaims = decodeClaims(storage()?.getItem(ID_TOKEN_KEY) ?? null);
+    const displayName = String(
+      idClaims.name ??
+      idClaims.preferred_username ??
+      idClaims.email ??
+      idClaims.sub ??
+      accessClaims.name ??
+      accessClaims.preferred_username ??
+      accessClaims.email ??
+      accessClaims.sub ??
+      "Signed-in user",
+    );
+    const detail = String(
+      idClaims.email ??
+      idClaims.preferred_username ??
+      accessClaims.email ??
+      accessClaims.preferred_username ??
+      "OIDC session",
+    );
+    return {
+      displayName,
+      detail,
+      mode: "oidc",
+      roles: [],
+      scope,
+      capabilities: NO_AUTH_CAPABILITIES,
+    };
+  }
+
   if (isDevelopmentAuthEnabled()) {
     return {
       displayName: import.meta.env.VITE_EYVAN_DEV_USER ?? "dashboard-dev",
-      detail: `Development ${import.meta.env.VITE_EYVAN_DEV_ROLE ?? "viewer"}`,
+      detail: "Development identity; authority pending server verification",
       mode: "development",
+      roles: [],
+      scope,
+      capabilities: NO_AUTH_CAPABILITIES,
     };
   }
-  if (!getAccessToken()) return undefined;
-  const claims = decodeClaims(storage()?.getItem(ID_TOKEN_KEY) ?? null);
-  const displayName = String(claims.name ?? claims.preferred_username ?? claims.email ?? claims.sub ?? "Signed-in user");
-  const detail = String(claims.email ?? claims.preferred_username ?? "OIDC session");
-  return { displayName, detail, mode: "oidc" };
+  return undefined;
 }
 
 export function clearTokens(): void {

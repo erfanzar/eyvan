@@ -19,6 +19,17 @@
  * `Last-Event-ID` header the server already honours.
  */
 
+/** A terminal authenticated stream response that requires session reconciliation. */
+export class EventStreamHttpError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "EventStreamHttpError";
+  }
+}
+
 /** One decoded server-sent event. */
 export interface StreamEvent {
   id?: string;
@@ -123,7 +134,8 @@ export async function followEventStream(options: EventStreamOptions): Promise<vo
         },
         signal,
       });
-      if (!response.ok || response.body === null) throw new Error(`event stream returned ${response.status}`);
+      if (!response.ok) throw new EventStreamHttpError(`event stream returned ${response.status}`, response.status);
+      if (response.body === null) throw new Error("event stream returned no response body");
       failures = 0;
       onConnectionChange?.(true);
       const reader = response.body.getReader();
@@ -146,7 +158,13 @@ export async function followEventStream(options: EventStreamOptions): Promise<vo
       }
     } catch (error) {
       if (signal.aborted) break;
-      void error;
+      if (error instanceof EventStreamHttpError && [401, 403].includes(error.status)) {
+        // Retrying an authorization denial forever is both a forbidden-read
+        // loop and a stale-capability bug. Surface it so App can resolve
+        // /session and either resubscribe with current authority or stop.
+        onConnectionChange?.(false);
+        throw error;
+      }
     }
     onConnectionChange?.(false);
     if (signal.aborted) break;

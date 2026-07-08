@@ -9,6 +9,13 @@ export type Route =
   | { section: Section }
   | { section: "workloads"; workloadId: string };
 
+export type SectionAvailability = Partial<Record<Section, boolean>>;
+
+/** Keep a forbidden deep link from mounting panels that issue fleet-only reads. */
+export function accessibleRoute(route: Route, availability: SectionAvailability): Route {
+  return availability[route.section] === false ? { section: "overview" } : route;
+}
+
 export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   const path = hash.replace(/^#\/?/, "");
   const [section, id] = path.split("/");

@@ -26,6 +26,7 @@ interface OverviewPageProps {
   workloads: WorkloadSummary[];
   onOpenWorkload: (id: string) => void;
   onShowWorkloads: () => void;
+  fleetAvailable: boolean;
 }
 
 export function OverviewPage({
@@ -33,11 +34,16 @@ export function OverviewPage({
   workloads,
   onOpenWorkload,
   onShowWorkloads,
+  fleetAvailable,
 }: OverviewPageProps) {
   const activeWorkloads = workloads
     .filter((workload) => ["running", "provisioning", "checkpointing"].includes(workload.status))
     .slice(0, 5);
-  const maxQueue = Math.max(...overview.queueTrend.map((point) => point.queued), 1);
+  const hasQueueActivity = overview.queueTrend.some((point) => point.submitted > 0 || point.admitted > 0);
+  const maxQueueActivity = Math.max(
+    ...overview.queueTrend.flatMap((point) => [point.submitted, point.admitted]),
+    1,
+  );
   const budgetUsed = percent(overview.monthlySpend, overview.monthlyBudget);
 
   return (
@@ -59,8 +65,8 @@ export function OverviewPage({
         />
         <MetricCard
           label="Scoped utilization"
-          value={`${overview.fleetUtilization}%`}
-          detail="active leases in the configured project"
+          value={fleetAvailable ? `${overview.fleetUtilization}%` : "Restricted"}
+          detail={fleetAvailable ? "active leases in the configured project" : "fleet inventory requires fleet administration"}
           icon={Server}
         />
         <MetricCard
@@ -83,17 +89,17 @@ export function OverviewPage({
         <div className="panel queue-panel">
           <div className="panel-header">
             <div>
-              <h2>Queue pressure</h2>
-              <p>Historical pending and admitted workload samples</p>
+              <h2>Submission and admission activity</h2>
+              <p>Workload events in seven buckets over the last 24 hours</p>
             </div>
             <button className="text-button" type="button" onClick={onShowWorkloads}>
               View queue
               <ArrowRight size={15} aria-hidden="true" />
             </button>
           </div>
-          {overview.queueTrend.length ? <div className="queue-chart" aria-label="Queue pressure chart">
+          {hasQueueActivity ? <div className="queue-chart" aria-label="Submission and admission activity chart">
             <div className="chart-legend">
-              <span><i className="legend-box legend-queued" />Queued</span>
+              <span><i className="legend-box legend-queued" />Submitted</span>
               <span><i className="legend-box legend-admitted" />Admitted</span>
             </div>
             <div className="bar-chart">
@@ -102,12 +108,12 @@ export function OverviewPage({
                   <div className="bar-values">
                     <span
                       className="bar bar-queued"
-                      style={{ height: `${Math.max(8, (point.queued / maxQueue) * 100)}%` }}
-                      title={`${point.queued} queued at ${point.label}`}
+                      style={{ height: `${point.submitted > 0 ? Math.max(8, (point.submitted / maxQueueActivity) * 100) : 0}%` }}
+                      title={`${point.submitted} submitted at ${point.label}`}
                     />
                     <span
                       className="bar bar-admitted"
-                      style={{ height: `${Math.max(8, (point.admitted / maxQueue) * 100)}%` }}
+                      style={{ height: `${point.admitted > 0 ? Math.max(8, (point.admitted / maxQueueActivity) * 100) : 0}%` }}
                       title={`${point.admitted} admitted at ${point.label}`}
                     />
                   </div>
@@ -115,7 +121,7 @@ export function OverviewPage({
                 </div>
               ))}
             </div>
-          </div> : <EmptyState title="No queue history available" detail="The control plane did not return historical queue samples for this scope." />}
+          </div> : <EmptyState title="No submission or admission activity" detail="No workload submission or admission event occurred in this scope during the selected window." />}
           <div className="priority-strip">
             {overview.priorityQueue.map((item) => (
               <div className="priority-summary" key={item.priority}>
@@ -135,28 +141,35 @@ export function OverviewPage({
             </div>
             <Layers3 size={18} aria-hidden="true" />
           </div>
-          <div className="resource-list">
-            {overview.fleetBreakdown.map((resource) => {
-              const utilization = percent(resource.used, resource.total);
-              return (
-                <div className="resource-row" key={resource.resource}>
-                  <div className="resource-row-heading">
-                    <span>{resource.resource}</span>
-                    <strong>{resource.used.toLocaleString()} / {resource.total.toLocaleString()}</strong>
+          {fleetAvailable ? (
+            <div className="resource-list">
+              {overview.fleetBreakdown.map((resource) => {
+                const utilization = percent(resource.used, resource.total);
+                return (
+                  <div className="resource-row" key={resource.resource}>
+                    <div className="resource-row-heading">
+                      <span>{resource.resource}</span>
+                      <strong>{resource.used.toLocaleString()} / {resource.total.toLocaleString()}</strong>
+                    </div>
+                    <ProgressBar
+                      value={utilization}
+                      label={`${resource.resource} utilization`}
+                      tone={utilization > 85 ? "amber" : "green"}
+                    />
+                    <div className="resource-row-detail">
+                      <span>{utilization}% allocated</span>
+                      <span>{resource.pending.toLocaleString()} pending</span>
+                    </div>
                   </div>
-                  <ProgressBar
-                    value={utilization}
-                    label={`${resource.resource} utilization`}
-                    tone={utilization > 85 ? "amber" : "green"}
-                  />
-                  <div className="resource-row-detail">
-                    <span>{utilization}% allocated</span>
-                    <span>{resource.pending.toLocaleString()} pending</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          ) : (
+            <EmptyState
+              title="Fleet inventory is restricted"
+              detail="Workload queue and budget data remain scoped to your project."
+            />
+          )}
           <div className="budget-inline">
             <div>
               <span>Monthly budget</span>

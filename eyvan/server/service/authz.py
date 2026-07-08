@@ -30,6 +30,11 @@ _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     # resize it would let them take capacity from a sibling project.
     Role.PROJECT_ADMIN: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE, Permission.MANAGE_PROJECT}),
     Role.PROJECT_OPERATOR: frozenset({Permission.READ, Permission.SUBMIT, Permission.OPERATE}),
+    # Submission without read or lifecycle authority. This is intentionally a
+    # separate kernel role rather than a dashboard-only label: automation can be
+    # allowed to enqueue work without learning what anyone else ran or being able
+    # to cancel it afterwards.
+    Role.PROJECT_SUBMITTER: frozenset({Permission.SUBMIT}),
     Role.PROJECT_VIEWER: frozenset({Permission.READ}),
 }
 
@@ -57,6 +62,27 @@ class Authorizer:
             if grant.project_id is not None and grant.project_id == project_id:
                 return True
         return False
+
+    def permissions(
+        self,
+        principal: Principal,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+    ) -> tuple[Permission, ...]:
+        """Return the effective permissions at one scope in stable enum order.
+
+        This is the same evaluator used by every enforcement point, exposed for
+        authenticated authority introspection. Keeping introspection on this
+        path prevents a dashboard role table from drifting away from the policy
+        the API actually enforces.
+        """
+
+        return tuple(
+            permission
+            for permission in Permission
+            if self.allows(principal, permission, org_id=org_id, project_id=project_id)
+        )
 
     def require(
         self,

@@ -73,6 +73,123 @@ describe("EyvanApiClient", () => {
     expect(fetch.mock.calls[0][1].headers).not.toHaveProperty("Authorization");
   });
 
+  it("maps server-resolved authority and switches every scoped request explicitly", async () => {
+    const fetch = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/session")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              subject: "alice",
+              display_name: "Alice",
+              global_permissions: [],
+              scopes: [
+                {
+                  org_id: "acme",
+                  project_id: "research",
+                  display_name: "Research",
+                  registered: true,
+                  enabled: true,
+                  accepts_new_work: true,
+                  roles: ["project_viewer"],
+                  permissions: ["read"],
+                },
+                {
+                  org_id: "other",
+                  project_id: "training",
+                  display_name: "Training",
+                  registered: true,
+                  enabled: true,
+                  accepts_new_work: true,
+                  roles: ["project_submitter"],
+                  permissions: ["submit"],
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
+      );
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    const authority = await client.getSessionAuthority();
+    client.setScope(authority.scopes[1]);
+    await client.listWorkloads();
+
+    expect(authority.scopes[1]).toMatchObject({
+      orgId: "other",
+      projectId: "training",
+      roles: ["project_submitter"],
+      permissions: ["submit"],
+    });
+    expect(fetch.mock.calls[0][0]).toContain("org_id=acme");
+    expect(fetch.mock.calls[1][0]).toContain("org_id=other&project_id=training");
+  });
+
+  it("reads project audit through the scoped route without probing fleet authority", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "event-1",
+            sequence: 7,
+            timestamp: "2026-01-01T00:00:00Z",
+            actor: "alice",
+            entity_type: "workload",
+            entity_id: "wl-1",
+            action: "workload.submitted",
+            payload: {},
+          },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await client.listAuditEvents({ orgId: "other", projectId: "research" });
+
+    expect(fetch.mock.calls[0][0]).toBe(
+      "/api/v1/events?limit=1000&org_id=other&project_id=research",
+    );
+    expect(fetch.mock.calls.some(([url]) => String(url).includes("/fleet/events"))).toBe(false);
+  });
+
+  it("uses the workload's own scope for deep-link event and lease composition", async () => {
+    const urls: string[] = [];
+    const fetch = vi.fn().mockImplementation((url: string) => {
+      urls.push(String(url));
+      if (String(url).endsWith("/workloads/wl-1")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ ...rawWorkload, org_id: "other", project_id: "training" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(url).endsWith("/logs")) return Promise.resolve(new Response("", { status: 200 }));
+      if (String(url).endsWith("/progress")) {
+        return Promise.resolve(new Response("missing", { status: 404 }));
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
+      );
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    const detail = await client.getWorkload("wl-1");
+
+    expect(detail).toMatchObject({ org: "other", project: "training" });
+    const composed = urls.filter((url) => url.includes("/events?") || url.includes("/leases?"));
+    expect(composed).toHaveLength(2);
+    expect(composed.every((url) => url.includes("org_id=other&project_id=training"))).toBe(true);
+  });
+
   it("does not fabricate per-workload budget or progress figures", async () => {
     const fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify([rawWorkload]), {
@@ -147,9 +264,40 @@ describe("EyvanApiClient", () => {
     });
   });
 
+  it("uses both components of the immutable selected scope for a same-project cross-org update", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ...rawPolicy, org_id: "other" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+    const policy = {
+      id: "other/research",
+      name: "Placement policy",
+      scope: "research",
+      type: "placement" as const,
+      summary: "scoped",
+      preemptionEnabled: true,
+      updatedAt: rawPolicy.updated_at,
+      configuration: {
+        allowedProviders: ["gcp"],
+        allowedRegions: [],
+        allowedCapacityClasses: [],
+        deniedAcceleratorTypes: [],
+        maxPriority: 1000,
+      },
+    };
+
+    await client.updatePolicy(policy, false, { orgId: "other", projectId: "research" });
+
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/policies/other/research");
+  });
+
   it("maps policies from server fields instead of hardcoding preemption", async () => {
     const fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify([rawPolicy]), {
+      new Response(JSON.stringify(rawPolicy), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -168,13 +316,35 @@ describe("EyvanApiClient", () => {
     expect(policies[0].name).not.toBe("Checkpoint-aware preemption");
   });
 
+  it("reads budget and policy through project-scoped routes", async () => {
+    const fetch = vi.fn().mockImplementation((url: string) => {
+      const response = (body: unknown) =>
+        new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url === "/api/v1/budgets/acme/research") return Promise.resolve(response(rawBudget));
+      if (url === "/api/v1/budgets/acme/research/status") {
+        return Promise.resolve(response({ org_id: "acme", project_id: "research", limit: 1000, spent: 100, forecast: 250 }));
+      }
+      if (url === "/api/v1/policies/acme/research") return Promise.resolve(response(rawPolicy));
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    const [budgets, policies] = await Promise.all([client.listBudgets(), client.listPolicies()]);
+
+    expect(budgets[0]).toMatchObject({ owner: "research", forecast: 250 });
+    expect(policies[0]).toMatchObject({ scope: "research" });
+    expect(fetch.mock.calls.map(([url]) => url)).not.toContain("/api/v1/budgets?org_id=acme");
+    expect(fetch.mock.calls.map(([url]) => url)).not.toContain("/api/v1/policies?org_id=acme");
+  });
+
   it("fetches each resource once when computing the overview from shared data", async () => {
     const fetch = vi.fn().mockImplementation((url: string) => {
       const response = (body: unknown, status = 200) =>
         new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
       if (url === "/api/v1/workloads") return Promise.resolve(response([rawWorkload]));
       if (url === "/api/v1/cells") return Promise.resolve(response([rawCell]));
-      if (url === "/api/v1/budgets?org_id=acme") return Promise.resolve(response([rawBudget]));
+      if (url === "/api/v1/budgets/acme/research") return Promise.resolve(response(rawBudget));
       if (url === "/api/v1/leases?org_id=acme&project_id=research") return Promise.resolve(response([rawLease]));
       return Promise.resolve(response([]));
     });
@@ -194,6 +364,24 @@ describe("EyvanApiClient", () => {
     expect(overview.queued).toBe(0);
     expect(cells[0].queuedWorkloads).toBeUndefined();
     expect(leases[0].class).toBeUndefined();
+  });
+
+  it("maps durable cell topology instead of substituting the accelerator type", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify([rawCell]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    const client = new EyvanApiClient("/api/v1", false);
+
+    const cells = await client.listCells([]);
+
+    expect(cells[0].topology).toBe("fabric=ici, slice=4x4");
+    expect(cells[0].topology).not.toContain(rawCell.accelerator_type);
   });
 
   it("fetches and maps workload progress on the detail page", async () => {
@@ -386,6 +574,7 @@ const rawCell = {
   allocatable: { cpu: 80, memory_gib: 800, gpu: 0, tpu: 12, custom: {} },
   accelerator_type: "v5p-8",
   labels: {},
+  topology: { slice: "4x4", fabric: "ici" },
 };
 
 const rawBudget = {
@@ -439,17 +628,18 @@ describe("dead field revival", () => {
     const trend = await client.getQueueTrend();
 
     expect(trend).toEqual([
-      { label: "22:00", queued: 4, admitted: 2 },
-      { label: "23:00", queued: 1, admitted: 5 },
+      { label: "22:00", submitted: 4, admitted: 2 },
+      { label: "23:00", submitted: 1, admitted: 5 },
     ]);
+    expect(fetch.mock.calls[0][0]).toContain("window_s=86400&buckets=7");
   });
 
-  it("renders an empty trend rather than failing the whole overview", async () => {
+  it("keeps a failed trend request fatal instead of presenting empty history", async () => {
     const fetch = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }));
     vi.stubGlobal("fetch", fetch);
     const client = new EyvanApiClient("/api/v1", false);
 
-    await expect(client.getQueueTrend()).resolves.toEqual([]);
+    await expect(client.getQueueTrend()).rejects.toMatchObject({ status: 500 });
   });
 
   it("joins a lease's capacity class from the cell it landed on", async () => {
@@ -494,8 +684,10 @@ describe("dead field revival", () => {
   it("does not recurse between listLeases and listCells", async () => {
     // listCells resolves leases to compute utilization, so a naive join in
     // listLeases would loop forever. Bounded call count is the assertion.
-    const fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
+    const fetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
+      ),
     );
     vi.stubGlobal("fetch", fetch);
     const client = new EyvanApiClient("/api/v1", false);

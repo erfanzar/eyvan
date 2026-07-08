@@ -53,6 +53,7 @@ CAPABILITY_ROUTES: dict[str, str] = {
 #: part of the Python SDK, so a Python caller would be the wrong thing to add.
 BROWSER_ROUTES: dict[str, str] = {
     "GET /api/v1/dashboard/config": "dashboard/src/auth/oidc.ts, so one image can serve two identity providers",
+    "GET /api/v1/session": "dashboard/src/api/client.ts resolves effective durable authority and project scopes",
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.

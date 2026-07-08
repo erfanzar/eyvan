@@ -79,6 +79,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "POST /api/v1/artifacts/holds": "hold another org's artifact",
     "DELETE /api/v1/artifacts/holds": "release another org's artifact hold",
     "GET /api/v1/fleets": "list fleets runnable in another org's scope",
+    "GET /api/v1/capacity/queue-trend": "read another project's submitted and admitted counts",
     "GET /api/v1/organizations/{org_id}": "read another tenant's registration",
     "GET /api/v1/organizations/{org_id}/projects": "enumerate another tenant's projects",
     "PUT /api/v1/organizations/{org_id}/projects/{project_id}": "create a project in another tenant",
@@ -105,7 +106,6 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/capacity/carbon": "fleet-wide grid intensity",
     "GET /api/v1/capacity/warmth": "fleet-wide warm state",
     "GET /api/v1/capacity/launch-latency": "fleet-wide provisioning latency",
-    "GET /api/v1/capacity/queue-trend": "fleet-wide queue depth",
     "GET /api/v1/fleets/{fleet_name}": "one fleet",
     "PUT /api/v1/fleets/{fleet_name}": "declarative fleet apply",
     "DELETE /api/v1/fleets/{fleet_name}": "delete a fleet",
@@ -134,6 +134,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
 #: Routes that carry no principal-scoped tenancy at all, each with the reason.
 EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/dashboard/config": "public OIDC discovery hints; no tenant data and no secret",
+    "GET /api/v1/session": "authenticated self-introspection; only the caller's resolved grants and scopes",
     "GET /api/v1/health": "liveness; no tenant data",
     "GET /healthz": "liveness; no tenant data",
     "GET /readyz": "readiness; reports only whether this replica can reach its store",

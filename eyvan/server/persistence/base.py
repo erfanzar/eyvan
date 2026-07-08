@@ -260,6 +260,9 @@ class RepositorySession(tp.Protocol):
         project_id: str | None = None,
         entity_type: str | None = None,
         entity_id: str | None = None,
+        occurred_at_or_after: datetime | None = None,
+        occurred_before: datetime | None = None,
+        newest_first: bool = False,
         limit: int = 100,
     ) -> list[AuditEvent]: ...
 

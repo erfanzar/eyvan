@@ -163,7 +163,13 @@ async def test_only_a_fleet_admin_registers_an_organization() -> None:
 
     service = _service()
 
-    for role in (Role.ORG_ADMIN, Role.PROJECT_ADMIN, Role.PROJECT_OPERATOR, Role.PROJECT_VIEWER):
+    for role in (
+        Role.ORG_ADMIN,
+        Role.PROJECT_ADMIN,
+        Role.PROJECT_OPERATOR,
+        Role.PROJECT_SUBMITTER,
+        Role.PROJECT_VIEWER,
+    ):
         with pytest.raises(AuthorizationError):
             await service.register_organization(
                 _principal(role),
