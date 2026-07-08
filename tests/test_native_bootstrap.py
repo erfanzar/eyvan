@@ -21,16 +21,22 @@ from eyvan.worker.runtime import ConfiguredExecutionResolver, ExecutionRuntimeRe
 from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
 from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
 
+_SHA256 = "a" * 64
+
 
 def test_compute_bootstrap_fetches_a_cell_scoped_token_from_secret_manager_and_runs_fleet_setup() -> None:
     token = derive_native_worker_token("agent-global-secret", "cell-uid")
     secret_resource = "projects/project-a/secrets/eyvan-native-cell-uid/versions/latest"
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/eyvan.whl",
+        package_sha256=_SHA256,
+        package_generation="1700000000000000",
         port=8123,
         state_dir="/var/lib/eyvan/worker",
         worker_secret_resource=secret_resource,
         wheelhouse="gs://artifacts/eyvan/wheelhouse.zip",
+        wheelhouse_sha256=_SHA256,
+        wheelhouse_generation="1700000000000001",
         before_start="echo setup-runtime",
     )
 
@@ -40,11 +46,15 @@ def test_compute_bootstrap_fetches_a_cell_scoped_token_from_secret_manager_and_r
     assert secret_resource in script
     assert "gcloud secrets versions access" in script
     assert script.index("echo setup-runtime") < script.index("gcloud storage cp")
-    assert "gcloud storage cp gs://artifacts/eyvan/eyvan.whl /var/lib/eyvan/bootstrap/eyvan.whl" in script
+    assert "gcloud storage cp 'gs://artifacts/eyvan/eyvan.whl#1700000000000000'" in script
+    assert "gcloud storage cp 'gs://artifacts/eyvan/wheelhouse.zip#1700000000000001'" in script
+    assert script.count("sha256sum --check --strict -") == 2
+    assert script.index("eyvan.whl#1700000000000000") < script.index("sha256sum --check --strict -")
+    assert script.index("sha256sum --check --strict -") < script.index("pip install")
     assert "/opt/eyvan-native/venv/bin/python -m pip install" in script
     assert "/var/lib/eyvan/bootstrap/eyvan.whl" in script
     assert "eyvan-worker.whl" not in script
-    assert "gcloud storage cp gs://artifacts/eyvan/wheelhouse.zip" in script
+    assert "gcloud storage cp 'gs://artifacts/eyvan/wheelhouse.zip#1700000000000001'" in script
     assert "--no-index --find-links /var/lib/eyvan/bootstrap/wheels" in script
     assert "eyvan.worker.runtime.native_worker --host 0.0.0.0 --port 8123" in script
     assert "--secret-file /run/eyvan-native/worker-secret" in script
@@ -135,6 +145,7 @@ def test_compute_bootstrap_apt_helper_executes_with_lock_timeout_and_preserves_f
 def test_compute_bootstrap_writes_the_declarative_runtime_environment_for_workloads() -> None:
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/eyvan.whl",
+        package_sha256=_SHA256,
         port=8123,
         state_dir="/var/lib/eyvan/worker",
         worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
@@ -159,6 +170,7 @@ def test_compute_bootstrap_writes_a_typed_oci_runtime_for_the_native_worker() ->
     )
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/eyvan.whl",
+        package_sha256=_SHA256,
         port=8123,
         state_dir="/var/lib/eyvan/worker",
         worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
@@ -183,6 +195,7 @@ def test_compute_bootstrap_rejects_container_artifacts_without_an_oci_runtime() 
     with pytest.raises(ValueError, match="require a container runtime"):
         build_native_worker_startup_script(
             package="gs://artifacts/eyvan/eyvan.whl",
+            package_sha256=_SHA256,
             port=8123,
             state_dir="/var/lib/eyvan/worker",
             worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
@@ -194,6 +207,7 @@ def test_compute_bootstrap_rejects_an_environment_that_cannot_be_loaded_by_a_nat
     with pytest.raises(ValueError, match="environment"):
         build_native_worker_startup_script(
             package="gs://artifacts/eyvan/eyvan.whl",
+            package_sha256=_SHA256,
             port=8123,
             state_dir="/var/lib/eyvan/worker",
             worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
@@ -205,6 +219,28 @@ def test_compute_bootstrap_rejects_a_gcs_package_without_a_wheel_filename() -> N
     with pytest.raises(ValueError, match=r"must name a .whl file"):
         build_native_worker_startup_script(
             package="gs://artifacts/eyvan/eyvan",
+            port=8123,
+            state_dir="/var/lib/eyvan/worker",
+            worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
+        )
+
+
+def test_compute_bootstrap_refuses_an_unverified_gcs_wheel() -> None:
+    with pytest.raises(ValueError, match="package SHA-256 is required"):
+        build_native_worker_startup_script(
+            package="gs://artifacts/eyvan/eyvan.whl",
+            port=8123,
+            state_dir="/var/lib/eyvan/worker",
+            worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
+        )
+
+
+def test_compute_bootstrap_rejects_a_non_numeric_gcs_generation() -> None:
+    with pytest.raises(ValueError, match="positive decimal integer"):
+        build_native_worker_startup_script(
+            package="gs://artifacts/eyvan/eyvan.whl",
+            package_sha256=_SHA256,
+            package_generation="latest",
             port=8123,
             state_dir="/var/lib/eyvan/worker",
             worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
@@ -363,6 +399,7 @@ def test_a_rebuilt_wheel_replaces_the_installed_package() -> None:
 
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/runtime/wheels/abc/eyvan-0.1.0-py3-none-any.whl",
+        package_sha256=_SHA256,
         port=8123,
         state_dir="/var/lib/eyvan/worker",
         worker_secret_resource="projects/p/secrets/s/versions/latest",
@@ -376,6 +413,7 @@ def test_the_forced_reinstall_does_not_rebuild_the_dependency_tree() -> None:
 
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/runtime/wheels/abc/eyvan-0.1.0-py3-none-any.whl",
+        package_sha256=_SHA256,
         port=8123,
         state_dir="/var/lib/eyvan/worker",
         worker_secret_resource="projects/p/secrets/s/versions/latest",

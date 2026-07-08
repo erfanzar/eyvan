@@ -31,6 +31,12 @@ import httpx
 from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
+from eyvan.capacity.providers.kubernetes.workers import (
+    CELL_ID_ANNOTATION,
+    CELL_LABEL,
+    FENCE_ANNOTATION,
+    GENERATION_LABEL,
+)
 
 #: Where a projected service-account token is mounted in a pod by default.
 DEFAULT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -53,6 +59,13 @@ class JobStatus:
     #: Set when Kueue refused or evicted the workload, with its own wording kept
     #: so an operator can find it in Kueue's own logs.
     kueue_reason: str = ""
+    api_version: str = ""
+    kind: str = ""
+    name: str = ""
+    namespace: str = ""
+    uid: str = ""
+    cell_label: str = ""
+    cell_id_annotation: str = ""
     generation_label: str = ""
     fence_fingerprint: str = ""
     resource_version: str = ""
@@ -77,7 +90,7 @@ def read_token(path: str = DEFAULT_TOKEN_PATH) -> str:
         ) from exc
 
 
-def interpret_job(payload: JsonObject | None, *, expected_fingerprint: str = "") -> JobStatus:
+def interpret_job(payload: JsonObject | None) -> JobStatus:
     """Map a Job resource to the fields the driver reasons about.
 
     ``None`` means the Job is absent, which is a legitimate observation rather
@@ -93,17 +106,23 @@ def interpret_job(payload: JsonObject | None, *, expected_fingerprint: str = "")
     labels = metadata.get("labels") if is_json_object(metadata.get("labels")) else {}
     annotations = metadata.get("annotations") if is_json_object(metadata.get("annotations")) else {}
     assert isinstance(labels, dict) and isinstance(annotations, dict)
-    del expected_fingerprint  # compared by the driver, which owns the durable record
     return JobStatus(
         exists=True,
+        api_version=str(payload.get("apiVersion", "")),
+        kind=str(payload.get("kind", "")),
+        name=str(metadata.get("name", "")),
+        namespace=str(metadata.get("namespace", "")),
+        uid=str(metadata.get("uid", "")),
+        cell_label=str(labels.get(CELL_LABEL, "")),
+        cell_id_annotation=str(annotations.get(CELL_ID_ANNOTATION, "")),
         ready=_count(status.get("ready")),
         active=_count(status.get("active")),
         failed=_count(status.get("failed")),
         parallelism=_count(spec.get("parallelism")),
         suspended=spec.get("suspend") is True,
         kueue_reason=_kueue_reason(status),
-        generation_label=str(labels.get("eyvan.dev/provider-generation", "")),
-        fence_fingerprint=str(annotations.get("eyvan.dev/fence-fingerprint", "")),
+        generation_label=str(labels.get(GENERATION_LABEL, "")),
+        fence_fingerprint=str(annotations.get(FENCE_ANNOTATION, "")),
         resource_version=str(metadata.get("resourceVersion", "")),
     )
 
@@ -199,21 +218,33 @@ class KubernetesApi:
                 retryable=True,
             ) from exc
 
-    def get_job(self, namespace: str, name: str) -> JsonObject | None:
-        """Return one Job, or ``None`` when it does not exist."""
+    def get(self, path: str) -> JsonObject | None:
+        """Return one namespaced object, failing closed on a malformed response."""
 
-        response = self.request("GET", f"/apis/batch/v1/namespaces/{namespace}/jobs/{name}")
+        response = self.request("GET", path)
         if response.status_code == 404:
             return None
         payload = self._decode(response)
-        return payload if is_json_object(payload) else None
+        if not is_json_object(payload):
+            raise CapacityProviderError(
+                "Kubernetes API returned a malformed object",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+                retryable=False,
+            )
+        return payload
+
+    def get_job(self, namespace: str, name: str) -> JsonObject | None:
+        """Return one Job, or ``None`` when it does not exist."""
+
+        return self.get(f"/apis/batch/v1/namespaces/{namespace}/jobs/{name}")
 
     def create(self, path: str, manifest: JsonObject) -> bool:
-        """Create one object, reporting whether it was newly created.
+        """Create one object, returning ``False`` for an unverified conflict.
 
-        A 409 is *not* an error. The names are deterministic, so an existing
-        object with the same name is this cell's own previous create -- exactly
-        the replay an at-least-once outbox produces.
+        ``False`` is deliberately *not* success. Kubernetes names are only a
+        routing key; a 409 may name a foreign or stale object. Callers must GET
+        the exact object and verify its ownership and security-critical content
+        before accepting it as an idempotent replay.
         """
 
         response = self.request("POST", path, json=manifest)
@@ -222,17 +253,35 @@ class KubernetesApi:
         self._decode(response)
         return True
 
-    def delete(self, path: str) -> None:
-        """Delete one object with foreground propagation.
+    def delete(
+        self,
+        path: str,
+        *,
+        uid: str | None = None,
+        resource_version: str | None = None,
+    ) -> None:
+        """Delete one object with foreground propagation and optional fencing.
 
         Foreground so the Job's pods are gone before the Job is: a background
-        delete returns while pods are still running, and the control plane would
-        believe the capacity was freed while it is still occupied.
+        delete returns while pods are still running. UID and resourceVersion
+        preconditions prevent a stale reconciler from deleting a replacement
+        that acquired the deterministic name after its GET.
         """
 
-        response = self.request("DELETE", path, json={"propagationPolicy": "Foreground"})
+        body: JsonObject = {"propagationPolicy": "Foreground"}
+        if uid is not None or resource_version is not None:
+            if not uid or not resource_version:
+                raise ValueError("fenced Kubernetes delete requires both uid and resource_version")
+            body["preconditions"] = {"uid": uid, "resourceVersion": resource_version}
+        response = self.request("DELETE", path, json=body)
         if response.status_code == 404:
             return
+        if response.status_code == 409 and uid is not None:
+            raise CapacityProviderError(
+                "Kubernetes object changed before its fenced delete",
+                code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE,
+                retryable=True,
+            )
         self._decode(response)
 
     @staticmethod

@@ -26,26 +26,33 @@ spec:
       app: eyvan-control-plane
   policyTypes: [Ingress]
   ingress:
-    # Not a blanket allow. `/metrics` exports every tenant's spend behind a
-    # scrape token an operator may not have configured, and this is the layer
-    # that holds when they have not.
+    # Same-namespace clients need the explicit pod grant. Cross-namespace
+    # workers must match both the exact worker namespace and the same pod label;
+    # NetworkPolicyPeer fields are ANDed, while separate peers are ORed.
     - from:
         - podSelector:
             matchLabels:
               {{ .Values.networkPolicy.apiClientLabel }}: "true"
         - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "eyvan.workerNamespace" . | quote }}
+          podSelector:
             matchLabels:
               {{ .Values.networkPolicy.apiClientLabel }}: "true"
       ports:
         - protocol: TCP
           port: 8080
-    # Separate, so scraping does not confer API access and API access does not
-    # confer scraping.
+    # `/metrics` and the API share TCP 8080, so NetworkPolicy cannot distinguish
+    # their paths. The separate selector narrows socket access; the required
+    # metrics bearer and API authentication remain the authorization boundary.
     - from:
         - podSelector:
             matchLabels:
               {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
         - namespaceSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
+          podSelector:
             matchLabels:
               {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
       ports:
@@ -69,4 +76,9 @@ spec:
     - port: http
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.existingSecret }}
+          key: metrics-token
 {{- end }}

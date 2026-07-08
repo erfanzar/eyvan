@@ -12,6 +12,8 @@ spec:
       app: eyvan-control-plane
   template:
     metadata:
+      annotations:
+        checksum/platform-config: {{ include (print $.Template.BasePath "/platform-config.yaml") . | sha256sum }}
       labels:
         {{- include "eyvan.controlPlaneLabels" . | nindent 8 }}
     spec:
@@ -28,7 +30,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: eyvan
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "eyvan.controlPlaneImage" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -54,6 +56,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: agent-shared-secret
+            - name: EYVAN_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: metrics-token
             - name: EYVAN_REPOSITORY_BACKEND
               value: {{ .Values.controlPlane.repositoryBackend | quote }}
             - name: EYVAN_AUTO_CREATE_SCHEMA
@@ -71,6 +78,10 @@ spec:
             - name: EYVAN_OIDC_DASHBOARD_CLIENT_ID
               value: {{ .Values.controlPlane.oidc.dashboardClientId | quote }}
           volumeMounts:
+            - name: platform-config
+              mountPath: /etc/eyvan/platform.yaml
+              subPath: platform.yaml
+              readOnly: true
             # readOnlyRootFilesystem leaves no writable /tmp, and a volume that
             # vanishes with the pod keeps a compromise from persisting.
             - name: tmp
@@ -95,6 +106,9 @@ spec:
           resources:
             {{- toYaml .Values.controlPlane.resources | nindent 12 }}
       volumes:
+        - name: platform-config
+          configMap:
+            name: eyvan-platform
         - name: tmp
           emptyDir: {}
 ---

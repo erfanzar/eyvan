@@ -1,0 +1,45 @@
+# Use the Eyvan package directory as build context. Both build-stage references
+# are required image@sha256 values from the release lock.
+# Standalone: docker build -f Dockerfile.worker [build args] .
+# Workspace:  docker build -f libs/eyvan/Dockerfile.worker [build args] libs/eyvan
+ARG EYVAN_WORKER_BASE_IMAGE
+ARG EYVAN_UV_IMAGE
+FROM ${EYVAN_UV_IMAGE} AS uv
+FROM ${EYVAN_WORKER_BASE_IMAGE} AS runtime
+
+ARG EYVAN_WORKER_BASE_IMAGE
+ARG EYVAN_UV_IMAGE
+RUN for reference in "$EYVAN_WORKER_BASE_IMAGE" "$EYVAN_UV_IMAGE"; do \
+      digest="${reference##*@sha256:}"; \
+      test "$digest" != "$reference" && \
+      test "${#digest}" -eq 64 && \
+      printf '%s' "$digest" | grep -Eq '^[0-9a-f]+$'; \
+    done
+
+ARG EYVAN_VERSION=0.1.0
+ARG EYVAN_REVISION=unknown
+LABEL org.opencontainers.image.title="Eyvan native Kubernetes worker" \
+      org.opencontainers.image.description="Native execution worker for Eyvan Kubernetes capacity cells" \
+      org.opencontainers.image.version="${EYVAN_VERSION}" \
+      org.opencontainers.image.revision="${EYVAN_REVISION}" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+
+COPY --from=uv /uv /uvx /bin/
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    EYVAN_NATIVE_WORKER_STATE_DIR=/var/lib/eyvan/native-worker
+WORKDIR /app
+COPY requirements-docker.txt ./requirements-docker.txt
+RUN uv venv "$VIRTUAL_ENV" && \
+    uv pip install --require-hashes -r requirements-docker.txt
+COPY pyproject.toml README.md LICENSE ./src/
+COPY eyvan ./src/eyvan
+RUN uv pip install --no-deps ./src && \
+    rm -rf ./src && \
+    install -d -o 65532 -g 65532 -m 0700 /var/lib/eyvan/native-worker
+
+USER 65532:65532
+EXPOSE 8100
+ENTRYPOINT ["eyvan-native-worker"]
+CMD ["--host", "0.0.0.0", "--port", "8100", "--state-dir", "/var/lib/eyvan/native-worker", "--secret-file", "/var/run/eyvan/token"]

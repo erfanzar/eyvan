@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import typing as tp
 from pathlib import Path
 
@@ -108,15 +109,168 @@ def test_packaged_migrations_are_discoverable_by_alembic(monkeypatch: pytest.Mon
     assert discovered == version_files
 
 
-def test_migrate_main_upgrades_head_with_env_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+def _packaged_migration_state(
+    *,
+    tables: tuple[str, ...],
+    current_revisions: tuple[str, ...],
+) -> migrate.MigrationDatabaseState:
+    script = ScriptDirectory.from_config(migrate.build_alembic_config())
+    return migrate.classify_database_state(
+        tables=tables,
+        current_revisions=current_revisions,
+        script_directory=script,
+    )
+
+
+def _packaged_head_and_parent() -> tuple[str, str]:
+    script = ScriptDirectory.from_config(migrate.build_alembic_config())
+    heads = script.get_heads()
+    assert len(heads) == 1
+    head = script.get_revision(heads[0])
+    down_revision = head.down_revision
+    if isinstance(down_revision, tuple):
+        assert down_revision
+        parent = sorted(down_revision)[0]
+    else:
+        assert isinstance(down_revision, str)
+        parent = down_revision
+    return head.revision, parent
+
+
+def _offline_script_directory(
+    root: Path,
+    revisions: dict[str, str | tuple[str, ...] | None],
+) -> ScriptDirectory:
+    versions = root / "versions"
+    versions.mkdir(parents=True)
+    for index, (revision, down_revision) in enumerate(revisions.items()):
+        (versions / f"{index:02d}_{revision}.py").write_text(
+            f"revision = {revision!r}\ndown_revision = {down_revision!r}\nbranch_labels = None\ndepends_on = None\n"
+        )
+    return ScriptDirectory(str(root))
+
+
+def _unsafe_migration_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, migrate.MigrationDatabaseState]:
+    tables = ("alembic_version", "workloads")
+
+    packaged = _offline_script_directory(
+        tmp_path / "unknown",
+        {"base": None, "packaged_head": "base"},
+    )
+    unknown = migrate.classify_database_state(
+        tables=tables,
+        current_revisions=("not_in_the_package",),
+        script_directory=packaged,
+    )
+
+    ahead_graph = _offline_script_directory(
+        tmp_path / "ahead",
+        {"base": None, "packaged_head": "base", "future_head": "packaged_head"},
+    )
+    monkeypatch.setattr(ahead_graph, "get_heads", lambda: ["packaged_head"])
+    ahead = migrate.classify_database_state(
+        tables=tables,
+        current_revisions=("future_head",),
+        script_directory=ahead_graph,
+    )
+
+    diverged_graph = _offline_script_directory(
+        tmp_path / "diverged",
+        {"base": None, "packaged_head": "base", "other_branch": "base"},
+    )
+    monkeypatch.setattr(diverged_graph, "get_heads", lambda: ["packaged_head"])
+    diverged = migrate.classify_database_state(
+        tables=tables,
+        current_revisions=("other_branch",),
+        script_directory=diverged_graph,
+    )
+
+    merged_graph = _offline_script_directory(
+        tmp_path / "multiple-current",
+        {
+            "base": None,
+            "left": "base",
+            "right": "base",
+            "merge_head": ("left", "right"),
+        },
+    )
+    multiple_current = migrate.classify_database_state(
+        tables=tables,
+        current_revisions=("left", "right"),
+        script_directory=merged_graph,
+    )
+
+    branched_graph = _offline_script_directory(
+        tmp_path / "multiple-heads",
+        {"base": None, "left_head": "base", "right_head": "base"},
+    )
+    multiple_heads = migrate.classify_database_state(
+        tables=tables,
+        current_revisions=("left_head",),
+        script_directory=branched_graph,
+    )
+    return {
+        "unknown": unknown,
+        "ahead": ahead,
+        "diverged": diverged,
+        "multiple-current": multiple_current,
+        "multiple-heads": multiple_heads,
+    }
+
+
+def test_migration_database_inspection_distinguishes_fresh_and_unknown_sqlite(tmp_path: Path) -> None:
+    database = tmp_path / "migration-policy.db"
+    config = migrate.build_alembic_config(f"sqlite+aiosqlite:///{database}")
+
+    fresh = migrate.inspect_database_state(config)
+    assert fresh.classification is migrate.MigrationClassification.FRESH
+    assert fresh.current_revisions == ()
+    assert len(fresh.expected_heads) == 1
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE existing_control_plane_data (id INTEGER PRIMARY KEY)")
+
+    existing = migrate.inspect_database_state(config)
+    assert existing.classification is migrate.MigrationClassification.UNKNOWN
+    assert existing.requires_maintenance is False
+    with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="authorizes only"):
+        migrate.require_safe_migration(existing, maintenance_acknowledged=True)
+
+
+def test_packaged_graph_classifies_exact_head_and_known_single_ancestor() -> None:
+    head, parent = _packaged_head_and_parent()
+    exact = _packaged_migration_state(
+        tables=("alembic_version", "workloads"),
+        current_revisions=(head,),
+    )
+    behind = _packaged_migration_state(
+        tables=("alembic_version", "workloads"),
+        current_revisions=(parent,),
+    )
+
+    assert exact.classification is migrate.MigrationClassification.EXACT_HEAD
+    assert behind.classification is migrate.MigrationClassification.BEHIND
+    assert behind.requires_maintenance is True
+
+
+def test_migrate_main_upgrades_fresh_database_with_env_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[tp.Any, str]] = []
 
     def fake_upgrade(config: tp.Any, revision: str, **_kwargs: tp.Any) -> None:
         calls.append((config, revision))
 
     monkeypatch.setattr(migrate.command, "upgrade", fake_upgrade)
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: _packaged_migration_state(tables=(), current_revisions=()),
+    )
     monkeypatch.setenv("EYVAN_DATABASE_URL", "postgresql+asyncpg://eyvan:eyvan@db.internal:5432/eyvan")
-    migrate.main([])
+
+    assert migrate.main([]) == 0
     assert len(calls) == 1
     config, revision = calls[0]
     assert revision == "head"
@@ -132,28 +286,243 @@ def test_migrate_help_never_opens_or_changes_a_database(monkeypatch: pytest.Monk
         called = True
 
     monkeypatch.setattr(migrate.command, "upgrade", fail_upgrade)
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: pytest.fail("--help must not inspect a database"),
+    )
     with pytest.raises(SystemExit, match="0"):
         migrate.main(["--help"])
     assert called is False
     assert "Upgrade the Eyvan control-plane database" in capsys.readouterr().out
 
 
-def test_migrate_can_render_offline_sql_without_applying(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_migrate_can_render_offline_sql_without_inspecting_or_applying(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, bool, str]] = []
 
     def fake_upgrade(config: tp.Any, revision: str, *, sql: bool) -> None:
         calls.append((revision, sql, config.get_main_option("sqlalchemy.url")))
 
     monkeypatch.setattr(migrate.command, "upgrade", fake_upgrade)
-    migrate.main(["--database-url", "postgresql+asyncpg://example/db", "--sql", "0011_quota_grants"])
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: pytest.fail("offline SQL must not inspect a database"),
+    )
+    assert (
+        migrate.main(
+            ["--database-url", "postgresql+asyncpg://example/db", "--sql", "0011_quota_grants"]
+        )
+        == 0
+    )
     assert calls == [("0011_quota_grants", True, "postgresql+asyncpg://example/db")]
 
 
+def test_migrate_rejects_an_online_non_head_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: pytest.fail("an invalid online target must be rejected before database I/O"),
+    )
+    with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="fixed to packaged head"):
+        migrate.main(["0011_quota_grants"])
+
+
+def test_migrate_main_keeps_same_head_rollouts_usable_without_acknowledgement(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, _parent = _packaged_head_and_parent()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: _packaged_migration_state(
+            tables=("alembic_version", "workloads"),
+            current_revisions=(head,),
+        ),
+    )
+    monkeypatch.setattr(migrate.command, "upgrade", lambda _config, revision: calls.append(revision))
+
+    assert migrate.main([]) == 0
+    assert calls == ["head"]
+
+
+def test_one_use_acknowledgement_is_rejected_for_fresh_and_exact_head() -> None:
+    head, _parent = _packaged_head_and_parent()
+    states = (
+        _packaged_migration_state(tables=(), current_revisions=()),
+        _packaged_migration_state(
+            tables=("alembic_version", "workloads"),
+            current_revisions=(head,),
+        ),
+    )
+
+    for state in states:
+        with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="unnecessary"):
+            migrate.require_safe_migration(state, maintenance_acknowledged=True)
+
+
+def test_migrate_refuses_a_behind_schema_without_maintenance_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _head, parent = _packaged_head_and_parent()
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: _packaged_migration_state(
+            tables=("alembic_version", "workloads"),
+            current_revisions=(parent,),
+        ),
+    )
+    monkeypatch.setattr(
+        migrate.command,
+        "upgrade",
+        lambda *_args, **_kwargs: pytest.fail("an unacknowledged migration must not run"),
+    )
+
+    with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="Quiesce every writer"):
+        migrate.main([])
+
+
+def test_migrate_acknowledgement_allows_only_the_known_behind_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    _head, parent = _packaged_head_and_parent()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        migrate,
+        "inspect_database_state",
+        lambda _config: _packaged_migration_state(
+            tables=("alembic_version", "workloads"),
+            current_revisions=(parent,),
+        ),
+    )
+    monkeypatch.setattr(migrate.command, "upgrade", lambda _config, revision: calls.append(revision))
+
+    assert migrate.main(["--maintenance-acknowledged"]) == 0
+    assert calls == ["head"]
+
+
+def test_migrate_check_is_non_mutating_for_safe_states(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    head, parent = _packaged_head_and_parent()
+    states_and_arguments = (
+        (_packaged_migration_state(tables=(), current_revisions=()), ["--check"]),
+        (
+            _packaged_migration_state(
+                tables=("alembic_version", "workloads"),
+                current_revisions=(head,),
+            ),
+            ["--check"],
+        ),
+        (
+            _packaged_migration_state(
+                tables=("alembic_version", "workloads"),
+                current_revisions=(parent,),
+            ),
+            ["--check", "--maintenance-acknowledged"],
+        ),
+    )
+    monkeypatch.setattr(
+        migrate.command,
+        "upgrade",
+        lambda *_args, **_kwargs: pytest.fail("--check must never mutate the database"),
+    )
+
+    for state, arguments in states_and_arguments:
+        monkeypatch.setattr(migrate, "inspect_database_state", lambda _config, state=state: state)
+        assert migrate.main(arguments) == 0
+    output = capsys.readouterr().out
+    assert "fresh" in output
+    assert "at packaged head" in output
+    assert "known behind; maintenance acknowledged" in output
+
+
+def test_unknown_ahead_diverged_and_multi_revision_states_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = _unsafe_migration_states(tmp_path, monkeypatch)
+    assert {name: state.classification for name, state in states.items()} == {
+        "unknown": migrate.MigrationClassification.UNKNOWN,
+        "ahead": migrate.MigrationClassification.AHEAD,
+        "diverged": migrate.MigrationClassification.DIVERGED,
+        "multiple-current": migrate.MigrationClassification.MULTIPLE_CURRENT_REVISIONS,
+        "multiple-heads": migrate.MigrationClassification.MULTIPLE_PACKAGED_HEADS,
+    }
+
+    for state in states.values():
+        for acknowledged in (False, True):
+            with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="unsafe Alembic"):
+                migrate.require_safe_migration(state, maintenance_acknowledged=acknowledged)
+
+
+def test_check_refuses_every_unsafe_graph_state_even_with_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = _unsafe_migration_states(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        migrate.command,
+        "upgrade",
+        lambda *_args, **_kwargs: pytest.fail("--check must never mutate the database"),
+    )
+
+    for state in states.values():
+        monkeypatch.setattr(migrate, "inspect_database_state", lambda _config, state=state: state)
+        with pytest.raises(migrate.UnsafeAutomaticMigrationError, match="authorizes only"):
+            migrate.main(["--check", "--maintenance-acknowledged"])
+
+
 def test_dockerfiles_install_from_pinned_requirements() -> None:
-    for name in ("Dockerfile", "Dockerfile.agent"):
+    for name in ("Dockerfile", "Dockerfile.agent", "Dockerfile.worker"):
         content = (EYVAN_ROOT / name).read_text()
         assert "uv sync" not in content, f"{name} still re-resolves dependencies at image-build time"
         assert "requirements-docker.txt" in content, f"{name} does not install the pinned requirements"
+
+
+def test_control_plane_agent_and_worker_images_have_distinct_entrypoints_and_oci_labels() -> None:
+    control = (EYVAN_ROOT / "Dockerfile").read_text()
+    agent = (EYVAN_ROOT / "Dockerfile.agent").read_text()
+    worker = (EYVAN_ROOT / "Dockerfile.worker").read_text()
+
+    assert 'ENTRYPOINT ["eyvan-server"]' in control
+    assert 'ENTRYPOINT ["eyvan-agent"]' in agent
+    assert 'ENTRYPOINT ["eyvan-native-worker"]' in worker
+    assert 'ENTRYPOINT ["eyvan-agent"]' not in control
+    assert "eyvan:latest" not in control
+    assert "eyvan-agent:latest" not in agent
+    assert ":latest" not in worker
+    for dockerfile in (control, agent, worker):
+        assert "org.opencontainers.image.version" in dockerfile
+        assert "org.opencontainers.image.revision" in dockerfile
+        assert "org.opencontainers.image.licenses" in dockerfile
+
+
+def test_only_the_control_plane_image_bundles_the_hosted_dashboard() -> None:
+    control = (EYVAN_ROOT / "Dockerfile").read_text()
+    agent = (EYVAN_ROOT / "Dockerfile.agent").read_text()
+    worker = (EYVAN_ROOT / "Dockerfile.worker").read_text()
+
+    assert "EYVAN_DASHBOARD_DIR=/app/dashboard/dist" in control
+    assert "COPY --from=dashboard /dashboard/dist /app/dashboard/dist" in control
+    assert "EYVAN_DASHBOARD_DIR" not in agent
+    assert "COPY --from=dashboard" not in agent
+    assert "EYVAN_DASHBOARD_DIR" not in worker
+    assert "COPY --from=dashboard" not in worker
+
+
+def test_package_smoke_builds_and_installs_both_artifact_types_outside_the_source_tree() -> None:
+    script_path = EYVAN_ROOT / "scripts" / "smoke-package-artifacts.sh"
+    script = script_path.read_text()
+
+    assert script_path.stat().st_mode & 0o111
+    assert "build --wheel --sdist" in script
+    assert "dist/*.whl" in script
+    assert "dist/*.tar.gz" in script
+    assert 'cd "${tmp}/outside-source"' in script
+    assert '"${UV_BIN}" pip install' in script
+    assert '"${venv}/bin/${entrypoint}" --help' in script
+    assert "python -I" not in script  # invocation is the isolated venv path, not ambient Python
+    assert "uv run" not in script
 
 
 def test_migration_job_uses_wheel_entrypoint() -> None:

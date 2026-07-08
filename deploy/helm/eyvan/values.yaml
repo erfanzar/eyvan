@@ -4,14 +4,44 @@
 # serve rather than one that serves insecurely.
 
 nameOverride: ""
-namespace:
-  create: true
-  name: eyvan-system
 
+# Tags remain a development fallback so `helm lint` works without a registry.
+# Production qualification sets each digest to a registry-reported sha256 value;
+# when present, the templates render repository@digest and ignore the tag.
 image:
   repository: eyvan
-  tag: latest
+  tag: "0.1.0"
+  digest: ""
   pullPolicy: IfNotPresent
+
+# The agent has a different entrypoint and release artifact from the control
+# plane. It must never inherit `image` by accident.
+agentImage:
+  repository: eyvan-agent
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Used only by the Kubernetes capacity backend. There is deliberately no tag
+# fallback: every worker Job must use the qualified Dockerfile.worker artifact
+# by its registry-reported digest.
+workerImage:
+  repository: eyvan-native-worker
+  digest: ""
+
+serviceAccounts:
+  controlPlane:
+    annotations: {}
+  # For example, set iam.gke.io/gcp-service-account here for GKE Workload Identity.
+  cellAgent:
+    annotations: {}
+  worker:
+    annotations: {}
+
+platform:
+  # Empty uses this release's in-cluster cell-agent Service when enabled. When
+  # cellAgent.enabled=false, set the HTTPS endpoint for the external agent.
+  defaultAgentEndpoint: ""
 
 controlPlane:
   replicas: 2
@@ -39,11 +69,28 @@ controlPlane:
       memory: 2Gi
 
 cellAgent:
-  enabled: true
+  # Disabled until an operator explicitly supplies durable shared state. An
+  # unconfigured in-cluster agent would otherwise persist ownership in its pod.
+  enabled: false
+  # Fixed by template validation: more than one owner can mutate the same fleet.
   replicas: 1
+  # Explicit rather than inherited from the Python default. Supported production
+  # examples below are gcp and kubernetes.
+  capacityBackend: gcp
+  executionBackend: eyvan-native
+  # Enabling the agent requires a canonical gs://bucket/non-empty-object URI.
   fleetStateUri: ""
   nativeWorkerPackage: ""
+  nativeWorkerPackageSha256: ""
+  # Decimal GCS object generation. Set it with the digest for a gs:// package.
+  nativeWorkerPackageGeneration: ""
   nativeWorkerWheelhouse: ""
+  nativeWorkerWheelhouseSha256: ""
+  nativeWorkerWheelhouseGeneration: ""
+  kubernetes:
+    # Empty safely resolves to the Helm release namespace. A different namespace
+    # must already exist; the chart creates namespaced RBAC there, not a Namespace.
+    workerNamespace: ""
   resources:
     requests:
       cpu: 250m
@@ -53,10 +100,11 @@ cellAgent:
       memory: 1Gi
 
 migration:
-  # A pre-install and pre-upgrade hook. Without it an operator has to order the
-  # migration Job against the rollout by hand, and getting that wrong starts a
-  # control plane against a schema it refuses.
+  # The hook always checks database state. Fresh installs and same-head releases
+  # proceed; a non-empty schema behind the packaged head is refused unless the
+  # operator explicitly acknowledges a quiesced maintenance window.
   enabled: true
+  maintenanceAcknowledged: false
   backoffLimit: 1
 
 # The name of a Secret you create separately. Nothing in this chart generates

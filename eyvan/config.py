@@ -115,7 +115,7 @@ class EyvanSettings:
     #: per agent: the Job names are derived from cell ids, so two agents sharing a
     #: namespace would collide on names as surely as they would on fleet state.
     kubernetes_namespace: str = "eyvan"
-    kubernetes_worker_image: str = "ghcr.io/erfanzar/eyvan-native-worker:latest"
+    kubernetes_worker_image: str = ""
     retention_interval_s: float = 3600.0
     artifact_collection_interval_s: float = 3600.0
     """How often unreferenced managed artifacts are collected. 0 disables it.
@@ -178,9 +178,13 @@ class EyvanSettings:
     ray_jobs_port: int = 8265
     native_worker_port: int = 8100
     native_worker_package: str | None = None
+    native_worker_package_sha256: str | None = None
+    native_worker_package_generation: str | None = None
     native_worker_artifact_root_uri: str | None = None
     native_worker_public_ingress_tag: str | None = None
     native_worker_wheelhouse: str | None = None
+    native_worker_wheelhouse_sha256: str | None = None
+    native_worker_wheelhouse_generation: str | None = None
     native_worker_state_dir: str = "/var/lib/eyvan/native-worker"
     platform_config_path: str = "/etc/eyvan/platform.yaml"
 
@@ -301,7 +305,11 @@ class EyvanSettings:
             ray_jobs_port=int(os.getenv("EYVAN_RAY_JOBS_PORT", defaults.ray_jobs_port)),
             native_worker_port=int(os.getenv("EYVAN_NATIVE_WORKER_PORT", defaults.native_worker_port)),
             native_worker_package=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE"),
+            native_worker_package_sha256=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE_SHA256") or None,
+            native_worker_package_generation=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE_GENERATION") or None,
             native_worker_wheelhouse=os.getenv("EYVAN_NATIVE_WORKER_WHEELHOUSE"),
+            native_worker_wheelhouse_sha256=os.getenv("EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256") or None,
+            native_worker_wheelhouse_generation=os.getenv("EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION") or None,
             native_worker_state_dir=os.getenv("EYVAN_NATIVE_WORKER_STATE_DIR", defaults.native_worker_state_dir),
             # Both are read by _gcp_factory (drivers/registry.py) and were set only by
             # from_gcp_native_runtime_profile, so a locally-profiled agent had them and an

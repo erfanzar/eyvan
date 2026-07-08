@@ -13,7 +13,7 @@ development.
 This page is the reference. The task-oriented pages are shorter and are where to
 start:
 
-- [docs/install.md](docs/install.md) — the thirteen things a remote deployment
+- [docs/install.md](docs/install.md) — the fifteen things a remote deployment
   needs, what each is for, and how each fails when it is missing.
 - [docs/operate.md](docs/operate.md) — daily operation: what is queued and why,
   cost, storage, durability, debugging one workload.
@@ -105,14 +105,12 @@ against them using `EYVAN_DATABASE_URL`, with no `alembic.ini` required:
 EYVAN_DATABASE_URL=postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan eyvan-migrate
 ```
 
-In another terminal, start the dashboard:
+In another terminal, install the dashboard dependencies once and start the
+explicitly source-only development launcher:
 
 ```bash
-cd libs/eyvan/dashboard
-npm install
-VITE_EYVAN_DEV_AUTH=true \
-VITE_EYVAN_DEV_ROLE=fleet_admin \
-  npm run dev
+npm --prefix libs/eyvan/dashboard install
+uv run eyvan dashboard-dev
 ```
 
 The API defaults to `http://127.0.0.1:8080`; the dashboard defaults to
@@ -141,15 +139,29 @@ that sends no version header is accepted, because browsers, `curl`, and other
 non-SDK callers never send one. A malformed floor fails at server startup
 rather than rejecting live traffic.
 
-The production dashboard uses authorization-code PKCE. Configure
-`VITE_EYVAN_OIDC_ISSUER` and `VITE_EYVAN_OIDC_CLIENT_ID` when building
-the image; optional settings are documented in `dashboard/README.md`.
+The production image bundles the static dashboard. Its authorization-code PKCE
+issuer and public client ID are served by the control plane at runtime, so the
+same digest can be promoted between environments. From an installed wheel,
+`eyvan dashboard` opens that hosted UI; `eyvan dashboard-dev` requires a source
+checkout and npm. Optional browser settings are documented in
+`dashboard/README.md`.
+
+The Dockerfile expects the Eyvan package directory as its build context. Use
+one of these commands for the checkout layout you are in:
 
 ```bash
-docker build -f libs/eyvan/Dockerfile -t eyvan:latest \
-  --build-arg VITE_EYVAN_OIDC_ISSUER=https://identity.example.com \
-  --build-arg VITE_EYVAN_OIDC_CLIENT_ID=eyvan-dashboard .
+# EasyDeL workspace root
+docker build -f libs/eyvan/Dockerfile \
+  -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" libs/eyvan
+
+# Standalone Eyvan checkout
+docker build -f Dockerfile \
+  -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" .
 ```
+
+Publish the image, obtain its real registry digest, and deploy the
+`repository@sha256:...` reference. The qualification workflow in
+`deploy/helm/eyvan/README.md` deliberately supplies no example digest.
 
 ## Declarative fleet operations
 
@@ -577,11 +589,12 @@ For `eyvan-native`, Eyvan renders its worker bootstrap plus the typed
 provisioned VM or every host in the TPU cell, and waits for its authenticated
 health API before the cell becomes schedulable. `provider_options.startup_script`
 is retained only as a legacy bootstrap hook and cannot be combined with `runtime`.
-Set `EYVAN_NATIVE_WORKER_PACKAGE` on the
-provisioning agent to a pinned `gs://` wheel while Eyvan is unreleased. For an
-internal-only `private-google-access` VM, also set
-`EYVAN_NATIVE_WORKER_WHEELHOUSE` to a pinned `gs://` zip containing every
-Python dependency wheel; Private Google Access reaches GCS but not PyPI. This
+Set `EYVAN_NATIVE_WORKER_PACKAGE` on the provisioning agent to a `gs://`
+wheel together with its exact `EYVAN_NATIVE_WORKER_PACKAGE_SHA256` and GCS
+object generation. For an internal-only `private-google-access` VM, also set
+`EYVAN_NATIVE_WORKER_WHEELHOUSE` plus its SHA-256 and generation for a zip
+containing every Python dependency wheel; Private Google Access reaches GCS but
+not PyPI. Bootstrap verifies both files before installation or extraction. This
 is fleet bootstrap, never a job-level flag. Native pools require an explicit
 `bootstrap_egress` route:
 `private-google-access` or `cloud-nat` for an internal-only VM, or
@@ -615,9 +628,17 @@ A cell agent should run in the GCP project/VPC that owns its Compute Engine and
 Cloud TPU capacity:
 
 ```bash
+# EasyDeL workspace root
 docker build -f libs/eyvan/Dockerfile.agent \
-  -t eyvan-agent:latest .
+  -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" libs/eyvan
+
+# Standalone Eyvan checkout
+docker build -f Dockerfile.agent \
+  -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" .
 ```
+
+Publish and deploy the agent by its own registry-reported digest; it is not the
+control-plane image with a different name.
 
 The standalone agent image includes the Google Cloud CLI required by the
 generic `gcp` capacity backend. It installs neither eray nor the optional Ray
@@ -635,7 +656,11 @@ EYVAN_FLEET_STATE_URI=gs://fleet-state/eyvan/fleet-state.json \
 EYVAN_CAPACITY_BACKEND=gcp \
 EYVAN_EXECUTION_BACKEND=eyvan-native \
 EYVAN_NATIVE_WORKER_PACKAGE=gs://artifacts/eyvan/eyvan-0.1.0-py3-none-any.whl \
+EYVAN_NATIVE_WORKER_PACKAGE_SHA256="$EYVAN_WORKER_WHEEL_SHA256" \
+EYVAN_NATIVE_WORKER_PACKAGE_GENERATION="$EYVAN_WORKER_WHEEL_GENERATION" \
 EYVAN_NATIVE_WORKER_WHEELHOUSE=gs://artifacts/eyvan/eyvan-wheelhouse.zip \
+EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256="$EYVAN_WORKER_WHEELHOUSE_SHA256" \
+EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION="$EYVAN_WORKER_WHEELHOUSE_GENERATION" \
   uv run eyvan-agent --port 8090
 ```
 
@@ -650,9 +675,14 @@ churn would thrash that cache and could repoint an executor at a different pod.
 ```bash
 EYVAN_CAPACITY_BACKEND=kubernetes \
 EYVAN_KUBERNETES_NAMESPACE=eyvan \
-EYVAN_KUBERNETES_WORKER_IMAGE=registry.example/eyvan-native-worker:1.2.3 \
+EYVAN_KUBERNETES_WORKER_IMAGE="$EYVAN_WORKER_REPOSITORY@$EYVAN_WORKER_DIGEST" \
   uv run eyvan-agent --port 8090
 ```
+
+The Kubernetes driver refuses tags and accepts only a
+`repository@sha256:<registry-reported digest>` worker image. Build that distinct
+artifact from `Dockerfile.worker`; the stock Helm chart also creates its worker
+ServiceAccount and namespaced Role/RoleBinding.
 
 **Kueue is opt-in.** Set `provider_options.queue_name` on a pool to route its
 Jobs through Kueue; without it, kube-scheduler and the cluster autoscaler place
