@@ -561,7 +561,13 @@ def test_the_orm_stamps_the_head_of_the_migration_chain() -> None:
         importlib.import_module(f"{versions.__name__}.{info.name}") for info in pkgutil.iter_modules(versions.__path__)
     ]
     revisions = {module.revision for module in modules}
-    superseded = {module.down_revision for module in modules if module.down_revision is not None}
+    superseded: set[str] = set()
+    for module in modules:
+        down_revision = module.down_revision
+        if isinstance(down_revision, tuple):
+            superseded.update(down_revision)
+        elif down_revision is not None:
+            superseded.add(down_revision)
     heads = revisions - superseded
 
     assert heads == {SCHEMA_REVISION}
