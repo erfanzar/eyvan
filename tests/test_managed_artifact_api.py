@@ -309,7 +309,8 @@ def test_every_capability_authenticated_transfer_is_audited(tmp_path) -> None:
     events = _audit_actions(app)
     assert ("workload:wl-audit", "artifact.read", f"callables/{callable_uri(digest)}") in events
     # The actor is the workload, not the operator who happened to upload it.
-    assert all(actor.startswith("workload:") for actor, _action, _entity in events)
+    transfer_events = [event for event in events if event[1] == "artifact.read"]
+    assert all(actor.startswith("workload:") for actor, _action, _entity in transfer_events)
 
 
 def test_a_refused_transfer_token_is_audited_too(tmp_path) -> None:
@@ -441,6 +442,8 @@ def test_inventory_api_is_dry_run_first_and_reindex_requires_scope_acknowledgeme
             "status": "physical_only",
             "indexed_size_bytes": None,
             "observed_size_bytes": len(b"physical"),
+            "lifecycle_state": None,
+            "indexed_object_version": None,
             "observed_object_version": dry_run.json()["entries"][0]["observed_object_version"],
             "reindexed": False,
         }

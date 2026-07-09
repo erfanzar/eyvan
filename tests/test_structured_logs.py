@@ -624,6 +624,11 @@ def _artifact_access(tmp_path):
     )
 
 
+def _attach_artifact_access(controller, access) -> None:
+    controller.artifact_access = access
+    controller.service.artifact_store = access.store
+
+
 async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:
     """The failure this archive exists for.
 
@@ -634,7 +639,7 @@ async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:
 
     agent = _PagingAgent(message="the last thing it printed")
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
     workload_id = "wl-1"
 
     async with controller.repository.transaction() as transaction:
@@ -663,7 +668,7 @@ async def test_an_attempt_with_no_archive_says_so_rather_than_looking_silent(tmp
 
     agent = _PagingAgent()
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
 
     async with controller.repository.transaction() as transaction:
         stored = await transaction.get_workload("wl-1")
@@ -687,13 +692,13 @@ async def test_each_attempt_archives_separately(tmp_path) -> None:
 
     access = _artifact_access(tmp_path)
     first = await _controller_with(_PagingAgent(message="attempt one"), attempt=1)
-    first.artifact_access = access
+    _attach_artifact_access(first, access)
     async with first.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
     await first._archive_terminal_logs(workload)
 
     second = await _controller_with(_PagingAgent(message="attempt two"), attempt=2)
-    second.artifact_access = access
+    _attach_artifact_access(second, access)
     async with second.repository.transaction() as transaction:
         retried = await transaction.get_workload("wl-1")
     await second._archive_terminal_logs(retried)
@@ -720,7 +725,7 @@ async def test_an_archive_failure_does_not_block_settlement(tmp_path) -> None:
     access = _artifact_access(tmp_path)
     object.__setattr__(access, "store", _BrokenStore())
     controller = await _controller_with(_PagingAgent())
-    controller.artifact_access = access
+    _attach_artifact_access(controller, access)
 
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
@@ -757,7 +762,7 @@ async def test_the_release_path_itself_archives(tmp_path) -> None:
 
     access = _artifact_access(tmp_path)
     controller = await _controller_with(_PagingAgent(message="final line"))
-    controller.artifact_access = access
+    _attach_artifact_access(controller, access)
 
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
@@ -790,8 +795,9 @@ async def _collection_service(tmp_path):
 async def _index(service, uri: str, *, age_days: int) -> None:
     from datetime import timedelta
 
-    from eyvan.records import ManagedArtifactRecord, utcnow
+    from eyvan.records import ManagedArtifactRecord, ManagedArtifactState, utcnow
 
+    created_at = utcnow() - timedelta(days=age_days)
     async with service.repository.transaction() as transaction:
         await transaction.put_managed_artifact(
             ManagedArtifactRecord(
@@ -799,8 +805,15 @@ async def _index(service, uri: str, *, age_days: int) -> None:
                 org_id="acme",
                 project_id="research",
                 kind=uri.split("//")[1].split("/")[0],
+                state=ManagedArtifactState.ACTIVE,
+                record_generation=1,
                 size_bytes=10,
-                created_at=utcnow() - timedelta(days=age_days),
+                sha256="0" * 64,
+                object_version="test:version-1",
+                created_at=created_at,
+                updated_at=created_at,
+                activated_at=created_at,
+                quarantine_reason=None,
             )
         )
 

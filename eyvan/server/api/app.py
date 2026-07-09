@@ -15,7 +15,6 @@ import ipaddress
 import logging
 import os
 import secrets
-import subprocess
 import typing as tp
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -40,9 +39,9 @@ from eyvan.artifacts.managed import (
     ArtifactAction,
     ArtifactTokenSigner,
     InvalidArtifactToken,
-    ManagedArtifactConflictError,
     ManagedArtifactInventoryError,
     ManagedArtifactInventoryStore,
+    ManagedArtifactVersionedStore,
     callable_uri,
     managed_artifact_store_from_uri,
     result_uri,
@@ -151,6 +150,7 @@ from eyvan.server.service.errors import (
     InputError,
     NoMatchingCapacityPoolError,
     NotFoundError,
+    UnavailableError,
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 from eyvan.server.service.groups import GroupRole
@@ -312,11 +312,13 @@ def create_app(
 
     if service.inventory_store is not None and service.inventory_store is not artifact_access.store:
         raise ValueError("the service inventory and transfer API must use the same managed artifact store")
-    # Inventory and transfer observe one physical namespace. Do not wire the
-    # deletion-capable artifact_store here: collection needs the later serialized
-    # deletion/upload state machine, and API inventory must not enable it early.
-    # Older injected transfer stores remain usable, but the inventory endpoint
-    # fails closed until they implement the bounded, scope-explicit protocol.
+    # Transfer, inventory, lifecycle reads and conditional deletion must name
+    # exactly one physical namespace. A store lacking versions can remain an
+    # explicitly injected legacy SDK object, but it cannot back managed API I/O.
+    if service.artifact_store is not None and service.artifact_store is not artifact_access.store:
+        raise ValueError("the service lifecycle and transfer API must use the same managed artifact store")
+    if service.artifact_store is None and isinstance(artifact_access.store, ManagedArtifactVersionedStore):
+        service.artifact_store = artifact_access.store
     if service.inventory_store is None and isinstance(artifact_access.store, ManagedArtifactInventoryStore):
         service.inventory_store = artifact_access.store
 
@@ -434,6 +436,8 @@ def create_app(
             status_code = status.HTTP_404_NOT_FOUND
         elif isinstance(exc, ConflictError):
             status_code = status.HTTP_409_CONFLICT
+        elif isinstance(exc, UnavailableError):
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         else:
             status_code = status.HTTP_400_BAD_REQUEST
         if isinstance(exc, (AuthorizationError, NotFoundError)):
@@ -586,10 +590,7 @@ def create_app(
         return bytes(payload)
 
     async def managed_get(uri: str, *, org_id: str, project_id: str) -> bytes:
-        try:
-            return await asyncio.to_thread(artifact_access.store.get, uri, org_id=org_id, project_id=project_id)
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            raise NotFoundError(f"managed artifact {uri!r} was not found") from exc
+        return await service.read_managed_artifact(org_id=org_id, project_id=project_id, uri=uri)
 
     async def managed_put(
         uri: str,
@@ -598,33 +599,18 @@ def create_app(
         org_id: str,
         project_id: str,
         sha256: str | None = None,
-    ) -> None:
-        """Index one object's bytes, then store it.
+        actor: str,
+    ) -> ManagedArtifactRecord:
+        """Reserve, conditionally write, and activate one scoped object."""
 
-        Index first: the quota check lives in ``index_managed_artifact`` and has
-        to be able to refuse the write. Ordering it after the store would leave a
-        rejected upload sitting in the object store with no index row -- bytes
-        that are charged to nobody and that no collector would ever find.
-
-        The reverse failure is the safe one. If the store write fails after the
-        index row lands, the row over-reports usage for one URI until the next
-        successful write to it, which costs the project quota headroom rather
-        than losing an object.
-        """
-
-        await service.index_managed_artifact(
+        return await service.upload_managed_artifact(
             org_id=org_id,
             project_id=project_id,
             uri=uri,
-            size_bytes=len(payload),
+            payload=payload,
             sha256=sha256,
+            actor=actor,
         )
-        try:
-            await asyncio.to_thread(artifact_access.store.put, uri, payload, org_id=org_id, project_id=project_id)
-        except ManagedArtifactConflictError as exc:
-            raise ConflictError(str(exc)) from exc
-        except (TypeError, ValueError) as exc:
-            raise InputError(str(exc)) from exc
 
     def verify_artifact_token(
         token: str,
@@ -682,14 +668,6 @@ def create_app(
                 action="artifact.read_denied",
             )
             raise
-        await service.record_artifact_access(
-            org_id=org_id,
-            project_id=project_id,
-            workload_id=workload_id,
-            kind=kind,
-            object_id=uri,
-            action="artifact.read",
-        )
 
     async def current_result_uri(workload_id: str) -> str:
         """Return the managed result URI this workload's current attempt owns.
@@ -989,7 +967,14 @@ def create_app(
         except ValueError as exc:
             raise InputError(str(exc)) from exc
         payload = await artifact_body(raw_request, limit=settings.artifact_max_callable_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id, sha256=digest)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            sha256=digest,
+            actor=principal.subject,
+        )
         return {"uri": uri, "sha256": digest}
 
     @app.put("/api/v1/artifacts/workspaces/{digest}", tags=["artifacts"])
@@ -1012,7 +997,14 @@ def create_app(
         except ValueError as exc:
             raise InputError(str(exc)) from exc
         payload = await artifact_body(raw_request, limit=settings.artifact_max_workspace_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id, sha256=digest)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            sha256=digest,
+            actor=principal.subject,
+        )
         return {"uri": uri, "sha256": digest}
 
     @app.get(
@@ -1039,11 +1031,16 @@ def create_app(
             workload_id=workload_id,
             kind="workspaces",
         )
-        return Response(
-            await managed_get(uri, org_id=org_id, project_id=project_id),
-            media_type="application/gzip",
-            headers={"Cache-Control": "private, no-store"},
+        payload = await managed_get(uri, org_id=org_id, project_id=project_id)
+        await service.record_artifact_access(
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            kind="workspaces",
+            object_id=uri,
+            action="artifact.read",
         )
+        return Response(payload, media_type="application/gzip", headers={"Cache-Control": "private, no-store"})
 
     @app.get("/api/v1/artifacts/results/{result_id}", response_class=Response, tags=["artifacts"])
     async def download_result_artifact(
@@ -1087,11 +1084,16 @@ def create_app(
             workload_id=workload_id,
             kind="callables",
         )
-        return Response(
-            await managed_get(uri, org_id=org_id, project_id=project_id),
-            media_type="application/octet-stream",
-            headers={"Cache-Control": "private, no-store"},
+        payload = await managed_get(uri, org_id=org_id, project_id=project_id)
+        await service.record_artifact_access(
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            kind="callables",
+            object_id=uri,
+            action="artifact.read",
         )
+        return Response(payload, media_type="application/octet-stream", headers={"Cache-Control": "private, no-store"})
 
     @app.put("/api/v1/artifacts/results/{result_id}/content", include_in_schema=False)
     async def transfer_result_artifact(
@@ -1139,7 +1141,13 @@ def create_app(
             workload_id=workload_id,
         )
         payload = await artifact_body(raw_request, limit=settings.artifact_max_result_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            actor=f"workload:{workload_id}",
+        )
         return {"uri": uri}
 
     @app.get("/api/v1/secrets/content", response_class=Response, include_in_schema=False)

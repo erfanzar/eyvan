@@ -1141,16 +1141,16 @@ class _ControllerObservation:
         found = False
         for rank in range(_ARCHIVED_RANK_SCAN_LIMIT):
             try:
-                payload = await asyncio.to_thread(
-                    self.artifact_access.store.get,
-                    log_uri(workload.id, workload.attempt, rank),
+                payload = await self.service.read_managed_artifact(
                     org_id=workload.org_id,
                     project_id=workload.project_id,
+                    uri=log_uri(workload.id, workload.attempt, rank),
                 )
-            except Exception:
-                # Absent rather than unreadable: ranks are archived contiguously
-                # from zero, so the first gap is the end of the set.
+            except NotFoundError:
+                # Ranks are archived contiguously, so a proved absence is the end.
                 break
+            except Exception:
+                return LogPage(unavailable=True, detail="archived logs could not be read conclusively")
             found = True
             for line in payload.decode(errors="replace").splitlines():
                 if not line.strip():

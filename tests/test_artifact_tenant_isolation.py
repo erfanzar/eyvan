@@ -18,10 +18,13 @@ from eyvan.artifacts.managed import callable_uri
 from eyvan.config import EyvanSettings
 from eyvan.records import (
     ArtifactReferenceRecord,
+    ManagedArtifactRecord,
+    ManagedArtifactState,
     Principal,
     Role,
     RoleGrant,
     artifact_reference_id,
+    utcnow,
 )
 from eyvan.server.api.app import create_app
 from eyvan.server.persistence.memory import InMemoryRepository
@@ -68,6 +71,21 @@ async def _seed(service) -> None:
     await service.index_managed_artifact(org_id="acme", project_id="beta", uri=_URI, size_bytes=29, sha256="a" * 64)
     async with service.repository.transaction() as transaction:
         for project_id, workload_id in (("alpha", "wl-alpha"), ("beta", "wl-beta")):
+            record = await transaction.get_managed_artifact("acme", project_id, _URI)
+            assert record is not None
+            now = utcnow()
+            await transaction.put_managed_artifact(
+                ManagedArtifactRecord.model_validate(
+                    {
+                        **record.model_dump(mode="python"),
+                        "state": ManagedArtifactState.ACTIVE,
+                        "object_version": f"test:{project_id}",
+                        "activated_at": now,
+                        "updated_at": now,
+                        "quarantine_reason": None,
+                    }
+                )
+            )
             await transaction.put_artifact_reference(
                 ArtifactReferenceRecord(
                     id=artifact_reference_id("acme", project_id, _URI, workload_id),

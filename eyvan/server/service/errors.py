@@ -39,6 +39,10 @@ class InputError(EyvanServiceError):
     """Request is structurally valid but violates a domain precondition."""
 
 
+class UnavailableError(EyvanServiceError):
+    """A dependency outcome is inconclusive and the request may be retried."""
+
+
 class NoMatchingCapacityPoolError(NotFoundError):
     """No enabled pool in one fleet provides the requested accelerator type."""
 
@@ -67,4 +71,5 @@ __all__ = (
     "NoMatchingCapacityPoolError",
     "NotFoundError",
     "ServiceErrorCode",
+    "UnavailableError",
 )
