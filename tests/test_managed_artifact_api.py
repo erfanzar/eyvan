@@ -126,6 +126,71 @@ def test_managed_callable_and_result_round_trip_with_scoped_transfer_tokens(tmp_
     assert result.content == result_payload
 
 
+def test_local_artifact_permission_failure_returns_503_without_changing_lifecycle(tmp_path) -> None:
+    app = _app(tmp_path)
+    client = TestClient(app)
+    payload = b"permission-failure"
+    digest = hashlib.sha256(payload).hexdigest()
+    uri = callable_uri(digest)
+    uploaded = client.put(
+        f"/api/v1/artifacts/callables/{digest}",
+        params={"org_id": "acme", "project_id": "research"},
+        headers={**_headers(), "Content-Type": "application/octet-stream"},
+        content=payload,
+    )
+    assert uploaded.status_code == 200
+    access = app.state.artifact_access
+    target = next((access.store.root / "scopes").rglob(f"{digest}.pkl"))
+    transfer = access.callable_download_transfer(
+        uri,
+        org_id="acme",
+        project_id="research",
+        workload_id="wl-permission",
+    )
+    target.chmod(0)
+    try:
+        response = client.get(
+            _route(transfer.url),
+            headers={"X-Eyvan-Artifact-Token": transfer.token},
+        )
+    finally:
+        target.chmod(0o400)
+
+    assert response.status_code == 503
+    assert "Permission" not in response.text
+    assert str(target) not in response.text
+
+    async def state() -> str:
+        async with app.state.service.repository.transaction() as transaction:
+            record = await transaction.get_managed_artifact("acme", "research", uri)
+        assert record is not None
+        return record.state.value
+
+    assert asyncio.run(state()) == "active"
+
+
+def test_content_addressed_upload_mismatch_is_rejected_before_reservation(tmp_path) -> None:
+    app = _app(tmp_path)
+    client = TestClient(app)
+    intended_digest = hashlib.sha256(b"intended").hexdigest()
+    uri = callable_uri(intended_digest)
+
+    response = client.put(
+        f"/api/v1/artifacts/callables/{intended_digest}",
+        params={"org_id": "acme", "project_id": "research"},
+        headers={**_headers(), "Content-Type": "application/octet-stream"},
+        content=b"different",
+    )
+
+    assert response.status_code == 400
+
+    async def missing() -> bool:
+        async with app.state.service.repository.transaction() as transaction:
+            return await transaction.get_managed_artifact("acme", "research", uri) is None
+
+    assert asyncio.run(missing()) is True
+
+
 def test_managed_artifact_tokens_and_tenant_storage_do_not_cross_scopes(tmp_path) -> None:
     app = _app(tmp_path)
     client = TestClient(app)
@@ -478,6 +543,39 @@ def test_inventory_api_is_dry_run_first_and_reindex_requires_scope_acknowledgeme
     assert repaired.json()["entries"][0]["reindexed"] is True
     assert store.get(uri, org_id="acme", project_id="research") == b"physical"
     assert any(action == "artifact.inventory_reindexed" for _actor, action, _entity in _audit_actions(app))
+
+
+def test_inventory_reindex_fails_closed_on_content_addressed_physical_mismatch(tmp_path) -> None:
+    app = _app(tmp_path)
+    client = TestClient(app)
+    intended = b"intended"
+    digest = hashlib.sha256(intended).hexdigest()
+    uri = callable_uri(digest)
+    store = app.state.artifact_access.store
+    target = store.root / "scopes" / storage_scope("acme", "research") / "callables" / f"{digest}.pkl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"wrong-physical-bytes")
+    target.chmod(0o400)
+
+    response = client.post(
+        "/api/v1/artifacts/inventory/reindex",
+        headers={**_headers(), "X-Eyvan-Roles": "project_admin"},
+        json={
+            "org_id": "acme",
+            "project_id": "research",
+            "limit": 100,
+            "acknowledge_scope": "acme/research",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_inventory_inconclusive"
+
+    async def missing() -> bool:
+        async with app.state.service.repository.transaction() as transaction:
+            return await transaction.get_managed_artifact("acme", "research", uri) is None
+
+    assert asyncio.run(missing()) is True
 
 
 def test_inventory_api_fails_closed_instead_of_treating_parse_failure_as_an_empty_scope(tmp_path) -> None:

@@ -15,6 +15,7 @@ from datetime import timedelta
 import pytest
 
 from eyvan.artifacts.managed import (
+    LocalManagedArtifactStore,
     ManagedArtifactConflictError,
     ManagedArtifactDeleteInconclusiveError,
     ManagedArtifactDeleteResult,
@@ -24,6 +25,8 @@ from eyvan.artifacts.managed import (
     ManagedArtifactVersionMismatchError,
     ManagedArtifactWrite,
     callable_uri,
+    result_uri,
+    storage_scope,
 )
 from eyvan.records import (
     CallableExecution,
@@ -41,7 +44,7 @@ from eyvan.records import (
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.errors import ConflictError, InputError
+from eyvan.server.service.errors import ConflictError, InputError, UnavailableError
 
 
 class VersionedMemoryStore:
@@ -79,7 +82,10 @@ class VersionedMemoryStore:
             if current is not None:
                 existing, version = current
                 if existing != payload:
-                    raise ManagedArtifactConflictError("different bytes")
+                    raise ManagedArtifactConflictError(
+                        "different bytes",
+                        current_metadata=self._metadata(uri, existing, version),
+                    )
                 return ManagedArtifactWrite(self._metadata(uri, existing, version), created=False)
             version = self._next_version
             self._next_version += 1
@@ -102,7 +108,7 @@ class VersionedMemoryStore:
             payload, version = current
             metadata = self._metadata(uri, payload, version)
             if object_version is not None and metadata.object_version != object_version:
-                raise ManagedArtifactVersionMismatchError("different version")
+                raise ManagedArtifactVersionMismatchError("different version", current_metadata=metadata)
             return ManagedArtifactRead(payload=payload, metadata=metadata)
 
     def delete_versioned(
@@ -253,6 +259,43 @@ async def test_no_physical_store_io_runs_while_the_repository_transaction_is_loc
 
 
 @pytest.mark.asyncio
+async def test_local_read_permission_failure_is_unavailable_not_absent_or_corrupt(tmp_path) -> None:
+    repository = InMemoryRepository()
+    await repository.open()
+    store = LocalManagedArtifactStore(tmp_path / "objects")
+    service = ControlPlaneService(
+        repository,
+        artifact_store=store,
+        callable_trust=CallableProjectTrustPolicy.from_projects(("acme/research",)),
+    )
+    payload = b"permission-failure"
+    digest = hashlib.sha256(payload).hexdigest()
+    uri = callable_uri(digest)
+    active = await service.upload_managed_artifact(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        payload=payload,
+    )
+    target = next((store.root / "scopes").rglob(f"{digest}.pkl"))
+    target.chmod(0)
+    try:
+        with pytest.raises(UnavailableError, match="read is inconclusive"):
+            await service.read_managed_artifact(
+                org_id="acme",
+                project_id="research",
+                uri=uri,
+            )
+    finally:
+        target.chmod(0o400)
+
+    unchanged = await _record(service, uri)
+    assert unchanged.state is ManagedArtifactState.ACTIVE
+    assert unchanged.record_generation == active.record_generation
+    assert unchanged.object_version == active.object_version
+
+
+@pytest.mark.asyncio
 async def test_reserve_write_activate_and_exact_read_are_distinct_boundaries() -> None:
     service, store = await _service()
     payload = b"payload"
@@ -306,6 +349,54 @@ async def test_pending_upload_cannot_be_referenced_or_held_before_activation() -
 
 
 @pytest.mark.asyncio
+async def test_recovery_treats_pending_and_tombstone_read_races_as_inconclusive() -> None:
+    service, store = await _service()
+    payload = b"changing-during-recovery"
+    uri = callable_uri(hashlib.sha256(payload).hexdigest())
+    reserved = await service.reserve_managed_artifact_upload(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    original_get = store.get_versioned
+
+    def changing(*args, **kwargs):
+        del args, kwargs
+        raise ManagedArtifactVersionMismatchError("changed during exact observation")
+
+    store.get_versioned = changing  # type: ignore[method-assign]
+    pending_result = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=reserved.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert pending_result["inconclusive"] == 1
+    assert (await _record(service, uri)).state is ManagedArtifactState.PENDING_UPLOAD
+
+    store.get_versioned = original_get  # type: ignore[method-assign]
+    released = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=reserved.updated_at + timedelta(seconds=3),
+        recovery_grace_s=1,
+    )
+    assert released["released"] == 1
+    tombstone = await _record(service, uri)
+    store.get_versioned = changing  # type: ignore[method-assign]
+    tombstone_result = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=tombstone.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert tombstone_result["inconclusive"] == 1
+    assert (await _record(service, uri)).state is ManagedArtifactState.DELETED
+
+
+@pytest.mark.asyncio
 async def test_expired_pending_absence_releases_quota_as_a_tombstone() -> None:
     service, _store = await _service()
     payload = b"pending"
@@ -328,6 +419,152 @@ async def test_expired_pending_absence_releases_quota_as_a_tombstone() -> None:
     assert record.state is ManagedArtifactState.DELETED
     assert record.size_bytes == 0
     assert record.record_generation == reserved.record_generation
+
+
+@pytest.mark.asyncio
+async def test_stale_upload_cannot_delete_the_provider_version_activated_by_its_retry() -> None:
+    service, store = await _service()
+    payload = b"stale-upload-retry"
+    uri = callable_uri(hashlib.sha256(payload).hexdigest())
+    original_put = store.put_versioned
+    first_put_started = threading.Event()
+    allow_first_put = threading.Event()
+    put_calls = 0
+
+    def pause_first_put(
+        value_uri: str,
+        value_payload: bytes,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> ManagedArtifactWrite:
+        nonlocal put_calls
+        put_calls += 1
+        if put_calls == 1:
+            first_put_started.set()
+            if not allow_first_put.wait(timeout=3):
+                raise RuntimeError("stale upload barrier timed out")
+        return original_put(value_uri, value_payload, org_id=org_id, project_id=project_id)
+
+    store.put_versioned = pause_first_put  # type: ignore[method-assign]
+    stale_upload = asyncio.create_task(
+        service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=payload,
+        )
+    )
+    assert await asyncio.to_thread(first_put_started.wait, 3)
+    first_reservation = await _record(service, uri)
+    assert first_reservation.state is ManagedArtifactState.PENDING_UPLOAD
+
+    recovered = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=first_reservation.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert recovered["released"] == 1
+    assert (await _record(service, uri)).state is ManagedArtifactState.DELETED
+
+    retry = await service.upload_managed_artifact(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        payload=payload,
+    )
+    assert retry.state is ManagedArtifactState.ACTIVE
+    assert retry.record_generation == first_reservation.record_generation + 1
+    allow_first_put.set()
+    with pytest.raises(ConflictError, match="activation is stale"):
+        await stale_upload
+
+    final = await _record(service, uri)
+    assert final.state is ManagedArtifactState.ACTIVE
+    assert final.record_generation == retry.record_generation
+    assert final.object_version == retry.object_version
+    assert (
+        await service.read_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+        )
+        == payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_stale_payload_charges_its_full_size_when_the_retry_is_quarantined() -> None:
+    service, store = await _service()
+    stale_payload = b"a" * 100
+    retry_payload = b"b"
+    uri = result_uri("late-stale-payload")
+    original_put = store.put_versioned
+    first_put_started = threading.Event()
+    allow_first_put = threading.Event()
+    put_calls = 0
+
+    def pause_first_put(
+        value_uri: str,
+        value_payload: bytes,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> ManagedArtifactWrite:
+        nonlocal put_calls
+        put_calls += 1
+        if put_calls == 1:
+            first_put_started.set()
+            if not allow_first_put.wait(timeout=3):
+                raise RuntimeError("stale payload barrier timed out")
+        return original_put(value_uri, value_payload, org_id=org_id, project_id=project_id)
+
+    store.put_versioned = pause_first_put  # type: ignore[method-assign]
+    stale_upload = asyncio.create_task(
+        service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=stale_payload,
+        )
+    )
+    assert await asyncio.to_thread(first_put_started.wait, 3)
+    first_reservation = await _record(service, uri)
+    released = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=first_reservation.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert released["released"] == 1
+    retry_reservation = await service.reserve_managed_artifact_upload(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        size_bytes=len(retry_payload),
+        sha256=hashlib.sha256(retry_payload).hexdigest(),
+    )
+    assert retry_reservation.record_generation == first_reservation.record_generation + 1
+
+    allow_first_put.set()
+    with pytest.raises(ConflictError, match="is stale"):
+        await stale_upload
+    with pytest.raises(ConflictError, match="physical object conflicts"):
+        await service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=retry_payload,
+        )
+
+    quarantined = await _record(service, uri)
+    assert quarantined.state is ManagedArtifactState.QUARANTINED
+    assert quarantined.record_generation == retry_reservation.record_generation
+    assert quarantined.size_bytes == len(stale_payload)
+    assert store.get(uri, org_id="acme", project_id="research") == stale_payload
+    usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
+    assert usage.stored_bytes == len(stale_payload)
 
 
 @pytest.mark.asyncio
@@ -544,6 +781,36 @@ async def test_stale_delete_version_never_removes_a_reuploaded_generation() -> N
 
 
 @pytest.mark.asyncio
+async def test_delete_version_mismatch_charges_the_larger_quarantined_replacement() -> None:
+    service, store = await _service()
+    payload = b"a"
+    replacement = b"b" * 100
+    uri = callable_uri(hashlib.sha256(payload).hexdigest())
+    active = await service.upload_managed_artifact(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        payload=payload,
+    )
+    store.replace_out_of_band(uri, replacement, org_id="acme", project_id="research")
+
+    result = await service.collect_artifacts_once(
+        org_id="acme",
+        project_id="research",
+        grace_period_s=0,
+        dry_run=False,
+        now=(active.activated_at or utcnow()) + timedelta(seconds=1),
+    )
+
+    assert result.collected_uris == ()
+    quarantined = await _record(service, uri)
+    assert quarantined.state is ManagedArtifactState.QUARANTINED
+    assert quarantined.size_bytes == len(replacement)
+    usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
+    assert usage.stored_bytes == len(replacement)
+
+
+@pytest.mark.asyncio
 async def test_out_of_band_active_replacement_quarantines_instead_of_returning_bytes() -> None:
     service, store = await _service()
     payload = b"original"
@@ -552,7 +819,59 @@ async def test_out_of_band_active_replacement_quarantines_instead_of_returning_b
     store.replace_out_of_band(uri, b"replacement", org_id="acme", project_id="research")
     with pytest.raises(ConflictError, match="outside the lifecycle"):
         await service.read_managed_artifact(org_id="acme", project_id="research", uri=uri)
-    assert (await _record(service, uri)).state is ManagedArtifactState.QUARANTINED
+    quarantined = await _record(service, uri)
+    assert quarantined.state is ManagedArtifactState.QUARANTINED
+    assert quarantined.size_bytes == len(b"replacement")
+    usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
+    assert usage.stored_bytes == len(b"replacement")
+
+
+@pytest.mark.asyncio
+async def test_late_invalid_callable_bytes_after_tombstone_are_quarantined_and_charged(tmp_path) -> None:
+    repository = InMemoryRepository()
+    await repository.open()
+    store = LocalManagedArtifactStore(tmp_path / "objects")
+    service = ControlPlaneService(
+        repository,
+        artifact_store=store,
+        callable_trust=CallableProjectTrustPolicy.from_projects(("acme/research",)),
+    )
+    intended = b"a"
+    replacement = b"b" * 100
+    digest = hashlib.sha256(intended).hexdigest()
+    uri = callable_uri(digest)
+    reserved = await service.reserve_managed_artifact_upload(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        size_bytes=len(intended),
+        sha256=digest,
+    )
+    released = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=reserved.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert released["released"] == 1
+    target = store.root / "scopes" / storage_scope("acme", "research") / "callables" / f"{digest}.pkl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(replacement)
+    target.chmod(0o400)
+
+    recovered = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=(await _record(service, uri)).updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+
+    assert recovered["quarantined"] == 1
+    quarantined = await _record(service, uri)
+    assert quarantined.state is ManagedArtifactState.QUARANTINED
+    assert quarantined.size_bytes == len(replacement)
+    usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
+    assert usage.stored_bytes == len(replacement)
 
 
 @pytest.mark.asyncio

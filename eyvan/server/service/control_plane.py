@@ -22,6 +22,7 @@ from eyvan._internal.json_types import JsonObject, JsonValue, model_json
 from eyvan.artifacts.managed import (
     CONTENT_ADDRESSED_KINDS,
     MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
+    InvalidManagedArtifactURI,
     ManagedArtifactConflictError,
     ManagedArtifactDeleteInconclusiveError,
     ManagedArtifactDeleteStatus,
@@ -6001,6 +6002,8 @@ class ControlPlaneService:
         """Reserve quota and one logical generation before external I/O."""
 
         reference = parse_managed_uri(uri)
+        if reference.kind in CONTENT_ADDRESSED_KINDS and sha256 != reference.object_id:
+            raise InputError("managed artifact digest does not match its content-addressed URI")
         now = utcnow()
         async with self.repository.transaction() as tx:
             existing = await tx.get_managed_artifact(org_id, project_id, uri)
@@ -6233,9 +6236,23 @@ class ControlPlaneService:
                     record_generation=reserved.record_generation,
                     reason="active physical object changed during upload replay",
                     actor=actor,
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
                 )
                 raise ConflictError("active managed artifact version changed") from exc
-            except ManagedArtifactOperationInconclusiveError as exc:
+            except ManagedArtifactConflictError as exc:
+                await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=uri,
+                    record_generation=reserved.record_generation,
+                    reason="active physical bytes disagree with their URI",
+                    actor=actor,
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                raise ConflictError("active managed artifact bytes disagree with their ledger") from exc
+            except (ManagedArtifactOperationInconclusiveError, InvalidManagedArtifactURI, OSError) as exc:
                 raise UnavailableError("managed artifact replay verification is inconclusive") from exc
             if current_bytes.payload != payload:
                 await self._quarantine_managed_artifact(
@@ -6266,35 +6283,31 @@ class ControlPlaneService:
                 record_generation=reserved.record_generation,
                 reason="physical object contains different bytes",
                 actor=actor,
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
             )
             raise ConflictError("managed artifact physical object conflicts with the reservation") from exc
-        except (ManagedArtifactWriteInconclusiveError, ManagedArtifactOperationInconclusiveError) as exc:
+        except (
+            ManagedArtifactWriteInconclusiveError,
+            ManagedArtifactOperationInconclusiveError,
+            ManagedArtifactVersionMismatchError,
+            InvalidManagedArtifactURI,
+            OSError,
+        ) as exc:
             raise UnavailableError("managed artifact write is inconclusive; retry or reconcile the reservation") from exc
 
-        try:
-            return await self.activate_managed_artifact_upload(
-                org_id=org_id,
-                project_id=project_id,
-                uri=uri,
-                record_generation=reserved.record_generation,
-                metadata=written.metadata,
-                actor=actor,
-            )
-        except ConflictError:
-            # A stale writer may create bytes only under put-if-absent. Remove
-            # exactly the version it created; never fall back to an unconditional
-            # cleanup that could erase a later generation.
-            try:
-                await asyncio.to_thread(
-                    self.artifact_store.delete_versioned,
-                    uri,
-                    org_id=org_id,
-                    project_id=project_id,
-                    object_version=written.metadata.object_version,
-                )
-            except ManagedArtifactOperationInconclusiveError:
-                logger.error("stale artifact upload cleanup was inconclusive for %s", uri)
-            raise
+        # Do not physically clean up after an activation CAS failure here. A
+        # retry may already have activated the same immutable provider version,
+        # and no lock may span the storage call needed to distinguish that race.
+        # Bounded inventory/reconciliation owns any genuinely orphaned object.
+        return await self.activate_managed_artifact_upload(
+            org_id=org_id,
+            project_id=project_id,
+            uri=uri,
+            record_generation=reserved.record_generation,
+            metadata=written.metadata,
+            actor=actor,
+        )
 
     async def read_managed_artifact(
         self,
@@ -6339,9 +6352,23 @@ class ControlPlaneService:
                 record_generation=record.record_generation,
                 reason="active physical object version changed",
                 actor="system:artifact-read",
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
             )
             raise ConflictError("managed artifact version changed outside the lifecycle") from exc
-        except ManagedArtifactOperationInconclusiveError as exc:
+        except ManagedArtifactConflictError as exc:
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=record.record_generation,
+                reason="active physical bytes disagree with their URI",
+                actor="system:artifact-read",
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+            )
+            raise ConflictError("managed artifact bytes disagree with their ledger") from exc
+        except (ManagedArtifactOperationInconclusiveError, InvalidManagedArtifactURI, OSError) as exc:
             raise UnavailableError("managed artifact read is inconclusive") from exc
 
         if (
@@ -6471,10 +6498,29 @@ class ControlPlaneService:
                     )
                     counts["released"] += 1
                 continue
-            except (ManagedArtifactOperationInconclusiveError, ManagedArtifactInventoryError):
+            except (
+                ManagedArtifactOperationInconclusiveError,
+                ManagedArtifactInventoryError,
+                ManagedArtifactVersionMismatchError,
+                InvalidManagedArtifactURI,
+                OSError,
+            ):
                 counts["inconclusive"] += 1
                 continue
-            except (ManagedArtifactConflictError, ValueError):
+            except ManagedArtifactConflictError as exc:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    record_generation=record.record_generation,
+                    reason="pending physical object could not be verified",
+                    actor="system:artifact-recovery",
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+            except ValueError:
                 quarantined = await self._quarantine_managed_artifact(
                     org_id=org_id,
                     project_id=project_id,
@@ -6545,7 +6591,27 @@ class ControlPlaneService:
                     ):
                         await tx.put_managed_artifact(current.model_copy(update={"updated_at": moment}))
                 continue
-            except (ManagedArtifactOperationInconclusiveError, ManagedArtifactInventoryError, ValueError):
+            except ManagedArtifactConflictError as exc:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=tombstone.uri,
+                    record_generation=tombstone.record_generation,
+                    reason="physical object appeared after lifecycle deletion with invalid bytes",
+                    actor="system:artifact-recovery",
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+            except (
+                ManagedArtifactOperationInconclusiveError,
+                ManagedArtifactInventoryError,
+                ManagedArtifactVersionMismatchError,
+                InvalidManagedArtifactURI,
+                OSError,
+                ValueError,
+            ):
                 counts["inconclusive"] += 1
                 continue
             quarantined = await self._quarantine_managed_artifact(
@@ -6742,7 +6808,13 @@ class ControlPlaneService:
                         project_id=project_id,
                         object_version=expected.object_version,
                     )
-                except (OSError, ManagedArtifactOperationInconclusiveError, ValueError) as exc:
+                except (
+                    OSError,
+                    ManagedArtifactConflictError,
+                    ManagedArtifactOperationInconclusiveError,
+                    ManagedArtifactVersionMismatchError,
+                    ValueError,
+                ) as exc:
                     raise ManagedArtifactInventoryError(
                         f"could not verify exact inventory object {entry.uri!r}"
                     ) from exc
@@ -7117,7 +7189,12 @@ class ControlPlaneService:
                 project_id=claim.project_id,
                 object_version=claim.object_version,
             )
-        except (ManagedArtifactDeleteInconclusiveError, ManagedArtifactOperationInconclusiveError):
+        except (
+            ManagedArtifactDeleteInconclusiveError,
+            ManagedArtifactOperationInconclusiveError,
+            InvalidManagedArtifactURI,
+            OSError,
+        ):
             return False, False
         if result.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH:
             await self._quarantine_managed_artifact(
@@ -7128,6 +7205,7 @@ class ControlPlaneService:
                 reason="conditional deletion observed a different physical version",
                 actor=principal.subject,
                 object_version=(None if result.current_metadata is None else result.current_metadata.object_version),
+                observed_size_bytes=(None if result.current_metadata is None else result.current_metadata.size_bytes),
             )
             return False, False
         finalized = await self._finalize_artifact_deletion(

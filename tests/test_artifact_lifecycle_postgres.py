@@ -16,10 +16,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from eyvan.artifacts.managed import LocalManagedArtifactStore, callable_uri
+from eyvan.artifacts.managed import LocalManagedArtifactStore, callable_uri, result_uri
 from eyvan.records import (
     ArtifactReferenceRecord,
     CallableExecution,
+    ManagedArtifactState,
     Principal,
     QuotaRecord,
     ResourceGang,
@@ -34,6 +35,25 @@ from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_sch
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
 from eyvan.server.service.errors import ConflictError, InputError
+
+
+class BlockingFirstPutStore(LocalManagedArtifactStore):
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.first_put_started = threading.Event()
+        self.allow_first_put = threading.Event()
+        self._put_lock = threading.Lock()
+        self._put_calls = 0
+
+    def put_versioned(self, uri, payload, *, org_id, project_id):
+        with self._put_lock:
+            self._put_calls += 1
+            call_number = self._put_calls
+        if call_number == 1:
+            self.first_put_started.set()
+            if not self.allow_first_put.wait(timeout=3):
+                raise RuntimeError("stale upload barrier timed out")
+        return super().put_versioned(uri, payload, org_id=org_id, project_id=project_id)
 
 
 class BlockingDeleteStore(LocalManagedArtifactStore):
@@ -99,6 +119,121 @@ def _spec(uri: str) -> WorkloadDefinition:
         execution=CallableExecution(kind="callable", artifact_uri=uri, sha256=digest, python="3.11"),
         gang=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1)),
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_upload_cannot_delete_the_local_version_activated_by_its_postgres_retry(
+    repository,
+    tmp_path,
+) -> None:
+    store = BlockingFirstPutStore(tmp_path / "objects")
+    service = _service(repository, store)
+    payload = b"postgres-stale-upload-retry"
+    uri = callable_uri(hashlib.sha256(payload).hexdigest())
+    stale_upload = asyncio.create_task(
+        service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=payload,
+        )
+    )
+    assert await asyncio.to_thread(store.first_put_started.wait, 2)
+    async with repository.transaction() as transaction:
+        first_reservation = await transaction.get_managed_artifact("acme", "research", uri)
+    assert first_reservation is not None
+    assert first_reservation.state is ManagedArtifactState.PENDING_UPLOAD
+
+    recovered = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=first_reservation.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert recovered["released"] == 1
+    retry = await service.upload_managed_artifact(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        payload=payload,
+    )
+    assert retry.state is ManagedArtifactState.ACTIVE
+    assert retry.record_generation == first_reservation.record_generation + 1
+
+    store.allow_first_put.set()
+    with pytest.raises(ConflictError, match="activation is stale"):
+        await stale_upload
+
+    async with repository.transaction() as transaction:
+        final = await transaction.get_managed_artifact("acme", "research", uri)
+    assert final is not None
+    assert final.state is ManagedArtifactState.ACTIVE
+    assert final.record_generation == retry.record_generation
+    assert final.object_version == retry.object_version
+    assert (
+        await service.read_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+        )
+        == payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_stale_payload_is_fully_charged_after_postgres_retry_conflict(repository, tmp_path) -> None:
+    store = BlockingFirstPutStore(tmp_path / "objects")
+    service = _service(repository, store)
+    stale_payload = b"a" * 100
+    retry_payload = b"b"
+    uri = result_uri("postgres-late-stale-payload")
+    stale_upload = asyncio.create_task(
+        service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=stale_payload,
+        )
+    )
+    assert await asyncio.to_thread(store.first_put_started.wait, 2)
+    async with repository.transaction() as transaction:
+        first_reservation = await transaction.get_managed_artifact("acme", "research", uri)
+    assert first_reservation is not None
+    released = await service.reconcile_artifact_lifecycle_once(
+        org_id="acme",
+        project_id="research",
+        now=first_reservation.updated_at + timedelta(seconds=2),
+        recovery_grace_s=1,
+    )
+    assert released["released"] == 1
+    retry_reservation = await service.reserve_managed_artifact_upload(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        size_bytes=len(retry_payload),
+        sha256=hashlib.sha256(retry_payload).hexdigest(),
+    )
+
+    store.allow_first_put.set()
+    with pytest.raises(ConflictError, match="is stale"):
+        await stale_upload
+    with pytest.raises(ConflictError, match="physical object conflicts"):
+        await service.upload_managed_artifact(
+            org_id="acme",
+            project_id="research",
+            uri=uri,
+            payload=retry_payload,
+        )
+
+    async with repository.transaction() as transaction:
+        final = await transaction.get_managed_artifact("acme", "research", uri)
+    assert final is not None
+    assert final.state is ManagedArtifactState.QUARANTINED
+    assert final.record_generation == retry_reservation.record_generation
+    assert final.size_bytes == len(stale_payload)
+    assert store.get(uri, org_id="acme", project_id="research") == stale_payload
+    usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
+    assert usage.stored_bytes == len(stale_payload)
 
 
 @pytest.mark.asyncio

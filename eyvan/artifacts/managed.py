@@ -71,6 +71,15 @@ class InvalidManagedArtifactURI(ValueError):
 class ManagedArtifactConflictError(RuntimeError):
     """Raised when an immutable managed object already has different bytes."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_metadata: ManagedArtifactObjectMetadata | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.current_metadata = current_metadata
+
 
 class ManagedArtifactInventoryError(RuntimeError):
     """Raised when physical inventory cannot be observed conclusively.
@@ -83,6 +92,15 @@ class ManagedArtifactInventoryError(RuntimeError):
 
 class ManagedArtifactVersionMismatchError(RuntimeError):
     """Raised when an exact-version read observes a different live object."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_metadata: ManagedArtifactObjectMetadata | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.current_metadata = current_metadata
 
 
 class ManagedArtifactOperationInconclusiveError(RuntimeError):
@@ -1115,7 +1133,10 @@ class LocalManagedArtifactStore:
             conflict_on_unsafe=conflict_on_unsafe,
         )
         if object_version is not None and observed.object_version != object_version:
-            raise ManagedArtifactVersionMismatchError("managed artifact object version does not match")
+            raise ManagedArtifactVersionMismatchError(
+                "managed artifact object version does not match",
+                current_metadata=observed,
+            )
         return ManagedArtifactRead(payload=raw_payload, metadata=observed)
 
     def _observe_descriptor(
@@ -1150,7 +1171,10 @@ class LocalManagedArtifactStore:
         finally:
             os.close(descriptor)
         if not _payloads_match(existing.payload, payload):
-            raise ManagedArtifactConflictError("managed object already contains different bytes")
+            raise ManagedArtifactConflictError(
+                "managed object already contains different bytes",
+                current_metadata=existing.metadata,
+            )
         return ManagedArtifactWrite(metadata=existing.metadata, created=created)
 
     def _open_or_create_generation(
@@ -1351,7 +1375,13 @@ class LocalManagedArtifactStore:
                     os.close(descriptor)
         except FileNotFoundError:
             raise FileNotFoundError("managed artifact object is absent") from None
-        payload = _validate_loaded_payload(reference, observed.payload)
+        try:
+            payload = _validate_loaded_payload(reference, observed.payload)
+        except ValueError as exc:
+            raise ManagedArtifactConflictError(
+                "managed artifact bytes do not match their content-addressed URI",
+                current_metadata=observed.metadata,
+            ) from exc
         return ManagedArtifactRead(payload=payload, metadata=observed.metadata)
 
     def put(self, uri: str, payload: bytes, *, org_id: str, project_id: str) -> str:
@@ -2686,7 +2716,10 @@ class GCSManagedArtifactStore:
         if before is None:
             raise FileNotFoundError("managed artifact object is absent")
         if object_version is not None and before.object_version != object_version:
-            raise ManagedArtifactVersionMismatchError("managed artifact object version does not match")
+            raise ManagedArtifactVersionMismatchError(
+                "managed artifact object version does not match",
+                current_metadata=before,
+            )
         try:
             payload = self._get_object(self._object_uri(reference, org_id, project_id))
         except ManagedArtifactOperationInconclusiveError:
@@ -2699,7 +2732,10 @@ class GCSManagedArtifactStore:
             if current is None:
                 raise FileNotFoundError("managed artifact object is absent") from None
             if current.object_version != before.object_version:
-                raise ManagedArtifactVersionMismatchError("managed artifact object changed while it was read") from None
+                raise ManagedArtifactVersionMismatchError(
+                    "managed artifact object changed while it was read",
+                    current_metadata=current,
+                ) from None
             raise
         try:
             after = self.stat(reference.uri, org_id=org_id, project_id=project_id)
@@ -2708,18 +2744,27 @@ class GCSManagedArtifactStore:
         if after is None:
             raise FileNotFoundError("managed artifact object is absent")
         if after.object_version != before.object_version:
-            raise ManagedArtifactVersionMismatchError("managed artifact object changed while it was read")
+            raise ManagedArtifactVersionMismatchError(
+                "managed artifact object changed while it was read",
+                current_metadata=after,
+            )
         if after != before:
             raise ManagedArtifactOperationInconclusiveError(
                 "GCS returned inconsistent metadata for one object generation"
             )
-        payload = _validate_loaded_payload(reference, payload)
         observed_metadata = ManagedArtifactObjectMetadata(
             uri=after.uri,
             size_bytes=after.size_bytes,
             object_version=after.object_version,
             sha256=hashlib.sha256(payload).hexdigest(),
         )
+        try:
+            payload = _validate_loaded_payload(reference, payload)
+        except ValueError as exc:
+            raise ManagedArtifactConflictError(
+                "managed artifact bytes do not match their content-addressed URI",
+                current_metadata=observed_metadata,
+            ) from exc
         return ManagedArtifactRead(payload=payload, metadata=observed_metadata)
 
     def _matching_current_write(
@@ -2747,7 +2792,10 @@ class GCSManagedArtifactStore:
             except (FileNotFoundError, ManagedArtifactVersionMismatchError):
                 continue
             if not _payloads_match(observed.payload, payload):
-                raise ManagedArtifactConflictError("managed object already contains different bytes")
+                raise ManagedArtifactConflictError(
+                    "managed object already contains different bytes",
+                    current_metadata=observed.metadata,
+                )
             return ManagedArtifactWrite(metadata=observed.metadata, created=created)
         raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write verification was inconclusive")
 
