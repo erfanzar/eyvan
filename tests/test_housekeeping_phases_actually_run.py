@@ -24,8 +24,10 @@ what failed to notice.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
-from test_artifact_collection import _DIGEST, _service, _stored
+from test_artifact_collection import _DIGEST, _PAYLOAD, _service, _stored
 from test_controller import principal
 
 from eyvan.artifacts.managed import callable_uri
@@ -100,13 +102,8 @@ async def test_a_zero_retention_window_collects_nothing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_collection_asks_the_service_to_actually_delete() -> None:
-    """``dry_run`` defaults to true, which is how this stayed dormant.
-
-    The service's own docstring recorded that nothing called it with
-    ``dry_run=False``; a wrapper that kept the default would reproduce the bug
-    while looking wired.
-    """
+async def test_collection_remains_dry_run_without_explicit_destructive_opt_in() -> None:
+    """A scheduled pass observes candidates but cannot silently enable deletion."""
 
     controller = _controller(artifact_retention_s=3600)
     async with controller.repository.transaction() as tx:
@@ -126,6 +123,7 @@ async def test_collection_asks_the_service_to_actually_delete() -> None:
         class _Empty:
             collected_uris = ()
             reclaimed_bytes = 0
+            dry_run = False
 
         return _Empty()
 
@@ -133,7 +131,7 @@ async def test_collection_asks_the_service_to_actually_delete() -> None:
 
     await controller.collect_artifacts_once()
 
-    assert seen["dry_run"] is False, "collection ran in dry-run mode and deleted nothing"
+    assert seen["dry_run"] is True
     assert (seen["org_id"], seen["project_id"]) == ("acme", "research")
     assert seen["grace_period_s"] == 3600.0
     assert seen["principal"] is not None, "an unaudited deletion is an unexplainable loss"
@@ -194,7 +192,11 @@ async def test_a_deleted_artifact_is_audited(tmp_path) -> None:
     collected = [event for event in events if event.action == "artifact.collected"]
     assert len(collected) == len(collection.collected_uris)
     assert collected[0].entity_type == "artifact"
-    assert collected[0].payload["removed"] is True
+    assert collected[0].previous_state == "deleting"
+    assert collected[0].new_state == "deleted"
+    assert collected[0].payload["provider_status"] in {"deleted", "absent"}
+    assert collected[0].payload["record_generation"] >= 1
+    assert collected[0].payload["object_version"]
 
 
 @pytest.mark.asyncio
@@ -211,3 +213,59 @@ async def test_a_dry_run_collection_audits_nothing(tmp_path) -> None:
     async with service.repository.transaction() as tx:
         events = await tx.list_events(org_id="acme", project_id="research")
     assert not [event for event in events if event.action == "artifact.collected"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_discovers_artifact_scopes_without_project_registry_rows(tmp_path) -> None:
+    """A stranded upload cannot be invisible merely because its project row is absent."""
+
+    service, store = await _service(tmp_path)
+    uri = callable_uri(_DIGEST)
+    payload = _PAYLOAD
+    reserved = await service.reserve_managed_artifact_upload(
+        org_id="orphan-org",
+        project_id="orphan-project",
+        uri=uri,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    store.put_versioned(uri, payload, org_id="orphan-org", project_id="orphan-project")
+    controller = EyvanController(
+        service.repository,
+        service,
+        settings=EyvanSettings(artifact_retention_s=0, artifact_recovery_grace_s=0),
+    )
+
+    assert await controller.collect_artifacts_once() == 0
+    async with service.repository.transaction() as transaction:
+        recovered = await transaction.get_managed_artifact("orphan-org", "orphan-project", uri)
+        projects = await transaction.list_projects()
+    assert projects == []
+    assert recovered is not None
+    assert recovered.record_generation == reserved.record_generation
+    assert recovered.state.value == "active"
+
+
+@pytest.mark.asyncio
+async def test_explicit_destructive_collection_setting_reaches_the_service() -> None:
+    controller = _controller(
+        artifact_retention_s=3600,
+        artifact_destructive_collection_enabled=True,
+    )
+    async with controller.repository.transaction() as transaction:
+        await transaction.put_project(ProjectRecord(org_id="acme", id="research", owner="alice", created_by="alice"))
+    seen: dict[str, object] = {}
+
+    async def collect(**kwargs: object):
+        seen.update(kwargs)
+
+        class Empty:
+            collected_uris = ()
+            reclaimed_bytes = 0
+            dry_run = False
+
+        return Empty()
+
+    controller.service.collect_artifacts_once = collect  # type: ignore[method-assign]
+    await controller.collect_artifacts_once()
+    assert seen["dry_run"] is False

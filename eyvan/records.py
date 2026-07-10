@@ -2347,6 +2347,8 @@ class ArtifactCollection(EyvanModel):
     held: int = Field(default=0, ge=0)
     referenced: int = Field(default=0, ge=0)
     within_grace: int = Field(default=0, ge=0)
+    #: True when the bounded scan could not examine the complete active/claimed set.
+    capped: bool = False
     #: True when nothing was deleted and the pass only reported.
     dry_run: bool = True
 
@@ -2362,6 +2364,16 @@ class ArtifactUsage(EyvanModel):
     quota_bytes: int | None = Field(default=None, ge=0)
 
 
+class ManagedArtifactState(StrEnum):
+    """Durable lifecycle of one scoped managed object."""
+
+    PENDING_UPLOAD = "pending_upload"
+    ACTIVE = "active"
+    DELETING = "deleting"
+    DELETED = "deleted"
+    QUARANTINED = "quarantined"
+
+
 class ArtifactInventoryStatus(StrEnum):
     """Relationship between one scoped index row and one physical object."""
 
@@ -2369,6 +2381,7 @@ class ArtifactInventoryStatus(StrEnum):
     PHYSICAL_ONLY = "physical_only"
     INDEX_ONLY = "index_only"
     SIZE_MISMATCH = "size_mismatch"
+    VERSION_MISMATCH = "version_mismatch"
 
 
 class ArtifactInventoryEntry(EyvanModel):
@@ -2378,10 +2391,12 @@ class ArtifactInventoryEntry(EyvanModel):
     status: ArtifactInventoryStatus
     indexed_size_bytes: int | None = Field(default=None, ge=0)
     observed_size_bytes: int | None = Field(default=None, ge=0)
+    lifecycle_state: ManagedArtifactState | None = None
+    indexed_object_version: str | None = Field(default=None, min_length=1, max_length=256)
     #: GCS generation or local file identity captured with observed_size_bytes.
     observed_object_version: str | None = Field(default=None, min_length=1, max_length=256)
-    #: True only when this call added a previously missing index row. Existing
-    #: rows, discrepancies, and missing bytes are never rewritten as repair.
+    #: True only when an explicitly acknowledged exact-version reconciliation
+    #: activated a physical-only or quarantined row. Physical bytes are untouched.
     reindexed: bool = False
 
 
@@ -2427,56 +2442,46 @@ class ArtifactHold(EyvanModel):
 
 
 class ManagedArtifactRecord(EyvanModel):
-    """One stored object in the managed artifact store, and what it costs.
+    """Fenced ledger entry for one tenant-scoped physical object.
 
-    The control plane has always been able to *serve* artifacts and has never
-    known how many there are or how many bytes they occupy. This record is that
-    ledger, and it deliberately holds no bytes: ``uri`` addresses the object in
-    the store, which stays the only copy.
-
-    The durable identity is ``(org_id, project_id, uri)``, matching the physical
-    store namespace. Two projects may use the same content-addressed URI, but
-    each owns a distinct object and ledger row; a re-upload updates only the row
-    in the requested scope. ``size_bytes`` is recorded at store time because it
-    cannot be recovered later without reading the object back, and byte
-    accounting that requires reading every object is accounting nobody runs.
+    ``record_generation`` fences stale database actors while ``object_version``
+    fences provider mutations.  Rows are retained as zero-byte tombstones after
+    deletion; a later upload advances the generation instead of resurrecting an
+    old claim in place.
     """
 
     uri: str = Field(max_length=512)
     kind: str = Field(max_length=32)
     org_id: str = Field(max_length=128)
     project_id: str = Field(max_length=128)
+    state: ManagedArtifactState = ManagedArtifactState.QUARANTINED
+    record_generation: int = Field(default=1, ge=1)
     size_bytes: int = Field(ge=0)
-    #: Digest of the stored bytes for content-addressed kinds, else ``None``.
-    #: Recorded so a future collector can prove it is deleting the object it
-    #: indexed rather than one that replaced it at the same URI.
     sha256: str | None = Field(default=None, max_length=64)
+    object_version: str | None = Field(default=None, max_length=256)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
-    #: Last capability-authenticated read. Recency, not liveness -- an artifact
-    #: no attempt has read in a month may still be referenced by a queued
-    #: workload, so this informs a human, never a deletion.
+    upload_started_at: datetime | None = None
+    activated_at: datetime | None = None
+    deletion_claim_id: str | None = Field(default=None, max_length=96)
+    deletion_started_at: datetime | None = None
+    deleted_at: datetime | None = None
+    quarantine_reason: str | None = Field(default="legacy object version has not been verified", max_length=512)
     last_accessed_at: datetime | None = None
-    #: An explicit human claim on this object, independent of any workload.
     hold: ArtifactHold | None = None
-    #: Set when a later attempt of the same workload minted a newer result URI at
-    #: a different address, making this one the output of a run that was retried.
-    #: Superseded is a *fact*, not a verdict: an operator debugging why attempt 2
-    #: differs from attempt 1 needs attempt 1's output, which is exactly why this
-    #: is recorded rather than acted on.
     superseded_at: datetime | None = None
     superseded_by_uri: str | None = Field(default=None, max_length=512)
 
+    @property
+    def charged_bytes(self) -> int:
+        """Return bytes conservatively charged to quota in this state."""
+
+        return 0 if self.state is ManagedArtifactState.DELETED else self.size_bytes
+
     def collectable_at(self, moment: datetime, *, has_live_reference: bool) -> bool:
-        """Return whether nothing currently protects this artifact.
+        """Return whether an active object is currently eligible for a claim."""
 
-        Three independent protections, all of which must be absent. A live
-        reference means something may still run against it. A hold means a human
-        said not to. Both are checked here rather than at each future call site,
-        so a collector cannot be written that consults one and forgets the other.
-        """
-
-        if has_live_reference:
+        if self.state is not ManagedArtifactState.ACTIVE or has_live_reference:
             return False
         return self.hold is None or not self.hold.active_at(moment)
 
@@ -2487,6 +2492,45 @@ class ManagedArtifactRecord(EyvanModel):
         _validate_string(self.org_id, field_name="managed artifact organization id")
         _validate_string(self.project_id, field_name="managed artifact project id")
         _validate_string(self.sha256, field_name="managed artifact digest", optional=True)
+        _validate_string(self.object_version, field_name="managed artifact object version", optional=True)
+        _validate_string(self.deletion_claim_id, field_name="managed artifact deletion claim", optional=True)
+        _validate_string(self.quarantine_reason, field_name="managed artifact quarantine reason", optional=True)
+
+        if self.sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("managed artifact digest must be a lowercase SHA-256")
+        if (
+            self.state
+            in {
+                ManagedArtifactState.PENDING_UPLOAD,
+                ManagedArtifactState.ACTIVE,
+                ManagedArtifactState.DELETING,
+            }
+            and self.sha256 is None
+        ):
+            raise ValueError("managed artifact lifecycle states require an expected SHA-256")
+        if self.state is ManagedArtifactState.PENDING_UPLOAD:
+            if self.upload_started_at is None or self.object_version is not None:
+                raise ValueError("pending managed artifacts require an upload start and no object version")
+        elif self.state is ManagedArtifactState.ACTIVE:
+            if self.object_version is None or self.activated_at is None:
+                raise ValueError("active managed artifacts require an object version and activation time")
+        elif self.state is ManagedArtifactState.DELETING:
+            if self.object_version is None or self.deletion_claim_id is None or self.deletion_started_at is None:
+                raise ValueError("deleting managed artifacts require a versioned durable claim")
+        elif self.state is ManagedArtifactState.DELETED:
+            if self.size_bytes != 0 or self.deleted_at is None:
+                raise ValueError("deleted managed artifacts must be zero-byte tombstones with a deletion time")
+        elif self.state is ManagedArtifactState.QUARANTINED and self.quarantine_reason is None:
+            raise ValueError("quarantined managed artifacts require a reason")
+
+        if self.state is not ManagedArtifactState.QUARANTINED and self.quarantine_reason is not None:
+            raise ValueError("only quarantined managed artifacts may carry a quarantine reason")
+        if self.state is not ManagedArtifactState.DELETING and (
+            self.deletion_claim_id is not None or self.deletion_started_at is not None
+        ):
+            raise ValueError("only deleting managed artifacts may retain a deletion claim")
+        if self.state is not ManagedArtifactState.DELETED and self.deleted_at is not None:
+            raise ValueError("only deleted managed artifacts may carry a deletion time")
         return self
 
 

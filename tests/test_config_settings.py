@@ -171,3 +171,31 @@ def test_from_env_reads_every_native_worker_setting_the_gcp_factory_consumes(
     for field in ("native_worker_artifact_root_uri", "native_worker_public_ingress_tag"):
         assert f"settings.{field}" in factory_source
         assert getattr(settings, field) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("artifact_collection_interval_s", 0.0),
+        ("artifact_collection_interval_s", float("inf")),
+        ("artifact_recovery_grace_s", -1.0),
+        ("artifact_recovery_grace_s", float("nan")),
+        ("artifact_retention_s", -1),
+        ("log_retention_s", -1),
+    ),
+)
+def test_artifact_lifecycle_settings_reject_unbounded_or_negative_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        EyvanSettings(**{field: value})
+
+
+def test_artifact_lifecycle_settings_load_safe_operational_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EYVAN_ARTIFACT_COLLECTION_INTERVAL_S", "12.5")
+    monkeypatch.setenv("EYVAN_ARTIFACT_RECOVERY_GRACE_S", "0")
+    monkeypatch.setenv("EYVAN_ARTIFACT_RETENTION_S", "0")
+    monkeypatch.setenv("EYVAN_LOG_RETENTION_S", "42")
+    settings = EyvanSettings.from_env()
+    assert settings.artifact_collection_interval_s == 12.5
+    assert settings.artifact_recovery_grace_s == 0
+    assert settings.artifact_retention_s == 0
+    assert settings.log_retention_s == 42

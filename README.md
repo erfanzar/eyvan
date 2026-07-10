@@ -72,13 +72,19 @@ CLI and SDK work without an authentication setup. A non-loopback bind never
 gets that implicit behavior. Set `EYVAN_DEV_AUTH_ENABLED=0` only when a local
 server must reject those headers.
 
-The unconfigured loopback server persists workloads, fleet pools, leases,
-outbox commands, and audit history in `~/.eyvan/control-plane.json`. It also
-creates one owner-only managed-artifact signing key at
-`~/.eyvan/artifact-token.key`, so a server restart does not invalidate a
-running local callable's artifact transfer. A second server cannot open the
-same local state file. This local mode is deliberately unavailable on a
-network bind; use PostgreSQL for a shared or network-exposed control plane.
+The unconfigured loopback server persists the complete control-plane metadata
+state, including artifact lifecycle rows and references, in the owner-only
+schema-v2 file `~/.eyvan/control-plane.json`. Managed artifact payload bytes
+remain in the configured artifact store and are never embedded in that JSON.
+The first write over a schema-v1 file creates the crash-durable owner-only
+backup `~/.eyvan/control-plane.json.v1.bak`; this is a pre-upgrade recovery
+point, not a lossless downgrade. See [artifact safety](docs/artifact-safety.md#local-json-v1-to-v2-recovery-and-validated-export)
+for forward repair and offline export. The server also creates one owner-only
+managed-artifact signing key at `~/.eyvan/artifact-token.key`, so a restart
+does not invalidate a running local callable's artifact transfer. A second
+server cannot open the same local state file. This local mode is deliberately
+unavailable on a network bind; use PostgreSQL for a shared or network-exposed
+control plane.
 
 `eyvan-server` starts the scheduler and capacity controller by default. Its
 startup record and `/api/v1/health` report `controller: active`; an

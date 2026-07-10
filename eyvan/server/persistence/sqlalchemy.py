@@ -21,6 +21,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Connection,
     DateTime,
     Index,
@@ -49,6 +50,7 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    ManagedArtifactState,
     OrganizationRecord,
     OutboxRecord,
     OutboxState,
@@ -64,7 +66,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0013_merge_artifact_audit"
+SCHEMA_REVISION = "0014_artifact_lifecycle"
 
 
 @tp.runtime_checkable
@@ -238,8 +240,17 @@ class ManagedArtifactRow(Base):
     __tablename__ = "managed_artifacts"
     __table_args__ = (
         PrimaryKeyConstraint("org_id", "project_id", "uri", name="pk_managed_artifacts_scoped"),
+        CheckConstraint(
+            "state IN ('pending_upload', 'active', 'deleting', 'deleted', 'quarantined')",
+            name="ck_managed_artifacts_lifecycle_state",
+        ),
+        CheckConstraint(
+            "record_generation >= 1",
+            name="ck_managed_artifacts_record_generation_positive",
+        ),
         Index("ix_managed_artifacts_scope_bytes", "org_id", "project_id", "size_bytes"),
         Index("ix_managed_artifacts_scope_created", "org_id", "project_id", "created_at", "uri"),
+        Index("ix_managed_artifacts_scope_state_updated", "org_id", "project_id", "state", "updated_at"),
     )
     #: The physical and durable identity. A content-addressed URI can appear in
     #: every project without merging ownership or quota accounting. The explicit
@@ -249,10 +260,14 @@ class ManagedArtifactRow(Base):
     project_id: Mapped[str] = mapped_column(String(128), index=True)
     uri: Mapped[str] = mapped_column(String(512))
     kind: Mapped[str | None] = mapped_column(String(32), index=True)
-    #: A real column, not a field inside ``data``: the quota check SUMs it on
-    #: the upload path, and a JSON extraction cannot use an index.
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    record_generation: Mapped[int] = mapped_column(BigInteger)
+    object_version: Mapped[str | None] = mapped_column(String(256))
+    #: Typed accounting/state columns make quota and recovery bounded without
+    #: trusting a JSON projection that could disagree with the locked row.
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -280,6 +295,34 @@ class ArtifactReferenceRow(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+def _managed_artifact_row_matches(row: ManagedArtifactRow, record: ManagedArtifactRecord) -> bool:
+    """Return whether typed lifecycle columns agree with their JSON record."""
+
+    return (
+        (record.org_id, record.project_id, record.uri) == (row.org_id, row.project_id, row.uri)
+        and row.kind == record.kind
+        and row.state == record.state.value
+        and row.record_generation == record.record_generation
+        and row.object_version == record.object_version
+        and row.size_bytes == record.size_bytes
+    )
+
+
+def _decode_managed_artifact_rows(rows: tp.Iterable[ManagedArtifactRow]) -> list[ManagedArtifactRecord]:
+    records: list[ManagedArtifactRecord] = []
+    for row in rows:
+        try:
+            record = ManagedArtifactRecord.model_validate(row.data)
+        except ValidationError:
+            logger.exception("skipping unreadable managed_artifacts row %r", row.uri)
+            continue
+        if not _managed_artifact_row_matches(row, record):
+            logger.error("skipping managed_artifacts row %r with mismatched typed lifecycle", row.uri)
+            continue
+        records.append(record)
+    return records
 
 
 class IdempotencyRow(Base):
@@ -798,8 +841,8 @@ class SqlAlchemySession:
         if row is None:
             return None
         record = ManagedArtifactRecord.model_validate(row.data)
-        if (record.org_id, record.project_id, record.uri) != (org_id, project_id, uri):
-            logger.error("managed_artifacts typed identity disagrees with its JSON record for %r", uri)
+        if not _managed_artifact_row_matches(row, record):
+            logger.error("managed_artifacts typed lifecycle disagrees with its JSON record for %r", uri)
             return None
         return record
 
@@ -810,8 +853,12 @@ class SqlAlchemySession:
                 org_id=record.org_id,
                 project_id=record.project_id,
                 kind=record.kind,
+                state=record.state.value,
+                record_generation=record.record_generation,
+                object_version=record.object_version,
                 size_bytes=record.size_bytes,
                 created_at=record.created_at,
+                updated_at=record.updated_at,
                 data=_dump(record),
             )
         )
@@ -832,7 +879,7 @@ class SqlAlchemySession:
             statement = statement.where(ManagedArtifactRow.kind == kind)
         statement = statement.order_by(ManagedArtifactRow.created_at, ManagedArtifactRow.uri).limit(limit)
         rows = (await self.session.scalars(statement)).all()
-        records = _decode_rows(ManagedArtifactRecord, rows, table="managed_artifacts")
+        records = _decode_managed_artifact_rows(rows)
         return [record for record in records if record.org_id == org_id and record.project_id == project_id]
 
     async def list_managed_artifacts_page(
@@ -846,23 +893,68 @@ class SqlAlchemySession:
         statement = select(ManagedArtifactRow).where(
             ManagedArtifactRow.org_id == org_id,
             ManagedArtifactRow.project_id == project_id,
+            ManagedArtifactRow.state != ManagedArtifactState.DELETED.value,
         )
         if after_uri is not None:
             statement = statement.where(ManagedArtifactRow.uri > after_uri)
         statement = statement.order_by(ManagedArtifactRow.uri).limit(limit)
         rows = (await self.session.scalars(statement)).all()
-        records = _decode_rows(ManagedArtifactRecord, rows, table="managed_artifacts")
+        records = _decode_managed_artifact_rows(rows)
         return [
             record
             for record in records
             if record.org_id == org_id
             and record.project_id == project_id
+            and record.state is not ManagedArtifactState.DELETED
             and (after_uri is None or record.uri > after_uri)
+        ]
+
+    async def list_managed_artifact_projects(self, *, limit: int = 1000) -> list[tuple[str, str]]:
+        statement = (
+            select(ManagedArtifactRow.org_id, ManagedArtifactRow.project_id)
+            .distinct()
+            .order_by(ManagedArtifactRow.org_id, ManagedArtifactRow.project_id)
+            .limit(limit)
+        )
+        return [(str(org_id), str(project_id)) for org_id, project_id in (await self.session.execute(statement)).all()]
+
+    async def list_managed_artifacts_by_state(
+        self,
+        *,
+        state: ManagedArtifactState,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        updated_before: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        statement = select(ManagedArtifactRow).where(ManagedArtifactRow.state == state.value)
+        if org_id is not None:
+            statement = statement.where(ManagedArtifactRow.org_id == org_id)
+        if project_id is not None:
+            statement = statement.where(ManagedArtifactRow.project_id == project_id)
+        if updated_before is not None:
+            statement = statement.where(ManagedArtifactRow.updated_at <= updated_before)
+        statement = statement.order_by(
+            ManagedArtifactRow.updated_at,
+            ManagedArtifactRow.org_id,
+            ManagedArtifactRow.project_id,
+            ManagedArtifactRow.uri,
+        ).limit(limit)
+        rows = (await self.session.scalars(statement)).all()
+        records = _decode_managed_artifact_rows(rows)
+        return [
+            record
+            for record in records
+            if record.state is state
+            and (org_id is None or record.org_id == org_id)
+            and (project_id is None or record.project_id == project_id)
+            and (updated_before is None or record.updated_at <= updated_before)
         ]
 
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
         statement = select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)).where(
-            ManagedArtifactRow.org_id == org_id
+            ManagedArtifactRow.org_id == org_id,
+            ManagedArtifactRow.state != ManagedArtifactState.DELETED.value,
         )
         if project_id is not None:
             statement = statement.where(ManagedArtifactRow.project_id == project_id)
@@ -870,14 +962,25 @@ class SqlAlchemySession:
         return int(total or 0)
 
     async def count_managed_artifacts(self, *, org_id: str, project_id: str | None = None) -> int:
-        statement = select(func.count()).select_from(ManagedArtifactRow).where(ManagedArtifactRow.org_id == org_id)
+        statement = (
+            select(func.count())
+            .select_from(ManagedArtifactRow)
+            .where(
+                ManagedArtifactRow.org_id == org_id,
+                ManagedArtifactRow.state != ManagedArtifactState.DELETED.value,
+            )
+        )
         if project_id is not None:
             statement = statement.where(ManagedArtifactRow.project_id == project_id)
         total = await self.session.scalar(statement)
         return int(total or 0)
 
     async def sum_all_managed_artifact_bytes(self) -> int:
-        total = await self.session.scalar(select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)))
+        total = await self.session.scalar(
+            select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)).where(
+                ManagedArtifactRow.state != ManagedArtifactState.DELETED.value
+            )
+        )
         return int(total or 0)
 
     async def put_artifact_reference(self, record: ArtifactReferenceRecord) -> None:

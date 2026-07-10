@@ -19,6 +19,7 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    ManagedArtifactState,
     OrganizationRecord,
     OutboxRecord,
     OutboxState,
@@ -154,6 +155,22 @@ class RepositorySession(tp.Protocol):
         limit: int,
     ) -> list[ManagedArtifactRecord]:
         """Return a URI-ordered bounded page for physical inventory comparison."""
+        ...
+
+    async def list_managed_artifact_projects(self, *, limit: int = 1000) -> list[tuple[str, str]]:
+        """Return a bounded ordered page of scopes that own artifact rows."""
+        ...
+
+    async def list_managed_artifacts_by_state(
+        self,
+        *,
+        state: ManagedArtifactState,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        updated_before: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        """Return a bounded oldest-first lifecycle recovery page."""
         ...
 
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:

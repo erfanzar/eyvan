@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from collections import Counter
@@ -181,12 +180,12 @@ class _ControllerSettlement:
             payload = "\n".join(json.dumps(line, sort_keys=True) for line in lines).encode()
             uri = log_uri(workload.id, workload.attempt, rank)
             try:
-                await asyncio.to_thread(
-                    self.artifact_access.store.put,
-                    uri,
-                    payload,
+                await self.service.upload_managed_artifact(
                     org_id=workload.org_id,
                     project_id=workload.project_id,
+                    uri=uri,
+                    payload=payload,
+                    actor="system:log-archiver",
                 )
             except Exception:
                 logger.warning("could not archive logs for %s rank %d", workload.id, rank, exc_info=True)
@@ -857,45 +856,56 @@ class _ControllerSettlement:
             logger.debug("replica %s of service %s was already terminal", replica_id, service.id)
 
     async def collect_artifacts_once(self) -> int:
-        """Delete managed artifacts nothing references and nothing holds.
-
-        The service has always been able to do this; nothing ever asked it to.
-        Its own docstring recorded that no caller passed ``dry_run=False``, so
-        the index, the quota accounting, the legal holds and the reverse
-        reference index all worked while storage grew without bound.
-
-        ``artifact_retention_s`` is an age floor on top of the service's
-        ``grace_period_s``: the grace period closes a race inside one pass,
-        while the retention window is the operator's statement about how long an
-        unreferenced artifact is worth keeping.
-        """
+        """Recover lifecycle claims, then collect only under explicit opt-in."""
 
         retention_s = self.settings.artifact_retention_s
-        if retention_s <= 0:
-            return 0
         log_retention_s = self.settings.log_retention_s
         retention_by_kind = {ManagedArtifactKind.LOGS.value: float(log_retention_s) if log_retention_s > 0 else None}
-        # Artifact rows may never be listed without a complete scope. The durable
-        # project registry is the only safe source of scopes here: an opaque store
-        # prefix cannot be reversed, and an orphaned prefix must be reported by
-        # inventory rather than guessed into a tenant and deleted.
         async with self.repository.transaction() as tx:
             projects = await tx.list_projects()
+            artifact_scopes = await tx.list_managed_artifact_projects(limit=1001)
+        if len(artifact_scopes) > 1000:
+            raise RuntimeError("artifact lifecycle scope discovery exceeded 1000 entries; the sweep is inconclusive")
+        artifact_scope_set = set(artifact_scopes)
+        scopes = sorted({(project.org_id, project.id) for project in projects} | artifact_scope_set)
         deleted = reclaimed = 0
-        for project in projects:
+        for org_id, project_id in scopes:
+            if (org_id, project_id) in artifact_scope_set:
+                recovery = await self.service.reconcile_artifact_lifecycle_once(
+                    org_id=org_id,
+                    project_id=project_id,
+                    recovery_grace_s=self.settings.artifact_recovery_grace_s,
+                )
+                if recovery["capped"] or recovery["inconclusive"]:
+                    logger.warning(
+                        "artifact lifecycle recovery was incomplete for %s/%s (capped=%d, inconclusive=%d)",
+                        org_id,
+                        project_id,
+                        recovery["capped"],
+                        recovery["inconclusive"],
+                    )
+            if retention_s <= 0:
+                continue
             collection = await self.service.collect_artifacts_once(
-                org_id=project.org_id,
-                project_id=project.id,
+                org_id=org_id,
+                project_id=project_id,
                 principal=self._principal,
                 grace_period_s=float(retention_s),
-                # Logs outlive the general window, and zero means never collect
-                # them -- the same "zero disables" convention the other retention
-                # windows use.
                 retention_by_kind=retention_by_kind,
-                dry_run=False,
+                dry_run=not self.settings.artifact_destructive_collection_enabled,
             )
-            deleted += len(collection.collected_uris)
-            reclaimed += collection.reclaimed_bytes
+            if getattr(collection, "capped", False):
+                logger.warning("artifact collection scan was capped for %s/%s", org_id, project_id)
+            if not collection.dry_run:
+                deleted += len(collection.collected_uris)
+                reclaimed += collection.reclaimed_bytes
+            elif collection.collected_uris:
+                logger.info(
+                    "artifact collection dry-run found %d candidate(s) in %s/%s",
+                    len(collection.collected_uris),
+                    org_id,
+                    project_id,
+                )
         if deleted:
             logger.info(
                 "collected %d unreferenced managed artifact(s), reclaiming %d bytes",

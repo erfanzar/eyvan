@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import math
-import subprocess
 import typing as tp
 import uuid
 from datetime import datetime, timedelta
@@ -23,12 +22,19 @@ from eyvan._internal.json_types import JsonObject, JsonValue, model_json
 from eyvan.artifacts.managed import (
     CONTENT_ADDRESSED_KINDS,
     MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
+    InvalidManagedArtifactURI,
+    ManagedArtifactConflictError,
+    ManagedArtifactDeleteInconclusiveError,
+    ManagedArtifactDeleteStatus,
     ManagedArtifactInventoryError,
     ManagedArtifactInventoryStore,
     ManagedArtifactKind,
     ManagedArtifactObjectMetadata,
+    ManagedArtifactOperationInconclusiveError,
     ManagedArtifactRef,
-    ManagedArtifactStore,
+    ManagedArtifactVersionedStore,
+    ManagedArtifactVersionMismatchError,
+    ManagedArtifactWriteInconclusiveError,
     is_managed_uri,
     parse_managed_uri,
 )
@@ -75,6 +81,7 @@ from eyvan.records import (
     LeaseRecord,
     LeaseState,
     ManagedArtifactRecord,
+    ManagedArtifactState,
     OrganizationRecord,
     OutboxRecord,
     OutboxState,
@@ -128,6 +135,7 @@ from eyvan.server.service.errors import (
     InputError,
     NoMatchingCapacityPoolError,
     NotFoundError,
+    UnavailableError,
 )
 from eyvan.server.service.federation import (
     BudgetGrantRecord,
@@ -326,11 +334,29 @@ QUEUE_TREND_MAX_WINDOW_S = 31 * 86_400.0
 #: garbage until the submission lands. One day is far longer than that window and
 #: costs only delayed reclamation.
 DEFAULT_ARTIFACT_GRACE_PERIOD_S = 86_400.0
+DEFAULT_ARTIFACT_RECOVERY_GRACE_S = 900.0
 
 #: URI prefix of the managed result kind. Compared as a prefix rather than parsed:
 #: the supersession sweep runs over every reference of every workload, and the only
 #: question it asks is which kind the URI names.
 _MANAGED_RESULT_PREFIX = f"eyvan://{ManagedArtifactKind.RESULTS.value}/"
+
+
+def _is_finite_nonnegative_number(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
+
+
+def _artifact_record_update(
+    record: ManagedArtifactRecord,
+    updates: tp.Mapping[str, tp.Any],
+) -> ManagedArtifactRecord:
+    """Apply one lifecycle transition with full Pydantic invariant checks."""
+
+    return ManagedArtifactRecord.model_validate({**record.model_dump(mode="python"), **updates})
 
 
 def _explain_base(workload: WorkloadRecord) -> dict[str, tp.Any]:
@@ -412,7 +438,7 @@ class ControlPlaneService:
         #: Only the artifact collector needs it, and only to *delete*. Optional so
         #: every deployment that does not run a collector -- which is all of them
         #: until an operator opts in -- carries no path to removing bytes at all.
-        artifact_store: ManagedArtifactStore | None = None,
+        artifact_store: ManagedArtifactVersionedStore | None = None,
         #: Read-only/additive inventory can be exposed before the deletion state
         #: machine. It is deliberately separate from ``artifact_store`` so wiring
         #: API uploads for inventory does not silently enable the current unsafe
@@ -1160,6 +1186,11 @@ class ControlPlaneService:
         """
 
         for uri in self.referenced_artifact_uris(workload.spec):
+            artifact = await tx.get_managed_artifact(workload.org_id, workload.project_id, uri)
+            if artifact is not None and artifact.state is not ManagedArtifactState.ACTIVE:
+                raise ConflictError(
+                    f"managed artifact {uri!r} is {artifact.state.value}; retry after lifecycle reconciliation"
+                )
             await tx.put_artifact_reference(
                 ArtifactReferenceRecord(
                     id=artifact_reference_id(workload.org_id, workload.project_id, uri, workload.id),
@@ -6013,50 +6044,680 @@ class ControlPlaneService:
         size_bytes: int,
         sha256: str | None = None,
     ) -> ManagedArtifactRecord:
-        """Record one stored object's size, enforcing the project's byte quota.
+        """Create conservative metadata for an object whose version is unknown.
 
-        Called *before* the bytes reach the store, so the quota is a genuine
-        admission gate rather than an after-the-fact report: refusing a write
-        that already landed would leave the store and the index disagreeing about
-        what exists, which is the one thing this index must never do.
-
-        Re-indexing a content-addressed URI is an update only within the requested
-        project. The physical store namespaces bytes by organization and project,
-        so another project using the same URI owns an independent row and charge.
-
-        Raises:
-            InputError: If the write would exceed the scope's artifact byte quota.
+        This compatibility surface no longer creates a readable row. Only
+        ``upload_managed_artifact`` or the exact-version inventory reconciler can
+        activate bytes. Treating metadata as proof of a provider generation was
+        the index-before-store bug M1.6 removes.
         """
 
         reference = parse_managed_uri(uri)
         now = utcnow()
         async with self.repository.transaction() as tx:
             existing = await tx.get_managed_artifact(org_id, project_id, uri)
+            if existing is not None:
+                return existing
             quota = await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
-            if quota is not None:
-                stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
-                # Subtract what this URI already occupies: an overwrite replaces
-                # bytes rather than adding them, and charging the full size again
-                # would make a re-upload fail at half the real limit.
-                projected = stored - (existing.size_bytes if existing is not None else 0) + size_bytes
-                if projected > quota:
-                    raise InputError(
-                        f"artifact would put {org_id}/{project_id} at {projected} bytes, "
-                        f"above its {quota}-byte artifact quota"
-                    )
+            stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
+            if quota is not None and stored + size_bytes > quota:
+                raise InputError(
+                    f"artifact would put {org_id}/{project_id} at {stored + size_bytes} bytes, "
+                    f"above its {quota}-byte artifact quota"
+                )
             record = ManagedArtifactRecord(
                 uri=uri,
                 kind=reference.kind.value,
                 org_id=org_id,
                 project_id=project_id,
+                state=ManagedArtifactState.QUARANTINED,
+                record_generation=1,
                 size_bytes=size_bytes,
                 sha256=sha256,
-                created_at=existing.created_at if existing is not None else now,
+                created_at=now,
                 updated_at=now,
-                last_accessed_at=existing.last_accessed_at if existing is not None else None,
+                quarantine_reason="object version was not supplied by the physical store",
             )
             await tx.put_managed_artifact(record)
             return record
+
+    async def reserve_managed_artifact_upload(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        uri: str,
+        size_bytes: int,
+        sha256: str,
+        actor: str = "system:artifact-upload",
+    ) -> ManagedArtifactRecord:
+        """Reserve quota and one logical generation before external I/O."""
+
+        reference = parse_managed_uri(uri)
+        if reference.kind in CONTENT_ADDRESSED_KINDS and sha256 != reference.object_id:
+            raise InputError("managed artifact digest does not match its content-addressed URI")
+        now = utcnow()
+        async with self.repository.transaction() as tx:
+            existing = await tx.get_managed_artifact(org_id, project_id, uri)
+            if existing is not None:
+                if existing.state is ManagedArtifactState.ACTIVE:
+                    if existing.size_bytes == size_bytes and existing.sha256 == sha256:
+                        return existing
+                    raise ConflictError("an immutable managed artifact is already active with different bytes")
+                if existing.state is ManagedArtifactState.PENDING_UPLOAD:
+                    if existing.size_bytes == size_bytes and existing.sha256 == sha256:
+                        return existing
+                    raise ConflictError("a different managed artifact upload already owns this reservation")
+                if existing.state is ManagedArtifactState.DELETING:
+                    raise ConflictError("managed artifact deletion is in progress; retry after reconciliation")
+                if existing.state is ManagedArtifactState.QUARANTINED:
+                    raise ConflictError("managed artifact ownership is quarantined; reconcile it before upload")
+
+            quota = await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
+            stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
+            prior_charge = 0 if existing is None else existing.charged_bytes
+            projected = stored - prior_charge + size_bytes
+            if quota is not None and projected > quota:
+                raise InputError(
+                    f"artifact would put {org_id}/{project_id} at {projected} bytes, "
+                    f"above its {quota}-byte artifact quota"
+                )
+            generation = 1 if existing is None else existing.record_generation + 1
+            reserved = ManagedArtifactRecord(
+                uri=uri,
+                kind=reference.kind.value,
+                org_id=org_id,
+                project_id=project_id,
+                state=ManagedArtifactState.PENDING_UPLOAD,
+                record_generation=generation,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                created_at=now if existing is None else existing.created_at,
+                updated_at=now,
+                upload_started_at=now,
+                activated_at=None,
+                object_version=None,
+                quarantine_reason=None,
+                last_accessed_at=None if existing is None else existing.last_accessed_at,
+                superseded_at=None if existing is None else existing.superseded_at,
+                superseded_by_uri=None if existing is None else existing.superseded_by_uri,
+            )
+            await tx.put_managed_artifact(reserved)
+            await self._audit_scoped(
+                tx,
+                Principal(subject=actor),
+                org_id=org_id,
+                project_id=project_id,
+                entity_type="artifact",
+                entity_id=uri[:256],
+                action="artifact.upload_reserved",
+                new_state=reserved.state.value,
+                payload={"record_generation": generation, "size_bytes": size_bytes},
+            )
+            return reserved
+
+    async def activate_managed_artifact_upload(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        uri: str,
+        record_generation: int,
+        metadata: ManagedArtifactObjectMetadata,
+        actor: str = "system:artifact-upload",
+    ) -> ManagedArtifactRecord:
+        """Activate only the unchanged reservation and exact physical version."""
+
+        if metadata.uri != uri:
+            raise ConflictError("physical artifact metadata names a different object")
+        if metadata.sha256 is None:
+            raise ConflictError("physical artifact metadata lacks a backend-observed digest")
+        now = utcnow()
+        async with self.repository.transaction() as tx:
+            current = await tx.get_managed_artifact(org_id, project_id, uri)
+            if current is None:
+                raise ConflictError("artifact upload reservation disappeared before activation")
+            if current.state is ManagedArtifactState.ACTIVE:
+                if (
+                    current.record_generation == record_generation
+                    and current.object_version == metadata.object_version
+                    and current.size_bytes == metadata.size_bytes
+                    and current.sha256 == metadata.sha256
+                ):
+                    return current
+                raise ConflictError("artifact upload activation is stale")
+            if (
+                current.state is not ManagedArtifactState.PENDING_UPLOAD
+                or current.record_generation != record_generation
+            ):
+                raise ConflictError("artifact upload reservation is stale")
+            if current.size_bytes != metadata.size_bytes:
+                raise ConflictError("physical artifact size does not match the reservation")
+            if current.sha256 != metadata.sha256:
+                raise ConflictError("physical artifact digest does not match the reservation")
+            activated = _artifact_record_update(
+                current,
+                {
+                    "state": ManagedArtifactState.ACTIVE,
+                    "object_version": metadata.object_version,
+                    "activated_at": now,
+                    "updated_at": now,
+                    "quarantine_reason": None,
+                },
+            )
+            await tx.put_managed_artifact(activated)
+            await self._audit_scoped(
+                tx,
+                Principal(subject=actor),
+                org_id=org_id,
+                project_id=project_id,
+                entity_type="artifact",
+                entity_id=uri[:256],
+                action="artifact.upload_activated",
+                previous_state=current.state.value,
+                new_state=activated.state.value,
+                payload={
+                    "record_generation": record_generation,
+                    "object_version": metadata.object_version,
+                    "size_bytes": metadata.size_bytes,
+                },
+            )
+            return activated
+
+    async def _quarantine_managed_artifact(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        uri: str,
+        record_generation: int,
+        reason: str,
+        actor: str,
+        object_version: str | None = None,
+        observed_size_bytes: int | None = None,
+    ) -> ManagedArtifactRecord | None:
+        """Quarantine one unchanged generation after an unprovable outcome."""
+
+        now = utcnow()
+        async with self.repository.transaction() as tx:
+            current = await tx.get_managed_artifact(org_id, project_id, uri)
+            if current is None or current.record_generation != record_generation:
+                return None
+            quarantined = _artifact_record_update(
+                current,
+                {
+                    "state": ManagedArtifactState.QUARANTINED,
+                    "size_bytes": (
+                        current.size_bytes
+                        if observed_size_bytes is None
+                        else max(current.size_bytes, observed_size_bytes)
+                    ),
+                    "object_version": object_version if object_version is not None else current.object_version,
+                    "updated_at": now,
+                    "deletion_claim_id": None,
+                    "deletion_started_at": None,
+                    "deleted_at": None,
+                    "quarantine_reason": reason,
+                },
+            )
+            await tx.put_managed_artifact(quarantined)
+            await self._audit_scoped(
+                tx,
+                Principal(subject=actor),
+                org_id=org_id,
+                project_id=project_id,
+                entity_type="artifact",
+                entity_id=uri[:256],
+                action="artifact.quarantined",
+                previous_state=current.state.value,
+                new_state=quarantined.state.value,
+                payload={"record_generation": record_generation, "reason": reason},
+            )
+            return quarantined
+
+    async def upload_managed_artifact(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        uri: str,
+        payload: bytes,
+        sha256: str | None = None,
+        actor: str = "system:artifact-upload",
+    ) -> ManagedArtifactRecord:
+        """Reserve, conditionally write, and generation-CAS activate one object."""
+
+        if self.artifact_store is None:
+            raise InputError("a versioned managed artifact store is not configured")
+        digest = hashlib.sha256(payload).hexdigest()
+        if sha256 is not None and sha256 != digest:
+            raise InputError("managed artifact digest does not match its payload")
+        reserved = await self.reserve_managed_artifact_upload(
+            org_id=org_id,
+            project_id=project_id,
+            uri=uri,
+            size_bytes=len(payload),
+            sha256=digest,
+            actor=actor,
+        )
+        if reserved.state is ManagedArtifactState.ACTIVE:
+            assert reserved.object_version is not None
+            try:
+                current_bytes = await asyncio.to_thread(
+                    self.artifact_store.get_versioned,
+                    uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                    object_version=reserved.object_version,
+                )
+            except FileNotFoundError as exc:
+                await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=uri,
+                    record_generation=reserved.record_generation,
+                    reason="active physical object is absent during upload replay",
+                    actor=actor,
+                )
+                raise ConflictError("active managed artifact bytes are absent") from exc
+            except ManagedArtifactVersionMismatchError as exc:
+                await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=uri,
+                    record_generation=reserved.record_generation,
+                    reason="active physical object changed during upload replay",
+                    actor=actor,
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                raise ConflictError("active managed artifact version changed") from exc
+            except ManagedArtifactConflictError as exc:
+                await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=uri,
+                    record_generation=reserved.record_generation,
+                    reason="active physical bytes disagree with their URI",
+                    actor=actor,
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                raise ConflictError("active managed artifact bytes disagree with their ledger") from exc
+            except (ManagedArtifactOperationInconclusiveError, InvalidManagedArtifactURI, OSError) as exc:
+                raise UnavailableError("managed artifact replay verification is inconclusive") from exc
+            if current_bytes.payload != payload:
+                await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=uri,
+                    record_generation=reserved.record_generation,
+                    reason="active physical bytes disagree with their ledger",
+                    actor=actor,
+                    object_version=current_bytes.metadata.object_version,
+                    observed_size_bytes=current_bytes.metadata.size_bytes,
+                )
+                raise ConflictError("active managed artifact bytes disagree with their ledger")
+            return reserved
+        try:
+            written = await asyncio.to_thread(
+                self.artifact_store.put_versioned,
+                uri,
+                payload,
+                org_id=org_id,
+                project_id=project_id,
+            )
+        except ManagedArtifactConflictError as exc:
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=reserved.record_generation,
+                reason="physical object contains different bytes",
+                actor=actor,
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+            )
+            raise ConflictError("managed artifact physical object conflicts with the reservation") from exc
+        except (
+            ManagedArtifactWriteInconclusiveError,
+            ManagedArtifactOperationInconclusiveError,
+            ManagedArtifactVersionMismatchError,
+            InvalidManagedArtifactURI,
+            OSError,
+        ) as exc:
+            raise UnavailableError("managed artifact write is inconclusive; retry or reconcile the reservation") from exc
+
+        # Do not physically clean up after an activation CAS failure here. A
+        # retry may already have activated the same immutable provider version,
+        # and no lock may span the storage call needed to distinguish that race.
+        # Bounded inventory/reconciliation owns any genuinely orphaned object.
+        return await self.activate_managed_artifact_upload(
+            org_id=org_id,
+            project_id=project_id,
+            uri=uri,
+            record_generation=reserved.record_generation,
+            metadata=written.metadata,
+            actor=actor,
+        )
+
+    async def read_managed_artifact(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        uri: str,
+    ) -> bytes:
+        """Read only an active row's exact version and revalidate before return."""
+
+        if self.artifact_store is None:
+            raise InputError("a versioned managed artifact store is not configured")
+        async with self.repository.transaction() as tx:
+            record = await tx.get_managed_artifact(org_id, project_id, uri)
+            if record is None or record.state is ManagedArtifactState.DELETED:
+                raise NotFoundError(f"managed artifact {uri!r} was not found")
+            if record.state is not ManagedArtifactState.ACTIVE or record.object_version is None:
+                raise ConflictError(f"managed artifact {uri!r} is {record.state.value} and cannot be read")
+        try:
+            observed = await asyncio.to_thread(
+                self.artifact_store.get_versioned,
+                uri,
+                org_id=org_id,
+                project_id=project_id,
+                object_version=record.object_version,
+            )
+        except FileNotFoundError as exc:
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=record.record_generation,
+                reason="active physical object is absent",
+                actor="system:artifact-read",
+            )
+            raise NotFoundError(f"managed artifact {uri!r} was not found") from exc
+        except ManagedArtifactVersionMismatchError as exc:
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=record.record_generation,
+                reason="active physical object version changed",
+                actor="system:artifact-read",
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+            )
+            raise ConflictError("managed artifact version changed outside the lifecycle") from exc
+        except ManagedArtifactConflictError as exc:
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=record.record_generation,
+                reason="active physical bytes disagree with their URI",
+                actor="system:artifact-read",
+                object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+            )
+            raise ConflictError("managed artifact bytes disagree with their ledger") from exc
+        except (ManagedArtifactOperationInconclusiveError, InvalidManagedArtifactURI, OSError) as exc:
+            raise UnavailableError("managed artifact read is inconclusive") from exc
+
+        if (
+            observed.metadata.size_bytes != record.size_bytes
+            or observed.metadata.sha256 != record.sha256
+            or hashlib.sha256(observed.payload).hexdigest() != record.sha256
+        ):
+            await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=uri,
+                record_generation=record.record_generation,
+                reason="active physical bytes disagree with their ledger",
+                actor="system:artifact-read",
+                object_version=observed.metadata.object_version,
+                observed_size_bytes=observed.metadata.size_bytes,
+            )
+            raise ConflictError("managed artifact bytes disagree with their ledger")
+
+        async with self.repository.transaction() as tx:
+            current = await tx.get_managed_artifact(org_id, project_id, uri)
+            if (
+                current is None
+                or current.state is not ManagedArtifactState.ACTIVE
+                or current.record_generation != record.record_generation
+                or current.object_version != observed.metadata.object_version
+            ):
+                raise ConflictError("managed artifact lifecycle changed while it was read")
+            await tx.put_managed_artifact(current.model_copy(update={"last_accessed_at": utcnow()}))
+        return observed.payload
+
+    async def reconcile_artifact_lifecycle_once(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime | None = None,
+        recovery_grace_s: float = DEFAULT_ARTIFACT_RECOVERY_GRACE_S,
+        limit: int = 100,
+    ) -> dict[str, int]:
+        """Recover expired uploads/deletions and detect late physical objects."""
+
+        if self.artifact_store is None:
+            raise InputError("a versioned managed artifact store is not configured")
+        if not _is_finite_nonnegative_number(recovery_grace_s):
+            raise InputError("artifact recovery grace period must be finite and non-negative")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise InputError("artifact recovery limit must be between 1 and 1000")
+        moment = now or utcnow()
+        cutoff = moment - timedelta(seconds=recovery_grace_s)
+        counts = {
+            "activated": 0,
+            "released": 0,
+            "deleted": 0,
+            "quarantined": 0,
+            "inconclusive": 0,
+            "capped": 0,
+        }
+        async with self.repository.transaction() as tx:
+            pending = await tx.list_managed_artifacts_by_state(
+                state=ManagedArtifactState.PENDING_UPLOAD,
+                org_id=org_id,
+                project_id=project_id,
+                updated_before=cutoff,
+                limit=limit + 1,
+            )
+            deleting = await tx.list_managed_artifacts_by_state(
+                state=ManagedArtifactState.DELETING,
+                org_id=org_id,
+                project_id=project_id,
+                updated_before=cutoff,
+                limit=limit + 1,
+            )
+            tombstones = await tx.list_managed_artifacts_by_state(
+                state=ManagedArtifactState.DELETED,
+                org_id=org_id,
+                project_id=project_id,
+                updated_before=cutoff,
+                limit=limit + 1,
+            )
+        if len(pending) > limit or len(deleting) > limit or len(tombstones) > limit:
+            counts["capped"] = 1
+        pending = pending[:limit]
+        deleting = deleting[:limit]
+        tombstones = tombstones[:limit]
+
+        for record in pending:
+            try:
+                observed = await asyncio.to_thread(
+                    self.artifact_store.get_versioned,
+                    record.uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+            except FileNotFoundError:
+                async with self.repository.transaction() as tx:
+                    current = await tx.get_managed_artifact(org_id, project_id, record.uri)
+                    if (
+                        current is None
+                        or current.state is not ManagedArtifactState.PENDING_UPLOAD
+                        or current.record_generation != record.record_generation
+                        or current.updated_at > cutoff
+                    ):
+                        continue
+                    released = _artifact_record_update(
+                        current,
+                        {
+                            "state": ManagedArtifactState.DELETED,
+                            "size_bytes": 0,
+                            "updated_at": moment,
+                            "deleted_at": moment,
+                            "quarantine_reason": None,
+                        },
+                    )
+                    await tx.put_managed_artifact(released)
+                    await self._audit_scoped(
+                        tx,
+                        Principal(subject="system:artifact-recovery"),
+                        org_id=org_id,
+                        project_id=project_id,
+                        entity_type="artifact",
+                        entity_id=record.uri[:256],
+                        action="artifact.upload_reservation_released",
+                        previous_state=current.state.value,
+                        new_state=released.state.value,
+                        payload={"record_generation": current.record_generation},
+                    )
+                    counts["released"] += 1
+                continue
+            except (
+                ManagedArtifactOperationInconclusiveError,
+                ManagedArtifactInventoryError,
+                ManagedArtifactVersionMismatchError,
+                InvalidManagedArtifactURI,
+                OSError,
+            ):
+                counts["inconclusive"] += 1
+                continue
+            except ManagedArtifactConflictError as exc:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    record_generation=record.record_generation,
+                    reason="pending physical object could not be verified",
+                    actor="system:artifact-recovery",
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+            except ValueError:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    record_generation=record.record_generation,
+                    reason="pending physical object could not be verified",
+                    actor="system:artifact-recovery",
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+
+            digest = hashlib.sha256(observed.payload).hexdigest()
+            if observed.metadata.size_bytes != record.size_bytes or digest != record.sha256:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    record_generation=record.record_generation,
+                    reason="pending physical object does not match its reservation",
+                    actor="system:artifact-recovery",
+                    object_version=observed.metadata.object_version,
+                    observed_size_bytes=observed.metadata.size_bytes,
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+            try:
+                await self.activate_managed_artifact_upload(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=record.uri,
+                    record_generation=record.record_generation,
+                    metadata=observed.metadata,
+                    actor="system:artifact-recovery",
+                )
+            except ConflictError:
+                continue
+            counts["activated"] += 1
+
+        recovery_actor = Principal(subject="system:artifact-recovery")
+        for claim in deleting:
+            finalized, _removed = await self._execute_artifact_deletion_claim(
+                claim,
+                principal=recovery_actor,
+                now=moment,
+            )
+            counts["deleted"] += int(finalized)
+            if not finalized:
+                counts["inconclusive"] += 1
+
+        # A late stale uploader may create bytes after its expired reservation
+        # was tombstoned. Never delete them by inference: quarantine and charge
+        # the observed physical size for explicit inventory resolution.
+        for tombstone in tombstones:
+            try:
+                observed = await asyncio.to_thread(
+                    self.artifact_store.get_versioned,
+                    tombstone.uri,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+            except FileNotFoundError:
+                async with self.repository.transaction() as tx:
+                    current = await tx.get_managed_artifact(org_id, project_id, tombstone.uri)
+                    if (
+                        current is not None
+                        and current.state is ManagedArtifactState.DELETED
+                        and current.record_generation == tombstone.record_generation
+                    ):
+                        await tx.put_managed_artifact(current.model_copy(update={"updated_at": moment}))
+                continue
+            except ManagedArtifactConflictError as exc:
+                quarantined = await self._quarantine_managed_artifact(
+                    org_id=org_id,
+                    project_id=project_id,
+                    uri=tombstone.uri,
+                    record_generation=tombstone.record_generation,
+                    reason="physical object appeared after lifecycle deletion with invalid bytes",
+                    actor="system:artifact-recovery",
+                    object_version=(None if exc.current_metadata is None else exc.current_metadata.object_version),
+                    observed_size_bytes=(None if exc.current_metadata is None else exc.current_metadata.size_bytes),
+                )
+                counts["quarantined"] += int(quarantined is not None)
+                continue
+            except (
+                ManagedArtifactOperationInconclusiveError,
+                ManagedArtifactInventoryError,
+                ManagedArtifactVersionMismatchError,
+                InvalidManagedArtifactURI,
+                OSError,
+                ValueError,
+            ):
+                counts["inconclusive"] += 1
+                continue
+            quarantined = await self._quarantine_managed_artifact(
+                org_id=org_id,
+                project_id=project_id,
+                uri=tombstone.uri,
+                record_generation=tombstone.record_generation,
+                reason="physical object appeared after lifecycle deletion",
+                actor="system:artifact-recovery",
+                object_version=observed.metadata.object_version,
+                observed_size_bytes=observed.metadata.size_bytes,
+            )
+            counts["quarantined"] += int(quarantined is not None)
+        return counts
 
     @staticmethod
     async def _artifact_quota(
@@ -6190,6 +6851,11 @@ class ControlPlaneService:
                 status = ArtifactInventoryStatus.INDEX_ONLY
             elif record.size_bytes != observed.size_bytes:
                 status = ArtifactInventoryStatus.SIZE_MISMATCH
+            elif (
+                record.state in {ManagedArtifactState.ACTIVE, ManagedArtifactState.DELETING}
+                and record.object_version != observed.object_version
+            ):
+                status = ArtifactInventoryStatus.VERSION_MISMATCH
             else:
                 status = ArtifactInventoryStatus.MATCHED
             entries.append(
@@ -6198,6 +6864,8 @@ class ControlPlaneService:
                     status=status,
                     indexed_size_bytes=None if record is None else record.size_bytes,
                     observed_size_bytes=None if observed is None else observed.size_bytes,
+                    lifecycle_state=None if record is None else record.state,
+                    indexed_object_version=None if record is None else record.object_version,
                     observed_object_version=None if observed is None else observed.object_version,
                 )
             )
@@ -6208,8 +6876,13 @@ class ControlPlaneService:
             # write. A late list/stat/digest error therefore leaves the whole
             # page report-only instead of partially reindexed.
             validated: list[ManagedArtifactObjectMetadata] = []
+            if not isinstance(store, ManagedArtifactVersionedStore):
+                raise ManagedArtifactInventoryError("lifecycle reconciliation requires exact-version reads")
             for entry in entries:
-                if entry.status is not ArtifactInventoryStatus.PHYSICAL_ONLY:
+                if entry.status is not ArtifactInventoryStatus.PHYSICAL_ONLY and not (
+                    entry.status is ArtifactInventoryStatus.MATCHED
+                    and entry.lifecycle_state is ManagedArtifactState.QUARANTINED
+                ):
                     continue
                 assert entry.observed_size_bytes is not None
                 assert entry.observed_object_version is not None
@@ -6219,23 +6892,36 @@ class ControlPlaneService:
                     object_version=entry.observed_object_version,
                 )
                 reference = parse_managed_uri(entry.uri)
-                if reference.kind in CONTENT_ADDRESSED_KINDS:
-                    try:
-                        payload = await asyncio.to_thread(
-                            store.get,
-                            entry.uri,
-                            org_id=org_id,
-                            project_id=project_id,
-                        )
-                    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-                        raise ManagedArtifactInventoryError(
-                            f"could not verify content-addressed inventory object {entry.uri!r}"
-                        ) from exc
-                    if len(payload) != expected.size_bytes:
-                        raise ConflictError(
-                            f"artifact {entry.uri!r} changed while its content digest was verified; rerun inventory"
-                        )
-                validated.append(expected)
+                try:
+                    exact = await asyncio.to_thread(
+                        store.get_versioned,
+                        entry.uri,
+                        org_id=org_id,
+                        project_id=project_id,
+                        object_version=expected.object_version,
+                    )
+                except (
+                    OSError,
+                    ManagedArtifactConflictError,
+                    ManagedArtifactOperationInconclusiveError,
+                    ManagedArtifactVersionMismatchError,
+                    ValueError,
+                ) as exc:
+                    raise ManagedArtifactInventoryError(
+                        f"could not verify exact inventory object {entry.uri!r}"
+                    ) from exc
+                if (
+                    exact.metadata != expected
+                    or exact.metadata.sha256 is None
+                    or len(exact.payload) != expected.size_bytes
+                    or hashlib.sha256(exact.payload).hexdigest() != exact.metadata.sha256
+                ):
+                    raise ConflictError(
+                        f"artifact {entry.uri!r} changed while its exact bytes were verified; rerun inventory"
+                    )
+                if reference.kind in CONTENT_ADDRESSED_KINDS and exact.metadata.sha256 != reference.object_id:
+                    raise ConflictError(f"content-addressed artifact {entry.uri!r} does not match its URI digest")
+                validated.append(exact.metadata)
 
             # This is the last provider observation before the additive database
             # transaction. In particular it runs after content-addressed reads,
@@ -6279,36 +6965,59 @@ class ControlPlaneService:
         project_id: str,
         metadata: tuple[ManagedArtifactObjectMetadata, ...],
     ) -> frozenset[str]:
-        """Atomically add observed physical-only rows and their audit events."""
+        """Activate exact physical-only or quarantined rows atomically."""
 
         if not metadata:
             return frozenset()
         now = utcnow()
+        updated_uris: set[str] = set()
         async with self.repository.transaction() as tx:
-            missing: list[tuple[ManagedArtifactObjectMetadata, ManagedArtifactRef]] = []
+            candidates: list[tuple[ManagedArtifactObjectMetadata, ManagedArtifactRef, ManagedArtifactRecord | None]] = []
             for observed in metadata:
-                if await tx.get_managed_artifact(org_id, project_id, observed.uri) is None:
-                    missing.append((observed, parse_managed_uri(observed.uri)))
+                existing = await tx.get_managed_artifact(org_id, project_id, observed.uri)
+                if existing is None:
+                    candidates.append((observed, parse_managed_uri(observed.uri), None))
+                elif existing.state is ManagedArtifactState.QUARANTINED:
+                    if existing.size_bytes != observed.size_bytes or (
+                        existing.sha256 is not None and existing.sha256 != observed.sha256
+                    ):
+                        raise ConflictError(
+                            f"quarantined artifact {observed.uri!r} disagrees with the exact physical object"
+                        )
+                    candidates.append((observed, parse_managed_uri(observed.uri), existing))
             quota = await self._artifact_quota(tx, org_id=org_id, project_id=project_id)
             stored = await tx.sum_managed_artifact_bytes(org_id=org_id, project_id=project_id)
-            projected = stored + sum(observed.size_bytes for observed, _reference in missing)
+            projected = stored + sum(
+                observed.size_bytes for observed, _reference, existing in candidates if existing is None
+            )
             if quota is not None and projected > quota:
                 raise InputError(
                     f"reindexing observed artifacts would put {org_id}/{project_id} at {projected} bytes, "
                     f"above its {quota}-byte artifact quota"
                 )
-            for observed, reference in missing:
+            for observed, reference, existing in candidates:
                 record = ManagedArtifactRecord(
                     uri=observed.uri,
                     kind=reference.kind.value,
                     org_id=org_id,
                     project_id=project_id,
+                    state=ManagedArtifactState.ACTIVE,
+                    record_generation=1 if existing is None else existing.record_generation,
                     size_bytes=observed.size_bytes,
-                    sha256=reference.object_id if reference.kind in CONTENT_ADDRESSED_KINDS else None,
-                    created_at=now,
+                    sha256=observed.sha256,
+                    object_version=observed.object_version,
+                    created_at=now if existing is None else existing.created_at,
                     updated_at=now,
+                    upload_started_at=None if existing is None else existing.upload_started_at,
+                    activated_at=now,
+                    quarantine_reason=None,
+                    last_accessed_at=None if existing is None else existing.last_accessed_at,
+                    hold=None if existing is None else existing.hold,
+                    superseded_at=None if existing is None else existing.superseded_at,
+                    superseded_by_uri=None if existing is None else existing.superseded_by_uri,
                 )
                 await tx.put_managed_artifact(record)
+                action = "artifact.inventory_reindexed" if existing is None else "artifact.inventory_reconciled"
                 await self._audit_scoped(
                     tx,
                     principal,
@@ -6316,13 +7025,17 @@ class ControlPlaneService:
                     project_id=project_id,
                     entity_type="artifact",
                     entity_id=observed.uri[:256],
-                    action="artifact.inventory_reindexed",
+                    action=action,
+                    previous_state=None if existing is None else existing.state.value,
+                    new_state=record.state.value,
                     payload={
                         "size_bytes": observed.size_bytes,
                         "object_version": observed.object_version,
+                        "record_generation": record.record_generation,
                     },
                 )
-        return frozenset(observed.uri for observed, _reference in missing)
+                updated_uris.add(observed.uri)
+        return frozenset(updated_uris)
 
     async def artifact_usage(
         self,
@@ -6367,6 +7080,8 @@ class ControlPlaneService:
             record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:
                 raise NotFoundError(f"artifact {uri!r} is not indexed in {org_id}/{project_id}")
+            if record.state is not ManagedArtifactState.ACTIVE:
+                raise ConflictError(f"artifact {uri!r} is {record.state.value} and cannot be held")
             hold = ArtifactHold(reason=reason, held_by=principal.subject, expires_at=expires_at)
             held = record.model_copy(update={"hold": hold, "updated_at": utcnow()})
             await tx.put_managed_artifact(held)
@@ -6397,6 +7112,8 @@ class ControlPlaneService:
             record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:
                 raise NotFoundError(f"artifact {uri!r} is not indexed in {org_id}/{project_id}")
+            if record.state in {ManagedArtifactState.DELETING, ManagedArtifactState.DELETED}:
+                raise ConflictError(f"artifact {uri!r} is {record.state.value}; retry after reconciliation")
             if record.hold is None:
                 return record
             released = record.model_copy(update={"hold": None, "updated_at": utcnow()})
@@ -6487,6 +7204,110 @@ class ControlPlaneService:
                     collectable.append(record)
         return collectable
 
+    async def _finalize_artifact_deletion(
+        self,
+        *,
+        claim: ManagedArtifactRecord,
+        status: ManagedArtifactDeleteStatus,
+        principal: Principal,
+        now: datetime,
+    ) -> bool:
+        """Finalize only the unchanged durable deletion claim."""
+
+        async with self.repository.transaction() as tx:
+            current = await tx.get_managed_artifact(claim.org_id, claim.project_id, claim.uri)
+            if (
+                current is None
+                or current.state is not ManagedArtifactState.DELETING
+                or current.record_generation != claim.record_generation
+                or current.deletion_claim_id != claim.deletion_claim_id
+                or current.object_version != claim.object_version
+            ):
+                return False
+            deleted = _artifact_record_update(
+                current,
+                {
+                    "state": ManagedArtifactState.DELETED,
+                    "size_bytes": 0,
+                    "updated_at": now,
+                    "deleted_at": now,
+                    "deletion_claim_id": None,
+                    "deletion_started_at": None,
+                    "quarantine_reason": None,
+                    "hold": None,
+                },
+            )
+            await tx.put_managed_artifact(deleted)
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=claim.org_id,
+                project_id=claim.project_id,
+                entity_type="artifact",
+                entity_id=claim.uri[:256],
+                action="artifact.collected",
+                previous_state=current.state.value,
+                new_state=deleted.state.value,
+                payload={
+                    "kind": current.kind,
+                    "size_bytes": current.size_bytes,
+                    "record_generation": current.record_generation,
+                    "object_version": current.object_version,
+                    "provider_status": status.value,
+                },
+            )
+            return True
+
+    async def _execute_artifact_deletion_claim(
+        self,
+        claim: ManagedArtifactRecord,
+        *,
+        principal: Principal,
+        now: datetime,
+    ) -> tuple[bool, bool]:
+        """Conditionally delete and reconcile one already-durable claim.
+
+        Returns ``(finalized, physically_deleted)``. Inconclusive operations
+        intentionally leave ``DELETING`` durable for a later recovery pass.
+        """
+
+        if self.artifact_store is None or claim.object_version is None:
+            return False, False
+        try:
+            result = await asyncio.to_thread(
+                self.artifact_store.delete_versioned,
+                claim.uri,
+                org_id=claim.org_id,
+                project_id=claim.project_id,
+                object_version=claim.object_version,
+            )
+        except (
+            ManagedArtifactDeleteInconclusiveError,
+            ManagedArtifactOperationInconclusiveError,
+            InvalidManagedArtifactURI,
+            OSError,
+        ):
+            return False, False
+        if result.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH:
+            await self._quarantine_managed_artifact(
+                org_id=claim.org_id,
+                project_id=claim.project_id,
+                uri=claim.uri,
+                record_generation=claim.record_generation,
+                reason="conditional deletion observed a different physical version",
+                actor=principal.subject,
+                object_version=(None if result.current_metadata is None else result.current_metadata.object_version),
+                observed_size_bytes=(None if result.current_metadata is None else result.current_metadata.size_bytes),
+            )
+            return False, False
+        finalized = await self._finalize_artifact_deletion(
+            claim=claim,
+            status=result.status,
+            principal=principal,
+            now=now,
+        )
+        return finalized, finalized and result.status is ManagedArtifactDeleteStatus.DELETED
+
     async def collect_artifacts_once(
         self,
         *,
@@ -6499,119 +7320,150 @@ class ControlPlaneService:
         limit: int = 500,
         now: datetime | None = None,
     ) -> ArtifactCollection:
-        """Reclaim artifacts nothing protects, newest-safe and dry by default.
-
-        **The grace period is the load-bearing part, and the race it closes is not
-        obvious.** An upload indexes the object *before* any workload names it --
-        it has to, since the submitter needs the URI to build the spec. So between
-        the upload and the submission the artifact has zero references and looks
-        exactly like abandoned garbage. A collector without a grace period would
-        delete callables out from under jobs being submitted right now, and would
-        do it more often the busier the fleet is.
-
-        ``dry_run`` defaults to true for the same reason the index shipped before
-        any collector: the first real pass on a fleet should be one a human read
-        first. The legacy controller can call the destructive branch when a
-        deletion store is explicitly wired, but M1.5 does not add the serialized,
-        version-conditional state machine that would make that branch race-free.
-
-        Order matters on failure. The store object is removed first and the index
-        row second, so a crash between them leaves an index entry for bytes that
-        are gone -- which the next pass re-attempts and resolves, since deleting an
-        absent object is not an error. The reverse order would leak: bytes with no
-        index row are bytes nothing will ever look at again.
-        """
+        """Dry-run candidates or claim/version-delete/finalize them safely."""
 
         if self.artifact_store is None:
-            raise InputError("a managed artifact store is not configured")
+            raise InputError("a versioned managed artifact store is not configured")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise InputError("artifact collection limit must be between 1 and 10000")
+        if not _is_finite_nonnegative_number(grace_period_s):
+            raise InputError("artifact collection grace period must be finite and non-negative")
         moment = now or utcnow()
-        # Per kind, because they are not the same thing. A callable is
-        # reproducible from its source; an attempt's logs are the only record of
-        # what happened, and they are wanted long after the bytes that produced
-        # them stopped mattering. One window for both means either deleting the
-        # evidence early or keeping every pickle forever.
-        #
-        # ``None`` means never collect this kind. Spelled out rather than as an
-        # infinite window: ``timedelta(seconds=inf)`` overflows, so the clever
-        # version is not merely less clear, it does not run.
+        actor = principal or Principal(subject="system:artifact-collector")
         windows: dict[str, float | None] = dict(retention_by_kind or {})
+        if any(value is not None and (not _is_finite_nonnegative_number(value)) for value in windows.values()):
+            raise InputError("artifact retention windows must be finite non-negative numbers or null")
         collected: list[str] = []
         reclaimed = 0
         held = referenced = within_grace = 0
+        scan_limit = 10_000
         async with self.repository.transaction() as tx:
-            candidates = await tx.list_managed_artifacts(org_id=org_id, project_id=project_id, limit=100_000)
-        for record in candidates:
+            deleting_candidates = await tx.list_managed_artifacts_by_state(
+                state=ManagedArtifactState.DELETING,
+                org_id=org_id,
+                project_id=project_id,
+                limit=scan_limit + 1,
+            )
+            active_candidates = await tx.list_managed_artifacts_by_state(
+                state=ManagedArtifactState.ACTIVE,
+                org_id=org_id,
+                project_id=project_id,
+                limit=scan_limit + 1,
+            )
+        capped = len(deleting_candidates) > scan_limit or len(active_candidates) > scan_limit
+        deleting_candidates = deleting_candidates[:scan_limit]
+        active_candidates = active_candidates[:scan_limit]
+
+        # First resume claims whose owner crashed after the database commit. A
+        # claim already excludes new references/holds, and the provider version
+        # keeps a stale recovery pass away from any replacement.
+        for index, candidate in enumerate(deleting_candidates):
             if len(collected) >= limit:
+                capped = capped or index < len(deleting_candidates)
                 break
-            if record.hold is not None and record.hold.active_at(moment):
+            finalized, removed = await self._execute_artifact_deletion_claim(
+                candidate,
+                principal=actor,
+                now=moment,
+            )
+            if finalized:
+                collected.append(candidate.uri)
+                if removed:
+                    reclaimed += candidate.size_bytes
+
+        for index, candidate in enumerate(active_candidates):
+            if len(collected) >= limit:
+                capped = capped or index < len(active_candidates)
+                break
+            if candidate.hold is not None and candidate.hold.active_at(moment):
                 held += 1
                 continue
-            window = windows.get(str(record.kind), grace_period_s)
+            window = windows.get(candidate.kind, grace_period_s)
             if window is None:
                 within_grace += 1
                 continue
-            if record.created_at > moment - timedelta(seconds=window):
+            age_origin = candidate.activated_at or candidate.created_at
+            if age_origin > moment - timedelta(seconds=window):
                 within_grace += 1
                 continue
+
+            claim: ManagedArtifactRecord | None = None
             async with self.repository.transaction() as tx:
+                current = await tx.get_managed_artifact(org_id, project_id, candidate.uri)
+                if current is None or current.state is not ManagedArtifactState.ACTIVE:
+                    continue
+                if current.hold is not None and current.hold.active_at(moment):
+                    held += 1
+                    continue
+                current_origin = current.activated_at or current.created_at
+                current_window = windows.get(current.kind, grace_period_s)
+                if current_window is None or current_origin > moment - timedelta(seconds=current_window):
+                    within_grace += 1
+                    continue
                 if await tx.list_artifact_references(
                     org_id=org_id,
                     project_id=project_id,
-                    uri=record.uri,
+                    uri=current.uri,
                     active_only=True,
                 ):
                     referenced += 1
                     continue
-            if dry_run:
-                collected.append(record.uri)
-                reclaimed += record.size_bytes
-                continue
-            removed = await asyncio.to_thread(
-                self.artifact_store.delete,
-                record.uri,
-                org_id=record.org_id,
-                project_id=record.project_id,
-            )
-            async with self.repository.transaction() as tx:
-                current = await tx.get_managed_artifact(org_id, project_id, record.uri)
-                if current is None:
+                if dry_run:
+                    collected.append(current.uri)
+                    reclaimed += current.size_bytes
                     continue
-                held_after_delete = current.hold is not None and current.hold.active_at(utcnow())
-                if held_after_delete:
-                    # Someone claimed it between the check and the delete. The
-                    # bytes are already gone, so the honest move is to drop the
-                    # index row and let the hold's owner find it missing rather
-                    # than leave a row pointing at nothing.
-                    logger.warning("artifact %s was held after its bytes were removed", record.uri)
-                await tx.put_managed_artifact(current.model_copy(update={"size_bytes": 0, "updated_at": utcnow()}))
-                if principal is not None:
-                    # In the same transaction as the index update, so a deletion
-                    # cannot be unaudited: bytes removed with no ledger entry is
-                    # exactly the gap that makes a loss unexplainable later.
-                    await self._audit_scoped(
-                        tx,
-                        principal,
-                        org_id=record.org_id,
-                        project_id=record.project_id,
-                        entity_type="artifact",
-                        entity_id=record.uri[:256],
-                        action="artifact.collected",
-                        payload={
-                            "kind": str(record.kind),
-                            "size_bytes": record.size_bytes,
-                            "removed": removed,
-                            "held_after_delete": held_after_delete,
-                        },
-                    )
-            if removed:
-                collected.append(record.uri)
-                reclaimed += record.size_bytes
+                if current.object_version is None:
+                    # Model validation normally makes this unreachable. Do not
+                    # attempt external deletion when a forward/corrupt row slips
+                    # through a custom repository implementation.
+                    logger.error("active artifact %s has no provider version", current.uri)
+                    continue
+                claim = _artifact_record_update(
+                    current,
+                    {
+                        "state": ManagedArtifactState.DELETING,
+                        "record_generation": current.record_generation + 1,
+                        "updated_at": moment,
+                        "deletion_claim_id": _new_id("artifact_delete"),
+                        "deletion_started_at": moment,
+                        "quarantine_reason": None,
+                    },
+                )
+                await tx.put_managed_artifact(claim)
+                await self._audit_scoped(
+                    tx,
+                    actor,
+                    org_id=org_id,
+                    project_id=project_id,
+                    entity_type="artifact",
+                    entity_id=current.uri[:256],
+                    action="artifact.deletion_claimed",
+                    previous_state=current.state.value,
+                    new_state=claim.state.value,
+                    payload={
+                        "record_generation": claim.record_generation,
+                        "object_version": claim.object_version,
+                        "claim_id": claim.deletion_claim_id,
+                    },
+                )
+            if claim is not None:
+                finalized, removed = await self._execute_artifact_deletion_claim(
+                    claim,
+                    principal=actor,
+                    now=moment,
+                )
+                if finalized:
+                    collected.append(claim.uri)
+                    if removed:
+                        reclaimed += claim.size_bytes
+
         return ArtifactCollection(
             collected_uris=tuple(collected),
             reclaimed_bytes=reclaimed,
             held=held,
             referenced=referenced,
             within_grace=within_grace,
+            capped=capped,
             dry_run=dry_run,
         )
 
@@ -6994,7 +7846,7 @@ class ControlPlaneService:
         except ValueError:
             return
         record = await tx.get_managed_artifact(org_id, project_id, uri)
-        if record is None:
+        if record is None or record.state is not ManagedArtifactState.ACTIVE:
             return
         await tx.put_managed_artifact(record.model_copy(update={"last_accessed_at": utcnow()}))
 

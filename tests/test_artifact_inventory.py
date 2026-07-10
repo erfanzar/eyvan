@@ -15,8 +15,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from eyvan.artifacts.managed import (
     LocalManagedArtifactStore,
+    ManagedArtifactDeleteResult,
     ManagedArtifactInventoryPage,
     ManagedArtifactObjectMetadata,
+    ManagedArtifactRead,
+    ManagedArtifactWrite,
     callable_uri,
     result_uri,
 )
@@ -105,6 +108,35 @@ class ReplacingAfterReadInventoryStore:
         self.get_calls += 1
         self.generation = 2
         return self.payload
+
+    def get_versioned(
+        self,
+        uri: str,
+        *,
+        org_id: str,
+        project_id: str,
+        object_version: str | None = None,
+    ) -> ManagedArtifactRead:
+        assert object_version == "gcs:1"
+        payload = self.get(uri, org_id=org_id, project_id=project_id)
+        return ManagedArtifactRead(
+            payload=payload,
+            metadata=ManagedArtifactObjectMetadata(
+                uri=self.uri,
+                size_bytes=len(payload),
+                object_version="gcs:1",
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+        )
+
+    def put_versioned(self, uri: str, payload: bytes, *, org_id: str, project_id: str) -> ManagedArtifactWrite:
+        raise AssertionError("inventory reindex must not write provider objects")
+
+    def delete_versioned(
+        self, uri: str, *, org_id: str, project_id: str, object_version: str
+    ) -> ManagedArtifactDeleteResult:
+        self.delete_calls += 1
+        raise AssertionError("inventory reindex must never delete provider objects")
 
     def put(self, uri: str, payload: bytes, *, org_id: str, project_id: str) -> str:
         raise AssertionError("inventory reindex must not write provider objects")
@@ -250,3 +282,34 @@ async def test_reindex_requires_the_same_live_generation_after_digest_validation
     async with repository.transaction() as transaction:
         assert await transaction.get_managed_artifact("acme", "research", uri) is None
         assert await transaction.list_events(org_id="acme", project_id="research") == []
+
+
+@pytest.mark.asyncio
+async def test_reindex_reconciles_a_quarantined_non_content_object_only_after_exact_read(tmp_path) -> None:
+    repository = InMemoryRepository()
+    store = LocalManagedArtifactStore(tmp_path / "objects")
+    service = ControlPlaneService(repository=repository, artifact_store=store)
+    payload = b"opaque result bytes"
+    uri = result_uri("legacy-result")
+    store.put(uri, payload, org_id="acme", project_id="research")
+    indexed = await service.index_managed_artifact(
+        org_id="acme", project_id="research", uri=uri, size_bytes=len(payload)
+    )
+    assert indexed.state.value == "quarantined"
+
+    report = await service.inventory_managed_artifacts(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        reindex_missing=True,
+        acknowledge_scope="acme/research",
+    )
+
+    assert report.reindexed_count == 1
+    async with repository.transaction() as transaction:
+        reconciled = await transaction.get_managed_artifact("acme", "research", uri)
+    assert reconciled is not None
+    assert reconciled.state.value == "active"
+    assert reconciled.sha256 == hashlib.sha256(payload).hexdigest()
+    assert reconciled.object_version is not None
+    assert await service.read_managed_artifact(org_id="acme", project_id="research", uri=uri) == payload
