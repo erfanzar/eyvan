@@ -134,7 +134,7 @@ from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
-from eyvan.server.invariants import Invariant, check_fleet, snapshot_fleet
+from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
@@ -164,6 +164,17 @@ from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, 
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
+from eyvan.soak_contract import (
+    MAX_BUDGET_SCOPES,
+    MAX_COVERAGE_ENTRIES,
+    MAX_PARTICIPANTS,
+    MAX_SAFE_COUNTER,
+    MAX_SERVER_VIOLATIONS,
+    ParticipantBinding,
+    is_opaque_id,
+    participant_manifest_sha256,
+    safe_scope_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1403,23 +1414,164 @@ def create_app(
 
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
         violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        # Deduplicate before bounding so a repeated subject cannot evict distinct
+        # evidence. Sorting also makes the cap deterministic across repository
+        # implementations with different row orders.
+        unique_violations: dict[tuple[str, str], Violation] = {}
+        for violation in violations:
+            key = (violation.invariant.value, violation.subject)
+            prior = unique_violations.get(key)
+            if prior is None or violation.detail < prior.detail:
+                unique_violations[key] = violation
+        ordered_violations = [unique_violations[key] for key in sorted(unique_violations)]
+        violations_truncated = len(ordered_violations) > MAX_SERVER_VIOLATIONS
+        ordered_violations = ordered_violations[:MAX_SERVER_VIOLATIONS]
+
         # The snapshot travels with the verdict so a long-running observer makes
         # one call per tick rather than two that describe different moments --
         # and a budget compared against an artifact count from a second later is
         # a comparison of two fleets.
         snapshot = await snapshot_fleet(repository)
+        budget_items = sorted(snapshot.budget_spend.items())
+        budget_spend_truncated = len(budget_items) > MAX_BUDGET_SCOPES
+        budget_items = budget_items[:MAX_BUDGET_SCOPES]
+        execution_items = sorted(snapshot.execution_lease_counts.items())
+        coverage_truncated = len(execution_items) > MAX_COVERAGE_ENTRIES
+        execution_items = execution_items[:MAX_COVERAGE_ENTRIES]
+        if any(count > MAX_SAFE_COUNTER for _, count in execution_items):
+            coverage_truncated = True
+
         return {
             "checked": [invariant.value for invariant in Invariant],
             "violations": [
                 {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
-                for violation in violations
+                for violation in ordered_violations
             ],
+            "violations_truncated": violations_truncated,
             "snapshot": {
                 "observed_at": snapshot.observed_at.isoformat(),
-                "budget_spend": {f"{org}/{project}": value for (org, project), value in snapshot.budget_spend.items()},
+                "budget_spend": [
+                    {
+                        "scope_id": safe_scope_id(org, project),
+                        "spent": observation.spent,
+                        "revision": observation.revision,
+                        "period_id": observation.period_id,
+                        "period_started_at": (
+                            observation.period_started_at.isoformat()
+                            if observation.period_started_at is not None
+                            else None
+                        ),
+                    }
+                    for (org, project), observation in budget_items
+                ],
+                "budget_spend_truncated": budget_spend_truncated,
                 "artifact_bytes": snapshot.artifact_bytes,
                 "workload_count": snapshot.workload_count,
                 "cell_count": snapshot.cell_count,
+                "coverage": {
+                    "executions": [
+                        {**identity.as_dict(), "execution_count": min(count, MAX_SAFE_COUNTER)}
+                        for identity, count in execution_items
+                    ],
+                    "truncated": coverage_truncated,
+                },
+                # The generic control-plane endpoint does not own process/DB or
+                # provider-inventory measurement. A P8 evaluator must therefore
+                # report the corresponding explicit missing-evidence codes.
+                "p8_evidence": None,
+            },
+        }
+
+    @app.post("/api/v1/system/invariants/soak", tags=["system"])
+    async def proof_scoped_fleet_invariants(
+        payload: dict[str, tp.Any],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, tp.Any]:
+        """Return invariant state plus coverage for one exact frozen proof manifest."""
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        if set(payload) != {"proof_id", "config_sha256", "participants"}:
+            raise InputError("the soak manifest has unexpected or missing fields")
+        proof_id = payload["proof_id"]
+        config_sha256 = payload["config_sha256"]
+        raw_participants = payload["participants"]
+        if not is_opaque_id(proof_id) or not is_opaque_id(config_sha256):
+            raise InputError("the soak proof and configuration identifiers must be canonical sha256 values")
+        if not isinstance(raw_participants, list) or not 0 < len(raw_participants) <= MAX_PARTICIPANTS:
+            raise InputError("the soak manifest must contain a bounded non-empty participant list")
+        try:
+            participants = tuple(ParticipantBinding.from_dict(item) for item in raw_participants)
+        except ValueError as error:
+            raise InputError("the soak manifest contains an invalid participant binding") from error
+        if len(participants) != len(set(participants)):
+            raise InputError("the soak manifest contains a duplicate participant binding")
+        manifest_sha256 = participant_manifest_sha256(proof_id, participants)
+
+        violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        unique_violations: dict[tuple[str, str], Violation] = {}
+        for violation in violations:
+            key = (violation.invariant.value, violation.subject)
+            prior = unique_violations.get(key)
+            if prior is None or violation.detail < prior.detail:
+                unique_violations[key] = violation
+        ordered_violations = [unique_violations[key] for key in sorted(unique_violations)]
+        violations_truncated = len(ordered_violations) > MAX_SERVER_VIOLATIONS
+        ordered_violations = ordered_violations[:MAX_SERVER_VIOLATIONS]
+
+        snapshot = await snapshot_fleet(
+            repository,
+            proof_id=proof_id,
+            config_sha256=config_sha256,
+            participants=participants,
+        )
+        budget_items = sorted(snapshot.budget_spend.items())
+        budget_spend_truncated = len(budget_items) > MAX_BUDGET_SCOPES
+        budget_items = budget_items[:MAX_BUDGET_SCOPES]
+        execution_items = sorted(snapshot.participant_execution_counts.items())
+        coverage_truncated = len(execution_items) > MAX_COVERAGE_ENTRIES
+        execution_items = execution_items[:MAX_COVERAGE_ENTRIES]
+        if any(count > MAX_SAFE_COUNTER for _, count in execution_items):
+            coverage_truncated = True
+        if snapshot.participant_manifest_sha256 != manifest_sha256:
+            raise RuntimeError("proof-scoped snapshot returned a mismatched participant manifest")
+
+        return {
+            "checked": [invariant.value for invariant in Invariant],
+            "violations": [
+                {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
+                for violation in ordered_violations
+            ],
+            "violations_truncated": violations_truncated,
+            "snapshot": {
+                "observed_at": snapshot.observed_at.isoformat(),
+                "budget_spend": [
+                    {
+                        "scope_id": safe_scope_id(org, project),
+                        "spent": observation.spent,
+                        "revision": observation.revision,
+                        "period_id": observation.period_id,
+                        "period_started_at": (
+                            observation.period_started_at.isoformat()
+                            if observation.period_started_at is not None
+                            else None
+                        ),
+                    }
+                    for (org, project), observation in budget_items
+                ],
+                "budget_spend_truncated": budget_spend_truncated,
+                "artifact_bytes": snapshot.artifact_bytes,
+                "workload_count": snapshot.workload_count,
+                "cell_count": snapshot.cell_count,
+                "coverage": {
+                    "proof_id": proof_id,
+                    "manifest_sha256": manifest_sha256,
+                    "executions": [
+                        {**identity.as_dict(), "execution_count": min(count, MAX_SAFE_COUNTER)}
+                        for identity, count in execution_items
+                    ],
+                    "truncated": coverage_truncated,
+                },
+                "p8_evidence": None,
             },
         }
 

@@ -353,66 +353,89 @@ lifecycle: pods registering back and a workload executing need a control plane
 the cluster can route to, which a laptop advertising loopback is not.
 **Shape** GKE, CPU node pool then one GPU node pool. **~2 hours, modest cost.**
 
-## P8 — the soak
+## P8 — the soak (not yet qualifiable)
 
-**The one the plan calls disqualifying if absent.** Everything above is minutes
-to hours with a human watching. This is the only evidence about days.
+P8 is the release-candidate 72-hour mixed CPU + TPU run described by the
+production-readiness plan. **No qualifying P8 receipt exists.** The current
+`eyvan soak` command closes false-pass paths in the evaluator, but the live
+control-plane route does not produce the independent resource, database, cost,
+or provider-inventory evidence required for a P8 decision.
 
-```
-eyvan up configs/eyvan-live-cpu-us-east5-a.yaml
-eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
-# submit a mixed load: short callables, a long checkpointed trainer,
-# a batch fan-out, and a service
-eyvan soak --hours 72 --interval-s 60 --output soak.json
-```
+The intended evaluator invocation is documented in
+[operate.md](operate.md#the-unattended-evaluator). Its immutable inputs are:
 
-**Passes when** `soak.json` reports `"healthy": true` — no invariant violated
-persistently across 72 hours, meaning no stranded cells, no leases outliving
-their workloads, no stuck outbox commands, no workload non-terminal without a
-lease, budget spend monotone and matching settled cost, and audit retention
-actually pruning.
+- full candidate and source SHAs;
+- one opaque `sha256:` proof/run ID;
+- a materialized content-addressed snapshot of every execution config;
+- exact workload/lease/cell participant joins with expected **joint**
+  capability/backend/provider identities, including CPU and TPU; and
+- finite explicit bounds for RSS, FD, database and artifact net growth.
 
-Read `artifact_growth` even on a pass: it is the number that says whether
-collection ran at all, and a total alone cannot.
+Every participating workload must persist the same proof ID and frozen config
+digest in `eyvan.soak.proof_id` and `eyvan.soak.config_sha256` metadata and be
+launched from the frozen snapshot. The scoped invariant route counts a path only
+after a non-PENDING/non-ADMITTED workload and non-PENDING lease have a durable
+`run_started_at`, the exact lease joins the exact workload and cell, the cell is
+READY/DRAINING at the fenced generation, and both metadata bindings match.
+Counters are keyed by opaque participant ID plus the whole joint identity;
+unrelated workload, artifact, budget, lease, or cell traffic is excluded. This
+is control-plane state evidence only: the receipt fixes
+`hardware_attested: false`.
 
-**In flight since 2026-08-07 03:12 UTC — the real run.** 72 hours against a CPU
-fleet in `us-east5-a` with continuous mixed churn: a short job every 10 minutes
-and a ten-minute job every twelfth. Detached, so it outlives the session that
-started it; the verdict lands in `p8-soak-exit` and the detail in `p8-soak.json`
-around **2026-08-10 03:12 UTC**.
+The receipt never exports raw violation subjects/details, invalid identity
+inputs, arbitrary reason text, project/tenant names, locations, URIs, buckets,
+or exception messages. It contains only closed reason codes/counts, opaque
+subject/participant/scope IDs, closed identity enums, and bounded numeric
+summaries. Only timeout/unreachable windows may consume availability budget;
+auth, server, request/schema/overflow, filesystem, and internal errors make the
+result inconclusive regardless of that budget. Bounded Decimal CLI text is
+reduced to integer coefficient/exponent ratios, so process-wide Decimal
+precision cannot change scheduling (`0.07h / 0.1s = 2520` slots); input whose
+shortest float rendering does not round-trip to the same Decimal is rejected.
+Budget spend remains monotone across normal revision increments and
+may reset only after a separately proved forward period transition.
 
-Deviation, stated rather than buried: CPU only. The plan asks for a CPU fleet
-*plus a small TPU fleet*, and a v5p-16 held for 72 hours is a spend of a
-different order than the ~$3 this costs. The TPU half is unproven.
+A real P8 evaluator additionally needs a proof-bound sample at every successful
+observation with:
 
-The churn rate was wrong twice before it was right, and both times the mistake
-was the same: pacing against the seconds a job *sleeps* rather than the ~2.5
-minutes it *occupies a cell* once dispatch is counted. The queue grew instead of
-staying flat, which measures backpressure rather than durability and over 72
-hours would have buried the invariants under tens of thousands of pending
-records.
+- process RSS and open-FD counts, judged by explicit peak-growth bounds;
+- database bytes, judged by an explicit peak-growth bound;
+- spend-reconciliation status;
+- provider inventory count; and
+- cleanup completion.
 
-It has already found two things in its first seven hours, both through the
-invariant that was structurally blind until this session: a `workload.cancel`
-stuck failing for six hours -- the same defect as the one that pinned a v5p-16,
-cleared with `eyvan workload-force-finalize` -- and a wording defect in I3's own
-message, which claimed a command "has been processing for" an age measured from
-its creation.
+The final receipt also requires artifact creation and collection, artifact net
+growth within its bound, reconciled spend, cleanup complete, and final provider
+inventory exactly zero. Missing evidence is never inferred from `cell_count` or
+from an absent error.
 
-**Earlier, 2026-08-05: a 30-minute soak, exit 0. This is not P8.** 30 observations,
-0 unreachable, no invariant violated once let alone persistently, and no
-over-time finding. 76 workloads churned through a local fleet during it -- short
-jobs every 25s and a three-minute job every tenth -- so the leases, settlement
-and outbox paths were genuinely exercised rather than watched while idle.
+The current `/api/v1/system/invariants/soak` response returns
+`p8_evidence: null` deliberately. It has no trustworthy process/DB-size or live
+provider-inventory source. Consequently current live invocations end
+`inconclusive`/exit 2 with explicit codes including
+`rss_growth_evidence_missing`, `fd_growth_evidence_missing`,
+`database_growth_evidence_missing`, `spend_reconciliation_evidence_missing`,
+`provider_inventory_evidence_missing`, and `cleanup_evidence_missing`. The docs
+do **not** define exit 0 from the current endpoint as P8.
 
-What it does not establish is what P8 is for. Thirty minutes is not three days,
-and the plan is explicit that the duration is the load-bearing part. There was
-no TPU fleet. And `artifact_growth` was 0 because command workloads store no
-results, so the one criterion this page singles out -- whether collection runs
-at all -- was not exercised. A shorter soak answers "did anything break just
-now", which is the question that was already answerable.
-**Shape** CPU fleet plus v5p-16. **72 hours.** This is the largest single spend
-here and the only one that cannot be shortened without changing what it proves.
+Future work may connect a bounded, authenticated external monitor that emits the
+closed `eyvan.soak.external-evidence.v1` sample. Only after that source is
+implemented, independently reviewed, and exercised against the frozen candidate
+may exit 0 mean that the **evaluator criteria** passed. Provider operation and
+CPU/TPU hardware qualification still require their own immutable evidence; the
+durable state receipt alone is not attestation.
+
+**Passes when** a future reviewed external monitor supplies every proof-bound
+sample, the evaluator returns exit 0 with every closed criterion satisfied, and
+the separate immutable provider/hardware evidence confirms the claimed CPU/TPU
+operations. The current endpoint cannot meet this criterion and exits 2.
+
+**Shape** Release-candidate mixed CPU + TPU fleet for 72 hours, exercising short
+callables, a checkpointed trainer, batch/DAG/service activity, artifact
+lifecycle, controlled control-plane/agent/database restarts, cost reconciliation
+and complete provider cleanup. A timeout or unavailable required provider event
+is inconclusive, not pass.
+
 
 ---
 
@@ -423,47 +446,13 @@ other slices. P6 needs wall-clock time and nothing else, so it can overlap
 anything. P8 goes last, after the others have confirmed the individual
 behaviours it assumes.
 
-## A defect this page's runs found, still open
+## Historical notes are not proof receipts
 
-**A cancel the worker cannot complete makes a slice unreleasable.** Observed
-2026-08-06 on the v5p-16 in `us-central1-a`. The native worker answered
-`500 Internal Server Error` on
-`POST /api/v1/workloads/<id>/stop`; the agent retried 24 times; the workload
-stayed in `cancelling` for the rest of its life, never released its lease, and
-`eyvan down` could not drain the cell -- 13 minutes in `draining` with the
-queued resource still ACTIVE. The slice had to be released with
-`gcloud compute tpus queued-resources delete --force`.
-
-Two things make it worse than a stuck job. The capacity keeps billing, and it is
-a TPU. And `eyvan capacity invariants` reported **no violations** throughout.
-
-That second half is fixed: I3 listed only PENDING and PROCESSING commands, and a
-command that keeps failing lives in FAILED between attempts -- so the check could
-only ever catch a command nobody had picked up. With FAILED included it now names
-both stuck commands with their topic and age, verified against this exact live
-state (`workload.cancel` failed for 3198s, `capacity.drain` for 2227s).
-
-**The state was unrecoverable; there is now an escape.**
-`eyvan workload-force-finalize <id> --reason ...` settles a workload whose stop
-the worker will never confirm: it discards the stuck command, releases the
-lease, and **drains the cell rather than returning it** -- nobody confirmed the
-process stopped, so scheduling other work onto that host would be worse than the
-deadlock. It is refused on anything not stuck for `STUCK_CANCEL_AFTER_S`, the
-same threshold I3 reports at, so an operator cannot force-finalize something the
-invariants still call healthy. Used against the live deadlock this section
-describes, it settled the workload and the fleet came back to zero violations.
-
-The chain it escapes: the workload never leaves `cancelling`, so its lease stays active, so
-`eyvan cell-delete` refuses with *"still owns 1 active lease(s)"*, so the cell
-stays `draining`, so `eyvan down` never completes. `preemption-force-finalize`
-does not apply -- it attests *preemption* victims, and this is an ordinary
-cancel. There is no operator command that resolves it, and a subsequent fleet in
-the same zone did not provision while it persisted.
-
-Bounding the retry is not obviously right either: forcing the workload terminal
-means declaring a process dead that the worker never confirmed stopping, which is
-a decision about replacing the cell rather than a retry constant. Making it
-visible was the part that could be fixed without deciding that.
+Unversioned operator notes and point-in-time invariant output can motivate a
+fix, but they do not identify an immutable candidate, prove the requested
+duration, or show which criteria were exercised. They are intentionally not
+promoted to qualification claims on this page. Only an immutable versioned
+receipt stored outside git can change the supported evidence matrix.
 
 ## What a failure means
 

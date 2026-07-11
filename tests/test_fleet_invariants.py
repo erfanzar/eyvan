@@ -16,9 +16,11 @@ one an operator mutes within a week, and a muted invariant is an absent one.
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 from eyvan.records import (
+    ArtifactReferenceRecord,
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
@@ -26,6 +28,7 @@ from eyvan.records import (
     CommandExecution,
     LeaseRecord,
     LeaseState,
+    ManagedArtifactRecord,
     OutboxRecord,
     ResourceGang,
     ResourceVector,
@@ -36,6 +39,7 @@ from eyvan.records import (
 )
 from eyvan.server.invariants import (
     STUCK_OUTBOX_AFTER_S,
+    BudgetObservation,
     FleetSnapshot,
     Invariant,
     check_fleet,
@@ -43,6 +47,14 @@ from eyvan.server.invariants import (
     snapshot_fleet,
 )
 from eyvan.server.persistence.memory import InMemoryRepository
+from eyvan.soak_contract import (
+    SOAK_CONFIG_METADATA_KEY,
+    SOAK_PROOF_METADATA_KEY,
+    ParticipantBinding,
+    ParticipantExecutionIdentity,
+    participant_manifest_sha256,
+    safe_period_id,
+)
 
 
 def _pool(pool_id: str = "pool-a") -> CapacityPoolRecord:
@@ -88,6 +100,7 @@ def _lease(
     workload_id: str = "wl-a",
     cell_id: str = "cell-a",
     state: LeaseState = LeaseState.ACTIVE,
+    ran: bool = False,
 ) -> LeaseRecord:
     return LeaseRecord(
         id=lease_id,
@@ -99,6 +112,7 @@ def _lease(
         fencing_token=f"{cell_id}:1",
         resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0)),
         expires_at=utcnow() + timedelta(hours=1),
+        run_started_at=utcnow() if ran else None,
     )
 
 
@@ -129,6 +143,10 @@ async def _fleet(*records) -> InMemoryRepository:
                 await tx.put_lease(record)
             elif isinstance(record, BudgetRecord):
                 await tx.put_budget(record)
+            elif isinstance(record, ManagedArtifactRecord):
+                await tx.put_managed_artifact(record)
+            elif isinstance(record, ArtifactReferenceRecord):
+                await tx.put_artifact_reference(record)
             elif isinstance(record, OutboxRecord):
                 await tx.put_outbox(record)
             else:  # pragma: no cover - a scenario passing an unhandled type
@@ -354,16 +372,207 @@ async def test_i9_catches_a_lease_on_a_cell_that_no_longer_exists() -> None:
 # --------------------------------------------------------------------------- over time
 
 
-async def test_a_snapshot_records_what_the_over_time_checks_need() -> None:
-    """And nothing else: a snapshot that grew with the run would defeat I7."""
+async def test_a_snapshot_records_one_coherent_executed_lease_identity() -> None:
+    """Every projection comes from the same workload/lease/cell join."""
 
-    repository = await _fleet(_pool(), _cell(), _workload(), _lease(), _budget(12.0))
+    repository = await _fleet(_pool(), _cell(), _workload(), _lease(ran=True), _budget(12.0))
 
     snapshot = await snapshot_fleet(repository)
 
-    assert snapshot.budget_spend == {("acme", "research"): (12.0, 1)}
+    assert snapshot.budget_spend == {
+        ("acme", "research"): BudgetObservation(
+            spent=12.0,
+            revision=1,
+            period_id=safe_period_id(None),
+            period_started_at=None,
+        )
+    }
     assert snapshot.workload_count == 1
     assert snapshot.cell_count == 1
+    assert len(snapshot.execution_lease_counts) == 1
+    identity, count = next(iter(snapshot.execution_lease_counts.items()))
+    assert count == 1
+    assert identity.capability.as_dict() == {
+        "execution": "command",
+        "checkpointable": False,
+        "coordination": "none",
+        "required_executor": "any",
+    }
+    assert identity.backend.as_dict() == {"capacity_backend": "local", "executor": "eyvan-native"}
+    assert identity.provider.as_dict() == {
+        "provider": "local",
+        "resource_class": "cpu",
+        "capacity_class": "on_demand",
+    }
+    serialized = str(identity.as_dict())
+    assert "acme" not in serialized
+    assert "research" not in serialized
+    assert "agent:8090" not in serialized
+
+
+async def test_pending_leases_or_pending_workloads_are_not_execution_evidence() -> None:
+    pending_lease = await _fleet(
+        _pool(),
+        _cell(),
+        _workload(state=WorkloadState.RUNNING),
+        _lease(state=LeaseState.PENDING, ran=True),
+    )
+    assert (await snapshot_fleet(pending_lease)).execution_lease_counts == {}
+
+    # Decisive regression: an ACTIVE/run-stamped lease joined to a PENDING
+    # workload is inconsistent durable state, not proof that a payload ran.
+    pending_workload = await _fleet(
+        _pool(),
+        _cell(),
+        _workload(state=WorkloadState.PENDING),
+        _lease(state=LeaseState.ACTIVE, ran=True),
+    )
+    assert (await snapshot_fleet(pending_workload)).execution_lease_counts == {}
+
+
+async def test_proof_scoped_coverage_requires_exact_bound_records_metadata_and_live_cell_generation() -> None:
+    proof_id = "sha256:" + "d" * 64
+    config_sha256 = "sha256:" + "c" * 64
+    participant = ParticipantBinding("wl-a", "lease-a", "cell-a")
+    workload = _workload().model_copy(
+        update={
+            "spec": _workload().spec.model_copy(
+                update={
+                    "metadata": {
+                        SOAK_PROOF_METADATA_KEY: proof_id,
+                        SOAK_CONFIG_METADATA_KEY: config_sha256,
+                    }
+                }
+            )
+        }
+    )
+    repository = await _fleet(_pool(), _cell(), workload, _lease(ran=True))
+
+    snapshot = await snapshot_fleet(
+        repository,
+        proof_id=proof_id,
+        config_sha256=config_sha256,
+        participants=(participant,),
+    )
+
+    assert snapshot.participant_manifest_sha256 == participant_manifest_sha256(proof_id, (participant,))
+    assert len(snapshot.participant_execution_counts) == 1
+    observed, count = next(iter(snapshot.participant_execution_counts.items()))
+    assert isinstance(observed, ParticipantExecutionIdentity)
+    assert observed.participant_id == participant.opaque_id(proof_id)
+    assert count == 1
+
+    wrong_lease = ParticipantBinding("wl-a", "lease-other", "cell-a")
+    wrong_snapshot = await snapshot_fleet(
+        repository,
+        proof_id=proof_id,
+        config_sha256=config_sha256,
+        participants=(wrong_lease,),
+    )
+    assert wrong_snapshot.participant_execution_counts == {}
+
+    stale_cell_repository = await _fleet(
+        _pool(),
+        _cell().model_copy(update={"generation": 2}),
+        workload,
+        _lease(ran=True),
+    )
+    stale = await snapshot_fleet(
+        stale_cell_repository,
+        proof_id=proof_id,
+        config_sha256=config_sha256,
+        participants=(participant,),
+    )
+    assert stale.participant_execution_counts == {}
+
+    wrong_config_workload = workload.model_copy(
+        update={
+            "spec": workload.spec.model_copy(
+                update={
+                    "metadata": {
+                        SOAK_PROOF_METADATA_KEY: proof_id,
+                        SOAK_CONFIG_METADATA_KEY: "sha256:" + "e" * 64,
+                    }
+                }
+            )
+        }
+    )
+    wrong_config_repository = await _fleet(
+        _pool(),
+        _cell(),
+        wrong_config_workload,
+        _lease(ran=True),
+    )
+    wrong_config = await snapshot_fleet(
+        wrong_config_repository,
+        proof_id=proof_id,
+        config_sha256=config_sha256,
+        participants=(participant,),
+    )
+    assert wrong_config.participant_execution_counts == {}
+
+
+async def test_proof_scoped_artifact_bytes_ignore_unrelated_fleet_traffic() -> None:
+    proof_id = "sha256:" + "d" * 64
+    config_sha256 = "sha256:" + "c" * 64
+    participant = ParticipantBinding("wl-a", "lease-a", "cell-a")
+    workload = _workload().model_copy(
+        update={
+            "spec": _workload().spec.model_copy(
+                update={
+                    "metadata": {
+                        SOAK_PROOF_METADATA_KEY: proof_id,
+                        SOAK_CONFIG_METADATA_KEY: config_sha256,
+                    }
+                }
+            )
+        }
+    )
+    own = ManagedArtifactRecord(
+        uri="eyvan://results/own",
+        kind="results",
+        org_id="acme",
+        project_id="research",
+        size_bytes=10,
+    )
+    unrelated = ManagedArtifactRecord(
+        uri="eyvan://results/unrelated",
+        kind="results",
+        org_id="other",
+        project_id="other",
+        size_bytes=1_000_000,
+    )
+    own_reference = ArtifactReferenceRecord(
+        id="ref-own",
+        uri=own.uri,
+        workload_id="wl-a",
+        org_id="acme",
+        project_id="research",
+    )
+    unrelated_reference = ArtifactReferenceRecord(
+        id="ref-unrelated",
+        uri=unrelated.uri,
+        workload_id="wl-other",
+        org_id="other",
+        project_id="other",
+    )
+    repository = await _fleet(
+        _pool(),
+        _cell(),
+        workload,
+        _lease(ran=True),
+        own,
+        unrelated,
+        own_reference,
+        unrelated_reference,
+    )
+    snapshot = await snapshot_fleet(
+        repository,
+        proof_id=proof_id,
+        config_sha256=config_sha256,
+        participants=(participant,),
+    )
+    assert snapshot.artifact_bytes == 10
 
 
 def test_i6_catches_spend_that_went_backwards() -> None:
@@ -373,8 +582,16 @@ def test_i6_catches_spend_that_went_backwards() -> None:
     """
 
     now = utcnow()
-    previous = FleetSnapshot(observed_at=now - timedelta(hours=1), budget_spend={("acme", "research"): (50.0, 1)})
-    current = FleetSnapshot(observed_at=now, budget_spend={("acme", "research"): (30.0, 1)})
+    period = now - timedelta(days=1)
+    previous = FleetSnapshot(
+        observed_at=now - timedelta(hours=1),
+        budget_spend={("acme", "research"): BudgetObservation(50.0, 1, safe_period_id(period.isoformat()), period)},
+    )
+    # Ordinary settlement increments revision. Spend must still be compared.
+    current = FleetSnapshot(
+        observed_at=now,
+        budget_spend={("acme", "research"): BudgetObservation(30.0, 2, safe_period_id(period.isoformat()), period)},
+    )
 
     violations = compare_snapshots(previous, current)
 
@@ -389,8 +606,30 @@ def test_i6_does_not_fire_when_a_budget_period_rolled() -> None:
     """
 
     now = utcnow()
-    previous = FleetSnapshot(observed_at=now - timedelta(hours=1), budget_spend={("acme", "research"): (50.0, 1)})
-    current = FleetSnapshot(observed_at=now, budget_spend={("acme", "research"): (0.0, 2)})
+    previous_period = now - timedelta(days=32)
+    current_period = now - timedelta(days=1)
+    previous = FleetSnapshot(
+        observed_at=now - timedelta(hours=1),
+        budget_spend={
+            ("acme", "research"): BudgetObservation(
+                50.0,
+                7,
+                safe_period_id(previous_period.isoformat()),
+                previous_period,
+            )
+        },
+    )
+    current = FleetSnapshot(
+        observed_at=now,
+        budget_spend={
+            ("acme", "research"): BudgetObservation(
+                0.0,
+                8,
+                safe_period_id(current_period.isoformat()),
+                current_period,
+            )
+        },
+    )
 
     assert compare_snapshots(previous, current) == ()
 
@@ -431,7 +670,11 @@ def test_a_new_budget_is_not_compared_against_nothing() -> None:
 
     now = utcnow()
     previous = FleetSnapshot(observed_at=now - timedelta(hours=1))
-    current = FleetSnapshot(observed_at=now, budget_spend={("acme", "research"): (30.0, 1)})
+    period = now - timedelta(days=1)
+    current = FleetSnapshot(
+        observed_at=now,
+        budget_spend={("acme", "research"): BudgetObservation(30.0, 1, safe_period_id(period.isoformat()), period)},
+    )
 
     assert compare_snapshots(previous, current) == ()
 
@@ -493,10 +736,152 @@ def test_an_operator_can_ask_the_running_plane(tmp_path) -> None:
     # The names are reported alongside the result so a reader can tell "nothing
     # is broken" from "nothing was checked" -- which an empty list alone cannot.
     assert body["checked"] == [invariant.value for invariant in Invariant]
+    assert body["violations_truncated"] is False
+    assert body["snapshot"]["budget_spend"] == []
+    assert body["snapshot"]["budget_spend_truncated"] is False
+    assert body["snapshot"]["coverage"] == {"executions": [], "truncated": False}
+
+
+async def test_invariant_route_emits_only_the_safe_coherent_coverage_allowlist(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    cell = _cell().model_copy(
+        update={
+            "provider_project": "secret-project",
+            "endpoint": "https://agent.internal.example/v1",
+            "labels": {"dataset_uri": "gs://private-bucket/data"},
+        }
+    )
+    repository = await _fleet(_pool(), cell, _workload(), _lease(ran=True), _budget())
+    client = TestClient(
+        create_app(
+            repository=repository,
+            settings=EyvanSettings(
+                dev_auth_enabled=True,
+                artifact_token_key="k" * 32,
+                artifact_store_uri=str(tmp_path / "artifacts"),
+            ),
+        )
+    )
+
+    response = client.get(
+        "/api/v1/system/invariants",
+        headers={"X-Eyvan-User": "root", "X-Eyvan-Roles": "fleet_admin"},
+    )
+
+    assert response.status_code == 200, response.text
+    snapshot = response.json()["snapshot"]
+    coverage = snapshot["coverage"]
+    assert snapshot["budget_spend_truncated"] is False
+    assert len(snapshot["budget_spend"]) == 1
+    assert snapshot["budget_spend"][0]["scope_id"].startswith("sha256:")
+    assert coverage["truncated"] is False
+    assert coverage["executions"] == [
+        {
+            "capability": {
+                "execution": "command",
+                "checkpointable": False,
+                "coordination": "none",
+                "required_executor": "any",
+            },
+            "backend": {"capacity_backend": "local", "executor": "eyvan-native"},
+            "provider": {
+                "provider": "local",
+                "resource_class": "cpu",
+                "capacity_class": "on_demand",
+            },
+            "execution_count": 1,
+        }
+    ]
+    serialized = json.dumps(snapshot, sort_keys=True)
+    assert "secret-project" not in serialized
+    assert "private-bucket" not in serialized
+    assert "agent.internal" not in serialized
+    assert "project" not in serialized
+    assert "uri" not in serialized.lower()
+
+
+async def test_scoped_soak_route_returns_only_the_exact_opaque_participant_and_no_fake_p8_evidence(
+    tmp_path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from eyvan.config import EyvanSettings
+    from eyvan.server.api.app import create_app
+
+    proof_id = "sha256:" + "d" * 64
+    config_sha256 = "sha256:" + "c" * 64
+    participant = ParticipantBinding("wl-a", "lease-a", "cell-a")
+    workload = _workload().model_copy(
+        update={
+            "spec": _workload().spec.model_copy(
+                update={
+                    "metadata": {
+                        SOAK_PROOF_METADATA_KEY: proof_id,
+                        SOAK_CONFIG_METADATA_KEY: config_sha256,
+                    }
+                }
+            )
+        }
+    )
+    unrelated = _workload("wl-other").model_copy(
+        update={
+            "spec": _workload("wl-other").spec.model_copy(
+                update={
+                    "metadata": {
+                        SOAK_PROOF_METADATA_KEY: proof_id,
+                        SOAK_CONFIG_METADATA_KEY: config_sha256,
+                    }
+                }
+            )
+        }
+    )
+    repository = await _fleet(
+        _pool(),
+        _cell(),
+        workload,
+        _lease(ran=True),
+        unrelated,
+        _lease("lease-other", workload_id="wl-other", ran=True),
+    )
+    client = TestClient(
+        create_app(
+            repository=repository,
+            settings=EyvanSettings(
+                dev_auth_enabled=True,
+                artifact_token_key="k" * 32,
+                artifact_store_uri=str(tmp_path / "artifacts"),
+            ),
+        )
+    )
+    response = client.post(
+        "/api/v1/system/invariants/soak",
+        headers={"X-Eyvan-User": "root", "X-Eyvan-Roles": "fleet_admin"},
+        json={
+            "proof_id": proof_id,
+            "config_sha256": config_sha256,
+            "participants": [participant.as_request_dict()],
+        },
+    )
+    assert response.status_code == 200, response.text
+    snapshot = response.json()["snapshot"]
+    assert snapshot["p8_evidence"] is None
+    assert snapshot["coverage"]["proof_id"] == proof_id
+    assert snapshot["coverage"]["manifest_sha256"] == participant_manifest_sha256(proof_id, (participant,))
+    assert len(snapshot["coverage"]["executions"]) == 1
+    assert snapshot["coverage"]["executions"][0]["participant_id"] == participant.opaque_id(proof_id)
+    serialized = json.dumps(snapshot)
+    assert "wl-a" not in serialized
+    assert "wl-other" not in serialized
+    assert "lease-a" not in serialized
+    assert "cell-a" not in serialized
 
 
 def test_the_invariant_report_is_not_readable_by_a_tenant(tmp_path) -> None:
-    """It names every cell, lease and budget scope in the fleet."""
+    """Invariant findings can name fleet-wide cells, leases, and budget scopes."""
 
     from fastapi.testclient import TestClient
 
@@ -524,3 +909,18 @@ def test_the_invariant_report_is_not_readable_by_a_tenant(tmp_path) -> None:
     )
 
     assert response.status_code == 403, response.text
+    scoped = client.post(
+        "/api/v1/system/invariants/soak",
+        headers={
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Roles": "operator",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+        },
+        json={
+            "proof_id": "sha256:" + "d" * 64,
+            "config_sha256": "sha256:" + "c" * 64,
+            "participants": [ParticipantBinding("wl-a", "lease-a", "cell-a").as_request_dict()],
+        },
+    )
+    assert scoped.status_code == 403, scoped.text
