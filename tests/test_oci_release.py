@@ -22,7 +22,10 @@ from types import ModuleType
 import pytest
 import yaml
 
-ROOT = Path(__file__).resolve().parents[3]
+_MONOREPO_ROOT = Path(__file__).resolve().parents[3]
+if not (_MONOREPO_ROOT / "WORKSPACE.md").is_file():
+    pytest.skip("OCI release policy is owned by the EasyDeL workspace", allow_module_level=True)
+ROOT = _MONOREPO_ROOT
 EYVAN_ROOT = ROOT / "libs" / "eyvan"
 SCRIPT = ROOT / "scripts" / "verify_eyvan_oci_release.py"
 LOCK = EYVAN_ROOT / "oci" / "release-lock.json"

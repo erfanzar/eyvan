@@ -421,12 +421,13 @@ def test_the_dashboard_identity_is_configurable_without_rebuilding() -> None:
     assert "/api/v1/dashboard/config" in oidc
 
 
-def test_a_declared_but_unset_build_argument_does_not_look_configured() -> None:
-    """``ARG VITE_EYVAN_OIDC_ISSUER`` with no value produces the empty string.
+def test_dashboard_identity_is_runtime_only_in_the_reusable_image() -> None:
+    """The release image must not bake one deployment's OIDC identity.
 
-    That is what the shipped Dockerfile does, so treating ``""`` as configured
-    would defeat the runtime fallback in exactly the deployment it exists for.
-    Asserted here because the Dockerfile is what creates the condition.
+    Older development images declared an unset ``VITE_EYVAN_OIDC_ISSUER``
+    argument and relied on the browser's empty-string fallback. The immutable
+    release image has a stronger boundary: it accepts no identity build
+    arguments at all and resolves public OIDC configuration from the server.
     """
 
     dockerfile = (pathlib.Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
@@ -434,8 +435,10 @@ def test_a_declared_but_unset_build_argument_does_not_look_configured() -> None:
         encoding="utf-8"
     )
 
-    assert "ARG VITE_EYVAN_OIDC_ISSUER" in dockerfile
-    # `||` rather than `??`: only the former treats an empty string as unset.
+    assert "ARG VITE_EYVAN_OIDC_ISSUER" not in dockerfile
+    assert "ARG VITE_EYVAN_OIDC_CLIENT_ID" not in dockerfile
+    assert "/api/v1/dashboard/config" in oidc
+    # Development builds still treat an explicitly empty Vite value as unset.
     assert "import.meta.env.VITE_EYVAN_OIDC_ISSUER || undefined" in oidc
 
 
