@@ -25,58 +25,98 @@ release makes `helm uninstall` a data-loss operation.
 
 ## Build and qualify immutable images
 
-Every Dockerfile expects the Eyvan package directory as its build context. The
-Kubernetes worker has its own `Dockerfile.worker` and explicit
-`eyvan-native-worker` entrypoint. Its two base-stage arguments are intentionally
-required: set each to an immutable `repository@sha256:...` reference from the
-release lock, not a tag.
+The only release path is the manual `Eyvan immutable OCI release` workflow at
+an exact full candidate SHA already reachable from protected `main`. Its job is
+guarded by the `eyvan-oci-release` GitHub environment. A pull request gets a
+separate read-only lane: it never receives an OIDC token, registry login, or
+write permission, builds with `push: false`/`load: true`, runs every entrypoint's
+`--help`, emits SPDX, and applies the same High/Critical scan policy.
+
+[`oci/release-lock.json`](../../../oci/release-lock.json) is canonical JSON and
+pins the sole `linux/amd64` base manifests, host-tool downloads and GitHub Action
+commits. [`oci/high-critical-allowlist.json`](../../../oci/high-critical-allowlist.json)
+is initially empty. Validate both and the Dockerfiles before using a value:
 
 ```bash
-: "${EYVAN_WORKER_BASE_IMAGE:?set an immutable Python base image reference}"
-: "${EYVAN_UV_IMAGE:?set an immutable uv image reference}"
+python3 scripts/verify_eyvan_oci_release.py validate-policy \
+  --lock libs/eyvan/oci/release-lock.json \
+  --allowlist libs/eyvan/oci/high-critical-allowlist.json \
+  --repository-root .
+```
+
+Every Dockerfile expects the Eyvan package directory as context and has no
+base-image, source, revision, or version default. The examples below are local
+mechanics, **not qualification**: only the protected workflow records the
+registry-reported index/platform digests, scanner and DB snapshot, SBOM
+attestations, keyless signatures/Rekor inclusion, provenance, chart/render,
+wheel/sdist, and signed canonical receipt. Copy base arguments exactly from the
+validated release lock; do not substitute a tag or digest-only reference.
+
+```bash
+export EYVAN_SOURCE=https://github.com/erfanzar/EasyDeL
+export EYVAN_REVISION="$(git rev-parse HEAD)" # must be the full 40-character SHA
+export EYVAN_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' libs/eyvan/pyproject.toml | head -1)"
+IFS=$'\t' read -r EYVAN_NODE_IMAGE EYVAN_RUNTIME_IMAGE EYVAN_UV_IMAGE EYVAN_WORKER_BASE_IMAGE \
+  < <(python3 - <<'PY'
+import json
+
+with open("libs/eyvan/oci/release-lock.json", encoding="utf-8") as handle:
+    images = json.load(handle)["images"]
+values = [
+    images["control-plane"]["buildArgs"]["EYVAN_NODE_IMAGE"],
+    images["control-plane"]["buildArgs"]["EYVAN_RUNTIME_IMAGE"],
+    images["control-plane"]["buildArgs"]["EYVAN_UV_IMAGE"],
+    images["worker"]["buildArgs"]["EYVAN_WORKER_BASE_IMAGE"],
+]
+print("\t".join(values))
+PY
+)
+export EYVAN_NODE_IMAGE EYVAN_RUNTIME_IMAGE EYVAN_UV_IMAGE EYVAN_WORKER_BASE_IMAGE
 
 # From the EasyDeL workspace root:
-docker build -f libs/eyvan/Dockerfile \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+docker build --platform linux/amd64 -f libs/eyvan/Dockerfile \
+  --build-arg EYVAN_NODE_IMAGE --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" libs/eyvan
-docker build -f libs/eyvan/Dockerfile.agent \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+docker build --platform linux/amd64 -f libs/eyvan/Dockerfile.agent \
+  --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" libs/eyvan
-docker build -f libs/eyvan/Dockerfile.worker \
-  --build-arg EYVAN_WORKER_BASE_IMAGE="$EYVAN_WORKER_BASE_IMAGE" \
-  --build-arg EYVAN_UV_IMAGE="$EYVAN_UV_IMAGE" \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+docker build --platform linux/amd64 -f libs/eyvan/Dockerfile.worker \
+  --build-arg EYVAN_WORKER_BASE_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_WORKER_REPOSITORY:$BUILD_ID" libs/eyvan
 
-# From a standalone Eyvan checkout:
-docker build -f Dockerfile \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+# From a standalone Eyvan checkout (use the same validated values):
+docker build --platform linux/amd64 -f Dockerfile \
+  --build-arg EYVAN_NODE_IMAGE --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" .
-docker build -f Dockerfile.agent \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+docker build --platform linux/amd64 -f Dockerfile.agent \
+  --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" .
-docker build -f Dockerfile.worker \
-  --build-arg EYVAN_WORKER_BASE_IMAGE="$EYVAN_WORKER_BASE_IMAGE" \
-  --build-arg EYVAN_UV_IMAGE="$EYVAN_UV_IMAGE" \
-  --build-arg EYVAN_REVISION="$SOURCE_REVISION" \
+docker build --platform linux/amd64 -f Dockerfile.worker \
+  --build-arg EYVAN_WORKER_BASE_IMAGE --build-arg EYVAN_UV_IMAGE \
+  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
   -t "$EYVAN_WORKER_REPOSITORY:$BUILD_ID" .
 ```
 
-Push only unique build tags, then obtain the registry-reported digest of each
-artifact. Qualification values have `sha256:` followed by 64 lowercase hex
-characters; this document deliberately supplies no example digest.
+The workflow pushes each `sha-$FULL_SHA` artifact once, scans the exact digest
+(including unfixed findings), signs and verifies it with the exact workflow
+identity and GitHub OIDC issuer, then copies that same index digest to the
+one-use `v$VERSION` tag. It never rebuilds during promotion and never creates
+`latest`. The Helm overlay preserves three independent values:
+`image`, `agentImage`, and `workerImage`; the rendered release must contain the
+three corresponding `repository@sha256:...` references.
 
-```bash
-: "${EYVAN_CONTROL_PLANE_DIGEST:?set the registry-reported control-plane digest}"
-: "${EYVAN_AGENT_DIGEST:?set the registry-reported agent digest}"
-: "${EYVAN_WORKER_DIGEST:?set the registry-reported worker digest for Kubernetes mode}"
-```
-
-The release pipeline must fail closed on High/Critical vulnerability findings,
-emit an SPDX or CycloneDX SBOM for every deployed digest, sign those digest
-references, and verify signatures with the deployment identity. All three
-Dockerfiles carry OCI version, revision, and license labels. These are release
-gates, not claims that this repository run performed a registry scan or push.
+A receipt deliberately records `deploymentApplied=false`, hardware evidence as
+`not-run`, and `linux/arm64`, `linux/ppc64le`, and `linux/s390x` as unverified.
+Static tests and hosted `linux/amd64` image builds do not prove Kubernetes
+admission, image pullability from a target cluster, database migration,
+provider behavior, accelerator compatibility, TPU/GPU runtime behavior, or
+performance. Qualify those separately in the exact target environment without
+editing the release receipt.
 
 ## GCP capacity mode
 

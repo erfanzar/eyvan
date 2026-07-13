@@ -1,31 +1,42 @@
-# Use the Eyvan package directory as build context.
-# Standalone: docker build -f Dockerfile.agent -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" .
-# Workspace:  docker build -f libs/eyvan/Dockerfile.agent -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" libs/eyvan
-FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
-ARG EYVAN_VERSION=0.1.0
-ARG EYVAN_REVISION=unknown
-LABEL org.opencontainers.image.title="Eyvan cell agent" \
-      org.opencontainers.image.version="${EYVAN_VERSION}" \
+# Use libs/eyvan as the build context. Every image argument is copied
+# verbatim from oci/release-lock.json after validate-policy succeeds.
+# Standalone: docker buildx build -f Dockerfile.agent [required build args] .
+# Workspace:  docker buildx build -f libs/eyvan/Dockerfile.agent [required build args] libs/eyvan
+ARG TARGETPLATFORM
+ARG EYVAN_UV_IMAGE
+ARG EYVAN_RUNTIME_IMAGE
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_UV_IMAGE} AS uv
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_RUNTIME_IMAGE} AS runtime
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+ARG EYVAN_SOURCE
+ARG EYVAN_REVISION
+ARG EYVAN_VERSION
+RUN test "$TARGETOS" = linux && test "$TARGETARCH" = amd64 && \
+    test "$TARGETPLATFORM" = linux/amd64 && \
+    printf '%s' "$EYVAN_REVISION" | grep -Eq '^[0-9a-f]{40}$' && \
+    printf '%s' "$EYVAN_SOURCE" | grep -Eq '^https://github\.com/[^/]+/[^/]+$' && \
+    printf '%s' "$EYVAN_VERSION" | grep -Eq '^[0-9]+([.][0-9A-Za-z]+)+([-+][0-9A-Za-z.-]+)?$'
+LABEL org.opencontainers.image.source="${EYVAN_SOURCE}" \
       org.opencontainers.image.revision="${EYVAN_REVISION}" \
+      org.opencontainers.image.version="${EYVAN_VERSION}" \
+      org.opencontainers.image.title="Eyvan cell agent" \
+      org.opencontainers.image.description="Capacity and execution cell agent for the Eyvan fleet control plane" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
-
-COPY --from=ghcr.io/astral-sh/uv:0.9.21 /uv /uvx /bin/
-
+COPY --from=uv /uv /uvx /bin/
 ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
-
 WORKDIR /app
-# Pinned dependency closure exported from the workspace uv.lock; refresh from
-# the workspace root with:
-# uv export --package eyvan --no-dev --no-emit-workspace --locked -o libs/eyvan/requirements-docker.txt
 COPY requirements-docker.txt ./requirements-docker.txt
 RUN uv venv "$VIRTUAL_ENV" && \
     uv pip install --require-hashes -r requirements-docker.txt
 COPY pyproject.toml README.md LICENSE ./
 COPY eyvan ./eyvan
 RUN uv pip install --no-deps .
-
 EXPOSE 8090
 ENTRYPOINT ["eyvan-agent"]
 CMD ["--host", "0.0.0.0", "--port", "8090"]

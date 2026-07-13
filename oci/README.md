@@ -1,0 +1,132 @@
+# Eyvan immutable OCI policy
+
+This directory is the checked-in, fail-closed input to
+`.github/workflows/eyvan-oci-release.yaml`. It contains no registry credential,
+environment-specific OIDC issuer/client, release digest, or exception hidden in
+prose.
+
+## Canonical policy files
+
+`release-lock.json` and `high-critical-allowlist.json` are strict canonical
+JSON: UTF-8, lexicographically sorted object keys, compact separators, and one
+trailing newline. Duplicate keys, unknown fields, non-canonical bytes, moving
+image/tool references, placeholder action SHAs, or a Dockerfile that diverges
+from the lock fail `validate-policy`.
+
+The release lock makes four explicit supply-chain decisions:
+
+* the only built platform is `linux/amd64`; other named platforms remain
+  unverified;
+* every base stage is passed as a required `fixed-tag@sha256:<amd64-manifest>`
+  build argument;
+* each downloaded host tool has a fixed version URL, exact byte size, and
+  SHA-256; streaming stops at the locked size and checks `Content-Length` when
+  present, and every used GitHub Action is addressed by a full commit SHA;
+* control plane, cell agent, and native worker have distinct repositories,
+  entrypoints, labels, and Helm digest values.
+
+The base pins were independently resolved as both multi-platform index and
+`linux/amd64` leaf manifests on 2026-08-08. `baseImages` records both digests;
+each Docker build reference intentionally uses the leaf manifest. Re-resolving
+a source tag is evidence for a reviewed lock update; it must never silently
+change a release build.
+
+Run from the EasyDeL root:
+
+```bash
+python3 scripts/verify_eyvan_oci_release.py validate-policy \
+  --lock libs/eyvan/oci/release-lock.json \
+  --allowlist libs/eyvan/oci/high-critical-allowlist.json \
+  --repository-root .
+```
+
+## High/Critical exceptions
+
+The allowlist starts empty. The scan gate fails on every unmatched High or
+Critical Trivy finding, including findings with no fixed version. An exception
+is an exact tuple of:
+
+* image `role`;
+* CVE/GHSA `vulnerability`;
+* package name, exact PURL, and installed `version`;
+* accountable `owner`, concrete HTTPS `issue`, specific `reason`; and
+* second-precision UTC `expiresAt`, later than gate time and no more than 30
+  days away.
+
+Wildcards, placeholders, stale/long expirations, duplicate entries, near
+matches, and unused entries for the scanned role fail. Entries remain sorted by
+role, vulnerability, PURL, and version. An exception is not proof of safety; it
+is a short, reviewable release decision.
+
+## Verifier surfaces
+
+The verifier is standard-library-only and exposes:
+
+* `validate-policy` for the lock, allowlist, and Dockerfiles;
+* `capture-scanner-metadata` and `capture-db-metadata` for exact tool/DB
+  evidence;
+* `gate-scan` for raw Trivy JSON and a canonical zero-unmatched disposition
+  whose `evaluatedAt` is the exact second-precision policy decision clock used
+  for receipt replay;
+* `verify-image-metadata` for `linux/amd64`, entrypoint, labels, and OIDC
+  neutrality;
+* `verify-rendered-digest-refs` for the exact three-way Helm digest split;
+* `extract-rekor` for one inclusion-proved entry in a Cosign bundle; and
+* `emit-receipt` / `verify-receipt` for the closed receipt-v1 schema and all
+  referenced artifact hashes.
+
+`download_release_assets.py` first permits only the fixed receipt and detached
+bundle (1 MiB/4 MiB caps). After their signature and closed schema are verified
+with logic checked out from the protected workflow commit, it accepts exactly
+34 unique receipt-named assets. GitHub release metadata must contain exactly 36
+assets, each no larger than 256 MiB and no more than 1 GiB in aggregate; reported
+and streamed byte counts plus every signed hash are checked. No wildcard release
+download is used.
+
+The receipt binds full source SHA/ref/version and environment-gated workflow
+run, three role/index/platform digests, locked bases and exact labels, SPDX and
+SBOM attestation bundles, raw scans/tool/DB/allowlist/dispositions, Cosign
+issuer/workflow/bundle/Rekor facts, signed SLSA-v1 predicates and materials,
+wheel/sdist, chart/overlay/render and deployment references. No arbitrary
+`diagnostics` object is accepted. It explicitly says no deployment or hardware
+proof was run and names every unverified platform.
+
+The signed receipt cannot recursively hash its own signature bundle. The
+workflow therefore signs the canonical receipt as a blob, strictly verifies it
+against the same issuer and exact workflow identity, then promotes the already
+qualified index digests to immutable version tags without rebuilding or adding a
+`latest` tag. The PyPI workflow uses a contents-read authentication job with no
+OIDC permission, checks the dispatch source is an ancestor of protected
+`origin/main`, proves the exact tag target, and executes only verifier/tool logic
+from the protected workflow commit. A separate minimal publisher receives only
+the authenticated wheel and sdist; a direct `eyvan-v*` tag no longer starts
+PyPI publication.
+
+## Release governance prerequisites
+
+The release job is intentionally unusable until an operator configures all of
+these repository controls outside the workflow:
+
+* `main` is protected by branch protection or a qualifying ruleset;
+* the `eyvan-oci-release` environment requires an explicit reviewer approval
+  and restricts deployment branches to protected `main` only;
+* immutable GitHub releases are enabled; and
+* that environment exposes `EYVAN_GITHUB_GOVERNANCE_TOKEN`, a fine-grained,
+  read-only token with repository Administration read access, solely so the
+  workflow can call the immutable-releases status endpoint.
+
+Before executing candidate verifier scripts or writing a registry, the workflow
+queries the branch, immutable-release, and run-approval APIs with bounded reads
+and fails closed unless all three controls are proved. It never enables or edits
+those controls. The PyPI bootstrap independently rechecks current `main`
+protection and requires its trusted release/bootstrap surfaces to be unchanged
+between the signed candidate and the protected workflow commit.
+
+## Qualification boundary
+
+Pull-request qualification is static/hosted and read-only. Release
+qualification is a GitHub-hosted `linux/amd64` build plus registry scan,
+attestation, and digest/render verification. Neither lane applies a deployment
+or exercises CPU/GPU/TPU workload hardware. A canonical receipt with
+`deploymentApplied=false`, hardware `not-run`, and non-amd64 platforms listed as
+unverified is accurate evidence, not a readiness claim for a live cluster.

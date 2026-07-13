@@ -1,31 +1,50 @@
-# Use the Eyvan package directory as build context.
-# Standalone: docker build -f Dockerfile -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" .
-# Workspace:  docker build -f libs/eyvan/Dockerfile -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" libs/eyvan
-FROM node:22-alpine AS dashboard
+# Use libs/eyvan as the build context. Every image argument is copied
+# verbatim from oci/release-lock.json after validate-policy succeeds.
+# Standalone: docker buildx build -f Dockerfile [required build args] .
+# Workspace:  docker buildx build -f libs/eyvan/Dockerfile [required build args] libs/eyvan
+ARG TARGETPLATFORM
+ARG EYVAN_NODE_IMAGE
+ARG EYVAN_UV_IMAGE
+ARG EYVAN_RUNTIME_IMAGE
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_NODE_IMAGE} AS dashboard
+ARG TARGETOS
+ARG TARGETARCH
+RUN test "$TARGETOS" = linux && test "$TARGETARCH" = amd64
 WORKDIR /dashboard
 COPY dashboard/package*.json ./
 RUN npm ci
 COPY dashboard/ ./
-ARG VITE_EYVAN_OIDC_ISSUER
-ARG VITE_EYVAN_OIDC_CLIENT_ID
+# OIDC issuer/client configuration is fetched from /api/v1/dashboard/config at
+# runtime. Never bake a deployment identity into this reusable image.
 RUN npm run build
 
-FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:stable AS runtime
-ARG EYVAN_VERSION=0.1.0
-ARG EYVAN_REVISION=unknown
-LABEL org.opencontainers.image.title="Eyvan control plane" \
-      org.opencontainers.image.version="${EYVAN_VERSION}" \
+FROM --platform=$TARGETPLATFORM ${EYVAN_UV_IMAGE} AS uv
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_RUNTIME_IMAGE} AS runtime
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+ARG EYVAN_SOURCE
+ARG EYVAN_REVISION
+ARG EYVAN_VERSION
+RUN test "$TARGETOS" = linux && test "$TARGETARCH" = amd64 && \
+    test "$TARGETPLATFORM" = linux/amd64 && \
+    printf '%s' "$EYVAN_REVISION" | grep -Eq '^[0-9a-f]{40}$' && \
+    printf '%s' "$EYVAN_SOURCE" | grep -Eq '^https://github\.com/[^/]+/[^/]+$' && \
+    printf '%s' "$EYVAN_VERSION" | grep -Eq '^[0-9]+([.][0-9A-Za-z]+)+([-+][0-9A-Za-z.-]+)?$'
+LABEL org.opencontainers.image.source="${EYVAN_SOURCE}" \
       org.opencontainers.image.revision="${EYVAN_REVISION}" \
+      org.opencontainers.image.version="${EYVAN_VERSION}" \
+      org.opencontainers.image.title="Eyvan control plane" \
+      org.opencontainers.image.description="Policy-aware global fleet control plane for CPU, GPU, and TPU capacity" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
-COPY --from=ghcr.io/astral-sh/uv:0.9.21 /uv /uvx /bin/
+COPY --from=uv /uv /uvx /bin/
 ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     EYVAN_DASHBOARD_DIR=/app/dashboard/dist
 WORKDIR /app
-# Pinned dependency closure exported from the workspace uv.lock; refresh from
-# the workspace root with:
-# uv export --package eyvan --no-dev --no-emit-workspace --locked -o libs/eyvan/requirements-docker.txt
 COPY requirements-docker.txt ./requirements-docker.txt
 RUN uv venv "$VIRTUAL_ENV" && \
     uv pip install --require-hashes -r requirements-docker.txt
