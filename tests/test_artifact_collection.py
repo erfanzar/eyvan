@@ -94,12 +94,19 @@ async def _stored(
 ) -> None:
     """Index and store one artifact, aged past the grace period by default."""
 
-    await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=len(payload))
-    store.put(uri, payload, org_id="acme", project_id="research")
+    await service.upload_managed_artifact(
+        org_id="acme",
+        project_id="research",
+        uri=uri,
+        payload=payload,
+    )
     async with service.repository.transaction() as tx:
         record = await tx.get_managed_artifact("acme", "research", uri)
         assert record is not None
-        await tx.put_managed_artifact(record.model_copy(update={"created_at": utcnow() - age}))
+        aged = utcnow() - age
+        await tx.put_managed_artifact(
+            record.model_copy(update={"created_at": aged, "activated_at": aged, "updated_at": aged})
+        )
 
 
 def _callable_spec() -> WorkloadDefinition:
@@ -276,6 +283,7 @@ async def test_the_pass_is_bounded(tmp_path) -> None:
     result = await service.collect_artifacts_once(org_id="acme", project_id="research", limit=2)
 
     assert len(result.collected_uris) == 2
+    assert result.capped is True
 
 
 def test_a_symlink_planted_at_the_object_path_is_refused_not_followed(tmp_path) -> None:

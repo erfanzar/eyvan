@@ -25,6 +25,7 @@ would need.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import timedelta
 
 import pytest
@@ -33,6 +34,8 @@ from eyvan.artifacts.managed import callable_uri, result_uri, workspace_uri
 from eyvan.records import (
     ArtifactHold,
     CallableExecution,
+    ManagedArtifactRecord,
+    ManagedArtifactState,
     Principal,
     ResourceGang,
     ResourceVector,
@@ -97,7 +100,21 @@ def _callable_spec(*, name: str = "train", result: str | None = None, max_retrie
 
 
 async def _index(service: ControlPlaneService, uri: str, size: int = 1024) -> None:
-    await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=size)
+    record = await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=size)
+    now = utcnow()
+    active = ManagedArtifactRecord.model_validate(
+        {
+            **record.model_dump(mode="python"),
+            "state": ManagedArtifactState.ACTIVE,
+            "sha256": record.sha256 or hashlib.sha256(uri.encode()).hexdigest(),
+            "object_version": f"test:{uri}",
+            "activated_at": now,
+            "updated_at": now,
+            "quarantine_reason": None,
+        }
+    )
+    async with service.repository.transaction() as tx:
+        await tx.put_managed_artifact(active)
 
 
 def test_a_hold_with_no_expiry_is_indefinite_rather_than_expired() -> None:

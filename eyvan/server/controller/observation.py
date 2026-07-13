@@ -1210,20 +1210,22 @@ class _ControllerObservation:
             return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
 
         async def read_rank(rank: int) -> bytes:
-            return await asyncio.to_thread(
-                self.artifact_access.store.get,
-                log_uri(workload.id, workload.attempt, rank),
+            return await self.service.read_managed_artifact(
                 org_id=workload.org_id,
                 project_id=workload.project_id,
+                uri=log_uri(workload.id, workload.attempt, rank),
             )
 
         try:
             first_payload = await read_rank(0)
-        except Exception:
+        except NotFoundError:
             return LogPage(unavailable=True, detail="this attempt has no archived logs")
+        except Exception:
+            return LogPage(unavailable=True, detail="archived logs could not be read conclusively")
 
         def entries(payload: bytes) -> list[object]:
             decoded: list[object] = []
+
             for line in payload.decode(errors="replace").splitlines():
                 if not line.strip():
                     continue

@@ -23,6 +23,7 @@ from eyvan.records import (
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
+    ManagedArtifactState,
     OrganizationRecord,
     OutboxRecord,
     OutboxState,
@@ -334,15 +335,42 @@ class StateSession(RepositorySession):
                 for item in self._state.managed_artifacts.values()
                 if item.org_id == org_id
                 and item.project_id == project_id
+                and item.state is not ManagedArtifactState.DELETED
                 and (after_uri is None or item.uri > after_uri)
             ),
             key=lambda item: item.uri,
         )
         return items[:limit]
 
+    async def list_managed_artifact_projects(self, *, limit: int = 1000) -> list[tuple[str, str]]:
+        scopes = sorted({(item.org_id, item.project_id) for item in self._state.managed_artifacts.values()})
+        return scopes[:limit]
+
+    async def list_managed_artifacts_by_state(
+        self,
+        *,
+        state: ManagedArtifactState,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        updated_before: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        items = sorted(
+            (
+                item
+                for item in self._state.managed_artifacts.values()
+                if item.state is state
+                and (org_id is None or item.org_id == org_id)
+                and (project_id is None or item.project_id == project_id)
+                and (updated_before is None or item.updated_at <= updated_before)
+            ),
+            key=lambda item: (item.updated_at, item.org_id, item.project_id, item.uri),
+        )
+        return items[:limit]
+
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
         return sum(
-            item.size_bytes
+            item.charged_bytes
             for item in self._state.managed_artifacts.values()
             if item.org_id == org_id and (project_id is None or item.project_id == project_id)
         )
@@ -351,11 +379,13 @@ class StateSession(RepositorySession):
         return sum(
             1
             for item in self._state.managed_artifacts.values()
-            if item.org_id == org_id and (project_id is None or item.project_id == project_id)
+            if item.org_id == org_id
+            and (project_id is None or item.project_id == project_id)
+            and item.state is not ManagedArtifactState.DELETED
         )
 
     async def sum_all_managed_artifact_bytes(self) -> int:
-        return sum(item.size_bytes for item in self._state.managed_artifacts.values())
+        return sum(item.charged_bytes for item in self._state.managed_artifacts.values())
 
     async def put_artifact_reference(self, record: ArtifactReferenceRecord) -> None:
         key = (record.org_id, record.project_id, record.uri, record.workload_id)

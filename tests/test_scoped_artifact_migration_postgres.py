@@ -93,6 +93,7 @@ async def _insert_managed(
     json_project_id: str | None = None,
     uri: str = _URI,
     size: int = 13,
+    lifecycle: bool = False,
 ) -> None:
     data = {
         "uri": uri,
@@ -101,11 +102,29 @@ async def _insert_managed(
         "project_id": project_id if json_project_id is None else json_project_id,
         "size_bytes": size,
     }
-    await connection.execute(
-        text(
+    if lifecycle:
+        data.update(
+            {
+                "state": "quarantined",
+                "record_generation": 1,
+                "object_version": None,
+                "quarantine_reason": "legacy object version has not been verified",
+            }
+        )
+        statement = (
+            "INSERT INTO managed_artifacts "
+            "(uri, org_id, project_id, kind, state, record_generation, object_version, size_bytes, "
+            "created_at, updated_at, data) "
+            "VALUES (:uri, :org_id, :project_id, 'callables', 'quarantined', 1, NULL, :size, "
+            "now(), now(), CAST(:data AS json))"
+        )
+    else:
+        statement = (
             "INSERT INTO managed_artifacts (uri, org_id, project_id, kind, size_bytes, created_at, data) "
             "VALUES (:uri, :org_id, :project_id, 'callables', :size, now(), CAST(:data AS json))"
-        ),
+        )
+    await connection.execute(
+        text(statement),
         {
             "uri": uri,
             "org_id": org_id,
@@ -307,8 +326,9 @@ async def test_head_bootstrap_uses_migration_constraint_names_and_can_conditiona
 
     async with database.begin() as connection:
         await _insert_workload(connection, workload_id="wl-alpha", org_id="acme", project_id="alpha")
-        # Head tables use the same columns accepted by these populated helpers.
-        await _insert_managed(connection, org_id="acme", project_id="alpha")
+        # Head tables use the same identity plus an explicitly downgrade-safe
+        # quarantined lifecycle row.
+        await _insert_managed(connection, org_id="acme", project_id="alpha", lifecycle=True)
         scoped_id = artifact_reference_id("acme", "alpha", _URI, "wl-alpha")
         data = {
             "id": scoped_id,

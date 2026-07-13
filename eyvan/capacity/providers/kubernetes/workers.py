@@ -192,25 +192,28 @@ def headless_service_manifest(
         labels[GENERATION_LABEL] = str(provider_generation)
         annotations[FENCE_ANNOTATION] = fence
     name = object_name("eyvan", cell_id)
-    return {
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": labels,
-            "annotations": annotations,
+    return tp.cast(
+        JsonObject,
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": labels,
+                "annotations": annotations,
+            },
+            "spec": {
+                "clusterIP": "None",
+                # Published before readiness so DNS resolves while the workers are
+                # still starting; the control plane decides readiness from Job status,
+                # not from whether a name resolves.
+                "publishNotReadyAddresses": True,
+                "selector": {CELL_LABEL: cell_label_value(cell_id)},
+                "ports": [{"name": "native-worker", "port": 8100, "targetPort": 8100}],
+            },
         },
-        "spec": {
-            "clusterIP": "None",
-            # Published before readiness so DNS resolves while the workers are
-            # still starting; the control plane decides readiness from Job status,
-            # not from whether a name resolves.
-            "publishNotReadyAddresses": True,
-            "selector": {CELL_LABEL: cell_label_value(cell_id)},
-            "ports": [{"name": "native-worker", "port": 8100, "targetPort": 8100}],
-        },
-    }
+    )
 
 
 def worker_endpoints(cell_id: str, namespace: str, worker_count: int, *, port: int = 8100) -> tuple[str, ...]:

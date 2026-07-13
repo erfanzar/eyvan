@@ -629,11 +629,16 @@ def _artifact_access(tmp_path):
     )
 
 
+def _attach_artifact_access(controller, access) -> None:
+    controller.artifact_access = access
+    controller.service.artifact_store = access.store
+
+
 async def test_secret_bearing_workload_output_is_not_streamed_or_archived(tmp_path) -> None:
     marker = "embedded-control-plane-secret"
     agent = _PagingAgent(message=f"prefix-{marker}-suffix")
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
         secret_spec = workload.spec.model_copy(update={"secret_mounts": {"HF_TOKEN": "gcp-secret://project/token"}})
@@ -660,7 +665,7 @@ async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:
 
     agent = _PagingAgent(message="the last thing it printed")
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
     workload_id = "wl-1"
 
     async with controller.repository.transaction() as transaction:
@@ -689,7 +694,7 @@ async def test_an_attempt_with_no_archive_says_so_rather_than_looking_silent(tmp
 
     agent = _PagingAgent()
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
 
     async with controller.repository.transaction() as transaction:
         stored = await transaction.get_workload("wl-1")
@@ -713,13 +718,13 @@ async def test_each_attempt_archives_separately(tmp_path) -> None:
 
     access = _artifact_access(tmp_path)
     first = await _controller_with(_PagingAgent(message="attempt one"), attempt=1)
-    first.artifact_access = access
+    _attach_artifact_access(first, access)
     async with first.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
     await first._archive_terminal_logs(workload)
 
     second = await _controller_with(_PagingAgent(message="attempt two"), attempt=2)
-    second.artifact_access = access
+    _attach_artifact_access(second, access)
     async with second.repository.transaction() as transaction:
         retried = await transaction.get_workload("wl-1")
     await second._archive_terminal_logs(retried)
@@ -763,7 +768,7 @@ async def test_archive_overflow_is_trimmed_per_rank_and_replays_as_visibly_parti
 
     agent = _ChattyAgent()
     controller = await _controller_with(agent)
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
     async with controller.repository.transaction() as transaction:
         cell = await transaction.get_cell("cell-a")
         await transaction.put_cell(cell.model_copy(update={"runtime_process_count": 2}))
@@ -805,18 +810,24 @@ async def test_sparse_high_rank_archive_writes_are_bounded_and_direct(tmp_path) 
             self.backing = backing
             self.put_uris: list[str] = []
 
-        def put(self, uri, payload, **scope):
+        def put_versioned(self, uri, payload, **scope):
             self.put_uris.append(uri)
-            return self.backing.put(uri, payload, **scope)
+            return self.backing.put_versioned(uri, payload, **scope)
+
+        def get_versioned(self, uri, **scope):
+            return self.backing.get_versioned(uri, **scope)
+
+        def put(self, uri, payload, **scope):
+            return self.put_versioned(uri, payload, **scope).metadata.uri
 
         def get(self, uri, **scope):
-            return self.backing.get(uri, **scope)
+            return self.get_versioned(uri, **scope).payload
 
     controller = await _controller_with(_PagingAgent())
     access = _artifact_access(tmp_path)
     counting = _CountingStore(access.store)
     object.__setattr__(access, "store", counting)
-    controller.artifact_access = access
+    _attach_artifact_access(controller, access)
     high_rank = 1_000_000
 
     async def sparse_page(_workload_id, *, after="", limit=200):
@@ -850,14 +861,14 @@ async def test_checked_in_legacy_archive_is_read_by_the_manifest_aware_reader(tm
     from eyvan.artifacts.managed import log_uri
 
     controller = await _controller_with(_PagingAgent())
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
     fixtures = Path(__file__).parent / "fixtures" / "log_archives"
     for rank in (0, 1):
-        controller.artifact_access.store.put(
-            log_uri("wl-1", 1, rank),
-            (fixtures / f"legacy-rank-{rank}.jsonl").read_bytes(),
+        await controller.service.upload_managed_artifact(
             org_id="acme",
             project_id="research",
+            uri=log_uri("wl-1", 1, rank),
+            payload=(fixtures / f"legacy-rank-{rank}.jsonl").read_bytes(),
         )
 
     page = await controller._archived_log_page(await _only_workload(controller))
@@ -876,7 +887,7 @@ async def test_new_manifest_archive_retains_the_old_contiguous_jsonl_shape(tmp_p
     from eyvan.artifacts.managed import log_uri
 
     controller = await _controller_with(_PagingAgent())
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
 
     async def sparse_page(_workload_id, *, after="", limit=200):
         del after
@@ -927,7 +938,7 @@ async def test_an_archive_failure_does_not_block_settlement(tmp_path) -> None:
     access = _artifact_access(tmp_path)
     object.__setattr__(access, "store", _BrokenStore())
     controller = await _controller_with(_PagingAgent())
-    controller.artifact_access = access
+    _attach_artifact_access(controller, access)
 
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
@@ -964,7 +975,7 @@ async def test_the_release_path_itself_archives(tmp_path) -> None:
 
     access = _artifact_access(tmp_path)
     controller = await _controller_with(_PagingAgent(message="final line"))
-    controller.artifact_access = access
+    _attach_artifact_access(controller, access)
 
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-1")
@@ -997,8 +1008,9 @@ async def _collection_service(tmp_path):
 async def _index(service, uri: str, *, age_days: int) -> None:
     from datetime import timedelta
 
-    from eyvan.records import ManagedArtifactRecord, utcnow
+    from eyvan.records import ManagedArtifactRecord, ManagedArtifactState, utcnow
 
+    created_at = utcnow() - timedelta(days=age_days)
     async with service.repository.transaction() as transaction:
         await transaction.put_managed_artifact(
             ManagedArtifactRecord(
@@ -1006,8 +1018,15 @@ async def _index(service, uri: str, *, age_days: int) -> None:
                 org_id="acme",
                 project_id="research",
                 kind=uri.split("//")[1].split("/")[0],
+                state=ManagedArtifactState.ACTIVE,
+                record_generation=1,
                 size_bytes=10,
-                created_at=utcnow() - timedelta(days=age_days),
+                sha256="0" * 64,
+                object_version="test:version-1",
+                created_at=created_at,
+                updated_at=created_at,
+                activated_at=created_at,
+                quarantine_reason=None,
             )
         )
 
@@ -1488,7 +1507,7 @@ async def test_multi_host_archive_replays_global_ranks_and_explicit_truncation(t
         "cell-b": (_JournalHost("b0"), _JournalHost("b1", always_unreachable=True)),
     }
     controller = await _gang_controller(_MultiHostAgent(hosts), runtime_process_counts=(2, 2))
-    controller.artifact_access = _artifact_access(tmp_path)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
 
     async with controller.repository.transaction() as transaction:
         workload = await transaction.get_workload("wl-gang")

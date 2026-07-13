@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
 import threading
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
@@ -26,9 +29,14 @@ from eyvan.artifacts.managed import (
     InvalidManagedArtifactURI,
     LocalManagedArtifactStore,
     ManagedArtifactConflictError,
+    ManagedArtifactDeleteInconclusiveError,
+    ManagedArtifactDeleteStatus,
     ManagedArtifactInventoryError,
     ManagedArtifactKind,
     ManagedArtifactObjectMetadata,
+    ManagedArtifactOperationInconclusiveError,
+    ManagedArtifactVersionMismatchError,
+    ManagedArtifactWriteInconclusiveError,
     callable_uri,
     parse_managed_uri,
     result_uri,
@@ -153,10 +161,1257 @@ def test_local_store_rejects_symlink_escape_before_writing(tmp_path: Path) -> No
     assert list(outside.iterdir()) == []
 
 
+def test_local_versioned_store_retries_one_inode_and_deletes_only_that_version(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("run-versioned")
+
+    first = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+    retried = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+    exact = store.get_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=first.metadata.object_version,
+    )
+
+    assert first.created is True
+    assert retried.created is False
+    assert retried.metadata == first.metadata
+    assert exact.payload == b"first"
+    assert exact.metadata == first.metadata
+    assert first.metadata.object_version.startswith("local:2:")
+    assert first.metadata.sha256 == hashlib.sha256(b"first").hexdigest()
+    assert list((store.root / ".locks").glob("*.lock"))
+    assert list((store.root / ".generations").rglob("*.artifact"))
+    assert not list((store.root / "scopes").rglob("*.lock"))
+
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "run-versioned.result"
+    replacement = target.with_name("replacement.result")
+    replacement.write_bytes(b"replacement")
+    replacement.replace(target)
+
+    with pytest.raises(ManagedArtifactVersionMismatchError):
+        store.get_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=first.metadata.object_version,
+        )
+    mismatch = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=first.metadata.object_version,
+    )
+    assert mismatch.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert mismatch.current_metadata is not None
+    assert mismatch.current_metadata.object_version != first.metadata.object_version
+    assert target.read_bytes() == b"replacement"
+
+    deleted = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=mismatch.current_metadata.object_version,
+    )
+    absent = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=mismatch.current_metadata.object_version,
+    )
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert absent.status is ManagedArtifactDeleteStatus.ABSENT
+
+
+def test_local_conditional_delete_never_unlinks_a_rename_at_detach_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("rename-at-delete")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "rename-at-delete.result"
+    replacement = target.with_name("replacement.result")
+    replacement.write_bytes(b"generation-b")
+    original_rename = os.rename
+    replacement_installed = False
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replacement_installed
+        if source == target.name and not replacement_installed:
+            replacement_installed = True
+            assert src_dir_fd is not None
+            original_rename(
+                replacement.name,
+                target.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=src_dir_fd,
+            )
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert replacement_installed
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    assert target.read_bytes() == b"generation-b"
+
+
+def test_local_delete_raw_detached_replacement_is_preserved_before_receipt_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replace-detached-raw")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replace-detached-raw.result"
+    replacement = target.with_name("replacement-detached-raw.result")
+    replacement.write_bytes(b"generation-b")
+    original_ftruncate = os.ftruncate
+    original_rename = os.rename
+    original_unlink = os.unlink
+    unlinked_names: list[tuple[str, int | None]] = []
+    installed = False
+
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal installed
+        if length == 0 and not installed:
+            installed = True
+            detached = next((store.root / ".generations").rglob("detached"))
+            # Deliberately bypass every store helper: first install B at the
+            # canonical name, then rename that raw path over the verified
+            # staging entry. The truncate must still hit generation A's fd,
+            # while this generation B entry survives.
+            original_rename(replacement, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def record_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlinked_names.append((os.fspath(path), dir_fd))
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(os, "unlink", record_unlink)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert installed
+    detached_unlinks = [directory_fd for name, directory_fd in unlinked_names if name == "detached"]
+    assert detached_unlinks
+    assert all(directory_fd is not None for _name, directory_fd in unlinked_names)
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    replacement_digest = hashlib.sha256(b"generation-b").hexdigest()
+    assert outcome.current_metadata.sha256 == replacement_digest
+    assert target.read_bytes() == b"generation-b"
+    generation_directory = next((store.root / ".generations").iterdir())
+    replacement_anchor = generation_directory / f"{replacement_digest}.artifact"
+    assert replacement_anchor.samefile(target)
+    assert target.stat().st_nlink == 2
+    assert not list(generation_directory.glob(".delete-*"))
+    assert not list(generation_directory.glob(".trash-*"))
+
+
+def test_local_delete_rehashes_same_inode_mutated_during_detach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("mutated-during-detach")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "mutated-during-detach.result"
+    original_rename = os.rename
+    mutated = False
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated
+        if source == target.name and destination == "detached" and not mutated:
+            mutated = True
+            inode = target.stat().st_ino
+            os.chmod(target, 0o600)
+            target.write_bytes(b"generation-b-expanded")
+            assert target.stat().st_ino == inode
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert mutated
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b-expanded").hexdigest()
+    assert target.read_bytes() == b"generation-b-expanded"
+    assert target.stat().st_ino != int(written.metadata.object_version.split(":")[-2])
+
+
+def test_local_delete_retains_an_invalid_content_addressed_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    original_payload = b"callable-generation-a"
+    replacement_payload = b"callable-generation-b-invalid-for-uri"
+    digest = hashlib.sha256(original_payload).hexdigest()
+    uri = callable_uri(digest)
+    written = store.put_versioned(uri, original_payload, org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "callables" / f"{digest}.pkl"
+    original_rename = os.rename
+    original_unlink = os.unlink
+    mutated = False
+    unlinked_receipt_entries: list[str] = []
+
+    def adversarial_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated
+        if source == target.name and destination == "detached" and not mutated:
+            mutated = True
+            inode = target.stat().st_ino
+            os.chmod(target, 0o600)
+            target.write_bytes(replacement_payload)
+            assert target.stat().st_ino == inode
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    def record_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlinked_receipt_entries.append(os.fspath(path))
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "rename", adversarial_rename)
+    monkeypatch.setattr(os, "unlink", record_unlink)
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert mutated
+    transactions = list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    retained_payloads = [target.read_bytes()] if target.exists() and target.is_file() else []
+    retained_payloads.extend(
+        path.read_bytes()
+        for path in transactions[0].iterdir()
+        if path.is_file() and not path.is_symlink() and path.stat().st_size
+    )
+    assert replacement_payload in retained_payloads
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+    assert not {"detached", "preserved-anchor"}.intersection(unlinked_receipt_entries)
+
+
+def test_local_delete_retains_detached_b_when_a_different_c_becomes_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replacement-b-versus-current-c")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = (
+        store.root / "scopes" / storage_scope("acme", "research") / "results" / "replacement-b-versus-current-c.result"
+    )
+    staging_b = target.with_name("staging-generation-b.result")
+    staging_b.write_bytes(b"generation-b")
+    original_ftruncate = os.ftruncate
+    original_rename = os.rename
+    original_install = store._install_preserved_replacement
+    installed_b = False
+    installed_c = False
+
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal installed_b
+        if length == 0 and not installed_b:
+            installed_b = True
+            detached = next((store.root / ".generations").rglob("detached"))
+            original_rename(staging_b, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def install_after_c_appears(
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference,
+        payload: bytes,
+    ):
+        nonlocal installed_c
+        if not installed_c:
+            installed_c = True
+            target.write_bytes(b"generation-c")
+            target.chmod(0o400)
+        return original_install(generation_fd, directory_fd, relative, reference, payload)
+
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(store, "_install_preserved_replacement", install_after_c_appears)
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert installed_b and installed_c
+    assert target.read_bytes() == b"generation-c"
+    transactions = list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    assert any(
+        path.is_file() and not path.is_symlink() and path.read_bytes() == b"generation-b"
+        for path in transactions[0].iterdir()
+    )
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+
+
+def test_local_delete_anchors_an_exact_current_b_before_receipt_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("replacement-b-is-current-b")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "replacement-b-is-current-b.result"
+    staging_b = target.with_name("staging-current-generation-b.result")
+    staging_b.write_bytes(b"generation-b")
+    original_ftruncate = os.ftruncate
+    original_rename = os.rename
+    original_install = store._install_preserved_replacement
+    installed_b = False
+    current_b = False
+
+    def adversarial_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal installed_b
+        if length == 0 and not installed_b:
+            installed_b = True
+            detached = next((store.root / ".generations").rglob("detached"))
+            original_rename(staging_b, target)
+            generation_directory = detached.parent.parent
+            os.link(target, generation_directory / f"{hashlib.sha256(b'generation-b').hexdigest()}.artifact")
+            original_rename(target, detached)
+        original_ftruncate(descriptor, length)
+
+    def install_after_same_b_appears(
+        generation_fd: int,
+        directory_fd: int,
+        relative: Path,
+        reference,
+        payload: bytes,
+    ):
+        nonlocal current_b
+        if not current_b:
+            current_b = True
+            target.write_bytes(b"generation-b")
+            target.chmod(0o400)
+        return original_install(generation_fd, directory_fd, relative, reference, payload)
+
+    monkeypatch.setattr(os, "ftruncate", adversarial_ftruncate)
+    monkeypatch.setattr(store, "_install_preserved_replacement", install_after_same_b_appears)
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert installed_b and current_b
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert target.read_bytes() == b"generation-b"
+    observed = store.stat(uri, org_id="acme", project_id="research")
+    assert observed is not None
+    replacement_digest = hashlib.sha256(b"generation-b").hexdigest()
+    assert observed.object_version.startswith(f"local:2:{replacement_digest}:")
+    anchor = next((store.root / ".generations").glob(f"*/{replacement_digest}.artifact"))
+    assert anchor.samefile(target)
+    assert not list((store.root / ".generations").glob("*/.delete-v1-*"))
+    assert not list((store.root / ".generations").glob("*/.trash-v1-*"))
+
+
+@pytest.mark.parametrize("crash_boundary", ("detached", "truncated", "anchor-retired"))
+def test_local_delete_crash_residue_is_private_and_retry_put_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = tmp_path / f"managed-{crash_boundary}"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri(f"crash-{crash_boundary}")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    original_ftruncate = os.ftruncate
+    crashed = False
+
+    def crash_after_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal crashed
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        should_crash = (crash_boundary == "detached" and destination == "detached") or (
+            crash_boundary == "anchor-retired" and destination == "destroyed-anchor"
+        )
+        if should_crash and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    def crash_after_truncate(descriptor: int, length: int) -> None:
+        nonlocal crashed
+        original_ftruncate(descriptor, length)
+        if crash_boundary == "truncated" and length == 0 and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_rename)
+    monkeypatch.setattr(os, "ftruncate", crash_after_truncate)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+    assert crashed
+
+    target = root / "scopes" / storage_scope("acme", "research") / "results" / f"crash-{crash_boundary}.result"
+    assert not target.exists()
+    transactions = list((root / ".generations").glob("*/.delete-v1-*"))
+    assert len(transactions) == 1
+    assert (transactions[0] / "detached").stat().st_nlink == 2
+    assert not list((root / "scopes").rglob(".eyvan-delete-*"))
+    inventory = store.list_scope(org_id="acme", project_id="research")
+    assert inventory.objects == ()
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    monkeypatch.setattr(os, "ftruncate", original_ftruncate)
+    restarted = LocalManagedArtifactStore(root)
+    rewritten = restarted.put_versioned(uri, b"generation-b", org_id="acme", project_id="research")
+
+    assert rewritten.created is True
+    assert rewritten.metadata.object_version != written.metadata.object_version
+    assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
+    assert not list((root / ".generations").glob("*/.delete-v1-*"))
+    assert not list((root / ".generations").glob("*/.trash-v1-*"))
+
+
+def test_local_delete_retry_finishes_a_post_detach_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("retry-post-detach")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    crashed = False
+
+    def crash_after_detach(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal crashed
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == "detached" and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_detach)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    outcome = LocalManagedArtifactStore(store.root).delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.DELETED
+    generation_directory = next((store.root / ".generations").iterdir())
+    assert list(generation_directory.iterdir()) == []
+
+
+def test_local_delete_reuse_keeps_inode_consumption_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "managed"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri("bounded-receipts")
+
+    for cycle in range(100):
+        written = store.put_versioned(
+            uri,
+            f"generation-{cycle}".encode(),
+            org_id="acme",
+            project_id="research",
+        )
+        deleted = store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+
+    generation_directory = next((root / ".generations").iterdir())
+    assert list(generation_directory.iterdir()) == []
+    physical_entries = (root, *root.rglob("*"))
+    allocated_inodes = {(entry.lstat().st_dev, entry.lstat().st_ino) for entry in physical_entries}
+    assert len(allocated_inodes) <= 8
+
+
+@pytest.mark.parametrize(
+    "crash_boundary",
+    (
+        "archive-renamed",
+        "archive-synced",
+        "cleanup-safe-unlinked",
+        "complete-unlinked",
+        "destroyed-anchor-unlinked",
+        "detached-unlinked",
+        "validated-unlinked",
+        "receipt-synced",
+        "receipt-removed",
+        "generation-synced",
+    ),
+)
+@pytest.mark.parametrize("retry_operation", ("delete", "put"))
+def test_local_delete_cleanup_recovers_after_every_durable_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+    retry_operation: str,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = tmp_path / f"managed-{crash_boundary}-{retry_operation}"
+    store = LocalManagedArtifactStore(root)
+    uri = result_uri("cleanup-crash")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    original_rename = os.rename
+    original_unlink = os.unlink
+    original_rmdir = os.rmdir
+    original_fsync = os.fsync
+    archived = False
+    archive_synced = False
+    receipt_removed = False
+    crashed = False
+
+    def crash(event: str) -> None:
+        nonlocal crashed
+        if event == crash_boundary and not crashed:
+            crashed = True
+            raise SimulatedCrash
+
+    def boundary_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal archived
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination.startswith(".trash-"):
+            archived = True
+            crash("archive-renamed")
+
+    def boundary_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        original_unlink(path, dir_fd=dir_fd)
+        if archived:
+            crash(f"{os.fspath(path)}-unlinked")
+
+    def boundary_rmdir(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal receipt_removed
+        original_rmdir(path, dir_fd=dir_fd)
+        if archived and os.fspath(path).startswith(".trash-"):
+            receipt_removed = True
+            crash("receipt-removed")
+
+    def boundary_fsync(descriptor: int) -> None:
+        nonlocal archive_synced
+        original_fsync(descriptor)
+        if receipt_removed:
+            crash("generation-synced")
+        elif archived and not archive_synced:
+            archive_synced = True
+            crash("archive-synced")
+        elif archived:
+            crash("receipt-synced")
+
+    monkeypatch.setattr(os, "rename", boundary_rename)
+    monkeypatch.setattr(os, "unlink", boundary_unlink)
+    monkeypatch.setattr(os, "rmdir", boundary_rmdir)
+    monkeypatch.setattr(os, "fsync", boundary_fsync)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+    assert crashed
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    monkeypatch.setattr(os, "rmdir", original_rmdir)
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    restarted = LocalManagedArtifactStore(root)
+    if retry_operation == "delete":
+        retried = restarted.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        expected = (
+            ManagedArtifactDeleteStatus.ABSENT
+            if crash_boundary in {"receipt-removed", "generation-synced"}
+            else ManagedArtifactDeleteStatus.DELETED
+        )
+        assert retried.status is expected
+    else:
+        replacement = restarted.put_versioned(
+            uri,
+            b"generation-b",
+            org_id="acme",
+            project_id="research",
+        )
+        assert replacement.created is True
+        stale_delete = restarted.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert stale_delete.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+        assert stale_delete.current_metadata == replacement.metadata
+        assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
+
+    generation_directory = next((root / ".generations").iterdir())
+    assert not list(generation_directory.glob(".delete-*"))
+    assert not list(generation_directory.glob(".trash-*"))
+
+
+class _SimulatedArchivedReceiptCrash(BaseException):
+    pass
+
+
+def _leave_archived_local_delete_receipt(
+    store: LocalManagedArtifactStore,
+    uri: str,
+    object_version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    original_rename = os.rename
+
+    def crash_after_archive(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination.startswith(".trash-"):
+            raise _SimulatedArchivedReceiptCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_archive)
+    with pytest.raises(_SimulatedArchivedReceiptCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=object_version,
+        )
+    monkeypatch.setattr(os, "rename", original_rename)
+    receipts = list((store.root / ".generations").glob("*/.trash-v1-*"))
+    assert len(receipts) == 1
+    return receipts[0]
+
+
+def test_local_delete_cleanup_retains_payload_receipts_without_cleanup_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("legacy-unvalidated-receipt")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+    (receipt / "cleanup-safe").unlink()
+    retained = receipt / "preserved-anchor"
+    retained.write_bytes(b"unvalidated-scope-replacement")
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.DELETED
+    assert receipt.is_dir()
+    assert retained.read_bytes() == b"unvalidated-scope-replacement"
+
+
+@pytest.mark.parametrize(
+    "unexpected_kind",
+    ("unknown-file", "unknown-directory", "unknown-symlink", "known-directory"),
+)
+def test_local_delete_cleanup_retains_unexpected_receipt_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unexpected_kind: str,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri(f"unexpected-receipt-{unexpected_kind}")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+
+    if unexpected_kind == "unknown-file":
+        unexpected = receipt / "unknown"
+        unexpected.write_bytes(b"retain")
+    elif unexpected_kind == "unknown-directory":
+        unexpected = receipt / "unknown"
+        unexpected.mkdir()
+        (unexpected / "do-not-traverse").write_bytes(b"retain")
+    elif unexpected_kind == "unknown-symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"retain")
+        unexpected = receipt / "unknown"
+        unexpected.symlink_to(outside)
+    else:
+        unexpected = receipt / "detached"
+        unexpected.unlink()
+        unexpected.mkdir()
+        (unexpected / "do-not-traverse").write_bytes(b"retain")
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError, match=r"unexpected entry|nested directory"):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert receipt.is_dir()
+    assert os.path.lexists(unexpected)
+    if unexpected_kind == "unknown-symlink":
+        assert outside.read_bytes() == b"retain"
+    else:
+        assert (receipt / "complete").is_file()
+
+
+@pytest.mark.parametrize("operation", ("delete", "put"))
+def test_local_generation_recovery_has_an_explicit_fixed_scan_cap(tmp_path: Path, operation: str) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("bounded-generation-scan")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    generation_directory = next((store.root / ".generations").iterdir())
+    for index in range(256):
+        (generation_directory / f"ignored-{index:03d}").touch()
+
+    expected_error = (
+        ManagedArtifactDeleteInconclusiveError if operation == "delete" else ManagedArtifactWriteInconclusiveError
+    )
+    with pytest.raises(expected_error, match="bounded scan limit"):
+        if operation == "delete":
+            store.delete_versioned(
+                uri,
+                org_id="acme",
+                project_id="research",
+                object_version=written.metadata.object_version,
+            )
+        else:
+            store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+
+    assert store.get(uri, org_id="acme", project_id="research") == b"generation-a"
+
+
+def test_local_delete_receipt_recovery_has_an_explicit_fixed_scan_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("bounded-receipt-scan")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    receipt = _leave_archived_local_delete_receipt(store, uri, written.metadata.object_version, monkeypatch)
+    for index in range(17 - len(list(receipt.iterdir()))):
+        (receipt / f"unknown-{index:02d}").touch()
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError, match="bounded scan limit"):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert receipt.is_dir()
+    assert len(list(receipt.iterdir())) == 17
+
+
+def test_local_delete_recovery_never_removes_a_later_canonical_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("crash-then-replacement")
+    written = store.put_versioned(uri, b"generation-a", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "crash-then-replacement.result"
+    original_rename = os.rename
+
+    def crash_after_detach(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == "detached":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(os, "rename", crash_after_detach)
+    with pytest.raises(SimulatedCrash):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    target.write_bytes(b"generation-b")
+    outcome = LocalManagedArtifactStore(store.root).delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert outcome.current_metadata is not None
+    assert outcome.current_metadata.sha256 == hashlib.sha256(b"generation-b").hexdigest()
+    assert target.read_bytes() == b"generation-b"
+
+
+def test_local_delete_receipt_special_entries_are_unlinked_nonblocking_in_a_bounded_subprocess(
+    tmp_path: Path,
+) -> None:
+    script = r"""
+import os
+import socket
+import sys
+from pathlib import Path
+
+from eyvan.artifacts.managed import LocalManagedArtifactStore, ManagedArtifactDeleteStatus, result_uri
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+root = Path(sys.argv[1])
+store = LocalManagedArtifactStore(root)
+
+
+def leave_receipt(name, payload):
+    uri = result_uri(name)
+    written = store.put_versioned(uri, payload, org_id="acme", project_id="research")
+    original_rename = os.rename
+
+    def crash_after_archive(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+        original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        if destination.startswith(".trash-"):
+            raise SimulatedCrash
+
+    os.rename = crash_after_archive
+    try:
+        try:
+            store.delete_versioned(
+                uri,
+                org_id="acme",
+                project_id="research",
+                object_version=written.metadata.object_version,
+            )
+        except SimulatedCrash:
+            pass
+        else:
+            raise AssertionError("delete reached past the archived receipt boundary")
+    finally:
+        os.rename = original_rename
+    receipts = list(root.glob(".generations/*/.trash-v1-*"))
+    if len(receipts) != 1:
+        raise AssertionError(f"expected one receipt, found {len(receipts)}")
+    return uri, written.metadata.object_version, receipts[0]
+
+
+for kind in ("fifo", "socket", "symlink"):
+    uri, object_version, receipt = leave_receipt(f"special-receipt-{kind}", kind.encode())
+    detached = receipt / "detached"
+    detached.unlink()
+    listener = None
+    outside = root / f"outside-{kind}"
+    if kind == "fifo":
+        os.mkfifo(detached)
+    elif kind == "socket":
+        listener = socket.socket(socket.AF_UNIX)
+        previous = Path.cwd()
+        os.chdir(receipt)
+        try:
+            listener.bind("detached")
+        finally:
+            os.chdir(previous)
+    else:
+        outside.write_bytes(b"retain")
+        detached.symlink_to(outside)
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=object_version,
+    )
+    if outcome.status is not ManagedArtifactDeleteStatus.DELETED:
+        raise AssertionError(f"unexpected retry outcome: {outcome.status}")
+    if receipt.exists():
+        raise AssertionError("special receipt was retained")
+    if kind == "symlink" and outside.read_bytes() != b"retain":
+        raise AssertionError("receipt symlink target was followed")
+    if listener is not None:
+        listener.close()
+
+print("bounded")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "special-receipts")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        cwd=Path(__file__).parents[1],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "bounded"
+
+
+def test_local_special_file_opens_are_nonblocking_and_type_safe_in_a_bounded_subprocess(tmp_path: Path) -> None:
+    script = r"""
+import os
+import socket
+import stat
+import sys
+from pathlib import Path
+
+from eyvan.artifacts.managed import (
+    InvalidManagedArtifactURI,
+    LocalManagedArtifactStore,
+    ManagedArtifactDeleteInconclusiveError,
+    result_uri,
+    storage_scope,
+)
+
+root = Path(sys.argv[1])
+store = LocalManagedArtifactStore(root)
+uri = result_uri("special")
+store.put(uri, b"payload", org_id="acme", project_id="research")
+target = root / "scopes" / storage_scope("acme", "research") / "results" / "special.result"
+
+target.unlink()
+os.mkfifo(target)
+try:
+    store.stat(uri, org_id="acme", project_id="research")
+except InvalidManagedArtifactURI:
+    pass
+else:
+    raise AssertionError("FIFO was accepted")
+target.unlink()
+
+store.put(uri, b"payload", org_id="acme", project_id="research")
+target.unlink()
+previous = Path.cwd()
+os.chdir(target.parent)
+listener = socket.socket(socket.AF_UNIX)
+try:
+    listener.bind(target.name)
+finally:
+    os.chdir(previous)
+try:
+    store.stat(uri, org_id="acme", project_id="research")
+except InvalidManagedArtifactURI:
+    pass
+else:
+    raise AssertionError("socket was accepted")
+listener.close()
+target.unlink()
+
+store.put(uri, b"payload", org_id="acme", project_id="research")
+original_open = os.open
+
+def replace_open_with_device(path, flags, *args, **kwargs):
+    if path == target.name and kwargs.get("dir_fd") is not None:
+        return original_open(os.devnull, flags)
+    return original_open(path, flags, *args, **kwargs)
+
+os.open = replace_open_with_device
+try:
+    try:
+        store.stat(uri, org_id="acme", project_id="research")
+    except InvalidManagedArtifactURI:
+        pass
+    else:
+        raise AssertionError("device was accepted")
+finally:
+    os.open = original_open
+
+race_uri = result_uri("race-special")
+race_write = store.put_versioned(race_uri, b"payload", org_id="acme", project_id="research")
+race_target = root / "scopes" / storage_scope("acme", "research") / "results" / "race-special.result"
+race_fifo = race_target.with_name("race-special.fifo")
+os.mkfifo(race_fifo)
+original_rename = os.rename
+replaced = False
+
+def replace_before_detach(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+    global replaced
+    if source == race_target.name and not replaced:
+        replaced = True
+        original_rename(
+            race_fifo.name,
+            race_target.name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=src_dir_fd,
+        )
+    original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+os.rename = replace_before_detach
+try:
+    try:
+        store.delete_versioned(
+            race_uri,
+            org_id="acme",
+            project_id="research",
+            object_version=race_write.metadata.object_version,
+        )
+    except ManagedArtifactDeleteInconclusiveError:
+        pass
+    else:
+        raise AssertionError("racing FIFO was accepted or deleted")
+finally:
+    os.rename = original_rename
+assert replaced and stat.S_ISFIFO(os.lstat(race_target).st_mode)
+print("bounded")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "special-root")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        cwd=Path(__file__).parents[1],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "bounded"
+
+
+def test_local_store_rejects_an_unrecognized_hardlink_without_deleting_it(tmp_path: Path) -> None:
+    store = LocalManagedArtifactStore(tmp_path / "managed")
+    uri = result_uri("hardlink")
+    written = store.put_versioned(uri, b"managed", org_id="acme", project_id="research")
+    target = store.root / "scopes" / storage_scope("acme", "research") / "results" / "hardlink.result"
+    outside = target.with_name("outside")
+    target.unlink()
+    outside.write_bytes(b"replacement")
+    os.link(outside, target)
+
+    with pytest.raises(InvalidManagedArtifactURI, match="unrecognized hard link"):
+        store.stat(uri, org_id="acme", project_id="research")
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert target.read_bytes() == b"replacement"
+    assert outside.read_bytes() == b"replacement"
+
+
+class _BlockingLocalManagedArtifactStore(LocalManagedArtifactStore):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.pause_next_lock = False
+        self.lock_entered = threading.Event()
+        self.release_lock = threading.Event()
+
+    @contextlib.contextmanager
+    def _object_lock(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Iterator[None]:
+        with super()._object_lock(*args, **kwargs):
+            if self.pause_next_lock:
+                self.pause_next_lock = False
+                self.lock_entered.set()
+                assert self.release_lock.wait(timeout=5)
+            yield
+
+
+def test_local_cross_store_lock_serializes_conditional_delete_and_put(tmp_path: Path) -> None:
+    root = tmp_path / "managed"
+    deleting_store = _BlockingLocalManagedArtifactStore(root)
+    writing_store = LocalManagedArtifactStore(root)
+    uri = result_uri("serialized")
+    initial = deleting_store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    deleting_store.pause_next_lock = True
+    write_started = threading.Event()
+
+    def rewrite() -> tp.Any:
+        write_started.set()
+        return writing_store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        delete_future = executor.submit(
+            deleting_store.delete_versioned,
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=initial.metadata.object_version,
+        )
+        assert deleting_store.lock_entered.wait(timeout=5)
+        write_future = executor.submit(rewrite)
+        assert write_started.wait(timeout=5)
+        assert not write_future.done()
+        deleting_store.release_lock.set()
+        deleted = delete_future.result(timeout=5)
+        rewritten = write_future.result(timeout=5)
+
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert rewritten.created is True
+    assert rewritten.metadata.object_version != initial.metadata.object_version
+    assert writing_store.get(uri, org_id="acme", project_id="research") == b"payload"
+
+
 class FakeGcloudRunner:
+    """Generation-aware gcloud and exact-current JSON API fake."""
+
     def __init__(self):
-        self.objects: dict[str, bytes] = {}
+        self.objects: dict[str, tuple[bytes, int]] = {}
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
+        self.inventory_calls: list[str] = []
+        self.inventory_failures: list[tuple[int, bytes] | Exception] = []
+        self.cp_barrier: threading.Barrier | None = None
+        self.cp_timeout_after_commit = False
+        self.cp_post_stat_failure = False
+        self.cat_observed: threading.Event | None = None
+        self.cat_release: threading.Event | None = None
+        self.cat_post_stat_failure = False
+        self.cat_timeout = False
+        self.rm_failure: str | None = None
+        self.rm_timeout_after_delete = False
+        self._next_generation = 40
+        self._lock = threading.Lock()
+
+    def replace(self, uri: str, payload: bytes) -> int:
+        with self._lock:
+            self._next_generation += 1
+            self.objects[uri] = (payload, self._next_generation)
+            return self._next_generation
 
     def __call__(
         self,
@@ -164,38 +1419,349 @@ class FakeGcloudRunner:
         *,
         check: bool,
         capture_output: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
+        del check, capture_output
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout)
         uri = command[-1]
-        if command[2:4] == ["objects", "describe"]:
-            return subprocess.CompletedProcess(command, 0 if uri in self.objects else 1, stdout=b"", stderr=b"")
         if command[2] == "cp":
-            if uri in self.objects:
-                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"already exists")
-            self.objects[uri] = Path(command[-2]).read_bytes()
+            assert "--if-generation-match=0" in command
+            assert "--no-clobber" not in command
+            if self.cp_barrier is not None:
+                self.cp_barrier.wait()
+            with self._lock:
+                if uri in self.objects:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+                self._next_generation += 1
+                self.objects[uri] = (Path(command[-2]).read_bytes(), self._next_generation)
+            if self.cp_post_stat_failure:
+                self.inventory_failures.append((403, b'{"error":"provider-secret"}'))
+            if self.cp_timeout_after_commit:
+                raise subprocess.TimeoutExpired(command, timeout)
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         if command[2] == "cat":
-            if uri not in self.objects and check:
-                raise subprocess.CalledProcessError(1, command)
-            return subprocess.CompletedProcess(command, 0, stdout=self.objects[uri], stderr=b"")
+            if self.cat_timeout:
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
+            with self._lock:
+                current = self.objects.get(uri)
+            if current is None:
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+            if self.cat_observed is not None:
+                self.cat_observed.set()
+                assert self.cat_release is not None and self.cat_release.wait(timeout=5)
+            if self.cat_post_stat_failure:
+                self.inventory_failures.append((403, b'{"error":"provider-secret"}'))
+            return subprocess.CompletedProcess(command, 0, stdout=current[0], stderr=b"")
+        if command[2] == "rm":
+            assert any(argument.startswith("--if-generation-match=") for argument in command)
+            if self.rm_failure == "permission":
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+            if self.rm_failure == "timeout":
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
+            expected = int(next(argument.split("=", 1)[1] for argument in command if argument.startswith("--if-")))
+            with self._lock:
+                current = self.objects.get(uri)
+                if current is None or current[1] != expected:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"provider-secret")
+                del self.objects[uri]
+            if self.rm_timeout_after_delete:
+                raise subprocess.TimeoutExpired(command, timeout, stderr=b"provider-secret")
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         raise AssertionError(command)
 
+    def inventory(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]:
+        del headers, timeout_seconds, maximum_response_bytes
+        self.inventory_calls.append(url)
+        if self.inventory_failures:
+            failure = self.inventory_failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        parsed = urlsplit(url)
+        encoded_bucket, separator, encoded_name = parsed.path.partition("/o/")
+        assert separator
+        bucket = unquote(encoded_bucket.rsplit("/b/", 1)[1])
+        name = unquote(encoded_name)
+        uri = f"gs://{bucket}/{name}"
+        with self._lock:
+            current = self.objects.get(uri)
+        if current is None:
+            return 404, b'{"error":{"message":"not found"}}'
+        payload, generation = current
+        return 200, json.dumps(
+            {"name": name, "size": str(len(payload)), "generation": str(generation)},
+            separators=(",", ":"),
+        ).encode()
 
-def test_gcs_store_uses_scoped_no_clobber_objects() -> None:
+    def store(self) -> GCSManagedArtifactStore:
+        return GCSManagedArtifactStore(
+            "gs://eyvan-managed/artifacts",
+            runner=self,
+            inventory_transport=self.inventory,
+            access_token_provider=lambda: "fake-access-token",
+        )
+
+
+def test_gcs_store_uses_conditional_create_and_returns_the_stable_generation() -> None:
     runner = FakeGcloudRunner()
-    store = GCSManagedArtifactStore("gs://eyvan-managed/artifacts", runner=runner)
+    store = runner.store()
     uri = result_uri("run-1")
 
-    store.put(uri, b"result", org_id="acme", project_id="research")
-    store.put(uri, b"result", org_id="acme", project_id="research")
+    created = store.put_versioned(uri, b"result", org_id="acme", project_id="research")
+    retried = store.put_versioned(uri, b"result", org_id="acme", project_id="research")
 
     object_uri = next(iter(runner.objects))
     assert object_uri == f"gs://eyvan-managed/artifacts/scopes/{storage_scope('acme', 'research')}/results/run-1.result"
-    assert "--no-clobber" in next(command for command in runner.calls if command[2] == "cp")
+    assert created.created is True
+    assert retried.created is False
+    assert retried.metadata == created.metadata
+    assert created.metadata.sha256 == hashlib.sha256(b"result").hexdigest()
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+    cp = next(command for command in runner.calls if command[2] == "cp")
+    assert "--if-generation-match=0" in cp
+    assert "--no-clobber" not in cp
     assert not store.exists(uri, org_id="acme", project_id="other")
     with pytest.raises(ManagedArtifactConflictError):
         store.put(uri, b"changed", org_id="acme", project_id="research")
+
+
+def test_gcs_cp_timeout_after_commit_is_resolved_by_an_exact_digest_read() -> None:
+    runner = FakeGcloudRunner()
+    runner.cp_timeout_after_commit = True
+    store = runner.store()
+    uri = result_uri("cp-timeout-after-commit")
+
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    assert written.created is None
+    assert written.metadata.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert 30.0 in runner.timeouts
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+
+
+def test_gcs_cat_timeout_is_bounded_and_sanitized() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("cat-timeout")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.cat_timeout = True
+
+    with pytest.raises(ManagedArtifactOperationInconclusiveError) as inconclusive:
+        store.get_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert str(inconclusive.value) == "GCS managed artifact read failed"
+    assert "provider-secret" not in str(inconclusive.value)
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+
+
+@pytest.mark.parametrize("failure_point", ("post_cp_stat", "post_cat_stat"))
+def test_gcs_write_normalizes_every_post_cp_verification_failure(failure_point: str) -> None:
+    runner = FakeGcloudRunner()
+    if failure_point == "post_cp_stat":
+        runner.cp_post_stat_failure = True
+    else:
+        runner.cat_post_stat_failure = True
+    store = runner.store()
+    uri = result_uri(f"write-{failure_point}")
+
+    with pytest.raises(ManagedArtifactWriteInconclusiveError) as inconclusive:
+        store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    assert str(inconclusive.value) == "GCS managed artifact write was inconclusive"
+    assert "provider-secret" not in str(inconclusive.value)
+    assert any(command[2] == "cp" for command in runner.calls)
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+
+
+def test_gcs_conditional_create_race_accepts_only_the_identical_current_generation() -> None:
+    runner = FakeGcloudRunner()
+    runner.cp_barrier = threading.Barrier(2)
+    store = runner.store()
+    uri = result_uri("race")
+
+    def write() -> tp.Any:
+        return store.put_versioned(uri, b"same", org_id="acme", project_id="research")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writes = tuple(executor.map(lambda _index: write(), range(2)))
+
+    assert {write.created for write in writes} == {True, None}
+    assert writes[0].metadata == writes[1].metadata
+    cp_calls = [command for command in runner.calls if command[2] == "cp"]
+    assert len(cp_calls) == 2
+    assert all("--if-generation-match=0" in command and "--no-clobber" not in command for command in cp_calls)
+
+
+def test_gcs_exact_read_detects_a_replacement_during_the_byte_read() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("read-race")
+    written = store.put_versioned(uri, b"original", org_id="acme", project_id="research")
+    object_uri = next(iter(runner.objects))
+    runner.cat_observed = threading.Event()
+    runner.cat_release = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reading = executor.submit(
+            store.get_versioned,
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+        assert runner.cat_observed.wait(timeout=5)
+        new_generation = runner.replace(object_uri, b"replacement")
+        runner.cat_release.set()
+        with pytest.raises(ManagedArtifactVersionMismatchError):
+            reading.result(timeout=5)
+
+    runner.cat_observed = None
+    runner.cat_release = None
+    current = store.get_versioned(uri, org_id="acme", project_id="research")
+    assert current.payload == b"replacement"
+    assert current.metadata.object_version == f"gcs:{new_generation}"
+    assert current.metadata.sha256 == hashlib.sha256(b"replacement").hexdigest()
+
+
+def test_gcs_conditional_delete_classifies_deleted_absent_and_version_mismatch() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("delete")
+    original = store.put_versioned(uri, b"first", org_id="acme", project_id="research")
+
+    deleted = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    absent = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    assert deleted.status is ManagedArtifactDeleteStatus.DELETED
+    assert absent.status is ManagedArtifactDeleteStatus.ABSENT
+
+    replacement = store.put_versioned(uri, b"second", org_id="acme", project_id="research")
+    mismatch = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=original.metadata.object_version,
+    )
+    assert mismatch.status is ManagedArtifactDeleteStatus.VERSION_MISMATCH
+    assert mismatch.current_metadata == replacement.metadata
+    assert store.get(uri, org_id="acme", project_id="research") == b"second"
+    assert store.delete(uri, org_id="acme", project_id="research") is True
+    rm_calls = [command for command in runner.calls if command[2] == "rm"]
+    assert rm_calls
+    assert all(any(argument.startswith("--if-generation-match=") for argument in command) for command in rm_calls)
+
+
+def test_gcs_rm_timeout_after_delete_is_resolved_as_absent() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("rm-timeout-after-delete")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_timeout_after_delete = True
+
+    outcome = store.delete_versioned(
+        uri,
+        org_id="acme",
+        project_id="research",
+        object_version=written.metadata.object_version,
+    )
+
+    assert outcome.status is ManagedArtifactDeleteStatus.ABSENT
+    assert runner.timeouts and set(runner.timeouts) == {30.0}
+
+
+@pytest.mark.parametrize("failure", ("permission", "timeout"))
+def test_gcs_conditional_delete_does_not_translate_permission_or_timeout_to_absent(failure: str) -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri(f"delete-{failure}")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_failure = failure
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError) as inconclusive:
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert "provider-secret" not in str(inconclusive.value)
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+    rm = next(command for command in runner.calls if command[2] == "rm")
+    assert any(argument.startswith("--if-generation-match=") for argument in rm)
+
+
+def test_gcs_conditional_delete_normalizes_an_inconclusive_post_rm_stat() -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("delete-stat-permission")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.rm_failure = "permission"
+    runner.inventory_failures.append((403, b'{"error":"provider-secret"}'))
+
+    with pytest.raises(ManagedArtifactDeleteInconclusiveError) as inconclusive:
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=written.metadata.object_version,
+        )
+
+    assert str(inconclusive.value) == "GCS managed artifact deletion was inconclusive"
+    assert "provider-secret" not in str(inconclusive.value)
+    rm = next(command for command in runner.calls if command[2] == "rm")
+    assert any(argument.startswith("--if-generation-match=") for argument in rm)
+
+
+@pytest.mark.parametrize(
+    "object_version",
+    (
+        "local:1:2:3",
+        "gcs:0",
+        "gcs:01",
+        "gcs:18446744073709551616",
+    ),
+)
+def test_gcs_versioned_operations_reject_wrong_or_out_of_range_versions(object_version: str) -> None:
+    runner = FakeGcloudRunner()
+    store = runner.store()
+    uri = result_uri("bad-version")
+
+    with pytest.raises(ValueError):
+        store.get_versioned(uri, org_id="acme", project_id="research", object_version=object_version)
+    with pytest.raises(ValueError):
+        store.delete_versioned(
+            uri,
+            org_id="acme",
+            project_id="research",
+            object_version=object_version,
+        )
+
+    assert runner.calls == []
+    assert runner.inventory_calls == []
 
 
 def test_transfer_token_is_url_safe_time_bounded_and_fully_scoped() -> None:
@@ -501,6 +2067,10 @@ def test_local_inventory_is_bounded_scoped_and_detects_replacement_identity(tmp_
 
     assert [item.uri for item in first.objects] == list(uris[:2])
     assert [item.size_bytes for item in first.objects] == [1, 2]
+    assert [item.sha256 for item in first.objects] == [
+        hashlib.sha256(b"x").hexdigest(),
+        hashlib.sha256(b"xx").hexdigest(),
+    ]
     assert first.next_cursor == uris[1]
     assert [item.uri for item in second.objects] == [uris[2]]
     assert second.next_cursor is None

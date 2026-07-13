@@ -123,6 +123,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "POST /api/v1/federation/quota-grants": "cut a peer a slice of a tenant's quota",
     "DELETE /api/v1/federation/quota-grants/{grant_id}": "withdraw a peer's authority to place work",
     "GET /api/v1/system/invariants": "fleet-wide durability check",
+    "POST /api/v1/system/invariants/soak": "fleet-wide proof-scoped durability check",
     "POST /api/v1/system/reconcile": "force a scheduling pass",
     "GET /api/v1/organizations": "tenant list, narrowed to the caller's own grants",
     "PUT /api/v1/organizations/{org_id}": "register a tenant",

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,7 +119,9 @@ class EyvanSettings:
     kubernetes_worker_image: str = ""
     retention_interval_s: float = 3600.0
     artifact_collection_interval_s: float = 3600.0
-    """How often unreferenced managed artifacts are collected. 0 disables it.
+    artifact_destructive_collection_enabled: bool = False
+    artifact_recovery_grace_s: float = 900.0
+    """How often artifact lifecycle recovery and dry-run collection execute.
 
     Collection was implemented, tested, and called by nothing, so managed
     artifact storage grew without bound in production while the index, quota
@@ -198,6 +201,13 @@ class EyvanSettings:
                 raise ValueError(f"{name} must not be negative; use 0 to disable pruning")
         if self.retention_batch_limit <= 0:
             raise ValueError("retention_batch_limit must be positive")
+        if not math.isfinite(self.artifact_collection_interval_s) or self.artifact_collection_interval_s <= 0:
+            raise ValueError("artifact_collection_interval_s must be finite and positive")
+        if not math.isfinite(self.artifact_recovery_grace_s) or self.artifact_recovery_grace_s < 0:
+            raise ValueError("artifact_recovery_grace_s must be finite and non-negative")
+        for name in ("artifact_retention_s", "log_retention_s"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must not be negative; use 0 to disable collection")
         validate_minimum_client_version(self.min_client_version)
 
     @classmethod
@@ -283,6 +293,13 @@ class EyvanSettings:
             retention_interval_s=float(os.getenv("EYVAN_RETENTION_INTERVAL_S", defaults.retention_interval_s)),
             artifact_collection_interval_s=float(
                 os.getenv("EYVAN_ARTIFACT_COLLECTION_INTERVAL_S", defaults.artifact_collection_interval_s)
+            ),
+            artifact_destructive_collection_enabled=truthy(
+                "EYVAN_ARTIFACT_DESTRUCTIVE_COLLECTION_ENABLED",
+                defaults.artifact_destructive_collection_enabled,
+            ),
+            artifact_recovery_grace_s=float(
+                os.getenv("EYVAN_ARTIFACT_RECOVERY_GRACE_S", defaults.artifact_recovery_grace_s)
             ),
             artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
             log_retention_s=int(os.getenv("EYVAN_LOG_RETENTION_S", defaults.log_retention_s)),

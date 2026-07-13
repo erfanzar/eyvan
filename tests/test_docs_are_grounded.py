@@ -184,9 +184,7 @@ def test_the_docs_directory_exists_and_is_not_empty() -> None:
 def test_design_records_are_reachable_from_an_operator_landing_page() -> None:
     """A nested record with no inbound link exists only for repository archaeologists."""
 
-    landing_pages = "\n".join(
-        (DOCS / name).read_text(encoding="utf-8") for name in ("operate.md", "security.md")
-    )
+    landing_pages = "\n".join((DOCS / name).read_text(encoding="utf-8") for name in ("operate.md", "security.md"))
     design_records = sorted((DOCS / "design").glob("*.md"))
 
     assert design_records, "docs/design/ is empty"

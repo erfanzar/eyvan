@@ -28,6 +28,8 @@ written against it.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -38,6 +40,7 @@ from eyvan.records import (
     CallableExecution,
     CommandExecution,
     ManagedArtifactRecord,
+    ManagedArtifactState,
     Principal,
     QuotaRecord,
     ResourceGang,
@@ -47,6 +50,7 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadState,
     artifact_reference_id,
+    utcnow,
 )
 from eyvan.server.api.app import create_app
 from eyvan.server.persistence import InMemoryRepository
@@ -79,6 +83,25 @@ async def _service() -> ControlPlaneService:
         repository=repository,
         callable_trust=CallableProjectTrustPolicy.from_projects(("acme/research",)),
     )
+
+
+async def _activate_indexed(service: ControlPlaneService, uri: str) -> None:
+    async with service.repository.transaction() as tx:
+        record = await tx.get_managed_artifact("acme", "research", uri)
+        assert record is not None
+        now = utcnow()
+        active = ManagedArtifactRecord.model_validate(
+            {
+                **record.model_dump(mode="python"),
+                "state": ManagedArtifactState.ACTIVE,
+                "sha256": record.sha256 or hashlib.sha256(uri.encode()).hexdigest(),
+                "object_version": f"test:{uri}",
+                "activated_at": now,
+                "updated_at": now,
+                "quarantine_reason": None,
+            }
+        )
+        await tx.put_managed_artifact(active)
 
 
 #: Clients ask for a managed result by naming any eyvan://results URI; the server
@@ -199,7 +222,8 @@ async def test_overwriting_an_indexed_uri_is_measured_against_its_own_current_si
 
     record = await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=9_500)
 
-    assert record.size_bytes == 9_500
+    assert record.size_bytes == 9_000
+    assert record.state is ManagedArtifactState.QUARANTINED
 
 
 @pytest.mark.asyncio
@@ -268,6 +292,7 @@ async def test_submitting_a_callable_workload_claims_every_artifact_it_names() -
     service = await _service()
     for uri in (callable_uri(_DIGEST), workspace_uri(_OTHER_DIGEST)):
         await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=1)
+        await _activate_indexed(service, uri)
 
     workload, _ = await service.submit_workload(
         _principal(),
@@ -366,7 +391,9 @@ async def test_a_replayed_submission_does_not_inflate_the_reference_set() -> Non
 @pytest.mark.asyncio
 async def test_two_workloads_sharing_one_callable_are_both_recorded() -> None:
     service = await _service()
-    await service.index_managed_artifact(org_id="acme", project_id="research", uri=callable_uri(_DIGEST), size_bytes=1)
+    uri = callable_uri(_DIGEST)
+    await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=1)
+    await _activate_indexed(service, uri)
     submitted = [
         (
             await service.submit_workload(
@@ -392,7 +419,9 @@ async def test_a_terminal_workload_releases_its_claims_without_erasing_them() ->
     """The released row is what proves the artifact was once in use."""
 
     service = await _service()
-    await service.index_managed_artifact(org_id="acme", project_id="research", uri=callable_uri(_DIGEST), size_bytes=1)
+    uri = callable_uri(_DIGEST)
+    await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=1)
+    await _activate_indexed(service, uri)
     workload, _ = await service.submit_workload(
         _principal(),
         org_id="acme",
@@ -418,7 +447,9 @@ async def test_a_terminal_workload_releases_its_claims_without_erasing_them() ->
 @pytest.mark.asyncio
 async def test_one_workload_terminating_does_not_release_a_siblings_claim() -> None:
     service = await _service()
-    await service.index_managed_artifact(org_id="acme", project_id="research", uri=callable_uri(_DIGEST), size_bytes=1)
+    uri = callable_uri(_DIGEST)
+    await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=1)
+    await _activate_indexed(service, uri)
     first, _ = await service.submit_workload(
         _principal(),
         org_id="acme",
@@ -456,10 +487,10 @@ async def test_references_for_an_unindexed_artifact_are_a_not_found_not_an_empty
 @pytest.mark.asyncio
 async def test_reading_an_artifact_stamps_its_last_access() -> None:
     service = await _service()
-    record = await service.index_managed_artifact(
-        org_id="acme", project_id="research", uri=callable_uri(_DIGEST), size_bytes=1
-    )
+    uri = callable_uri(_DIGEST)
+    record = await service.index_managed_artifact(org_id="acme", project_id="research", uri=uri, size_bytes=1)
     assert record.last_accessed_at is None
+    await _activate_indexed(service, uri)
 
     await service.record_artifact_access(
         org_id="acme",

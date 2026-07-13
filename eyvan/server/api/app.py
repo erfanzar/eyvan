@@ -15,7 +15,6 @@ import ipaddress
 import logging
 import os
 import secrets
-import subprocess
 import typing as tp
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -40,9 +39,9 @@ from eyvan.artifacts.managed import (
     ArtifactAction,
     ArtifactTokenSigner,
     InvalidArtifactToken,
-    ManagedArtifactConflictError,
     ManagedArtifactInventoryError,
     ManagedArtifactInventoryStore,
+    ManagedArtifactVersionedStore,
     callable_uri,
     managed_artifact_store_from_uri,
     result_uri,
@@ -135,7 +134,7 @@ from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
-from eyvan.server.invariants import Invariant, check_fleet, snapshot_fleet
+from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
@@ -159,11 +158,23 @@ from eyvan.server.service.errors import (
     InputError,
     NoMatchingCapacityPoolError,
     NotFoundError,
+    UnavailableError,
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
+from eyvan.soak_contract import (
+    MAX_BUDGET_SCOPES,
+    MAX_COVERAGE_ENTRIES,
+    MAX_PARTICIPANTS,
+    MAX_SAFE_COUNTER,
+    MAX_SERVER_VIOLATIONS,
+    ParticipantBinding,
+    is_opaque_id,
+    participant_manifest_sha256,
+    safe_scope_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -319,11 +330,13 @@ def create_app(
 
     if service.inventory_store is not None and service.inventory_store is not artifact_access.store:
         raise ValueError("the service inventory and transfer API must use the same managed artifact store")
-    # Inventory and transfer observe one physical namespace. Do not wire the
-    # deletion-capable artifact_store here: collection needs the later serialized
-    # deletion/upload state machine, and API inventory must not enable it early.
-    # Older injected transfer stores remain usable, but the inventory endpoint
-    # fails closed until they implement the bounded, scope-explicit protocol.
+    # Transfer, inventory, lifecycle reads and conditional deletion must name
+    # exactly one physical namespace. A store lacking versions can remain an
+    # explicitly injected legacy SDK object, but it cannot back managed API I/O.
+    if service.artifact_store is not None and service.artifact_store is not artifact_access.store:
+        raise ValueError("the service lifecycle and transfer API must use the same managed artifact store")
+    if service.artifact_store is None and isinstance(artifact_access.store, ManagedArtifactVersionedStore):
+        service.artifact_store = artifact_access.store
     if service.inventory_store is None and isinstance(artifact_access.store, ManagedArtifactInventoryStore):
         service.inventory_store = artifact_access.store
 
@@ -441,6 +454,8 @@ def create_app(
             status_code = status.HTTP_404_NOT_FOUND
         elif isinstance(exc, ConflictError):
             status_code = status.HTTP_409_CONFLICT
+        elif isinstance(exc, UnavailableError):
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         else:
             status_code = status.HTTP_400_BAD_REQUEST
         if isinstance(exc, (AuthorizationError, NotFoundError)):
@@ -679,10 +694,7 @@ def create_app(
         return bytes(payload)
 
     async def managed_get(uri: str, *, org_id: str, project_id: str) -> bytes:
-        try:
-            return await asyncio.to_thread(artifact_access.store.get, uri, org_id=org_id, project_id=project_id)
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            raise NotFoundError(f"managed artifact {uri!r} was not found") from exc
+        return await service.read_managed_artifact(org_id=org_id, project_id=project_id, uri=uri)
 
     async def managed_put(
         uri: str,
@@ -691,33 +703,18 @@ def create_app(
         org_id: str,
         project_id: str,
         sha256: str | None = None,
-    ) -> None:
-        """Index one object's bytes, then store it.
+        actor: str,
+    ) -> ManagedArtifactRecord:
+        """Reserve, conditionally write, and activate one scoped object."""
 
-        Index first: the quota check lives in ``index_managed_artifact`` and has
-        to be able to refuse the write. Ordering it after the store would leave a
-        rejected upload sitting in the object store with no index row -- bytes
-        that are charged to nobody and that no collector would ever find.
-
-        The reverse failure is the safe one. If the store write fails after the
-        index row lands, the row over-reports usage for one URI until the next
-        successful write to it, which costs the project quota headroom rather
-        than losing an object.
-        """
-
-        await service.index_managed_artifact(
+        return await service.upload_managed_artifact(
             org_id=org_id,
             project_id=project_id,
             uri=uri,
-            size_bytes=len(payload),
+            payload=payload,
             sha256=sha256,
+            actor=actor,
         )
-        try:
-            await asyncio.to_thread(artifact_access.store.put, uri, payload, org_id=org_id, project_id=project_id)
-        except ManagedArtifactConflictError as exc:
-            raise ConflictError(str(exc)) from exc
-        except (TypeError, ValueError) as exc:
-            raise InputError(str(exc)) from exc
 
     def verify_artifact_token(
         token: str,
@@ -775,14 +772,6 @@ def create_app(
                 action="artifact.read_denied",
             )
             raise
-        await service.record_artifact_access(
-            org_id=org_id,
-            project_id=project_id,
-            workload_id=workload_id,
-            kind=kind,
-            object_id=uri,
-            action="artifact.read",
-        )
 
     async def current_result_uri(workload_id: str) -> str:
         """Return the managed result URI this workload's current attempt owns.
@@ -1085,7 +1074,14 @@ def create_app(
         except ValueError as exc:
             raise InputError(str(exc)) from exc
         payload = await artifact_body(raw_request, limit=settings.artifact_max_callable_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id, sha256=digest)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            sha256=digest,
+            actor=principal.subject,
+        )
         return {"uri": uri, "sha256": digest}
 
     @app.put("/api/v1/artifacts/workspaces/{digest}", tags=["artifacts"])
@@ -1108,7 +1104,14 @@ def create_app(
         except ValueError as exc:
             raise InputError(str(exc)) from exc
         payload = await artifact_body(raw_request, limit=settings.artifact_max_workspace_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id, sha256=digest)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            sha256=digest,
+            actor=principal.subject,
+        )
         return {"uri": uri, "sha256": digest}
 
     @app.get(
@@ -1135,11 +1138,16 @@ def create_app(
             workload_id=workload_id,
             kind="workspaces",
         )
-        return Response(
-            await managed_get(uri, org_id=org_id, project_id=project_id),
-            media_type="application/gzip",
-            headers={"Cache-Control": "private, no-store"},
+        payload = await managed_get(uri, org_id=org_id, project_id=project_id)
+        await service.record_artifact_access(
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            kind="workspaces",
+            object_id=uri,
+            action="artifact.read",
         )
+        return Response(payload, media_type="application/gzip", headers={"Cache-Control": "private, no-store"})
 
     @app.get("/api/v1/artifacts/results/{result_id}", response_class=Response, tags=["artifacts"])
     async def download_result_artifact(
@@ -1183,11 +1191,16 @@ def create_app(
             workload_id=workload_id,
             kind="callables",
         )
-        return Response(
-            await managed_get(uri, org_id=org_id, project_id=project_id),
-            media_type="application/octet-stream",
-            headers={"Cache-Control": "private, no-store"},
+        payload = await managed_get(uri, org_id=org_id, project_id=project_id)
+        await service.record_artifact_access(
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            kind="callables",
+            object_id=uri,
+            action="artifact.read",
         )
+        return Response(payload, media_type="application/octet-stream", headers={"Cache-Control": "private, no-store"})
 
     @app.put("/api/v1/artifacts/results/{result_id}/content", include_in_schema=False)
     async def transfer_result_artifact(
@@ -1235,7 +1248,13 @@ def create_app(
             workload_id=workload_id,
         )
         payload = await artifact_body(raw_request, limit=settings.artifact_max_result_bytes)
-        await managed_put(uri, payload, org_id=org_id, project_id=project_id)
+        await managed_put(
+            uri,
+            payload,
+            org_id=org_id,
+            project_id=project_id,
+            actor=f"workload:{workload_id}",
+        )
         return {"uri": uri}
 
     @app.get("/api/v1/secrets/content", response_class=Response, include_in_schema=False)
@@ -1395,23 +1414,164 @@ def create_app(
 
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
         violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        # Deduplicate before bounding so a repeated subject cannot evict distinct
+        # evidence. Sorting also makes the cap deterministic across repository
+        # implementations with different row orders.
+        unique_violations: dict[tuple[str, str], Violation] = {}
+        for violation in violations:
+            key = (violation.invariant.value, violation.subject)
+            prior = unique_violations.get(key)
+            if prior is None or violation.detail < prior.detail:
+                unique_violations[key] = violation
+        ordered_violations = [unique_violations[key] for key in sorted(unique_violations)]
+        violations_truncated = len(ordered_violations) > MAX_SERVER_VIOLATIONS
+        ordered_violations = ordered_violations[:MAX_SERVER_VIOLATIONS]
+
         # The snapshot travels with the verdict so a long-running observer makes
         # one call per tick rather than two that describe different moments --
         # and a budget compared against an artifact count from a second later is
         # a comparison of two fleets.
         snapshot = await snapshot_fleet(repository)
+        budget_items = sorted(snapshot.budget_spend.items())
+        budget_spend_truncated = len(budget_items) > MAX_BUDGET_SCOPES
+        budget_items = budget_items[:MAX_BUDGET_SCOPES]
+        execution_items = sorted(snapshot.execution_lease_counts.items())
+        coverage_truncated = len(execution_items) > MAX_COVERAGE_ENTRIES
+        execution_items = execution_items[:MAX_COVERAGE_ENTRIES]
+        if any(count > MAX_SAFE_COUNTER for _, count in execution_items):
+            coverage_truncated = True
+
         return {
             "checked": [invariant.value for invariant in Invariant],
             "violations": [
                 {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
-                for violation in violations
+                for violation in ordered_violations
             ],
+            "violations_truncated": violations_truncated,
             "snapshot": {
                 "observed_at": snapshot.observed_at.isoformat(),
-                "budget_spend": {f"{org}/{project}": value for (org, project), value in snapshot.budget_spend.items()},
+                "budget_spend": [
+                    {
+                        "scope_id": safe_scope_id(org, project),
+                        "spent": observation.spent,
+                        "revision": observation.revision,
+                        "period_id": observation.period_id,
+                        "period_started_at": (
+                            observation.period_started_at.isoformat()
+                            if observation.period_started_at is not None
+                            else None
+                        ),
+                    }
+                    for (org, project), observation in budget_items
+                ],
+                "budget_spend_truncated": budget_spend_truncated,
                 "artifact_bytes": snapshot.artifact_bytes,
                 "workload_count": snapshot.workload_count,
                 "cell_count": snapshot.cell_count,
+                "coverage": {
+                    "executions": [
+                        {**identity.as_dict(), "execution_count": min(count, MAX_SAFE_COUNTER)}
+                        for identity, count in execution_items
+                    ],
+                    "truncated": coverage_truncated,
+                },
+                # The generic control-plane endpoint does not own process/DB or
+                # provider-inventory measurement. A P8 evaluator must therefore
+                # report the corresponding explicit missing-evidence codes.
+                "p8_evidence": None,
+            },
+        }
+
+    @app.post("/api/v1/system/invariants/soak", tags=["system"])
+    async def proof_scoped_fleet_invariants(
+        payload: dict[str, tp.Any],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, tp.Any]:
+        """Return invariant state plus coverage for one exact frozen proof manifest."""
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        if set(payload) != {"proof_id", "config_sha256", "participants"}:
+            raise InputError("the soak manifest has unexpected or missing fields")
+        proof_id = payload["proof_id"]
+        config_sha256 = payload["config_sha256"]
+        raw_participants = payload["participants"]
+        if not is_opaque_id(proof_id) or not is_opaque_id(config_sha256):
+            raise InputError("the soak proof and configuration identifiers must be canonical sha256 values")
+        if not isinstance(raw_participants, list) or not 0 < len(raw_participants) <= MAX_PARTICIPANTS:
+            raise InputError("the soak manifest must contain a bounded non-empty participant list")
+        try:
+            participants = tuple(ParticipantBinding.from_dict(item) for item in raw_participants)
+        except ValueError as error:
+            raise InputError("the soak manifest contains an invalid participant binding") from error
+        if len(participants) != len(set(participants)):
+            raise InputError("the soak manifest contains a duplicate participant binding")
+        manifest_sha256 = participant_manifest_sha256(proof_id, participants)
+
+        violations = await check_fleet(repository, audit_retention_s=settings.audit_retention_s)
+        unique_violations: dict[tuple[str, str], Violation] = {}
+        for violation in violations:
+            key = (violation.invariant.value, violation.subject)
+            prior = unique_violations.get(key)
+            if prior is None or violation.detail < prior.detail:
+                unique_violations[key] = violation
+        ordered_violations = [unique_violations[key] for key in sorted(unique_violations)]
+        violations_truncated = len(ordered_violations) > MAX_SERVER_VIOLATIONS
+        ordered_violations = ordered_violations[:MAX_SERVER_VIOLATIONS]
+
+        snapshot = await snapshot_fleet(
+            repository,
+            proof_id=proof_id,
+            config_sha256=config_sha256,
+            participants=participants,
+        )
+        budget_items = sorted(snapshot.budget_spend.items())
+        budget_spend_truncated = len(budget_items) > MAX_BUDGET_SCOPES
+        budget_items = budget_items[:MAX_BUDGET_SCOPES]
+        execution_items = sorted(snapshot.participant_execution_counts.items())
+        coverage_truncated = len(execution_items) > MAX_COVERAGE_ENTRIES
+        execution_items = execution_items[:MAX_COVERAGE_ENTRIES]
+        if any(count > MAX_SAFE_COUNTER for _, count in execution_items):
+            coverage_truncated = True
+        if snapshot.participant_manifest_sha256 != manifest_sha256:
+            raise RuntimeError("proof-scoped snapshot returned a mismatched participant manifest")
+
+        return {
+            "checked": [invariant.value for invariant in Invariant],
+            "violations": [
+                {"invariant": violation.invariant.value, "subject": violation.subject, "detail": violation.detail}
+                for violation in ordered_violations
+            ],
+            "violations_truncated": violations_truncated,
+            "snapshot": {
+                "observed_at": snapshot.observed_at.isoformat(),
+                "budget_spend": [
+                    {
+                        "scope_id": safe_scope_id(org, project),
+                        "spent": observation.spent,
+                        "revision": observation.revision,
+                        "period_id": observation.period_id,
+                        "period_started_at": (
+                            observation.period_started_at.isoformat()
+                            if observation.period_started_at is not None
+                            else None
+                        ),
+                    }
+                    for (org, project), observation in budget_items
+                ],
+                "budget_spend_truncated": budget_spend_truncated,
+                "artifact_bytes": snapshot.artifact_bytes,
+                "workload_count": snapshot.workload_count,
+                "cell_count": snapshot.cell_count,
+                "coverage": {
+                    "proof_id": proof_id,
+                    "manifest_sha256": manifest_sha256,
+                    "executions": [
+                        {**identity.as_dict(), "execution_count": min(count, MAX_SAFE_COUNTER)}
+                        for identity, count in execution_items
+                    ],
+                    "truncated": coverage_truncated,
+                },
+                "p8_evidence": None,
             },
         }
 

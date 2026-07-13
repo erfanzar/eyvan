@@ -23,10 +23,7 @@ _SCRIPTS = _MONOREPO / "scripts"
 _VALUES = {
     "GCP_PROJECT_ID": "example-eyvan-project",
     "GCS_BUCKET": "example-eyvan-artifacts",
-    "OCI_IMAGE": (
-        "us-east5-docker.pkg.dev/example-eyvan-project/eyvan/easydel-oci-smoke@sha256:"
-        + "0" * 64
-    ),
+    "OCI_IMAGE": ("us-east5-docker.pkg.dev/example-eyvan-project/eyvan/easydel-oci-smoke@sha256:" + "0" * 64),
 }
 
 

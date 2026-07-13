@@ -788,19 +788,22 @@ class KubernetesCapacityDriver:
             }
         else:  # pragma: no cover - closed internal call surface
             raise ValueError(f"unsupported Kubernetes release kind {kind!r}")
-        return {
-            "apiVersion": api_version,
-            "kind": kind,
-            "metadata": {
-                "name": name,
-                "namespace": namespace,
-                "labels": labels,
-                "annotations": {
-                    CELL_ID_ANNOTATION: cell_id,
-                    FENCE_ANNOTATION: fencing_fingerprint,
+        return tp.cast(
+            JsonObject,
+            {
+                "apiVersion": api_version,
+                "kind": kind,
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "labels": labels,
+                    "annotations": {
+                        CELL_ID_ANNOTATION: cell_id,
+                        FENCE_ANNOTATION: fencing_fingerprint,
+                    },
                 },
             },
-        }
+        )
 
     def _read_release_resource(
         self,
