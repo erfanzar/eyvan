@@ -825,7 +825,7 @@ class SoakState:
         declared_budget_truncated = snapshot["budget_spend_truncated"]
         if not isinstance(declared_budget_truncated, bool):
             raise ValueError("budget_spend_truncated must be boolean")
-        normalized = {
+        normalized: dict[str, object] = {
             "artifact_bytes": snapshot["artifact_bytes"],
             "budget_spend": budget_spend,
             "workload_count": snapshot["workload_count"],

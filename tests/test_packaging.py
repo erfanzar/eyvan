@@ -309,12 +309,7 @@ def test_migrate_can_render_offline_sql_without_inspecting_or_applying(monkeypat
         "inspect_database_state",
         lambda _config: pytest.fail("offline SQL must not inspect a database"),
     )
-    assert (
-        migrate.main(
-            ["--database-url", "postgresql+asyncpg://example/db", "--sql", "0011_quota_grants"]
-        )
-        == 0
-    )
+    assert migrate.main(["--database-url", "postgresql+asyncpg://example/db", "--sql", "0011_quota_grants"]) == 0
     assert calls == [("0011_quota_grants", True, "postgresql+asyncpg://example/db")]
 
 
