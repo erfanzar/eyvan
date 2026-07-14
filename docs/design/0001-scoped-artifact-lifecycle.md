@@ -1,9 +1,13 @@
 # DR-0001: Scoped managed-artifact identity and fenced lifecycle
 
-**Status:** Accepted design boundary; implementation and migration are pending.
+**Status:** Implemented at the host/PostgreSQL software boundary. Migration of an
+existing deployment, live object-store reconciliation, and destructive
+collection remain externally unqualified and require their separate gates.
 
 **Scope:** Managed callables, workspaces, results, and archived logs. This record
-precedes M1.5/M1.6 and does not authorize collection on an existing deployment.
+preceded M1.5/M1.6 and still does not authorize collection on an existing
+deployment. The context below records the pre-implementation state that led to
+the decision.
 
 ## Context
 

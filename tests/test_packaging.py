@@ -20,6 +20,7 @@ import eyvan.server.persistence.migrate as migrate
 
 EYVAN_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS_PATH = EYVAN_ROOT / "requirements-docker.txt"
+BUILD_REQUIREMENTS_PATH = EYVAN_ROOT / "requirements-build.txt"
 
 
 def _normalize(name: str) -> str:
@@ -70,6 +71,17 @@ def test_requirements_docker_exists_and_every_line_is_pinned() -> None:
         assert "--hash=sha256:" in line, f"requirement is missing hashes: {token!r}"
 
 
+def test_build_backend_is_exactly_pinned_and_hashed() -> None:
+    project = _pyproject()
+    assert project["build-system"]["requires"] == ["uv_build==0.7.19"]
+    assert project["dependency-groups"]["eyvan-build"] == ["uv-build==0.7.19"]
+    assert BUILD_REQUIREMENTS_PATH.is_file()
+    requirements = [line for line in _requirement_lines(BUILD_REQUIREMENTS_PATH) if not line.startswith("#")]
+    assert len(requirements) == 1
+    assert requirements[0].split()[0] == "uv-build==0.7.19"
+    assert "--hash=sha256:" in requirements[0]
+
+
 def test_requirements_cover_every_mandatory_pyproject_dependency() -> None:
     dependencies = _pyproject()["project"]["dependencies"]
     mandatory = {_normalize(re.match(r"[A-Za-z0-9_.-]+", dependency).group(0)) for dependency in dependencies}
@@ -77,6 +89,28 @@ def test_requirements_cover_every_mandatory_pyproject_dependency() -> None:
     pinned = _pinned_requirements(REQUIREMENTS_PATH)
     missing = mandatory - pinned.keys()
     assert not missing, f"mandatory dependencies missing from requirements-docker.txt: {sorted(missing)}"
+
+
+def test_published_dependency_contract_excludes_known_vulnerable_floors() -> None:
+    project = _pyproject()
+    dependencies = set(project["project"]["dependencies"])
+    assert {
+        "click>=8.4.2",
+        "cryptography>=50.0.0",
+        "fastapi>=0.141.1",
+        "idna>=3.18",
+        "pygments>=2.20.0",
+        "starlette>=1.5.0",
+    } <= dependencies
+    extras = project["project"]["optional-dependencies"]
+    assert {"pyasn1>=0.6.4", "requests>=2.34.2"} <= set(extras["oci"])
+    assert {
+        "aiohttp>=3.14.3",
+        "msgpack>=1.2.1",
+        "pyasn1>=0.6.4",
+        "ray[default]>=2.56.1",
+        "requests>=2.34.2",
+    } <= set(extras["ray"])
 
 
 def test_pyproject_registers_migrate_entrypoint() -> None:
@@ -471,7 +505,10 @@ def test_dockerfiles_install_from_pinned_requirements() -> None:
     for name in ("Dockerfile", "Dockerfile.agent", "Dockerfile.worker"):
         content = (EYVAN_ROOT / name).read_text()
         assert "uv sync" not in content, f"{name} still re-resolves dependencies at image-build time"
-        assert "requirements-docker.txt" in content, f"{name} does not install the pinned requirements"
+        assert "requirements-docker.txt" in content, f"{name} does not install the pinned runtime requirements"
+        assert "requirements-build.txt" in content, f"{name} does not install the pinned build backend"
+        assert "--no-build-isolation" in content, f"{name} still resolves an isolated build backend"
+        assert "uv pip uninstall uv-build" in content, f"{name} leaves the build backend in the runtime image"
 
 
 def test_control_plane_agent_and_worker_images_have_distinct_entrypoints_and_oci_labels() -> None:
@@ -510,11 +547,13 @@ def test_package_smoke_builds_and_installs_both_artifact_types_outside_the_sourc
     script = script_path.read_text()
 
     assert script_path.stat().st_mode & 0o111
-    assert "build --wheel --sdist" in script
+    assert "build --no-build-isolation --wheel --sdist" in script
     assert "dist/*.whl" in script
     assert "dist/*.tar.gz" in script
     assert 'cd "${tmp}/outside-source"' in script
     assert '"${UV_BIN}" pip install' in script
+    assert '"${ROOT}/requirements-build.txt"' in script
+    assert "--no-build-isolation" in script
     assert '"${venv}/bin/${entrypoint}" --help' in script
     assert "python -I" not in script  # invocation is the isolated venv path, not ambient Python
     assert "uv run" not in script

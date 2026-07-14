@@ -45,12 +45,14 @@ ENV VIRTUAL_ENV=/app/.venv \
     PYTHONUNBUFFERED=1 \
     EYVAN_DASHBOARD_DIR=/app/dashboard/dist
 WORKDIR /app
-COPY requirements-docker.txt ./requirements-docker.txt
+COPY requirements-docker.txt requirements-build.txt ./
 RUN uv venv "$VIRTUAL_ENV" && \
-    uv pip install --require-hashes -r requirements-docker.txt
+    uv pip install --require-hashes -r requirements-docker.txt && \
+    uv pip install --require-hashes -r requirements-build.txt
 COPY pyproject.toml README.md LICENSE ./
 COPY eyvan ./eyvan
-RUN uv pip install --no-deps .
+RUN uv pip install --no-build-isolation --no-deps . && \
+    uv pip uninstall uv-build
 COPY --from=dashboard /dashboard/dist /app/dashboard/dist
 EXPOSE 8080
 ENTRYPOINT ["eyvan-server"]

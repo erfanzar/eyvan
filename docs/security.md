@@ -1,19 +1,26 @@
 # Security model
 
-## Pending production boundary decisions
+## Production boundary decisions
 
-These accepted design records are implementation-pending and must not be read as
-current security claims:
+These accepted design records have distinct implementation and qualification
+states and must not be read as provider claims:
 
 - [artifact scope and generation-fenced deletion](design/0001-scoped-artifact-lifecycle.md)
-  aligns the metadata key with the tenant-scoped byte store;
+  aligns the metadata key with the tenant-scoped byte store and is implemented
+  at the host/PostgreSQL boundary; live migration, object-store, and destructive
+  collection evidence is still required;
 - [log rank and cursor compatibility](design/0002-global-log-ranks-and-cursors.md)
-  treats an opaque cursor as untrusted state, not as a credential;
+  treats an opaque cursor as untrusted state, not as a credential; the narrower
+  M1.3 global-rank/cursor/archive surface is implemented, but strict
+  topology-bound rejection and the full archive manifest remain pending along
+  with multi-host hardware evidence;
 - [service health and metrics ownership](design/0003-service-health-and-metrics.md)
-  keeps requests, responses, and raw application telemetry out of Eyvan; and
+  remains implementation-pending and keeps requests, responses, and raw
+  application telemetry out of Eyvan; and
 - [federation trust and witnessed ownership](design/0004-federation-consistency.md)
-  requires external PKI and an external quorum-backed lease/CAS service rather
-  than an Eyvan-built CA or consensus protocol.
+  remains implementation-pending and requires external PKI and an external
+  quorum-backed lease/CAS service rather than an Eyvan-built CA or consensus
+  protocol.
 
 ## The authority boundary
 

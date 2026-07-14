@@ -1,12 +1,16 @@
 # Outstanding hardware proofs
 
-Everything in this package is CPU-verified: 2652 tests, real PostgreSQL, seven
-import contracts, every new behaviour mutation-checked. None of that is evidence
-about a TPU.
+Host, static, and real-PostgreSQL suites exercise this package, with exact
+counts and source identities recorded in the EasyDeL production-readiness
+journal rather than copied into prose here. None of that is evidence about a
+TPU, GPU, provider lifecycle, or the current release image.
 
 This page exists so approving a spend is a decision about a known quantity. Each
 proof states what it establishes, the exact commands, the pass criterion, the
-shape, and roughly what it costs. Nothing here has been run.
+shape, and roughly what it costs. Historical runs are retained below, but they
+were tied to their own candidates and some ended with exit 2. **No historical
+run qualifies the current candidate without an immutable exact-candidate
+receipt.**
 
 **The criteria are executable.** `eyvan proof catalog | preemption | warm-window
 | secret` evaluates the stated criterion against the live plane and exits 0 on
@@ -49,9 +53,10 @@ All proof fleets are spot unless a proof explicitly states otherwise.
 ## Why these and not a general soak of everything
 
 Each row proves something a CPU cannot: Pallas lowering, real provider
-semantics, multi-host behaviour, or the passage of wall-clock time. Anything a
-CPU *could* establish is already established, and re-proving it on an
-accelerator would be spending to learn what is known.
+semantics, multi-host behaviour, or the passage of wall-clock time. These
+hardware runs do not substitute for CPU-establishable software gates: remaining
+host gaps, including the strict cursor/topology/archive contracts tracked in the
+roadmap, must close independently before a hardware receipt can qualify them.
 
 ---
 
@@ -128,13 +133,13 @@ exercised. Both say so rather than passing. Killing a host mid-stream on a
 two-host slice is what remains, and it needs a v5p-16 carrying the new worker
 wheel.
 
-Rank width is persisted separately from allocation width. ``worker_count`` is
-the number of TPU slices in a cell; ``runtime_process_count`` is the exact
-provider-observed native-worker/JAX endpoint count and remains stable when a
-later observation loses a host. Terminal archives store an exact sparse-rank
-manifest. A per-rank line ceiling is requested with one sentinel line, and any
-trimmed or unreachable rank remains explicit on replay rather than looking
-complete.
+Rank width is represented separately from allocation width. ``worker_count`` is
+the number of TPU slices in a cell; ``runtime_process_count`` records an
+observed native-worker/JAX endpoint count. The current M1.3 archive embeds a v1
+sparse-rank index for observed, truncated, and unavailable ranks, and a per-rank
+line ceiling uses one sentinel line. It is **not** the full DR-0002 manifest:
+attempt-frozen topology plus every-rank status, object digest, and size remain
+pending, and reconciliation must not be described as proving a stable topology.
 
 Two defects were found by reading one real page, both invisible to the unit
 tests: the decoder fed an already-decoded stream name back through the *priority*

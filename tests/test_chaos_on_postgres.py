@@ -351,10 +351,10 @@ async def test_the_fleet_is_whole_after_the_matrix(plane) -> None:
 def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
     """Affected-only CI is silent on the week that matters most.
 
-    Everything else in the workspace workflow runs when its files change, which
-    means a week nobody touched ``libs/eyvan`` produces no PostgreSQL run at all
-    -- and that is exactly the week a dependency bump changes what SERIALIZABLE,
-    advisory locks or asyncpg do underneath it. A schedule is the difference
+    Most workspace matrices run only when their files change. A week nobody
+    touches ``libs/eyvan`` is exactly when a dependency advisory or registry
+    change can alter what SERIALIZABLE, advisory locks or asyncpg do underneath
+    it. A schedule is the difference
     between "these held when we last edited them" and "these hold".
 
     Skipped outside the monorepo: the workflow lives at the repository root,
@@ -362,6 +362,7 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
     """
 
     import pathlib
+    import re
 
     import pytest
     import yaml
@@ -387,3 +388,56 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
         "the PostgreSQL step does not run the fault matrix this file defines"
     )
     assert "schedule" in postgres[0]["if"], "the scheduled run cannot reach the PostgreSQL step"
+
+    job = document["jobs"]["eyvan-postgres"]
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert re.fullmatch(r"postgres:17-alpine@sha256:[0-9a-f]{64}", job["services"]["postgres"]["image"])
+    assert postgres[0]["env"]["EYVAN_REQUIRE_POSTGRES"] == "1"
+    expected_contracts = {
+        "test_artifact_lifecycle_migration_postgres.py",
+        "test_artifact_lifecycle_postgres.py",
+        "test_artifact_tenant_isolation.py",
+        "test_chaos_on_postgres.py",
+        "test_migrations.py",
+        "test_postgres_semantics.py",
+        "test_queue_trend.py",
+        "test_scoped_artifact_migration_postgres.py",
+        "test_secret_dispatch_transactions.py",
+        "test_sql_retention.py",
+    }
+    assert all(name in postgres[0]["run"] for name in expected_contracts)
+    postgres_consumers = {
+        path.name
+        for path in pathlib.Path(__file__).parent.glob("test_*.py")
+        if re.search(r"\bpostgres_(?:url|fixture)\b", path.read_text(encoding="utf-8"))
+    }
+    assert postgres_consumers <= expected_contracts
+    assert all(name in postgres[0]["run"] for name in postgres_consumers)
+    sync = next(step for step in job["steps"] if step.get("name") == "Sync workspace with the locked build backend")
+    assert "--require-hashes -r libs/eyvan/requirements-build.txt" in sync["run"]
+    assert "uv sync --locked --group eyvan-build --no-install-project --no-build-isolation" in sync["run"]
+    assert 'echo "UV_NO_SYNC=1" >> "$GITHUB_ENV"' in sync["run"]
+    smoke_sync = next(
+        step
+        for step in document["jobs"]["smoke"]["steps"]
+        if step.get("name") == "Sync workspace with the locked build backend"
+    )
+    assert smoke_sync["run"] == sync["run"]
+    assert document["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert "github.event_name" in document["concurrency"]["group"]
+    assert document["concurrency"]["cancel-in-progress"] == "${{ github.event_name != 'schedule' }}"
+    smoke_gate = next(step for step in document["jobs"]["smoke"]["steps"] if step.get("id") == "gate")
+    assert 'github.event_name }}" = "schedule"' in smoke_gate["run"]
+    assert 'matrix.lib }}" = "eyvan"' in smoke_gate["run"]
+    assert "github.event_name == 'schedule'" in document["jobs"]["eyvan-package"]["if"]
+    action_references = [
+        step["uses"] for candidate in document["jobs"].values() for step in candidate.get("steps", []) if "uses" in step
+    ]
+    assert action_references
+    assert all(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", reference) for reference in action_references)
+    all_steps = [step for candidate in document["jobs"].values() for step in candidate.get("steps", [])]
+    setup_uv = [step for step in all_steps if step.get("uses", "").startswith("astral-sh/setup-uv@")]
+    assert setup_uv and all(step.get("with", {}).get("version") == "0.9.21" for step in setup_uv)
+    shell = "\n".join(str(step.get("run", "")) for step in all_steps)
+    assert re.search(r"\buv sync(?! --locked)", shell) is None
+    assert re.search(r"\buv run(?! --locked)", shell) is None

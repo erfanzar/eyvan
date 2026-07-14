@@ -1,17 +1,24 @@
 # Operating Eyvan
 
-## Pending production design contracts
+## Production design contracts
 
-The following accepted records define migrations and later capabilities; they do
-**not** describe behavior implemented by the current release:
+The accepted records have different implementation boundaries:
 
-- [scoped artifact identity and fenced upload/deletion](design/0001-scoped-artifact-lifecycle.md);
-- [flattened log ranks, opaque cursors, and archive compatibility](design/0002-global-log-ranks-and-cursors.md);
-- [managed-service health and metrics ownership](design/0003-service-health-and-metrics.md); and
-- [federation trust, consistency, and witnessed ownership](design/0004-federation-consistency.md).
+- [scoped artifact identity and fenced upload/deletion](design/0001-scoped-artifact-lifecycle.md)
+  is implemented and PostgreSQL-tested, but existing-deployment migration,
+  object-store reconciliation, and destructive live collection remain gated;
+- [flattened log ranks, opaque cursors, and archive compatibility](design/0002-global-log-ranks-and-cursors.md)
+  is partially implemented: the narrower M1.3 global-rank/cursor/archive surface
+  is host-tested, while strict topology-bound cursor rejection and the full
+  archive manifest remain pending in addition to real multi-host qualification;
+- [managed-service health and metrics ownership](design/0003-service-health-and-metrics.md)
+  remains an accepted, implementation-pending boundary; and
+- [federation trust, consistency, and witnessed ownership](design/0004-federation-consistency.md)
+  remains implementation-pending and disabled.
 
-Keep artifact collection and federation/failover enablement behind their stated
-evidence gates while those records remain implementation-pending.
+Keep destructive artifact collection and federation/failover behind their
+stated evidence gates. Implemented software is not authorization to mutate an
+existing deployment.
 
 ## Every day
 

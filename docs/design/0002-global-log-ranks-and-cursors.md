@@ -1,9 +1,14 @@
 # DR-0002: Flattened global log ranks and opaque cursors
 
-**Status:** Accepted design boundary; implementation is pending.
+**Status:** Partially implemented. The narrower M1.3 global-rank, bounded opaque
+cursor, sparse archive, and legacy-replay surface is host-tested. Full
+attempt/topology/kind/mode cursor binding, fail-closed incompatible-cursor
+responses, and the per-rank archive-manifest contract below remain pending;
+real multi-host qualification is also open.
 
 **Scope:** Live structured logs, multi-worker cells, multi-cell gangs, resume
-cursors, terminal archives, and legacy readers.
+cursors, terminal archives, and legacy readers. The context below records the
+pre-implementation state that led to the decision.
 
 ## Context
 

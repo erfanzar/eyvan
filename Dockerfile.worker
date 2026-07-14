@@ -32,12 +32,14 @@ ENV VIRTUAL_ENV=/app/.venv \
     PYTHONUNBUFFERED=1 \
     EYVAN_NATIVE_WORKER_STATE_DIR=/var/lib/eyvan/native-worker
 WORKDIR /app
-COPY requirements-docker.txt ./requirements-docker.txt
+COPY requirements-docker.txt requirements-build.txt ./
 RUN uv venv "$VIRTUAL_ENV" && \
-    uv pip install --require-hashes -r requirements-docker.txt
+    uv pip install --require-hashes -r requirements-docker.txt && \
+    uv pip install --require-hashes -r requirements-build.txt
 COPY pyproject.toml README.md LICENSE ./src/
 COPY eyvan ./src/eyvan
-RUN uv pip install --no-deps ./src && \
+RUN uv pip install --no-build-isolation --no-deps ./src && \
+    uv pip uninstall uv-build && \
     rm -rf ./src && \
     install -d -o 65532 -g 65532 -m 0700 /var/lib/eyvan/native-worker
 USER 65532:65532

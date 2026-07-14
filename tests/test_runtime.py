@@ -355,7 +355,7 @@ class FakeJobClient:
         self.list_error: RuntimeError | None = None
 
     def get_version(self) -> str:
-        return "2.54.0"
+        return "2.56.1"
 
     def submit_job(
         self,

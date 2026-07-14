@@ -6,11 +6,22 @@ set -euo pipefail
 readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly UV_BIN="${UV_BIN:-uv}"
 command -v "${UV_BIN}" >/dev/null 2>&1 || { echo "missing required uv binary" >&2; exit 1; }
+readonly PYTHON_BIN="$("${UV_BIN}" python find --no-python-downloads --no-project --system '>=3.11,<3.14')"
+[[ -n "${PYTHON_BIN}" && "${PYTHON_BIN}" = /* && "${PYTHON_BIN}" != "${ROOT}/"* ]] || {
+  echo "smoke Python must be a compatible absolute host interpreter outside the source tree" >&2
+  exit 1
+}
+export UV_PYTHON_DOWNLOADS=never
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/eyvan-package-smoke.XXXXXX")"
 trap 'rm -rf "${tmp}"' EXIT
 mkdir -p "${tmp}/dist" "${tmp}/outside-source"
-"${UV_BIN}" build --wheel --sdist --out-dir "${tmp}/dist" "${ROOT}"
+build_venv="${tmp}/venv-build"
+"${UV_BIN}" venv --no-python-downloads --python "${PYTHON_BIN}" "${build_venv}"
+"${UV_BIN}" pip install --python "${build_venv}/bin/python" \
+  --require-hashes -r "${ROOT}/requirements-build.txt"
+VIRTUAL_ENV="${build_venv}" PATH="${build_venv}/bin:${PATH}" \
+  "${UV_BIN}" build --no-build-isolation --wheel --sdist --out-dir "${tmp}/dist" "${ROOT}"
 
 shopt -s nullglob
 wheels=("${tmp}"/dist/*.whl)
@@ -22,8 +33,11 @@ smoke_artifact() {
   local kind="$1"
   local artifact="$2"
   local venv="${tmp}/venv-${kind}"
-  "${UV_BIN}" venv "${venv}"
-  "${UV_BIN}" pip install --python "${venv}/bin/python" "${artifact}"
+  "${UV_BIN}" venv --no-python-downloads --python "${PYTHON_BIN}" "${venv}"
+  "${UV_BIN}" pip install --python "${venv}/bin/python" \
+    --require-hashes -r "${ROOT}/requirements-build.txt"
+  "${UV_BIN}" pip install --python "${venv}/bin/python" --no-build-isolation "${artifact}"
+  "${UV_BIN}" pip uninstall --python "${venv}/bin/python" uv-build
   (
     cd "${tmp}/outside-source"
     unset PYTHONPATH

@@ -1053,6 +1053,17 @@ def test_workflow_separates_read_only_pr_and_environment_gated_release_lanes() -
     assert "attestations" not in content
     release_text = json.dumps(release)
     release_commands = "\n".join(step.get("run", "") for step in release["steps"])
+    distribution_step = next(
+        step
+        for step in release["steps"]
+        if step["name"] == "Build and smoke the exact wheel and sdist before OCI qualification"
+    )
+    assert "export UV_PYTHON_DOWNLOADS=never" in distribution_step["run"]
+    assert (
+        "uv sync --locked --package eyvan --no-dev --group eyvan-build --no-install-project" in distribution_step["run"]
+    )
+    assert "uv build --no-build-isolation --package eyvan" in distribution_step["run"]
+    assert "--locked-runtime libs/eyvan/requirements-docker.txt" in distribution_step["run"]
     governance_step = next(
         step
         for step in release["steps"]

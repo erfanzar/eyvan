@@ -315,19 +315,16 @@ def test_the_proofs_page_states_a_criterion_and_a_shape_for_each_run() -> None:
         assert "**Shape**" in section, f"{title} states no shape"
 
 
-def test_the_proofs_page_does_not_claim_any_of_them_has_run() -> None:
-    """The whole value of the page is that it is honest about what is unproven.
-
-    A future edit that quietly moves a row from "not run" to "verified" without
-    a run behind it is the exact failure this repository has avoided all along.
-    """
+def test_the_proofs_page_does_not_promote_local_or_historical_runs_to_hardware_proof() -> None:
+    """Completed host checks and old receipts must remain scoped to their candidates."""
 
     # Whitespace-normalized: the prose wraps, and a substring check against
     # wrapped text asserts the line width rather than the sentence.
     proofs = " ".join((DOCS / "proofs.md").read_text(encoding="utf-8").split()).lower()
 
-    assert "nothing here has been run." in proofs
     assert "none of that is evidence about a tpu" in proofs
-    # And no row may quietly acquire a result without a run behind it.
+    assert "no historical run qualifies the current candidate" in proofs
+    assert "hardware runs do not substitute for cpu-establishable software gates" in proofs
+    # No row may quietly acquire a result without an exact-candidate receipt.
     for claimed in ("verified on hardware", "confirmed on hardware", "passed on v5p", "proven on v5p"):
         assert claimed not in proofs

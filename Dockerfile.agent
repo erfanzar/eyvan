@@ -31,12 +31,14 @@ ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 WORKDIR /app
-COPY requirements-docker.txt ./requirements-docker.txt
+COPY requirements-docker.txt requirements-build.txt ./
 RUN uv venv "$VIRTUAL_ENV" && \
-    uv pip install --require-hashes -r requirements-docker.txt
+    uv pip install --require-hashes -r requirements-docker.txt && \
+    uv pip install --require-hashes -r requirements-build.txt
 COPY pyproject.toml README.md LICENSE ./
 COPY eyvan ./eyvan
-RUN uv pip install --no-deps .
+RUN uv pip install --no-build-isolation --no-deps . && \
+    uv pip uninstall uv-build
 EXPOSE 8090
 ENTRYPOINT ["eyvan-agent"]
 CMD ["--host", "0.0.0.0", "--port", "8090"]
