@@ -59,6 +59,7 @@ from eyvan.records import (
     QuotaRecord,
     RoleGrantRecord,
     UserProgressReport,
+    WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
     utcnow,
@@ -66,7 +67,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0014_artifact_lifecycle"
+SCHEMA_REVISION = "0015_attempt_topology"
 
 
 @tp.runtime_checkable
@@ -199,6 +200,24 @@ class ProgressReportRow(Base):
     #: Unbounded per-rank history is the growth this design refuses.
     workload_id: Mapped[str] = mapped_column(String(96), primary_key=True)
     rank: Mapped[int] = mapped_column(Integer, primary_key=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class WorkloadTopologyRow(Base):
+    __tablename__ = "workload_topologies"
+    __table_args__ = (
+        CheckConstraint("attempt >= 1", name="ck_workload_topologies_attempt_positive"),
+        CheckConstraint("total_rank_count >= 1", name="ck_workload_topologies_rank_count_positive"),
+    )
+    #: Composite key on the attempt, not on the workload: a retry is a different
+    #: rank space, and overwriting the previous attempt's row would destroy the
+    #: only proof of which host was rank N while that attempt was running.
+    workload_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    attempt: Mapped[int] = mapped_column(Integer, primary_key=True)
+    #: A real column so the digest can be compared without extracting JSON, and
+    #: so a mismatch is visible to an operator reading the table directly.
+    digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    total_rank_count: Mapped[int] = mapped_column(Integer, nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -752,6 +771,30 @@ class SqlAlchemySession:
         )
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(UserProgressReport, rows, table="progress_reports")
+
+    async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
+        row = await self._get_locked(WorkloadTopologyRow, {"workload_id": workload_id, "attempt": attempt})
+        return None if row is None else WorkloadAttemptTopology.model_validate(row.data)
+
+    async def put_workload_topology(self, topology: WorkloadAttemptTopology) -> None:
+        await self.session.merge(
+            WorkloadTopologyRow(
+                workload_id=topology.workload_id,
+                attempt=topology.attempt,
+                digest=topology.digest,
+                total_rank_count=topology.total_rank_count,
+                data=_dump(topology),
+            )
+        )
+
+    async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
+        statement = (
+            select(WorkloadTopologyRow)
+            .where(WorkloadTopologyRow.workload_id == workload_id)
+            .order_by(WorkloadTopologyRow.attempt)
+        )
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_rows(WorkloadAttemptTopology, rows, table="workload_topologies")
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         row = await self._get_locked(PlanePeerRow, plane_id)

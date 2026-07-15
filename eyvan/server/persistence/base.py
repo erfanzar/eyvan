@@ -28,6 +28,7 @@ from eyvan.records import (
     QuotaRecord,
     RoleGrantRecord,
     UserProgressReport,
+    WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
 )
@@ -207,6 +208,23 @@ class RepositorySession(tp.Protocol):
         ...
 
     async def list_progress_reports(self, workload_id: str) -> list[UserProgressReport]: ...
+
+    async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
+        """Return one attempt's frozen rank space, or ``None`` when it is unknown.
+
+        ``None`` is a real answer and never an invitation to reconstruct one. An
+        attempt dispatched before this record existed has no proven rank map, and
+        deriving it from today's cells is exactly the mistake the record removes.
+        """
+        ...
+
+    async def put_workload_topology(self, topology: WorkloadAttemptTopology) -> None:
+        """Freeze one attempt's rank space, keyed by (workload id, attempt)."""
+        ...
+
+    async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
+        """Return every frozen attempt topology for one workload, oldest attempt first."""
+        ...
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None: ...
 

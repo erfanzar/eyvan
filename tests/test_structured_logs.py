@@ -1175,8 +1175,18 @@ class _PerRankAgent:
         }
 
 
-async def _gang_controller(agent, *, runtime_process_counts: tuple[int, int] = (1, 1)):
-    """A two-cell gang whose durable rank widths come from provider observation."""
+async def _gang_controller(
+    agent,
+    *,
+    runtime_process_counts: tuple[int, int] = (1, 1),
+    freeze_topology: bool = True,
+):
+    """A two-cell gang whose rank space is frozen the way dispatch freezes it.
+
+    ``freeze_topology=False`` reproduces an attempt that was already running when
+    the frozen record shipped: it has no proven rank map, and the controller must
+    say so instead of reconstructing one.
+    """
 
     from datetime import timedelta
 
@@ -1189,9 +1199,11 @@ async def _gang_controller(agent, *, runtime_process_counts: tuple[int, int] = (
         LeaseState,
         ResourceGang,
         ResourceVector,
+        WorkloadAttemptTopology,
         WorkloadDefinition,
         WorkloadRecord,
         WorkloadState,
+        WorkloadTopologyCell,
         utcnow,
     )
     from eyvan.server.controller import EyvanController
@@ -1269,6 +1281,23 @@ async def _gang_controller(agent, *, runtime_process_counts: tuple[int, int] = (
                 created_by="alice",
             )
         )
+        if freeze_topology:
+            await transaction.put_workload_topology(
+                WorkloadAttemptTopology.freeze(
+                    workload_id="wl-gang",
+                    attempt=1,
+                    generation=1,
+                    cells=[
+                        WorkloadTopologyCell(
+                            cell_id=cell_id,
+                            generation=1,
+                            runtime_process_count=process_count,
+                            global_rank_offset=0,
+                        )
+                        for cell_id, process_count in zip(("cell-a", "cell-b"), runtime_process_counts, strict=True)
+                    ],
+                )
+            )
     return controller
 
 
@@ -1359,11 +1388,14 @@ class _MultiHostAgent:
         }
 
 
-async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal() -> None:
+async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise controller -> cell -> inner-host cursor composition end to end."""
 
     from eyvan.worker.runtime.log_records import split_log_cursor
 
+    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
     hosts = {
         "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
         "cell-b": (_JournalHost("b0"), _JournalHost("b1", fail_once_after_first=True)),
@@ -1384,14 +1416,27 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
         (3, "b1:0"),
     ]
     assert first["truncated_ranks"] == []
-    attempt, cell_cursors = split_log_cursor(first["next_cursor"])
+    attempt, positions = split_log_cursor(first["next_cursor"])
     assert attempt == 1
-    assert set(cell_cursors) == {0, 1}
-    _inner_attempt, cell_a_cursors = split_log_cursor(cell_cursors[0])
-    _inner_attempt, cell_b_cursors = split_log_cursor(cell_cursors[1])
-    assert cell_a_cursors == {0: hosts["cell-a"][0].first_cursor, 1: hosts["cell-a"][1].first_cursor}
-    assert cell_b_cursors == {0: hosts["cell-b"][0].first_cursor, 1: hosts["cell-b"][1].first_cursor}
-    assert all("|" in cursor for cursor in (*cell_a_cursors.values(), *cell_b_cursors.values()))
+    # The old shape asserted here was ``set(cursors) == {0, 1}``: two CELL
+    # indices for a four-process attempt, each holding a nested cursor for the
+    # hosts inside it. That is the defect DR-0002 lines 42-44 and 68-70 name.
+    # Keying by cell index means the cursor cannot address rank 3 at all -- its
+    # position only exists inside another envelope -- so a reader cannot say
+    # where rank 3 is, and a cell whose declared width changes silently moves
+    # which host every following key refers to. One position per global rank
+    # removes both: the keys are the rank space, and they are the same rank
+    # space as the records, the truncation list, and the archive.
+    assert sorted(positions) == [0, 1, 2, 3]
+    assert positions == {
+        0: f"eyvan-r1:{hosts['cell-a'][0].first_cursor}",
+        1: f"eyvan-r1:{hosts['cell-a'][1].first_cursor}",
+        2: f"eyvan-r1:{hosts['cell-b'][0].first_cursor}",
+        3: f"eyvan-r1:{hosts['cell-b'][1].first_cursor}",
+    }
+    # Backend cursors still travel as opaque leaves: the legacy delimiter inside
+    # them is data, never structure.
+    assert all("|" in value for value in positions.values())
 
     second = await controller.workload_log_page("wl-gang", after=first["next_cursor"])
     assert [(record["rank"], record["message"]) for record in second["records"]] == [
@@ -1402,10 +1447,10 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
     assert second["truncated_ranks"] == [3]
     assert second["unavailable"] is False
 
-    # The unreachable host's last good inner cursor survives the outer page.
-    _attempt, second_cells = split_log_cursor(second["next_cursor"])
-    _attempt, second_cell_b = split_log_cursor(second_cells[1])
-    assert second_cell_b[1] == hosts["cell-b"][1].first_cursor
+    # The unreachable host keeps its own last good position, addressed directly
+    # rather than through the cell that happens to contain it.
+    _attempt, second_positions = split_log_cursor(second["next_cursor"])
+    assert second_positions[3] == f"eyvan-r1:{hosts['cell-b'][1].first_cursor}"
 
     third = await controller.workload_log_page("wl-gang", after=second["next_cursor"])
     assert [(record["rank"], record["message"]) for record in third["records"]] == [(3, "b1:1")]

@@ -170,12 +170,38 @@ def test_cursor_size_and_entry_bounds_fail_closed_before_decode() -> None:
         join_log_cursor(1, {0: "x" * (log_records._LOG_CURSOR_MAX_VALUE_BYTES + 1)})
 
 
-def test_a_rank_that_reported_no_cursor_is_omitted() -> None:
-    """Encoding an empty cursor would tell that rank to replay everything."""
+def test_an_empty_leaf_is_dropped_by_the_envelope_so_a_position_must_be_written() -> None:
+    """The envelope cannot carry "no position", so callers must not rely on it.
 
-    encoded = join_log_cursor(1, {0: "a", 1: ""})
+    This used to be asserted as a *feature* -- "a rank that reported no cursor is
+    omitted" -- and the controller relied on it, keying the envelope by cell index
+    and leaving out any cell that had not moved. DR-0002 lines 42-44 and 68-70 say
+    why that is wrong: an omitted key is indistinguishable from a rank that is not
+    part of the attempt, so the reader filled the gap with "start from the
+    beginning" and that rank replayed its whole journal.
+
+    The codec behaviour itself is fine and stays: an empty string is not a
+    position. What changed is that the controller now writes an explicit
+    non-empty leaf for a rank it has no position for, so every expected global
+    rank survives the round trip and the difference between "no position" and
+    "not in this attempt" is on the wire.
+    """
+
+    assert split_log_cursor(join_log_cursor(1, {0: "a", 1: ""})) == (1, {0: "a"})
+
+    from eyvan.server.controller.observation import _flat_cursor_values
+
+    encoded = join_log_cursor(1, _flat_cursor_values({0: "a", 3: "d"}, total_rank_count=4))
+    attempt, positions = split_log_cursor(encoded)
+
     assert encoded.startswith("eyvan-log-v2.")
-    assert split_log_cursor(encoded) == (1, {0: "a"})
+    assert attempt == 1
+    assert positions == {
+        0: "eyvan-r1:a",
+        1: "eyvan-r1!",
+        2: "eyvan-r1!",
+        3: "eyvan-r1:d",
+    }
 
 
 def test_no_cursors_at_all_encodes_to_empty() -> None:

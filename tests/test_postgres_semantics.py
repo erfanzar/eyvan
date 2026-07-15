@@ -122,7 +122,62 @@ async def test_the_migration_chain_runs_against_a_real_database(database) -> Non
         "progress_reports",
         "organizations",
         "projects",
+        "workload_topologies",
     } <= tables
+
+
+async def test_a_frozen_attempt_topology_round_trips_on_the_production_backend(database) -> None:
+    """The rank map has to survive on the backend production actually runs.
+
+    Every other durable backend is exercised in ``test_attempt_topology``. This
+    one is here because a table added by a migration can render and still behave
+    differently: the JSON column, the composite (workload, attempt) key, and the
+    ``FOR UPDATE`` read are PostgreSQL behaviour, and a topology that silently
+    fails to store turns every attempt on this deployment into one whose ranks
+    are unproven.
+    """
+
+    from eyvan.records import WorkloadAttemptTopology, WorkloadTopologyCell
+
+    repository = await _migrated(database)
+    frozen = WorkloadAttemptTopology.freeze(
+        workload_id="wl-1",
+        attempt=2,
+        generation=3,
+        cells=[
+            WorkloadTopologyCell(cell_id="cell-b", generation=4, runtime_process_count=4, global_rank_offset=0),
+            WorkloadTopologyCell(
+                cell_id="cell-a",
+                generation=2,
+                runtime_process_count=2,
+                global_rank_offset=0,
+                worker_endpoints=("http://h0:8100", "http://h1:8100"),
+            ),
+        ],
+    )
+
+    async with repository.transaction() as tx:
+        await tx.put_workload_topology(frozen)
+    async with repository.transaction() as tx:
+        stored = await tx.get_workload_topology("wl-1", 2)
+        listed = await tx.list_workload_topologies("wl-1")
+        missing = await tx.get_workload_topology("wl-1", 1)
+
+    async with database.connect() as connection:
+        columns = (
+            await connection.execute(
+                text("SELECT digest, total_rank_count FROM workload_topologies WHERE workload_id = 'wl-1'")
+            )
+        ).all()
+
+    assert stored == frozen
+    assert [item.attempt for item in listed] == [2]
+    # A different attempt is a different rank space, not a fallback.
+    assert missing is None
+    assert [(cell.cell_id, cell.global_rank_offset) for cell in stored.cells] == [("cell-a", 0), ("cell-b", 2)]
+    # The digest and width are real columns, so an operator can compare them in
+    # SQL without extracting JSON.
+    assert columns == [(frozen.digest, 6)]
 
 
 async def test_a_mismatched_stamp_refuses_to_open_a_real_database(database) -> None:
