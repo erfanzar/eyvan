@@ -558,6 +558,27 @@ def log_uri(workload_id: str, attempt: int, rank: int) -> str:
     return ManagedArtifactRef(ManagedArtifactKind.LOGS, _validate_object_id(ManagedArtifactKind.LOGS, object_id)).uri
 
 
+def log_manifest_uri(workload_id: str, attempt: int) -> str:
+    """Build a canonical managed URI for one attempt's archive manifest.
+
+    A first-class object beside the per-rank blobs rather than a line inside
+    rank zero's own blob. An index that lives inside the first object it
+    describes can only ever name what the writer *intends* to upload: rank zero
+    is written before any other rank exists, so it claims objects that may still
+    fail, and losing rank zero itself hides every rank that did land. A separate
+    URI can be committed last, once every blob's fate is known, and is
+    discoverable without reading any rank at all.
+
+    ``-manifest`` cannot collide with ``-r{rank}`` because a rank suffix is
+    always decimal digits.
+    """
+
+    if attempt < 1:
+        raise InvalidManagedArtifactURI("log archive manifests require a positive attempt")
+    object_id = f"{workload_id}-a{attempt}-manifest"
+    return ManagedArtifactRef(ManagedArtifactKind.LOGS, _validate_object_id(ManagedArtifactKind.LOGS, object_id)).uri
+
+
 def result_uri(result_id: str) -> str:
     """Build a canonical managed URI for a result object."""
 
