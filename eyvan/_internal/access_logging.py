@@ -79,11 +79,25 @@ REDACTED_QUERY_PARAMETERS: frozenset[str] = CURSOR_QUERY_PARAMETERS | CREDENTIAL
 REDACTED_QUERY_VALUE = "REDACTED"
 """The fixed placeholder written in place of a sensitive query value."""
 
-#: Uvicorn logs one access record per response, always as
-#: ``'%s - "%s %s HTTP/%s" %d'`` with
-#: ``(client_addr, method, path_with_query_string, http_version, status)``.
-_ACCESS_RECORD_ARGUMENTS = 5
-_REQUEST_TARGET_ARGUMENT = 2
+REDACTED_URL_LOGGERS: tuple[str, ...] = ("uvicorn.access", "httpx")
+"""Loggers whose records are redacted before any handler sees them.
+
+``uvicorn.access`` is the inbound request line. ``httpx`` is the outbound one:
+it logs ``'HTTP Request: %s %s "%s %d %s"'`` with the whole URL at **INFO**, so
+a controller-to-agent or agent-to-worker log page carries its cursor there too.
+Both names were established by enumeration -- attaching a capturing handler to
+the root logger at ``DEBUG`` and paging logs through the client Eyvan actually
+uses -- rather than by guessing: ``httpcore.connection`` and ``httpcore.http11``
+also log during that request and render the request as ``<Request [b'GET']>``,
+with no URL in it, so they are deliberately not listed.
+"""
+
+#: Scalars are never request targets and are left alone so that a record's
+#: ``%d`` conversions keep working.
+_OPAQUE_ARGUMENT_TYPES = (bool, int, float, complex, bytes, bytearray)
+#: Containers are never request targets either, and rendering one to look for a
+#: query string could be arbitrarily expensive.
+_CONTAINER_ARGUMENT_TYPES = (list, tuple, set, frozenset, dict)
 
 _ACCESS_FORMAT = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
 _DEFAULT_FORMAT = "%(levelprefix)s %(message)s"
@@ -126,33 +140,67 @@ def redact_request_target(target: str) -> str:
     )
 
 
+def _redacted_argument(value: object) -> object:
+    """Return one log argument with its sensitive query values replaced.
+
+    Positional arguments are matched by shape rather than by position, because
+    the two loggers that carry a URL disagree about where it sits: uvicorn puts
+    the request target third in ``(client_addr, method, target, version,
+    status)`` while httpx puts an ``httpx.URL`` second in ``(method, url,
+    version, status, reason)``. An argument is only replaced when redaction
+    actually changed how it renders, so an unrelated argument keeps its original
+    object and type.
+    """
+
+    if isinstance(value, _OPAQUE_ARGUMENT_TYPES) or isinstance(value, _CONTAINER_ARGUMENT_TYPES) or value is None:
+        return value
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            # A logging filter that raises takes the log line and the request
+            # with it, so an argument that cannot render is simply left alone.
+            return value
+    redacted = redact_request_target(text)
+    return redacted if redacted != text else value
+
+
 def _redacted_record(record: logging.LogRecord) -> logging.LogRecord:
-    """Return the record to format, copied and redacted when it needs it."""
+    """Return the record to emit, copied and redacted when it needs it."""
 
     arguments = record.args
-    if not isinstance(arguments, tuple) or len(arguments) != _ACCESS_RECORD_ARGUMENTS:
+    if isinstance(arguments, tuple):
+        redacted: tuple[object, ...] | dict[str, object] = tuple(_redacted_argument(item) for item in arguments)
+        changed = any(new is not old for new, old in zip(redacted, arguments, strict=True))
+    elif isinstance(arguments, dict):
+        redacted = {key: _redacted_argument(item) for key, item in arguments.items()}
+        changed = any(value is not arguments[key] for key, value in redacted.items())
+    else:
         return record
-    target = arguments[_REQUEST_TARGET_ARGUMENT]
-    if not isinstance(target, str):
-        return record
-    redacted = redact_request_target(target)
-    if redacted == target:
+    if not changed:
         return record
     duplicate = copy(record)
-    duplicate.args = (*arguments[:_REQUEST_TARGET_ARGUMENT], redacted, *arguments[_REQUEST_TARGET_ARGUMENT + 1 :])
+    duplicate.args = redacted
     return duplicate
 
 
 class QueryRedactionFilter(logging.Filter):
-    """Strip sensitive query values from an access record before it is handled.
+    """Strip sensitive query values from a record before it is handled.
 
-    A logger's filters run once, in ``Logger.handle``, ahead of every handler,
-    so this is what makes the redaction a property of the record rather than of
-    one formatter: an operator who adds a second, JSON-shaped access handler
-    gets the redacted target too. The record is edited in place because that is
-    the point -- downstream of the access logger the raw cursor should not
-    exist. A record whose arguments are not uvicorn's access tuple is left
-    exactly as it was.
+    A logger's filters run once, in ``Logger.handle``, ahead of every handler
+    and ahead of propagation to the root logger, so this is what makes the
+    redaction a property of the record rather than of one formatter: an operator
+    who adds a JSON access handler, or who simply calls
+    ``logging.basicConfig(level=DEBUG)`` while chasing a stuck log page, gets
+    the redacted URL too. The record is edited in place because that is the
+    point -- downstream of the emitting logger the raw cursor should not exist.
+
+    A filter only runs on the logger that emitted the record, never on an
+    ancestor, so this must be attached to each name in
+    :data:`REDACTED_URL_LOGGERS` individually. A record carrying nothing
+    sensitive is left exactly as it was.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -238,6 +286,10 @@ def uvicorn_log_config(level: str = "INFO", extra_loggers: Mapping[str, JsonValu
                 "level": configured_level,
                 "propagate": False,
             },
+            # Filter only: httpx keeps its own level and propagation, so this
+            # neither starts nor silences outbound request logging, it only
+            # removes the cursor from a line something else chose to emit.
+            **{name: {"filters": ["redact_query"]} for name in REDACTED_URL_LOGGERS if name != "uvicorn.access"},
             **dict(extra_loggers or {}),
         },
     }
@@ -248,6 +300,7 @@ __all__ = (
     "CURSOR_QUERY_PARAMETERS",
     "REDACTED_QUERY_PARAMETERS",
     "REDACTED_QUERY_VALUE",
+    "REDACTED_URL_LOGGERS",
     "QueryRedactionFilter",
     "RedactingAccessFormatter",
     "redact_request_target",

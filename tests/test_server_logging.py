@@ -39,6 +39,8 @@ from eyvan._internal.access_logging import (
     CURSOR_QUERY_PARAMETERS,
     REDACTED_QUERY_PARAMETERS,
     REDACTED_QUERY_VALUE,
+    REDACTED_URL_LOGGERS,
+    QueryRedactionFilter,
     RedactingAccessFormatter,
     redact_request_target,
     uvicorn_log_config,
@@ -426,4 +428,192 @@ def test_the_native_worker_cli_serves_with_the_redacting_access_log(monkeypatch:
     line = _access_line(options["log_config"], CURSOR_TARGET)
     assert LOG_PAGE_PATH in line
     assert "200" in line
+    _assert_cursor_absent(line)
+
+
+_OUTBOUND_PROBE = r"""
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+
+import uvicorn
+from uvicorn.config import LOGGING_CONFIG
+
+from eyvan._internal.access_logging import uvicorn_log_config
+from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
+from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+
+CURSOR = __import__("sys").argv[1]
+
+
+async def application(scope, receive, send):
+    body = b'{"records": [], "next_cursor": "", "unavailable": false, "detail": null, "truncated_ranks": []}'
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+def page(log_config):
+    # ``log_level='critical'`` keeps uvicorn's own access line out of the way:
+    # this measures what the outbound client logs, not what the server logs.
+    config = uvicorn.Config(application, host="127.0.0.1", port=0, log_config=log_config, log_level="critical")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        raise RuntimeError("uvicorn did not start")
+    port = server.servers[0].sockets[0].getsockname()[1]
+    seen = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            seen.append({"logger": record.name, "level": record.levelname, "message": record.getMessage()})
+
+    # Exactly what an operator does while chasing a stuck log page.
+    handler = Capture()
+    logging.root.addHandler(handler)
+    previous = logging.root.level
+    logging.root.setLevel(logging.DEBUG)
+    try:
+        executor = NativeRemoteExecutor(endpoint=f"http://127.0.0.1:{port}", secret="worker-secret")
+        executor.log_page("remote-1", after=CURSOR, limit=200)
+    finally:
+        logging.root.removeHandler(handler)
+        logging.root.setLevel(previous)
+        server.should_exit = True
+        thread.join(timeout=60)
+    return seen
+
+
+# Stock first, for the same filter-persistence reason as the inbound probe.
+print(
+    json.dumps(
+        {
+            "stock_uvicorn": page(LOGGING_CONFIG),
+            "control_plane": page(server_log_config(ServerLogLevel.INFO)),
+            "cell_agent": page(uvicorn_log_config()),
+            "native_worker": page(uvicorn_log_config()),
+        }
+    )
+)
+"""
+
+
+@pytest.fixture(scope="module")
+def outbound_client_log() -> dict[str, tp.Any]:
+    """Page logs through the real client under each configuration and capture root."""
+
+    result = subprocess.run(
+        [sys.executable, "-c", _OUTBOUND_PROBE, CURSOR],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _httpx_records(captured: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return the outbound request records httpx emitted."""
+
+    return [record for record in captured if record["logger"] == "httpx"]
+
+
+@pytest.mark.parametrize("service", ("control_plane", "cell_agent", "native_worker"))
+def test_the_outbound_log_page_request_never_logs_its_cursor(
+    outbound_client_log: dict[str, tp.Any], service: str
+) -> None:
+    captured = outbound_client_log[service]
+    (outbound,) = _httpx_records(captured)
+
+    assert "/api/v1/workloads/remote-1/log-page" in outbound["message"]
+    assert f"after={REDACTED_QUERY_VALUE}" in outbound["message"]
+    assert "limit=200" in outbound["message"]
+    _assert_cursor_absent(outbound["message"])
+    # Nothing else that ran during the request may carry it either.
+    for record in captured:
+        _assert_cursor_absent(record["message"])
+
+
+def test_the_outbound_client_leaks_the_cursor_without_the_filter(outbound_client_log: dict[str, tp.Any]) -> None:
+    # The control: this is what an operator's ``logging.basicConfig(DEBUG)``
+    # printed before this change, so the assertions above are a real difference.
+    (outbound,) = _httpx_records(outbound_client_log["stock_uvicorn"])
+
+    assert CURSOR in outbound["message"]
+
+
+def test_the_outbound_request_line_is_logged_at_ordinary_verbosity(
+    outbound_client_log: dict[str, tp.Any],
+) -> None:
+    # httpx logs the full URL at INFO, not DEBUG, which is why the filter and
+    # not a level policy is what keeps the cursor out of it.
+    (outbound,) = _httpx_records(outbound_client_log["stock_uvicorn"])
+
+    assert outbound["level"] == "INFO"
+
+
+def test_redaction_covers_every_logger_that_renders_a_url_during_a_log_page(
+    outbound_client_log: dict[str, tp.Any],
+) -> None:
+    # The denylist of loggers is only defensible if it names every logger that
+    # actually renders the URL. Anything else that logs during the request must
+    # be shown not to carry the cursor at all.
+    leaking = {record["logger"] for record in outbound_client_log["stock_uvicorn"] if CURSOR in record["message"]}
+
+    assert leaking == {"httpx"}
+    assert leaking <= set(REDACTED_URL_LOGGERS)
+    # httpcore traces the same request and renders it as ``<Request [b'GET']>``.
+    assert {record["logger"] for record in outbound_client_log["stock_uvicorn"]} > leaking
+
+
+def test_the_filter_leaves_httpx_s_own_level_and_propagation_alone() -> None:
+    # Filter-only entry: redaction must not quietly turn outbound request
+    # logging on, off, or away from the root logger an operator configured.
+    loggers = uvicorn_log_config()["loggers"]
+    assert isinstance(loggers, dict)
+
+    assert loggers["httpx"] == {"filters": ["redact_query"]}
+
+
+def test_an_httpx_style_record_is_redacted_wherever_the_url_sits() -> None:
+    # uvicorn puts the target third and httpx puts an URL object second, so the
+    # redaction has to match on shape rather than on position.
+    class Url:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def __str__(self) -> str:
+            return self._value
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger(f"eyvan.tests.httpx.{uuid4().hex}")
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    logger.addFilter(QueryRedactionFilter())
+
+    logger.info(
+        'HTTP Request: %s %s "%s %d %s"',
+        "GET",
+        Url(f"http://cell-a:8090{LOG_PAGE_PATH}?after={CURSOR}&limit=200"),
+        "HTTP/1.1",
+        200,
+        "OK",
+    )
+    handler.flush()
+    line = stream.getvalue()
+
+    assert LOG_PAGE_PATH in line
+    assert f"after={REDACTED_QUERY_VALUE}" in line
+    # The %d conversion still has an int to render.
+    assert '"HTTP/1.1 200 OK"' in line
     _assert_cursor_absent(line)

@@ -12,6 +12,7 @@ from eyvan._internal.access_logging import (
     CURSOR_QUERY_PARAMETERS,
     REDACTED_QUERY_PARAMETERS,
     REDACTED_QUERY_VALUE,
+    REDACTED_URL_LOGGERS,
     QueryRedactionFilter,
     RedactingAccessFormatter,
     redact_request_target,
@@ -37,8 +38,11 @@ def server_log_config(level: ServerLogLevel) -> JsonObject:
 
     The access formatter is
     :class:`~eyvan._internal.access_logging.RedactingAccessFormatter`, not
-    uvicorn's, so a log-page request does not write its ``?after=`` cursor into
-    the access log. That is unconditional rather than opt-in: DR-0002 states
+    uvicorn's, and every logger in
+    :data:`~eyvan._internal.access_logging.REDACTED_URL_LOGGERS` carries the
+    matching filter, so neither the inbound log-page request line nor httpx's
+    outbound one writes a ``?after=`` cursor. That is unconditional rather than
+    opt-in: DR-0002 states
     that cursors are not logged at ordinary verbosity, an access line is not a
     wire payload, and a switch that turns the leak back on would be a switch
     someone eventually flips.
@@ -62,6 +66,7 @@ __all__ = (
     "CURSOR_QUERY_PARAMETERS",
     "REDACTED_QUERY_PARAMETERS",
     "REDACTED_QUERY_VALUE",
+    "REDACTED_URL_LOGGERS",
     "QueryRedactionFilter",
     "RedactingAccessFormatter",
     "ServerLogLevel",
