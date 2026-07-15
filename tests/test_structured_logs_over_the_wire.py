@@ -25,8 +25,11 @@ import httpx
 import pytest
 
 from eyvan.worker.runtime.log_records import (
+    CursorFresh,
+    CursorInvalid,
     LogPage,
     LogRecord,
+    decode_log_cursor,
     join_log_cursor,
     log_page_from_json,
     split_log_cursor,
@@ -157,13 +160,26 @@ def test_nested_slice_cursors_with_the_largest_manual_host_count_round_trip() ->
 
 
 def test_cursor_size_and_entry_bounds_fail_closed_before_decode() -> None:
-    """Hostile query cursors cannot trigger unbounded base64/JSON work."""
+    """Hostile query cursors cannot trigger unbounded base64/JSON work.
+
+    The bound is still checked before any base64 or JSON allocation. What this
+    test no longer says is that breaching it *restarts the read*: the earlier
+    version asserted ``split_log_cursor(oversized) == (None, {})``, which is the
+    same answer as "no cursor was sent", so the assertion pinned the fail-open
+    decoder DR-0002 invariant 4 exists to forbid. A refused cursor now names
+    itself, and only empty input decodes to :class:`CursorFresh`.
+    """
 
     import eyvan.worker.runtime.log_records as log_records
 
     oversized = "x" * (log_records._LOG_CURSOR_MAX_BYTES + 1)
-    assert split_log_cursor(oversized) == (None, {})
-    assert split_log_cursor(f"eyvan-log-v2.{oversized}") == (None, {})
+
+    for value in (oversized, f"eyvan-log-v2.{oversized}"):
+        outcome = decode_log_cursor(value)
+        assert isinstance(outcome, CursorInvalid)
+        assert outcome.reason == log_records.CURSOR_TOO_LARGE
+        assert outcome != CursorFresh()
+
     with pytest.raises(ValueError, match="entry limit"):
         join_log_cursor(1, {rank: "c" for rank in range(log_records._LOG_CURSOR_MAX_ENTRIES + 1)})
     with pytest.raises(ValueError, match="size limit"):
