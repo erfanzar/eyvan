@@ -49,6 +49,10 @@ def main() -> None:
 
     import uvicorn
 
+    # Imported here, beside uvicorn itself, so importing this module stays free
+    # of the server dependency it only needs once it is actually serving.
+    from eyvan._internal.access_logging import uvicorn_log_config
+
     uvicorn.run(
         create_agent_app(
             settings=_settings_for_runtime_profile(args.runtime_profile),
@@ -56,6 +60,9 @@ def main() -> None:
         ),
         host=args.host,
         port=args.port,
+        # Uvicorn's own graph, with the access formatter that keeps a log-page
+        # request's ``?after=`` cursor out of this host's access log.
+        log_config=uvicorn_log_config(),
         log_level=args.log_level,
     )
 

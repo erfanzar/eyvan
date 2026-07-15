@@ -7,6 +7,16 @@
 
 from __future__ import annotations
 
+from eyvan._internal.access_logging import (
+    CREDENTIAL_QUERY_PARAMETERS,
+    CURSOR_QUERY_PARAMETERS,
+    REDACTED_QUERY_PARAMETERS,
+    REDACTED_QUERY_VALUE,
+    QueryRedactionFilter,
+    RedactingAccessFormatter,
+    redact_request_target,
+    uvicorn_log_config,
+)
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject
 
@@ -23,42 +33,39 @@ class ServerLogLevel(StrEnum):
 
 
 def server_log_config(level: ServerLogLevel) -> JsonObject:
-    """Return one handler graph for Uvicorn and all Eyvan package loggers."""
+    """Return one handler graph for Uvicorn and all Eyvan package loggers.
+
+    The access formatter is
+    :class:`~eyvan._internal.access_logging.RedactingAccessFormatter`, not
+    uvicorn's, so a log-page request does not write its ``?after=`` cursor into
+    the access log. That is unconditional rather than opt-in: DR-0002 states
+    that cursors are not logged at ordinary verbosity, an access line is not a
+    wire payload, and a switch that turns the leak back on would be a switch
+    someone eventually flips.
+
+    Args:
+        level: The level applied to the uvicorn and ``eyvan`` loggers.
+
+    Returns:
+        A ``logging.config.dictConfig`` document.
+    """
 
     configured_level = level.value.upper()
-    return {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "default": {
-                "()": "uvicorn.logging.DefaultFormatter",
-                "fmt": "%(levelprefix)s %(message)s",
-                "use_colors": None,
-            },
-            "access": {
-                "()": "uvicorn.logging.AccessFormatter",
-                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
-            },
-        },
-        "handlers": {
-            "default": {
-                "formatter": "default",
-                "class": "logging.StreamHandler",
-                "stream": "ext://sys.stderr",
-            },
-            "access": {
-                "formatter": "access",
-                "class": "logging.StreamHandler",
-                "stream": "ext://sys.stdout",
-            },
-        },
-        "loggers": {
-            "uvicorn": {"handlers": ["default"], "level": configured_level, "propagate": False},
-            "uvicorn.error": {"level": configured_level},
-            "uvicorn.access": {"handlers": ["access"], "level": configured_level, "propagate": False},
-            "eyvan": {"handlers": ["default"], "level": configured_level, "propagate": False},
-        },
-    }
+    return uvicorn_log_config(
+        configured_level,
+        {"eyvan": {"handlers": ["default"], "level": configured_level, "propagate": False}},
+    )
 
 
-__all__ = ("ServerLogLevel", "server_log_config")
+__all__ = (
+    "CREDENTIAL_QUERY_PARAMETERS",
+    "CURSOR_QUERY_PARAMETERS",
+    "REDACTED_QUERY_PARAMETERS",
+    "REDACTED_QUERY_VALUE",
+    "QueryRedactionFilter",
+    "RedactingAccessFormatter",
+    "ServerLogLevel",
+    "redact_request_target",
+    "server_log_config",
+    "uvicorn_log_config",
+)

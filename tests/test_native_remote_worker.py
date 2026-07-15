@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import eyvan.worker.runtime.native_worker as native_worker
+from eyvan._internal.access_logging import uvicorn_log_config
 from eyvan._internal.json_types import JsonObject
 from eyvan.capacity.drivers.base import (
     CapacityStatus,
@@ -145,7 +146,11 @@ def test_native_worker_main_uses_cli_and_environment(monkeypatch, tmp_path: Path
             "container_artifact_mounts": (),
         }
     ]
-    assert served == [{"app": app, "host": "127.0.0.1", "port": 9123}]
+    # The access log is uvicorn's own graph with Eyvan's redacting access
+    # formatter, so a log-page request does not write its cursor to this host.
+    assert served == [
+        {"app": app, "host": "127.0.0.1", "port": 9123, "log_config": uvicorn_log_config()},
+    ]
 
 
 def test_native_worker_reads_the_bootstrap_systemd_compatibility_flag(monkeypatch, tmp_path: Path) -> None:
