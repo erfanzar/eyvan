@@ -1089,9 +1089,7 @@ class _ControllerWorkloadCommands:
         if workload is None or lease is None:
             raise StaleOutboxCommand("unlaunchable attempt references a missing workload or lease")
         if workload.generation != command.generation:
-            raise StaleOutboxCommand(
-                f"workload generation is {workload.generation}, command is {command.generation}"
-            )
+            raise StaleOutboxCommand(f"workload generation is {workload.generation}, command is {command.generation}")
         await self._release_terminal(
             workload,
             lease,

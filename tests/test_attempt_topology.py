@@ -34,6 +34,7 @@ from eyvan.records import (
     LeaseRecord,
     LeaseState,
     OutboxRecord,
+    OutboxState,
     ResourceGang,
     ResourceVector,
     WorkloadAttemptTopology,
@@ -819,11 +820,16 @@ async def test_dispatch_refuses_a_composed_rank_count_above_the_attempt_ceiling(
         command = await transaction.get_outbox("cmd-dispatch")
         assert await transaction.get_workload_topology("wl-dispatch", 1) is None
     assert workload is not None and workload.remote_id is None
-    assert workload.state is WorkloadState.LEASED
     assert agent.submissions == []
-    assert command is not None
-    assert "bounded rank space" in (command.last_error or "")
-    assert str(MAX_ATTEMPT_RANK_COUNT) in (command.last_error or "")
+    # Terminal, not retried. The width is a property of the leased cells, so a
+    # retry can only fail again -- and the outbox backs off forever with no dead
+    # letter, so a retrying command would hold the lease and keep the cell
+    # undeletable, which is the stuck-lease shape that already blocks `eyvan down`.
+    assert workload.state is WorkloadState.FAILED
+    assert "bounded rank space" in (workload.failure_reason or "")
+    assert str(MAX_ATTEMPT_RANK_COUNT) in (workload.failure_reason or "")
+    assert command is not None and command.state is OutboxState.SUCCEEDED
+    assert await controller.dispatch_outbox_once() == 0
 
 
 # --------------------------------------------------------------------------- persistence parity
