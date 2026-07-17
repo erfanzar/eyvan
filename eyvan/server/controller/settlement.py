@@ -7,13 +7,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from datetime import timedelta
 
+from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue
-from eyvan.artifacts.managed import ManagedArtifactKind, log_uri
+from eyvan.artifacts.managed import ManagedArtifactKind, log_manifest_uri, log_uri
 from eyvan.capacity import (
     CapacityStatus,
 )
@@ -33,6 +37,8 @@ from eyvan.records import (
     GcpQueueAdmissionDenialTarget,
     LeaseRecord,
     LeaseState,
+    ManagedArtifactRecord,
+    ManagedArtifactState,
     OutboxRecord,
     WorkloadRecord,
     WorkloadState,
@@ -62,6 +68,117 @@ from eyvan.worker.runtime.log_records import (
 #: distinguished from exceeding it and truncation is explicit in the manifest.
 _LOG_ARCHIVE_LINE_LIMIT = 1000
 
+#: Schema version of the *standalone* terminal archive manifest object.
+#:
+#: Deliberately not the same tag as ``LOG_ARCHIVE_MANIFEST_VERSION``. That
+#: version belongs to the array line embedded inside rank zero's own blob and
+#: keeps its meaning unchanged; this one belongs to a different object at a
+#: different URI. Two payload schemas never share one version tag, so a rolling
+#: reader that knows only the embedded index cannot be handed a document it
+#: would misread.
+LOG_ARCHIVE_MANIFEST_SCHEMA_V2 = 2
+
+#: Ceiling on the number of physical rank objects one settlement may write.
+#:
+#: A declared attempt width is bounded only by ``runtime_process_count`` per
+#: cell times the gang size, so "one object per expected rank" is otherwise an
+#: unbounded amount of I/O inside the release path -- the path that must not be
+#: slow enough to strand an accelerator. Ranks that produced output, or whose
+#: fate is anything other than "silent", are written first; the manifest still
+#: records every remaining expected rank, and says how many objects it left out.
+_LOG_ARCHIVE_MAX_RANK_OBJECTS = 1024
+
+#: Ceiling on how many ranks the manifest enumerates. A manifest that could not
+#: name every expected rank says so through ``enumeration_capped`` and is never
+#: reported ``complete``.
+_LOG_ARCHIVE_MAX_MANIFEST_RANKS = 10_000
+
+#: Operator switch for the DR-0002 stage-2 manifest object.
+#:
+#: Default off. DR-0002's own rollout ships a feature-disabled v2 writer first
+#: and switches emission only once every serving and rollback image carries the
+#: reader; enabling it here changes nothing an existing reader parses, because
+#: the embedded v1 index keeps being written byte-for-byte and the new object
+#: lives at a URI no v1 reader looks at. Read through ``EyvanSettings`` first so
+#: a later typed setting supersedes the variable without touching this module.
+_LOG_ARCHIVE_MANIFEST_V2_SETTING = "log_archive_manifest_v2_enabled"
+_LOG_ARCHIVE_MANIFEST_V2_ENVIRONMENT_VARIABLE = "EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED"
+
+
+class LogArchiveRankStatus(StrEnum):
+    """What became of one expected global rank in a terminal archive.
+
+    The distinction the embedded v1 index cannot make: it lists observed ranks
+    only, so a rank that legitimately printed nothing, a rank whose host was
+    unreachable, and a rank whose object failed to upload are all equally
+    absent from it.
+    """
+
+    #: Everything the rank produced is in its object.
+    ARCHIVED = "archived"
+    #: The rank was reachable and produced nothing. Its object exists and is empty.
+    QUIET = "quiet"
+    #: Lines were captured, but the per-rank ceiling dropped the oldest ones.
+    TRUNCATED = "truncated"
+    #: The live read could not reach this rank, so nothing was captured for it.
+    UNREACHABLE = "unreachable"
+    #: The object could not be committed; its contents are unknown or absent.
+    FAILED = "failed"
+
+
+#: Statuses that mean this rank's output was captured in full.
+_COMPLETE_RANK_STATUSES = frozenset({LogArchiveRankStatus.ARCHIVED, LogArchiveRankStatus.QUIET})
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveTopology:
+    """The attempt shape every expected global rank is derived from."""
+
+    width: int
+    digest: str
+    cells: tuple[tuple[str, int, int], ...]
+
+    def as_json(self) -> JsonObject:
+        """Return the manifest projection of this topology."""
+
+        return {
+            "source": "leases",
+            "width": self.width,
+            "digest": self.digest,
+            "cells": [
+                {"cell": cell_id, "generation": generation, "width": width} for cell_id, generation, width in self.cells
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchivedRank:
+    """One expected global rank's fate and the exact object that holds it."""
+
+    rank: int
+    status: LogArchiveRankStatus
+    uri: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = None
+    detail: str = ""
+    #: Whether a later settlement of this attempt could still land this object.
+    #: An inconclusive write can; an immutable object that already holds other
+    #: bytes cannot. Not part of the manifest: it describes this writer's
+    #: knowledge, not the archive.
+    retryable: bool = False
+
+    def as_json(self) -> JsonObject:
+        """Return the manifest projection of this rank."""
+
+        return {
+            "rank": self.rank,
+            "status": self.status.value,
+            "uri": self.uri,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "detail": self.detail,
+        }
+
 
 class _ControllerSettlement:
     """Terminal release, billing, retention, and what capacity failures teach.
@@ -86,7 +203,16 @@ class _ControllerSettlement:
         # the capacity bill stops, which is also when someone starts asking what
         # happened. Failures here are swallowed on purpose: a job that ran must
         # still be recorded as finished even if its logs could not be saved.
-        await self._archive_terminal_logs(workload)
+        #
+        # The guard is outermost rather than only inside the per-object writes.
+        # An archive that raised anywhere -- reading the page, deriving the
+        # attempt topology, committing the manifest -- would abort settlement and
+        # leave a finished workload holding an accelerator because its logs were
+        # unreadable. Capacity is settled on every path.
+        try:
+            await self._archive_terminal_logs(workload)
+        except Exception:
+            logger.warning("could not archive logs for %s before release", workload.id, exc_info=True)
         await self.service.settle_terminal_workload(
             self._principal,
             workload.id,
@@ -132,19 +258,27 @@ class _ControllerSettlement:
             global_rank = rank if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0 else 0
             by_rank.setdefault(global_rank, []).append(entry)
         raw_truncated = page.get("truncated_ranks")
-        truncated = {
+        unreachable = {
             rank
             for rank in (raw_truncated if isinstance(raw_truncated, list) else [])
             if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0
         }
+        truncated = set(unreachable)
         # The provider was asked for one sentinel line beyond the advertised
         # ceiling. Trim independently per global rank so one chatty process does
         # not consume every other rank's diagnostic tail. Keep the last lines:
         # they are the ones nearest the terminal failure this archive explains.
+        #
+        # Tracked separately as well as in the union: "this rank kept only its
+        # tail" and "this rank could not be read at all" are different incidents,
+        # and the v1 index has one field for both.
+        line_truncated: set[int] = set()
         for rank, lines in by_rank.items():
             if len(lines) > _LOG_ARCHIVE_LINE_LIMIT:
                 by_rank[rank] = lines[-_LOG_ARCHIVE_LINE_LIMIT:]
                 truncated.add(rank)
+                line_truncated.add(rank)
+        page_unavailable = bool(page.get("unavailable"))
 
         archived_ranks = sorted(set(by_rank) | truncated)
         manifest_ranks: list[JsonValue] = list(archived_ranks)
@@ -153,7 +287,7 @@ class _ControllerSettlement:
             "version": LOG_ARCHIVE_MANIFEST_VERSION,
             "ranks": manifest_ranks,
             "truncated_ranks": manifest_truncated,
-            "unavailable": bool(page.get("unavailable")),
+            "unavailable": page_unavailable,
             "line_limit_per_rank": _LOG_ARCHIVE_LINE_LIMIT,
         }
         # A JSON array rather than a record-shaped object keeps old readers
@@ -172,23 +306,296 @@ class _ControllerSettlement:
         # make one corrupt/high rank an O(max_rank) release operation.
         legacy_visible = [rank for rank in archived_ranks if rank < LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT]
         compatibility_ranks = set(range(max(legacy_visible) + 1)) if legacy_visible else {0}
-        write_ranks = sorted({0, *archived_ranks, *compatibility_ranks})
-        for rank in write_ranks:
+        observed_ranks = {0, *archived_ranks, *compatibility_ranks}
+
+        topology: _ArchiveTopology | None = None
+        expected: set[int] = set()
+        write_ranks = set(observed_ranks)
+        manifest_v2 = self._log_archive_manifest_v2_enabled()
+        if manifest_v2:
+            # Every expected rank comes from the attempt's *declared* width, not
+            # from whichever ranks happened to answer. A rank that was never
+            # reachable produces no record anywhere else, so a set derived from
+            # observation can only ever describe the ranks that were fine.
+            topology = await self._archive_topology(workload)
+            if topology is not None:
+                expected = set(range(topology.width))
+            headroom = max(_LOG_ARCHIVE_MAX_RANK_OBJECTS - len(write_ranks), 0)
+            write_ranks |= set(sorted(expected - write_ranks)[:headroom])
+
+        # A rank the live read could not reach at all is unreachable, not quiet.
+        # When the whole read failed, that is true of every expected rank.
+        unreachable_ranks = unreachable | (expected if page_unavailable else set())
+        intended = {
+            rank: self._intended_rank_status(
+                rank,
+                observed=set(by_rank),
+                unreachable=unreachable_ranks,
+                line_truncated=line_truncated,
+            )
+            for rank in sorted(write_ranks | expected)
+        }
+
+        outcomes: dict[int, _ArchivedRank] = {}
+        for rank in sorted(write_ranks):
             lines: list[JsonValue] = list(by_rank.get(rank, ()))
             if rank == 0:
                 lines.insert(0, manifest)
             payload = "\n".join(json.dumps(line, sort_keys=True) for line in lines).encode()
-            uri = log_uri(workload.id, workload.attempt, rank)
-            try:
-                await self.service.upload_managed_artifact(
-                    org_id=workload.org_id,
-                    project_id=workload.project_id,
-                    uri=uri,
-                    payload=payload,
-                    actor="system:log-archiver",
+            outcomes[rank] = await self._archive_rank_object(workload, rank, payload, intended=intended[rank])
+
+        if not manifest_v2:
+            return
+        unfinished = sorted(rank for rank, outcome in outcomes.items() if outcome.retryable)
+        if unfinished:
+            # Publishing now would spend the attempt's one manifest URI on a
+            # provisional answer. The URI is immutable, so a reservation taken
+            # for these bytes is the reservation a later settlement -- which may
+            # actually land these objects -- would need for the real ones. The
+            # rank objects that did land are immutable and still there; the next
+            # settlement reuses them and commits the manifest that describes the
+            # finished archive.
+            logger.warning(
+                "log archive manifest for %s deferred; rank(s) %s may still be written",
+                workload.id,
+                ", ".join(str(rank) for rank in unfinished),
+            )
+            return
+        # Last, and only now. Every object's fate is known, so the manifest
+        # states what exists rather than what the writer intended to write.
+        await self._commit_log_archive_manifest(
+            workload,
+            topology=topology,
+            outcomes=outcomes,
+            intended=intended,
+            unavailable=page_unavailable,
+        )
+
+    def _log_archive_manifest_v2_enabled(self) -> bool:
+        """Return whether this replica commits the standalone manifest object.
+
+        Off unless an operator turns it on. DR-0002 rolls the writer out before
+        the emission switch, so an image without the reader must never be the
+        one that starts producing manifests other replicas depend on.
+        """
+
+        configured = getattr(self.settings, _LOG_ARCHIVE_MANIFEST_V2_SETTING, None)
+        if configured is not None:
+            return bool(configured)
+        raw = os.getenv(_LOG_ARCHIVE_MANIFEST_V2_ENVIRONMENT_VARIABLE)
+        return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _intended_rank_status(
+        rank: int,
+        *,
+        observed: set[int],
+        unreachable: set[int],
+        line_truncated: set[int],
+    ) -> LogArchiveRankStatus:
+        """Classify one expected rank from what the live read could see."""
+
+        if rank in unreachable:
+            return LogArchiveRankStatus.UNREACHABLE
+        if rank in line_truncated:
+            return LogArchiveRankStatus.TRUNCATED
+        return LogArchiveRankStatus.ARCHIVED if rank in observed else LogArchiveRankStatus.QUIET
+
+    async def _archive_topology(self, workload: WorkloadRecord) -> _ArchiveTopology | None:
+        """Derive one attempt's declared rank space from its leased cells.
+
+        The same ordering and per-cell width the live read uses, so a rank means
+        the same physical worker in the archive as it did while the job ran.
+        ``None`` when the membership cannot be resolved -- an archive that cannot
+        prove the shape must not claim to be complete.
+        """
+
+        try:
+            members = await self._load_workload_members(workload)
+            ordered = self._ordered_gang_member_pairs(members) if len(members) > 1 else tuple(members)
+        except Exception:
+            logger.debug("could not resolve the archive topology for %s", workload.id, exc_info=True)
+            return None
+        if not ordered:
+            return None
+        cells = tuple((cell.id, cell.generation, cell.runtime_process_count) for _lease, cell in ordered)
+        fingerprint = json.dumps(
+            {
+                "attempt": workload.attempt,
+                "cells": [
+                    {"cell": cell_id, "generation": generation, "width": width} for cell_id, generation, width in cells
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return _ArchiveTopology(
+            width=sum(width for _cell, _generation, width in cells),
+            digest=f"sha256:{hashlib.sha256(fingerprint).hexdigest()}",
+            cells=cells,
+        )
+
+    async def _active_managed_artifact(
+        self,
+        workload: WorkloadRecord,
+        uri: str,
+    ) -> ManagedArtifactRecord | None:
+        """Return the committed ledger row for ``uri``, if one already exists."""
+
+        try:
+            async with self.repository.transaction() as transaction:
+                record = await transaction.get_managed_artifact(workload.org_id, workload.project_id, uri)
+        except Exception:
+            logger.debug("could not read the artifact ledger for %s", uri, exc_info=True)
+            return None
+        if record is None or record.state is not ManagedArtifactState.ACTIVE or record.sha256 is None:
+            return None
+        return record
+
+    async def _archive_rank_object(
+        self,
+        workload: WorkloadRecord,
+        rank: int,
+        payload: bytes,
+        *,
+        intended: LogArchiveRankStatus,
+    ) -> _ArchivedRank:
+        """Commit or reuse one rank's immutable object and report what happened.
+
+        Managed artifact URIs are immutable, so a settlement retry whose live
+        read produced different bytes cannot overwrite its predecessor: it would
+        conflict, quarantine the row, and lose the archive that already existed.
+        An already-active object is therefore reused, and the manifest describes
+        the bytes that are actually stored.
+        """
+
+        uri = log_uri(workload.id, workload.attempt, rank)
+        digest = hashlib.sha256(payload).hexdigest()
+        existing = await self._active_managed_artifact(workload, uri)
+        if existing is not None:
+            if existing.sha256 == digest:
+                return _ArchivedRank(rank, intended, uri, existing.sha256, existing.size_bytes)
+            observed = LogArchiveRankStatus.ARCHIVED if existing.size_bytes > 0 else LogArchiveRankStatus.QUIET
+            return _ArchivedRank(
+                rank,
+                observed,
+                uri,
+                existing.sha256,
+                existing.size_bytes,
+                detail="an earlier settlement of this attempt committed different bytes",
+            )
+        try:
+            record = await self.service.upload_managed_artifact(
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                uri=uri,
+                payload=payload,
+                actor="system:log-archiver",
+            )
+        except Exception as exc:
+            logger.warning("could not archive logs for %s rank %d", workload.id, rank, exc_info=True)
+            # The class name only. This document is readable by the tenant, and a
+            # provider exception body is exactly the place a credential or an
+            # internal path leaks into one.
+            #
+            # A conflict is the object's final answer: the URI is immutable and
+            # already holds something else, so no retry changes it. Anything else
+            # -- an inconclusive write, an outage, a quota -- may still land, and
+            # the manifest must not be published as though it had not.
+            return _ArchivedRank(
+                rank,
+                LogArchiveRankStatus.FAILED,
+                uri,
+                detail=type(exc).__name__,
+                retryable=not isinstance(exc, ConflictError),
+            )
+        if record.state is not ManagedArtifactState.ACTIVE or record.sha256 != digest:
+            return _ArchivedRank(
+                rank,
+                LogArchiveRankStatus.FAILED,
+                uri,
+                record.sha256,
+                record.size_bytes,
+                detail="the upload did not activate the bytes it was given",
+            )
+        return _ArchivedRank(rank, intended, uri, record.sha256, record.size_bytes)
+
+    async def _commit_log_archive_manifest(
+        self,
+        workload: WorkloadRecord,
+        *,
+        topology: _ArchiveTopology | None,
+        outcomes: dict[int, _ArchivedRank],
+        intended: dict[int, LogArchiveRankStatus],
+        unavailable: bool,
+    ) -> None:
+        """Commit the immutable schema-v2 manifest for one terminal attempt.
+
+        Written last and at its own URI. The manifest -- not the first missing
+        object -- defines completeness, so it can only be honest once every blob
+        has either landed or failed. An existing manifest is never rewritten: the
+        first one committed for an attempt is the record of that attempt.
+        """
+
+        uri = log_manifest_uri(workload.id, workload.attempt)
+        if await self._active_managed_artifact(workload, uri) is not None:
+            return
+        enumerated = sorted(set(outcomes) | set(intended))
+        named = enumerated[:_LOG_ARCHIVE_MAX_MANIFEST_RANKS]
+        enumeration_capped = len(named) != len(enumerated)
+        entries: list[JsonValue] = []
+        statuses: list[LogArchiveRankStatus] = []
+        objects_omitted = 0
+        for rank in named:
+            outcome = outcomes.get(rank)
+            if outcome is None:
+                objects_omitted += 1
+                outcome = _ArchivedRank(
+                    rank,
+                    intended.get(rank, LogArchiveRankStatus.QUIET),
+                    detail="no object was written; this attempt reached its per-settlement object ceiling",
                 )
-            except Exception:
-                logger.warning("could not archive logs for %s rank %d", workload.id, rank, exc_info=True)
+            entries.append(outcome.as_json())
+            statuses.append(outcome.status)
+        complete = (
+            topology is not None
+            and not enumeration_capped
+            and objects_omitted == 0
+            and not unavailable
+            and all(status in _COMPLETE_RANK_STATUSES for status in statuses)
+        )
+        body: JsonObject = {
+            "schema": LOG_ARCHIVE_MANIFEST_SCHEMA_V2,
+            "kind": "workload-log-archive",
+            "workload": workload.id,
+            "attempt": workload.attempt,
+            "topology": (
+                topology.as_json()
+                if topology is not None
+                else {"source": "unknown", "width": None, "digest": None, "cells": []}
+            ),
+            "line_limit_per_rank": _LOG_ARCHIVE_LINE_LIMIT,
+            "object_limit": _LOG_ARCHIVE_MAX_RANK_OBJECTS,
+            "objects_omitted": objects_omitted,
+            "enumeration_capped": enumeration_capped,
+            "unavailable": unavailable,
+            "complete": complete,
+            "ranks": entries,
+        }
+        payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            await self.service.upload_managed_artifact(
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                uri=uri,
+                payload=payload,
+                actor="system:log-archiver",
+            )
+        except Exception:
+            # The rank objects are already committed and immutable, so the next
+            # settlement of this attempt reuses them and commits the manifest
+            # then. Losing the manifest costs discoverability, never bytes.
+            logger.warning("could not commit the log archive manifest for %s", workload.id, exc_info=True)
 
     async def _record_capacity_stockout(self, cell: CellRecord) -> None:
         """Persist a STOCKOUT belief for a cell reclaimed before it ever became READY.
