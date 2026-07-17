@@ -21,12 +21,22 @@ opaque ``__CURSOR``, ``--after-cursor``, ``--lines``, ``--since``, and
 ``--output=json`` with ``PRIORITY`` and ``_PID``. Reimplementing that in Postgres
 would be strictly worse; the control plane keeps an *index* plus an archived blob
 for terminal attempts, because releasing a cell otherwise destroys the logs.
+
+**A refused cursor is an answer.** ``decode_log_cursor`` returns a
+:data:`CursorOutcome` -- fresh, resume, invalid, or incompatible -- because the
+one thing a log cursor decoder must never do is answer "start from the
+beginning" to a cursor it could not read. That answer is byte-identical to a
+first poll, so a client whose cursor was truncated, oversized, minted for
+another attempt, or aimed at another journal re-reads everything on every poll
+and is never told why. See DR-0002 (``docs/design/0002-global-log-ranks-and-cursors.md``)
+invariant 4.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import typing as tp
 from dataclasses import dataclass, field
@@ -51,6 +61,14 @@ LOG_ARCHIVE_MANIFEST_VERSION = 1
 #: Contiguous rank range probed by readers that predate archive manifests.
 #: Writers may place compatibility gap objects only inside this fixed window.
 LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT = 64
+
+#: Rank recorded when a payload declared a ``rank`` that is not a non-negative
+#: integer. Coercing such a rank to ``0`` is worse than useless: two malformed
+#: ranks collide onto rank zero and the page then looks complete to the
+#: controller, which validates ranks against the cell's durable process width.
+#: ``-1`` fails that range check, so invalidity survives decoding instead of
+#: being normalised away.
+INVALID_LOG_RANK = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,166 +128,755 @@ _LOG_CURSOR_MAX_BYTES = 16 * 1024 * 1024
 _LOG_CURSOR_MAX_ENTRIES = 10_000
 _LOG_CURSOR_MAX_VALUE_BYTES = 8 * 1024 * 1024
 _LEGACY_RANK_PREFIX = re.compile(r"^[0-9]+=")
+#: A legacy rank is a canonical decimal. ``int()`` also accepts ``" +1_0 "``,
+#: which would let two spellings of the same rank collide silently.
+_CANONICAL_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)$")
+#: A legacy leaf that itself looks like a cursor cannot be told apart from a
+#: second level of the same delimiter grammar, so it is refused rather than guessed.
+_LEGACY_NESTED_LEAF = re.compile(r"^(?:0|[1-9][0-9]*):")
+
+#: The only journal kind this codec mints cursors for. A cursor naming any other
+#: kind was minted for a different reader and is not decoded into positions.
+CURSOR_KIND_WORKLOAD_LOG = "workload-log"
+_KNOWN_CURSOR_KINDS = frozenset({CURSOR_KIND_WORKLOAD_LOG})
+
+#: Live reads address backend journals; archive reads address immutable objects.
+#: A live position replayed against the archive addresses nothing.
+CURSOR_MODE_LIVE = "live"
+CURSOR_MODE_ARCHIVE = "archive"
+_KNOWN_CURSOR_MODES = frozenset({CURSOR_MODE_LIVE, CURSOR_MODE_ARCHIVE})
+
+#: Environment flag gating *emission* of the fully bound DR-0002 v2 envelope.
+#: Decoding both shapes ships first and unconditionally; emission stays off
+#: until every serving and rollback image can decode it, which is the whole
+#: point of the two-stage rollout. Turning this on mid-upgrade is safe only once
+#: that is true.
+LOG_CURSOR_V2_EMISSION_ENV = "EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Closed key sets. An envelope carrying a key outside its schema is rejected
+# rather than ignored: silently dropping a field is how a reader ends up
+# resuming from a position that meant something else to the writer.
+_STRICT_ENVELOPE_KEYS = frozenset({"v", "kind", "attempt", "topology", "mode", "workload", "positions"})
+_STRICT_ENVELOPE_REQUIRED = frozenset({"v", "kind", "attempt", "mode", "positions"})
+_STRICT_POSITION_KEYS = frozenset({"rank", "cursor", "cell", "local"})
+_STRICT_POSITION_REQUIRED = frozenset({"rank", "cursor"})
+#: The shape emitted before the bound envelope existed. Kept decodable for the
+#: rolling upgrade; discriminated from the bound envelope by disjoint keys, so
+#: the two never have to be told apart by guessing.
+_DRAFT_ENVELOPE_KEYS = frozenset({"version", "attempt", "cursors"})
+
+# Reason codes. Stable strings rather than prose: a caller routes on these, and
+# ``detail`` carries the human sentence.
+CURSOR_MALFORMED = "cursor_malformed"
+CURSOR_TOO_LARGE = "cursor_too_large"
+CURSOR_LEAF_TOO_LARGE = "cursor_leaf_too_large"
+CURSOR_TOO_MANY_POSITIONS = "cursor_too_many_positions"
+CURSOR_DUPLICATE_KEY = "cursor_duplicate_key"
+CURSOR_UNKNOWN_FIELD = "cursor_unknown_field"
+CURSOR_MISSING_FIELD = "cursor_missing_field"
+CURSOR_UNSUPPORTED_VERSION = "cursor_unsupported_version"
+CURSOR_UNKNOWN_KIND = "cursor_unknown_kind"
+CURSOR_UNKNOWN_MODE = "cursor_unknown_mode"
+CURSOR_INVALID_ATTEMPT = "cursor_invalid_attempt"
+CURSOR_INVALID_RANK = "cursor_invalid_rank"
+CURSOR_DUPLICATE_RANK = "cursor_duplicate_rank"
+CURSOR_INVALID_POSITION = "cursor_invalid_position"
+#: DR-0002's name for "this cursor cannot be resumed; ask for a fresh read".
+CURSOR_RESET_REQUIRED = "cursor_reset_required"
+CURSOR_ATTEMPT_CHANGED = "cursor_attempt_changed"
+CURSOR_TOPOLOGY_CHANGED = "cursor_topology_changed"
+CURSOR_KIND_MISMATCH = "cursor_kind_mismatch"
+CURSOR_MODE_MISMATCH = "cursor_mode_mismatch"
+CURSOR_WORKLOAD_MISMATCH = "cursor_workload_mismatch"
+CURSOR_UNKNOWN_RANK = "cursor_unknown_rank"
 
 
-def split_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
-    """Decode a versioned log cursor, with compatibility for legacy cursors.
+@dataclass(frozen=True, slots=True)
+class CursorPosition:
+    """One backend position, addressed by its global rank.
 
-    Version 2 is base64url JSON. Backend cursors are opaque strings inside that
-    document, so a journald cursor containing ``|`` or ``=`` cannot be confused
-    with the outer fan-out structure. Malformed v2 cursors restart the read
-    instead of handing a guessed position to the wrong journal.
-
-    The legacy decoder accepts both the former per-rank shape
-    ``"{attempt}:{rank}={cursor}|..."`` and the original single-rank shape
-    ``"{attempt}:{cursor}"``. The latter matters for journald cursors such as
-    ``s=...``: only a leading decimal rank followed by ``=`` identifies the
-    delimiter-based per-rank encoding.
-
-    A bare value with no attempt is read as "no opinion" rather than attempt
-    zero, so a first read is not mistaken for a superseded one.
+    Attributes:
+        rank: Global rank inside the attempt's flattened rank space.
+        cursor: The issuing backend's opaque position. Never parsed.
+        cell: Diagnostic source cell identity; empty when the cursor is unbound.
+        local: Diagnostic rank inside that cell; ``None`` when unbound.
     """
 
+    rank: int
+    cursor: str
+    cell: str = ""
+    local: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CursorContext:
+    """The read a cursor is being decoded *for*.
+
+    A cursor is opaque but neither authenticated nor confidential, so the read
+    it is served against is the only thing that can decide whether it addresses
+    this journal. Empty/``None`` fields mean "do not constrain".
+
+    Attributes:
+        kind: Journal kind being read.
+        mode: ``"live"`` or ``"archive"``.
+        attempt: Attempt being served; a cursor from another attempt names lines
+            in journals that no longer exist.
+        workload: Workload the read belongs to.
+        topology: Digest of the attempt topology the rank space was derived from.
+        ranks: Expected global rank set. Also the reversibility witness that
+            makes a multi-rank legacy cursor decodable at all.
+    """
+
+    kind: str = CURSOR_KIND_WORKLOAD_LOG
+    mode: str = CURSOR_MODE_LIVE
+    attempt: int | None = None
+    workload: str = ""
+    topology: str = ""
+    ranks: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CursorFresh:
+    """Empty input: this read starts at the beginning.
+
+    The *only* outcome that means "start". A malformed cursor decoding to this
+    is the fail-open defect DR-0002 exists to close.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class CursorResume:
+    """A decoded cursor that addresses the read being served.
+
+    Attributes:
+        positions: One backend position per rank the cursor carried.
+        attempt: Attempt the positions came from, ``None`` when unstated.
+        version: ``1`` for a legacy cursor, ``2`` for either v2 envelope.
+        bound: True when the cursor carried its own kind/mode context rather
+            than inheriting the reader's assumption.
+        kind: Kind declared by the cursor, empty when unbound.
+        mode: Mode declared by the cursor, empty when unbound.
+        workload: Workload declared by the cursor, empty when unbound.
+        topology: Topology digest declared by the cursor, empty when unbound.
+        missing_ranks: Expected ranks the cursor carried no position for. Those
+            ranks resume from the start of their journal; naming them keeps that
+            visible instead of presenting a partial resume as a whole one.
+    """
+
+    positions: tuple[CursorPosition, ...] = ()
+    attempt: int | None = None
+    version: int = _LOG_CURSOR_VERSION
+    bound: bool = False
+    kind: str = ""
+    mode: str = ""
+    workload: str = ""
+    topology: str = ""
+    missing_ranks: tuple[int, ...] = ()
+
+    @property
+    def cursors(self) -> dict[int, str]:
+        """Return the positions as the ``{rank: backend cursor}`` fan-out map."""
+
+        return {position.rank: position.cursor for position in self.positions}
+
+
+@dataclass(frozen=True, slots=True)
+class CursorInvalid:
+    """The bytes are not a well-formed cursor of ours.
+
+    Attributes:
+        reason: Stable machine-readable code.
+        detail: One human sentence naming what failed.
+    """
+
+    reason: str
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CursorIncompatible:
+    """A well-formed cursor that addresses a different read.
+
+    Distinct from :class:`CursorInvalid` because the caller's remedy differs: an
+    incompatible cursor means the journal moved on (retry, topology change,
+    archive handover), not that the client corrupted anything.
+
+    Attributes:
+        reason: Stable machine-readable code.
+        detail: One human sentence naming the mismatch.
+    """
+
+    reason: str
+    detail: str = ""
+
+
+#: Every decode ends in exactly one of these. There is no fallthrough.
+CursorOutcome = CursorFresh | CursorResume | CursorInvalid | CursorIncompatible
+
+
+class _DuplicateCursorKey(ValueError):
+    """Raised by the JSON hook when an object repeats a key."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object, refusing the last-wins collapse ``json`` performs.
+
+    ``{"attempt": 1, "attempt": 9}`` is valid JSON and decodes to ``9`` under the
+    default hook, so a cursor can carry one attempt past a proxy and a different
+    one into the decoder.
+
+    Args:
+        pairs: Key/value pairs in document order.
+
+    Returns:
+        The object as a mapping.
+
+    Raises:
+        _DuplicateCursorKey: If any key appears more than once.
+    """
+
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateCursorKey(key)
+        result[key] = value
+    return result
+
+
+def _is_rank(value: object) -> bool:
+    """Return whether ``value`` is a usable rank (``bool`` is not an ``int`` here)."""
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _leaf_too_large(cursor: str) -> bool:
+    """Return whether one backend position exceeds the per-leaf byte ceiling."""
+
+    try:
+        return len(cursor.encode("utf-8")) > _LOG_CURSOR_MAX_VALUE_BYTES
+    except UnicodeEncodeError:
+        return True
+
+
+def decode_log_cursor(value: str, *, expected: CursorContext | None = None) -> CursorOutcome:
+    """Decode a log cursor into an explicit outcome.
+
+    The contract that matters: **only empty input decodes to**
+    :class:`CursorFresh`. Every other failure is named. A decoder that answers
+    "start from the beginning" for a truncated, oversized, unknown-version or
+    foreign cursor is indistinguishable from a first read, so a client whose
+    cursor was corrupted silently re-reads the whole journal and never learns
+    why.
+
+    Three wire shapes are accepted, discriminated without guessing:
+
+    * the DR-0002 bound envelope (``{"v": 2, "kind": ..., "positions": [...]}``),
+    * the draft envelope still emitted today (``{"version": 2, "cursors": [...]}``),
+      whose keys are disjoint from the bound one,
+    * the pre-envelope delimiter grammar, accepted only where it is reversible.
+
+    Args:
+        value: The cursor exactly as the client returned it.
+        expected: The read being served. ``None`` decodes structure only and
+            performs no binding checks, which is appropriate for a nested
+            fan-out level whose parent already validated the context.
+
+    Returns:
+        A :data:`CursorOutcome`.
+    """
+
+    return _decode_log_cursor(value, expected=expected, require_rank_witness=True)
+
+
+def _decode_log_cursor(
+    value: str,
+    *,
+    expected: CursorContext | None,
+    require_rank_witness: bool,
+) -> CursorOutcome:
+    """Run the decode, parameterized by how strictly legacy cursors are read."""
+
+    if not isinstance(value, str):
+        return CursorInvalid(CURSOR_MALFORMED, "a log cursor must be a string")
     if not value:
-        return None, {}
-    # Check characters first so a hostile non-ASCII value is rejected without
+        return CursorFresh()
+    # Character count first: a hostile non-ASCII value is rejected without
     # allocating up to four encoded bytes per code point.
     if len(value) > _LOG_CURSOR_MAX_BYTES:
-        return None, {}
+        return CursorInvalid(CURSOR_TOO_LARGE, "log cursor exceeds the size limit")
     try:
         if len(value.encode("utf-8")) > _LOG_CURSOR_MAX_BYTES:
-            return None, {}
+            return CursorInvalid(CURSOR_TOO_LARGE, "log cursor exceeds the size limit")
     except UnicodeEncodeError:
-        return None, {}
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor is not encodable as UTF-8")
     if value.startswith(_LOG_CURSOR_PREFIX):
-        return _split_v2_log_cursor(value.removeprefix(_LOG_CURSOR_PREFIX))
-    return _split_v1_log_cursor(value)
+        outcome = _decode_v2_log_cursor(value.removeprefix(_LOG_CURSOR_PREFIX))
+    else:
+        outcome = _decode_v1_log_cursor(value, expected=expected, require_rank_witness=require_rank_witness)
+    if not isinstance(outcome, CursorResume):
+        return outcome
+    return _bind(outcome, expected)
 
 
-def _split_v2_log_cursor(encoded: str) -> tuple[int | None, dict[int, str]]:
+def _decode_v2_log_cursor(encoded: str) -> CursorOutcome:
+    """Decode either base64url JSON envelope into positions."""
+
     if len(encoded) > _LOG_CURSOR_MAX_BYTES - len(_LOG_CURSOR_PREFIX):
-        return None, {}
+        return CursorInvalid(CURSOR_TOO_LARGE, "log cursor exceeds the size limit")
     try:
         padding = "=" * (-len(encoded) % 4)
         raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
-        if len(raw) > _LOG_CURSOR_MAX_BYTES:
-            return None, {}
-        document = json.loads(raw)
-    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, {}
-    if not isinstance(document, dict) or document.get("version") != _LOG_CURSOR_VERSION:
-        return None, {}
-    attempt = document.get("attempt")
-    entries = document.get("cursors")
-    if (
-        isinstance(attempt, bool)
-        or not isinstance(attempt, int)
-        or attempt < 0
-        or not isinstance(entries, list)
-        or len(entries) > _LOG_CURSOR_MAX_ENTRIES
-    ):
-        return None, {}
-    cursors: dict[int, str] = {}
+    except (ValueError, TypeError):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor is not valid base64url")
+    if len(raw) > _LOG_CURSOR_MAX_BYTES:
+        return CursorInvalid(CURSOR_TOO_LARGE, "log cursor exceeds the size limit")
+    try:
+        document = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except _DuplicateCursorKey as exc:
+        return CursorInvalid(CURSOR_DUPLICATE_KEY, f"log cursor repeats the key {exc.args[0]!r}")
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor does not contain a JSON document")
+    if not isinstance(document, dict):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor document is not an object")
+    strict = "v" in document
+    draft = "version" in document
+    if strict and draft:
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor declares two schema versions at once")
+    if strict:
+        return _decode_bound_envelope(document)
+    if draft:
+        return _decode_draft_envelope(document)
+    return CursorInvalid(CURSOR_UNSUPPORTED_VERSION, "log cursor document declares no version")
+
+
+def _check_keys(document: dict[str, object], allowed: frozenset[str], required: frozenset[str]) -> CursorInvalid | None:
+    """Enforce a closed key set.
+
+    Args:
+        document: The decoded JSON object.
+        allowed: Every key the schema defines.
+        required: The subset that must be present.
+
+    Returns:
+        The refusal, or ``None`` when the key set is exact.
+    """
+
+    unknown = sorted(set(document) - allowed)
+    if unknown:
+        return CursorInvalid(CURSOR_UNKNOWN_FIELD, f"log cursor carries unknown field(s): {', '.join(unknown)}")
+    missing = sorted(required - set(document))
+    if missing:
+        return CursorInvalid(CURSOR_MISSING_FIELD, f"log cursor is missing field(s): {', '.join(missing)}")
+    return None
+
+
+def _decode_bound_envelope(document: dict[str, object]) -> CursorOutcome:
+    """Decode the DR-0002 envelope: closed key set, one position per rank."""
+
+    failure = _check_keys(document, _STRICT_ENVELOPE_KEYS, _STRICT_ENVELOPE_REQUIRED)
+    if failure is not None:
+        return failure
+    version = document["v"]
+    # ``2.0 == 2`` and ``True == 1`` in Python, so identity of type is part of
+    # the version check rather than an afterthought.
+    if not isinstance(version, int) or isinstance(version, bool) or version != _LOG_CURSOR_VERSION:
+        return CursorInvalid(CURSOR_UNSUPPORTED_VERSION, f"log cursor version {version!r} is not supported")
+    kind = document["kind"]
+    if not isinstance(kind, str) or kind not in _KNOWN_CURSOR_KINDS:
+        return CursorInvalid(CURSOR_UNKNOWN_KIND, f"log cursor kind {kind!r} is not a known journal kind")
+    mode = document["mode"]
+    if not isinstance(mode, str) or mode not in _KNOWN_CURSOR_MODES:
+        return CursorInvalid(CURSOR_UNKNOWN_MODE, f"log cursor mode {mode!r} is not a known read mode")
+    attempt = document["attempt"]
+    if not _is_rank(attempt):
+        return CursorInvalid(CURSOR_INVALID_ATTEMPT, "log cursor attempt must be a non-negative integer")
+    topology = document.get("topology", "")
+    workload = document.get("workload", "")
+    if not isinstance(topology, str) or not isinstance(workload, str):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor topology and workload must be strings")
+    entries = document["positions"]
+    if not isinstance(entries, list):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor positions must be a list")
+    if len(entries) > _LOG_CURSOR_MAX_ENTRIES:
+        return CursorInvalid(CURSOR_TOO_MANY_POSITIONS, "log cursor exceeds the entry limit")
+    positions: list[CursorPosition] = []
+    seen: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return CursorInvalid(CURSOR_INVALID_POSITION, "log cursor position is not an object")
+        failure = _check_keys(entry, _STRICT_POSITION_KEYS, _STRICT_POSITION_REQUIRED)
+        if failure is not None:
+            return failure
+        rank = entry["rank"]
+        if not _is_rank(rank):
+            return CursorInvalid(CURSOR_INVALID_RANK, f"log cursor rank {rank!r} is not a non-negative integer")
+        if rank in seen:
+            return CursorInvalid(CURSOR_DUPLICATE_RANK, f"log cursor names rank {rank} twice")
+        cursor = entry["cursor"]
+        if not isinstance(cursor, str) or not cursor:
+            return CursorInvalid(CURSOR_INVALID_POSITION, f"log cursor for rank {rank} is not a non-empty string")
+        if _leaf_too_large(cursor):
+            return CursorInvalid(CURSOR_LEAF_TOO_LARGE, f"log cursor for rank {rank} exceeds the leaf size limit")
+        cell = entry.get("cell", "")
+        local = entry.get("local")
+        if not isinstance(cell, str):
+            return CursorInvalid(CURSOR_INVALID_POSITION, f"log cursor cell for rank {rank} is not a string")
+        if local is not None and not _is_rank(local):
+            return CursorInvalid(CURSOR_INVALID_RANK, f"log cursor local rank for rank {rank} is not valid")
+        seen.add(rank)
+        positions.append(CursorPosition(rank=rank, cursor=cursor, cell=cell, local=local))
+    return CursorResume(
+        positions=tuple(positions),
+        attempt=attempt,
+        version=_LOG_CURSOR_VERSION,
+        bound=True,
+        kind=kind,
+        mode=mode,
+        workload=workload,
+        topology=topology,
+    )
+
+
+def _decode_draft_envelope(document: dict[str, object]) -> CursorOutcome:
+    """Decode the ``[[rank, cursor], ...]`` envelope emitted before the binding.
+
+    Structurally as strict as the bound one; it simply carries no context, so
+    the resume it produces is reported as unbound rather than pretending the
+    read it names was checked.
+    """
+
+    failure = _check_keys(document, _DRAFT_ENVELOPE_KEYS, _DRAFT_ENVELOPE_KEYS)
+    if failure is not None:
+        return failure
+    version = document["version"]
+    if not isinstance(version, int) or isinstance(version, bool) or version != _LOG_CURSOR_VERSION:
+        return CursorInvalid(CURSOR_UNSUPPORTED_VERSION, f"log cursor version {version!r} is not supported")
+    attempt = document["attempt"]
+    if not _is_rank(attempt):
+        return CursorInvalid(CURSOR_INVALID_ATTEMPT, "log cursor attempt must be a non-negative integer")
+    entries = document["cursors"]
+    if not isinstance(entries, list):
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor entries must be a list")
+    if len(entries) > _LOG_CURSOR_MAX_ENTRIES:
+        return CursorInvalid(CURSOR_TOO_MANY_POSITIONS, "log cursor exceeds the entry limit")
+    positions: list[CursorPosition] = []
+    seen: set[int] = set()
     for entry in entries:
         if not isinstance(entry, list) or len(entry) != 2:
-            return None, {}
+            return CursorInvalid(CURSOR_INVALID_POSITION, "log cursor entry is not a [rank, cursor] pair")
         rank, cursor = entry
-        if (
-            isinstance(rank, bool)
-            or not isinstance(rank, int)
-            or rank < 0
-            or not isinstance(cursor, str)
-            or not cursor
-            or len(cursor) > _LOG_CURSOR_MAX_VALUE_BYTES
-            or rank in cursors
-        ):
-            return None, {}
-        try:
-            if len(cursor.encode("utf-8")) > _LOG_CURSOR_MAX_VALUE_BYTES:
-                return None, {}
-        except UnicodeEncodeError:
-            return None, {}
-        cursors[rank] = cursor
-    return attempt, cursors
+        if not _is_rank(rank):
+            return CursorInvalid(CURSOR_INVALID_RANK, f"log cursor rank {rank!r} is not a non-negative integer")
+        if rank in seen:
+            return CursorInvalid(CURSOR_DUPLICATE_RANK, f"log cursor names rank {rank} twice")
+        if not isinstance(cursor, str) or not cursor:
+            return CursorInvalid(CURSOR_INVALID_POSITION, f"log cursor for rank {rank} is not a non-empty string")
+        if _leaf_too_large(cursor):
+            return CursorInvalid(CURSOR_LEAF_TOO_LARGE, f"log cursor for rank {rank} exceeds the leaf size limit")
+        seen.add(rank)
+        positions.append(CursorPosition(rank=rank, cursor=cursor))
+    return CursorResume(positions=tuple(positions), attempt=attempt, version=_LOG_CURSOR_VERSION, bound=False)
 
 
-def _split_v1_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
-    """Decode the unprefixed delimiter-based v1 and its single-rank predecessor."""
+def _decode_v1_log_cursor(
+    value: str,
+    *,
+    expected: CursorContext | None,
+    require_rank_witness: bool = True,
+) -> CursorOutcome:
+    """Decode the pre-envelope grammar, only where it is reversible.
+
+    Two shapes existed. ``"{attempt}:{cursor}"`` has exactly one reading and is
+    always accepted -- this is what makes a journald cursor such as ``s=...``
+    work. ``"{attempt}:{rank}={cursor}|..."`` nests an unescaped delimiter
+    grammar inside opaque leaves, so ``"3:0=a|1=b"`` is equally readable as one
+    rank whose cursor is ``a|1=b``. It is decoded only when the caller supplies
+    the rank set that makes the split reversible; otherwise DR-0002 requires
+    ``cursor_reset_required`` rather than a guess.
+
+    Args:
+        value: The cursor as received.
+        expected: The read being served; its ``ranks`` are the reversibility
+            witness for a multi-rank legacy cursor.
+        require_rank_witness: Demand that witness. The pre-outcome
+            :func:`split_log_cursor` shim clears it so an upgrade does not turn
+            every retained legacy cursor into a silent restart at a call site
+            that cannot report the refusal.
+    """
 
     attempt_text, separator, remainder = value.partition(":")
     if not separator:
-        return None, {}
-    try:
-        attempt = int(attempt_text)
-    except ValueError:
-        return None, {}
-    if attempt < 0:
-        return None, {}
+        return CursorInvalid(CURSOR_MALFORMED, "log cursor carries no attempt")
+    if not _CANONICAL_DECIMAL.match(attempt_text):
+        return CursorInvalid(CURSOR_INVALID_ATTEMPT, f"log cursor attempt {attempt_text!r} is not a decimal integer")
+    attempt = int(attempt_text)
     if not remainder:
-        return attempt, {}
+        return CursorResume(attempt=attempt, version=1)
     if not _LEGACY_RANK_PREFIX.match(remainder):
-        if len(remainder.encode("utf-8")) > _LOG_CURSOR_MAX_VALUE_BYTES:
-            return None, {}
-        return attempt, {0: remainder}
-    if remainder.count("|") + 1 > _LOG_CURSOR_MAX_ENTRIES:
-        return None, {}
-    cursors: dict[int, str] = {}
-    for entry in remainder.split("|"):
-        rank_text, assigned, cursor = entry.partition("=")
-        if not assigned or not cursor:
-            continue
-        try:
-            if len(cursor.encode("utf-8")) > _LOG_CURSOR_MAX_VALUE_BYTES:
-                return None, {}
-            rank = int(rank_text)
-        except (UnicodeEncodeError, ValueError):
-            continue
-        if rank >= 0:
-            cursors[rank] = cursor
-    return attempt, cursors
+        if _leaf_too_large(remainder):
+            return CursorInvalid(CURSOR_LEAF_TOO_LARGE, "log cursor exceeds the leaf size limit")
+        return CursorResume(positions=(CursorPosition(rank=0, cursor=remainder),), attempt=attempt, version=1)
+    pieces = remainder.split("|")
+    if len(pieces) > _LOG_CURSOR_MAX_ENTRIES:
+        return CursorInvalid(CURSOR_TOO_MANY_POSITIONS, "log cursor exceeds the entry limit")
+    positions: list[CursorPosition] = []
+    seen: set[int] = set()
+    for piece in pieces:
+        rank_text, assigned, cursor = piece.partition("=")
+        if not assigned or not cursor or not _CANONICAL_DECIMAL.match(rank_text):
+            return CursorInvalid(CURSOR_RESET_REQUIRED, f"legacy log cursor piece {piece!r} is not rank=cursor")
+        if _LEGACY_NESTED_LEAF.match(cursor) or cursor.startswith(_LOG_CURSOR_PREFIX):
+            return CursorInvalid(CURSOR_RESET_REQUIRED, f"legacy log cursor nests a cursor at rank {rank_text}")
+        if _leaf_too_large(cursor):
+            return CursorInvalid(CURSOR_LEAF_TOO_LARGE, "log cursor exceeds the leaf size limit")
+        rank = int(rank_text)
+        if rank in seen:
+            return CursorInvalid(CURSOR_DUPLICATE_RANK, f"legacy log cursor names rank {rank} twice")
+        seen.add(rank)
+        positions.append(CursorPosition(rank=rank, cursor=cursor))
+    if len(positions) > 1:
+        if expected is None or expected.ranks is None:
+            if require_rank_witness:
+                return CursorInvalid(
+                    CURSOR_RESET_REQUIRED,
+                    "a multi-rank legacy log cursor is reversible only against a known rank set",
+                )
+        elif seen != set(expected.ranks):
+            return CursorIncompatible(
+                CURSOR_RESET_REQUIRED,
+                "legacy log cursor rank set does not match this attempt's ranks",
+            )
+    return CursorResume(positions=tuple(positions), attempt=attempt, version=1)
 
 
-def join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
-    """Encode every backend position in a deterministic opaque v2 cursor.
+def _bind(resume: CursorResume, expected: CursorContext | None) -> CursorOutcome:
+    """Check a decoded cursor against the read it is being served for.
 
-    Empty when no rank reported one, which is distinct from a cursor pointing at
-    the start: resuming from empty means "wherever you were", and a start cursor
-    means "replay everything".
+    Base64 opacity is not authorization and not addressing. A cursor minted for
+    another workload, attempt, topology, kind or mode is structurally perfect and
+    still names positions in a journal this read is not looking at.
     """
 
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
-        raise ValueError("structured log cursor attempt must be a non-negative integer")
-    live: list[tuple[int, str]] = []
-    cursor_bytes_total = 0
-    for rank, cursor in cursors.items():
-        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+    if expected is None:
+        return resume
+    if resume.kind and expected.kind and resume.kind != expected.kind:
+        return CursorIncompatible(CURSOR_KIND_MISMATCH, f"log cursor was minted for kind {resume.kind!r}")
+    if resume.mode and expected.mode and resume.mode != expected.mode:
+        return CursorIncompatible(CURSOR_MODE_MISMATCH, f"log cursor was minted for the {resume.mode!r} read mode")
+    if resume.workload and expected.workload and resume.workload != expected.workload:
+        return CursorIncompatible(CURSOR_WORKLOAD_MISMATCH, f"log cursor was minted for workload {resume.workload!r}")
+    if resume.topology and expected.topology and resume.topology != expected.topology:
+        return CursorIncompatible(CURSOR_TOPOLOGY_CHANGED, "log cursor was minted for a different attempt topology")
+    if resume.attempt is not None and expected.attempt is not None and resume.attempt != expected.attempt:
+        return CursorIncompatible(CURSOR_ATTEMPT_CHANGED, f"log cursor belongs to attempt {resume.attempt}")
+    if expected.ranks is None:
+        return resume
+    allowed = set(expected.ranks)
+    unknown = sorted({position.rank for position in resume.positions} - allowed)
+    if unknown:
+        return CursorIncompatible(
+            CURSOR_UNKNOWN_RANK,
+            f"log cursor names rank(s) outside this attempt: {', '.join(str(rank) for rank in unknown)}",
+        )
+    missing = tuple(sorted(allowed - {position.rank for position in resume.positions}))
+    return CursorResume(
+        positions=resume.positions,
+        attempt=resume.attempt,
+        version=resume.version,
+        bound=resume.bound,
+        kind=resume.kind,
+        mode=resume.mode,
+        workload=resume.workload,
+        topology=resume.topology,
+        missing_ranks=missing,
+    )
+
+
+def split_log_cursor(value: str) -> tuple[int | None, dict[int, str]]:
+    """Decode a cursor, collapsing every refusal into "start from the beginning".
+
+    Compatibility shim for call sites that predate :data:`CursorOutcome` and have
+    nowhere to put a refusal. It is *fail-open by construction*: an invalid or
+    incompatible cursor is reported as ``(None, {})``, which the caller cannot
+    tell apart from a first read. That is precisely the behaviour DR-0002 rules
+    out, so new code -- and every path that answers a client -- must call
+    :func:`decode_log_cursor` and act on the outcome.
+
+    Because it cannot report a refusal, this shim also keeps reading a
+    well-formed multi-rank legacy cursor without the rank-set witness
+    :func:`decode_log_cursor` demands. Tightening it here would silently restart
+    every retained legacy cursor mid-upgrade, which trades a wrong-position risk
+    for a guaranteed duplicate-output one.
+
+    Args:
+        value: The cursor exactly as the client returned it.
+
+    Returns:
+        The attempt (``None`` when unstated or undecodable) and the per-rank
+        backend positions.
+    """
+
+    outcome = _decode_log_cursor(value, expected=None, require_rank_witness=False)
+    if isinstance(outcome, CursorResume):
+        return outcome.attempt, outcome.cursors
+    return None, {}
+
+
+def log_cursor_v2_emission_enabled(environ: tp.Mapping[str, str] | None = None) -> bool:
+    """Return whether the fully bound v2 envelope may be emitted.
+
+    Off unless explicitly enabled. Stage one of the DR-0002 rollout ships the
+    decoder everywhere while emission keeps the draft shape, so no serving or
+    rollback image can meet a payload it cannot read.
+
+    Args:
+        environ: Environment to read; defaults to the process environment.
+
+    Returns:
+        True when emission of the bound envelope is enabled.
+    """
+
+    source = os.environ if environ is None else environ
+    return source.get(LOG_CURSOR_V2_EMISSION_ENV, "").strip().lower() in _TRUTHY
+
+
+def _validated_positions(
+    positions: tp.Mapping[int, str] | tp.Sequence[CursorPosition],
+) -> list[CursorPosition]:
+    """Normalize and bound an emission's positions.
+
+    Raises:
+        ValueError: If a rank, cursor, or the total size is unusable.
+    """
+
+    items = (
+        [CursorPosition(rank=rank, cursor=cursor) for rank, cursor in positions.items()]
+        if isinstance(positions, tp.Mapping)
+        else list(positions)
+    )
+    live: list[CursorPosition] = []
+    total = 0
+    for item in items:
+        if isinstance(item.rank, bool) or not isinstance(item.rank, int) or item.rank < 0:
             raise ValueError("structured log cursor ranks must be non-negative integers")
-        if not isinstance(cursor, str):
+        if not isinstance(item.cursor, str):
             raise ValueError("structured log backend cursors must be strings")
-        if not cursor:
+        if not item.cursor:
             continue
         try:
-            cursor_size = len(cursor.encode("utf-8"))
+            size = len(item.cursor.encode("utf-8"))
         except UnicodeEncodeError as exc:
             raise ValueError("structured log backend cursors must be valid UTF-8") from exc
-        if cursor_size > _LOG_CURSOR_MAX_VALUE_BYTES:
+        if size > _LOG_CURSOR_MAX_VALUE_BYTES:
             raise ValueError("structured log backend cursor exceeds the size limit")
-        cursor_bytes_total += cursor_size
-        if cursor_bytes_total > _LOG_CURSOR_MAX_BYTES:
+        total += size
+        if total > _LOG_CURSOR_MAX_BYTES:
             raise ValueError("structured log cursor exceeds the size limit")
-        live.append((rank, cursor))
-    if not live:
-        return ""
+        live.append(item)
+    if len({item.rank for item in live}) != len(live):
+        raise ValueError("structured log cursor ranks must be unique")
     if len(live) > _LOG_CURSOR_MAX_ENTRIES:
         raise ValueError("structured log cursor exceeds the entry limit")
-    live.sort(key=lambda entry: entry[0])
-    document = {"version": _LOG_CURSOR_VERSION, "attempt": attempt, "cursors": live}
-    raw = json.dumps(document, separators=(",", ":")).encode()
+    live.sort(key=lambda item: item.rank)
+    return live
+
+
+def _encode_envelope(document: dict[str, object]) -> str:
+    raw = json.dumps(document, separators=(",", ":"), sort_keys=False).encode()
     encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
     result = f"{_LOG_CURSOR_PREFIX}{encoded}"
     if len(result) > _LOG_CURSOR_MAX_BYTES:
         raise ValueError("structured log cursor exceeds the size limit")
     return result
+
+
+def encode_log_cursor(
+    positions: tp.Mapping[int, str] | tp.Sequence[CursorPosition],
+    *,
+    context: CursorContext | None = None,
+    bound: bool | None = None,
+) -> str:
+    """Encode every backend position in a deterministic opaque cursor.
+
+    Empty when no rank reported one, which is distinct from a cursor pointing at
+    the start: resuming from empty means "wherever you were", and a start cursor
+    means "replay everything".
+
+    Args:
+        positions: Backend positions, as ``{rank: cursor}`` or as
+            :class:`CursorPosition` records carrying cell/local diagnostics.
+        context: The read these positions belong to. Required for the bound
+            envelope, which records it.
+        bound: Emit the bound DR-0002 envelope. ``None`` consults
+            :func:`log_cursor_v2_emission_enabled`, which is off by default.
+
+    Returns:
+        The opaque cursor, or ``""`` when no rank reported a position.
+
+    Raises:
+        ValueError: If a rank, cursor, attempt, or the total size is unusable.
+    """
+
+    live = _validated_positions(positions)
+    if not live:
+        return ""
+    context = context or CursorContext()
+    if bound is None:
+        bound = log_cursor_v2_emission_enabled()
+    if not bound:
+        return _encode_envelope(
+            {
+                "version": _LOG_CURSOR_VERSION,
+                "attempt": context.attempt or 0,
+                "cursors": [[item.rank, item.cursor] for item in live],
+            }
+        )
+    if context.attempt is None:
+        raise ValueError("a bound structured log cursor requires an attempt")
+    if context.kind not in _KNOWN_CURSOR_KINDS:
+        raise ValueError(f"unknown structured log cursor kind {context.kind!r}")
+    if context.mode not in _KNOWN_CURSOR_MODES:
+        raise ValueError(f"unknown structured log cursor mode {context.mode!r}")
+    return _encode_envelope(
+        {
+            "v": _LOG_CURSOR_VERSION,
+            "kind": context.kind,
+            "attempt": context.attempt,
+            "topology": context.topology,
+            "mode": context.mode,
+            "workload": context.workload,
+            "positions": [
+                {"rank": item.rank, "cursor": item.cursor}
+                | ({"cell": item.cell} if item.cell else {})
+                | ({"local": item.local} if item.local is not None else {})
+                for item in live
+            ],
+        }
+    )
+
+
+def join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
+    """Encode every backend position for ``attempt`` in an opaque v2 cursor.
+
+    Kept as the positional entry point the fan-out executors already call. Which
+    envelope it writes is decided by :func:`log_cursor_v2_emission_enabled`, so
+    the rollout flips in one place rather than at every call site.
+
+    Args:
+        attempt: Attempt the positions were read from.
+        cursors: ``{rank: backend cursor}``; empty cursors are dropped.
+
+    Returns:
+        The opaque cursor, or ``""`` when no rank reported a position.
+
+    Raises:
+        ValueError: If the attempt, a rank, a cursor, or the total size is unusable.
+    """
+
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ValueError("structured log cursor attempt must be a non-negative integer")
+    return encode_log_cursor(cursors, context=CursorContext(attempt=attempt))
 
 
 def _stream_from_wire(value: object) -> LogStream:
@@ -296,6 +903,15 @@ def log_page_from_json(payload: object) -> LogPage:
     exception, for the same reason ``log_page`` returns one: a follower polling
     every second should not have to catch an exception to learn a host answered
     badly, and "unavailable" is the honest description of what it got.
+
+    An unusable ``rank`` is preserved as :data:`INVALID_LOG_RANK` rather than
+    coerced to ``0``, and a malformed ``truncated_ranks`` entry is preserved
+    rather than filtered out. Both normalisations produced the same failure: the
+    controller validates each rank against the cell's durable process width, so
+    a rank that was silently rewritten to zero -- or a truncation notice that was
+    silently dropped -- made a partial page look complete. An absent ``rank``
+    key is still the documented default of ``0``; only a *declared* rank that is
+    not a non-negative integer is invalid.
     """
 
     if not isinstance(payload, dict):
@@ -312,7 +928,7 @@ def log_page_from_json(payload: object) -> LogPage:
                 parsed = datetime.fromisoformat(stamp)
             except ValueError:
                 parsed = None
-        rank = item.get("rank")
+        rank = item.get("rank", 0)
         pid = item.get("pid")
         records.append(
             LogRecord(
@@ -325,21 +941,25 @@ def log_page_from_json(payload: object) -> LogPage:
                 stream=_stream_from_wire(item.get("stream")),
                 timestamp=parsed,
                 cursor=str(item.get("cursor", "")),
-                rank=rank if isinstance(rank, int) and not isinstance(rank, bool) else 0,
-                pid=pid if isinstance(pid, int) else None,
+                rank=rank if _is_rank(rank) else INVALID_LOG_RANK,
+                pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
             )
         )
     truncated = payload.get("truncated_ranks")
+    if truncated is None:
+        truncated_ranks: tuple[int, ...] = ()
+    elif isinstance(truncated, list):
+        truncated_ranks = tuple(rank if _is_rank(rank) else INVALID_LOG_RANK for rank in truncated)
+    else:
+        # A non-list truncation field is not "nothing was truncated". Reporting
+        # it as empty is how a half-read cell is presented as a whole one.
+        truncated_ranks = (INVALID_LOG_RANK,)
     return LogPage(
         records=tuple(records),
         next_cursor=str(payload.get("next_cursor", "")),
         unavailable=bool(payload.get("unavailable")),
         detail=str(payload.get("detail", "")),
-        truncated_ranks=tuple(
-            r
-            for r in (truncated if isinstance(truncated, list) else [])
-            if isinstance(r, int) and not isinstance(r, bool) and r >= 0
-        ),
+        truncated_ranks=truncated_ranks,
     )
 
 
@@ -458,10 +1078,49 @@ def _optional_int(value: object) -> int | None:
 
 
 __all__ = (
+    "CURSOR_ATTEMPT_CHANGED",
+    "CURSOR_DUPLICATE_KEY",
+    "CURSOR_DUPLICATE_RANK",
+    "CURSOR_INVALID_ATTEMPT",
+    "CURSOR_INVALID_POSITION",
+    "CURSOR_INVALID_RANK",
+    "CURSOR_KIND_MISMATCH",
+    "CURSOR_KIND_WORKLOAD_LOG",
+    "CURSOR_LEAF_TOO_LARGE",
+    "CURSOR_MALFORMED",
+    "CURSOR_MISSING_FIELD",
+    "CURSOR_MODE_ARCHIVE",
+    "CURSOR_MODE_LIVE",
+    "CURSOR_MODE_MISMATCH",
+    "CURSOR_RESET_REQUIRED",
+    "CURSOR_TOO_LARGE",
+    "CURSOR_TOO_MANY_POSITIONS",
+    "CURSOR_TOPOLOGY_CHANGED",
+    "CURSOR_UNKNOWN_FIELD",
+    "CURSOR_UNKNOWN_KIND",
+    "CURSOR_UNKNOWN_MODE",
+    "CURSOR_UNKNOWN_RANK",
+    "CURSOR_UNSUPPORTED_VERSION",
+    "CURSOR_WORKLOAD_MISMATCH",
+    "INVALID_LOG_RANK",
+    "LOG_CURSOR_V2_EMISSION_ENV",
+    "CursorContext",
+    "CursorFresh",
+    "CursorIncompatible",
+    "CursorInvalid",
+    "CursorOutcome",
+    "CursorPosition",
+    "CursorResume",
     "LogPage",
     "LogRecord",
     "LogStream",
+    "decode_log_cursor",
+    "encode_log_cursor",
+    "join_log_cursor",
+    "log_cursor_v2_emission_enabled",
+    "log_page_from_json",
     "merge_pages",
     "parse_journal_json",
+    "split_log_cursor",
     "stream_for_priority",
 )
