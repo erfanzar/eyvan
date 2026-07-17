@@ -15,6 +15,7 @@ import stat
 import tempfile
 import typing as tp
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -38,6 +39,7 @@ from eyvan.records import (
     QuotaRecord,
     RoleGrantRecord,
     UserProgressReport,
+    WorkloadAttemptTopology,
     WorkloadRecord,
     utcnow,
 )
@@ -47,6 +49,17 @@ from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, 
 
 LOCAL_CONTROL_PLANE_SCHEMA = "eyvan.control-plane"
 LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
+#: Emitted only once an attempt topology has actually been frozen.
+#:
+#: The document model is ``extra='forbid'``, so a new collection *inside* v2
+#: would make every state file written by this build unreadable to a rolled-back
+#: replica -- and it would put two different schemas behind one version tag, which
+#: is the ambiguity every reader here is written to refuse. A distinct version
+#: says the same thing honestly: an older build rejects it by version rather than
+#: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
+#: writing v2 documents an older build still reads.
+LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -220,8 +233,18 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
 
     @classmethod
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneDocument:
-        """Encode one in-process aggregate snapshot in deterministic identity order."""
+        """Encode one in-process aggregate snapshot in deterministic identity order.
 
+        Refuses a state carrying frozen attempt topologies rather than dropping
+        them. v2 has no place to put them, and a silent omission would turn a
+        durable rank map into an attempt that reports its topology as unknown
+        after one restart -- the exact failure the record exists to prevent.
+        Callers use :func:`local_control_plane_document`, which selects v3 when
+        there is something only v3 can carry.
+        """
+
+        if state.workload_topologies:
+            raise ValueError("frozen attempt topologies require the v3 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -290,7 +313,63 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
         return state
 
 
-_LocalControlPlaneReadableDocument: tp.TypeAlias = _LocalControlPlaneV1Document | LocalControlPlaneDocument
+class LocalControlPlaneV3Document(LocalControlPlaneDocument):
+    """Schema-v3 document: v2 plus the frozen per-attempt rank topologies.
+
+    Purely additive. Every v2 collection keeps its meaning and its ordering, so a
+    v3 document differs from the v2 one it replaces only by the presence of a
+    collection v2 could not express.
+    """
+
+    version: Literal[3] = LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION
+    workload_topologies: tuple[WorkloadAttemptTopology, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v3_document(self) -> LocalControlPlaneV3Document:
+        """Reject duplicate (workload, attempt) identities before restoration merges them."""
+
+        keys = [(item.workload_id, item.attempt) for item in self.workload_topologies]
+        if len(set(keys)) != len(keys):
+            raise ValueError("local control-plane attempt topologies must have unique workload/attempt identities")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV3Document:
+        """Encode one snapshot including every frozen attempt topology."""
+
+        topologies = tuple(state.workload_topologies[key] for key in sorted(state.workload_topologies))
+        without_topologies = replace(state, workload_topologies={})
+        base = LocalControlPlaneDocument.from_state(without_topologies)
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            workload_topologies=topologies,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v2 aggregates plus every frozen attempt rank space."""
+
+        state = super().to_state()
+        state.workload_topologies = {(record.workload_id, record.attempt): record for record in self.workload_topologies}
+        return state
+
+
+def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
+    """Return the lowest document version that can carry one whole state.
+
+    A fleet that has never frozen an attempt topology keeps emitting v2, which an
+    older build still reads; the first frozen topology moves the file to v3, and
+    an older build then refuses it by version instead of silently discarding a
+    durable rank map it does not understand.
+    """
+
+    if state.workload_topologies:
+        return LocalControlPlaneV3Document.from_state(state)
+    return LocalControlPlaneDocument.from_state(state)
+
+
+_LocalControlPlaneReadableDocument: tp.TypeAlias = (
+    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document
+)
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
 
@@ -348,7 +427,7 @@ class LocalControlPlaneStore:
             if self._existing_metadata() is not None:
                 existing_document, existing_snapshot = self._read_document()
 
-            document = LocalControlPlaneDocument.from_state(state).model_dump(mode="json", by_alias=True)
+            document = local_control_plane_document(state).model_dump(mode="json", by_alias=True)
             self._validate_json_depth(document, validate_integers=True)
             if not is_json_object(document):
                 raise LocalControlPlaneError("local Eyvan control-plane state did not serialize to a JSON object")
@@ -410,13 +489,16 @@ class LocalControlPlaneStore:
                     f"local Eyvan control-plane state {self.path} has an unsupported or missing schema"
                 )
             version = raw.get("version")
-            if type(version) is not int or version not in (1, LOCAL_CONTROL_PLANE_SCHEMA_VERSION):
+            if type(version) is not int or version not in LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS:
                 raise LocalControlPlaneSchemaError(
                     f"local Eyvan control-plane state {self.path} has an unsupported schema version"
                 )
-            model: type[_LocalControlPlaneReadableDocument]
-            model = _LocalControlPlaneV1Document if version == 1 else LocalControlPlaneDocument
-            document = model.model_validate(raw)
+            models: dict[int, type[_LocalControlPlaneReadableDocument]] = {
+                1: _LocalControlPlaneV1Document,
+                LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
+                LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
+            }
+            document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
             raise
         except (OSError, ValueError, RecursionError) as exc:
@@ -854,8 +936,10 @@ class LocalJsonRepository(StateRepository):
 
 __all__ = (
     "LOCAL_CONTROL_PLANE_MAX_BYTES",
+    "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
     "LocalControlPlaneAmbiguousCommitError",
     "LocalControlPlaneDocument",
@@ -864,7 +948,9 @@ __all__ = (
     "LocalControlPlaneLease",
     "LocalControlPlaneSchemaError",
     "LocalControlPlaneStore",
+    "LocalControlPlaneV3Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",
+    "local_control_plane_document",
 )

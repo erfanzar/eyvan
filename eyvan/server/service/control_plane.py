@@ -7516,6 +7516,15 @@ class ControlPlaneService:
         A report from a stale attempt is dropped rather than stored. Attempt 1
         finishing its last step after attempt 2 has started would otherwise walk
         the displayed progress backwards, which reads as a job that lost work.
+
+        The rank is checked against the attempt's frozen topology when there is
+        one. Progress correlates with logs, archives, and cursors through exactly
+        one rank space, so a report from a rank that space does not contain is
+        not a row to keep: it either names a process this attempt never launched
+        or it comes from a shape nobody can map back to a host. An attempt with
+        no frozen topology has no width to check against and is accepted as it
+        was before, because inventing one from today's cells would be the same
+        guess this refuses.
         """
 
         moment = now or utcnow()
@@ -7526,6 +7535,12 @@ class ControlPlaneService:
                 return next(
                     (item for item in existing if item.rank == rank),
                     UserProgressReport(rank=rank, attempt=workload.attempt),
+                )
+            topology = await tx.get_workload_topology(workload_id, workload.attempt)
+            if topology is not None and not topology.contains_rank(rank):
+                raise InputError(
+                    f"workload {workload_id!r} attempt {workload.attempt} has ranks "
+                    f"0..{topology.total_rank_count - 1}; rank {rank} is outside its frozen topology"
                 )
             report = UserProgressReport(
                 rank=rank,

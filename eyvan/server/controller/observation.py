@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import typing as tp
 import uuid
 from dataclasses import replace
@@ -36,8 +37,10 @@ from eyvan.records import (
     CoordinationKind,
     LeaseRecord,
     LeaseState,
+    WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
+    WorkloadTopologyCell,
     utcnow,
 )
 from eyvan.server.controller._support import (
@@ -80,6 +83,111 @@ from eyvan.worker.runtime.log_records import (
 #: carry their exact rank set and do not use this compatibility ceiling.
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+
+#: Enables emitting flat per-global-rank cursors instead of per-cell ones.
+#:
+#: Off by default, which is stage one of DR-0002's rollout: every build ships the
+#: decoder for both shapes first, and only a fleet whose entire serving *and*
+#: rollback set can read a flat cursor turns the writer on. The two shapes are
+#: self-describing (see ``_FLAT_POSITION_PREFIX``) so this replica can never
+#: confuse them, but an older replica cannot tell them apart -- it would read a
+#: global rank as a cell index and resume the wrong journal -- so a mixed fleet
+#: must keep emitting the old shape.
+_FLAT_LOG_CURSOR_ENV = "EYVAN_FLAT_LOG_CURSORS"
+
+#: Marks a leaf position in a flat per-global-rank cursor.
+#:
+#: The tag is what makes the flat and per-cell shapes distinguishable inside one
+#: opaque envelope, and it is deliberately not empty: the envelope codec drops
+#: empty values, so an "this rank has no position" leaf can only be preserved by
+#: writing something. Omitting it is what let a rank silently disappear from a
+#: cursor and then replay its whole journal on the next poll.
+_FLAT_POSITION_PREFIX = "eyvan-r1:"
+_FLAT_POSITION_UNAVAILABLE = "eyvan-r1!"
+
+#: What a page says about the rank identity it is serving.
+_TOPOLOGY_FROZEN = "frozen"
+_TOPOLOGY_UNKNOWN = "unknown"
+_TOPOLOGY_CHANGED = "changed"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _flat_log_cursors_enabled() -> bool:
+    """Return whether this replica emits flat per-global-rank cursors."""
+
+    return os.getenv(_FLAT_LOG_CURSOR_ENV, "").strip().lower() in _TRUTHY
+
+
+def _decode_controller_cursor(after: str) -> tuple[int | None, dict[int, str], bool, str]:
+    """Decode a log cursor into positions, saying which rank space they name.
+
+    Returns the attempt, the positions, whether they are flat per-global-rank
+    positions, and a refusal reason. Both shapes are accepted regardless of what
+    this replica emits, which is what makes a rollback safe: a cursor issued by a
+    replica running ahead still resolves to exact positions here rather than to a
+    guessed restart.
+
+    A cursor that carries *both* shapes is refused rather than resolved. It
+    cannot be produced by any single writer, and every way of interpreting it
+    resumes some rank from a journal that did not issue its position.
+    """
+
+    attempt, raw = _split_log_cursor(after)
+    if not raw:
+        return attempt, {}, False, ""
+    tagged = sum(
+        1 for value in raw.values() if value.startswith(_FLAT_POSITION_PREFIX) or value == _FLAT_POSITION_UNAVAILABLE
+    )
+    if tagged == 0:
+        return attempt, raw, False, ""
+    if tagged != len(raw):
+        return attempt, {}, True, "log cursor mixes flat global-rank positions with per-cell positions"
+    positions = {
+        rank: value.removeprefix(_FLAT_POSITION_PREFIX)
+        for rank, value in raw.items()
+        if value != _FLAT_POSITION_UNAVAILABLE
+    }
+    return attempt, positions, True, ""
+
+
+def _flat_cursor_values(positions: tp.Mapping[int, str], *, total_rank_count: int) -> dict[int, str]:
+    """Project per-rank positions onto exactly one leaf per expected global rank.
+
+    Every rank the frozen topology declares appears, including the ones with no
+    position: an absent entry is indistinguishable from a rank that was never
+    part of the attempt, and the reader that filled the gap with "start from the
+    beginning" is what made a temporarily unreachable host replay its journal.
+    """
+
+    return {
+        rank: f"{_FLAT_POSITION_PREFIX}{positions[rank]}" if positions.get(rank) else _FLAT_POSITION_UNAVAILABLE
+        for rank in range(total_rank_count)
+    }
+
+
+def _cell_leaf_positions(next_cursor: str, *, width: int) -> tuple[dict[int, str], bool]:
+    """Split one cell's returned cursor into per-local-rank leaf positions.
+
+    A single-process cell has exactly one position, so its whole opaque cursor
+    *is* that leaf and is never parsed -- which is also the only way a backend
+    cursor that happens to look like an envelope survives the round trip. A
+    multi-process cell must return the per-local-rank envelope its slice executor
+    writes; anything else cannot be attributed to a host, and guessing would give
+    one journal another journal's position.
+
+    The boolean says whether the value was understood. ``False`` means the caller
+    must retain the positions it already had rather than advance.
+    """
+
+    if not next_cursor:
+        return {}, True
+    if width == 1:
+        return {0: next_cursor}, True
+    _attempt, decoded = _split_log_cursor(next_cursor)
+    if not decoded or any(local >= width for local in decoded):
+        return {}, False
+    return decoded, True
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int, runtime_process_count: int = 1) -> LogPage:
@@ -151,6 +259,10 @@ def _log_page_document(
     attempt: int,
     attempt_changed: bool = False,
     cursors: tp.Mapping[int, str] | None = None,
+    topology_state: str = _TOPOLOGY_UNKNOWN,
+    topology_digest: str | None = None,
+    expected_ranks: int | None = None,
+    cursor_reset_required: bool = False,
 ) -> JsonObject:
     """Project a merged page onto the wire, carrying the attempt it belongs to.
 
@@ -158,6 +270,12 @@ def _log_page_document(
     from. The attempt has to travel with it: without it an attempt boundary is
     undetectable, and a follower resumes a retry from its predecessor's
     position.
+
+    ``topology`` and ``topology_state`` are additive and describe what the ranks
+    on this page mean. ``frozen`` says every rank names the process it named at
+    dispatch; ``unknown`` says the attempt predates the frozen record and its
+    rank identity is not proven; ``changed`` says the fleet no longer matches the
+    frozen map, so the page is explicitly incomplete rather than renumbered.
     """
 
     document: JsonObject = {
@@ -168,8 +286,44 @@ def _log_page_document(
         "unavailable": page.unavailable,
         "detail": page.detail,
         "truncated_ranks": list(page.truncated_ranks),
+        "topology_state": topology_state,
+        "topology": topology_digest,
+        "expected_ranks": expected_ranks,
+        # A follower that keeps sending a cursor Eyvan refused would be silently
+        # restarted on every poll. Saying so is the difference between "you are
+        # at the beginning" and "your position is not usable here".
+        "cursor_reset_required": cursor_reset_required,
+        "completeness_unknown": topology_state == _TOPOLOGY_UNKNOWN,
     }
     return document
+
+
+def _topology_mismatch(frozen: WorkloadTopologyCell, current: CellRecord, observed_endpoints: tuple[str, ...]) -> str:
+    """Return why a live cell no longer matches its frozen entry, or ``""``.
+
+    The comparison is the point of freezing at all. ``runtime_process_count`` is
+    rewritten by ordinary capacity observation, so a cell that reports a
+    different width mid-attempt would move every following cell's global ranks if
+    the offsets were recomputed. Here it makes the cell's own range explicitly
+    truncated and leaves every other rank exactly where it was.
+    """
+
+    if current.generation != frozen.generation:
+        return (
+            f"cell {frozen.cell_id} is at generation {current.generation}, "
+            f"not the generation {frozen.generation} this attempt was dispatched against"
+        )
+    if current.runtime_process_count != frozen.runtime_process_count:
+        return (
+            f"cell {frozen.cell_id} now reports {current.runtime_process_count} runtime processes, "
+            f"not the {frozen.runtime_process_count} frozen for this attempt"
+        )
+    if frozen.worker_endpoints and observed_endpoints != frozen.worker_endpoints:
+        return (
+            f"cell {frozen.cell_id} reports {len(observed_endpoints)} worker endpoints in a different order "
+            f"or count than the {len(frozen.worker_endpoints)} frozen for this attempt"
+        )
+    return ""
 
 
 class _ControllerObservation:
@@ -1113,21 +1267,41 @@ class _ControllerObservation:
         new one; a follower that kept using it would be shown the new attempt's
         first lines appended to the old attempt's tail, and would conclude the
         job had resumed where it left off.
+
+        Ranks come from the topology frozen at dispatch, never from whatever the
+        cells report now. An attempt with no frozen topology is served with its
+        rank identity reported as unknown rather than reconstructed: today's
+        cells cannot prove which host was rank N while that attempt started.
         """
 
         async with self.repository.transaction() as transaction:
             workload = await transaction.get_workload(workload_id)
+            topology = (
+                None if workload is None else await transaction.get_workload_topology(workload_id, workload.attempt)
+            )
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
+        frozen_state = _TOPOLOGY_UNKNOWN if topology is None else _TOPOLOGY_FROZEN
+        frozen_digest = None if topology is None else topology.digest
+        frozen_ranks = None if topology is None else topology.total_rank_count
         if workload.spec.secret_mounts:
             return _log_page_document(
                 LogPage(unavailable=True, detail=_SECRET_OUTPUT_SUPPRESSED),
                 attempt=workload.attempt,
+                topology_state=frozen_state,
+                topology_digest=frozen_digest,
+                expected_ranks=frozen_ranks,
             )
         if workload.remote_id is None:
-            return _log_page_document(LogPage(), attempt=workload.attempt)
+            return _log_page_document(
+                LogPage(),
+                attempt=workload.attempt,
+                topology_state=frozen_state,
+                topology_digest=frozen_digest,
+                expected_ranks=frozen_ranks,
+            )
 
-        requested_attempt, cursors = _split_log_cursor(after)
+        requested_attempt, cursors, cursor_is_flat, refusal = _decode_controller_cursor(after)
         attempt_changed = requested_attempt is not None and requested_attempt != workload.attempt
         if attempt_changed:
             # A retry runs a different execution; the old positions name lines
@@ -1147,7 +1321,202 @@ class _ControllerObservation:
                 await self._archived_log_page(workload),
                 attempt=workload.attempt,
                 attempt_changed=attempt_changed,
+                topology_state=frozen_state,
+                topology_digest=frozen_digest,
+                expected_ranks=frozen_ranks,
+                cursor_reset_required=bool(refusal),
             )
+        if topology is None:
+            return await self._unproven_log_page(
+                workload,
+                members,
+                cursors=cursors if not cursor_is_flat else {},
+                attempt_changed=attempt_changed,
+                cursor_reset_required=bool(refusal) or cursor_is_flat,
+                limit=limit,
+            )
+        return await self._frozen_log_page(
+            workload,
+            topology,
+            members,
+            positions=cursors,
+            cursor_is_flat=cursor_is_flat,
+            attempt_changed=attempt_changed,
+            refusal=refusal,
+            limit=limit,
+        )
+
+    async def _frozen_log_page(
+        self,
+        workload: WorkloadRecord,
+        topology: WorkloadAttemptTopology,
+        members: tp.Sequence[tuple[LeaseRecord, CellRecord]],
+        *,
+        positions: tp.Mapping[int, str],
+        cursor_is_flat: bool,
+        attempt_changed: bool,
+        refusal: str,
+        limit: int,
+    ) -> JsonObject:
+        """Serve one live page against the rank space frozen at dispatch.
+
+        Fan-out is grouped at the cell RPC boundary only. Inside this method
+        every position is a global rank: one per expected rank on the way out,
+        regrouped into a cell-local envelope for exactly as long as the request
+        to that cell is in flight, and mapped straight back afterwards.
+        """
+
+        if len(members) > 1:
+            # Keeps the gang's one-trusted-endpoint validation, whose failure is
+            # a configuration error rather than a page to serve.
+            self._ordered_gang_member_pairs(members)
+        current = {cell.id: cell for _lease, cell in members}
+        cursor_reset_required = bool(refusal)
+        if refusal:
+            positions = {}
+        elif not cursor_is_flat:
+            positions = self._positions_from_cell_cursors(topology, positions)
+
+        live: dict[int, str] = {
+            rank: value for rank, value in positions.items() if topology.contains_rank(rank) and value
+        }
+        pages: dict[int, LogPage] = {}
+        changed = False
+        for frozen in topology.cells:
+            offset = frozen.global_rank_offset
+            width = frozen.runtime_process_count
+            declared = tuple(range(offset, offset + width))
+            cell = current.get(frozen.cell_id)
+            mismatch = (
+                f"cell {frozen.cell_id} no longer holds this attempt"
+                if cell is None
+                else _topology_mismatch(frozen, cell, self._cell_worker_endpoints(cell))
+            )
+            if mismatch:
+                # Not renumbered and not dropped: the frozen range this cell owns
+                # is exactly what is missing, and every other rank keeps its
+                # identity and its position.
+                changed = True
+                pages[offset] = LogPage(unavailable=True, detail=mismatch, truncated_ranks=declared)
+                continue
+            try:
+                payload = await asyncio.to_thread(
+                    self._agent_factory(cell).log_page,
+                    cell.id,
+                    workload.remote_id,
+                    after=self._cell_after_cursor(live, frozen, attempt=workload.attempt),
+                    limit=limit,
+                )
+            except Exception as exc:
+                # The cell boundary failed before its inner ranks could answer;
+                # every frozen host is therefore explicitly truncated.
+                pages[offset] = LogPage(unavailable=True, detail=str(exc), truncated_ranks=declared)
+                continue
+            page = _log_page_from_document(payload, rank=offset, runtime_process_count=width)
+            leaves, understood = _cell_leaf_positions(page.next_cursor, width=width)
+            if not understood:
+                detail = f"cell {frozen.cell_id} returned a cursor its frozen worker order cannot explain"
+                page = LogPage(
+                    records=page.records,
+                    unavailable=page.unavailable,
+                    detail=f"{page.detail}; {detail}" if page.detail else detail,
+                    truncated_ranks=tuple(sorted(set(page.truncated_ranks) | set(declared))),
+                )
+            for local, leaf in leaves.items():
+                live[offset + local] = leaf
+            pages[offset] = page
+        return _log_page_document(
+            merge_pages(pages) if pages else LogPage(),
+            attempt=workload.attempt,
+            attempt_changed=attempt_changed,
+            cursors=(
+                _flat_cursor_values(live, total_rank_count=topology.total_rank_count)
+                if _flat_log_cursors_enabled()
+                else self._cell_cursors(topology, live, attempt=workload.attempt)
+            ),
+            topology_state=_TOPOLOGY_CHANGED if changed else _TOPOLOGY_FROZEN,
+            topology_digest=topology.digest,
+            expected_ranks=topology.total_rank_count,
+            cursor_reset_required=cursor_reset_required,
+        )
+
+    @staticmethod
+    def _cell_after_cursor(
+        positions: tp.Mapping[int, str],
+        frozen: WorkloadTopologyCell,
+        *,
+        attempt: int,
+    ) -> str:
+        """Regroup global-rank positions into what one cell understands."""
+
+        offset = frozen.global_rank_offset
+        leaves = {
+            local: positions[offset + local]
+            for local in range(frozen.runtime_process_count)
+            if positions.get(offset + local)
+        }
+        if frozen.runtime_process_count == 1:
+            return leaves.get(0, "")
+        return _join_log_cursor(attempt, leaves)
+
+    @classmethod
+    def _cell_cursors(
+        cls,
+        topology: WorkloadAttemptTopology,
+        positions: tp.Mapping[int, str],
+        *,
+        attempt: int,
+    ) -> dict[int, str]:
+        """Encode positions in the per-cell shape a pre-flat replica understands."""
+
+        encoded: dict[int, str] = {}
+        for index, frozen in enumerate(topology.cells):
+            value = cls._cell_after_cursor(positions, frozen, attempt=attempt)
+            if value:
+                encoded[index] = value
+        return encoded
+
+    @staticmethod
+    def _positions_from_cell_cursors(
+        topology: WorkloadAttemptTopology,
+        cursors: tp.Mapping[int, str],
+    ) -> dict[int, str]:
+        """Read per-cell positions back into the one global rank space.
+
+        The decoder half of the rollout: a cursor issued before flat emission is
+        resolved to exact per-rank positions rather than restarted, which is what
+        lets a replica move in either direction without replaying a journal.
+        """
+
+        positions: dict[int, str] = {}
+        for index, frozen in enumerate(topology.cells):
+            value = cursors.get(index, "")
+            leaves, understood = _cell_leaf_positions(value, width=frozen.runtime_process_count)
+            if not understood:
+                continue
+            for local, leaf in leaves.items():
+                positions[frozen.global_rank_offset + local] = leaf
+        return positions
+
+    async def _unproven_log_page(
+        self,
+        workload: WorkloadRecord,
+        members: tp.Sequence[tuple[LeaseRecord, CellRecord]],
+        *,
+        cursors: tp.Mapping[int, str],
+        attempt_changed: bool,
+        cursor_reset_required: bool,
+        limit: int,
+    ) -> JsonObject:
+        """Serve an attempt dispatched before its rank space was ever frozen.
+
+        The offsets here are recomputed from live cells, which is exactly the
+        thing the frozen record exists to stop -- so the page says so. Nothing is
+        written back: reconstructing a map from today's inventory and storing it
+        would turn an unproven guess into a durable claim, and this attempt's
+        cells may already have been reconciled to a different width.
+        """
+
         # ``_ordered_gang_member_pairs`` validates a *gang* -- it refuses fewer
         # than two cells -- so a single-cell workload uses its one member
         # directly. The gang path gets the deterministic cell ordering that
@@ -1194,6 +1563,10 @@ class _ControllerObservation:
             attempt=workload.attempt,
             attempt_changed=attempt_changed,
             cursors=advanced,
+            topology_state=_TOPOLOGY_UNKNOWN,
+            topology_digest=None,
+            expected_ranks=None,
+            cursor_reset_required=cursor_reset_required,
         )
 
     async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:

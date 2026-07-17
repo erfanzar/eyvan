@@ -31,6 +31,7 @@ EXPECTED_TABLES = (
     "outbox",
     "audit_events",
     "capacity_pools",
+    "workload_topologies",
 )
 
 

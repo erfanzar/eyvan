@@ -32,6 +32,7 @@ from eyvan.records import (
     QuotaRecord,
     RoleGrantRecord,
     UserProgressReport,
+    WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
     utcnow,
@@ -64,6 +65,11 @@ class ControlPlaneState:
     #: workload id -> rank -> latest report. Keyed by rank so a new report for a
     #: rank replaces the old one rather than accumulating.
     progress_reports: dict[str, dict[int, UserProgressReport]] = field(default_factory=dict)
+    #: (workload id, attempt) -> the rank space that attempt was dispatched
+    #: against. Written once at dispatch and never derived from live cells: a
+    #: cell whose observed process width changes mid-attempt must not renumber
+    #: the ranks of the cells after it.
+    workload_topologies: dict[tuple[str, int], WorkloadAttemptTopology] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
@@ -245,6 +251,15 @@ class StateSession(RepositorySession):
     async def list_progress_reports(self, workload_id: str) -> list[UserProgressReport]:
         reports = self._state.progress_reports.get(workload_id, {})
         return [reports[rank] for rank in sorted(reports)]
+
+    async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
+        return self._state.workload_topologies.get((workload_id, attempt))
+
+    async def put_workload_topology(self, topology: WorkloadAttemptTopology) -> None:
+        self._state.workload_topologies[(topology.workload_id, topology.attempt)] = topology
+
+    async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
+        return [topology for key, topology in sorted(self._state.workload_topologies.items()) if key[0] == workload_id]
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         return self._state.plane_peers.get(plane_id)

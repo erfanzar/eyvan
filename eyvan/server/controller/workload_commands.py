@@ -20,6 +20,7 @@ from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
 )
 from eyvan.records import (
+    MAX_ATTEMPT_RANK_COUNT,
     AuditEvent,
     CellRecord,
     CellState,
@@ -27,9 +28,11 @@ from eyvan.records import (
     LeaseState,
     OutboxRecord,
     OutboxState,
+    WorkloadAttemptTopology,
     WorkloadDispatchReservation,
     WorkloadRecord,
     WorkloadState,
+    WorkloadTopologyCell,
     WorkspaceRef,
     utcnow,
 )
@@ -70,6 +73,18 @@ _SECRET_MATERIALIZING_EXECUTORS = frozenset({"eyvan-native"})
 #: aggregate *and* of the exact at-least-once delivery that contacted the agent.
 _DISPATCH_RESERVATION_KEY = "dispatch_reservation"
 _RETRIABLE_DISPATCH_OUTBOX_STATES = frozenset({OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED})
+
+
+class AttemptRankSpaceTooLarge(RuntimeError):
+    """The composed rank space of an attempt is above the ceiling.
+
+    Permanent by construction: the width comes from the leased cells, so retrying
+    the same dispatch produces the same refusal. The outbox retries a failed
+    command forever with a capped backoff, so raising a bare error here would hold
+    the lease and keep the cell undeletable indefinitely -- the same stuck-lease
+    shape that already blocks ``eyvan down``. Dispatch settles the workload as
+    failed instead of retrying it.
+    """
 
 
 class _ControllerWorkloadCommands:
@@ -124,6 +139,85 @@ class _ControllerWorkloadCommands:
             )
             for lease, cell in cls._ordered_gang_member_pairs(members)
         )
+
+    @staticmethod
+    def _cell_worker_endpoints(cell: CellRecord) -> tuple[str, ...]:
+        """Return one cell's ordered per-host identities, when the provider names them.
+
+        Only a declared list that is exactly as long as the cell's durable
+        runtime process width counts. A shorter list is the defect this guards
+        against -- it would freeze a narrower rank space than the cell actually
+        runs -- and a longer one describes hosts the width says are not there.
+        Anything else is recorded as unknown rather than padded or truncated.
+        """
+
+        declared = cell.provider_options.get("hosts")
+        if not isinstance(declared, list) or len(declared) != cell.runtime_process_count:
+            return ()
+        endpoints = tuple(entry.strip() for entry in declared if isinstance(entry, str) and entry.strip())
+        if len(endpoints) != cell.runtime_process_count or len(set(endpoints)) != len(endpoints):
+            return ()
+        return endpoints
+
+    @classmethod
+    def _freeze_attempt_topology(
+        cls,
+        workload: WorkloadRecord,
+        cells: tp.Sequence[CellRecord],
+    ) -> WorkloadAttemptTopology:
+        """Capture the rank space this attempt is about to be dispatched onto.
+
+        Once, here, and never recomputed. Reading the widths back from live cell
+        records is what let a reconciliation that changed one cell's observed
+        process count shift every later cell's global ranks mid-attempt, so two
+        pages of one attempt disagreed about which host was rank N.
+
+        Also the only place the *total* rank count is bounded. The per-cell and
+        per-group ceilings are each 10,000 and compose into a hundred million
+        ranks; every one of those would be a cursor position and an archive
+        object, so the composed width is refused before anything is launched.
+        """
+
+        try:
+            return WorkloadAttemptTopology.freeze(
+                workload_id=workload.id,
+                attempt=workload.attempt,
+                generation=workload.generation,
+                cells=[
+                    WorkloadTopologyCell(
+                        cell_id=cell.id,
+                        generation=cell.generation,
+                        runtime_process_count=cell.runtime_process_count,
+                        global_rank_offset=0,
+                        worker_endpoints=cls._cell_worker_endpoints(cell),
+                    )
+                    for cell in cells
+                ],
+            )
+        except ValueError as exc:
+            raise AttemptRankSpaceTooLarge(
+                f"workload {workload.id!r} cannot be dispatched with a bounded rank space "
+                f"(ceiling {MAX_ATTEMPT_RANK_COUNT}): {exc}"
+            ) from exc
+
+    async def _persist_attempt_topology(
+        self,
+        transaction: RepositorySession,
+        workload: WorkloadRecord,
+        cells: tp.Sequence[CellRecord],
+    ) -> WorkloadAttemptTopology:
+        """Durably freeze this attempt's rank space in the reservation transaction.
+
+        Written before the submit RPC and in the same transaction as the dispatch
+        reservation, so an attempt can never be running with no proof of the map
+        its ranks mean. Re-preparing the same attempt rewrites it: this path only
+        runs while the attempt has no remote id, and the topology that matters is
+        the one the process that actually started was launched against.
+        """
+
+        topology = self._freeze_attempt_topology(workload, cells)
+        await transaction.put_workload_topology(topology)
+        return topology
 
     async def _load_workload_members(
         self,
@@ -694,6 +788,7 @@ class _ControllerWorkloadCommands:
                 workload,
                 reservation,
             )
+            await self._persist_attempt_topology(transaction, reserved, (cell,))
             entrypoint, environment = self._render_execution(reserved, runtime_environment=cell.runtime.env)
             request = WorkloadRequest(
                 mutation=self._mutation(command, lease.fencing_token),
@@ -791,6 +886,7 @@ class _ControllerWorkloadCommands:
                 workload,
                 reservation,
             )
+            await self._persist_attempt_topology(transaction, reserved, concrete_cells)
             entrypoint, environment = self._render_execution(reserved, runtime_environment=leader_cell.runtime.env)
             spec = {
                 "entrypoint": entrypoint,
@@ -971,6 +1067,37 @@ class _ControllerWorkloadCommands:
                 )
             )
 
+    async def _settle_unlaunchable_attempt(
+        self,
+        command: OutboxRecord,
+        lease_ids: tp.Sequence[str],
+        refusal: AttemptRankSpaceTooLarge,
+    ) -> None:
+        """Fail a workload whose rank space can never be dispatched.
+
+        Retrying is pointless -- the width is a property of the leased cells --
+        and a command that retries forever holds the lease, which keeps the cell
+        draining and blocks ``eyvan down``. Settling here converts a permanent
+        refusal into a terminal state with the reason attached, so the capacity
+        comes back and the operator is told what to change.
+        """
+
+        workload_id = str(command.payload["workload_id"])
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+            lease = await transaction.get_lease(str(lease_ids[0])) if lease_ids else None
+        if workload is None or lease is None:
+            raise StaleOutboxCommand("unlaunchable attempt references a missing workload or lease")
+        if workload.generation != command.generation:
+            raise StaleOutboxCommand(f"workload generation is {workload.generation}, command is {command.generation}")
+        await self._release_terminal(
+            workload,
+            lease,
+            WorkloadState.FAILED,
+            "workload.failed",
+            failure_reason=str(refusal),
+        )
+
     async def _dispatch_workload(self, command: OutboxRecord) -> None:
         lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
         if len(lease_ids) > 1:
@@ -978,7 +1105,11 @@ class _ControllerWorkloadCommands:
             return
         lease_id = str(command.payload["lease_id"])
         recovered_cells = await self._recover_quarantined_dispatch_cells(command, (lease_id,))
-        prepared = await self._prepare_single_dispatch(command, recovered_cells=recovered_cells)
+        try:
+            prepared = await self._prepare_single_dispatch(command, recovered_cells=recovered_cells)
+        except AttemptRankSpaceTooLarge as exc:
+            await self._settle_unlaunchable_attempt(command, (lease_id,), exc)
+            return
         if prepared is None:
             return
         _workload, _lease, cell, request, reservation = prepared
@@ -993,7 +1124,11 @@ class _ControllerWorkloadCommands:
         """Launch one no-Ray native JAX job across independently leased cells."""
 
         recovered_cells = await self._recover_quarantined_dispatch_cells(command, lease_ids)
-        prepared = await self._prepare_gang_dispatch(command, lease_ids, recovered_cells=recovered_cells)
+        try:
+            prepared = await self._prepare_gang_dispatch(command, lease_ids, recovered_cells=recovered_cells)
+        except AttemptRankSpaceTooLarge as exc:
+            await self._settle_unlaunchable_attempt(command, lease_ids, exc)
+            return
         if prepared is None:
             return
         _workload, _members, _cells, coordinator_lease, coordinator_cell, request, reservation = prepared

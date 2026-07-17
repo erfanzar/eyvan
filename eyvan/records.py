@@ -1129,6 +1129,178 @@ class WorkloadDispatchReservation(EyvanModel):
         return self
 
 
+#: Ceiling on how many global ranks one workload attempt may declare.
+#:
+#: ``WorkloadDefinition.cell_group_count`` and ``CellRecord.runtime_process_count``
+#: are each bounded at 10,000, and nothing bounded their *product*: a 10,000-cell
+#: group of 10,000-process cells is a hundred million ranks, and every one of them
+#: is a cursor position, an archive object, and a progress row. The composed total
+#: is what the log, cursor, and archive contracts actually pay for, so the total is
+#: what is bounded -- once, before dispatch, rather than per factor.
+#:
+#: Also deliberately below the opaque log cursor's own entry ceiling. One flat
+#: cursor carries one position per expected global rank, so an attempt wider than
+#: that ceiling could be dispatched and then never resumed.
+MAX_ATTEMPT_RANK_COUNT = 4096
+
+
+class WorkloadTopologyCell(EyvanModel):
+    """One cell's frozen contribution to an attempt's global rank space."""
+
+    cell_id: str = Field(max_length=96)
+    #: The cell generation this attempt was dispatched against. A later
+    #: generation is a different machine, so a page read against it is not the
+    #: same rank space even when the identifier matches.
+    generation: int = Field(ge=1)
+    #: Runtime/native-worker processes this cell contributed, copied once at
+    #: dispatch. Reading ``CellRecord.runtime_process_count`` later instead is
+    #: the defect this record exists to remove: an observation may overwrite it,
+    #: which silently shifts every following cell's global ranks.
+    #:
+    #: Bounded exactly like the cell field it copies, deliberately *not* at the
+    #: attempt ceiling: a per-factor limit here would report an over-wide attempt
+    #: as a malformed cell rather than as the composed width that is actually too
+    #: large, which is the diagnosis an operator needs.
+    runtime_process_count: int = Field(ge=1, le=10_000, strict=True)
+    #: First global rank owned by this cell. ``global = offset + local_rank``.
+    global_rank_offset: int = Field(ge=0)
+    #: Ordered per-host identities the control plane could observe at dispatch.
+    #: Empty when the provider does not expose them -- an unknown order is
+    #: recorded as unknown rather than invented, and a later comparison then
+    #: falls back to the counts and generations that *are* durable.
+    worker_endpoints: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_cell(self) -> WorkloadTopologyCell:
+        _validate_string(self.cell_id, field_name="topology cell id")
+        _validate_strings(self.worker_endpoints, field_name="topology worker endpoints")
+        if self.worker_endpoints and len(self.worker_endpoints) != self.runtime_process_count:
+            raise ValueError("topology worker endpoints must match the cell runtime process count")
+        if len(set(self.worker_endpoints)) != len(self.worker_endpoints):
+            raise ValueError("topology worker endpoints must not contain duplicates")
+        return self
+
+
+class WorkloadAttemptTopology(EyvanModel):
+    """The rank space one workload attempt was dispatched against, frozen once.
+
+    Durable and additive: a control plane that predates this record simply never
+    reads the table, which is what makes it safe to write during a rolling
+    upgrade. The alternative -- a new field on ``WorkloadRecord`` -- is not, because
+    the persisted workload document is decoded with ``extra='forbid'`` and the
+    first write would make every workload unreadable to a rolled-back replica.
+
+    An attempt with no row is *unknown*, never reconstructed. Recomputing the map
+    from today's cells is precisely the bug: a reconciliation that changes one
+    cell's process width moves every later cell's ranks, so two pages of one
+    attempt disagree about which host is rank N.
+    """
+
+    workload_id: str = Field(max_length=96)
+    attempt: int = Field(ge=1)
+    #: Workload generation at dispatch. Together with ``attempt`` this is the
+    #: exact execution the ranks describe.
+    generation: int = Field(ge=1)
+    cells: tuple[WorkloadTopologyCell, ...] = Field(min_length=1)
+    total_rank_count: int = Field(ge=1, le=MAX_ATTEMPT_RANK_COUNT)
+    #: ``sha256:<hex>`` over the ordered cell identities and the total width.
+    #: Carried on every page so a follower can detect that it is reading a
+    #: different rank space than the one its cursor was issued against.
+    digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    frozen_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_topology(self) -> WorkloadAttemptTopology:
+        _validate_string(self.workload_id, field_name="topology workload id")
+        identifiers = [cell.cell_id for cell in self.cells]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("attempt topology cells must not repeat a cell id")
+        if identifiers != sorted(identifiers):
+            raise ValueError("attempt topology cells must be ordered by cell id")
+        offset = 0
+        for cell in self.cells:
+            if cell.global_rank_offset != offset:
+                raise ValueError("attempt topology rank offsets must be contiguous from zero")
+            offset += cell.runtime_process_count
+        if offset != self.total_rank_count:
+            raise ValueError("attempt topology total rank count must equal the sum of cell widths")
+        if self.digest != topology_digest(self.cells, total_rank_count=self.total_rank_count):
+            raise ValueError("attempt topology digest does not describe its cells")
+        return self
+
+    @classmethod
+    def freeze(
+        cls,
+        *,
+        workload_id: str,
+        attempt: int,
+        generation: int,
+        cells: tp.Sequence[WorkloadTopologyCell],
+        frozen_at: datetime | None = None,
+    ) -> WorkloadAttemptTopology:
+        """Build one attempt topology, computing offsets, width, and digest."""
+
+        ordered = sorted(cells, key=lambda cell: cell.cell_id)
+        placed: list[WorkloadTopologyCell] = []
+        offset = 0
+        for cell in ordered:
+            placed.append(cell.model_copy(update={"global_rank_offset": offset}))
+            offset += cell.runtime_process_count
+        if offset > MAX_ATTEMPT_RANK_COUNT:
+            raise ValueError(
+                f"workload attempt declares {offset} global ranks, above the {MAX_ATTEMPT_RANK_COUNT} rank ceiling"
+            )
+        frozen = tuple(placed)
+        return cls(
+            workload_id=workload_id,
+            attempt=attempt,
+            generation=generation,
+            cells=frozen,
+            total_rank_count=offset,
+            digest=topology_digest(frozen, total_rank_count=offset),
+            frozen_at=frozen_at or utcnow(),
+        )
+
+    def cell_for_rank(self, rank: int) -> WorkloadTopologyCell | None:
+        """Return the frozen cell owning one global rank, or ``None``."""
+
+        for cell in self.cells:
+            if cell.global_rank_offset <= rank < cell.global_rank_offset + cell.runtime_process_count:
+                return cell
+        return None
+
+    def contains_rank(self, rank: int) -> bool:
+        """Return whether one global rank exists in this frozen rank space."""
+
+        return isinstance(rank, int) and not isinstance(rank, bool) and 0 <= rank < self.total_rank_count
+
+
+def topology_digest(cells: tp.Sequence[WorkloadTopologyCell], *, total_rank_count: int) -> str:
+    """Return the stable digest of one ordered attempt topology.
+
+    Covers cell identity, generation, width, offset, and any observed worker
+    order -- everything a global rank means. Two attempts with the same digest
+    name the same physical process for the same rank; two with different digests
+    are not comparable and no cursor crosses between them.
+    """
+
+    payload = {
+        "total_rank_count": total_rank_count,
+        "cells": [
+            {
+                "cell_id": cell.cell_id,
+                "generation": cell.generation,
+                "runtime_process_count": cell.runtime_process_count,
+                "global_rank_offset": cell.global_rank_offset,
+                "worker_endpoints": list(cell.worker_endpoints),
+            }
+            for cell in cells
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 class WorkloadRecord(EyvanModel):
     """Persisted workload aggregate."""
 
