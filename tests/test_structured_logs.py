@@ -380,9 +380,10 @@ def test_a_workload_with_no_durable_record_is_unavailable_rather_than_silent(tmp
 
 
 def _cursor_helpers():
-    from eyvan.server.controller.observation import _log_page_document, _split_log_cursor
+    from eyvan.server.controller.observation import _log_page_document
+    from eyvan.worker.runtime.log_records import split_log_cursor
 
-    return _split_log_cursor, _log_page_document
+    return split_log_cursor, _log_page_document
 
 
 @pytest.mark.parametrize(
@@ -1149,9 +1150,9 @@ async def test_each_rank_is_asked_from_its_own_position() -> None:
     not comparable, let alone interchangeable.
     """
 
-    from eyvan.server.controller.observation import _split_log_cursor
+    from eyvan.worker.runtime.log_records import split_log_cursor
 
-    attempt, cursors = _split_log_cursor("3:0=from-rank-zero|1=from-rank-one")
+    attempt, cursors = split_log_cursor("3:0=from-rank-zero|1=from-rank-one")
 
     assert attempt == 3
     assert cursors == {0: "from-rank-zero", 1: "from-rank-one"}
@@ -1393,9 +1394,9 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
 ) -> None:
     """Exercise controller -> cell -> inner-host cursor composition end to end."""
 
-    from eyvan.worker.runtime.log_records import split_log_cursor
+    from eyvan.worker.runtime.log_records import LOG_CURSOR_V2_EMISSION_ENV, CursorResume, decode_log_cursor
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
     hosts = {
         "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
         "cell-b": (_JournalHost("b0"), _JournalHost("b1", fail_once_after_first=True)),
@@ -1416,8 +1417,9 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
         (3, "b1:0"),
     ]
     assert first["truncated_ranks"] == []
-    attempt, positions = split_log_cursor(first["next_cursor"])
-    assert attempt == 1
+    resume = decode_log_cursor(first["next_cursor"])
+    assert isinstance(resume, CursorResume)
+    assert resume.attempt == 1
     # The old shape asserted here was ``set(cursors) == {0, 1}``: two CELL
     # indices for a four-process attempt, each holding a nested cursor for the
     # hosts inside it. That is the defect DR-0002 lines 42-44 and 68-70 name.
@@ -1427,16 +1429,18 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
     # which host every following key refers to. One position per global rank
     # removes both: the keys are the rank space, and they are the same rank
     # space as the records, the truncation list, and the archive.
-    assert sorted(positions) == [0, 1, 2, 3]
-    assert positions == {
-        0: f"eyvan-r1:{hosts['cell-a'][0].first_cursor}",
-        1: f"eyvan-r1:{hosts['cell-a'][1].first_cursor}",
-        2: f"eyvan-r1:{hosts['cell-b'][0].first_cursor}",
-        3: f"eyvan-r1:{hosts['cell-b'][1].first_cursor}",
-    }
+    assert [(item.rank, item.cell, item.local, item.cursor) for item in resume.positions] == [
+        (0, "cell-a", 0, hosts["cell-a"][0].first_cursor),
+        (1, "cell-a", 1, hosts["cell-a"][1].first_cursor),
+        (2, "cell-b", 0, hosts["cell-b"][0].first_cursor),
+        (3, "cell-b", 1, hosts["cell-b"][1].first_cursor),
+    ]
+    assert resume.bound is True
+    assert resume.topology == first["topology"]
+    assert first["missing_ranks"] == []
     # Backend cursors still travel as opaque leaves: the legacy delimiter inside
     # them is data, never structure.
-    assert all("|" in value for value in positions.values())
+    assert all("|" in item.cursor for item in resume.positions)
 
     second = await controller.workload_log_page("wl-gang", after=first["next_cursor"])
     assert [(record["rank"], record["message"]) for record in second["records"]] == [
@@ -1449,8 +1453,9 @@ async def test_multi_host_cells_keep_global_ranks_and_resume_every_inner_journal
 
     # The unreachable host keeps its own last good position, addressed directly
     # rather than through the cell that happens to contain it.
-    _attempt, second_positions = split_log_cursor(second["next_cursor"])
-    assert second_positions[3] == f"eyvan-r1:{hosts['cell-b'][1].first_cursor}"
+    second_resume = decode_log_cursor(second["next_cursor"])
+    assert isinstance(second_resume, CursorResume)
+    assert second_resume.cursors[3] == hosts["cell-b"][1].first_cursor
 
     third = await controller.workload_log_page("wl-gang", after=second["next_cursor"])
     assert [(record["rank"], record["message"]) for record in third["records"]] == [(3, "b1:1")]

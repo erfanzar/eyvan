@@ -49,13 +49,17 @@ from eyvan.server.persistence.local import LocalJsonRepository
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
 from eyvan.server.service.control_plane import ControlPlaneService
-from eyvan.server.service.errors import InputError
+from eyvan.server.service.errors import InputError, LogCursorRejectedError
 from eyvan.server.service.scheduling import CoreSchedulingService
-from eyvan.worker.runtime.log_records import LogPage, LogRecord, split_log_cursor
-
-_FLAT_POSITION = "eyvan-r1:"
-_FLAT_UNAVAILABLE = "eyvan-r1!"
-
+from eyvan.worker.runtime.log_records import (
+    CURSOR_ATTEMPT_CHANGED,
+    CURSOR_UNKNOWN_RANK,
+    LOG_CURSOR_V2_EMISSION_ENV,
+    CursorResume,
+    LogPage,
+    LogRecord,
+    decode_log_cursor,
+)
 
 # --------------------------------------------------------------------------- harness
 
@@ -256,9 +260,16 @@ async def _replace_cell(controller, cell: CellRecord) -> None:
         await transaction.put_cell(cell)
 
 
+def _resume(document) -> CursorResume:
+    """Decode a page's cursor, refusing to interpret anything but a resume."""
+
+    outcome = decode_log_cursor(document["next_cursor"])
+    assert isinstance(outcome, CursorResume), outcome
+    return outcome
+
+
 def _positions(document) -> dict[int, str]:
-    _attempt, positions = split_log_cursor(document["next_cursor"])
-    return positions
+    return _resume(document).cursors
 
 
 # --------------------------------------------------------------------------- the frozen map
@@ -414,7 +425,7 @@ async def test_whole_cell_and_inner_host_loss_keep_the_exact_surviving_leaves(
 ) -> None:
     """Losing a cell and a host inside another one must not disturb the rest."""
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
     hosts = {
         "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
         "cell-b": (
@@ -448,26 +459,29 @@ async def test_whole_cell_and_inner_host_loss_keep_the_exact_surviving_leaves(
     assert second["truncated_ranks"] == [0, 1, 3]
     # The lost cell's two ranks keep the exact leaves they had, and the surviving
     # cell's ranks advanced -- one page, two different fates, no renumbering.
-    assert _positions(second)[0] == f"{_FLAT_POSITION}{hosts['cell-a'][0].first_cursor}"
-    assert _positions(second)[1] == f"{_FLAT_POSITION}{hosts['cell-a'][1].first_cursor}"
-    assert _positions(second)[2] == f"{_FLAT_POSITION}{hosts['cell-b'][0].second_cursor}"
-    assert _positions(second)[3] == _FLAT_UNAVAILABLE
+    assert _positions(second)[0] == hosts["cell-a"][0].first_cursor
+    assert _positions(second)[1] == hosts["cell-a"][1].first_cursor
+    assert _positions(second)[2] == hosts["cell-b"][0].second_cursor
+    # Rank 3 never produced a position, so it is named as missing rather than
+    # dropped out of the cursor as if it were not part of the attempt.
+    assert 3 not in _positions(second)
+    assert second["missing_ranks"] == [3]
 
 
 # --------------------------------------------------------------------------- the flat cursor
 
 
-async def test_the_flat_cursor_names_exactly_every_expected_global_rank(
+async def test_the_flat_cursor_accounts_for_every_expected_global_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One position per expected rank, including the ranks that have none.
+    """Every expected rank is either positioned or named as missing.
 
     The per-cell shape could not express rank 3 at all: its position lived inside
     another envelope keyed by cell index, so a reader could not say where rank 3
     was, and an entry that was simply absent meant "start from the beginning".
     """
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
     hosts = {
         "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
         "cell-b": (_JournalHost("b0"), _JournalHost("b1", unreachable=True)),
@@ -475,11 +489,21 @@ async def test_the_flat_cursor_names_exactly_every_expected_global_rank(
     controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2), _tpu_cell("cell-b", 2)])
 
     page = await controller.workload_log_page("wl-1")
-    positions = _positions(page)
+    resume = _resume(page)
 
-    assert sorted(positions) == [0, 1, 2, 3]
-    assert positions[0] == f"{_FLAT_POSITION}{hosts['cell-a'][0].first_cursor}"
-    assert positions[3] == _FLAT_UNAVAILABLE
+    assert sorted(resume.cursors) + page["missing_ranks"] == [0, 1, 2, 3]
+    assert page["expected_ranks"] == 4
+    assert page["missing_ranks"] == [3]
+    assert resume.cursors[0] == hosts["cell-a"][0].first_cursor
+    # The envelope carries the source cell and local rank beside each global
+    # rank, so a position can be attributed back to the host that issued it.
+    assert [(item.rank, item.cell, item.local) for item in resume.positions] == [
+        (0, "cell-a", 0),
+        (1, "cell-a", 1),
+        (2, "cell-b", 0),
+    ]
+    assert resume.topology == page["topology"]
+    assert resume.workload == "wl-1"
     assert page["next_cursor"].startswith("eyvan-log-v2.")
 
 
@@ -488,7 +512,7 @@ async def test_a_rank_whose_host_reported_no_position_is_carried_not_restarted(
 ) -> None:
     """A missing position must resume where the rank was, not replay its journal."""
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
     flaky = _JournalHost("b1", fail_once_after_first=True)
     hosts = {
         "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
@@ -501,7 +525,7 @@ async def test_a_rank_whose_host_reported_no_position_is_carried_not_restarted(
     third = await controller.workload_log_page("wl-1", after=second["next_cursor"])
 
     assert second["truncated_ranks"] == [3]
-    assert _positions(second)[3] == f"{_FLAT_POSITION}{flaky.first_cursor}"
+    assert _positions(second)[3] == flaky.first_cursor
     assert [(record["rank"], record["message"]) for record in third["records"]] == [(3, "b1:1")]
     # Asked from its own last good position both times it was reachable, and
     # never asked from the beginning again.
@@ -527,11 +551,12 @@ async def test_a_flat_cursor_still_resumes_every_rank_when_flat_emission_is_off(
     }
     controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2), _tpu_cell("cell-b", 2)])
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
     first = await controller.workload_log_page("wl-1")
     assert sorted(_positions(first)) == [0, 1, 2, 3]
+    assert _resume(first).bound is True
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "0")
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "0")
     second = await controller.workload_log_page("wl-1", after=first["next_cursor"])
 
     assert [(record["rank"], record["message"]) for record in second["records"]] == [
@@ -540,9 +565,10 @@ async def test_a_flat_cursor_still_resumes_every_rank_when_flat_emission_is_off(
         (2, "b0:1"),
         (3, "b1:1"),
     ]
-    # Emitted in the per-cell shape a replica without the writer produces.
+    # Emitted in the per-cell shape a replica without the writer produces: two
+    # keys for two cells, unbound, carrying no attempt topology of their own.
     assert sorted(_positions(second)) == [0, 1]
-    assert all(not value.startswith("eyvan-r1") for value in _positions(second).values())
+    assert _resume(second).bound is False
     for host in (*hosts["cell-a"], *hosts["cell-b"]):
         assert host.seen_after == ["", host.first_cursor]
 
@@ -559,28 +585,153 @@ async def test_the_default_emission_stays_the_per_cell_shape() -> None:
     page = await controller.workload_log_page("wl-1")
 
     assert sorted(_positions(page)) == [0, 1]
-    assert all(not value.startswith("eyvan-r1") for value in _positions(page).values())
+    assert _resume(page).bound is False
 
 
-async def test_a_cursor_mixing_both_shapes_is_refused_rather_than_resolved(
+# --------------------------------------------------------------------------- refusals
+
+
+async def test_a_cursor_naming_a_rank_outside_the_frozen_width_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No writer produces one, and every reading of it resumes a wrong journal."""
+    """A position for a rank this attempt does not have addresses another journal.
 
-    from eyvan.worker.runtime.log_records import join_log_cursor
+    Restarting the read instead would be the fail-open answer: the client cannot
+    tell it from a first read, so it re-reads everything and never learns that
+    its cursor named a process that is not in this attempt.
+    """
 
-    monkeypatch.setenv("EYVAN_FLAT_LOG_CURSORS", "1")
-    hosts = {
-        "cell-a": (_JournalHost("a0"), _JournalHost("a1")),
-        "cell-b": (_JournalHost("b0"), _JournalHost("b1")),
-    }
-    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2), _tpu_cell("cell-b", 2)])
+    from eyvan.worker.runtime.log_records import CursorContext, CursorPosition, encode_log_cursor
 
-    mixed = join_log_cursor(1, {0: f"{_FLAT_POSITION}s=a0|position=1", 1: "s=b0|position=1"})
-    page = await controller.workload_log_page("wl-1", after=mixed)
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
+    hosts = {"cell-a": (_JournalHost("a0"), _JournalHost("a1"))}
+    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2)])
+    async with controller.repository.transaction() as transaction:
+        topology = await transaction.get_workload_topology("wl-1", 1)
 
-    assert page["cursor_reset_required"] is True
-    assert [record["message"] for record in page["records"]] == ["a0:0", "a1:0", "b0:0", "b1:0"]
+    foreign = encode_log_cursor(
+        [CursorPosition(rank=9, cursor="s=ghost|position=1")],
+        context=CursorContext(attempt=1, workload="wl-1", topology=topology.digest),
+        bound=True,
+    )
+
+    with pytest.raises(LogCursorRejectedError) as raised:
+        await controller.workload_log_page("wl-1", after=foreign)
+
+    assert raised.value.reason == CURSOR_UNKNOWN_RANK
+    assert raised.value.incompatible is True
+    assert raised.value.expected_ranks == 2
+    assert raised.value.topology == topology.digest
+    assert raised.value.as_document()["code"] == CURSOR_UNKNOWN_RANK
+
+
+async def test_a_cursor_minted_against_another_topology_is_refused() -> None:
+    """A rank means a host only inside the topology it was numbered against."""
+
+    from eyvan.worker.runtime.log_records import CursorContext, CursorPosition, encode_log_cursor
+
+    hosts = {"cell-a": (_JournalHost("a0"), _JournalHost("a1"))}
+    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2)])
+
+    stale = encode_log_cursor(
+        [CursorPosition(rank=0, cursor="s=a0|position=1")],
+        context=CursorContext(attempt=1, workload="wl-1", topology="sha256:" + "0" * 64),
+        bound=True,
+    )
+
+    with pytest.raises(LogCursorRejectedError) as raised:
+        await controller.workload_log_page("wl-1", after=stale)
+
+    assert raised.value.incompatible is True
+    assert "topology" in raised.value.reason
+
+
+async def test_a_corrupt_cursor_is_refused_rather_than_restarted() -> None:
+    """Only empty input starts a read; anything else says why it cannot."""
+
+    hosts = {"cell-a": (_JournalHost("a0"), _JournalHost("a1"))}
+    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2)])
+
+    with pytest.raises(LogCursorRejectedError) as raised:
+        await controller.workload_log_page("wl-1", after="eyvan-log-v2.not-base64!!")
+
+    assert raised.value.incompatible is False
+    assert raised.value.workload_id == "wl-1"
+    assert raised.value.attempt == 1
+    assert hosts["cell-a"][0].seen_after == [], "a refused cursor still reached the journal"
+
+
+async def test_the_preflight_refuses_the_same_cursors_the_page_does() -> None:
+    """A stream cannot answer a refusal after its 200 has been sent.
+
+    So the check has to be available before the response is committed, and it
+    has to decode against the same read -- a preflight that disagreed with the
+    page would either reject a usable cursor or admit one the read then refuses
+    silently.
+    """
+
+    hosts = {"cell-a": (_JournalHost("a0"), _JournalHost("a1"))}
+    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2)])
+
+    # A usable cursor passes both.
+    page = await controller.workload_log_page("wl-1")
+    await controller.validate_log_cursor("wl-1", page["next_cursor"])
+
+    with pytest.raises(LogCursorRejectedError) as preflight:
+        await controller.validate_log_cursor("wl-1", "eyvan-log-v2.not-base64!!")
+    with pytest.raises(LogCursorRejectedError) as served:
+        await controller.workload_log_page("wl-1", after="eyvan-log-v2.not-base64!!")
+
+    assert preflight.value.reason == served.value.reason
+    assert preflight.value.incompatible == served.value.incompatible
+
+
+async def test_a_slice_refuses_an_unresolvable_cursor_instead_of_restarting() -> None:
+    """A fan-out that restarts on a bad cursor replays every host silently."""
+
+    from eyvan.worker.runtime.native_slice import NativeSliceExecutor
+
+    executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
+    executor._workers = (_JournalHost("a0"), _JournalHost("a1"))
+
+    page = executor.log_page("remote-1", after="eyvan-log-v2.not-base64!!")
+
+    assert page.unavailable is True
+    assert page.records == ()
+    assert page.truncated_ranks == (0, 1)
+    assert "cursor_malformed" in page.detail
+    # Refused before any host was asked, so nothing replayed.
+    assert executor._workers[0].seen_after == []
+
+
+async def test_a_cursor_from_a_superseded_attempt_restarts_and_says_so() -> None:
+    """The one refusal DR-0002 lets resolve to empty positions.
+
+    The positions genuinely no longer exist -- the retry replaced the execution --
+    so there is nothing to resume and the honest answer is to report the boundary
+    and begin the new attempt at the start.
+    """
+
+    from eyvan.worker.runtime.log_records import CursorContext, CursorPosition, encode_log_cursor
+
+    hosts = {"cell-a": (_JournalHost("a0"), _JournalHost("a1"))}
+    controller = await _running_attempt(_SliceAgent(hosts), [_tpu_cell("cell-a", 2)], attempt=2)
+    async with controller.repository.transaction() as transaction:
+        topology = await transaction.get_workload_topology("wl-1", 2)
+
+    superseded = encode_log_cursor(
+        [CursorPosition(rank=0, cursor="s=a0|position=1")],
+        context=CursorContext(attempt=1, workload="wl-1", topology=topology.digest),
+        bound=True,
+    )
+    page = await controller.workload_log_page("wl-1", after=superseded)
+
+    assert page["attempt_changed"] is True
+    assert page["attempt"] == 2
+    assert [record["message"] for record in page["records"]] == ["a0:0", "a1:0"]
+    assert hosts["cell-a"][0].seen_after == [""]
+    # The codec still names the boundary with its own stable code.
+    assert CURSOR_ATTEMPT_CHANGED == "cursor_attempt_changed"
 
 
 # --------------------------------------------------------------------------- unproven attempts

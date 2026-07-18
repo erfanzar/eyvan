@@ -24,7 +24,17 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
-from eyvan.worker.runtime.log_records import LogPage, join_log_cursor, merge_pages, split_log_cursor
+from eyvan.worker.runtime.log_records import (
+    CURSOR_KIND_WORKLOAD_LOG,
+    CURSOR_MODE_LIVE,
+    CursorContext,
+    CursorFresh,
+    CursorResume,
+    LogPage,
+    decode_log_cursor,
+    join_log_cursor,
+    merge_pages,
+)
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
@@ -537,9 +547,27 @@ class NativeGangExecutor:
         construction, the same order used to assign JAX process IDs. Log ranks
         therefore describe the process that emitted a line rather than merely
         the cell that happened to contain it.
+
+        A cursor this gang cannot resolve is answered as an unavailable page
+        naming the codec's refusal rather than as a silent restart, for the same
+        reason the slice executor does: a restart replays every host's journal
+        while reporting a clean read.
         """
 
-        _attempt, cursors = split_log_cursor(after)
+        expected = CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_LIVE,
+            ranks=tuple(range(len(self._workers))),
+        )
+        outcome = decode_log_cursor(after, expected=expected)
+        if not isinstance(outcome, (CursorFresh, CursorResume)):
+            return LogPage(
+                unavailable=True,
+                detail=f"{outcome.reason}: {outcome.detail}",
+                truncated_ranks=tuple(range(len(self._workers))),
+            )
+        _attempt = outcome.attempt if isinstance(outcome, CursorResume) else None
+        cursors = outcome.cursors if isinstance(outcome, CursorResume) else {}
         pages: dict[int, LogPage] = {}
         next_cursors: dict[int, str] = {}
         for rank, worker in enumerate(self._workers):

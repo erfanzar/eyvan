@@ -26,10 +26,15 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime.log_records import (
+    CURSOR_KIND_WORKLOAD_LOG,
+    CURSOR_MODE_LIVE,
+    CursorContext,
+    CursorFresh,
+    CursorResume,
     LogPage,
+    decode_log_cursor,
     join_log_cursor,
     merge_pages,
-    split_log_cursor,
 )
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
@@ -518,9 +523,27 @@ class NativeSliceExecutor:
         than dropped: a fan-out that silently returned the hosts it could reach
         would show a complete-looking log for a half-dead slice, which is the
         failure this whole aggregation exists to prevent.
+
+        A cursor this slice cannot resolve is answered as an unavailable page
+        naming the codec's refusal, not by silently restarting every host. The
+        two are indistinguishable to the control plane, and the silent one
+        replays the whole slice's journal while reporting a clean read.
         """
 
-        _attempt, cursors = split_log_cursor(after)
+        expected = CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_LIVE,
+            ranks=tuple(range(len(self._workers))),
+        )
+        outcome = decode_log_cursor(after, expected=expected)
+        if not isinstance(outcome, (CursorFresh, CursorResume)):
+            return LogPage(
+                unavailable=True,
+                detail=f"{outcome.reason}: {outcome.detail}",
+                truncated_ranks=tuple(range(len(self._workers))),
+            )
+        _attempt = outcome.attempt if isinstance(outcome, CursorResume) else None
+        cursors = outcome.cursors if isinstance(outcome, CursorResume) else {}
         pages: dict[int, LogPage] = {}
         next_cursors: dict[int, str] = {}
         for rank, worker in enumerate(self._workers):

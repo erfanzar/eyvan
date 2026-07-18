@@ -186,38 +186,47 @@ def test_cursor_size_and_entry_bounds_fail_closed_before_decode() -> None:
         join_log_cursor(1, {0: "x" * (log_records._LOG_CURSOR_MAX_VALUE_BYTES + 1)})
 
 
-def test_an_empty_leaf_is_dropped_by_the_envelope_so_a_position_must_be_written() -> None:
-    """The envelope cannot carry "no position", so callers must not rely on it.
+def test_an_omitted_leaf_is_named_by_the_decoder_rather_than_silently_missing() -> None:
+    """An empty cursor is not a position, so the gap has to be reported instead.
 
     This used to be asserted as a *feature* -- "a rank that reported no cursor is
     omitted" -- and the controller relied on it, keying the envelope by cell index
     and leaving out any cell that had not moved. DR-0002 lines 42-44 and 68-70 say
     why that is wrong: an omitted key is indistinguishable from a rank that is not
     part of the attempt, so the reader filled the gap with "start from the
-    beginning" and that rank replayed its whole journal.
+    beginning" and that rank replayed its whole journal while the page reported a
+    clean read.
 
-    The codec behaviour itself is fine and stays: an empty string is not a
-    position. What changed is that the controller now writes an explicit
-    non-empty leaf for a rank it has no position for, so every expected global
-    rank survives the round trip and the difference between "no position" and
-    "not in this attempt" is on the wire.
+    The encoder still drops an empty leaf, because an empty string genuinely is
+    not a position. What changed is that the omission is no longer silent: decoded
+    against the attempt's expected rank set, every rank with no position comes
+    back in ``missing_ranks``, so "has no position" and "is not in this attempt"
+    are different answers on the wire.
     """
 
-    assert split_log_cursor(join_log_cursor(1, {0: "a", 1: ""})) == (1, {0: "a"})
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_KIND_WORKLOAD_LOG,
+        CURSOR_MODE_LIVE,
+        CursorContext,
+        CursorResume,
+        decode_log_cursor,
+    )
 
-    from eyvan.server.controller.observation import _flat_cursor_values
-
-    encoded = join_log_cursor(1, _flat_cursor_values({0: "a", 3: "d"}, total_rank_count=4))
-    attempt, positions = split_log_cursor(encoded)
+    encoded = join_log_cursor(1, {0: "a", 1: "", 3: "d"})
+    outcome = decode_log_cursor(
+        encoded,
+        expected=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_LIVE,
+            attempt=1,
+            ranks=(0, 1, 2, 3),
+        ),
+    )
 
     assert encoded.startswith("eyvan-log-v2.")
-    assert attempt == 1
-    assert positions == {
-        0: "eyvan-r1:a",
-        1: "eyvan-r1!",
-        2: "eyvan-r1!",
-        3: "eyvan-r1:d",
-    }
+    assert isinstance(outcome, CursorResume)
+    assert outcome.cursors == {0: "a", 3: "d"}
+    assert outcome.missing_ranks == (1, 2)
 
 
 def test_no_cursors_at_all_encodes_to_empty() -> None:
