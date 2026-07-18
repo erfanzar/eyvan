@@ -43,6 +43,67 @@ class UnavailableError(EyvanServiceError):
     """A dependency outcome is inconclusive and the request may be retried."""
 
 
+class LogCursorRejectedError(EyvanServiceError):
+    """A presented log cursor cannot address the read it was presented for.
+
+    Raised instead of restarting the read. A decoder that answers "start from the
+    beginning" for a truncated, foreign, or superseded cursor is indistinguishable
+    from a first read, so the client silently re-reads the whole journal and never
+    learns why -- "I could not find out", written down as a fact.
+
+    ``reason`` is the log-cursor codec's own stable code and is meant to be routed
+    on; ``detail`` is the one human sentence naming what failed. ``incompatible``
+    separates the two remedies: an *invalid* cursor was corrupted in transit and a
+    fresh read is the answer, while an *incompatible* one is well-formed and the
+    journal moved on beneath it -- a retry, a topology change, or an archive
+    handover -- which the caller may want to report differently.
+
+    Attributes:
+        reason: Stable machine-readable code from the cursor codec.
+        detail: One human sentence naming the mismatch or malformation.
+        incompatible: True when the cursor is well formed but addresses another read.
+        workload_id: Workload the read belongs to.
+        attempt: Attempt being served.
+        topology: Digest of the frozen attempt topology, or ``None`` when unproven.
+        expected_ranks: Width of the frozen rank space, or ``None`` when unproven.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        detail: str,
+        incompatible: bool,
+        workload_id: str,
+        attempt: int,
+        topology: str | None = None,
+        expected_ranks: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.detail = detail
+        self.incompatible = incompatible
+        self.workload_id = workload_id
+        self.attempt = attempt
+        self.topology = topology
+        self.expected_ranks = expected_ranks
+        super().__init__(detail or reason)
+
+    def as_document(self) -> dict[str, object]:
+        """Return the refusal as the body an adapter can serialize unchanged."""
+
+        return {
+            "detail": self.detail or self.reason,
+            "code": self.reason,
+            "context": {
+                "workload_id": self.workload_id,
+                "attempt": self.attempt,
+                "topology": self.topology,
+                "expected_ranks": self.expected_ranks,
+                "incompatible": self.incompatible,
+            },
+        }
+
+
 class NoMatchingCapacityPoolError(NotFoundError):
     """No enabled pool in one fleet provides the requested accelerator type."""
 
@@ -68,6 +129,7 @@ __all__ = (
     "ConflictError",
     "EyvanServiceError",
     "InputError",
+    "LogCursorRejectedError",
     "NoMatchingCapacityPoolError",
     "NotFoundError",
     "ServiceErrorCode",

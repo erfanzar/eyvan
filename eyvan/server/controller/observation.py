@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import typing as tp
 import uuid
 from dataclasses import replace
@@ -51,7 +50,7 @@ from eyvan.server.controller._support import (
     _provider_phase_start,
     logger,
 )
-from eyvan.server.service.errors import ConflictError, NotFoundError
+from eyvan.server.service.errors import ConflictError, LogCursorRejectedError, NotFoundError
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
@@ -64,19 +63,29 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
 )
 from eyvan.worker.runtime.log_records import (
+    CURSOR_ATTEMPT_CHANGED,
+    CURSOR_KIND_WORKLOAD_LOG,
+    CURSOR_MODE_LIVE,
+    CURSOR_UNKNOWN_RANK,
     LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
     LOG_ARCHIVE_MANIFEST_KEY,
     LOG_ARCHIVE_MANIFEST_VERSION,
+    CursorContext,
+    CursorFresh,
+    CursorIncompatible,
+    CursorInvalid,
+    CursorPosition,
+    CursorResume,
     LogPage,
     LogRecord,
+    decode_log_cursor,
+    encode_log_cursor,
+    log_cursor_v2_emission_enabled,
     log_page_from_json,
     merge_pages,
 )
 from eyvan.worker.runtime.log_records import (
     join_log_cursor as _join_log_cursor,
-)
-from eyvan.worker.runtime.log_records import (
-    split_log_cursor as _split_log_cursor,
 )
 
 #: How many contiguous ranks a pre-manifest archive read probes. New archives
@@ -84,86 +93,34 @@ from eyvan.worker.runtime.log_records import (
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
 
-#: Enables emitting flat per-global-rank cursors instead of per-cell ones.
-#:
-#: Off by default, which is stage one of DR-0002's rollout: every build ships the
-#: decoder for both shapes first, and only a fleet whose entire serving *and*
-#: rollback set can read a flat cursor turns the writer on. The two shapes are
-#: self-describing (see ``_FLAT_POSITION_PREFIX``) so this replica can never
-#: confuse them, but an older replica cannot tell them apart -- it would read a
-#: global rank as a cell index and resume the wrong journal -- so a mixed fleet
-#: must keep emitting the old shape.
-_FLAT_LOG_CURSOR_ENV = "EYVAN_FLAT_LOG_CURSORS"
-
-#: Marks a leaf position in a flat per-global-rank cursor.
-#:
-#: The tag is what makes the flat and per-cell shapes distinguishable inside one
-#: opaque envelope, and it is deliberately not empty: the envelope codec drops
-#: empty values, so an "this rank has no position" leaf can only be preserved by
-#: writing something. Omitting it is what let a rank silently disappear from a
-#: cursor and then replay its whole journal on the next poll.
-_FLAT_POSITION_PREFIX = "eyvan-r1:"
-_FLAT_POSITION_UNAVAILABLE = "eyvan-r1!"
-
 #: What a page says about the rank identity it is serving.
 _TOPOLOGY_FROZEN = "frozen"
 _TOPOLOGY_UNKNOWN = "unknown"
 _TOPOLOGY_CHANGED = "changed"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+def _live_cursor_context(
+    workload: WorkloadRecord,
+    topology: WorkloadAttemptTopology | None,
+    *,
+    ranks: tuple[int, ...] | None = None,
+) -> CursorContext:
+    """Describe the read a presented cursor has to address.
 
-def _flat_log_cursors_enabled() -> bool:
-    """Return whether this replica emits flat per-global-rank cursors."""
-
-    return os.getenv(_FLAT_LOG_CURSOR_ENV, "").strip().lower() in _TRUTHY
-
-
-def _decode_controller_cursor(after: str) -> tuple[int | None, dict[int, str], bool, str]:
-    """Decode a log cursor into positions, saying which rank space they name.
-
-    Returns the attempt, the positions, whether they are flat per-global-rank
-    positions, and a refusal reason. Both shapes are accepted regardless of what
-    this replica emits, which is what makes a rollback safe: a cursor issued by a
-    replica running ahead still resolves to exact positions here rather than to a
-    guessed restart.
-
-    A cursor that carries *both* shapes is refused rather than resolved. It
-    cannot be produced by any single writer, and every way of interpreting it
-    resumes some rank from a journal that did not issue its position.
+    Opacity is not addressing: a structurally perfect cursor minted for another
+    workload, attempt, or attempt topology still names positions in a journal
+    this read is not looking at. The frozen topology digest is what makes the
+    last of those checkable at all.
     """
 
-    attempt, raw = _split_log_cursor(after)
-    if not raw:
-        return attempt, {}, False, ""
-    tagged = sum(
-        1 for value in raw.values() if value.startswith(_FLAT_POSITION_PREFIX) or value == _FLAT_POSITION_UNAVAILABLE
+    return CursorContext(
+        kind=CURSOR_KIND_WORKLOAD_LOG,
+        mode=CURSOR_MODE_LIVE,
+        attempt=workload.attempt,
+        workload=workload.id,
+        topology="" if topology is None else topology.digest,
+        ranks=ranks,
     )
-    if tagged == 0:
-        return attempt, raw, False, ""
-    if tagged != len(raw):
-        return attempt, {}, True, "log cursor mixes flat global-rank positions with per-cell positions"
-    positions = {
-        rank: value.removeprefix(_FLAT_POSITION_PREFIX)
-        for rank, value in raw.items()
-        if value != _FLAT_POSITION_UNAVAILABLE
-    }
-    return attempt, positions, True, ""
-
-
-def _flat_cursor_values(positions: tp.Mapping[int, str], *, total_rank_count: int) -> dict[int, str]:
-    """Project per-rank positions onto exactly one leaf per expected global rank.
-
-    Every rank the frozen topology declares appears, including the ones with no
-    position: an absent entry is indistinguishable from a rank that was never
-    part of the attempt, and the reader that filled the gap with "start from the
-    beginning" is what made a temporarily unreachable host replay its journal.
-    """
-
-    return {
-        rank: f"{_FLAT_POSITION_PREFIX}{positions[rank]}" if positions.get(rank) else _FLAT_POSITION_UNAVAILABLE
-        for rank in range(total_rank_count)
-    }
 
 
 def _cell_leaf_positions(next_cursor: str, *, width: int) -> tuple[dict[int, str], bool]:
@@ -176,6 +133,10 @@ def _cell_leaf_positions(next_cursor: str, *, width: int) -> tuple[dict[int, str
     writes; anything else cannot be attributed to a host, and guessing would give
     one journal another journal's position.
 
+    The cell's own attempt field is deliberately not constrained. It echoes
+    whatever the controller sent it, which is zero on a first read, and refusing
+    the position for that would strand every multi-host cell on its second poll.
+
     The boolean says whether the value was understood. ``False`` means the caller
     must retain the positions it already had rather than advance.
     """
@@ -184,10 +145,17 @@ def _cell_leaf_positions(next_cursor: str, *, width: int) -> tuple[dict[int, str
         return {}, True
     if width == 1:
         return {0: next_cursor}, True
-    _attempt, decoded = _split_log_cursor(next_cursor)
-    if not decoded or any(local >= width for local in decoded):
+    outcome = decode_log_cursor(
+        next_cursor,
+        expected=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_LIVE,
+            ranks=tuple(range(width)),
+        ),
+    )
+    if not isinstance(outcome, CursorResume) or not outcome.positions:
         return {}, False
-    return decoded, True
+    return outcome.cursors, True
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int, runtime_process_count: int = 1) -> LogPage:
@@ -259,40 +227,44 @@ def _log_page_document(
     attempt: int,
     attempt_changed: bool = False,
     cursors: tp.Mapping[int, str] | None = None,
+    next_cursor: str | None = None,
     topology_state: str = _TOPOLOGY_UNKNOWN,
     topology_digest: str | None = None,
     expected_ranks: int | None = None,
-    cursor_reset_required: bool = False,
+    missing_ranks: tp.Sequence[int] = (),
 ) -> JsonObject:
     """Project a merged page onto the wire, carrying the attempt it belongs to.
 
     ``next_cursor`` encodes every rank's position and the attempt they came
     from. The attempt has to travel with it: without it an attempt boundary is
     undetectable, and a follower resumes a retry from its predecessor's
-    position.
+    position. Pass it pre-encoded when the caller knows which rank space the
+    positions live in; ``cursors`` is the per-cell shortcut for the paths that
+    have no frozen rank space to encode against.
 
     ``topology`` and ``topology_state`` are additive and describe what the ranks
     on this page mean. ``frozen`` says every rank names the process it named at
     dispatch; ``unknown`` says the attempt predates the frozen record and its
     rank identity is not proven; ``changed`` says the fleet no longer matches the
     frozen map, so the page is explicitly incomplete rather than renumbered.
+
+    ``missing_ranks`` names every expected rank the returned cursor carries no
+    position for. Those ranks resume from the start of their journal, and saying
+    so is the difference between a partial resume and one presented as whole.
     """
 
     document: JsonObject = {
         "attempt": attempt,
         "attempt_changed": attempt_changed,
         "records": [dict(record.as_json()) for record in page.records],
-        "next_cursor": _join_log_cursor(attempt, cursors or {}),
+        "next_cursor": _join_log_cursor(attempt, cursors or {}) if next_cursor is None else next_cursor,
         "unavailable": page.unavailable,
         "detail": page.detail,
         "truncated_ranks": list(page.truncated_ranks),
         "topology_state": topology_state,
         "topology": topology_digest,
         "expected_ranks": expected_ranks,
-        # A follower that keeps sending a cursor Eyvan refused would be silently
-        # restarted on every poll. Saying so is the difference between "you are
-        # at the beginning" and "your position is not usable here".
-        "cursor_reset_required": cursor_reset_required,
+        "missing_ranks": list(missing_ranks),
         "completeness_unknown": topology_state == _TOPOLOGY_UNKNOWN,
     }
     return document
@@ -1301,12 +1273,7 @@ class _ControllerObservation:
                 expected_ranks=frozen_ranks,
             )
 
-        requested_attempt, cursors, cursor_is_flat, refusal = _decode_controller_cursor(after)
-        attempt_changed = requested_attempt is not None and requested_attempt != workload.attempt
-        if attempt_changed:
-            # A retry runs a different execution; the old positions name lines
-            # in journals that no longer exist.
-            cursors = {}
+        attempt_changed, cursors, cursor_is_flat = self._decoded_cursor(after, workload, topology)
 
         try:
             members = await self._load_workload_members(workload)
@@ -1324,15 +1291,13 @@ class _ControllerObservation:
                 topology_state=frozen_state,
                 topology_digest=frozen_digest,
                 expected_ranks=frozen_ranks,
-                cursor_reset_required=bool(refusal),
             )
         if topology is None:
             return await self._unproven_log_page(
                 workload,
                 members,
-                cursors=cursors if not cursor_is_flat else {},
+                cursors={} if cursor_is_flat else cursors,
                 attempt_changed=attempt_changed,
-                cursor_reset_required=bool(refusal) or cursor_is_flat,
                 limit=limit,
             )
         return await self._frozen_log_page(
@@ -1342,9 +1307,76 @@ class _ControllerObservation:
             positions=cursors,
             cursor_is_flat=cursor_is_flat,
             attempt_changed=attempt_changed,
-            refusal=refusal,
             limit=limit,
         )
+
+    def _decoded_cursor(
+        self,
+        after: str,
+        workload: WorkloadRecord,
+        topology: WorkloadAttemptTopology | None,
+    ) -> tuple[bool, dict[int, str], bool]:
+        """Decode one presented cursor, or refuse the read outright.
+
+        Returns whether the attempt changed, the positions, and whether those
+        positions name global ranks (a bound cursor) rather than cell indices.
+
+        Only empty input starts a read. A malformed, oversized, foreign, or
+        unresolvable cursor raises :class:`LogCursorRejectedError` instead of
+        being collapsed back into "start from the beginning" -- the two are
+        indistinguishable to a client, so the silent version re-reads the whole
+        journal and never says why. An attempt change is the one exception the
+        design names: the positions genuinely no longer exist, and DR-0002
+        requires reporting it and beginning the new attempt at empty positions.
+
+        Raises:
+            LogCursorRejectedError: If the cursor cannot address this read.
+        """
+
+        outcome = decode_log_cursor(after, expected=_live_cursor_context(workload, topology))
+        if isinstance(outcome, CursorInvalid) and topology is not None and not after.startswith("eyvan-log-v"):
+            # The pre-envelope grammar nests an unescaped delimiter inside opaque
+            # leaves, so it is reversible only against a known rank set. The one
+            # that was ever emitted addressed *cells*, so that is the witness --
+            # supplied explicitly rather than guessed, which is what DR-0002 means
+            # by accepting v1 only where it is reversible.
+            outcome = decode_log_cursor(
+                after,
+                expected=_live_cursor_context(workload, topology, ranks=tuple(range(len(topology.cells)))),
+            )
+        if isinstance(outcome, CursorFresh):
+            return False, {}, False
+        if isinstance(outcome, CursorIncompatible) and outcome.reason == CURSOR_ATTEMPT_CHANGED:
+            # A retry runs a different execution; the old positions name lines in
+            # journals that no longer exist. Reported, then restarted -- which is
+            # the only refusal DR-0002 lets resolve to empty positions.
+            return True, {}, False
+        if isinstance(outcome, (CursorInvalid, CursorIncompatible)):
+            raise LogCursorRejectedError(
+                reason=outcome.reason,
+                detail=outcome.detail,
+                incompatible=isinstance(outcome, CursorIncompatible),
+                workload_id=workload.id,
+                attempt=workload.attempt,
+                topology=None if topology is None else topology.digest,
+                expected_ranks=None if topology is None else topology.total_rank_count,
+            )
+        positions = outcome.cursors
+        if outcome.bound and topology is not None:
+            unknown = sorted(rank for rank in positions if not topology.contains_rank(rank))
+            if unknown:
+                raise LogCursorRejectedError(
+                    reason=CURSOR_UNKNOWN_RANK,
+                    detail=(
+                        "log cursor names rank(s) outside this attempt: " + ", ".join(str(rank) for rank in unknown)
+                    ),
+                    incompatible=True,
+                    workload_id=workload.id,
+                    attempt=workload.attempt,
+                    topology=topology.digest,
+                    expected_ranks=topology.total_rank_count,
+                )
+        return False, positions, outcome.bound
 
     async def _frozen_log_page(
         self,
@@ -1355,7 +1387,6 @@ class _ControllerObservation:
         positions: tp.Mapping[int, str],
         cursor_is_flat: bool,
         attempt_changed: bool,
-        refusal: str,
         limit: int,
     ) -> JsonObject:
         """Serve one live page against the rank space frozen at dispatch.
@@ -1371,10 +1402,7 @@ class _ControllerObservation:
             # a configuration error rather than a page to serve.
             self._ordered_gang_member_pairs(members)
         current = {cell.id: cell for _lease, cell in members}
-        cursor_reset_required = bool(refusal)
-        if refusal:
-            positions = {}
-        elif not cursor_is_flat:
+        if not cursor_is_flat:
             positions = self._positions_from_cell_cursors(topology, positions)
 
         live: dict[int, str] = {
@@ -1429,16 +1457,39 @@ class _ControllerObservation:
             merge_pages(pages) if pages else LogPage(),
             attempt=workload.attempt,
             attempt_changed=attempt_changed,
-            cursors=(
-                _flat_cursor_values(live, total_rank_count=topology.total_rank_count)
-                if _flat_log_cursors_enabled()
-                else self._cell_cursors(topology, live, attempt=workload.attempt)
-            ),
+            next_cursor=self._encode_frozen_cursor(workload, topology, live),
             topology_state=_TOPOLOGY_CHANGED if changed else _TOPOLOGY_FROZEN,
             topology_digest=topology.digest,
             expected_ranks=topology.total_rank_count,
-            cursor_reset_required=cursor_reset_required,
+            missing_ranks=[rank for rank in range(topology.total_rank_count) if rank not in live],
         )
+
+    @classmethod
+    def _encode_frozen_cursor(
+        cls,
+        workload: WorkloadRecord,
+        topology: WorkloadAttemptTopology,
+        positions: tp.Mapping[int, str],
+    ) -> str:
+        """Encode the attempt's positions in whichever rank space is being emitted.
+
+        The flat per-global-rank envelope and the per-cell one flip together with
+        the codec's own emission flag, because they are one decision: a replica
+        that emits global ranks inside the envelope an older replica reads as cell
+        indices would send that replica to the wrong journal. Both are decodable
+        here regardless, which is what makes the rollback direction safe.
+        """
+
+        if not log_cursor_v2_emission_enabled():
+            return _join_log_cursor(workload.attempt, cls._cell_cursors(topology, positions, attempt=workload.attempt))
+        leaves: list[CursorPosition] = []
+        for frozen in topology.cells:
+            for local in range(frozen.runtime_process_count):
+                rank = frozen.global_rank_offset + local
+                cursor = positions.get(rank, "")
+                if cursor:
+                    leaves.append(CursorPosition(rank=rank, cursor=cursor, cell=frozen.cell_id, local=local))
+        return encode_log_cursor(leaves, context=_live_cursor_context(workload, topology), bound=True)
 
     @staticmethod
     def _cell_after_cursor(
@@ -1505,7 +1556,6 @@ class _ControllerObservation:
         *,
         cursors: tp.Mapping[int, str],
         attempt_changed: bool,
-        cursor_reset_required: bool,
         limit: int,
     ) -> JsonObject:
         """Serve an attempt dispatched before its rank space was ever frozen.
@@ -1566,8 +1616,35 @@ class _ControllerObservation:
             topology_state=_TOPOLOGY_UNKNOWN,
             topology_digest=None,
             expected_ranks=None,
-            cursor_reset_required=cursor_reset_required,
         )
+
+    async def validate_log_cursor(self, workload_id: str, after: str) -> None:
+        """Refuse a log cursor before a response has been committed.
+
+        The paged route can answer a refusal with a status code because nothing
+        has been sent yet. A stream cannot: by the time the generator runs, the
+        client already has ``200``, and raising inside it ends the stream with no
+        way to say why. This is the preflight for that case, and it decodes
+        against exactly the same read the page would, so the two can never
+        disagree about whether a cursor is usable.
+
+        Args:
+            workload_id: Workload whose journal is being followed.
+            after: The cursor exactly as the client returned it.
+
+        Raises:
+            LookupError: If the workload does not exist.
+            LogCursorRejectedError: If the cursor cannot address this read.
+        """
+
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(workload_id)
+            topology = (
+                None if workload is None else await transaction.get_workload_topology(workload_id, workload.attempt)
+            )
+        if workload is None:
+            raise LookupError(f"workload {workload_id!r} does not exist")
+        self._decoded_cursor(after, workload, topology)
 
     async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
         """Read one attempt's archived logs back out of managed storage.
