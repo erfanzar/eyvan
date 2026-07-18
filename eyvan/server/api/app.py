@@ -175,6 +175,7 @@ from eyvan.soak_contract import (
     participant_manifest_sha256,
     safe_scope_id,
 )
+from eyvan.worker.runtime.log_records import CURSOR_RESET_REQUIRED, CursorInvalid, decode_log_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -2905,6 +2906,17 @@ def create_app(
 
         await service.get_workload(principal, workload_id)
         cursor = last_event_id or after
+        # Preflight the cursor here, for the same reason authorization happens
+        # here: the generator runs after the response is committed, so a refusal
+        # raised inside it reaches the caller as ``200`` followed by silence --
+        # which reads exactly like a quiet job. A browser reconnecting with a
+        # corrupted ``Last-Event-ID`` has to be told its position is unusable.
+        decoded = decode_log_cursor(cursor)
+        if isinstance(decoded, CursorInvalid) and decoded.reason != CURSOR_RESET_REQUIRED:
+            # A reset-required cursor is answered, not refused: the page restarts
+            # and reports it, which is what keeps a rolling upgrade working for a
+            # follower still holding a legacy position.
+            raise InputError(f"log cursor is not readable: {decoded.reason}")
 
         async def log_source() -> tp.AsyncIterator[str]:
             position = cursor

@@ -1,10 +1,28 @@
 # DR-0002: Flattened global log ranks and opaque cursors
 
-**Status:** Partially implemented. The narrower M1.3 global-rank, bounded opaque
-cursor, sparse archive, and legacy-replay surface is host-tested. Full
-attempt/topology/kind/mode cursor binding, fail-closed incompatible-cursor
-responses, and the per-rank archive-manifest contract below remain pending;
-real multi-host qualification is also open.
+**Status:** Substantially implemented, host-tested only.
+
+Closed since the original record: the strict discriminated cursor codec with
+typed invalid/incompatible outcomes; the attempt topology frozen at dispatch,
+persisted in an additive table, and used for every read and progress report
+instead of live cell records; flat one-position-per-global-rank cursors that
+name every expected rank; a separate schema-2 archive manifest carrying every
+expected rank's fate, digest, and size, plus the manifest-driven reader that
+verifies bytes before replaying them; explicit refusal of an unreadable cursor
+before an HTTP or SSE response is committed; and cursor redaction in the
+control-plane, cell-agent, native-worker, and outbound httpx logs.
+
+Deliberately still off by default: the bound v2 cursor envelope
+(``EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED``) and the manifest writer
+(``EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED``). Both are stage-two flips and are
+only safe once every serving and rollback image carries the decoder and the
+manifest-driven reader. The readers ship enabled; the writers do not.
+
+Still pending: a retained legacy multi-rank cursor is answered with a reset
+rather than resumed, because nothing can prove which rank space it names; the
+live-to-archive cursor handover does not translate live positions into archive
+offsets, so an archived read replays from the start; and none of this is
+qualified on real multi-host hardware -- P2 remains at exit 2.
 
 **Scope:** Live structured logs, multi-worker cells, multi-cell gangs, resume
 cursors, terminal archives, and legacy readers. The context below records the

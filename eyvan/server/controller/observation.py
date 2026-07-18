@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import typing as tp
@@ -16,7 +17,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 
 from eyvan._internal.json_types import JsonObject
-from eyvan.artifacts.managed import log_uri
+from eyvan.artifacts.managed import log_manifest_uri, log_uri
 from eyvan.capacity import (
     DEFINITIVE_CAPACITY_LOSS_STATUSES,
     PENDING_CAPACITY_STATUSES,
@@ -51,7 +52,7 @@ from eyvan.server.controller._support import (
     _provider_phase_start,
     logger,
 )
-from eyvan.server.service.errors import ConflictError, NotFoundError
+from eyvan.server.service.errors import ConflictError, InputError, NotFoundError
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
@@ -64,13 +65,18 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
 )
 from eyvan.worker.runtime.log_records import (
+    CURSOR_RESET_REQUIRED,
     LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
     LOG_ARCHIVE_MANIFEST_KEY,
     LOG_ARCHIVE_MANIFEST_VERSION,
+    CursorInvalid,
     LogPage,
     LogRecord,
     log_page_from_json,
     merge_pages,
+)
+from eyvan.worker.runtime.log_records import (
+    decode_log_cursor as _decode_log_cursor,
 )
 from eyvan.worker.runtime.log_records import (
     join_log_cursor as _join_log_cursor,
@@ -81,6 +87,15 @@ from eyvan.worker.runtime.log_records import (
 
 #: How many contiguous ranks a pre-manifest archive read probes. New archives
 #: carry their exact rank set and do not use this compatibility ceiling.
+_LOG_ARCHIVE_MANIFEST_SCHEMA_V2 = 2
+#: Rank fates a schema-2 manifest can record. Kept as plain strings rather than
+#: importing the writer's enum so the reader stays decoupled from settlement and
+#: keeps working against a manifest written by a newer control plane.
+_ARCHIVE_STATUS_QUIET = "quiet"
+_ARCHIVE_STATUS_TRUNCATED = "truncated"
+_ARCHIVE_STATUS_READABLE = frozenset({"archived", _ARCHIVE_STATUS_TRUNCATED})
+_ARCHIVE_STATUS_UNREACHED = frozenset({"unreachable", "failed"})
+
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
 
@@ -133,6 +148,18 @@ def _decode_controller_cursor(after: str) -> tuple[int | None, dict[int, str], b
     resumes some rank from a journal that did not issue its position.
     """
 
+    outcome = _decode_log_cursor(after)
+    if isinstance(outcome, CursorInvalid):
+        if outcome.reason == CURSOR_RESET_REQUIRED:
+            # Well-formed, but nothing here can prove which rank space it names --
+            # a retained legacy multi-rank cursor is the ordinary case during an
+            # upgrade. The read restarts and *says so*; refusing would turn a
+            # rolling upgrade into an error for every follower still holding one.
+            return None, {}, False, outcome.reason
+        # Bytes this control plane never issued. Restarting would answer a broken
+        # request with a full replay and give the caller no way to learn that its
+        # position was discarded, so the request is refused instead.
+        raise InputError(f"log cursor is not readable: {outcome.reason}")
     attempt, raw = _split_log_cursor(after)
     if not raw:
         return attempt, {}, False, ""
@@ -1569,14 +1596,143 @@ class _ControllerObservation:
             cursor_reset_required=cursor_reset_required,
         )
 
+    async def _manifest_archived_log_page(self, workload: WorkloadRecord) -> LogPage | None:
+        """Replay a terminal archive from its schema-2 manifest, or ``None``.
+
+        ``None`` means "there is no manifest to read" and hands the caller back to
+        the embedded-index decoder. Every other outcome is answered here, because
+        once a manifest exists it is the only record that knows which ranks were
+        *expected*: falling back after finding one would silently downgrade a
+        named gap into a rank nobody ever mentions.
+
+        Bytes are verified against the digest and size the writer recorded. A
+        mismatch is reported as a gap and never replayed -- an archive that does
+        not match its own manifest is not evidence about what a rank printed.
+        """
+
+        if self.artifact_access is None:
+            return None
+        try:
+            payload = await self.service.read_managed_artifact(
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                uri=log_manifest_uri(workload.id, workload.attempt),
+            )
+        except NotFoundError:
+            return None
+        except Exception:
+            # A manifest that exists but cannot be read conclusively must not fall
+            # through to the embedded index: that index describes fewer ranks, so
+            # the reply would look more complete than the evidence supports.
+            return LogPage(unavailable=True, detail="the archive manifest could not be read conclusively")
+
+        try:
+            document = json.loads(payload.decode())
+        except (UnicodeDecodeError, ValueError):
+            return LogPage(unavailable=True, detail="the archive manifest is unreadable")
+        if not isinstance(document, dict) or document.get("schema") != _LOG_ARCHIVE_MANIFEST_SCHEMA_V2:
+            return LogPage(unavailable=True, detail="the archive manifest is not a schema-2 log manifest")
+
+        raw_entries = document.get("ranks")
+        if not isinstance(raw_entries, list):
+            return LogPage(unavailable=True, detail="the archive manifest declares no ranks")
+
+        pages: dict[int, LogPage] = {}
+        truncated: set[int] = set()
+        gaps: list[str] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            rank = item.get("rank")
+            if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+                continue
+            status = item.get("status")
+            if status in _ARCHIVE_STATUS_UNREACHED:
+                # Named, never read: the writer already knows there are no bytes.
+                truncated.add(rank)
+                continue
+            if status == _ARCHIVE_STATUS_QUIET:
+                continue
+            if status not in _ARCHIVE_STATUS_READABLE:
+                truncated.add(rank)
+                gaps.append(f"{rank} (unknown status)")
+                continue
+            uri = item.get("uri")
+            if not isinstance(uri, str) or not uri:
+                truncated.add(rank)
+                gaps.append(f"{rank} (no object)")
+                continue
+            try:
+                blob = await self.service.read_managed_artifact(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    uri=uri,
+                )
+            except Exception:
+                truncated.add(rank)
+                gaps.append(f"{rank} (unreadable)")
+                continue
+            expected_size = item.get("size_bytes")
+            expected_digest = item.get("sha256")
+            if isinstance(expected_size, int) and not isinstance(expected_size, bool) and len(blob) != expected_size:
+                truncated.add(rank)
+                gaps.append(f"{rank} (size mismatch)")
+                continue
+            if isinstance(expected_digest, str) and expected_digest:
+                if hashlib.sha256(blob).hexdigest() != expected_digest.removeprefix("sha256:"):
+                    truncated.add(rank)
+                    gaps.append(f"{rank} (digest mismatch)")
+                    continue
+            records: list[JsonObject] = []
+            for line in blob.decode(errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    records.append(entry)
+            page = log_page_from_json({"records": records})
+            pages[rank] = LogPage(records=tuple(replace(record, rank=rank) for record in page.records))
+            if status == _ARCHIVE_STATUS_TRUNCATED:
+                truncated.add(rank)
+
+        merged = merge_pages(pages).records if pages else ()
+        detail = "archived"
+        if document.get("complete") is not True:
+            detail += "; the archive is incomplete"
+        omitted = document.get("objects_omitted")
+        if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0:
+            detail += f"; {omitted} rank object(s) were not written"
+        if document.get("enumeration_capped") is True:
+            detail += "; the expected rank list was capped"
+        if gaps:
+            detail += "; rank archives could not be replayed: " + ", ".join(gaps)
+        return LogPage(
+            records=tuple(merged),
+            unavailable=bool(document.get("unavailable") or truncated) and not merged,
+            detail=detail,
+            truncated_ranks=tuple(sorted(truncated)),
+        )
+
     async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
         """Read one attempt's archived logs back out of managed storage.
 
-        New archives carry a manifest in rank zero. It records the exact sparse
-        global-rank set and which ranks were unavailable at collection time, so
-        replay does not turn a partial live read into a complete-looking one.
-        Archives written before the manifest remain readable through the former
-        contiguous-rank scan.
+        Three decoders, newest first, because an archive outlives the control
+        plane that wrote it.
+
+        A schema-2 manifest is a separate immutable object naming every *expected*
+        rank, its fate, and its object's digest and size. It is authoritative: a
+        rank it names but whose bytes do not verify is reported as a gap rather
+        than replayed, and a rank that legitimately printed nothing is told apart
+        from one whose host was unreachable -- a distinction the embedded index
+        cannot make, because it lists only the ranks that answered.
+
+        Without it, the embedded v1 index in rank zero still gives the sparse
+        observed-rank set, and before that a contiguous scan from zero. Both
+        remain readable so an already-terminal workload does not become
+        unreadable when the control plane is upgraded.
         """
 
         if self.artifact_access is None:
@@ -1588,6 +1744,10 @@ class _ControllerObservation:
                 project_id=workload.project_id,
                 uri=log_uri(workload.id, workload.attempt, rank),
             )
+
+        manifest_page = await self._manifest_archived_log_page(workload)
+        if manifest_page is not None:
+            return manifest_page
 
         try:
             first_payload = await read_rank(0)

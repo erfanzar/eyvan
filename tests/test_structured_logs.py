@@ -1802,3 +1802,90 @@ def test_a_reconnecting_browser_resumes_from_last_event_id() -> None:
     )
 
     assert seen == ["2:0=c9|1=c8"], "the reconnect replayed from the tail instead of resuming"
+
+
+# --------------------------------------------------------------------------- a broken cursor is refused on the wire
+
+_AUTH = {
+    "X-Eyvan-User": "alice",
+    "X-Eyvan-Roles": "operator",
+    "X-Eyvan-Org": "acme",
+    "X-Eyvan-Project": "research",
+}
+_UNREADABLE_CURSOR = "eyvan-log-v2.!!!not-base64!!!"
+
+
+def test_a_broken_stream_cursor_is_refused_before_the_response_is_committed() -> None:
+    """A refusal raised inside the generator reaches the caller as 200 then silence.
+
+    That is indistinguishable from a job that has not printed yet, which is the
+    worst possible way to tell a reconnecting browser that its ``Last-Event-ID``
+    is unusable. The decode therefore happens beside the authorization check,
+    before the response exists -- and for the same reason.
+    """
+
+    client, app = _stream_client([])
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={**_AUTH, "Last-Event-ID": _UNREADABLE_CURSOR},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert "cursor" in response.text.lower()
+
+
+def test_a_broken_after_parameter_is_refused_on_the_streaming_route() -> None:
+    """``after`` and ``Last-Event-ID`` are the same position by two names."""
+
+    client, app = _stream_client([])
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false", "after": _UNREADABLE_CURSOR},
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 400
+
+
+def test_an_absent_cursor_still_starts_a_stream_from_the_beginning() -> None:
+    """Only an absent position may mean "read from the start"."""
+
+    client, app = _stream_client([{"attempt": 1, "records": [{"message": "hi", "rank": 0}], "next_cursor": ""}])
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 200
+    assert "hi" in response.text
+
+
+def test_a_retained_legacy_cursor_is_answered_with_a_reset_not_a_refusal() -> None:
+    """A rolling upgrade must not turn every reconnecting follower into an error.
+
+    A legacy multi-rank cursor cannot be proved to name the current rank space,
+    so its position is dropped -- but that is the control plane's uncertainty,
+    not a malformed request. The read restarts and reports it; refusing would
+    break every follower still holding one the moment the replicas roll.
+    """
+
+    client, app = _stream_client([{"attempt": 1, "records": [{"message": "hi", "rank": 0}], "next_cursor": ""}])
+    _seed_workload(app)
+
+    response = client.get(
+        "/api/v1/workloads/wl-1/logs/stream",
+        params={"follow": "false"},
+        headers={**_AUTH, "Last-Event-ID": "2:0=c9|1=c8"},
+    )
+
+    assert response.status_code == 200
+    assert "hi" in response.text

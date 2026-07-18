@@ -954,3 +954,125 @@ async def test_a_gang_topology_spans_every_cell_in_the_declared_rank_order(tmp_p
     ]
     assert [entry["status"] for entry in manifest["ranks"]] == ["quiet", "quiet", "quiet", "archived", "quiet"]
     assert manifest["complete"] is True
+
+
+# --------------------------------------------------------------------------- manifest-driven reader
+
+
+async def test_the_reader_replays_from_the_manifest_and_tells_quiet_from_unreachable(
+    tmp_path: Path,
+    manifest_v2: None,
+) -> None:
+    """The distinction the embedded index cannot make, now visible on replay.
+
+    A rank that printed nothing and a rank whose host could not be reached are
+    both simply absent from the v1 index, so replay reported the unreachable one
+    as if it had been read and found empty. The manifest names both, and the
+    reader keeps them apart: silence is not truncation.
+    """
+
+    controller = await _controller(tmp_path, width=3)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(
+        records=[{"message": "zero", "rank": 0}, {"message": "two", "rank": 2}],
+    )
+    await controller._archive_terminal_logs(await _workload(controller))
+    statuses = {rank: entry["status"] for rank, entry in _by_rank(await _manifest(controller)).items()}
+    assert statuses[1] == "quiet"
+
+    replayed = await controller._archived_log_page(await _workload(controller))
+
+    assert [(record.rank, record.message) for record in replayed.records] == [(0, "zero"), (2, "two")]
+    assert replayed.truncated_ranks == ()
+    assert replayed.unavailable is False
+
+
+async def test_the_reader_names_every_rank_a_failed_read_never_reached(
+    tmp_path: Path,
+    manifest_v2: None,
+) -> None:
+    """An attempt whose live read reached nothing must not replay as empty-and-fine."""
+
+    controller = await _controller(tmp_path, width=3)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(unavailable=True, records=[])
+    await controller._archive_terminal_logs(await _workload(controller))
+    statuses = {rank: entry["status"] for rank, entry in _by_rank(await _manifest(controller)).items()}
+    assert set(statuses.values()) == {"unreachable"}
+
+    replayed = await controller._archived_log_page(await _workload(controller))
+
+    assert replayed.records == ()
+    assert replayed.truncated_ranks == (0, 1, 2)
+    assert replayed.unavailable is True
+
+
+async def test_the_reader_refuses_bytes_that_contradict_the_manifest(tmp_path: Path, manifest_v2: None) -> None:
+    """An object that does not match its own manifest is not evidence.
+
+    Replaying it would present rewritten bytes as the rank's output, which is
+    worse than reporting the rank as a gap: the caller cannot tell it happened.
+    """
+
+    controller = await _controller(tmp_path, width=2)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(
+        records=[{"message": "zero", "rank": 0}, {"message": "one", "rank": 1}],
+    )
+    await controller._archive_terminal_logs(await _workload(controller))
+
+    tampered = _object_path(tmp_path, log_uri("wl-1", 1, 1))
+    os.unlink(tampered)
+    tampered.write_bytes(json.dumps({"message": "rewritten", "rank": 1}).encode() + b"\n")
+
+    replayed = await controller._archived_log_page(await _workload(controller))
+
+    assert [record.message for record in replayed.records] == ["zero"]
+    assert "rewritten" not in (replayed.detail or "")
+    assert replayed.truncated_ranks == (1,)
+    # Either the content-addressed store refuses the bytes on read or the reader's
+    # own digest check does. Both are the same guarantee; what matters is that the
+    # rank becomes a named gap and the rewritten bytes never reach the caller.
+    assert "could not be replayed: 1" in (replayed.detail or "")
+
+
+async def test_an_unreadable_manifest_never_falls_back_to_the_narrower_index(
+    tmp_path: Path,
+    manifest_v2: None,
+) -> None:
+    """Falling back would answer with fewer expected ranks than are known to exist."""
+
+    controller = await _controller(tmp_path, width=3)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(records=[{"message": "zero", "rank": 0}])
+    await controller._archive_terminal_logs(await _workload(controller))
+
+    manifest_object = _object_path(tmp_path, log_manifest_uri("wl-1", 1))
+    os.unlink(manifest_object)
+    manifest_object.write_bytes(b"{not json")
+
+    replayed = await controller._archived_log_page(await _workload(controller))
+
+    assert replayed.unavailable is True
+    assert replayed.records == ()
+    assert "manifest" in (replayed.detail or "")
+
+
+async def test_an_archive_without_a_manifest_still_reads_through_the_embedded_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archives already on disk predate the manifest and must stay readable."""
+
+    monkeypatch.delenv("EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED", raising=False)
+    controller = await _controller(tmp_path, width=2)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(
+        records=[{"message": "zero", "rank": 0}, {"message": "one", "rank": 1}],
+    )
+    await controller._archive_terminal_logs(await _workload(controller))
+    assert not await _committed(controller, log_manifest_uri("wl-1", 1))
+
+    replayed = await controller._archived_log_page(await _workload(controller))
+
+    assert [(record.rank, record.message) for record in replayed.records] == [(0, "zero"), (1, "one")]
