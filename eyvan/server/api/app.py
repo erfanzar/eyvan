@@ -52,6 +52,7 @@ from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.identity.rotation import RotatingCredential
 from eyvan.records import (
     ArtifactInventoryReport,
     ArtifactReferenceRecord,
@@ -150,6 +151,7 @@ from eyvan.server.service.control_plane import (
     QUEUE_TREND_MIN_WINDOW_S,
     ControlPlaneService,
 )
+from eyvan.server.service.credential_rotation import CredentialRotationService
 from eyvan.server.service.dag import DagNode
 from eyvan.server.service.errors import (
     AuthorizationError,
@@ -312,7 +314,18 @@ def create_app(
     # while constructing that adapter made an otherwise valid injection silently
     # launch declared mounts as missing variables.
     workload_capability = WorkloadCapabilitySigner(token_key)
-    secret_capability = SecretCapabilitySigner(token_key, ttl_seconds=settings.secret_token_ttl_s)
+    # A keyring rather than the raw key, so this replica can be handed new
+    # material without a restart. Identical behaviour until something rotates:
+    # one generation, no retiring epochs, the same signature over the same
+    # bytes. The fence that stops two rotations interleaving is durable and
+    # lives in ``eyvan.server.service.credential_rotation``; this is only the
+    # in-process half that decides what a signature is made with.
+    secret_capability_credential = RotatingCredential(token_key)
+    secret_capability = SecretCapabilitySigner(
+        secret_capability_credential,
+        ttl_seconds=settings.secret_token_ttl_s,
+    )
+    credential_rotation = CredentialRotationService(repository)
     if artifact_access is None:
         if settings.artifact_token_ttl_s <= 0:
             raise ValueError("EYVAN_ARTIFACT_TOKEN_TTL_S must be positive")
@@ -403,6 +416,13 @@ def create_app(
     app.state.grant_resolver = service.active_grants_for
     app.state.workload_capability = workload_capability
     app.state.secret_capability = secret_capability
+    # Exposed as state, not as a route. New material never crosses this API:
+    # putting a signing key in a request body would make every proxy log, every
+    # access log and every error path a place it can appear. An operator hands
+    # the material to the process out of band and drives the fenced ledger and
+    # the keyring together.
+    app.state.secret_capability_credential = secret_capability_credential
+    app.state.credential_rotation = credential_rotation
     app.state.metrics = metrics
     app.state.metrics_registry = registry
     app.state.controller = controller

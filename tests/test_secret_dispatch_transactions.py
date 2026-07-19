@@ -496,3 +496,77 @@ async def test_reentrant_secret_materialization_does_not_deadlock_postgres(postg
     finally:
         await repository.close()
         await engine.dispose()
+
+
+async def test_postgres_fences_two_replicas_beginning_one_credential_rotation(postgres_url: str) -> None:
+    """The rotation fence on the backend production actually uses.
+
+    Lives beside the other secret-path PostgreSQL contracts rather than with the
+    rest of the rotation tests, because this is the file the scheduled database
+    job runs. ``latest_credential_rotation`` reads the newest generation
+    ``FOR UPDATE``, so a second replica blocks, re-reads a row that is now in
+    flight, and refuses; without the lock both read "nothing in flight" and both
+    insert. The row and its check constraints are asserted in SQL for the same
+    reason -- an operator diagnosing a stuck rotation reads the table, not the
+    model.
+    """
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from eyvan.identity.rotation import CredentialRotationInterleaved
+    from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
+    from eyvan.server.service.credential_rotation import SECRET_CAPABILITY_CREDENTIAL, CredentialRotationService
+
+    engine = create_async_engine(postgres_url, poolclass=None)
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        await connection.execute(text("CREATE SCHEMA public"))
+    await create_schema(engine)
+    repository = SqlAlchemyRepository(engine)
+    await repository.open()
+    try:
+        first_replica = CredentialRotationService(repository)
+        second_replica = CredentialRotationService(repository)
+
+        started = await first_replica.begin(
+            credential=SECRET_CAPABILITY_CREDENTIAL,
+            fence="fence-a",
+            overlap_s=300,
+        )
+        with pytest.raises(CredentialRotationInterleaved):
+            await second_replica.begin(
+                credential=SECRET_CAPABILITY_CREDENTIAL,
+                fence="fence-b",
+                overlap_s=300,
+            )
+
+        committed = await first_replica.commit(
+            credential=SECRET_CAPABILITY_CREDENTIAL,
+            generation=started.generation,
+            fence="fence-a",
+        )
+        assert committed.previous_not_after is not None
+
+        async with engine.begin() as connection:
+            rows = (
+                await connection.execute(
+                    text("SELECT credential, generation, state FROM credential_rotations ORDER BY generation")
+                )
+            ).all()
+            with pytest.raises(IntegrityError):
+                # Generation 1 is the material a deployment started with, which
+                # nothing rotated into; the constraint is what stops a row from
+                # claiming otherwise.
+                await connection.execute(
+                    text(
+                        "INSERT INTO credential_rotations "
+                        "(credential, generation, state, fence, overlap_s, data) "
+                        "VALUES ('other', 1, 'pending', 'f', 0, '{}')"
+                    )
+                )
+        assert [tuple(row) for row in rows] == [(SECRET_CAPABILITY_CREDENTIAL, 2, "committed")]
+    finally:
+        await repository.close()
+        await engine.dispose()

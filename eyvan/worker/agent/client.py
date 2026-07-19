@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
     AgentCapabilities,
     AgentObservation,
@@ -128,11 +129,39 @@ def _raise_for_status(response: httpx.Response) -> None:
 
 
 class CellAgentClient:
-    """Control-plane client for one mTLS-fronted cell agent."""
+    """Control-plane client for one cell agent, optionally over mutual TLS."""
 
-    def __init__(self, base_url: str, *, token: str | None = None, client: httpx.Client | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        client: httpx.Client | None = None,
+        mtls: MutualTlsFiles | None = None,
+    ):
+        """Build the transport, presenting a client certificate only when asked.
+
+        ``mtls=None`` -- the default at every call site -- leaves the transport
+        byte for byte what it is today. This is the *client* half of the rollout
+        documented in :mod:`eyvan.identity.mtls`: the control plane starts
+        presenting a certificate at step 4, strictly before any agent is moved to
+        ``required`` at step 5. Reversing those two is what locks a control plane
+        out of the agents holding its running workloads.
+
+        An explicit ``client`` wins, because a caller that built its own
+        transport has already decided its TLS posture and silently replacing it
+        would be worse than ignoring the argument.
+        """
+
         headers = {"Authorization": f"Bearer {token}"} if token else None
-        self.client = client or httpx.Client(base_url=base_url, headers=headers, timeout=30.0)
+        if client is not None:
+            self.client = client
+            return
+        context = client_ssl_context(mtls) if mtls is not None else None
+        if context is None:
+            self.client = httpx.Client(base_url=base_url, headers=headers, timeout=30.0)
+        else:
+            self.client = httpx.Client(base_url=base_url, headers=headers, timeout=30.0, verify=context)
 
     def _send(self, method: str, url: str, **kwargs: tp.Any) -> httpx.Response:
         """Issue one request, mapping "could not ask" onto one typed error.

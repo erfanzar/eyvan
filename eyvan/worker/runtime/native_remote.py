@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity.drivers.base import ExecutionWorkloadObservation, MutationContext, StaleMutationError
+from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
     CheckpointRequest,
     MutationConflict,
@@ -38,7 +39,17 @@ class NativeRemoteExecutor:
         *,
         secret: str | None = None,
         client: httpx.Client | None = None,
+        mtls: MutualTlsFiles | None = None,
     ) -> None:
+        """Build the transport; ``mtls=None`` keeps today's bearer-only posture.
+
+        The inner half of the rollout in :mod:`eyvan.identity.mtls`: the agent
+        presents its certificate to the worker at step 4, before the worker is
+        moved to ``required`` at step 5. The bearer secret is still required
+        either way -- mutual TLS authenticates the *host*, not the fenced
+        mutation, and dropping the bearer would widen what a certificate grants.
+        """
+
         if not endpoint or endpoint != endpoint.strip():
             raise ValueError("native worker endpoint must be non-empty and trimmed")
         if not isinstance(secret, str) or not secret.strip():
@@ -46,7 +57,13 @@ class NativeRemoteExecutor:
         self.endpoint = endpoint.rstrip("/")
         self._headers = {"Authorization": f"Bearer {secret}"}
         self._owns_client = client is None
-        self.client = client or httpx.Client(base_url=self.endpoint, timeout=30.0)
+        context = client_ssl_context(mtls) if (client is None and mtls is not None) else None
+        if client is not None:
+            self.client = client
+        elif context is None:
+            self.client = httpx.Client(base_url=self.endpoint, timeout=30.0)
+        else:
+            self.client = httpx.Client(base_url=self.endpoint, timeout=30.0, verify=context)
         try:
             retire_wait_s = float(os.getenv("EYVAN_SUPERSEDE_WAIT_TIMEOUT_S", "300"))
         except ValueError:
