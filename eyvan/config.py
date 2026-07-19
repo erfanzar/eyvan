@@ -15,6 +15,7 @@ from pathlib import Path
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.capacity.stage_policy import CellStagePolicy, StageEvictionPolicy
 
 DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
 """Where a loopback control plane keeps its durable document by default."""
@@ -163,6 +164,32 @@ class EyvanSettings:
     #: because the accrual charges elapsed time rather than a fixed tick, so a
     #: longer interval costs resolution, never accuracy. Zero disables it.
     cell_billing_interval_s: float = 300.0
+    #: How often managed asset staging and stage eviction run. Zero disables
+    #: both, which is the default and today's behaviour: locality stays the soft
+    #: preference it has always been until an operator sizes a cache.
+    cell_stage_interval_s: float = 0.0
+    #: Hard ceiling on the bytes Eyvan may own on one cell's disk. Zero is the
+    #: off switch, and it is off by construction: nothing is staged, so nothing
+    #: has to be reclaimed and no budget can be exceeded.
+    cell_stage_budget_bytes: int = 0
+    #: Largest single asset staging may fetch. Separate from the budget because
+    #: it answers a different question -- the budget is how much of a host Eyvan
+    #: may use, this is how large one asset may be before staging it is somebody's
+    #: explicit decision rather than a cache's. Must not exceed the budget.
+    cell_stage_max_bytes: int = 0
+    #: Which staged asset is given up first. Named rather than defaulted at the
+    #: policy layer; the setting carries a value only so the loader has one, and
+    #: an unknown name is refused rather than silently replaced.
+    cell_stage_eviction_policy: str = "least_recently_used"
+    #: Whether the eviction phase may actually delete. Off by default, so the
+    #: phase computes and logs exactly the plan it would execute and removes
+    #: nothing -- a cache that starts deleting the moment it is switched on gives
+    #: an operator no way to see what it was about to do first.
+    cell_stage_eviction_enabled: bool = False
+    #: Staging attempts that may end without an answer before a stage is blocked.
+    #: Bounds a fetch that can never succeed without treating one timeout as a
+    #: verdict about the asset.
+    cell_stage_max_attempts: int = 3
     retention_batch_limit: int = 1000
     agent_shared_secret: str | None = field(default=None, repr=False)
     #: Bearer token a Prometheus scraper presents at ``/metrics``. A separate
@@ -208,7 +235,46 @@ class EyvanSettings:
         for name in ("artifact_retention_s", "log_retention_s"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative; use 0 to disable collection")
+        self._validate_cell_stage_settings()
         validate_minimum_client_version(self.min_client_version)
+
+    def _validate_cell_stage_settings(self) -> None:
+        """Refuse stage bounds that would let a cache bound nothing.
+
+        Every check here is the difference between a budget and a number. A
+        negative ceiling, a per-action limit above the whole budget, or an
+        eviction policy nobody recognises all produce a configuration that looks
+        like it constrains a disk and does not.
+        """
+
+        if not math.isfinite(self.cell_stage_interval_s) or self.cell_stage_interval_s < 0:
+            raise ValueError("cell_stage_interval_s must be finite and non-negative; use 0 to disable staging")
+        for name in ("cell_stage_budget_bytes", "cell_stage_max_bytes"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must not be negative; use 0 to disable staging")
+        if self.cell_stage_max_bytes > self.cell_stage_budget_bytes:
+            raise ValueError("cell_stage_max_bytes must not exceed cell_stage_budget_bytes")
+        if self.cell_stage_max_attempts < 1:
+            raise ValueError("cell_stage_max_attempts must be positive")
+        if self.cell_stage_eviction_policy not in {policy.value for policy in StageEvictionPolicy}:
+            choices = ", ".join(sorted(policy.value for policy in StageEvictionPolicy))
+            raise ValueError(f"cell_stage_eviction_policy must be one of: {choices}")
+
+    def cell_stage_policy(self) -> CellStagePolicy:
+        """Return the validated staging bounds this deployment declared.
+
+        A method rather than a field so the policy is constructed from settings
+        that have already been validated together, and so a deployment that never
+        enables staging carries no policy object it does not use.
+        """
+
+        return CellStagePolicy(
+            budget_bytes=self.cell_stage_budget_bytes,
+            max_stage_bytes=self.cell_stage_max_bytes,
+            eviction=StageEvictionPolicy(self.cell_stage_eviction_policy),
+            max_attempts=self.cell_stage_max_attempts,
+        )
 
     @classmethod
     def from_gcp_native_runtime_profile(cls, profile: GcpNativeRuntimeProfile) -> EyvanSettings:
@@ -311,6 +377,17 @@ class EyvanSettings:
             ),
             grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
+            cell_stage_interval_s=float(os.getenv("EYVAN_CELL_STAGE_INTERVAL_S", defaults.cell_stage_interval_s)),
+            cell_stage_budget_bytes=int(os.getenv("EYVAN_CELL_STAGE_BUDGET_BYTES", defaults.cell_stage_budget_bytes)),
+            cell_stage_max_bytes=int(os.getenv("EYVAN_CELL_STAGE_MAX_BYTES", defaults.cell_stage_max_bytes)),
+            cell_stage_eviction_policy=os.getenv(
+                "EYVAN_CELL_STAGE_EVICTION_POLICY", defaults.cell_stage_eviction_policy
+            ),
+            cell_stage_eviction_enabled=truthy(
+                "EYVAN_CELL_STAGE_EVICTION_ENABLED",
+                defaults.cell_stage_eviction_enabled,
+            ),
+            cell_stage_max_attempts=int(os.getenv("EYVAN_CELL_STAGE_MAX_ATTEMPTS", defaults.cell_stage_max_attempts)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),
             agent_shared_secret=os.getenv("EYVAN_AGENT_SHARED_SECRET"),
             metrics_token=os.getenv("EYVAN_METRICS_TOKEN"),

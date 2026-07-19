@@ -2929,3 +2929,143 @@ class WorkloadProgress(EyvanModel):
     #: the dashboard and ``client/callables.py`` already poll, so a training loop
     #: reporting its step needs no new polling loop anywhere.
     user_progress: tuple[UserProgressReport, ...] = ()
+
+
+#: Longest named-asset string one durable stage row may key on.
+#:
+#: ``WorkloadDefinition.named_assets`` is an opaque list of strings -- a dataset
+#: URI, a checkpoint path, an image reference -- and nothing bounded them,
+#: because until now nothing keyed durable state on one. A staged asset is a
+#: primary key in every backend, so the bound is the width the column has to
+#: reserve. Deliberately generous next to real object-store URIs and still far
+#: below any index key limit.
+MAX_CELL_STAGE_ASSET_LENGTH = 512
+
+
+class CellStageState(StrEnum):
+    """What this control plane can prove about one asset's copy on one cell.
+
+    Three of the five are the same statement -- *presence is unproven* -- kept
+    apart because the operator response differs: ``STAGING`` and ``EVICTING`` say
+    an action is running, ``UNKNOWN`` says one ended without an answer, and
+    ``BLOCKED`` says this control plane has stopped asking. Only ``STAGED``
+    claims the bytes are there, and only ``STAGED`` may be scored as a cache hit.
+
+    There is no state for *proven absent*: that is the absence of a row. A
+    confirmed eviction deletes the record rather than tombstoning it, so the
+    table stays bounded by what is actually on disk somewhere.
+    """
+
+    #: A staging action is in flight. Bytes may or may not be on disk.
+    STAGING = "staging"
+    #: An executor reported the exact bytes present at this cell generation.
+    STAGED = "staged"
+    #: An action ended without an answer. Not absent -- unproven.
+    UNKNOWN = "unknown"
+    #: An eviction is in flight. Bytes may or may not still be on disk.
+    EVICTING = "evicting"
+    #: No further automatic action will be taken. Presence is still unproven.
+    BLOCKED = "blocked"
+
+
+#: States in which the asset is not proven present. Every one of them charges
+#: the cell budget, because a disk does not care what this control plane can
+#: prove: bytes that *might* be there occupy space that might not be free.
+CELL_STAGE_UNPROVEN_STATES = frozenset(
+    {
+        CellStageState.STAGING,
+        CellStageState.UNKNOWN,
+        CellStageState.EVICTING,
+        CellStageState.BLOCKED,
+    }
+)
+
+
+class CellStageRecord(EyvanModel):
+    """One named asset's managed copy on one execution cell.
+
+    Durable and additive, in its own table. The alternative -- a field on
+    ``CellRecord`` -- is not available: the persisted cell document is decoded
+    with ``extra='forbid'``, so the first write would make every cell unreadable
+    to a rolled-back replica, and a control plane that cannot read its cells
+    schedules nothing.
+
+    Distinct from ``CellRecord.materialized_assets``, which is an agent's
+    unaccounted claim carried in free-form observation metadata. That claim has
+    no size, no digest, no generation and no lifecycle, so nothing can evict
+    against it or bound it. This record is the managed half: every field here is
+    either observed by an executor or decided by this control plane, and the two
+    are never mixed -- ``confirmed_at`` is set only by an observation.
+    """
+
+    cell_id: str = Field(max_length=96)
+    asset: str = Field(max_length=MAX_CELL_STAGE_ASSET_LENGTH)
+    #: The cell generation this row describes. A generation bump is a different
+    #: machine, so a row naming an older one describes a disk that no longer
+    #: exists: it is never a hit and never charged, whatever its state says.
+    cell_generation: int = Field(ge=1)
+    state: CellStageState
+    #: Bytes this stage is charged against its cell's budget -- the ceiling the
+    #: action was admitted under while presence is unproven, and the observed
+    #: size once an executor has measured it. One number so the budget is
+    #: comparable across states; the honest difference is ``observed_bytes``.
+    reserved_bytes: int = Field(ge=0)
+    #: What an executor actually measured, or ``None`` when nobody has. Never
+    #: inferred from the ceiling: an unmeasured stage reports unmeasured.
+    observed_bytes: int | None = Field(default=None, ge=0)
+    #: Content digest as reported by the executor. ``None`` means the executor
+    #: does not compute one for this asset, which is ordinary for a directory
+    #: tree -- presence is still proven, content is simply not verified.
+    digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    #: When an executor last proved the bytes present. Set only with
+    #: ``STAGED`` and cleared with every other state, so "confirmed" cannot
+    #: survive the observation that stopped confirming it.
+    confirmed_at: datetime | None = None
+    #: When a workload declaring this asset last held a lease on this cell.
+    #: The eviction policy's clock; not evidence of presence.
+    last_used_at: datetime | None = None
+    #: Completed staging attempts charged against the attempt budget. Bounds the
+    #: retry of a stage that keeps ending without an answer, so an asset that can
+    #: never be fetched stops consuming a leader phase forever.
+    attempts: int = Field(default=0, ge=0)
+    #: Why the last action ended as it did. Free text, and the only place an
+    #: operator can read the executor's own words.
+    detail: str | None = Field(default=None, max_length=2048)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_stage(self) -> CellStageRecord:
+        _validate_string(self.cell_id, field_name="cell stage cell id")
+        _validate_string(self.asset, field_name="cell stage asset")
+        if (self.state is CellStageState.STAGED) != (self.confirmed_at is not None):
+            raise ValueError("a cell stage is confirmed exactly when it is staged")
+        if self.state is CellStageState.STAGED and self.observed_bytes is None:
+            raise ValueError("a staged cell stage must carry the size an executor observed")
+        if self.state is CellStageState.STAGED and self.observed_bytes != self.reserved_bytes:
+            raise ValueError("a staged cell stage must be charged exactly the bytes an executor observed")
+        return self
+
+    @property
+    def presence_is_unproven(self) -> bool:
+        """Return whether nothing here claims the bytes are on a disk.
+
+        The half of the design that is easy to get backwards: an unproven stage
+        is never a cache hit and always a budget charge. Reading it off one named
+        set rather than off an inline comparison is what makes adding a state a
+        decision -- a new member either charges without hitting or it does not,
+        and the set is where that is written down.
+        """
+
+        return self.state in CELL_STAGE_UNPROVEN_STATES
+
+    def is_confirmed_on(self, cell: CellRecord) -> bool:
+        """Return whether this row proves the asset is on *this* cell right now.
+
+        Both halves matter. A row that is not ``STAGED`` never proved presence,
+        and a row from an older generation proved it about a machine that has
+        since been replaced. Either way the answer is "unknown", and unknown is
+        never a cache hit.
+        """
+
+        return not self.presence_is_unproven and self.cell_id == cell.id and self.cell_generation == cell.generation

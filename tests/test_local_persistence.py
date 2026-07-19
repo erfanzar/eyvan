@@ -976,11 +976,12 @@ def test_local_store_normalizes_pathological_json_decoder_failures(
         b"\xff",
         '{"schema":"eyvan.control-plane","version":2,"revision":0}'.encode("utf-16"),
         b"[]\n",
-        # Version 3 became a real schema when frozen attempt topologies needed a
-        # collection v2 could not carry, so the unsupported-version case moved up
-        # rather than disappearing: an unknown version must still be refused by
-        # version, before any field of it is interpreted.
-        b'{"schema":"eyvan.control-plane","version":4}\n',
+        # Versions 3 and 4 each became real schemas when a durable collection
+        # arrived that the previous one could not carry -- the frozen attempt
+        # topologies, then the managed cell stages. The unsupported-version case
+        # moves up each time rather than disappearing: an unknown version must
+        # still be refused by version, before any field of it is interpreted.
+        b'{"schema":"eyvan.control-plane","version":5}\n',
         b'{"version":2}\n',
         b'{"schema":"eyvan.control-plane","version":{},"revision":0}\n',
         b'{"schema":"eyvan.control-plane","version":2,"unexpected":true}\n',

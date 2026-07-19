@@ -36,6 +36,7 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.persistence.base import Repository
 from eyvan.server.service.control_plane import ControlPlaneService
+from eyvan.server.service.stage import CellStageExecutor
 from eyvan.worker.agent.client import (
     CellAgentClient,
 )
@@ -63,6 +64,13 @@ class _ControllerLifecycle:
         artifact_access: ManagedArtifactAccess | None = None,
         workload_capability: WorkloadCapabilitySigner | None = None,
         secret_capability: SecretCapabilitySigner | None = None,
+        #: Puts named assets on a host and takes them off again. Optional, and
+        #: unset in every shipped configuration: staging is a property of the
+        #: asset store rather than of the capacity provider, so binding one here
+        #: would make the contract unimplementable for anything but today's
+        #: agent. Without it nothing is staged and every stage reads as unknown,
+        #: which is the honest description of a plane that cannot reach a disk.
+        stage_executor: CellStageExecutor | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -85,6 +93,7 @@ class _ControllerLifecycle:
         self.artifact_access = artifact_access
         self.workload_capability = workload_capability
         self.secret_capability = secret_capability
+        self._stage_executor = stage_executor
         self._capacity_lifecycle = CapacityLifecycleLogger(logger)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:

@@ -579,6 +579,15 @@ class ControlPlaneService:
         the submitter made about placement, and a cache guess has no standing to
         argue with it -- silently replacing it would make an explicit pin behave
         differently depending on unrelated fleet history.
+
+        Confirmed managed stages outrank both weaker signals, and only confirmed
+        ones are read at all: a stage that is being fetched, could not be
+        observed, or was proven against a generation the cell no longer runs
+        contributes nothing, because preferring a cell on the strength of bytes
+        nobody confirmed is exactly the failure managed staging exists to remove.
+        Stages are fetched for this spec's assets only, so the submission path
+        stays proportional to what the workload named rather than to the fleet's
+        whole cache.
         """
 
         if not spec.named_assets or spec.preferred_cells:
@@ -590,6 +599,7 @@ class ControlPlaneService:
                 await tx.list_leases(),
                 now=moment,
                 cells=await tx.list_cells(),
+                stages=await tx.list_cell_stages(assets=spec.named_assets),
             )
         preferred = preferred_cells_for(spec.named_assets, index)
         if not preferred:

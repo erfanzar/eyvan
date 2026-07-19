@@ -28,6 +28,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CellStageRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -59,7 +60,14 @@ LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
 #: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
 #: writing v2 documents an older build still reads.
 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3)
+#: Emitted only once a managed cell stage exists, for the reason v3 exists.
+#:
+#: A stage row is durable evidence about a disk -- which asset, how many bytes,
+#: which generation confirmed it. Dropping it on a save would leave the budget
+#: charging nothing for bytes that are still on the host, so a document that
+#: cannot carry stages must refuse them rather than silently omit them.
+LOCAL_CONTROL_PLANE_STAGE_SCHEMA_VERSION = 4
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -239,12 +247,18 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
         them. v2 has no place to put them, and a silent omission would turn a
         durable rank map into an attempt that reports its topology as unknown
         after one restart -- the exact failure the record exists to prevent.
-        Callers use :func:`local_control_plane_document`, which selects v3 when
-        there is something only v3 can carry.
+        Callers use :func:`local_control_plane_document`, which selects the
+        lowest version that can carry everything the state holds.
+
+        Managed cell stages are refused for the same reason and a sharper one:
+        an omitted stage row stops charging bytes that are still occupying a
+        host's disk, so the budget silently starts bounding nothing.
         """
 
         if state.workload_topologies:
             raise ValueError("frozen attempt topologies require the v3 local control-plane document")
+        if state.cell_stages:
+            raise ValueError("managed cell stages require the v4 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -353,22 +367,64 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
         return state
 
 
+class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
+    """Schema-v4 document: v3 plus the managed per-cell stage ledger.
+
+    Additive exactly like v3 was. Every earlier collection keeps its meaning and
+    its ordering, so a v4 document differs from the v3 one it replaces only by a
+    collection v3 could not express -- and an older build refuses it by version
+    rather than dropping durable evidence about a disk it cannot see.
+    """
+
+    version: Literal[4] = LOCAL_CONTROL_PLANE_STAGE_SCHEMA_VERSION
+    cell_stages: tuple[CellStageRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v4_document(self) -> LocalControlPlaneV4Document:
+        """Reject duplicate (cell, asset) identities before restoration merges them."""
+
+        keys = [(record.cell_id, record.asset) for record in self.cell_stages]
+        if len(set(keys)) != len(keys):
+            raise ValueError("local control-plane cell stages must have unique cell/asset identities")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV4Document:
+        """Encode one snapshot including every managed cell stage."""
+
+        stages = tuple(state.cell_stages[key] for key in sorted(state.cell_stages))
+        base = LocalControlPlaneV3Document.from_state(replace(state, cell_stages={}))
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            cell_stages=stages,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v3 aggregates plus every managed cell stage."""
+
+        state = super().to_state()
+        state.cell_stages = {(record.cell_id, record.asset): record for record in self.cell_stages}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
-    older build still reads; the first frozen topology moves the file to v3, and
-    an older build then refuses it by version instead of silently discarding a
-    durable rank map it does not understand.
+    older build still reads; the first frozen topology moves the file to v3, the
+    first managed stage moves it to v4, and an older build then refuses it by
+    version instead of silently discarding durable state it does not understand.
     """
 
+    if state.cell_stages:
+        return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
         return LocalControlPlaneV3Document.from_state(state)
     return LocalControlPlaneDocument.from_state(state)
 
 
 _LocalControlPlaneReadableDocument: tp.TypeAlias = (
-    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document
+    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document | LocalControlPlaneV4Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -497,6 +553,7 @@ class LocalControlPlaneStore:
                 1: _LocalControlPlaneV1Document,
                 LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
+                LOCAL_CONTROL_PLANE_STAGE_SCHEMA_VERSION: LocalControlPlaneV4Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -939,6 +996,7 @@ __all__ = (
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_STAGE_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
     "LocalControlPlaneAmbiguousCommitError",
@@ -949,6 +1007,7 @@ __all__ = (
     "LocalControlPlaneSchemaError",
     "LocalControlPlaneStore",
     "LocalControlPlaneV3Document",
+    "LocalControlPlaneV4Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",
