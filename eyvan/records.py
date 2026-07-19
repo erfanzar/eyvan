@@ -2929,3 +2929,112 @@ class WorkloadProgress(EyvanModel):
     #: the dashboard and ``client/callables.py`` already poll, so a training loop
     #: reporting its step needs no new polling loop anywhere.
     user_progress: tuple[UserProgressReport, ...] = ()
+
+
+class ExpansionMode(StrEnum):
+    """How one fan-out expansion was admitted, as reported to its submitter.
+
+    Durable and wire-visible, so it lives beside the record that carries it
+    rather than in the service that computes it.
+    """
+
+    #: Every child competes for capacity from the moment it is created.
+    IMMEDIATE = "immediate"
+    #: Children compete in bounded waves; the rest are created, durably owed
+    #: execution, and invisible to the scheduler until an earlier wave drains.
+    WAVES = "waves"
+
+
+class ExpansionAdmissionState(StrEnum):
+    """Whether an expansion ledger still owes any child an admission."""
+
+    ADMITTING = "admitting"
+    #: Every child this ledger governs has been released, or can never be:
+    #: an absorbing state, so a settled expansion stops being scanned.
+    COMPLETE = "complete"
+
+
+class ExpansionAdmissionRecord(EyvanModel):
+    """The durable admission plan one fan-out expansion was accepted under.
+
+    Additive and in its own table on purpose. The alternative -- fields on the
+    coordinator workload -- is not available: the persisted workload document is
+    decoded with ``extra='forbid'``, so the first write would make every workload
+    unreadable to a rolled-back replica, and a control plane that cannot read its
+    workloads schedules nothing.
+
+    Durable rather than in-memory for the reason waves exist at all: a leader
+    that dies between two waves must resume the *same* plan. Recomputing it from
+    configuration would silently re-plan a running expansion whenever an operator
+    changed a setting, and recomputing it from live quota would make an
+    expansion's own progress change its remaining plan.
+
+    ``released_children`` is a ledger, never the decision input. Which child is
+    released next is read from the children themselves, so a leader that crashed
+    after flipping a child and before committing the counter releases nothing
+    twice.
+    """
+
+    #: Derived from the coordinator id, so a replayed submission rebinds the same
+    #: row instead of opening a second plan for one expansion.
+    id: str = Field(max_length=32)
+    #: The coordinator whose children this plan governs.
+    workload_id: str = Field(max_length=96)
+    org_id: str = Field(max_length=128)
+    project_id: str = Field(max_length=128)
+    kind: CoordinationKind
+    total_children: int = Field(ge=1)
+    #: How many children may compete at once. Equal to ``total_children`` when
+    #: the expansion was admitted immediately.
+    wave_size: int = Field(ge=1)
+    #: How many children this ledger has made schedulable so far, including the
+    #: first wave admitted inside the submitting transaction.
+    released_children: int = Field(default=0, ge=0)
+    #: The ceiling this expansion was held to, kept so an operator can see what
+    #: an already-admitted expansion was judged against after the setting moves.
+    ceiling: int = Field(ge=1)
+    mode: ExpansionMode
+    state: ExpansionAdmissionState = ExpansionAdmissionState.ADMITTING
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_admission(self) -> ExpansionAdmissionRecord:
+        _validate_string(self.id, field_name="expansion admission id")
+        _validate_string(self.workload_id, field_name="expansion admission workload id")
+        _validate_string(self.org_id, field_name="expansion admission organization id")
+        _validate_string(self.project_id, field_name="expansion admission project id")
+        if self.released_children > self.total_children:
+            raise ValueError("expansion admission cannot release more children than it created")
+        if self.wave_size > self.total_children:
+            raise ValueError("expansion admission wave cannot exceed the children it governs")
+        if self.mode is ExpansionMode.IMMEDIATE and self.wave_size != self.total_children:
+            raise ValueError("an immediately admitted expansion has one wave holding every child")
+        return self
+
+    @property
+    def deferred_children(self) -> int:
+        """Children created and owed execution that this ledger has not released."""
+
+        return self.total_children - self.released_children
+
+    def describe(self) -> str:
+        """Return the one-line, operator-readable summary of this admission."""
+
+        if self.mode is ExpansionMode.IMMEDIATE:
+            return f"admitted {self.total_children} children immediately (ceiling {self.ceiling})"
+        return (
+            f"admitted {self.total_children} children in waves of {self.wave_size}: "
+            f"{self.released_children} released, {self.deferred_children} waiting "
+            f"(ceiling {self.ceiling})"
+        )
+
+
+def expansion_admission_id(workload_id: str) -> str:
+    """Return the stable ledger id for one coordinator.
+
+    Derived rather than random so a replayed submission finds the row it already
+    wrote, and short enough to be a 32-character key in every backend.
+    """
+
+    return f"exp_{hashlib.sha256(workload_id.encode()).hexdigest()[:28]}"

@@ -20,6 +20,8 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    ExpansionAdmissionRecord,
+    ExpansionAdmissionState,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -70,6 +72,10 @@ class ControlPlaneState:
     #: cell whose observed process width changes mid-attempt must not renumber
     #: the ranks of the cells after it.
     workload_topologies: dict[tuple[str, int], WorkloadAttemptTopology] = field(default_factory=dict)
+    #: Coordinator workload id -> the admission plan its expansion was accepted
+    #: under. Keyed by coordinator because one expansion has exactly one plan,
+    #: and a replayed submission must rebind that plan rather than open a second.
+    expansion_admissions: dict[str, ExpansionAdmissionRecord] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
@@ -260,6 +266,20 @@ class StateSession(RepositorySession):
 
     async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
         return [topology for key, topology in sorted(self._state.workload_topologies.items()) if key[0] == workload_id]
+
+    async def get_expansion_admission(self, workload_id: str) -> ExpansionAdmissionRecord | None:
+        return self._state.expansion_admissions.get(workload_id)
+
+    async def put_expansion_admission(self, record: ExpansionAdmissionRecord) -> None:
+        self._state.expansion_admissions[record.workload_id] = record
+
+    async def list_expansion_admissions(
+        self,
+        *,
+        state: ExpansionAdmissionState | None = None,
+    ) -> list[ExpansionAdmissionRecord]:
+        records = sorted(self._state.expansion_admissions.values(), key=lambda record: record.id)
+        return [record for record in records if state is None or record.state is state]
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         return self._state.plane_peers.get(plane_id)

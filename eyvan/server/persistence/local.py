@@ -28,6 +28,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    ExpansionAdmissionRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -59,7 +60,15 @@ LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
 #: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
 #: writing v2 documents an older build still reads.
 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3)
+#: Emitted only once a fan-out expansion has been admitted under a wave plan.
+#:
+#: Same reasoning as v3, one version later: an admission ledger is durable state
+#: a v3 document has nowhere to put, and dropping it on the way through a
+#: restart would either strand an expansion's remaining children or release them
+#: all at once. A fleet that has never bounded a fan-out keeps writing the older
+#: version an older build still reads.
+LOCAL_CONTROL_PLANE_EXPANSION_SCHEMA_VERSION = 4
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -245,6 +254,8 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
 
         if state.workload_topologies:
             raise ValueError("frozen attempt topologies require the v3 local control-plane document")
+        if state.expansion_admissions:
+            raise ValueError("expansion admission ledgers require the v4 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -335,8 +346,16 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
 
     @classmethod
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV3Document:
-        """Encode one snapshot including every frozen attempt topology."""
+        """Encode one snapshot including every frozen attempt topology.
 
+        Refuses a state carrying expansion admission ledgers for the same reason
+        v2 refuses topologies: v3 has nowhere to put them, and a dropped ledger
+        is an expansion whose remaining children are either stranded or released
+        all at once after one restart.
+        """
+
+        if state.expansion_admissions:
+            raise ValueError("expansion admission ledgers require the v4 local control-plane document")
         topologies = tuple(state.workload_topologies[key] for key in sorted(state.workload_topologies))
         without_topologies = replace(state, workload_topologies={})
         base = LocalControlPlaneDocument.from_state(without_topologies)
@@ -353,22 +372,65 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
         return state
 
 
+class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
+    """Schema-v4 document: v3 plus the durable fan-out admission ledgers.
+
+    Purely additive, exactly like v3 over v2. Every earlier collection keeps its
+    meaning and its ordering, so a v4 document differs from the v3 one it
+    replaces only by carrying something v3 could not express.
+    """
+
+    version: Literal[4] = LOCAL_CONTROL_PLANE_EXPANSION_SCHEMA_VERSION
+    expansion_admissions: tuple[ExpansionAdmissionRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v4_document(self) -> LocalControlPlaneV4Document:
+        """Reject two ledgers for one coordinator before restoration merges them."""
+
+        coordinators = [record.workload_id for record in self.expansion_admissions]
+        if len(set(coordinators)) != len(coordinators):
+            raise ValueError("local control-plane expansion admissions must have unique coordinator identities")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV4Document:
+        """Encode one snapshot including every durable expansion admission plan."""
+
+        admissions = tuple(state.expansion_admissions[key] for key in sorted(state.expansion_admissions))
+        without_admissions = replace(state, expansion_admissions={})
+        base = LocalControlPlaneV3Document.from_state(without_admissions)
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            expansion_admissions=admissions,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v3 aggregates plus every expansion admission ledger."""
+
+        state = super().to_state()
+        state.expansion_admissions = {record.workload_id: record for record in self.expansion_admissions}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
     older build still reads; the first frozen topology moves the file to v3, and
     an older build then refuses it by version instead of silently discarding a
-    durable rank map it does not understand.
+    durable rank map it does not understand. The first bounded fan-out moves it
+    to v4 on exactly the same terms.
     """
 
+    if state.expansion_admissions:
+        return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
         return LocalControlPlaneV3Document.from_state(state)
     return LocalControlPlaneDocument.from_state(state)
 
 
 _LocalControlPlaneReadableDocument: tp.TypeAlias = (
-    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document
+    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document | LocalControlPlaneV4Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -497,6 +559,7 @@ class LocalControlPlaneStore:
                 1: _LocalControlPlaneV1Document,
                 LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
+                LOCAL_CONTROL_PLANE_EXPANSION_SCHEMA_VERSION: LocalControlPlaneV4Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -935,6 +998,7 @@ class LocalJsonRepository(StateRepository):
 
 
 __all__ = (
+    "LOCAL_CONTROL_PLANE_EXPANSION_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_MAX_BYTES",
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
     "LOCAL_CONTROL_PLANE_SCHEMA",
@@ -949,6 +1013,7 @@ __all__ = (
     "LocalControlPlaneSchemaError",
     "LocalControlPlaneStore",
     "LocalControlPlaneV3Document",
+    "LocalControlPlaneV4Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",

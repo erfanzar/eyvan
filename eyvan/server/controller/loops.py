@@ -67,9 +67,18 @@ class _ControllerLoops:
             # Before scheduling, so a node released this cycle can be placed in the
             # same cycle rather than waiting a full interval.
             LeaderPhase("release-dag-nodes", self.release_ready_dag_nodes_once),
+            # Before the feasibility gate, and before scheduling: a group that can
+            # be placed whole is leased here as one transaction, so the gate below
+            # never sees it and the ordinary pass never places half of it. Off by
+            # default, in which case this phase returns immediately.
+            LeaderPhase("place-groups", self.place_admitted_groups_once),
             # Before scheduling, for the same reason: a group that became feasible
             # this cycle should be placed in it, not a full interval later.
             LeaderPhase("release-groups", self.release_admitted_groups_once),
+            # Before scheduling, so a wave released this cycle competes in it. After
+            # settlement above, so a child that finished this cycle has already
+            # freed its place in the wave rather than holding it for a full interval.
+            LeaderPhase("release-expansion-waves", self.release_expansion_waves_once),
             # Before scheduling: a replica started this cycle should be placed
             # in it rather than a full interval later, which for a service is
             # the difference between a blip and a visible outage.
