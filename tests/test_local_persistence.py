@@ -977,10 +977,11 @@ def test_local_store_normalizes_pathological_json_decoder_failures(
         '{"schema":"eyvan.control-plane","version":2,"revision":0}'.encode("utf-16"),
         b"[]\n",
         # Version 3 became a real schema when frozen attempt topologies needed a
-        # collection v2 could not carry, so the unsupported-version case moved up
+        # collection v2 could not carry, and version 4 when the credential
+        # rotation ledger did, so the unsupported-version case moved up again
         # rather than disappearing: an unknown version must still be refused by
         # version, before any field of it is interpreted.
-        b'{"schema":"eyvan.control-plane","version":4}\n',
+        b'{"schema":"eyvan.control-plane","version":5}\n',
         b'{"version":2}\n',
         b'{"schema":"eyvan.control-plane","version":{},"revision":0}\n',
         b'{"schema":"eyvan.control-plane","version":2,"unexpected":true}\n',

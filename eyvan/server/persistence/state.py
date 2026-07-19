@@ -20,6 +20,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -70,6 +71,10 @@ class ControlPlaneState:
     #: cell whose observed process width changes mid-attempt must not renumber
     #: the ranks of the cells after it.
     workload_topologies: dict[tuple[str, int], WorkloadAttemptTopology] = field(default_factory=dict)
+    #: (credential, generation) -> that rotation's durable outcome. Keyed by the
+    #: generation, never by the credential alone: overwriting would erase the
+    #: inconclusive rotation an operator still has to resolve.
+    credential_rotations: dict[tuple[str, int], CredentialRotationRecord] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
@@ -260,6 +265,16 @@ class StateSession(RepositorySession):
 
     async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
         return [topology for key, topology in sorted(self._state.workload_topologies.items()) if key[0] == workload_id]
+
+    async def get_credential_rotation(self, credential: str, generation: int) -> CredentialRotationRecord | None:
+        return self._state.credential_rotations.get((credential, generation))
+
+    async def put_credential_rotation(self, rotation: CredentialRotationRecord) -> None:
+        self._state.credential_rotations[(rotation.credential, rotation.generation)] = rotation
+
+    async def latest_credential_rotation(self, credential: str) -> CredentialRotationRecord | None:
+        rotations = [rotation for key, rotation in self._state.credential_rotations.items() if key[0] == credential]
+        return max(rotations, key=lambda rotation: rotation.generation, default=None)
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         return self._state.plane_peers.get(plane_id)

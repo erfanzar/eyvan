@@ -24,6 +24,7 @@ from sqlalchemy import (
     CheckConstraint,
     Connection,
     DateTime,
+    Float,
     Index,
     Integer,
     PrimaryKeyConstraint,
@@ -47,6 +48,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -67,7 +69,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0015_attempt_topology"
+SCHEMA_REVISION = "0016_credential_rotation"
 
 
 @tp.runtime_checkable
@@ -218,6 +220,27 @@ class WorkloadTopologyRow(Base):
     #: so a mismatch is visible to an operator reading the table directly.
     digest: Mapped[str] = mapped_column(String(71), nullable=False)
     total_rank_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class CredentialRotationRow(Base):
+    __tablename__ = "credential_rotations"
+    __table_args__ = (
+        CheckConstraint("generation >= 2", name="ck_credential_rotations_generation_positive"),
+        CheckConstraint("overlap_s >= 0", name="ck_credential_rotations_overlap_non_negative"),
+    )
+    #: Composite key on the generation. A rotation is never overwritten by the
+    #: next one: an inconclusive rotation an operator has not resolved is the
+    #: single most important row in this table, and a key on the credential alone
+    #: would let the next attempt erase it.
+    credential: Mapped[str] = mapped_column(String(96), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, primary_key=True)
+    #: Real columns rather than JSON extractions so the two questions an operator
+    #: asks -- "is anything in flight" and "what does this row claim" -- are
+    #: answerable in SQL from a replica that is not running this code.
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    fence: Mapped[str] = mapped_column(String(64), nullable=False)
+    overlap_s: Mapped[float] = mapped_column(Float, nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -795,6 +818,42 @@ class SqlAlchemySession:
         )
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(WorkloadAttemptTopology, rows, table="workload_topologies")
+
+    async def get_credential_rotation(self, credential: str, generation: int) -> CredentialRotationRecord | None:
+        row = await self._get_locked(CredentialRotationRow, {"credential": credential, "generation": generation})
+        return None if row is None else CredentialRotationRecord.model_validate(row.data)
+
+    async def put_credential_rotation(self, rotation: CredentialRotationRecord) -> None:
+        await self.session.merge(
+            CredentialRotationRow(
+                credential=rotation.credential,
+                generation=rotation.generation,
+                state=str(rotation.state),
+                fence=rotation.fence,
+                overlap_s=rotation.overlap_s,
+                data=_dump(rotation),
+            )
+        )
+
+    async def latest_credential_rotation(self, credential: str) -> CredentialRotationRecord | None:
+        """Read the newest rotation row under a lock, so a racing begin serializes.
+
+        ``with_for_update`` on the *newest* row is what makes two replicas
+        beginning a rotation at the same moment produce one winner: the loser
+        waits, re-reads a row that is now in flight, and refuses. A read without
+        the lock would let both see "nothing in flight" and both insert.
+        """
+
+        statement = (
+            select(CredentialRotationRow)
+            .where(CredentialRotationRow.credential == credential)
+            .order_by(CredentialRotationRow.generation.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        rows = (await self.session.scalars(statement)).all()
+        decoded = _decode_rows(CredentialRotationRecord, rows, table="credential_rotations")
+        return decoded[0] if decoded else None
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         row = await self._get_locked(PlanePeerRow, plane_id)

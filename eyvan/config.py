@@ -15,6 +15,7 @@ from pathlib import Path
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.identity.mtls import MutualTlsFiles, MutualTlsMode, parse_mutual_tls_mode
 
 DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
 """Where a loopback control plane keeps its durable document by default."""
@@ -190,6 +191,39 @@ class EyvanSettings:
     native_worker_wheelhouse_generation: str | None = None
     native_worker_state_dir: str = "/var/lib/eyvan/native-worker"
     platform_config_path: str = "/etc/eyvan/platform.yaml"
+    #: Ask the provider metadata path who this host is instead of trusting a
+    #: long-lived key file. Off by default: a probe that runs everywhere would
+    #: add a network call to every process start, and on a host with no metadata
+    #: service the honest answer is the one nobody asked for.
+    provider_metadata_identity_enabled: bool = False
+    provider_metadata_identity_timeout_s: float = 2.0
+    #: Mutual TLS between control plane, cell agent, and native worker. ``off``
+    #: everywhere is today's deployment; see :mod:`eyvan.identity.mtls` for the
+    #: enablement order, which must be followed outward-in or the control plane
+    #: loses its own agents mid-rollout.
+    mutual_tls_mode: str = "off"
+    mutual_tls_client_enabled: bool = False
+    mutual_tls_trust_bundle: str = ""
+    mutual_tls_certificate: str = ""
+    mutual_tls_private_key: str = ""
+    #: Seconds a superseded signing generation keeps verifying after a rotation
+    #: commits. Long enough for a capability minted just before the rotation to
+    #: still be redeemed by a cell that is mid-bootstrap, and no longer.
+    credential_rotation_overlap_s: float = 300.0
+
+    def mutual_tls_files(self) -> MutualTlsFiles:
+        """Return this process's mutual-TLS paths, never its key material."""
+
+        return MutualTlsFiles(
+            trust_bundle=self.mutual_tls_trust_bundle,
+            certificate=self.mutual_tls_certificate,
+            private_key=self.mutual_tls_private_key,
+        )
+
+    def mutual_tls_server_mode(self) -> MutualTlsMode:
+        """Return what this process requires of peers connecting to it."""
+
+        return parse_mutual_tls_mode(self.mutual_tls_mode)
 
     def __post_init__(self) -> None:
         """Validate settings that participate in durable controller ownership."""
@@ -201,6 +235,15 @@ class EyvanSettings:
                 raise ValueError(f"{name} must not be negative; use 0 to disable pruning")
         if self.retention_batch_limit <= 0:
             raise ValueError("retention_batch_limit must be positive")
+        if not math.isfinite(self.credential_rotation_overlap_s) or self.credential_rotation_overlap_s < 0:
+            raise ValueError("credential_rotation_overlap_s must be finite and non-negative")
+        timeout_s = self.provider_metadata_identity_timeout_s
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("provider_metadata_identity_timeout_s must be finite and positive")
+        # Refuse an unrecognized spelling at construction rather than at the
+        # first connection: a typo in ``required`` that silently reads as off is
+        # exactly the failure mutual TLS is being added to prevent.
+        parse_mutual_tls_mode(self.mutual_tls_mode)
         if not math.isfinite(self.artifact_collection_interval_s) or self.artifact_collection_interval_s <= 0:
             raise ValueError("artifact_collection_interval_s must be finite and positive")
         if not math.isfinite(self.artifact_recovery_grace_s) or self.artifact_recovery_grace_s < 0:
@@ -335,4 +378,16 @@ class EyvanSettings:
             native_worker_artifact_root_uri=os.getenv("EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI"),
             native_worker_public_ingress_tag=os.getenv("EYVAN_NATIVE_WORKER_PUBLIC_INGRESS_TAG"),
             platform_config_path=os.getenv("EYVAN_PLATFORM_CONFIG_PATH", defaults.platform_config_path),
+            provider_metadata_identity_enabled=truthy("EYVAN_PROVIDER_METADATA_IDENTITY_ENABLED"),
+            provider_metadata_identity_timeout_s=float(
+                os.getenv("EYVAN_PROVIDER_METADATA_IDENTITY_TIMEOUT_S", defaults.provider_metadata_identity_timeout_s)
+            ),
+            mutual_tls_mode=os.getenv("EYVAN_MUTUAL_TLS_MODE", defaults.mutual_tls_mode),
+            mutual_tls_client_enabled=truthy("EYVAN_MUTUAL_TLS_CLIENT_ENABLED"),
+            mutual_tls_trust_bundle=os.getenv("EYVAN_MUTUAL_TLS_TRUST_BUNDLE", defaults.mutual_tls_trust_bundle),
+            mutual_tls_certificate=os.getenv("EYVAN_MUTUAL_TLS_CERTIFICATE", defaults.mutual_tls_certificate),
+            mutual_tls_private_key=os.getenv("EYVAN_MUTUAL_TLS_PRIVATE_KEY", defaults.mutual_tls_private_key),
+            credential_rotation_overlap_s=float(
+                os.getenv("EYVAN_CREDENTIAL_ROTATION_OVERLAP_S", defaults.credential_rotation_overlap_s)
+            ),
         )

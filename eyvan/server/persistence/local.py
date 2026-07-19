@@ -28,6 +28,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -59,7 +60,12 @@ LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
 #: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
 #: writing v2 documents an older build still reads.
 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3)
+#: Emitted only once a credential has actually been rotated, for exactly the
+#: reason v3 exists: an unresolved rotation is the one thing a local control
+#: plane must not forget across a restart, and silently dropping it would let a
+#: second rotation begin while the first is still unaccounted for.
+LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION = 4
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -335,8 +341,15 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
 
     @classmethod
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV3Document:
-        """Encode one snapshot including every frozen attempt topology."""
+        """Encode one snapshot including every frozen attempt topology.
 
+        Refuses a state carrying credential rotations for the same reason the v2
+        encoder refuses topologies: v3 has nowhere to put them, and forgetting an
+        unresolved rotation is how a restart lets two rotations interleave.
+        """
+
+        if state.credential_rotations:
+            raise ValueError("credential rotations require the v4 local control-plane document")
         topologies = tuple(state.workload_topologies[key] for key in sorted(state.workload_topologies))
         without_topologies = replace(state, workload_topologies={})
         base = LocalControlPlaneDocument.from_state(without_topologies)
@@ -353,22 +366,67 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
         return state
 
 
+class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
+    """Schema-v4 document: v3 plus the durable credential rotation ledger.
+
+    Additive again, and again with its own version rather than a new collection
+    inside v3: the document model is ``extra='forbid'``, so a rolled-back build
+    must refuse this file by version instead of by an unexplained unknown field.
+    """
+
+    version: Literal[4] = LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION
+    credential_rotations: tuple[CredentialRotationRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v4_document(self) -> LocalControlPlaneV4Document:
+        """Reject duplicate (credential, generation) identities before restoration merges them."""
+
+        keys = [(item.credential, item.generation) for item in self.credential_rotations]
+        if len(set(keys)) != len(keys):
+            raise ValueError("local control-plane credential rotations must have unique credential/generation keys")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV4Document:
+        """Encode one snapshot including every durable credential rotation."""
+
+        rotations = tuple(state.credential_rotations[key] for key in sorted(state.credential_rotations))
+        without_rotations = replace(state, credential_rotations={})
+        base = LocalControlPlaneV3Document.from_state(without_rotations)
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            credential_rotations=rotations,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v3 aggregates plus every recorded credential rotation."""
+
+        state = super().to_state()
+        state.credential_rotations = {
+            (record.credential, record.generation): record for record in self.credential_rotations
+        }
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
     older build still reads; the first frozen topology moves the file to v3, and
     an older build then refuses it by version instead of silently discarding a
-    durable rank map it does not understand.
+    durable rank map it does not understand. The first credential rotation moves
+    it to v4 on the same terms.
     """
 
+    if state.credential_rotations:
+        return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
         return LocalControlPlaneV3Document.from_state(state)
     return LocalControlPlaneDocument.from_state(state)
 
 
 _LocalControlPlaneReadableDocument: tp.TypeAlias = (
-    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document
+    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document | LocalControlPlaneV4Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -497,6 +555,7 @@ class LocalControlPlaneStore:
                 1: _LocalControlPlaneV1Document,
                 LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
+                LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION: LocalControlPlaneV4Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -937,6 +996,7 @@ class LocalJsonRepository(StateRepository):
 __all__ = (
     "LOCAL_CONTROL_PLANE_MAX_BYTES",
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
+    "LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
@@ -949,6 +1009,7 @@ __all__ = (
     "LocalControlPlaneSchemaError",
     "LocalControlPlaneStore",
     "LocalControlPlaneV3Document",
+    "LocalControlPlaneV4Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",

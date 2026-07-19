@@ -24,6 +24,7 @@ from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, canonical_execution_backend
 from eyvan.domain import costing
 from eyvan.domain.models import InfeasibilityCode, WorkerResourceScope
+from eyvan.identity.rotation import CredentialRotationState
 from eyvan.secrets import validate_secret_reference
 from eyvan.worker.distributed_environment import (
     DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES,
@@ -2929,3 +2930,94 @@ class WorkloadProgress(EyvanModel):
     #: the dashboard and ``client/callables.py`` already poll, so a training loop
     #: reporting its step needs no new polling loop anywhere.
     user_progress: tuple[UserProgressReport, ...] = ()
+
+
+#: Longest logical credential name a rotation ledger row may carry. Sized to the
+#: identifier columns elsewhere in this schema rather than to today's two names,
+#: so adding a third credential never needs a migration.
+MAX_CREDENTIAL_NAME_LENGTH = 96
+
+
+class CredentialRotationRecord(EyvanModel):
+    """One rotation of one signing credential, and how it ended.
+
+    Durable in a table of its own, and additive for the same reason
+    :class:`WorkloadAttemptTopology` is: a field on an existing persisted record
+    would be decoded with ``extra='forbid'`` by a rolled-back replica, and the
+    first rotation would make that record unreadable. A replica that predates
+    this table never selects from it and simply does not rotate.
+
+    **No material, and nothing derived from material.** Not the new key, not the
+    old one, and deliberately not a digest either: a digest of a credential is an
+    offline cracking target that an audit reader, a backup, and a support bundle
+    would all carry. A generation number is enough to say which material is in
+    effect, and it is the only thing here that refers to it.
+
+    The row is what lets two replicas agree, so ``previous_not_after`` is the
+    definite point at which the superseded generation stops verifying **fleet
+    wide** rather than per process.
+    """
+
+    id: str = Field(max_length=32)
+    #: Logical credential, not a key: which of a deployment's credentials this
+    #: rotation is about.
+    credential: str = Field(max_length=MAX_CREDENTIAL_NAME_LENGTH)
+    #: The generation this rotation produces. Generation 1 is the material a
+    #: deployment started with, which is not a rotation, so a row is always >= 2.
+    generation: int = Field(ge=2)
+    #: Held by whoever began the rotation and required to resolve it. Two
+    #: operators reacting to one alert produce one rotation and one refusal.
+    fence: str = Field(max_length=64)
+    state: CredentialRotationState
+    #: Seconds the superseded generation keeps verifying after a commit. Chosen
+    #: when the rotation begins so a commit cannot silently widen it.
+    overlap_s: float = Field(ge=0)
+    started_at: datetime = Field(default_factory=utcnow)
+    #: When the outcome was recorded -- including when it was recorded as
+    #: unknown. ``None`` only while the rotation is still in flight.
+    resolved_at: datetime | None = None
+    #: Absolute instant the previous generation stops verifying. Set only on a
+    #: commit: an abandoned rotation retires nothing, and an inconclusive one
+    #: does not know what it retired.
+    previous_not_after: datetime | None = None
+    #: Operator-safe text. Never a provider message, never a path, never a value.
+    detail: str = Field(default="", max_length=512)
+
+    @model_validator(mode="after")
+    def validate_rotation(self) -> CredentialRotationRecord:
+        _validate_string(self.id, field_name="credential rotation id")
+        _validate_string(self.credential, field_name="credential rotation credential")
+        _validate_string(self.fence, field_name="credential rotation fence")
+        if self.state is CredentialRotationState.PENDING:
+            if self.resolved_at is not None or self.previous_not_after is not None:
+                raise ValueError("an in-flight credential rotation has no outcome yet")
+            return self
+        if self.resolved_at is None:
+            raise ValueError("a resolved credential rotation must record when its outcome was observed")
+        if self.state is CredentialRotationState.COMMITTED:
+            if self.previous_not_after is None:
+                raise ValueError("a committed credential rotation must retire the previous generation at a point")
+            return self
+        if self.previous_not_after is not None:
+            # Neither of the two remaining states retires anything: an abandoned
+            # rotation changed nothing, and an inconclusive one cannot claim to
+            # know what it changed.
+            raise ValueError("only a committed credential rotation retires the previous generation")
+        return self
+
+    @property
+    def is_in_flight(self) -> bool:
+        """Return whether this rotation is still waiting for an outcome."""
+
+        return self.state is CredentialRotationState.PENDING
+
+    @property
+    def blocks_further_rotation(self) -> bool:
+        """Return whether this row prevents another rotation from beginning.
+
+        In flight, because two rotations must not interleave; inconclusive,
+        because stacking a second unknown on an unresolved one is how a
+        deployment ends up unable to say which material is live.
+        """
+
+        return self.state in {CredentialRotationState.PENDING, CredentialRotationState.INCONCLUSIVE}

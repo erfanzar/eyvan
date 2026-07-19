@@ -38,6 +38,7 @@ from eyvan.artifacts._capability_tokens import (
     sign_claims,
     verify_signature,
 )
+from eyvan.identity.rotation import CapabilityKeyring, StaticCredential
 
 #: Distinct from both the artifact and workload prefixes, and signed over.
 SECRET_TOKEN_VERSION = "eyvs1"
@@ -91,8 +92,29 @@ class SecretTokenClaims:
 class SecretCapabilitySigner:
     """Issue and verify the capability an attempt reads its secrets with."""
 
-    def __init__(self, secret: bytes, *, ttl_seconds: float, clock: tp.Callable[[], float] = time.time):
-        self._secret = require_secret(secret, "secret capability secret")
+    def __init__(
+        self,
+        secret: bytes | CapabilityKeyring,
+        *,
+        ttl_seconds: float,
+        clock: tp.Callable[[], float] = time.time,
+    ):
+        """Sign with one material, or with whichever one a keyring currently signs with.
+
+        ``bytes`` stays accepted and behaves exactly as before -- it is wrapped
+        in a one-material credential rather than special-cased, so the rotating
+        path is the only path and is therefore exercised by every existing test.
+
+        A keyring separates *signing* from *verifying*: tokens are always minted
+        under the material it signs with now, while a token presented later is
+        checked against every material still inside its retirement window. That
+        is what lets a credential rotate without restarting a running workload.
+        """
+
+        if isinstance(secret, bytes):
+            self._keyring: CapabilityKeyring = StaticCredential(require_secret(secret, "secret capability secret"))
+        else:
+            self._keyring = secret
         if ttl_seconds <= 0:
             raise ValueError("a secret capability requires a positive TTL")
         self._ttl_seconds = float(ttl_seconds)
@@ -121,7 +143,7 @@ class SecretCapabilitySigner:
             raise ValueError("a secret capability requires a positive generation")
         issued_at = int(self._clock())
         return sign_claims(
-            self._secret,
+            self._keyring.signing_material(),
             SECRET_TOKEN_VERSION,
             {
                 "action": READ_SECRET,
@@ -138,6 +160,28 @@ class SecretCapabilitySigner:
             },
         )
 
+    def _verified_claims(self, token: str) -> dict[str, object]:
+        """Return claims authenticated by any material still inside its window.
+
+        Newest material first, so the common case costs one HMAC. A material
+        whose ``not_after`` has passed is not in the tuple at all -- that is
+        where the definite point is enforced, and it is enforced against the
+        clock rather than against anything the presented token claims about
+        itself.
+        """
+
+        materials = self._keyring.verification_materials()
+        if not materials:
+            raise InvalidSecretToken("secret capability has no verifiable signing material")
+        for material in materials:
+            try:
+                return verify_signature(material, SECRET_TOKEN_VERSION, token)
+            except InvalidCapabilityToken:
+                continue
+        # One indistinguishable refusal, exactly as before: which generation a
+        # token failed against would tell a prober when a rotation happened.
+        raise InvalidCapabilityToken("invalid capability token")
+
     def verify(self, token: str, *, workload_id: str, org_id: str, project_id: str) -> SecretTokenClaims:
         """Verify a capability's authenticity, scope and expiry.
 
@@ -147,7 +191,7 @@ class SecretCapabilitySigner:
         reads a database is a signature check nobody can test in isolation.
         """
 
-        claims = verify_signature(self._secret, SECRET_TOKEN_VERSION, token)
+        claims = self._verified_claims(token)
         if set(claims) != _CLAIM_KEYS:
             # Exact, not a superset: an unrecognized claim means a token this
             # build does not fully understand, and honoring the parts it does

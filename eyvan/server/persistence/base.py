@@ -16,6 +16,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -224,6 +225,23 @@ class RepositorySession(tp.Protocol):
 
     async def list_workload_topologies(self, workload_id: str) -> list[WorkloadAttemptTopology]:
         """Return every frozen attempt topology for one workload, oldest attempt first."""
+        ...
+
+    async def get_credential_rotation(self, credential: str, generation: int) -> CredentialRotationRecord | None:
+        """Return one credential rotation by its exact generation, or ``None``."""
+        ...
+
+    async def put_credential_rotation(self, rotation: CredentialRotationRecord) -> None:
+        """Insert or replace one rotation row, keyed by (credential, generation)."""
+        ...
+
+    async def latest_credential_rotation(self, credential: str) -> CredentialRotationRecord | None:
+        """Return the highest-generation rotation of one credential, or ``None``.
+
+        ``None`` means this credential has never been rotated, which is a
+        different statement from "its last rotation failed" -- the caller starts
+        from generation 1 in the first case and refuses in the second.
+        """
         ...
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None: ...
