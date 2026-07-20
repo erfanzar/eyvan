@@ -192,6 +192,23 @@ class EyvanSettings:
     #: verdict about the asset.
     cell_stage_max_attempts: int = 3
     retention_batch_limit: int = 1000
+    #: Hard ceiling on how many children one batch, DAG, or group submission may
+    #: create. Enforced at admission, where the submitter is told and nothing has
+    #: been created yet. The default is the limit this package has always
+    #: enforced, so an operator who configures nothing sees no change.
+    max_expansion_children: int = 1000
+    #: How many children of one admitted expansion may compete for capacity at
+    #: once. Zero -- the default, and today's behaviour -- means every child is
+    #: schedulable immediately. A positive value creates all of them and releases
+    #: them in waves, so one large array cannot bury every other tenant's work in
+    #: the queue it shares.
+    expansion_wave_size: int = 0
+    #: Whether a heterogeneous group is leased as one transaction. Off by
+    #: default, which is the shipped behaviour: the group's members are released
+    #: to the ordinary scheduler once they all *could* be placed, and can still
+    #: be placed partially if capacity moves in between. On, the members are
+    #: leased together or not at all.
+    atomic_group_placement: bool = False
     agent_shared_secret: str | None = field(default=None, repr=False)
     #: Bearer token a Prometheus scraper presents at ``/metrics``. A separate
     #: credential rather than an OIDC identity because a scraper has none, and
@@ -271,6 +288,10 @@ class EyvanSettings:
         # first connection: a typo in ``required`` that silently reads as off is
         # exactly the failure mutual TLS is being added to prevent.
         parse_mutual_tls_mode(self.mutual_tls_mode)
+        if self.max_expansion_children <= 0:
+            raise ValueError("max_expansion_children must be positive")
+        if self.expansion_wave_size < 0:
+            raise ValueError("expansion_wave_size must not be negative; use 0 to disable waves")
         if not math.isfinite(self.artifact_collection_interval_s) or self.artifact_collection_interval_s <= 0:
             raise ValueError("artifact_collection_interval_s must be finite and positive")
         if not math.isfinite(self.artifact_recovery_grace_s) or self.artifact_recovery_grace_s < 0:
@@ -432,6 +453,9 @@ class EyvanSettings:
             ),
             cell_stage_max_attempts=int(os.getenv("EYVAN_CELL_STAGE_MAX_ATTEMPTS", defaults.cell_stage_max_attempts)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),
+            max_expansion_children=int(os.getenv("EYVAN_MAX_EXPANSION_CHILDREN", defaults.max_expansion_children)),
+            expansion_wave_size=int(os.getenv("EYVAN_EXPANSION_WAVE_SIZE", defaults.expansion_wave_size)),
+            atomic_group_placement=truthy("EYVAN_ATOMIC_GROUP_PLACEMENT", defaults.atomic_group_placement),
             agent_shared_secret=os.getenv("EYVAN_AGENT_SHARED_SECRET"),
             metrics_token=os.getenv("EYVAN_METRICS_TOKEN"),
             native_worker_root_secret=os.getenv("EYVAN_NATIVE_WORKER_ROOT_SECRET"),

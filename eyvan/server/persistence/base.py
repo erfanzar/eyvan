@@ -18,6 +18,8 @@ from eyvan.records import (
     CellRecord,
     CellStageRecord,
     CredentialRotationRecord,
+    ExpansionAdmissionRecord,
+    ExpansionAdmissionState,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -278,6 +280,33 @@ class RepositorySession(tp.Protocol):
         ``None`` means this credential has never been rotated, which is a
         different statement from "its last rotation failed" -- the caller starts
         from generation 1 in the first case and refuses in the second.
+        """
+        ...
+
+    async def get_expansion_admission(self, workload_id: str) -> ExpansionAdmissionRecord | None:
+        """Return the durable admission plan of one expansion coordinator.
+
+        ``None`` means this coordinator was admitted before expansion ledgers
+        existed, or under no wave plan at all. Both are read as "nothing here
+        governs its children" and never as a plan to be reconstructed: a plan
+        derived from today's configuration is not the one the submitter was told.
+        """
+        ...
+
+    async def put_expansion_admission(self, record: ExpansionAdmissionRecord) -> None:
+        """Upsert one expansion's admission ledger, keyed by its coordinator."""
+        ...
+
+    async def list_expansion_admissions(
+        self,
+        *,
+        state: ExpansionAdmissionState | None = None,
+    ) -> list[ExpansionAdmissionRecord]:
+        """Return admission ledgers in stable id order, optionally by state.
+
+        The state filter is what keeps the leader's wave phase from reading every
+        expansion the fleet has ever run: a completed ledger is absorbing, so the
+        scan is over the expansions still owing children and nothing else.
         """
         ...
 

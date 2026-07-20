@@ -21,6 +21,7 @@ from eyvan.server.controller._support import (
     logger,
 )
 from eyvan.server.controller.capacity_commands import _ControllerCapacityCommands
+from eyvan.server.controller.expansion import _ControllerExpansion
 from eyvan.server.controller.fleets import _ControllerFleets
 from eyvan.server.controller.lifecycle import _ControllerLifecycle
 from eyvan.server.controller.loops import _ControllerLoops
@@ -44,6 +45,7 @@ class EyvanController(
     _ControllerSettlement,
     _ControllerObservation,
     _ControllerStaging,
+    _ControllerExpansion,
     _ControllerLoops,
 ):
     """Turn pure scheduler decisions into fenced, recoverable backend actions."""

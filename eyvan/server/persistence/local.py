@@ -30,6 +30,7 @@ from eyvan.records import (
     CellRecord,
     CellStageRecord,
     CredentialRotationRecord,
+    ExpansionAdmissionRecord,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -61,12 +62,13 @@ LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
 #: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
 #: writing v2 documents an older build still reads.
 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
-#: Emitted only once a credential rotation or a managed cell stage exists, for
-#: exactly the reason v3 exists: both are durable evidence a restart must not
-#: lose. An unresolved rotation would let a second rotation begin while the
-#: first is still unaccounted for; a dropped stage row would leave the budget
-#: charging nothing for bytes that are still on a host. A document that cannot
-#: carry them refuses them rather than silently omitting them.
+#: Emitted once a credential rotation, a managed cell stage, or a bounded fan-out
+#: admission exists, for exactly the reason v3 exists: each is durable evidence a
+#: restart must not lose. An unresolved rotation would let a second rotation begin
+#: while the first is unaccounted for; a dropped stage row would leave the budget
+#: charging nothing for bytes still on a host; a dropped admission ledger would
+#: strand an expansion's remaining children or release them all at once. A
+#: document that cannot carry them refuses them rather than silently omitting them.
 LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION = 4
 LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
@@ -260,6 +262,10 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
             raise ValueError("frozen attempt topologies require the v3 local control-plane document")
         if state.cell_stages:
             raise ValueError("managed cell stages require the v4 local control-plane document")
+        if state.credential_rotations:
+            raise ValueError("credential rotations require the v4 local control-plane document")
+        if state.expansion_admissions:
+            raise ValueError("expansion admission ledgers require the v4 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -352,13 +358,20 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV3Document:
         """Encode one snapshot including every frozen attempt topology.
 
-        Refuses a state carrying credential rotations for the same reason the v2
-        encoder refuses topologies: v3 has nowhere to put them, and forgetting an
-        unresolved rotation is how a restart lets two rotations interleave.
+        Refuses a state carrying credential rotations, cell stages, or expansion
+        admission ledgers for the same reason the v2 encoder refuses topologies:
+        v3 has nowhere to put them. Forgetting an unresolved rotation is how a
+        restart lets two rotations interleave, and a dropped ledger is an
+        expansion whose remaining children are either stranded or released all at
+        once.
         """
 
+        if state.cell_stages:
+            raise ValueError("managed cell stages require the v4 local control-plane document")
         if state.credential_rotations:
             raise ValueError("credential rotations require the v4 local control-plane document")
+        if state.expansion_admissions:
+            raise ValueError("expansion admission ledgers require the v4 local control-plane document")
         topologies = tuple(state.workload_topologies[key] for key in sorted(state.workload_topologies))
         without_topologies = replace(state, workload_topologies={})
         base = LocalControlPlaneDocument.from_state(without_topologies)
@@ -376,22 +389,23 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
 
 
 class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
-    """Schema-v4 document: v3 plus the credential rotation and cell stage ledgers.
+    """Schema-v4 document: v3 plus the rotation, stage, and fan-out admission ledgers.
 
     Additive exactly like v3 was, and again with its own version rather than new
     collections inside v3: the document model is ``extra='forbid'``, so a
     rolled-back build must refuse this file by version instead of by an
     unexplained unknown field or, worse, by dropping durable evidence about a
-    disk and a half-finished rotation it cannot see.
+    disk, a half-finished rotation, or an expansion it cannot see.
     """
 
     version: Literal[4] = LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION
     cell_stages: tuple[CellStageRecord, ...] = ()
     credential_rotations: tuple[CredentialRotationRecord, ...] = ()
+    expansion_admissions: tuple[ExpansionAdmissionRecord, ...] = ()
 
     @model_validator(mode="after")
     def validate_v4_document(self) -> LocalControlPlaneV4Document:
-        """Reject duplicate identities in either ledger before restoration merges them."""
+        """Reject duplicate identities in any ledger before restoration merges them."""
 
         stage_keys = [(record.cell_id, record.asset) for record in self.cell_stages]
         if len(set(stage_keys)) != len(stage_keys):
@@ -399,29 +413,37 @@ class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
         rotation_keys = [(item.credential, item.generation) for item in self.credential_rotations]
         if len(set(rotation_keys)) != len(rotation_keys):
             raise ValueError("local control-plane credential rotations must have unique credential/generation keys")
+        admission_keys = [record.workload_id for record in self.expansion_admissions]
+        if len(set(admission_keys)) != len(admission_keys):
+            raise ValueError("local control-plane expansion admissions must have unique workload identities")
         return self
 
     @classmethod
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV4Document:
-        """Encode one snapshot including every cell stage and credential rotation."""
+        """Encode one snapshot including every stage, rotation, and admission ledger."""
 
         stages = tuple(state.cell_stages[key] for key in sorted(state.cell_stages))
         rotations = tuple(state.credential_rotations[key] for key in sorted(state.credential_rotations))
-        base = LocalControlPlaneV3Document.from_state(replace(state, cell_stages={}, credential_rotations={}))
+        admissions = tuple(state.expansion_admissions[key] for key in sorted(state.expansion_admissions))
+        base = LocalControlPlaneV3Document.from_state(
+            replace(state, cell_stages={}, credential_rotations={}, expansion_admissions={})
+        )
         return cls(
             **base.model_dump(exclude={"version"}),
             cell_stages=stages,
             credential_rotations=rotations,
+            expansion_admissions=admissions,
         )
 
     def to_state(self) -> ControlPlaneState:
-        """Restore v3 aggregates plus every cell stage and credential rotation."""
+        """Restore v3 aggregates plus every stage, rotation, and admission ledger."""
 
         state = super().to_state()
         state.cell_stages = {(record.cell_id, record.asset): record for record in self.cell_stages}
         state.credential_rotations = {
             (record.credential, record.generation): record for record in self.credential_rotations
         }
+        state.expansion_admissions = {record.workload_id: record for record in self.expansion_admissions}
         return state
 
 
@@ -430,12 +452,12 @@ def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneD
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
     older build still reads; the first frozen topology moves the file to v3, the
-    first managed stage or credential rotation moves it to v4, and an older build
-    then refuses it by version instead of silently discarding durable state it
-    does not understand.
+    first managed stage, credential rotation, or bounded fan-out moves it to v4,
+    and an older build then refuses it by version instead of silently discarding
+    durable state it does not understand.
     """
 
-    if state.cell_stages or state.credential_rotations:
+    if state.cell_stages or state.credential_rotations or state.expansion_admissions:
         return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
         return LocalControlPlaneV3Document.from_state(state)

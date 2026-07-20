@@ -162,6 +162,7 @@ from eyvan.server.service.errors import (
     NotFoundError,
     UnavailableError,
 )
+from eyvan.server.service.expansion import ExpansionLimits
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
@@ -207,6 +208,37 @@ def _route_label(request: Request) -> str:
 
     path = getattr(request.scope.get("route"), "path", None)
     return path if isinstance(path, str) else UNMATCHED_ROUTE_LABEL
+
+
+#: Response header naming how one fan-out expansion was admitted.
+#:
+#: A header rather than a response field on purpose. The submitter has to learn
+#: whether their fan-out is competing now or in waves -- a silently truncated or
+#: silently deferred expansion is worse than a refusal -- and a header carries
+#: that without changing a single byte of a response body that older clients
+#: already parse.
+EXPANSION_ADMISSION_HEADER = "Eyvan-Expansion-Admission"
+
+
+async def _report_expansion_admission(
+    service: ControlPlaneService,
+    principal: Principal,
+    response: Response,
+    coordinator_id: str,
+    *,
+    children: int,
+) -> None:
+    """Tell the submitter which admission their expansion actually got.
+
+    Read back from the durable ledger rather than recomputed, so a replayed
+    submission reports the plan the original was admitted under instead of one
+    derived from configuration as it stands now.
+    """
+
+    admission = await service.get_expansion_admission(principal, coordinator_id)
+    response.headers[EXPANSION_ADMISSION_HEADER] = (
+        admission.describe() if admission is not None else f"admitted {children} children immediately"
+    )
 
 
 def _artifact_token_key(settings: EyvanSettings) -> bytes:
@@ -297,6 +329,13 @@ def create_app(
             # consulting them at admission, so federation was configurable,
             # tested, and off everywhere.
             plane_id=settings.plane_id,
+            # The seam that makes the fan-out ceiling an operator control rather
+            # than a constant: without it the setting exists and no submission is
+            # ever judged against it.
+            expansion_limits=ExpansionLimits(
+                ceiling=settings.max_expansion_children,
+                wave_size=settings.expansion_wave_size,
+            ),
         )
     if verifier is None and settings.oidc_issuer:
         verifier = OIDCTokenVerifier(
@@ -1660,6 +1699,7 @@ def create_app(
             name_prefix=request.name_prefix,
             max_fan_out=request.max_fan_out,
         )
+        await _report_expansion_admission(service, principal, response, parent.id, children=len(tasks))
         # No Idempotent-Replay header: submit_batch is replay-transparent by
         # construction, returning the same parent and the same tasks in the same
         # order, so a caller cannot act differently on the two cases.
@@ -1746,6 +1786,7 @@ def create_app(
             name_prefix=request.name_prefix,
             max_fan_out=request.max_fan_out,
         )
+        await _report_expansion_admission(service, principal, response, parent.id, children=len(nodes))
         return DagSubmitResponse(parent=parent, nodes=nodes)
 
     @app.post(

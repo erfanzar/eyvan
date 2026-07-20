@@ -50,6 +50,8 @@ from eyvan.records import (
     CellRecord,
     CellStageRecord,
     CredentialRotationRecord,
+    ExpansionAdmissionRecord,
+    ExpansionAdmissionState,
     IdempotencyRecord,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -265,6 +267,27 @@ class CellStageRow(Base):
     #: The budget number, exposed so an operator can sum a cell's charge in SQL
     #: without decoding every document.
     reserved_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ExpansionAdmissionRow(Base):
+    __tablename__ = "expansion_admissions"
+    __table_args__ = (
+        CheckConstraint("total_children >= 1", name="ck_expansion_admissions_total_positive"),
+        CheckConstraint("wave_size >= 1", name="ck_expansion_admissions_wave_positive"),
+    )
+    #: Derived from the coordinator id and short by construction, so the ledger
+    #: of one expansion is addressable in a 32-character key column.
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    #: Unique, not merely indexed: one coordinator has exactly one admission
+    #: plan, and a second row for it would mean two leaders releasing waves from
+    #: two different plans over the same children.
+    workload_id: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
+    #: A real column so the leader's wave phase scans the expansions still owing
+    #: children instead of decoding every expansion the fleet has ever admitted.
+    state: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    total_children: Mapped[int] = mapped_column(Integer, nullable=False)
+    wave_size: Mapped[int] = mapped_column(Integer, nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -917,6 +940,34 @@ class SqlAlchemySession:
         rows = (await self.session.scalars(statement)).all()
         decoded = _decode_rows(CredentialRotationRecord, rows, table="credential_rotations")
         return decoded[0] if decoded else None
+
+    async def get_expansion_admission(self, workload_id: str) -> ExpansionAdmissionRecord | None:
+        statement = select(ExpansionAdmissionRow).where(ExpansionAdmissionRow.workload_id == workload_id)
+        row = (await self.session.scalars(statement)).one_or_none()
+        return None if row is None else ExpansionAdmissionRecord.model_validate(row.data)
+
+    async def put_expansion_admission(self, record: ExpansionAdmissionRecord) -> None:
+        await self.session.merge(
+            ExpansionAdmissionRow(
+                id=record.id,
+                workload_id=record.workload_id,
+                state=record.state.value,
+                total_children=record.total_children,
+                wave_size=record.wave_size,
+                data=_dump(record),
+            )
+        )
+
+    async def list_expansion_admissions(
+        self,
+        *,
+        state: ExpansionAdmissionState | None = None,
+    ) -> list[ExpansionAdmissionRecord]:
+        statement = select(ExpansionAdmissionRow).order_by(ExpansionAdmissionRow.id)
+        if state is not None:
+            statement = statement.where(ExpansionAdmissionRow.state == state.value)
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_rows(ExpansionAdmissionRecord, rows, table="expansion_admissions")
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         row = await self._get_locked(PlanePeerRow, plane_id)

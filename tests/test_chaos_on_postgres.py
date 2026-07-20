@@ -397,6 +397,7 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
         "test_artifact_lifecycle_migration_postgres.py",
         "test_artifact_lifecycle_postgres.py",
         "test_artifact_tenant_isolation.py",
+        "test_batch_backpressure_postgres.py",
         "test_chaos_on_postgres.py",
         "test_migrations.py",
         "test_postgres_semantics.py",
