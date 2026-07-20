@@ -20,6 +20,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CellStageRecord,
     CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
@@ -75,6 +76,10 @@ class ControlPlaneState:
     #: generation, never by the credential alone: overwriting would erase the
     #: inconclusive rotation an operator still has to resolve.
     credential_rotations: dict[tuple[str, int], CredentialRotationRecord] = field(default_factory=dict)
+    #: (cell id, asset) -> what this control plane can prove about that asset's
+    #: copy on that cell. Absence of a key is the only representation of proven
+    #: absence; every other answer, including "an action is running", is a row.
+    cell_stages: dict[tuple[str, str], CellStageRecord] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
@@ -256,6 +261,29 @@ class StateSession(RepositorySession):
     async def list_progress_reports(self, workload_id: str) -> list[UserProgressReport]:
         reports = self._state.progress_reports.get(workload_id, {})
         return [reports[rank] for rank in sorted(reports)]
+
+    async def get_cell_stage(self, cell_id: str, asset: str) -> CellStageRecord | None:
+        return self._state.cell_stages.get((cell_id, asset))
+
+    async def put_cell_stage(self, stage: CellStageRecord) -> None:
+        self._state.cell_stages[(stage.cell_id, stage.asset)] = stage
+
+    async def delete_cell_stage(self, cell_id: str, asset: str) -> None:
+        self._state.cell_stages.pop((cell_id, asset), None)
+
+    async def list_cell_stages(
+        self,
+        *,
+        cell_id: str | None = None,
+        assets: tp.Sequence[str] | None = None,
+    ) -> list[CellStageRecord]:
+        wanted = None if assets is None else set(assets)
+        items = [
+            stage
+            for key, stage in self._state.cell_stages.items()
+            if (cell_id is None or key[0] == cell_id) and (wanted is None or key[1] in wanted)
+        ]
+        return sorted(items, key=lambda stage: (stage.cell_id, stage.asset))
 
     async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
         return self._state.workload_topologies.get((workload_id, attempt))

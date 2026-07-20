@@ -140,6 +140,28 @@ class _ControllerLoops:
                 zero_interval_disables=True,
                 isolate_failures=True,
             ),
+            # Managed asset staging, and the eviction that bounds it. Both are
+            # housekeeping and must never delay placement, so they run last, on
+            # their own interval, with failures isolated -- a host that will not
+            # answer about a dataset is not a reason to stop scheduling work.
+            #
+            # Staging first: a stage confirmed this cycle is one eviction can
+            # account for in the same cycle, and the alternative order plans
+            # against a cell's charge one interval out of date.
+            LeaderPhase(
+                "stage-assets",
+                self.stage_cell_assets_once,
+                interval_s=self.settings.cell_stage_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
+            LeaderPhase(
+                "evict-stages",
+                self._evict_cell_stages_phase,
+                interval_s=self.settings.cell_stage_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
         )
 
     async def _run_leader_phases(self, *, now: float, due: dict[str, float]) -> dict[str, float]:

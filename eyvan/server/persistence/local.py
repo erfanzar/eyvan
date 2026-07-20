@@ -28,6 +28,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CellStageRecord,
     CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
@@ -60,11 +61,13 @@ LOCAL_CONTROL_PLANE_SCHEMA_VERSION = 2
 #: by a confusing "unexpected field", and a fleet that has frozen nothing keeps
 #: writing v2 documents an older build still reads.
 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
-#: Emitted only once a credential has actually been rotated, for exactly the
-#: reason v3 exists: an unresolved rotation is the one thing a local control
-#: plane must not forget across a restart, and silently dropping it would let a
-#: second rotation begin while the first is still unaccounted for.
-LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION = 4
+#: Emitted only once a credential rotation or a managed cell stage exists, for
+#: exactly the reason v3 exists: both are durable evidence a restart must not
+#: lose. An unresolved rotation would let a second rotation begin while the
+#: first is still unaccounted for; a dropped stage row would leave the budget
+#: charging nothing for bytes that are still on a host. A document that cannot
+#: carry them refuses them rather than silently omitting them.
+LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION = 4
 LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
@@ -245,12 +248,18 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
         them. v2 has no place to put them, and a silent omission would turn a
         durable rank map into an attempt that reports its topology as unknown
         after one restart -- the exact failure the record exists to prevent.
-        Callers use :func:`local_control_plane_document`, which selects v3 when
-        there is something only v3 can carry.
+        Callers use :func:`local_control_plane_document`, which selects the
+        lowest version that can carry everything the state holds.
+
+        Managed cell stages are refused for the same reason and a sharper one:
+        an omitted stage row stops charging bytes that are still occupying a
+        host's disk, so the budget silently starts bounding nothing.
         """
 
         if state.workload_topologies:
             raise ValueError("frozen attempt topologies require the v3 local control-plane document")
+        if state.cell_stages:
+            raise ValueError("managed cell stages require the v4 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -367,41 +376,49 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
 
 
 class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
-    """Schema-v4 document: v3 plus the durable credential rotation ledger.
+    """Schema-v4 document: v3 plus the credential rotation and cell stage ledgers.
 
-    Additive again, and again with its own version rather than a new collection
-    inside v3: the document model is ``extra='forbid'``, so a rolled-back build
-    must refuse this file by version instead of by an unexplained unknown field.
+    Additive exactly like v3 was, and again with its own version rather than new
+    collections inside v3: the document model is ``extra='forbid'``, so a
+    rolled-back build must refuse this file by version instead of by an
+    unexplained unknown field or, worse, by dropping durable evidence about a
+    disk and a half-finished rotation it cannot see.
     """
 
-    version: Literal[4] = LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION
+    version: Literal[4] = LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION
+    cell_stages: tuple[CellStageRecord, ...] = ()
     credential_rotations: tuple[CredentialRotationRecord, ...] = ()
 
     @model_validator(mode="after")
     def validate_v4_document(self) -> LocalControlPlaneV4Document:
-        """Reject duplicate (credential, generation) identities before restoration merges them."""
+        """Reject duplicate identities in either ledger before restoration merges them."""
 
-        keys = [(item.credential, item.generation) for item in self.credential_rotations]
-        if len(set(keys)) != len(keys):
+        stage_keys = [(record.cell_id, record.asset) for record in self.cell_stages]
+        if len(set(stage_keys)) != len(stage_keys):
+            raise ValueError("local control-plane cell stages must have unique cell/asset identities")
+        rotation_keys = [(item.credential, item.generation) for item in self.credential_rotations]
+        if len(set(rotation_keys)) != len(rotation_keys):
             raise ValueError("local control-plane credential rotations must have unique credential/generation keys")
         return self
 
     @classmethod
     def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV4Document:
-        """Encode one snapshot including every durable credential rotation."""
+        """Encode one snapshot including every cell stage and credential rotation."""
 
+        stages = tuple(state.cell_stages[key] for key in sorted(state.cell_stages))
         rotations = tuple(state.credential_rotations[key] for key in sorted(state.credential_rotations))
-        without_rotations = replace(state, credential_rotations={})
-        base = LocalControlPlaneV3Document.from_state(without_rotations)
+        base = LocalControlPlaneV3Document.from_state(replace(state, cell_stages={}, credential_rotations={}))
         return cls(
             **base.model_dump(exclude={"version"}),
+            cell_stages=stages,
             credential_rotations=rotations,
         )
 
     def to_state(self) -> ControlPlaneState:
-        """Restore v3 aggregates plus every recorded credential rotation."""
+        """Restore v3 aggregates plus every cell stage and credential rotation."""
 
         state = super().to_state()
+        state.cell_stages = {(record.cell_id, record.asset): record for record in self.cell_stages}
         state.credential_rotations = {
             (record.credential, record.generation): record for record in self.credential_rotations
         }
@@ -412,13 +429,13 @@ def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneD
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
-    older build still reads; the first frozen topology moves the file to v3, and
-    an older build then refuses it by version instead of silently discarding a
-    durable rank map it does not understand. The first credential rotation moves
-    it to v4 on the same terms.
+    older build still reads; the first frozen topology moves the file to v3, the
+    first managed stage or credential rotation moves it to v4, and an older build
+    then refuses it by version instead of silently discarding durable state it
+    does not understand.
     """
 
-    if state.credential_rotations:
+    if state.cell_stages or state.credential_rotations:
         return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
         return LocalControlPlaneV3Document.from_state(state)
@@ -555,7 +572,7 @@ class LocalControlPlaneStore:
                 1: _LocalControlPlaneV1Document,
                 LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
-                LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION: LocalControlPlaneV4Document,
+                LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION: LocalControlPlaneV4Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -996,11 +1013,11 @@ class LocalJsonRepository(StateRepository):
 __all__ = (
     "LOCAL_CONTROL_PLANE_MAX_BYTES",
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
-    "LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
+    "LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION",
     "LocalControlPlaneAmbiguousCommitError",
     "LocalControlPlaneDocument",
     "LocalControlPlaneError",

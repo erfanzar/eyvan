@@ -37,7 +37,8 @@ import typing as tp
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from eyvan.records import CellRecord, LeaseRecord, WorkloadRecord
+from eyvan.records import CellRecord, CellStageRecord, LeaseRecord, WorkloadRecord
+from eyvan.server.service.stage import confirmed_stage_index
 
 #: How long a cell is assumed to still hold an asset after a job that used it
 #: last held the cell. Six hours is chosen against the failure it causes: too
@@ -59,12 +60,23 @@ def build_index(
     now: datetime,
     ttl_s: float = DEFAULT_LOCALITY_TTL_S,
     cells: tp.Sequence[CellRecord] = (),
+    stages: tp.Sequence[CellStageRecord] = (),
 ) -> dict[str, tuple[str, ...]]:
     """Map each named asset to the cells that most recently worked with it.
 
     Cells are ordered most-recent-first, so the head of the list is the strongest
     guess. Ties break on cell id, so two leases stamped in the same instant do not
     make placement depend on dict ordering.
+
+    Three signals, strongest first. A **confirmed managed stage** is the only one
+    that is evidence: this control plane asked an executor for the bytes, was told
+    they arrived, and recorded the generation it was told about. An **agent
+    report** is a claim about a disk nobody here measured. **Lease history** is an
+    inference from "a job naming this asset held this cell recently". Every stage
+    that is not confirmed -- staging, unknown, evicting, blocked, or confirmed
+    against a generation this cell no longer runs -- contributes nothing at all,
+    which is the point: scoring an unproven stage as a hit would send a job to a
+    cold cell on the strength of a row that never claimed the bytes were there.
     """
 
     cutoff = now - timedelta(seconds=ttl_s)
@@ -106,6 +118,13 @@ def build_index(
     for asset, cell_ids in reported.items():
         inferred = [cell_id for cell_id in index.get(asset, ()) if cell_id not in set(cell_ids)]
         index[asset] = [*cell_ids, *inferred]
+
+    # Confirmed stages go ahead of both, and for the same de-duplication reason:
+    # a cell that is proven to hold the asset must appear exactly once, or it
+    # counts twice and outranks a cell holding more of the workload's assets.
+    for asset, cell_ids in confirmed_stage_index(stages, cells).items():
+        weaker = [cell_id for cell_id in index.get(asset, ()) if cell_id not in set(cell_ids)]
+        index[asset] = [*cell_ids, *weaker]
     return {asset: tuple(entries) for asset, entries in index.items()}
 
 

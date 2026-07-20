@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from eyvan.records import (
     AuditEvent,
     CellRecord,
+    CellStageState,
     CellState,
     CommandExecution,
     OutboxRecord,
@@ -123,6 +124,7 @@ async def test_the_migration_chain_runs_against_a_real_database(database) -> Non
         "organizations",
         "projects",
         "workload_topologies",
+        "cell_stages",
     } <= tables
 
 
@@ -666,3 +668,143 @@ async def test_the_readiness_probe_makes_a_real_round_trip(database) -> None:
 # session-scoped fixture every other test in this file shares. The unreachable
 # branch is covered against an in-memory double in ``test_readiness``; what only
 # a real database can prove is the round trip above, and that is what runs here.
+
+
+# --------------------------------------------------------------------------- managed cell stages
+
+
+def _stage_record(
+    cell_id: str,
+    asset: str,
+    *,
+    state: CellStageState = CellStageState.STAGED,
+    generation: int = 1,
+    reserved: int = 1024,
+    digest: str | None = None,
+    last_used_at=None,
+):
+    """Build one managed stage row for the parity assertions below."""
+
+    from eyvan.records import CellStageRecord
+
+    confirmed = state is CellStageState.STAGED
+    return CellStageRecord(
+        cell_id=cell_id,
+        asset=asset,
+        cell_generation=generation,
+        state=state,
+        reserved_bytes=reserved,
+        observed_bytes=reserved if confirmed else None,
+        digest=digest,
+        confirmed_at=utcnow() if confirmed else None,
+        last_used_at=last_used_at,
+    )
+
+
+async def test_a_managed_cell_stage_round_trips_on_the_production_backend(database) -> None:
+    """The stage ledger has to survive on the backend production actually runs.
+
+    Every other durable backend is exercised in ``test_locality_stage``. This one
+    is here because a table added by a migration can render valid DDL and still
+    behave differently: the composite (cell, asset) key, the typed ``state`` and
+    ``reserved_bytes`` columns, and the ``FOR UPDATE`` read are PostgreSQL
+    behaviour. A stage that silently fails to store is a byte budget bounding
+    nothing on the one deployment that has a real disk to fill.
+    """
+
+    repository = await _migrated(database)
+    digest = "sha256:" + "cd" * 32
+    stage = _stage_record("cell-a", "gs://acme/datasets/pile-v3", reserved=5 * 1024**3, digest=digest)
+
+    async with repository.transaction() as tx:
+        await tx.put_cell_stage(stage)
+    async with repository.transaction() as tx:
+        stored = await tx.get_cell_stage("cell-a", "gs://acme/datasets/pile-v3")
+        listed = await tx.list_cell_stages(cell_id="cell-a")
+        by_asset = await tx.list_cell_stages(assets=["gs://acme/datasets/pile-v3"])
+        unrelated = await tx.list_cell_stages(assets=["gs://acme/checkpoints/llama-70b"])
+        missing = await tx.get_cell_stage("cell-a", "gs://acme/checkpoints/llama-70b")
+
+    async with database.connect() as connection:
+        columns = (
+            await connection.execute(
+                text("SELECT state, cell_generation, reserved_bytes FROM cell_stages WHERE cell_id = 'cell-a'")
+            )
+        ).all()
+
+    assert stored == stage
+    assert listed == [stage]
+    assert by_asset == [stage]
+    # The asset filter is what keeps the submission path proportional to what a
+    # workload named rather than to the whole fleet's cache.
+    assert unrelated == []
+    assert missing is None
+    assert columns == [("staged", 1, 5 * 1024**3)]
+
+
+async def test_postgres_and_memory_agree_about_which_stages_are_provable(database) -> None:
+    """Parity where it matters: a backend must not change what counts as evidence.
+
+    An unproven stage is never a hit and always a charge, and both halves have to
+    hold identically on the backend that stores rows as JSON documents and on the
+    one that stores them in a dict.
+    """
+
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.stage import charged_bytes, confirmed_stage_index
+
+    repository = await _migrated(database)
+    cell = CellRecord(
+        id="cell-a",
+        provider="local",
+        region="local",
+        state=CellState.READY,
+        capacity=ResourceVector(cpu=8, memory_gib=64),
+        allocatable=ResourceVector(cpu=8, memory_gib=64),
+        generation=2,
+    )
+    confirmed = _stage_record("cell-a", "dataset", generation=2, reserved=16)
+    unproven = _stage_record("cell-a", "model", generation=2, reserved=8, state=CellStageState.UNKNOWN)
+    superseded = _stage_record("cell-a", "old", generation=1, reserved=4)
+
+    async with repository.transaction() as tx:
+        await tx.put_cell(cell)
+        for record in (confirmed, unproven, superseded):
+            await tx.put_cell_stage(record)
+    async with repository.transaction() as tx:
+        stored = await tx.list_cell_stages()
+
+    memory = InMemoryRepository()
+    await memory.open()
+    async with memory.transaction() as tx:
+        await tx.put_cell(cell)
+        for record in (confirmed, unproven, superseded):
+            await tx.put_cell_stage(record)
+    async with memory.transaction() as tx:
+        in_memory = await tx.list_cell_stages()
+
+    assert stored == in_memory
+    assert confirmed_stage_index(stored, [cell]) == {"dataset": ("cell-a",)}
+    # 16 confirmed plus 8 unproven; the superseded generation charges nothing
+    # because the host it measured has been replaced.
+    assert charged_bytes(stored, cell=cell) == 24
+    assert charged_bytes(stored, cell=cell) == charged_bytes(in_memory, cell=cell)
+
+
+async def test_a_confirmed_eviction_actually_deletes_the_row(database) -> None:
+    """Absence of a row is the claim a confirmed eviction makes.
+
+    A tombstone would grow without bound and would still have to be filtered out
+    of every budget sum, so the delete has to delete.
+    """
+
+    repository = await _migrated(database)
+    async with repository.transaction() as tx:
+        await tx.put_cell_stage(_stage_record("cell-a", "dataset"))
+    async with repository.transaction() as tx:
+        await tx.delete_cell_stage("cell-a", "dataset")
+        await tx.delete_cell_stage("cell-a", "never-existed")
+    async with repository.transaction() as tx:
+        remaining = await tx.list_cell_stages()
+
+    assert remaining == []

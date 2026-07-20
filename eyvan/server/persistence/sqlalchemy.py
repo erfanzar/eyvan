@@ -48,6 +48,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CellStageRecord,
     CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
@@ -69,7 +70,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0016_credential_rotation"
+SCHEMA_REVISION = "0017_merge_stage_rot"
 
 
 @tp.runtime_checkable
@@ -241,6 +242,29 @@ class CredentialRotationRow(Base):
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     fence: Mapped[str] = mapped_column(String(64), nullable=False)
     overlap_s: Mapped[float] = mapped_column(Float, nullable=False)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class CellStageRow(Base):
+    __tablename__ = "cell_stages"
+    __table_args__ = (
+        CheckConstraint("cell_generation >= 1", name="ck_cell_stages_generation_positive"),
+        CheckConstraint("reserved_bytes >= 0", name="ck_cell_stages_reserved_bytes_non_negative"),
+        Index("ix_cell_stages_asset_state", "asset", "state"),
+    )
+    #: Composite key on (cell, asset): one cell holds one copy of one named
+    #: asset, and a second row for the same pair would let the byte budget count
+    #: the same disk space twice.
+    cell_id: Mapped[str] = mapped_column(String(96), primary_key=True, index=True)
+    asset: Mapped[str] = mapped_column(String(512), primary_key=True)
+    #: Real columns because both are *filtered* on rather than merely read: the
+    #: staging phase selects unproven rows and the submission path selects
+    #: staged ones by asset. Extracting either from JSON would scan the table.
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    cell_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The budget number, exposed so an operator can sum a cell's charge in SQL
+    #: without decoding every document.
+    reserved_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -794,6 +818,45 @@ class SqlAlchemySession:
         )
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(UserProgressReport, rows, table="progress_reports")
+
+    async def get_cell_stage(self, cell_id: str, asset: str) -> CellStageRecord | None:
+        row = await self._get_locked(CellStageRow, {"cell_id": cell_id, "asset": asset})
+        return None if row is None else CellStageRecord.model_validate(row.data)
+
+    async def put_cell_stage(self, stage: CellStageRecord) -> None:
+        await self.session.merge(
+            CellStageRow(
+                cell_id=stage.cell_id,
+                asset=stage.asset,
+                state=stage.state.value,
+                cell_generation=stage.cell_generation,
+                reserved_bytes=stage.reserved_bytes,
+                data=_dump(stage),
+            )
+        )
+
+    async def delete_cell_stage(self, cell_id: str, asset: str) -> None:
+        row = await self._get_locked(CellStageRow, {"cell_id": cell_id, "asset": asset})
+        if row is not None:
+            await self.session.delete(row)
+
+    async def list_cell_stages(
+        self,
+        *,
+        cell_id: str | None = None,
+        assets: tp.Sequence[str] | None = None,
+    ) -> list[CellStageRecord]:
+        statement = select(CellStageRow)
+        if cell_id is not None:
+            statement = statement.where(CellStageRow.cell_id == cell_id)
+        if assets is not None:
+            wanted = sorted(set(assets))
+            if not wanted:
+                return []
+            statement = statement.where(CellStageRow.asset.in_(wanted))
+        statement = statement.order_by(CellStageRow.cell_id, CellStageRow.asset)
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_rows(CellStageRecord, rows, table="cell_stages")
 
     async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
         row = await self._get_locked(WorkloadTopologyRow, {"workload_id": workload_id, "attempt": attempt})

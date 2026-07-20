@@ -1,0 +1,625 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Fenced managed staging and eviction, one cell at a time.
+
+The shape of every pass here is the same three steps, and the order is the
+point: read and reserve in a transaction, close it, do the round trip, then
+reopen a transaction to record what happened. A staging fetch is minutes of
+network for hundreds of gigabytes; holding a row lock across it would park a
+PostgreSQL transaction for the length of a dataset pull, and every other writer
+touching that cell behind it.
+
+Between the two transactions the world can move, so every write re-reads and
+re-checks the generation it was planned against. A cell that was replaced while
+its dataset was being fetched gets nothing written against it: the row would
+describe a disk that no longer exists.
+
+Two phases rather than one, because they fail differently. Staging that cannot
+reach a host costs a cache miss; eviction that deletes the wrong thing costs a
+running job its data. So eviction plans first, deletes only when an operator has
+switched deletion on, and never touches an asset a live workload declared.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import typing as tp
+from datetime import datetime
+
+from eyvan._internal.observability import trace_span
+from eyvan.capacity.stage_policy import CellStagePolicy
+from eyvan.records import (
+    CellRecord,
+    CellStageRecord,
+    CellStageState,
+    CellState,
+    LeaseRecord,
+    WorkloadRecord,
+    utcnow,
+)
+from eyvan.server.controller._support import logger
+from eyvan.server.service.stage import (
+    MAX_STAGE_ACTIONS_PER_PASS,
+    CellStageEvictionPlan,
+    CellStageInconclusiveError,
+    CellStageMeasurement,
+    CellStageRefusedError,
+    CellStageRequest,
+    CellStageStaleError,
+    StageOutcome,
+    declared_assets_on_cell,
+    plan_eviction,
+    stage_headroom_bytes,
+)
+
+#: Cell states a stage may be acted on in. A cell that is not ready has no disk
+#: worth talking to, and one being released is about to lose the bytes anyway.
+_STAGEABLE_CELL_STATES = frozenset({CellState.READY})
+
+
+class _ControllerStaging:
+    """Managed asset staging and eviction for the cells this leader owns.
+
+    A concern of :class:`~eyvan.server.controller.EyvanController`; not
+    instantiated on its own.
+    """
+
+    def _stage_policy(self) -> CellStagePolicy:
+        """Return the staging bounds this deployment declared."""
+
+        return self.settings.cell_stage_policy()
+
+    def _stage_fence(self, cell: CellRecord) -> str:
+        """Return the fencing token one cell's stage actions carry.
+
+        Identical in shape to every other cell action's token, so an executor
+        that already understands one understands this, and so a stale token is
+        recognisable as stale rather than merely unfamiliar.
+        """
+
+        return f"cell:{cell.id}:{cell.generation}"
+
+    async def stage_cell_assets_once(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Materialize the assets running workloads declared on the cells they hold.
+
+        Desired stages are derived from live leases rather than from a durable
+        wish list. A lease is the control plane's own record that this workload
+        is on this cell, so the set cannot drift: a workload that finished stops
+        asking for its asset without anything having to remember to withdraw it.
+
+        This is deliberately a cache warmed by use rather than by prediction. The
+        workload that triggers a stage has already been placed and pays its own
+        pull; what the stage buys is the *next* placement, which is exactly the
+        thing the old lease-history inference was guessing at and could not
+        confirm.
+        """
+
+        policy = self._stage_policy()
+        outcome = StageOutcome()
+        if self._stage_executor is None or not policy.enabled:
+            return outcome.as_counts()
+        moment = now or utcnow()
+        async with self.repository.transaction() as transaction:
+            known = {cell.id: cell for cell in await transaction.list_cells()}
+            leases = await transaction.list_leases()
+            workloads = await transaction.list_workloads()
+            stages = await transaction.list_cell_stages()
+        stageable = {cell_id: cell for cell_id, cell in known.items() if cell.state in _STAGEABLE_CELL_STATES}
+        wanted = _desired_stages(stageable, workloads, leases)
+        by_cell: dict[str, list[CellStageRecord]] = {}
+        for stage in stages:
+            by_cell.setdefault(stage.cell_id, []).append(stage)
+
+        # Every cell that holds rows, not only the ones something wants staged: a
+        # cell that was replaced or retired stops appearing in the wish list, and
+        # the sweep is the only thing that would ever look at its rows again.
+        for cell_id, held in sorted(by_cell.items()):
+            await self._discard_superseded_stages(cell_id, known.get(cell_id), held, outcome)
+        for cell_id, assets in sorted(wanted.items()):
+            cell = stageable[cell_id]
+            for asset in sorted(assets):
+                if outcome.exhausted():
+                    # A bounded bite, and the next cycle takes the next one.
+                    # Reported rather than silent: a pass that keeps capping is a
+                    # fleet declaring more than staging can keep up with.
+                    outcome.capped = 1
+                    logger.info("cell staging reached its %s action budget for this pass", MAX_STAGE_ACTIONS_PER_PASS)
+                    return outcome.as_counts()
+                with trace_span("eyvan.cell_stage", cell=cell_id, asset=asset):
+                    await self._stage_one_asset(cell, asset, policy=policy, now=moment, outcome=outcome)
+        return outcome.as_counts()
+
+    async def _discard_superseded_stages(
+        self,
+        cell_id: str,
+        cell: CellRecord | None,
+        stages: tp.Sequence[CellStageRecord],
+        outcome: StageOutcome,
+    ) -> None:
+        """Delete rows describing a host that no longer exists.
+
+        Not an eviction: there is nothing to delete on any disk, because the
+        machine those rows measured has been replaced or retired. Leaving them
+        would charge a new host's budget for an old host's disk, which is how a
+        cache ends up refusing to stage anything on a cell that is in fact empty.
+
+        This is also the only garbage collector the ledger has. A row nothing can
+        confirm and nothing can delete is bounded by the life of its cell, and
+        this is where that bound is applied.
+        """
+
+        for stage in stages:
+            if cell is not None and stage.cell_generation == cell.generation:
+                continue
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_cell(cell_id)
+                stored = await transaction.get_cell_stage(cell_id, stage.asset)
+                if stored is None:
+                    continue
+                if current is not None and stored.cell_generation >= current.generation:
+                    continue
+                await transaction.delete_cell_stage(cell_id, stored.asset)
+            outcome.superseded += 1
+            logger.info(
+                "discarded stage %s on cell %s: recorded generation %s, cell is now %s",
+                stage.asset,
+                cell_id,
+                stage.cell_generation,
+                "absent" if cell is None else cell.generation,
+            )
+
+    async def _stage_one_asset(
+        self,
+        cell: CellRecord,
+        asset: str,
+        *,
+        policy: CellStagePolicy,
+        now: datetime,
+        outcome: StageOutcome,
+    ) -> None:
+        """Reserve, fetch, and confirm one asset on one cell.
+
+        Three transactions and two round trips, none of them overlapping. The
+        measurement is what makes the budget exact: the size is observed before
+        anything is admitted, so a cell never learns it is over budget by going
+        over it.
+        """
+
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_cell(cell.id)
+            if current is None or current.generation != cell.generation or current.state not in _STAGEABLE_CELL_STATES:
+                return
+            existing = await transaction.get_cell_stage(cell.id, asset)
+            if existing is not None and existing.cell_generation == current.generation:
+                if existing.state is CellStageState.STAGED:
+                    # Touched, not restaged. The eviction clock has to advance
+                    # for an asset a job is using, or LRU gives up exactly the
+                    # stage that is earning its bytes.
+                    await transaction.put_cell_stage(existing.model_copy(update={"last_used_at": now}))
+                    return
+                if existing.state in {CellStageState.BLOCKED, CellStageState.EVICTING}:
+                    return
+                if existing.attempts >= policy.max_attempts:
+                    # Includes a row left in ``STAGING`` by a leader that died
+                    # mid-fetch. Its bytes stay charged because nobody knows what
+                    # reached the disk, but it stops being retried -- an action
+                    # that has spent its budget must end somewhere.
+                    await transaction.put_cell_stage(
+                        existing.model_copy(
+                            update={
+                                "state": CellStageState.BLOCKED,
+                                "confirmed_at": None,
+                                "detail": f"staging stopped after {existing.attempts} attempts; presence is unknown",
+                                "updated_at": now,
+                            }
+                        )
+                    )
+                    outcome.blocked += 1
+                    return
+            live = await transaction.list_cell_stages(cell_id=cell.id)
+            headroom = stage_headroom_bytes(live, cell=current, policy=policy, excluding=asset)
+        if headroom <= 0:
+            outcome.refused_by_budget += 1
+            return
+
+        request = CellStageRequest(
+            cell_id=cell.id,
+            asset=asset,
+            cell_generation=cell.generation,
+            fencing_token=self._stage_fence(cell),
+            max_bytes=headroom,
+        )
+        outcome.actions += 1
+        measured = await self._measure_stage(request, outcome=outcome, now=now)
+        if measured is None:
+            return
+        if measured.size_bytes > headroom:
+            # Refused before a byte moves, and recorded as blocked rather than
+            # retried: the asset is larger than this cell may hold, and asking
+            # again tomorrow gets the same answer.
+            outcome.refused_by_budget += 1
+            await self._record_stage(
+                request,
+                state=CellStageState.BLOCKED,
+                reserved_bytes=0,
+                detail=f"asset needs {measured.size_bytes} bytes; this cell may admit {headroom}",
+                now=now,
+            )
+            return
+
+        reserved = await self._reserve_stage(request, measured=measured, policy=policy, now=now)
+        if reserved is None:
+            outcome.refused_by_budget += 1
+            return
+        outcome.actions += 1
+        try:
+            written = await asyncio.to_thread(self._stage_executor.stage, request)
+        except CellStageStaleError as exc:
+            logger.info("staging %s on cell %s was fenced out: %s", asset, cell.id, exc)
+            return
+        except CellStageRefusedError as exc:
+            outcome.blocked += 1
+            await self._record_stage(request, state=CellStageState.BLOCKED, reserved_bytes=0, detail=str(exc), now=now)
+            return
+        except (CellStageInconclusiveError, OSError) as exc:
+            outcome.inconclusive += 1
+            await self._record_stage(
+                request,
+                state=CellStageState.UNKNOWN,
+                reserved_bytes=measured.size_bytes,
+                detail=str(exc),
+                now=now,
+            )
+            return
+        await self._confirm_stage(request, written=written, now=now, outcome=outcome)
+
+    async def _measure_stage(
+        self,
+        request: CellStageRequest,
+        *,
+        outcome: StageOutcome,
+        now: datetime,
+    ) -> CellStageMeasurement | None:
+        """Ask what the asset would cost, outside every transaction."""
+
+        try:
+            return await asyncio.to_thread(self._stage_executor.measure, request)
+        except CellStageStaleError as exc:
+            logger.info("measuring %s on cell %s was fenced out: %s", request.asset, request.cell_id, exc)
+            return None
+        except CellStageRefusedError as exc:
+            outcome.blocked += 1
+            await self._record_stage(request, state=CellStageState.BLOCKED, reserved_bytes=0, detail=str(exc), now=now)
+            return None
+        except (CellStageInconclusiveError, OSError) as exc:
+            outcome.inconclusive += 1
+            await self._record_stage(
+                request,
+                state=CellStageState.UNKNOWN,
+                reserved_bytes=0,
+                detail=str(exc),
+                now=now,
+                charge_attempt=True,
+            )
+            return None
+
+    async def _reserve_stage(
+        self,
+        request: CellStageRequest,
+        *,
+        measured: CellStageMeasurement,
+        policy: CellStagePolicy,
+        now: datetime,
+    ) -> CellStageRecord | None:
+        """Charge the budget before the fetch starts, re-checking fence and headroom.
+
+        The reservation is what makes the budget hold: the bytes are charged
+        while they are being fetched, so anything looking at this cell afterwards
+        sees capacity that is already committed rather than capacity that merely
+        looks free. Headroom is recomputed here against fresh state because the
+        measurement round trip happened outside every transaction, and another
+        asset may have been admitted during it.
+
+        The attempt is charged here rather than on failure, so a leader that dies
+        mid-fetch still spends one: otherwise a crash loop retries an asset
+        forever and never reaches the attempt bound at all.
+        """
+
+        async with self.repository.transaction() as transaction:
+            cell = await transaction.get_cell(request.cell_id)
+            if cell is None or cell.generation != request.cell_generation:
+                return None
+            live = await transaction.list_cell_stages(cell_id=request.cell_id)
+            headroom = stage_headroom_bytes(live, cell=cell, policy=policy, excluding=request.asset)
+            if measured.size_bytes > headroom:
+                return None
+            existing = await transaction.get_cell_stage(request.cell_id, request.asset)
+            reserved = CellStageRecord(
+                cell_id=request.cell_id,
+                asset=request.asset,
+                cell_generation=request.cell_generation,
+                state=CellStageState.STAGING,
+                reserved_bytes=measured.size_bytes,
+                observed_bytes=None if existing is None else existing.observed_bytes,
+                digest=measured.digest,
+                last_used_at=now,
+                attempts=(0 if existing is None else existing.attempts) + 1,
+                detail=None,
+                created_at=now if existing is None else existing.created_at,
+                updated_at=now,
+            )
+            await transaction.put_cell_stage(reserved)
+            return reserved
+
+    async def _confirm_stage(
+        self,
+        request: CellStageRequest,
+        *,
+        written: CellStageMeasurement,
+        now: datetime,
+        outcome: StageOutcome,
+    ) -> None:
+        """Record the bytes an executor proved present, or refuse to.
+
+        The generation is re-checked here and not merely at reservation: the
+        fetch took real time, and a row confirming an asset on a cell that has
+        since been replaced is exactly the false hit this whole design exists to
+        avoid.
+        """
+
+        async with self.repository.transaction() as transaction:
+            cell = await transaction.get_cell(request.cell_id)
+            if cell is None or cell.generation != request.cell_generation:
+                logger.info(
+                    "not recording stage %s: cell %s moved to generation %s",
+                    request.asset,
+                    request.cell_id,
+                    None if cell is None else cell.generation,
+                )
+                return
+            existing = await transaction.get_cell_stage(request.cell_id, request.asset)
+            if existing is None or existing.cell_generation != request.cell_generation:
+                return
+            await transaction.put_cell_stage(
+                existing.model_copy(
+                    update={
+                        "state": CellStageState.STAGED,
+                        "reserved_bytes": written.size_bytes,
+                        "observed_bytes": written.size_bytes,
+                        "digest": written.digest,
+                        "confirmed_at": now,
+                        "last_used_at": now,
+                        "attempts": 0,
+                        "detail": written.detail or None,
+                        "updated_at": now,
+                    }
+                )
+            )
+        outcome.staged += 1
+
+    async def _record_stage(
+        self,
+        request: CellStageRequest,
+        *,
+        state: CellStageState,
+        reserved_bytes: int,
+        detail: str,
+        now: datetime,
+        charge_attempt: bool = False,
+    ) -> None:
+        """Write one unproven outcome, promoting to blocked at the attempt budget.
+
+        ``UNKNOWN`` says an action ended without an answer; it is never absence,
+        so the bytes stay charged. ``BLOCKED`` says this control plane has
+        stopped asking, which is what keeps an impossible fetch from consuming a
+        leader phase forever -- the bound the outbox's endless backoff lacks.
+        """
+
+        policy = self._stage_policy()
+        async with self.repository.transaction() as transaction:
+            cell = await transaction.get_cell(request.cell_id)
+            if cell is None or cell.generation != request.cell_generation:
+                return
+            existing = await transaction.get_cell_stage(request.cell_id, request.asset)
+            attempts = (0 if existing is None else existing.attempts) + int(charge_attempt)
+            resolved = state
+            if state is CellStageState.UNKNOWN and attempts >= policy.max_attempts:
+                resolved = CellStageState.BLOCKED
+                detail = f"{detail} (staging stopped after {attempts} attempts; presence is unknown)"
+            await transaction.put_cell_stage(
+                CellStageRecord(
+                    cell_id=request.cell_id,
+                    asset=request.asset,
+                    cell_generation=request.cell_generation,
+                    state=resolved,
+                    reserved_bytes=reserved_bytes,
+                    observed_bytes=None if existing is None else existing.observed_bytes,
+                    digest=None if existing is None else existing.digest,
+                    last_used_at=now,
+                    attempts=attempts,
+                    detail=detail[:2048],
+                    created_at=now if existing is None else existing.created_at,
+                    updated_at=now,
+                )
+            )
+
+    async def _evict_cell_stages_phase(self) -> tuple[CellStageEvictionPlan, ...]:
+        """Run eviction with the deletion switch this deployment configured.
+
+        Dry-run unless an operator turned deletion on, which is the whole point
+        of the switch: the phase logs exactly the plan it would execute for as
+        long as the operator wants to watch it, and the plan it eventually
+        executes is the one they watched.
+        """
+
+        return await self.evict_cell_stages_once(dry_run=not self.settings.cell_stage_eviction_enabled)
+
+    async def evict_cell_stages_once(
+        self,
+        *,
+        dry_run: bool = True,
+        now: datetime | None = None,
+    ) -> tuple[CellStageEvictionPlan, ...]:
+        """Return what eviction would do, and do it only when asked to.
+
+        A dry run is the same computation with the deletions withheld, not a
+        second code path that could disagree with the one that deletes. It is the
+        default because a cache that starts removing bytes the moment it is
+        configured gives an operator no way to see what it was about to remove.
+
+        Plans are returned for every cell examined, including those with nothing
+        to give up: "this cell is over budget and every byte over it belongs to a
+        running workload" is the answer an operator most needs, and it is a plan
+        with no victims and a non-zero shortfall.
+        """
+
+        policy = self._stage_policy()
+        if self._stage_executor is None or not policy.enabled:
+            return ()
+        moment = now or utcnow()
+        async with self.repository.transaction() as transaction:
+            cells = await transaction.list_cells()
+            leases = await transaction.list_leases()
+            workloads = await transaction.list_workloads()
+            stages = await transaction.list_cell_stages()
+        by_cell: dict[str, list[CellStageRecord]] = {}
+        for stage in stages:
+            by_cell.setdefault(stage.cell_id, []).append(stage)
+
+        plans: list[CellStageEvictionPlan] = []
+        deleted = 0
+        for cell in sorted(cells, key=lambda record: record.id):
+            held = by_cell.get(cell.id)
+            if not held:
+                continue
+            plan = plan_eviction(
+                held,
+                cell=cell,
+                policy=policy,
+                protected=declared_assets_on_cell(cell.id, workloads, leases),
+            )
+            plans.append(plan)
+            if plan.shortfall_bytes:
+                logger.warning(
+                    "cell %s is %s bytes over its stage budget and every remaining asset is in use by a "
+                    "running workload; nothing was evicted",
+                    cell.id,
+                    plan.shortfall_bytes,
+                )
+            if dry_run or not plan.deletes_anything:
+                continue
+            if deleted >= MAX_STAGE_ACTIONS_PER_PASS:
+                # Planning is pure and cheap, so every cell still gets a plan;
+                # only the round trips are rationed. An operator reading the
+                # result sees the whole picture and a partially executed pass.
+                logger.info("cell stage eviction reached its %s action budget", MAX_STAGE_ACTIONS_PER_PASS)
+                continue
+            deleted += len(plan.victims)
+            with trace_span("eyvan.cell_stage_eviction", cell=cell.id):
+                await self._execute_eviction(cell, plan, now=moment)
+        return tuple(plans)
+
+    async def _execute_eviction(
+        self,
+        cell: CellRecord,
+        plan: CellStageEvictionPlan,
+        *,
+        now: datetime,
+    ) -> None:
+        """Delete one plan's victims, re-checking protection against fresh state.
+
+        Protection is recomputed inside the transaction that marks each victim,
+        not trusted from the plan. Between planning and deleting, a workload can
+        be dispatched onto this cell declaring exactly the asset about to be
+        removed, and the plan has no way to know.
+        """
+
+        for victim in plan.victims:
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_cell(cell.id)
+                stored = await transaction.get_cell_stage(cell.id, victim.asset)
+                if current is None or current.generation != plan.cell_generation or stored is None:
+                    continue
+                if stored.cell_generation != plan.cell_generation:
+                    continue
+                protected = declared_assets_on_cell(
+                    cell.id,
+                    await transaction.list_workloads(),
+                    await transaction.list_leases(),
+                )
+                if victim.asset in protected:
+                    logger.info(
+                        "not evicting %s from cell %s: a running workload declared it",
+                        victim.asset,
+                        cell.id,
+                    )
+                    continue
+                await transaction.put_cell_stage(
+                    stored.model_copy(
+                        update={
+                            "state": CellStageState.EVICTING,
+                            "confirmed_at": None,
+                            "detail": "eviction in progress",
+                            "updated_at": now,
+                        }
+                    )
+                )
+            request = CellStageRequest(
+                cell_id=cell.id,
+                asset=victim.asset,
+                cell_generation=plan.cell_generation,
+                fencing_token=self._stage_fence(cell),
+                max_bytes=victim.reserved_bytes,
+            )
+            try:
+                await asyncio.to_thread(self._stage_executor.evict, request)
+            except CellStageStaleError as exc:
+                logger.info("evicting %s from cell %s was fenced out: %s", victim.asset, cell.id, exc)
+                continue
+            except (CellStageInconclusiveError, OSError) as exc:
+                # The bytes may or may not be gone, so the row stays charged and
+                # stays unproven. Uncharging here would be inventing evidence
+                # that a disk is free.
+                logger.warning("eviction of %s from cell %s was inconclusive: %s", victim.asset, cell.id, exc)
+                await self._record_stage(
+                    request,
+                    state=CellStageState.UNKNOWN,
+                    reserved_bytes=victim.reserved_bytes,
+                    detail=f"eviction was inconclusive: {exc}",
+                    now=now,
+                    charge_attempt=True,
+                )
+                continue
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_cell(cell.id)
+                stored = await transaction.get_cell_stage(cell.id, victim.asset)
+                if current is None or current.generation != plan.cell_generation or stored is None:
+                    continue
+                if stored.cell_generation != plan.cell_generation:
+                    continue
+                await transaction.delete_cell_stage(cell.id, victim.asset)
+
+
+def _desired_stages(
+    cells: tp.Mapping[str, CellRecord],
+    workloads: tp.Sequence[WorkloadRecord],
+    leases: tp.Sequence[LeaseRecord],
+) -> dict[str, set[str]]:
+    """Return the assets each stageable cell should be holding right now.
+
+    Read straight off live leases, so the wish list cannot outlive the work that
+    justified it: a workload that ended stops asking without anything having to
+    remember to withdraw its request.
+    """
+
+    wanted: dict[str, set[str]] = {}
+    for cell_id in cells:
+        for asset in declared_assets_on_cell(cell_id, workloads, leases):
+            wanted.setdefault(cell_id, set()).add(asset)
+    return wanted
+
+
+__all__ = ("_ControllerStaging",)

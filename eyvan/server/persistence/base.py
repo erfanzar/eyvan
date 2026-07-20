@@ -16,6 +16,7 @@ from eyvan.records import (
     BudgetRecord,
     CapacityPoolRecord,
     CellRecord,
+    CellStageRecord,
     CredentialRotationRecord,
     IdempotencyRecord,
     LeaseRecord,
@@ -209,6 +210,42 @@ class RepositorySession(tp.Protocol):
         ...
 
     async def list_progress_reports(self, workload_id: str) -> list[UserProgressReport]: ...
+
+    async def get_cell_stage(self, cell_id: str, asset: str) -> CellStageRecord | None:
+        """Return one cell's durable record for one named asset, or ``None``.
+
+        ``None`` means no row, which is the only representation of *proven
+        absent*. It is never an invitation to assume the bytes are there.
+        """
+        ...
+
+    async def put_cell_stage(self, stage: CellStageRecord) -> None:
+        """Upsert one managed stage, keyed by (cell id, asset)."""
+        ...
+
+    async def delete_cell_stage(self, cell_id: str, asset: str) -> None:
+        """Delete one managed stage after its removal was confirmed.
+
+        Deleting rather than tombstoning: absence of a row is exactly the claim a
+        confirmed eviction makes, and it keeps the table bounded by what is
+        actually staged somewhere.
+        """
+        ...
+
+    async def list_cell_stages(
+        self,
+        *,
+        cell_id: str | None = None,
+        assets: tp.Sequence[str] | None = None,
+    ) -> list[CellStageRecord]:
+        """Return managed stages in (cell id, asset) order.
+
+        Both filters exist so the submission path can ask only about the assets
+        one workload named, rather than paying for the whole fleet's cache index
+        on every submit. An empty ``assets`` sequence selects nothing, which is
+        what a workload declaring no assets means.
+        """
+        ...
 
     async def get_workload_topology(self, workload_id: str, attempt: int) -> WorkloadAttemptTopology | None:
         """Return one attempt's frozen rank space, or ``None`` when it is unknown.

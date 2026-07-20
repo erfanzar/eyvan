@@ -695,8 +695,8 @@ async def test_a_fleet_that_never_rotated_keeps_writing_the_older_local_document
     """
 
     from eyvan.server.persistence.local import (
-        LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION,
         LOCAL_CONTROL_PLANE_SCHEMA_VERSION,
+        LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION,
         LocalControlPlaneStore,
         local_control_plane_document,
     )
@@ -716,7 +716,7 @@ async def test_a_fleet_that_never_rotated_keeps_writing_the_older_local_document
         await repository.close()
 
     document = json.loads((tmp_path / "rotated.json").read_text())
-    assert document["version"] == LOCAL_CONTROL_PLANE_ROTATION_SCHEMA_VERSION
+    assert document["version"] == LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION
     assert [row["credential"] for row in document["credential_rotations"]] == [SECRET_CAPABILITY_CREDENTIAL]
     assert local_control_plane_document(empty).version == LOCAL_CONTROL_PLANE_SCHEMA_VERSION
 

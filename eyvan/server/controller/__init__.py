@@ -29,6 +29,7 @@ from eyvan.server.controller.outbox import _ControllerOutbox
 from eyvan.server.controller.preemption import _ControllerPreemption
 from eyvan.server.controller.scheduling import _ControllerScheduling
 from eyvan.server.controller.settlement import _ControllerSettlement
+from eyvan.server.controller.staging import _ControllerStaging
 from eyvan.server.controller.workload_commands import _ControllerWorkloadCommands
 
 
@@ -42,6 +43,7 @@ class EyvanController(
     _ControllerPreemption,
     _ControllerSettlement,
     _ControllerObservation,
+    _ControllerStaging,
     _ControllerLoops,
 ):
     """Turn pure scheduler decisions into fenced, recoverable backend actions."""
