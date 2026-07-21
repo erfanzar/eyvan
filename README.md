@@ -53,12 +53,8 @@ Install all workspace packages from the repository root:
 uv sync
 ```
 
-The core Eyvan package has no Ray dependency. A temporary Ray Jobs adapter
-is available only when explicitly installed:
-
-```bash
-uv sync --package eyvan --extra ray
-```
+The Eyvan package has no Ray dependency at all, and no optional extra that
+would add one. Eyvan runs workloads through its own native worker.
 
 Start the API with its durable owner-only local repository:
 
@@ -647,8 +643,7 @@ Publish and deploy the agent by its own registry-reported digest; it is not the
 control-plane image with a different name.
 
 The standalone agent image includes the Google Cloud CLI required by the
-generic `gcp` capacity backend. It installs neither eray nor the optional Ray
-adapter.
+generic `gcp` capacity backend. It installs neither eray nor Ray.
 
 Each cell receives a random durable Eyvan management UID. The GCP providers
 revalidate that UID and the requested resource identity before adopting or
@@ -909,14 +904,13 @@ generation supersedes an old attempt, terminal retirement waits up to
 terminal within `EYVAN_PREEMPTION_STOP_GRACE_S` (default 300 seconds) before
 its lease is settled.
 
-### Transitional Ray adapter
+### The retired Ray adapter
 
-Ray is not part of Eyvan's authority or base installation. During migration,
-cells that still require Ray Jobs can install the `ray` extra and set
-`EYVAN_EXECUTION_BACKEND=ray-jobs`. That adapter maps each replica to a Ray
-placement-group bundle and honors `EYVAN_GANG_READY_TIMEOUT_S` (default 600
-seconds). Capacity lifecycle, fencing, scheduling, budgets, and audit remain
-Eyvan-owned, so removing the adapter does not change those contracts.
+Eyvan replaces Ray; it does not dispatch to it. The transitional Ray Jobs
+adapter and the `ray` extra are gone, and no Eyvan module imports Ray. A
+workload still persisted against `ray-jobs` fails with an actionable message
+naming `eyvan-native` rather than an unknown-backend error, so an operator is
+told what to change instead of debugging a missing install.
 
 Preemption is one durable plan, not independent victim commands. All
 checkpoints complete before the plan enters its stopping phase; terminal

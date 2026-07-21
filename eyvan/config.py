@@ -223,7 +223,6 @@ class EyvanSettings:
     capacity_backend: str = "gcp"
     execution_backend: str = "eyvan-native"
     agent_state_dir: str = "~/.eyvan/agent"
-    ray_jobs_port: int = 8265
     native_worker_port: int = 8100
     native_worker_package: str | None = None
     native_worker_package_sha256: str | None = None
@@ -463,7 +462,6 @@ class EyvanSettings:
             capacity_backend=os.getenv("EYVAN_CAPACITY_BACKEND", defaults.capacity_backend),
             execution_backend=os.getenv("EYVAN_EXECUTION_BACKEND", defaults.execution_backend),
             agent_state_dir=os.getenv("EYVAN_AGENT_STATE_DIR", defaults.agent_state_dir),
-            ray_jobs_port=int(os.getenv("EYVAN_RAY_JOBS_PORT", defaults.ray_jobs_port)),
             native_worker_port=int(os.getenv("EYVAN_NATIVE_WORKER_PORT", defaults.native_worker_port)),
             native_worker_package=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE"),
             native_worker_package_sha256=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE_SHA256") or None,

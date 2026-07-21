@@ -170,7 +170,6 @@ class CellAgentService:
             executors = ConfiguredExecutionResolver(
                 capacity.capabilities().executor,
                 state_dir=settings.agent_state_dir,
-                ray_jobs_port=settings.ray_jobs_port,
                 native_worker_port=settings.native_worker_port,
                 native_worker_token=settings.native_worker_root_secret,
             )

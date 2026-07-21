@@ -109,6 +109,20 @@ def test_published_dependency_contract_excludes_known_vulnerable_floors() -> Non
     } <= dependencies
 
 
+def test_eyvan_declares_no_ray_dependency_in_any_extra() -> None:
+    """Eyvan replaces Ray rather than dispatching to it.
+
+    An unused extra is not free: it keeps a competitor in the published
+    dependency contract, in every dependency audit, and in every reader's model
+    of what Eyvan needs to run.
+    """
+
+    project = _pyproject()["project"]
+    assert "ray" not in project["optional-dependencies"]
+    declared = " ".join(project["dependencies"]) + " " + str(project["optional-dependencies"])
+    assert "ray" not in declared.lower().replace("array", "")
+
+
 def test_pyproject_registers_migrate_entrypoint() -> None:
     scripts = _pyproject()["project"]["scripts"]
     assert scripts.get("eyvan-migrate") == "eyvan.server.persistence.migrate:main"

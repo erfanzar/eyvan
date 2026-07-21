@@ -1,7 +1,8 @@
 # Eyvan roadmap
 
-This roadmap keeps Eyvan's control plane independent of Ray and eray. Items are
-ordered by the capability needed to replace the transitional Ray Jobs adapter,
+This roadmap keeps Eyvan's control plane independent of Ray and eray. The
+transitional Ray Jobs adapter has been removed; items are ordered by the
+capability needed to replace what it did,
 not by UI visibility.
 
 ## Status vocabulary and qualification boundary
@@ -131,7 +132,7 @@ entry describes only the named persistence contract, never the whole capability.
 
 ## Design gates
 
-- Ray and eray remain optional migration adapters, never control-plane
+- Ray is gone and eray remains an independent sibling, never a control-plane
   dependencies.
 - A workload is dispatched only when the selected runtime can enforce its full
   resource and fencing contract.

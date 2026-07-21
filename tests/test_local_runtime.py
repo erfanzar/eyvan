@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import stat
 import subprocess
 import sys
 import time
-import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -124,74 +124,6 @@ def test_detached_local_worker_startup_does_not_import_the_control_plane() -> No
     )
 
     subprocess.run((sys.executable, "-c", code), check=True)
-
-
-def test_configured_resolver_caches_per_cell_and_lazily_constructs_ray(tmp_path: Path, monkeypatch) -> None:
-    native = ConfiguredExecutionResolver("native-local", state_dir=tmp_path)
-    observation = CellObservation("cell-a", CapacityStatus.HEALTHY, 1)
-
-    first = native.resolve("cell-a", observation)
-    assert first is native.resolve("cell-a", observation)
-    assert isinstance(first, LocalProcessExecutor)
-
-    constructed: list[str] = []
-
-    class FakeRayJobsExecutor:
-        def __init__(self, dashboard_url: str):
-            self.dashboard_url = dashboard_url
-            self.ready = False
-            constructed.append(dashboard_url)
-
-        def health(self):
-            return self.ready
-
-    fake_module = types.ModuleType("eyvan.worker.runtime.ray_jobs")
-    fake_module.RayJobsExecutor = FakeRayJobsExecutor  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "eyvan.worker.runtime.ray_jobs", fake_module)
-    ray = ConfiguredExecutionResolver("ray-jobs", state_dir=tmp_path, ray_jobs_port=9123)
-    ray_observation = CellObservation(
-        "cell-b",
-        CapacityStatus.HEALTHY,
-        1,
-        metadata={"head_ip": "10.0.0.8"},
-    )
-
-    driver = ray.resolve("cell-b", ray_observation)
-
-    assert driver is ray.resolve("cell-b", ray_observation)
-    assert driver.dashboard_url == "http://10.0.0.8:9123"  # type: ignore[attr-defined]
-    assert constructed == ["http://10.0.0.8:9123"]
-    assert ray.readiness("cell-b", ray_observation)[0] is False
-    driver.ready = True  # type: ignore[attr-defined]
-    assert ray.readiness("cell-b", ray_observation)[0] is True
-    with pytest.raises(ValueError, match="belongs to cell"):
-        native.resolve("wrong-cell", observation)
-
-
-def test_configured_resolver_formats_ipv6_fallback_and_rejects_non_ip_hosts(tmp_path: Path, monkeypatch) -> None:
-    constructed: list[str] = []
-
-    class FakeRayJobsExecutor:
-        def __init__(self, dashboard_url: str):
-            constructed.append(dashboard_url)
-
-    fake_module = types.ModuleType("eyvan.worker.runtime.ray_jobs")
-    fake_module.__dict__["RayJobsExecutor"] = FakeRayJobsExecutor
-    monkeypatch.setitem(sys.modules, "eyvan.worker.runtime.ray_jobs", fake_module)
-    resolver = ConfiguredExecutionResolver("ray-jobs", state_dir=tmp_path, ray_jobs_port=9123)
-    ipv6 = CellObservation("cell-v6", CapacityStatus.HEALTHY, 1, metadata={"head_ip": "2001:0db8::1"})
-
-    resolver.resolve("cell-v6", ipv6)
-
-    assert constructed == ["http://[2001:db8::1]:9123"]
-    invalid = CellObservation(
-        "cell-invalid",
-        CapacityStatus.HEALTHY,
-        1,
-        metadata={"head_ip": "127.0.0.1@attacker.example"},
-    )
-    with pytest.raises(ValueError, match="invalid head IP address"):
-        resolver.resolve("cell-invalid", invalid)
 
 
 def test_execution_backend_aliases_canonicalize_to_stable_names(tmp_path: Path) -> None:
@@ -650,3 +582,38 @@ def test_local_worker_creates_the_log_file_with_owner_only_permissions_from_birt
     record = json.loads(record_path.read_text())
     assert record["status"] == ExecutionWorkloadStatus.SUCCEEDED.value
     assert log_path.read_text().splitlines() == ["hello-log"]
+
+
+def test_the_retired_ray_backend_refuses_with_an_actionable_message(tmp_path: Path) -> None:
+    """Eyvan replaces Ray rather than dispatching to it.
+
+    The name stays registered on purpose: a workload already persisted against
+    ``ray-jobs`` has to fail with a sentence an operator can act on, not with an
+    unknown-backend error that reads like a typo or a broken install.
+    """
+
+    resolver = ConfiguredExecutionResolver("ray-jobs", state_dir=tmp_path)
+    observation = CellObservation("cell-b", CapacityStatus.HEALTHY, 1, metadata={"head_ip": "10.0.0.8"})
+
+    with pytest.raises(RuntimeError, match="ray-jobs execution backend has been removed"):
+        resolver.resolve("cell-b", observation)
+
+
+def test_no_eyvan_module_imports_ray(tmp_path: Path) -> None:
+    """The dependency is gone, not merely optional.
+
+    An extra that nobody installs still shapes the package: it keeps a competitor
+    in the dependency contract, in the audit surface, and in every reader's model
+    of what Eyvan needs to run.
+    """
+
+    del tmp_path
+    import pathlib
+
+    package = pathlib.Path(__import__("eyvan").__file__).parent
+    offenders = [
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*.py")
+        if re.search(r"^\s*(?:import ray\b|from ray[.\s])", path.read_text(encoding="utf-8"), re.MULTILINE)
+    ]
+    assert offenders == []

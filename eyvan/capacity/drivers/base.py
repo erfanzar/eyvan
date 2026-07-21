@@ -30,6 +30,8 @@ def canonical_execution_backend(name: str) -> str:
         "native-remote": "eyvan-native",
         "native-worker": "eyvan-native",
         "eyvan": "eyvan-native",
+        # Retired: kept as aliases so a persisted workload naming Ray still
+        # normalises to one refused backend instead of an unknown-typo error.
         "ray": "ray-jobs",
         "rayjobs": "ray-jobs",
     }

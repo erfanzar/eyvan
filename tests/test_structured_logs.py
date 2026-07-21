@@ -42,16 +42,21 @@ def _journal(*entries: dict) -> str:
 def test_the_systemd_executor_satisfies_the_structured_log_protocol() -> None:
     """A protocol rather than a getattr probe, matching the three beside it.
 
-    ``ray_jobs`` deliberately does not implement it: a backend that cannot
-    produce cursors should say so by failing the protocol rather than by
-    returning something shaped like a page.
+    A backend that cannot produce cursors should say so by failing the protocol
+    rather than by returning something shaped like a page. The negative half of
+    this test used to point at the Ray adapter; Eyvan no longer ships one, so it
+    points at a driver that genuinely has no log surface instead of asserting
+    nothing.
     """
 
-    from eyvan.worker.runtime.ray_jobs import RayJobsExecutor
     from eyvan.worker.runtime.systemd_transient import SystemdTransientServiceExecutor
 
+    class PageLessExecutor:
+        """An execution driver with no structured-log surface at all."""
+
     assert hasattr(SystemdTransientServiceExecutor, "log_page")
-    assert not isinstance(RayJobsExecutor, StructuredLogExecutionDriver)
+    assert isinstance(SystemdTransientServiceExecutor, StructuredLogExecutionDriver)
+    assert not isinstance(PageLessExecutor, StructuredLogExecutionDriver)
 
 
 def test_journal_json_becomes_attributed_records() -> None:

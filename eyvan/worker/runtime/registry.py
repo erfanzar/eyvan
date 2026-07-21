@@ -112,9 +112,9 @@ class StructuredLogExecutionDriver(tp.Protocol):
     concatenation with ``===== rank N =====`` banners.
 
     Optional, and a protocol rather than a ``getattr`` probe, for the same
-    reason as the three above: ``ray_jobs`` deliberately does not implement it,
-    and a backend that cannot produce cursors should say so by not satisfying
-    the protocol rather than by returning something that looks like a page.
+    reason as the three above: a backend that cannot produce cursors should say
+    so by not satisfying the protocol rather than by returning something that
+    looks like a page.
     """
 
     def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage: ...
@@ -210,25 +210,25 @@ def _eyvan_native_factory(
     return NativeRemoteExecutor(endpoint, secret=token)
 
 
-def _ray_jobs_factory(
+def _retired_ray_jobs_factory(
     *,
     endpoint: str | None = None,
     state_dir: str | os.PathLike[str] | None = None,
     token: str | None = None,
 ) -> ExecutionDriver:
-    del state_dir, token
-    if endpoint is None or not endpoint.strip():
-        raise ValueError("ray-jobs execution requires a Ray dashboard endpoint")
-    # Ray support is transitional and optional. Importing Eyvan or selecting
-    # the native runtime must never import the Ray adapter.
-    from eyvan.worker.runtime.ray_jobs import RayJobsExecutor
+    """Refuse the retired Ray Jobs backend with an actionable message.
 
-    try:
-        return RayJobsExecutor(endpoint)
-    except ModuleNotFoundError as exc:
-        if exc.name == "ray" or (exc.name is not None and exc.name.startswith("ray.")):
-            raise RuntimeError("ray-jobs execution requires the 'eyvan[ray]' extra") from exc
-        raise
+    Eyvan replaces Ray rather than dispatching to it, so the adapter is gone. The
+    name is still *registered* on purpose: a workload already persisted with this
+    backend must fail with a sentence an operator can act on, not with an unknown
+    backend error that reads like a typo or a broken install.
+    """
+
+    del endpoint, state_dir, token
+    raise RuntimeError(
+        "the ray-jobs execution backend has been removed; Eyvan runs workloads natively -- "
+        "resubmit with required_executor='eyvan-native' (or 'native-local' for a single host)"
+    )
 
 
 class ExecutionRuntimeRegistry:
@@ -279,7 +279,7 @@ class ExecutionRuntimeRegistry:
 DEFAULT_EXECUTION_RUNTIMES = ExecutionRuntimeRegistry()
 DEFAULT_EXECUTION_RUNTIMES.register("native-local", _native_local_factory)
 DEFAULT_EXECUTION_RUNTIMES.register("eyvan-native", _eyvan_native_factory)
-DEFAULT_EXECUTION_RUNTIMES.register("ray-jobs", _ray_jobs_factory)
+DEFAULT_EXECUTION_RUNTIMES.register("ray-jobs", _retired_ray_jobs_factory)
 
 
 class ExecutionDriverResolver:
@@ -291,12 +291,9 @@ class ExecutionDriverResolver:
         *,
         registry: ExecutionRuntimeRegistry | None = None,
         state_dir: str | os.PathLike[str] | None = None,
-        ray_jobs_port: int = 8265,
         native_worker_port: int = 8100,
         native_worker_token: str | None = None,
     ) -> None:
-        if ray_jobs_port <= 0 or ray_jobs_port > 65535:
-            raise ValueError("Ray Jobs port must be between 1 and 65535")
         if native_worker_port <= 0 or native_worker_port > 65535:
             raise ValueError("native worker port must be between 1 and 65535")
         self.backend = _normalize_name(backend)
@@ -309,7 +306,6 @@ class ExecutionDriverResolver:
             choices = ", ".join(self.registry.names())
             raise ValueError(f"unknown execution backend {backend!r}; available backends: {choices}")
         self.state_dir = Path(state_dir).expanduser() if state_dir is not None else None
-        self.ray_jobs_port = ray_jobs_port
         self.native_worker_port = native_worker_port
         self.native_worker_token = native_worker_token
         self._drivers: dict[tuple[str, ...], ExecutionDriver] = {}
@@ -351,14 +347,7 @@ class ExecutionDriverResolver:
                 f"execution observation belongs to cell {observation.cell_id!r}, not requested cell {cell_id!r}"
             )
         endpoint = observation.execution_endpoint
-        if self.backend == "ray-jobs" and not endpoint:
-            head_ip = observation.metadata.get("head_ip")
-            if isinstance(head_ip, str) and head_ip.strip():
-                try:
-                    endpoint = format_http_ip_endpoint(head_ip, self.ray_jobs_port)
-                except ValueError as exc:
-                    raise ValueError("ray-jobs execution observation has an invalid head IP address") from exc
-        elif self.backend == "eyvan-native" and not endpoint:
+        if self.backend == "eyvan-native" and not endpoint:
             head_ip = observation.metadata.get("head_ip")
             if isinstance(head_ip, str) and head_ip.strip():
                 try:

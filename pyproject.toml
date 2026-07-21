@@ -46,7 +46,6 @@ eyvan-migrate = "eyvan.server.persistence.migrate:main"
 # looked green because only the in-memory store was exercised.
 dev = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0", "aiosqlite>=0.20.0"]
 oci = ["google-cloud-storage>=2.18.0"]
-ray = ["ray[default]>=2.54.0"]
 
 [tool.uv.build-backend]
 module-name = "eyvan"
