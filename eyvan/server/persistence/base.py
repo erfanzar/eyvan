@@ -66,6 +66,7 @@ class RepositorySession(tp.Protocol):
         org_id: str | None = None,
         project_id: str | None = None,
         state: WorkloadState | None = None,
+        states: frozenset[WorkloadState] | None = None,
     ) -> list[WorkloadRecord]: ...
 
     async def put_workload(self, workload: WorkloadRecord) -> None: ...

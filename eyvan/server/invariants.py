@@ -394,7 +394,16 @@ async def check_fleet(
 
     moment = now or utcnow()
     async with repository.transaction() as tx:
-        workloads = await tx.list_workloads()
+        # Only the workloads that can violate anything, never the whole history.
+        # Every check below is about live state: a lease names its workload, and
+        # I4 asks which lease-holding workloads have no lease. A terminal
+        # workload from last week participates in neither. Reading them all made
+        # this check O(everything the fleet has ever run) -- measured at ~30ms
+        # per thousand rows on SQLite -- so a long-running fleet slowed its own
+        # health check until the poll timed out, and a timing-out health check
+        # reports "unreachable", which is indistinguishable from a plane that is
+        # actually down.
+        workloads = await tx.list_workloads(states=LEASE_HOLDING_STATES)
         cells = await tx.list_cells()
         leases = await tx.list_leases()
         pools = await tx.list_capacity_pools()
@@ -412,6 +421,16 @@ async def check_fleet(
 
     violations: list[Violation] = []
     workload_by_id = {workload.id: workload for workload in workloads}
+    # A lease may name a workload that is already terminal -- that is exactly
+    # what I2 exists to catch -- and such a workload is not in the live set
+    # above. Fetch precisely those, bounded by the number of active leases,
+    # rather than reading every workload to find a handful.
+    async with repository.transaction() as tx:
+        for lease in leases:
+            if lease.state in ACTIVE_LEASE_STATES and lease.workload_id not in workload_by_id:
+                settled = await tx.get_workload(lease.workload_id)
+                if settled is not None:
+                    workload_by_id[settled.id] = settled
     cell_ids = {cell.id for cell in cells if cell.state is not CellState.DELETED}
     pool_ids = {pool.id for pool in pools}
 

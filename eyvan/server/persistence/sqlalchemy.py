@@ -543,6 +543,7 @@ class SqlAlchemySession:
         org_id: str | None = None,
         project_id: str | None = None,
         state: WorkloadState | None = None,
+        states: frozenset[WorkloadState] | None = None,
     ) -> list[WorkloadRecord]:
         statement = select(WorkloadRow)
         if org_id is not None:
@@ -551,6 +552,11 @@ class SqlAlchemySession:
             statement = statement.where(WorkloadRow.project_id == project_id)
         if state is not None:
             statement = statement.where(WorkloadRow.state == state.value)
+        if states is not None:
+            # Pushed into SQL rather than filtered after decode: the whole point
+            # of the narrowed read is not to pay JSON decode for rows nobody is
+            # going to look at.
+            statement = statement.where(WorkloadRow.state.in_(sorted(item.value for item in states)))
         rows = (await self.session.scalars(statement)).all()
         items = _decode_rows(WorkloadRecord, rows, table="workloads")
         return sorted(

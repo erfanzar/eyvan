@@ -115,13 +115,23 @@ class StateSession(RepositorySession):
         org_id: str | None = None,
         project_id: str | None = None,
         state: WorkloadState | None = None,
+        states: frozenset[WorkloadState] | None = None,
     ) -> list[WorkloadRecord]:
+        """Return workloads, optionally narrowed to one state or a set of them.
+
+        ``states`` exists so a caller wanting several states makes one pass
+        rather than one pass per state. The fleet health check wants exactly the
+        lease-holding states, and asking five times meant five scans and five
+        sorts of every workload the fleet had ever run.
+        """
+
         items = (
             item
             for item in self._state.workloads.values()
             if (org_id is None or item.org_id == org_id)
             and (project_id is None or item.project_id == project_id)
             and (state is None or item.state == state)
+            and (states is None or item.state in states)
         )
         return sorted(items, key=lambda item: (item.created_at, item.id))
 
