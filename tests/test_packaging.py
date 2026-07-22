@@ -596,3 +596,26 @@ def test_lazy_create_app_reexport_matches_the_real_factory_signature() -> None:
     for name, real_parameter in real.parameters.items():
         assert lazy.parameters[name].kind is real_parameter.kind, f"{name} changed parameter kind"
         assert lazy.parameters[name].default == real_parameter.default, f"{name} default drifted"
+
+
+def test_the_worker_image_stages_the_multi_host_initialization_hook() -> None:
+    """Both slice executors put this path on a multi-host workload's PYTHONPATH.
+
+    Only the GCP VM startup script ever created it, so on Kubernetes the
+    directory did not exist, ``sitecustomize`` never ran, and
+    ``jax.distributed.initialize`` was never called on the workload's behalf.
+    Nothing failed -- the ranks ran as independent single-process jobs, which is
+    the wrong-results failure rather than the loud one.
+    """
+
+    from eyvan.worker.runtime.native_gang import _MULTIHOST_SITE_PATH as GANG_PATH
+    from eyvan.worker.runtime.native_slice import _MULTIHOST_SITE_PATH as SLICE_PATH
+
+    worker = (EYVAN_ROOT / "Dockerfile.worker").read_text()
+
+    assert GANG_PATH == SLICE_PATH, "the two executors must stage the same hook directory"
+    assert f"install -d -m 0755 {GANG_PATH}" in worker
+    assert f"{GANG_PATH}/eyvan_multihost.py" in worker
+    assert f"{GANG_PATH}/eyvan_distributed_environment.py" in worker
+    assert f"{GANG_PATH}/sitecustomize.py" in worker
+    assert "initialize_worker_runtime()" in worker

@@ -41,7 +41,23 @@ COPY eyvan ./src/eyvan
 RUN uv pip install --no-build-isolation --no-deps ./src && \
     uv pip uninstall uv-build && \
     rm -rf ./src && \
-    install -d -o 65532 -g 65532 -m 0700 /var/lib/eyvan/native-worker
+    install -d -o 65532 -g 65532 -m 0700 /var/lib/eyvan/native-worker && \
+    # Stage the multi-host initialization hook the same way the VM startup
+    # script does. Both slice executors put /opt/eyvan-native/multihost on a
+    # multi-host workload's PYTHONPATH on every substrate, but only the GCP VM
+    # path ever created it -- so on Kubernetes the path did not exist, the
+    # sitecustomize hook never ran, and jax.distributed.initialize was never
+    # called on the workload's behalf. Nothing failed: the ranks simply ran as
+    # independent single-process jobs, which is the wrong-results failure rather
+    # than the loud one.
+    install -d -m 0755 /opt/eyvan-native/multihost && \
+    install -m 0644 "$(python -c 'import eyvan.worker.runtime._multihost_site as m; print(m.__file__)')" \
+        /opt/eyvan-native/multihost/eyvan_multihost.py && \
+    install -m 0644 "$(python -c 'import eyvan.worker.distributed_environment as m; print(m.__file__)')" \
+        /opt/eyvan-native/multihost/eyvan_distributed_environment.py && \
+    printf '%s\n\n%s\n' 'from eyvan_multihost import initialize_worker_runtime' \
+        'initialize_worker_runtime()' >/opt/eyvan-native/multihost/sitecustomize.py && \
+    chmod 0644 /opt/eyvan-native/multihost/sitecustomize.py
 USER 65532:65532
 EXPOSE 8100
 ENTRYPOINT ["eyvan-native-worker"]
