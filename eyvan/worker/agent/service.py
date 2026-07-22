@@ -172,6 +172,7 @@ class CellAgentService:
                 state_dir=settings.agent_state_dir,
                 native_worker_port=settings.native_worker_port,
                 native_worker_token=settings.native_worker_root_secret,
+                gang_initialization=settings.gang_initialization_policy(),
             )
         self.capacity = capacity
         self.execution_backend = canonical_execution_backend(capacity.capabilities().executor)

@@ -24,6 +24,12 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime._multihost_site import (
+    DEFAULT_GANG_INITIALIZATION,
+    GangInitializationPolicy,
+    gang_formation_failure_reason,
+    gang_initialization_outcome,
+)
 from eyvan.worker.runtime.log_records import (
     CURSOR_KIND_WORKLOAD_LOG,
     CURSOR_MODE_LIVE,
@@ -250,6 +256,21 @@ def _augment_error_detail(error: BaseException, detail: str) -> None:
         error.args = (*error.args, detail)
 
 
+def _reported_exit_status(detail: JsonObject) -> int | None:
+    """Return one host's reported process exit status, or ``None`` if unknown.
+
+    ``None`` covers three different things -- the host was not observed, the
+    unit is gone, the payload predates the field -- and all three mean the same
+    here: this rank offers no evidence either way, which is not the same as
+    evidence that it exited cleanly.
+    """
+
+    if detail.get("observed") is not True:
+        return None
+    status = detail.get("exec_main_status")
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
 class NativeGangExecutor:
     """Fan one fenced JAX workload across independently allocated Eyvan cells.
 
@@ -264,7 +285,10 @@ class NativeGangExecutor:
         members: tp.Sequence[NativeGangMember],
         *,
         clients: tp.Sequence[httpx.Client | None] | None = None,
+        initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
     ) -> None:
+        if not isinstance(initialization, GangInitializationPolicy):
+            raise TypeError("native gang initialization must be a GangInitializationPolicy")
         ordered_members = tuple(sorted(members, key=lambda member: member.cell_id))
         if len(ordered_members) < 2:
             raise ValueError("native gang execution requires at least two execution cells")
@@ -287,6 +311,7 @@ class NativeGangExecutor:
 
         self.members = ordered_members
         self.endpoints = endpoints
+        self.initialization = initialization
         self._coordinator_address = f"{coordinator.hostname}:{_COORDINATOR_PORT}"
         supplied_clients = clients or (None,) * len(flattened)
         self._workers = tuple(
@@ -341,6 +366,12 @@ class NativeGangExecutor:
                 "PYTHONPATH": f"{_MULTIHOST_SITE_PATH}:{python_path}" if python_path else _MULTIHOST_SITE_PATH,
             }
         )
+        # Last, and after the topology scrub above, so the deadline a cold gang
+        # gets is the one this control plane configured. A caller who submits
+        # its own copy has already had it stripped -- the whole ``EYVAN_JAX_``
+        # prefix is Eyvan's -- and could otherwise hand every rank a one-second
+        # barrier and blame the fleet.
+        environment.update(self.initialization.environment())
         payload["environment"] = environment
         return payload
 
@@ -411,10 +442,16 @@ class NativeGangExecutor:
                     observation=observation,
                 )
             )
+        status = _aggregate_status(workers)
+        message = _aggregate_message(workers)
+        if status is ExecutionWorkloadStatus.FAILED:
+            formation = self._gang_formation_failure(remote_id)
+            if formation is not None:
+                message = f"{formation} {message}"
         aggregate = ExecutionWorkloadObservation(
             remote_id=remote_id,
-            status=_aggregate_status(workers),
-            message=_aggregate_message(workers),
+            status=status,
+            message=message,
         )
         return {
             "remote_id": aggregate.remote_id,
@@ -422,6 +459,48 @@ class NativeGangExecutor:
             "message": aggregate.message,
             "workers": [worker.as_result() for worker in workers],
         }
+
+    def _gang_formation_failure(self, remote_id: str) -> str | None:
+        """Return the terminal reason when this gang never formed.
+
+        A failed gang and a failed workload are the same terminal state and used
+        to carry the same terminal message, while calling for opposite operator
+        actions: lengthen the deadline and resubmit, or go and read the user's
+        traceback. The difference is the exit status Eyvan's own initialization
+        hook gives a rank that never joined, which each host keeps in its
+        durable execution record -- so this is re-derived on every poll from
+        remote state and reads identically after a controller restart.
+
+        ``None`` means no rank offered that evidence. It is deliberately not
+        "the gang formed": an unreachable host, a host whose unit has already
+        been reaped, and an ordinary user-code failure all land here, and
+        turning any of them into a settled verdict is how a fleet learns to
+        distrust its own diagnostics.
+        """
+
+        if not self.initialization.fatal:
+            # Nothing can carry the evidence: without the fatal hook a rank that
+            # never joined is left to run on, and its exit status is user code's.
+            return None
+        deadline_ranks: list[int] = []
+        error_ranks: list[int] = []
+        for rank, worker in enumerate(self._workers):
+            try:
+                detail = worker.executor.process_status(remote_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                continue
+            outcome = gang_initialization_outcome(_reported_exit_status(detail))
+            if outcome == "deadline":
+                deadline_ranks.append(rank)
+            elif outcome == "error":
+                error_ranks.append(rank)
+        if not deadline_ranks and not error_ranks:
+            return None
+        return gang_formation_failure_reason(
+            deadline_s=self.initialization.initialization_timeout_s,
+            deadline_ranks=deadline_ranks,
+            error_ranks=error_ranks,
+        )
 
     def stop(self, remote_id: str) -> None:
         """Stop every gang rank using its original cell-scoped fence."""

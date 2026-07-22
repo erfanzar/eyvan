@@ -25,6 +25,12 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime._multihost_site import (
+    DEFAULT_GANG_INITIALIZATION,
+    GangInitializationPolicy,
+    gang_formation_failure_reason,
+    gang_initialization_outcome,
+)
 from eyvan.worker.runtime.log_records import (
     CURSOR_KIND_WORKLOAD_LOG,
     CURSOR_MODE_LIVE,
@@ -229,6 +235,21 @@ def _augment_error_detail(error: BaseException, detail: str) -> None:
         error.args = (*error.args, detail)
 
 
+def _reported_exit_status(detail: JsonObject) -> int | None:
+    """Return one host's reported process exit status, or ``None`` if unknown.
+
+    ``None`` covers three different things -- the host was not observed, the
+    unit is gone, the payload predates the field -- and all three mean the same
+    here: this rank offers no evidence either way, which is not the same as
+    evidence that it exited cleanly.
+    """
+
+    if detail.get("observed") is not True:
+        return None
+    status = detail.get("exec_main_status")
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
 class NativeSliceExecutor:
     """Fan one fenced workload out to every host in an atomic TPU slice group.
 
@@ -244,6 +265,7 @@ class NativeSliceExecutor:
         secret: str,
         clients: tp.Sequence[httpx.Client] | None = None,
         jax_cluster_detection: JaxClusterDetectionMode = JaxClusterDetectionMode.EXPLICIT,
+        initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
     ) -> None:
         normalized = tuple(endpoint.rstrip("/") for endpoint in endpoints)
         if not normalized or any(not endpoint or endpoint != endpoint.strip() for endpoint in normalized):
@@ -257,8 +279,11 @@ class NativeSliceExecutor:
             raise ValueError("native slice clients must match the number of worker endpoints")
         if not isinstance(jax_cluster_detection, JaxClusterDetectionMode):
             raise TypeError("native slice JAX cluster detection must be a JaxClusterDetectionMode")
+        if not isinstance(initialization, GangInitializationPolicy):
+            raise TypeError("native slice initialization must be a GangInitializationPolicy")
         self.endpoints = normalized
         self.jax_cluster_detection = jax_cluster_detection
+        self.initialization = initialization
         self._coordinator_address = f"{coordinator.hostname}:{_COORDINATOR_PORT}"
         self._workers = tuple(
             NativeRemoteExecutor(endpoint, secret=secret, client=client)
@@ -318,6 +343,12 @@ class NativeSliceExecutor:
                     "JAX_PROCESS_INDEX": str(rank),
                 }
             )
+        # Last, and after the topology scrub above, so the deadline a cold slice
+        # gets is the one this control plane configured. A caller who submits
+        # its own copy has already had it stripped -- the whole ``EYVAN_JAX_``
+        # prefix is Eyvan's -- and could otherwise hand every rank a one-second
+        # barrier and blame the fleet.
+        environment.update(self.initialization.environment())
         payload["environment"] = environment
         return payload
 
@@ -393,10 +424,16 @@ class NativeSliceExecutor:
                     observation=observation,
                 )
             )
+        status = _aggregate_status(workers)
+        message = _aggregate_message(workers)
+        if status is ExecutionWorkloadStatus.FAILED:
+            formation = self._gang_formation_failure(remote_id)
+            if formation is not None:
+                message = f"{formation} {message}"
         aggregate = ExecutionWorkloadObservation(
             remote_id=remote_id,
-            status=_aggregate_status(workers),
-            message=_aggregate_message(workers),
+            status=status,
+            message=message,
         )
         return {
             "remote_id": aggregate.remote_id,
@@ -404,6 +441,47 @@ class NativeSliceExecutor:
             "message": aggregate.message,
             "workers": [worker.as_result() for worker in workers],
         }
+
+    def _gang_formation_failure(self, remote_id: str) -> str | None:
+        """Return the terminal reason when this slice's gang never formed.
+
+        A slice is one cell, but its hosts join the same JAX registration
+        barrier a multi-cell gang does, so a cold start loses it the same way
+        and the operator needs the same distinction: lengthen the deadline and
+        resubmit, or go and read the user's traceback. The evidence is the exit
+        status Eyvan's own initialization hook gives a rank that never joined,
+        which each host keeps in its durable execution record -- so this is
+        re-derived on every poll from remote state and reads identically after a
+        controller restart.
+
+        ``None`` means no rank offered that evidence, which is deliberately not
+        "the gang formed": an unreachable host, a reaped unit, and an ordinary
+        user-code failure all land here.
+        """
+
+        if not self.initialization.fatal:
+            # Nothing can carry the evidence: without the fatal hook a rank that
+            # never joined is left to run on, and its exit status is user code's.
+            return None
+        deadline_ranks: list[int] = []
+        error_ranks: list[int] = []
+        for rank, worker in enumerate(self._workers):
+            try:
+                detail = worker.process_status(remote_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                continue
+            outcome = gang_initialization_outcome(_reported_exit_status(detail))
+            if outcome == "deadline":
+                deadline_ranks.append(rank)
+            elif outcome == "error":
+                error_ranks.append(rank)
+        if not deadline_ranks and not error_ranks:
+            return None
+        return gang_formation_failure_reason(
+            deadline_s=self.initialization.initialization_timeout_s,
+            deadline_ranks=deadline_ranks,
+            error_ranks=error_ranks,
+        )
 
     def stop(self, remote_id: str, context: MutationContext) -> None:
         """Stop the workload on every host, preserving the first failure."""
