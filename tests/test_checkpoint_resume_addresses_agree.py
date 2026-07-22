@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import pytest
 
+from eyvan.worker.runtime._multihost_site import DEFAULT_GANG_INITIALIZATION
 from eyvan.worker.runtime.native_slice import _RESUME_CHECKPOINT_ENV
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
@@ -50,6 +51,7 @@ def test_a_rank_resumes_from_the_address_its_hook_wrote(rank: int) -> None:
     executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
     executor._workers = (None,) * 4  # type: ignore[attr-defined]
     executor.jax_cluster_detection = _detection()  # type: ignore[attr-defined]
+    executor.initialization = DEFAULT_GANG_INITIALIZATION  # type: ignore[attr-defined]
     spec = {"entrypoint": "python train.py", "environment": {_RESUME_CHECKPOINT_ENV: BASE}}
 
     resume = _resume_env(executor, spec, rank)[_RESUME_CHECKPOINT_ENV]
@@ -72,6 +74,7 @@ def test_two_ranks_never_resume_from_the_same_object() -> None:
     executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
     executor._workers = (None,) * 2  # type: ignore[attr-defined]
     executor.jax_cluster_detection = _detection()  # type: ignore[attr-defined]
+    executor.initialization = DEFAULT_GANG_INITIALIZATION  # type: ignore[attr-defined]
     spec = {"entrypoint": "python train.py", "environment": {_RESUME_CHECKPOINT_ENV: BASE}}
 
     first = _resume_env(executor, spec, 0)[_RESUME_CHECKPOINT_ENV]
@@ -92,6 +95,7 @@ def test_a_first_attempt_is_given_no_resume_address() -> None:
     executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
     executor._workers = (None,) * 2  # type: ignore[attr-defined]
     executor.jax_cluster_detection = _detection()  # type: ignore[attr-defined]
+    executor.initialization = DEFAULT_GANG_INITIALIZATION  # type: ignore[attr-defined]
     spec = {"entrypoint": "python train.py", "environment": {_RESUME_CHECKPOINT_ENV: ""}}
 
     assert _resume_env(executor, spec, 0)[_RESUME_CHECKPOINT_ENV] == ""
@@ -105,6 +109,7 @@ def test_a_workload_with_no_resume_variable_is_left_alone() -> None:
     executor = NativeSliceExecutor.__new__(NativeSliceExecutor)
     executor._workers = (None,) * 2  # type: ignore[attr-defined]
     executor.jax_cluster_detection = _detection()  # type: ignore[attr-defined]
+    executor.initialization = DEFAULT_GANG_INITIALIZATION  # type: ignore[attr-defined]
     spec = {"entrypoint": "python train.py", "environment": {}}
 
     assert _RESUME_CHECKPOINT_ENV not in _resume_env(executor, spec, 0)

@@ -17,6 +17,7 @@ from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
 from eyvan.capacity.stage_policy import CellStagePolicy, StageEvictionPolicy
 from eyvan.identity.mtls import MutualTlsFiles, MutualTlsMode, parse_mutual_tls_mode
+from eyvan.worker.runtime._multihost_site import GangInitializationPolicy
 
 DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
 """Where a loopback control plane keeps its durable document by default."""
@@ -253,6 +254,32 @@ class EyvanSettings:
     #: commits. Long enough for a capability minted just before the rotation to
     #: still be redeemed by a cell that is mid-bootstrap, and no longer.
     credential_rotation_overlap_s: float = 300.0
+    #: How long a multi-host rank waits at the JAX registration barrier for its
+    #: peers. JAX's own default is 300s, which a cold gang restart after a
+    #: preemption routinely exceeds while a subset of hosts is still syncing an
+    #: environment or reading from GCS -- and the hosts that *did* arrive abort
+    #: the whole gang. Iris raised this to 1800 after losing v5p-64 gangs to it.
+    #:
+    #: The default here is the value this package has always applied on the host
+    #: (``_multihost_site.DEFAULT_INITIALIZATION_TIMEOUT_S``), so configuring
+    #: nothing changes nothing; what is new is that an operator can raise it
+    #: without rebuilding a wheel, and that a submitter cannot lower it.
+    gang_init_deadline_s: int = 600
+    #: How long a joined rank may go without heartbeating before the
+    #: coordination service declares it dead. Also today's shipped value: an
+    #: eSurge job on a two-host v5p-16 was killed by JAX's 100s default while
+    #: one host was still loading a 0.6B model.
+    gang_heartbeat_timeout_s: int = 900
+    #: Whether a rank that never joined the gang ends its own workload.
+    #:
+    #: Off is today's behaviour, and today's behaviour is not safe: the
+    #: initialization hook runs from ``sitecustomize``, and ``site.py`` catches
+    #: every ordinary exception raised there, prints one line and lets the
+    #: interpreter carry on -- so a gang that never formed currently runs on as
+    #: an unwitting single-process job and can exit 0. On, that rank exits with
+    #: an Eyvan-reserved status, and the executors report the distinct terminal
+    #: reason "the gang never formed" instead of an ordinary workload failure.
+    gang_init_fatal: bool = False
 
     def mutual_tls_files(self) -> MutualTlsFiles:
         """Return this process's mutual-TLS paths, never its key material."""
@@ -337,6 +364,28 @@ class EyvanSettings:
             max_stage_bytes=self.cell_stage_max_bytes,
             eviction=StageEvictionPolicy(self.cell_stage_eviction_policy),
             max_attempts=self.cell_stage_max_attempts,
+        )
+
+    def gang_initialization_policy(self) -> GangInitializationPolicy:
+        """Return the coordination deadlines Eyvan injects into every gang rank.
+
+        A method rather than a field so the policy is built from settings that
+        have already been read together, and so its own validation -- a
+        non-positive deadline means "abort every gang immediately" -- runs where
+        the executor asks for it rather than in a constructor that a host-side
+        process would also pay for.
+
+        Returns:
+            The validated policy the slice and gang executors inject.
+
+        Raises:
+            ValueError: If either deadline is not a positive number of seconds.
+        """
+
+        return GangInitializationPolicy(
+            initialization_timeout_s=self.gang_init_deadline_s,
+            heartbeat_timeout_s=self.gang_heartbeat_timeout_s,
+            fatal=self.gang_init_fatal,
         )
 
     @classmethod
@@ -489,4 +538,7 @@ class EyvanSettings:
             credential_rotation_overlap_s=float(
                 os.getenv("EYVAN_CREDENTIAL_ROTATION_OVERLAP_S", defaults.credential_rotation_overlap_s)
             ),
+            gang_init_deadline_s=int(os.getenv("EYVAN_GANG_INIT_DEADLINE_S", defaults.gang_init_deadline_s)),
+            gang_heartbeat_timeout_s=int(os.getenv("EYVAN_GANG_HEARTBEAT_TIMEOUT_S", defaults.gang_heartbeat_timeout_s)),
+            gang_init_fatal=truthy("EYVAN_GANG_INIT_FATAL", defaults.gang_init_fatal),
         )

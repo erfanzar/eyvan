@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import typing as tp
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -303,3 +304,303 @@ def test_a_second_call_in_the_same_process_is_a_no_op(monkeypatch) -> None:
     initialize_from_environment()
 
     assert len(distributed.initialize_calls) == 1
+
+
+class _Clock:
+    """A monotonic clock the barrier below advances by the time it makes a rank wait."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _GangBarrier:
+    """A registration barrier with the one property that loses cold gangs.
+
+    JAX's ``RegisterTask`` makes every already-registered task wait for the
+    slowest peer and aborts *all* of them when the deadline passes first. So
+    whether a gang forms is decided by one comparison: the deadline the ranks
+    were given against the arrival of the last host. That deadline is the number
+    Eyvan now owns, which is why it is the only thing this fake models.
+    """
+
+    def __init__(self, clock: _Clock, *, last_arrival_s: float | None) -> None:
+        self._clock = clock
+        self._last_arrival_s = last_arrival_s
+        self.initialize_calls: list[dict[str, object]] = []
+
+    @staticmethod
+    def is_initialized() -> bool:
+        return False
+
+    def initialize(self, **arguments: object) -> None:
+        self.initialize_calls.append(arguments)
+        deadline = arguments["initialization_timeout"]
+        assert isinstance(deadline, int)
+        arrival = self._last_arrival_s
+        if arrival is None or arrival > deadline:
+            self._clock.advance(deadline)
+            raise RuntimeError("DEADLINE_EXCEEDED: RegisterTask timed out waiting for tasks to register")
+        self._clock.advance(arrival)
+
+
+class _RankTerminated(Exception):
+    """Stands in for the rank's process exit so a test can survive it."""
+
+    def __init__(self, exit_status: int) -> None:
+        super().__init__(f"rank exited with status {exit_status}")
+        self.exit_status = exit_status
+
+
+def _multihost_rank(monkeypatch: pytest.MonkeyPatch, barrier: _GangBarrier, clock: _Clock) -> list[int]:
+    """Wire one rank onto a barrier and return where its exit status lands."""
+
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=barrier))
+    monkeypatch.setattr(_multihost_site, "time", SimpleNamespace(monotonic=clock.monotonic))
+    exits: list[int] = []
+
+    def terminate(exit_status: int) -> tp.NoReturn:
+        exits.append(exit_status)
+        raise _RankTerminated(exit_status)
+
+    monkeypatch.setattr(_multihost_site, "terminate_rank", terminate)
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    return exits
+
+
+def _apply(monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]) -> None:
+    """Set exactly the coordination environment an executor would inject."""
+
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+
+def _marker(captured: str, marker: str) -> str:
+    """Return the single marker line a rank wrote, failing if it wrote none."""
+
+    lines = [line for line in captured.splitlines() if line.startswith(marker)]
+    assert len(lines) == 1, f"expected exactly one {marker!r} line in {captured!r}"
+    return lines[0]
+
+
+def test_a_late_rank_does_not_abort_a_forming_gang(monkeypatch, capsys) -> None:
+    """The failure this workstream exists for, reduced to its one comparison.
+
+    A host that is 450 seconds late is ordinary on a cold gang restart after a
+    preemption: environment sync, imports, a GCS read. Under JAX's 300-second
+    default the ranks that *did* arrive abort, and the gang -- every host, every
+    accelerator -- is lost to nothing but start-up variance. Under the deadline
+    Eyvan injects, the same gang forms.
+    """
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=450.0)
+    _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy().environment())
+
+    _multihost_site.initialize_from_environment()
+
+    assert barrier.initialize_calls[0]["initialization_timeout"] == 600
+    joined = _marker(capsys.readouterr().err, _multihost_site.GANG_INITIALIZATION_JOINED_MARKER)
+    assert "waited_s=450.0" in joined
+
+
+def test_the_same_late_rank_loses_the_gang_under_jaxs_default(monkeypatch, capsys) -> None:
+    """The contrast that makes the deadline load-bearing rather than decorative."""
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=450.0)
+    _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(initialization_timeout_s=300).environment())
+
+    with pytest.raises(RuntimeError, match="DEADLINE_EXCEEDED"):
+        _multihost_site.initialize_from_environment()
+
+    failed = _marker(capsys.readouterr().err, _multihost_site.GANG_INITIALIZATION_FAILED_MARKER)
+    assert "waited_s=300.0" in failed
+    assert "outcome=deadline" in failed
+
+
+def test_a_stuck_initialization_ends_at_the_deadline_with_a_distinct_status(monkeypatch, capsys) -> None:
+    """A peer that never arrives must end the rank, not be swallowed.
+
+    ``site.py`` catches every ``Exception`` raised from ``sitecustomize``,
+    prints one line and lets the interpreter continue -- so without this a rank
+    whose gang never formed runs the workload as an unwitting single process and
+    can exit 0. The exit status is what makes "the gang never formed"
+    recoverable from the host afterwards.
+    """
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=None)
+    exits = _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(fatal=True).environment())
+
+    with pytest.raises(_RankTerminated):
+        _multihost_site.initialize_from_environment()
+
+    assert exits == [_multihost_site.GANG_INITIALIZATION_DEADLINE_EXIT_CODE]
+    failed = _marker(capsys.readouterr().err, _multihost_site.GANG_INITIALIZATION_FAILED_MARKER)
+    assert "waited_s=600.0" in failed
+    assert "deadline_s=600" in failed
+    assert "outcome=deadline" in failed
+
+
+def test_a_join_that_fails_early_is_not_reported_as_a_deadline(monkeypatch, capsys) -> None:
+    """A refused connection is not a slow gang, and says so.
+
+    Both are "the gang never formed", but they call for opposite actions --
+    lengthen the window, or go and fix this host -- so they carry different exit
+    statuses. Calling a two-second failure a deadline would send an operator to
+    raise a timeout that was never reached.
+    """
+
+    clock = _Clock()
+
+    class _RefusedBarrier(_GangBarrier):
+        def initialize(self, **arguments: object) -> None:
+            self.initialize_calls.append(arguments)
+            self._clock.advance(2.0)
+            raise RuntimeError("UNAVAILABLE: failed to connect to the coordination service")
+
+    barrier = _RefusedBarrier(clock, last_arrival_s=None)
+    exits = _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(fatal=True).environment())
+
+    with pytest.raises(_RankTerminated):
+        _multihost_site.initialize_from_environment()
+
+    assert exits == [_multihost_site.GANG_INITIALIZATION_ERROR_EXIT_CODE]
+    failed = _marker(capsys.readouterr().err, _multihost_site.GANG_INITIALIZATION_FAILED_MARKER)
+    assert "outcome=error" in failed
+    assert "waited_s=2.0" in failed
+
+
+def test_without_the_fatal_flag_a_failed_join_keeps_todays_behaviour(monkeypatch, capsys) -> None:
+    """Default off, per the rolling-upgrade rule -- and it is not a safe default.
+
+    The error propagates exactly as it always has, which means ``site.py``
+    swallows it and the workload runs on. The marker line is still written, so
+    the failure is at least visible in the rank's log before it is ignored.
+    """
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=None)
+    exits = _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy().environment())
+
+    with pytest.raises(RuntimeError, match="DEADLINE_EXCEEDED"):
+        _multihost_site.initialize_from_environment()
+
+    assert exits == []
+    assert _multihost_site.GANG_INITIALIZATION_FAILED_MARKER in capsys.readouterr().err
+
+
+def test_a_single_host_job_reads_no_gang_deadline_at_all(monkeypatch, capsys) -> None:
+    """One host has no gang to form, so none of this may apply to it.
+
+    Asserted with values that would fail loudly if they were read: a deadline
+    that is not a number, and a barrier that aborts every gang it is given.
+    """
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=None)
+    exits = _multihost_rank(monkeypatch, barrier, clock)
+    monkeypatch.delenv("EYVAN_JAX_MULTIHOST", raising=False)
+    monkeypatch.setenv(_multihost_site.INITIALIZATION_TIMEOUT_ENV, "not-a-number")
+    monkeypatch.setenv(_multihost_site.FATAL_INITIALIZATION_ENV, "not-a-boolean")
+
+    _multihost_site.initialize_from_environment()
+
+    assert barrier.initialize_calls == []
+    assert exits == []
+    assert capsys.readouterr().err == ""
+
+
+def test_a_nonsense_fatality_flag_is_refused_rather_than_read_as_off(monkeypatch) -> None:
+    """Reading it as off would silently restore the behaviour it disables."""
+
+    clock = _Clock()
+    barrier = _GangBarrier(clock, last_arrival_s=1.0)
+    _multihost_rank(monkeypatch, barrier, clock)
+    monkeypatch.setenv(_multihost_site.FATAL_INITIALIZATION_ENV, "yes-please")
+
+    with pytest.raises(RuntimeError, match=_multihost_site.FATAL_INITIALIZATION_ENV):
+        _multihost_site.initialize_from_environment()
+
+
+def test_a_policy_cannot_be_built_with_a_deadline_that_aborts_every_gang() -> None:
+    """Zero or negative means "abort immediately", which is never what was meant."""
+
+    with pytest.raises(ValueError, match="positive"):
+        _multihost_site.GangInitializationPolicy(initialization_timeout_s=0)
+    with pytest.raises(ValueError, match="positive"):
+        _multihost_site.GangInitializationPolicy(heartbeat_timeout_s=-1)
+
+
+def test_the_shipped_default_is_the_value_this_module_has_always_applied() -> None:
+    """Configuring nothing must change nothing for a fleet that is running now."""
+
+    policy = _multihost_site.GangInitializationPolicy()
+
+    assert policy.environment() == {
+        _multihost_site.INITIALIZATION_TIMEOUT_ENV: str(_multihost_site.DEFAULT_INITIALIZATION_TIMEOUT_S),
+        _multihost_site.HEARTBEAT_TIMEOUT_ENV: str(_multihost_site.DEFAULT_HEARTBEAT_TIMEOUT_S),
+        _multihost_site.FATAL_INITIALIZATION_ENV: "0",
+    }
+
+
+def test_the_staged_copy_builds_a_policy_without_being_registered_as_a_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged file is exec'd on a host that has no ``eyvan`` package at all.
+
+    Anything in it that resolves its own annotations through ``sys.modules`` --
+    ``dataclass`` does -- fails at interpreter start, inside ``sitecustomize``,
+    in every workload process, before a line of user code runs.
+    """
+
+    spec = spec_from_file_location("eyvan_multihost", Path(_multihost_site.__file__))
+    assert spec is not None and spec.loader is not None
+    staged = module_from_spec(spec)
+    monkeypatch.delitem(sys.modules, "eyvan_multihost", raising=False)
+    spec.loader.exec_module(staged)
+
+    assert staged.GangInitializationPolicy(initialization_timeout_s=1800, fatal=True).environment() == {
+        "EYVAN_JAX_INIT_TIMEOUT_S": "1800",
+        "EYVAN_JAX_HEARTBEAT_TIMEOUT_S": str(_multihost_site.DEFAULT_HEARTBEAT_TIMEOUT_S),
+        "EYVAN_JAX_INIT_FATAL": "1",
+    }
+
+
+def test_an_interrupted_rank_is_not_recorded_as_a_gang_that_never_formed(monkeypatch, capsys) -> None:
+    """Somebody stopped this workload; nothing was wrong with the gang.
+
+    Labelling it a failed join would send an operator to lengthen a deadline
+    that was never reached, and would spend an exit status that means something
+    else.
+    """
+
+    clock = _Clock()
+
+    class _InterruptedBarrier(_GangBarrier):
+        def initialize(self, **arguments: object) -> None:
+            self.initialize_calls.append(arguments)
+            self._clock.advance(30.0)
+            raise KeyboardInterrupt
+
+    barrier = _InterruptedBarrier(clock, last_arrival_s=None)
+    exits = _multihost_rank(monkeypatch, barrier, clock)
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(fatal=True).environment())
+
+    with pytest.raises(KeyboardInterrupt):
+        _multihost_site.initialize_from_environment()
+
+    assert exits == []
+    assert _multihost_site.GANG_INITIALIZATION_FAILED_MARKER not in capsys.readouterr().err

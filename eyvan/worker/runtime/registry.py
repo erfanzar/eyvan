@@ -24,6 +24,7 @@ from eyvan.capacity.drivers.base import (
     UnsupportedCapabilityError,
     canonical_execution_backend,
 )
+from eyvan.worker.runtime._multihost_site import DEFAULT_GANG_INITIALIZATION, GangInitializationPolicy
 from eyvan.worker.runtime.log_records import LogPage
 
 ExecutorFactory = tp.Callable[..., ExecutionDriver]
@@ -293,9 +294,12 @@ class ExecutionDriverResolver:
         state_dir: str | os.PathLike[str] | None = None,
         native_worker_port: int = 8100,
         native_worker_token: str | None = None,
+        gang_initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
     ) -> None:
         if native_worker_port <= 0 or native_worker_port > 65535:
             raise ValueError("native worker port must be between 1 and 65535")
+        if not isinstance(gang_initialization, GangInitializationPolicy):
+            raise TypeError("gang initialization must be a GangInitializationPolicy")
         self.backend = _normalize_name(backend)
         if self.backend == "eyvan-native" and (
             not isinstance(native_worker_token, str) or not native_worker_token.strip()
@@ -308,6 +312,7 @@ class ExecutionDriverResolver:
         self.state_dir = Path(state_dir).expanduser() if state_dir is not None else None
         self.native_worker_port = native_worker_port
         self.native_worker_token = native_worker_token
+        self.gang_initialization = gang_initialization
         self._drivers: dict[tuple[str, ...], ExecutionDriver] = {}
         self._lock = RLock()
 
@@ -387,6 +392,7 @@ class ExecutionDriverResolver:
                         jax_cluster_detection=(
                             JaxClusterDetectionMode.GCE_TPU if gce_tpu_cluster else JaxClusterDetectionMode.EXPLICIT
                         ),
+                        initialization=self.gang_initialization,
                     )
                 else:
                     driver = self.registry.create(self.backend, endpoint=endpoint, state_dir=state_dir, token=token)
@@ -435,7 +441,7 @@ class ExecutionDriverResolver:
                     context=cell.context,
                 )
             )
-        return NativeGangExecutor(members)
+        return NativeGangExecutor(members, initialization=self.gang_initialization)
 
     def _native_worker_token(self, observation: CellObservation) -> str:
         """Derive the per-cell worker token from the agent's shared secret."""
