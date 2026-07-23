@@ -144,6 +144,7 @@ def test_registry_exposes_every_backend_including_manual() -> None:
         "kubernetes",
         "local",
         "manual",
+        "onprem-ssh",
     )
 
 

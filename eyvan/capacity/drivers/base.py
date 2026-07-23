@@ -347,3 +347,46 @@ class ExecutionDriverResolver(tp.Protocol):
     """Resolve the configured execution backend for a particular cell."""
 
     def resolve(self, cell_id: str, observation: CellObservation) -> ExecutionDriver: ...
+
+
+class CapacityProviderPlugin(tp.Protocol):
+    """The object an out-of-tree capacity provider publishes at its entry point.
+
+    This is the whole ABI surface an external distribution has to satisfy. It is
+    deliberately three members and no base class: a provider must be able to
+    declare which ABI it was built against **without importing Eyvan**, because
+    the version check exists precisely for the case where importing this Eyvan
+    would fail or would mean something different than the provider expects. A
+    module object satisfies this protocol, so the smallest legal plugin is a
+    module with two module-level constants and one function.
+
+    Attributes:
+        abi_version: The published ABI this provider was written against, as
+            ``"MAJOR.MINOR"``. A plain string rather than a shared type for the
+            reason above. Mismatches are refused by
+            :mod:`eyvan.capacity.drivers.registry`, never adapted.
+        backend_names: The ``capacity_backend`` names this plugin serves, in the
+            same normalized form the registry uses. Plural because one factory
+            legitimately serves several modes, exactly as ``gcp``, ``gcp-tpu``
+            and ``gcp-compute`` share one in-tree factory.
+    """
+
+    abi_version: str
+    backend_names: tp.Sequence[str]
+
+    def create(self, name: str, *, state: tp.Any, settings: tp.Any) -> CapacityDriver:
+        """Build the driver for one of ``backend_names``.
+
+        Args:
+            name: The normalized backend name being created, so one plugin can
+                serve several modes.
+            state: The durable, fenced :class:`~eyvan.capacity.fleet_state.FleetStateStore`
+                this agent owns. Typed as ``Any`` here only to keep this module
+                import-free of the store it describes; the passed object is
+                always a ``FleetStateStore``.
+            settings: The agent's :class:`~eyvan.config.EyvanSettings`.
+
+        Returns:
+            A driver satisfying :class:`CapacityDriver`.
+        """
+        ...
