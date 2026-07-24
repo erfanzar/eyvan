@@ -599,6 +599,20 @@ class FleetStateStore:
                 raise FleetStateSchemaError(f"fleet cell {name!r} must be an object")
             record = FleetCellRecord.from_dict(value) if value is not None else None
             if record is not None:
+                # The tombstone check above is not enough on its own: a cell that
+                # has never been drained or released has no tombstone, and
+                # ``_validate_fence`` returns immediately when there is none. A
+                # superseded controller could therefore drain a live cell a newer
+                # incarnation owns -- taking healthy capacity out of service with
+                # every other mutation on that cell correctly refused. Draining is
+                # a mutation like any other, so it is fenced like one.
+                self._validate_fence(
+                    name,
+                    generation,
+                    fencing_token,
+                    {"generation": record.generation, "fencing_token": record.fencing_token},
+                    action="drained",
+                )
                 mutate(record)
                 cells[name] = record.to_dict()
             tombstones[name] = {
@@ -610,6 +624,7 @@ class FleetStateStore:
 
         self.backend.update(update)
         return result.get("record")
+
 
     def tombstone_record(
         self,

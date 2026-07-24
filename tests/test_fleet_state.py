@@ -663,3 +663,64 @@ def _empty_for_test() -> dict:
         "workload_fences": {},
         "lease": None,
     }
+
+
+def test_a_superseded_controller_cannot_drain_a_cell_it_no_longer_owns(tmp_path) -> None:
+    """Draining is a mutation, and a stale one must be refused like any other.
+
+    The tombstone check alone was not enough: a cell that has never been drained
+    or released has no tombstone, and the fence validator returns immediately
+    when there is none. A superseded controller could therefore take healthy
+    capacity out of service while every other mutation on that cell was
+    correctly refused.
+    """
+
+    owner = store(tmp_path / "fleet.json", "agent-a")
+
+    def claim(record: FleetCellRecord) -> None:
+        record.generation = 7
+        record.fencing_token = "token-7"
+
+    owner.mutate_or_create_record("cell-a", claim)
+
+    with pytest.raises(StaleFenceError, match="older than drained cell"):
+        owner.drain_record("cell-a", 6, "token-6", lambda record: None)
+
+    with pytest.raises(StaleFenceError, match="does not own drained cell"):
+        owner.drain_record("cell-a", 7, "token-other", lambda record: None)
+
+
+def test_the_owning_controller_still_drains(tmp_path) -> None:
+    """The fence must refuse the stale writer without refusing the real one."""
+
+    owner = store(tmp_path / "fleet.json", "agent-a")
+
+    def claim(record: FleetCellRecord) -> None:
+        record.generation = 7
+        record.fencing_token = "token-7"
+
+    owner.mutate_or_create_record("cell-a", claim)
+
+    def mutate(record: FleetCellRecord) -> None:
+        record.desired_state = "down"
+        record.state = CapacityStatus.DRAINING
+
+    drained = owner.drain_record("cell-a", 7, "token-7", mutate)
+
+    assert drained is not None
+    assert drained.desired_state == "down"
+    assert drained.state is CapacityStatus.DRAINING
+
+
+def test_a_newer_incarnation_may_drain_an_older_one(tmp_path) -> None:
+    """A recreate legitimately supersedes; only a *stale* writer is refused."""
+
+    owner = store(tmp_path / "fleet.json", "agent-a")
+
+    def claim(record: FleetCellRecord) -> None:
+        record.generation = 7
+        record.fencing_token = "token-7"
+
+    owner.mutate_or_create_record("cell-a", claim)
+
+    assert owner.drain_record("cell-a", 8, "token-8", lambda record: None) is not None
