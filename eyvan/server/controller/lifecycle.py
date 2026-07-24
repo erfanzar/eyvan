@@ -43,6 +43,7 @@ from eyvan.worker.agent.client import (
 from eyvan.worker.agent.models import (
     MutationModel,
 )
+from eyvan.worker.runtime.node_health import HostReplacementBudget
 
 
 class _ControllerLifecycle:
@@ -71,6 +72,10 @@ class _ControllerLifecycle:
         #: agent. Without it nothing is staged and every stage reads as unknown,
         #: which is the honest description of a plane that cannot reach a disk.
         stage_executor: CellStageExecutor | None = None,
+        #: How many hosts one pool may replace for node health in one window.
+        #: Defaults to the environment, which defaults to zero -- promotion off,
+        #: a failed attempt behaves exactly as it did before node health existed.
+        host_replacement_budget: HostReplacementBudget | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -94,6 +99,7 @@ class _ControllerLifecycle:
         self.workload_capability = workload_capability
         self.secret_capability = secret_capability
         self._stage_executor = stage_executor
+        self._host_replacement_budget = host_replacement_budget or HostReplacementBudget.from_env()
         self._capacity_lifecycle = CapacityLifecycleLogger(logger)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:

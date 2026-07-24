@@ -51,6 +51,7 @@ from eyvan.server.controller._support import (
     _provider_phase_start,
     logger,
 )
+from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import ConflictError, LogCursorRejectedError, NotFoundError
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
@@ -89,6 +90,19 @@ from eyvan.worker.runtime.log_records import (
 from eyvan.worker.runtime.log_records import (
     join_log_cursor as _join_log_cursor,
 )
+from eyvan.worker.runtime.node_health import (
+    HOST_FAULT_AUDIT_ENTITY,
+    HOST_FAULT_HOST_QUARANTINED,
+    HOST_FAULT_REASON,
+    HOST_FAULT_REPLACEMENT_DECLINED,
+    HostFault,
+    HostReplacementBudget,
+    format_host_fault_marker,
+    host_faults_by_rank,
+    host_replacement_scope,
+    match_host_fault,
+    parse_host_fault_marker,
+)
 
 #: How many contiguous ranks a pre-manifest archive read probes. New archives
 #: carry their exact rank set and do not use this compatibility ceiling.
@@ -103,6 +117,13 @@ _ARCHIVE_STATUS_UNREACHED = frozenset({"unreachable", "failed"})
 
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+
+#: Newest node-health audit events one replacement-budget decision reads. Small
+#: on purpose: the entity type carries nothing but these decisions, so a fleet
+#: that fills it has a systemic outage rather than ordinary traffic -- and the
+#: caller refuses to replace anything when the scan does fill, because a spend it
+#: could not establish is not a budget it may spend.
+_HOST_FAULT_EVENT_SCAN_LIMIT = 512
 
 #: What a page says about the rank identity it is serving.
 _TOPOLOGY_FROZEN = "frozen"
@@ -568,6 +589,13 @@ class _ControllerObservation:
         elif status in {ExecutionWorkloadStatus.FAILED, ExecutionWorkloadStatus.STOPPED}:
             if status is ExecutionWorkloadStatus.FAILED:
                 await self._stop_terminal_workload_peers(workload, lease, cell, status)
+                if not preemption_owned and await self._quarantine_faulted_host(workload, message):
+                    # The machine, not the workload, is what failed. Its cell is
+                    # now a definitive capacity loss, so the loss path in
+                    # ``observe_workloads_once`` requeues this attempt against
+                    # the capacity budget on the next pass -- rather than this
+                    # one spending a user-code retry to land on the same host.
+                    return
             if workload.state is WorkloadState.CANCELLING and not preemption_owned:
                 await self._release_terminal(workload, lease, WorkloadState.CANCELLED, "workload.cancelled")
             elif (
@@ -670,6 +698,238 @@ class _ControllerObservation:
                 status.value,
                 _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else exc,
             )
+
+    async def _quarantine_faulted_host(self, workload: WorkloadRecord, message: str | None) -> bool:
+        """Replace the host behind a failure that names an unrecoverable machine fault.
+
+        Eyvan's failure vocabulary describes attempts, not machines, so a TPU
+        that never initializes spends the workload's user-code retry budget and
+        then fails it -- while the dead host keeps its lease, keeps its cell
+        undeletable, and blocks ``eyvan down``. When the attempt's own output
+        carries one of :data:`HOST_FAULT_SIGNATURES`, the machine is what failed:
+        its cell is marked a definitive capacity loss so the existing loss path
+        recovers the workload against its *capacity* budget, and the pool
+        replaces the host instead of handing it back.
+
+        Attribution is the hard half and is deliberately strict. A gang's
+        observation is the concatenation of every rank's, so a fault is
+        attributed only through the rank that reported it and the frozen attempt
+        topology that says which cell owns that rank. An attempt with no frozen
+        topology, or a message with no per-rank structure, leaves the owning host
+        *unknown* -- and unknown is not "all of them". Quarantining a gang's
+        healthy peers because one rank's TPU died would destroy good accelerators
+        on exactly the evidence that names a single bad one.
+
+        Returns whether at least one cell was quarantined.
+        """
+
+        budget = self._host_replacement_budget
+        if not budget.enabled or not message:
+            return False
+        try:
+            members = await self._load_workload_members(workload)
+        except StaleOutboxCommand as exc:
+            logger.info("workload %s host-fault attribution became stale: %s", workload.id, exc)
+            return False
+        faults = await self._attribute_host_faults(workload, members, message)
+        quarantined = False
+        for cell_id, fault in sorted(faults.items()):
+            if await self._quarantine_faulted_cell(workload, cell_id, fault, budget):
+                quarantined = True
+        return quarantined
+
+    async def _attribute_host_faults(
+        self,
+        workload: WorkloadRecord,
+        members: tuple[tuple[LeaseRecord, CellRecord], ...],
+        message: str,
+    ) -> dict[str, HostFault]:
+        """Return the host fault each of this workload's cells is evidenced to have.
+
+        A single-cell workload owns every rank in its own observation, so the
+        whole diagnostic is that cell's. Anything wider has to name the rank, and
+        the rank has to resolve through the topology frozen at dispatch -- the
+        record that exists because recomputing a rank map from today's cells
+        silently renumbers hosts.
+        """
+
+        cell_ids = {cell.id for _lease, cell in members}
+        if len(members) == 1:
+            fault = match_host_fault(message)
+            return {} if fault is None else {members[0][1].id: fault}
+        faults_by_rank = host_faults_by_rank(message)
+        if not faults_by_rank:
+            return {}
+        async with self.repository.transaction() as transaction:
+            topology = await transaction.get_workload_topology(workload.id, workload.attempt)
+        if topology is None:
+            logger.warning(
+                "workload %s reported a host fault but attempt %s has no frozen rank space, so no host owns it",
+                workload.id,
+                workload.attempt,
+            )
+            return {}
+        attributed: dict[str, HostFault] = {}
+        for rank, fault in sorted(faults_by_rank.items()):
+            owner = topology.cell_for_rank(rank)
+            if owner is None or owner.cell_id not in cell_ids:
+                logger.warning(
+                    "workload %s reported a host fault at rank %s, which no leased cell of this attempt owns",
+                    workload.id,
+                    rank,
+                )
+                continue
+            attributed.setdefault(owner.cell_id, fault)
+        return attributed
+
+    async def _quarantine_faulted_cell(
+        self,
+        workload: WorkloadRecord,
+        cell_id: str,
+        fault: HostFault,
+        budget: HostReplacementBudget,
+    ) -> bool:
+        """Mark one cell as a lost host, inside its pool's replacement budget."""
+
+        now = utcnow()
+        transition: tuple[CellRecord, CellRecord] | None = None
+        refusal: tuple[CellRecord, str, str] | None = None
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_cell(cell_id)
+            if current is None:
+                return False
+            existing = parse_host_fault_marker(current.unavailable_reason, current.unavailable_detail)
+            if (
+                existing is not None
+                and existing.workload_id == workload.id
+                and existing.generation == workload.generation
+            ):
+                # Already promoted for this execution. Rewriting it would charge
+                # the pool's budget a second time for one broken machine.
+                return True
+            if current.state not in {CellState.REGISTERING, CellState.READY, CellState.UNAVAILABLE}:
+                # Draining, deleting, or gone: the cell is already leaving and the
+                # lifecycle that owns it does not need a second opinion.
+                return False
+            scope = host_replacement_scope(current.pool_id, current.provider, current.zone or current.region)
+            spent, complete = await self._host_replacements_spent(transaction, scope, now, budget)
+            if not complete:
+                refusal = (
+                    current,
+                    "unknown",
+                    f"more than {_HOST_FAULT_EVENT_SCAN_LIMIT} node-health events in the last "
+                    f"{budget.window_s:.0f}s, so this scope's spend could not be established",
+                )
+            elif spent >= budget.max_replacements:
+                refusal = (
+                    current,
+                    "exhausted",
+                    f"{scope} has already replaced {spent} host(s) in the last {budget.window_s:.0f}s, "
+                    f"which is its budget of {budget.max_replacements}",
+                )
+            else:
+                updated = current.model_copy(
+                    update={
+                        "state": CellState.UNAVAILABLE,
+                        "provider_phase": CapacityStatus.NEEDS_RECREATE,
+                        "provider_phase_started_at": _provider_phase_start(
+                            current,
+                            CapacityStatus.NEEDS_RECREATE,
+                            now,
+                        ),
+                        "unavailable_reason": HOST_FAULT_REASON,
+                        "unavailable_detail": format_host_fault_marker(
+                            fault,
+                            workload_id=workload.id,
+                            generation=workload.generation,
+                            observed_at=now,
+                        ),
+                        "availability": self._observe_capacity_belief(current, ProvisionOutcome.HOST_FAULT),
+                        "updated_at": now,
+                    }
+                )
+                await transaction.put_cell(updated)
+                transition = current, updated
+            await transaction.append_event(
+                AuditEvent(
+                    id=f"evt_{uuid.uuid4().hex}",
+                    actor=self._principal.subject,
+                    entity_type=HOST_FAULT_AUDIT_ENTITY,
+                    entity_id=cell_id,
+                    action=(HOST_FAULT_REPLACEMENT_DECLINED if refusal is not None else HOST_FAULT_HOST_QUARANTINED),
+                    previous_state=current.state.value,
+                    new_state=(current if refusal is not None else updated).state.value,
+                    payload={
+                        "code": fault.code.value,
+                        "diagnosis": fault.diagnosis,
+                        "evidence": fault.evidence,
+                        "workload_id": workload.id,
+                        "generation": workload.generation,
+                        "scope": scope,
+                        "budget": budget.max_replacements,
+                        "window_s": budget.window_s,
+                        "spent": spent,
+                        **({"declined": refusal[1], "detail": refusal[2]} if refusal is not None else {}),
+                    },
+                )
+            )
+        if refusal is not None:
+            stalled, _outcome, detail = refusal
+            # Reported, not retried. Replacing hosts one after another through a
+            # zone that is handing out broken machines costs a full provision and
+            # a destroy per attempt and never converges, so the budget stops and
+            # says so; the workload then follows its ordinary failure path.
+            logger.error(
+                "cell %s reported host fault %s (%s) and was not replaced: %s",
+                stalled.id,
+                fault.code.value,
+                fault.evidence,
+                detail,
+            )
+            return False
+        if transition is not None:
+            self._capacity_lifecycle.transition(
+                *transition,
+                reason=f"host fault {fault.code.value}: {fault.diagnosis}",
+            )
+        return True
+
+    @staticmethod
+    async def _host_replacements_spent(
+        transaction: RepositorySession,
+        scope: str,
+        now: datetime,
+        budget: HostReplacementBudget,
+    ) -> tuple[int, bool]:
+        """Return how many hosts one scope has replaced in the window, and whether that is known.
+
+        Counted from the audit ledger rather than from the surviving cell
+        records, because the records do not survive: an unpooled cell is
+        recreated *in place*, and ``recreate_cell`` clears
+        ``unavailable_reason`` -- so a count taken from cells would reset to zero
+        on the very replacement it is supposed to be bounding, and a zone full of
+        bad machines would loop forever one recreate at a time.
+
+        The second element is whether the window was seen whole. A scan that
+        fills its limit has not established anything, and an unestablished spend
+        is not an available budget: the caller refuses rather than assuming the
+        cheaper answer.
+
+        Single-writer by construction -- only the elected leader observes
+        workloads, and it does so one workload at a time -- so the read and the
+        append that follows it do not race another replacement decision.
+        """
+
+        events = await transaction.list_events(
+            entity_type=HOST_FAULT_AUDIT_ENTITY,
+            occurred_at_or_after=now - timedelta(seconds=budget.window_s),
+            newest_first=True,
+            limit=_HOST_FAULT_EVENT_SCAN_LIMIT,
+        )
+        spent = sum(
+            1 for event in events if event.action == HOST_FAULT_HOST_QUARANTINED and event.payload.get("scope") == scope
+        )
+        return spent, len(events) < _HOST_FAULT_EVENT_SCAN_LIMIT
 
     async def _escalate_unreadable_execution(
         self,
@@ -888,6 +1148,15 @@ class _ControllerObservation:
                     return None
                 if current.provider_phase is None:
                     return None
+            if current.unavailable_reason == HOST_FAULT_REASON:
+                # Quarantined for a matched host fault. The provider's opinion of
+                # this machine is not the evidence in question -- a queued
+                # resource stays ACTIVE while its accelerator refuses to
+                # initialize -- so letting an ordinary observation report it
+                # HEALTHY would clear the quarantine and hand the same broken
+                # host back to the scheduler. Only recreation, which replaces the
+                # machine and takes a new generation, returns it to service.
+                return None
             if current.availability.cooldown_until is not None and current.availability.cooldown_until > now:
                 return None
             if current.pool_id is not None:

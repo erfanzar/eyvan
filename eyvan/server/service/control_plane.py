@@ -186,6 +186,7 @@ from eyvan.server.service.subjobs import (
     parent_depth,
     validate_parent,
 )
+from eyvan.worker.runtime.node_health import HostFaultProof, parse_host_fault_marker
 
 
 def _new_id(prefix: str) -> str:
@@ -328,6 +329,26 @@ def _is_active_capacity_apply(command: OutboxRecord, cell: CellRecord) -> bool:
         and command.generation == cell.generation
         and command.state in _ACTIVE_CAPACITY_APPLY_STATES
     )
+
+
+def _host_fault_proof(cell: CellRecord, workload: WorkloadRecord) -> HostFaultProof | None:
+    """Return this execution's host-fault record on ``cell``, if it has one.
+
+    Narrow on purpose. The marker names the workload and the generation it was
+    observed for, and only that execution's own fault says anything about that
+    execution's process: a fault recorded for a previous tenant of the same cell
+    record is evidence about a machine that has since been replaced.
+
+    ``None`` means *no proof*, never *no fault* -- an older record, a truncated
+    detail, or a control plane that has never seen node health all land here, and
+    the caller answers all of them by giving the host up, which is what it did
+    before any of this existed.
+    """
+
+    proof = parse_host_fault_marker(cell.unavailable_reason, cell.unavailable_detail)
+    if proof is None or proof.workload_id != workload.id or proof.generation != workload.generation:
+        return None
+    return proof
 
 
 def _decimal_sum(*values: float) -> float:
@@ -2249,10 +2270,22 @@ class ControlPlaneService:
         victims and does not apply to an ordinary cancel.
 
         **This declares a process dead that nobody confirmed stopping.** That is
-        why the cell is drained rather than returned to service: the workload may
+        why a cell is drained rather than returned to service: the workload may
         still be running on it, and scheduling something else onto a host in that
         state would be worse than the deadlock. The capacity is given up, not
         recycled.
+
+        *Unless something did confirm it.* A cell that node health has quarantined
+        for this execution carries the host fault it matched, and those faults are
+        the ones where the accelerator runtime is dead -- so the process that
+        needed it is not still running. That cell is **reclaimed**: it is left on
+        the replacement path node health already put it on, rather than
+        additionally surrendered out of a caution the evidence has answered. Every
+        cell is judged on its own record, so a gang whose hosts disagree drains the
+        ones nobody could account for and reclaims the ones that are accounted
+        for. The audit entry names which happened to each cell and why -- an
+        operator reading "we gave up a v5p" is owed the difference between
+        "because we could not know" and "because we knew".
 
         Refused unless the stop has genuinely stopped making progress -- a live
         cancel in flight is not this, and a break-glass that also works on
@@ -2303,22 +2336,50 @@ class ControlPlaneService:
                         }
                     )
                 )
-            drained: set[str] = set()
+            held: set[str] = set()
             for lease in await tx.list_leases(workload_id=workload_id):
                 if lease.state not in ACTIVE_LEASE_STATES:
                     continue
                 await self._settle_lease(tx, principal, workload, lease, reason="force-finalized")
-                drained.add(lease.cell_id)
-            for cell_id in sorted(drained):
+                held.add(lease.cell_id)
+            drained: set[str] = set()
+            reclaimed: set[str] = set()
+            outcomes: list[JsonValue] = []
+            for cell_id in sorted(held):
                 cell = await tx.get_cell(cell_id)
                 if cell is None or cell.state in {CellState.DELETED, CellState.DELETING}:
                     continue
-                await tx.put_cell(cell.model_copy(update={"state": CellState.DRAINING, "updated_at": moment}))
+                proof = _host_fault_proof(cell, workload)
+                if proof is None:
+                    drained.add(cell_id)
+                    await tx.put_cell(cell.model_copy(update={"state": CellState.DRAINING, "updated_at": moment}))
+                    outcomes.append(
+                        {
+                            "cell_id": cell_id,
+                            "outcome": "drained",
+                            "reason": "nothing confirmed the process stopped, so the host is given up",
+                        }
+                    )
+                    continue
+                reclaimed.add(cell_id)
+                outcomes.append(
+                    {
+                        "cell_id": cell_id,
+                        "outcome": "reclaimed",
+                        "reason": f"{proof.diagnosis}, so the process that needed it is gone",
+                        "host_fault": proof.code.value,
+                        "evidence": proof.evidence,
+                    }
+                )
             settled = workload.model_copy(
                 update={
                     "state": WorkloadState.CANCELLED,
                     "dispatch_reservation": None,
-                    "failure_reason": f"force-finalized after an unconfirmed stop: {reason}",
+                    "failure_reason": (
+                        f"force-finalized after an unconfirmed stop: {reason}"
+                        if drained or not reclaimed
+                        else f"force-finalized after a host fault accounted for every cell it held: {reason}"
+                    ),
                     "updated_at": moment,
                 }
             )
@@ -2336,6 +2397,8 @@ class ControlPlaneService:
                     "reason": reason,
                     "discarded_commands": sorted(command.id for command in stuck),
                     "drained_cells": sorted(drained),
+                    "reclaimed_cells": sorted(reclaimed),
+                    "capacity_outcomes": outcomes,
                 },
             )
             return settled, False

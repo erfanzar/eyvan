@@ -108,6 +108,15 @@ class CapacityProviderFailureCode(StrEnum):
 #: "capacity pool not found" (a configuration mistake) was recorded as evidence
 #: that a zone had run out of accelerators, and every reason nobody had written
 #: a substring for became a stockout by default.
+#:
+#: ``ProvisionOutcome.HOST_FAULT`` is deliberately unreachable from this map and
+#: has no ``CapacityProviderFailureCode``. A host fault is observed from an
+#: *execution* -- an attempt's own output naming an accelerator that never came
+#: up -- and never from a provider API, which reports a machine it created
+#: successfully. Adding a provider code for it would put a value on the agent
+#: wire and in ``CellRecord.provider_failure_code`` that no provider raises, that
+#: a rolled-back replica could not decode, and that would make
+#: :func:`provision_outcome` claim a provider said something it did not.
 _PROVISION_OUTCOMES: dict[CapacityProviderFailureCode, ProvisionOutcome] = {
     CapacityProviderFailureCode.STOCKOUT: ProvisionOutcome.STOCKOUT,
     CapacityProviderFailureCode.QUOTA_EXCEEDED: ProvisionOutcome.QUOTA_ERROR,

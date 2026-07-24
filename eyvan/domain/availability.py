@@ -33,6 +33,26 @@ class ProvisionOutcome(StrEnum):
     QUOTA_ERROR = "quota_error"
     PROVIDER_ERROR = "provider_error"
     INTERRUPTED = "interrupted"
+    #: The pool delivered a machine and the machine was broken -- an accelerator
+    #: that never initialized, not a request the provider refused.
+    #:
+    #: Its own outcome rather than a PROVIDER_ERROR because the two say opposite
+    #: things about what to do next. A provider error is usually about the
+    #: request and clears in seconds; a bad host says something about the
+    #: physical pool that the next allocation from the same rack or image is
+    #: likely to repeat, and each repetition costs a full provision *and* a
+    #: destroy. So it is evidence against the zone, and it backs off hardest.
+    HOST_FAULT = "host_fault"
+
+
+#: First cooldown, in seconds, after one failing observation of each kind. The
+#: window doubles per consecutive failure and is capped by ``max_backoff_s``.
+#: Anything not named here backs off from 15s, which is the historical default
+#: for a provider error.
+_FAILURE_BACKOFF_BASE_S: dict[ProvisionOutcome, int] = {
+    ProvisionOutcome.STOCKOUT: 60,
+    ProvisionOutcome.HOST_FAULT: 300,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +136,12 @@ class CapacityBelief:
         else:
             failure += 1
             failures += 1
-            base = 60 if outcome is ProvisionOutcome.STOCKOUT else 15
+            # A stockout is answered by asking again later; a host fault is
+            # answered by provisioning a *replacement*, which costs a full
+            # allocation and a destroy before anything can be learned. Paying
+            # that every fifteen seconds against a zone handing out broken
+            # machines is the loop this backoff exists to stop.
+            base = _FAILURE_BACKOFF_BASE_S.get(outcome, 15)
             cooldown = now + timedelta(seconds=min(max_backoff_s, base * (2 ** (failures - 1))))
 
         return replace(
