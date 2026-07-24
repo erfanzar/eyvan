@@ -28,6 +28,8 @@ from eyvan.worker.agent.models import (
     AgentObservation,
     CapacityProviderFailure,
     CapacityRequest,
+    CellStageActionRequest,
+    CellStageActionResult,
     CheckpointRequest,
     ExecRequest,
     GangWorkloadMutationRequest,
@@ -201,6 +203,18 @@ def create_agent_app(
     )
     def release(cell_id: str, body: WorkloadMutationRequest) -> AgentObservation:
         return service.release(cell_id, body)
+
+    @app.post("/api/v1/cells/{cell_id}/stage-actions", dependencies=[Depends(authenticate)])
+    def stage_asset(cell_id: str, body: CellStageActionRequest) -> CellStageActionResult:
+        """Measure, materialize or remove one named asset on this cell's disk.
+
+        The one wire method managed staging adds, and the reason it is one: an
+        agent that predates it answers 404 for all three actions at once, so a
+        control plane learns "this agent has no staging executor" from a single
+        probe rather than inferring it three times.
+        """
+
+        return service.stage_asset(cell_id, body)
 
     @app.post("/api/v1/cells/{cell_id}/workloads", dependencies=[Depends(authenticate)])
     def submit(cell_id: str, body: WorkloadRequest) -> WorkloadObservation:

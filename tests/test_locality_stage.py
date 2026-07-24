@@ -39,6 +39,7 @@ import typing as tp
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from eyvan.capacity.stage_policy import CellStagePolicy, StageEvictionPolicy
@@ -80,6 +81,7 @@ from eyvan.server.service.stage import (
     plan_eviction,
     stage_headroom_bytes,
 )
+from eyvan.worker.agent.client import CellAgentClient
 
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 _DATASET = "gs://acme/datasets/pile-v3"
@@ -263,12 +265,33 @@ class _TransactionCountingRepository(InMemoryRepository):
             self.open_transactions -= 1
 
 
+def _agent_that_predates_staging() -> tp.Callable[[CellRecord], CellAgentClient]:
+    """Return an agent factory whose agent 404s the staging route.
+
+    Byte for byte what a control plane sees mid-rollout: the routes an older
+    agent serves answer normally, and the one it has never heard of does not
+    exist. Built from a mock transport rather than an old build so the test
+    keeps meaning this after that build is gone.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stage-actions"):
+            return httpx.Response(404, json={"detail": "Not Found"})
+        return httpx.Response(200, json={})
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+    return lambda _cell: client
+
+
 def _controller(
     repository: InMemoryRepository,
     executor: _Executor | None,
     *,
     policy: CellStagePolicy | None = None,
     eviction_enabled: bool = False,
+    agent_factory: tp.Callable[[CellRecord], CellAgentClient] | None = None,
 ) -> EyvanController:
     resolved = policy or _policy()
     settings = EyvanSettings(
@@ -280,7 +303,13 @@ def _controller(
         cell_stage_max_attempts=resolved.max_attempts,
     )
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
-    return EyvanController(repository, service, settings=settings, stage_executor=executor)
+    return EyvanController(
+        repository,
+        service,
+        settings=settings,
+        stage_executor=executor,
+        agent_factory=agent_factory or _agent_that_predates_staging(),
+    )
 
 
 async def _seed(
@@ -810,8 +839,19 @@ async def test_a_cell_that_is_not_ready_is_never_staged() -> None:
     assert await _stages(repository) == []
 
 
-async def test_without_an_executor_nothing_is_staged_and_nothing_is_claimed() -> None:
-    """A plane that cannot reach a disk reports no stages rather than inventing them."""
+async def test_an_agent_without_the_staging_route_reads_as_no_executor() -> None:
+    """A plane that cannot reach a disk reports no stages rather than inventing them.
+
+    The rolling-upgrade case, and the reason the deployment order is agents
+    first: a controller upgraded ahead of its fleet asks agents that have never
+    heard of the route. That is the absence of a capability, so it must look
+    exactly like a deployment with no executor configured -- nothing staged,
+    nothing recorded, nothing charged, nothing counted.
+
+    An inconclusive row here would be the expensive mistake: it charges the
+    cell's budget for bytes nobody attempted to fetch, and after enough passes
+    it blocks the asset permanently on evidence about the *control plane*.
+    """
 
     repository = InMemoryRepository()
     await repository.open()
@@ -1543,3 +1583,31 @@ async def test_one_pass_takes_a_bounded_bite_and_says_so() -> None:
 # PostgreSQL parity lives in ``test_postgres_semantics.py``: the fault matrix
 # requires every file that consumes the database fixture to be named in the
 # scheduled CI step, and that step is defined outside this package.
+
+
+async def test_an_asset_longer_than_a_stage_key_is_skipped_rather_than_attempted() -> None:
+    """``named_assets`` is unbounded user input; a stage row keys on 512 characters.
+
+    Fetching one first and failing to persist it afterwards takes the whole pass
+    down -- every cell, every asset -- for one over-long name in one spec. The
+    honest cost is that one cache entry, and nothing is claimed about it.
+    """
+
+    repository = InMemoryRepository()
+    await repository.open()
+    executor = _Executor(sizes={_DATASET: _GIB})
+    controller = _controller(repository, executor)
+    oversized = "gs://acme/" + "d" * 600
+    await _seed(
+        repository,
+        cells=[_cell("cell-a")],
+        workloads=[_workload("wl-1", oversized, _DATASET)],
+        leases=[_lease("l-1", workload_id="wl-1", cell_id="cell-a")],
+    )
+
+    counts = await controller.stage_cell_assets_once(now=NOW)
+    stored = await _stages(repository)
+
+    assert counts["staged"] == 1
+    assert [item.asset for item in stored] == [_DATASET]
+    assert [request.asset for request in executor.measured] == [_DATASET]

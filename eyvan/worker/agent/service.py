@@ -3,12 +3,22 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Cell-agent service composed from independent capacity, state, and execution backends."""
+"""Cell-agent service composed from independent capacity, state, and execution backends.
+
+**Deployment order for managed staging: agents first, controller second.** This
+module serves one wire method the control plane did not previously call --
+``stage_asset``, reached at ``POST /api/v1/cells/{cell_id}/stage-actions``. An
+agent that predates it answers 404, which the client reports as *this agent has
+no staging executor*: absence of a capability, never a failed action. So a
+control plane upgraded first stages nothing and records nothing, exactly as it
+does today, and the feature appears when the agents underneath it are upgraded.
+"""
 
 from __future__ import annotations
 
 import typing as tp
 from dataclasses import replace
+from pathlib import Path
 
 from fastapi import HTTPException
 
@@ -34,6 +44,10 @@ from eyvan.worker.agent.models import (
     AgentCapabilities,
     AgentObservation,
     CapacityRequest,
+    CellStageAction,
+    CellStageActionRequest,
+    CellStageActionResult,
+    CellStageVerdict,
     CheckpointRequest,
     GangWorkloadMember,
     GangWorkloadMutationRequest,
@@ -48,9 +62,39 @@ from eyvan.worker.runtime.registry import (
     NativeGangCell,
     StructuredLogExecutionDriver,
 )
+from eyvan.worker.runtime.stage_executor import AssetStageResult, AssetStageVerdict, LocalAssetStageExecutor
 
 if tp.TYPE_CHECKING:
     from eyvan.worker.runtime.native_gang import NativeGangWorkloadResult
+
+#: Execution backends whose workloads run on the disk this agent process owns.
+#:
+#: The gate that keeps a stage row honest. A stage record says *cell X holds
+#: asset A*, and placement is steered by it, so an agent that wrote the bytes to
+#: a disk the workload cannot read would be manufacturing exactly the confident
+#: false hit the whole design refuses. ``native-local`` runs the workload as a
+#: child of this process; ``eyvan-native`` reaches a worker on another machine,
+#: and putting bytes there needs a wire method on that worker which this wave
+#: does not add -- so it reports no executor rather than staging the wrong disk.
+_HOST_LOCAL_EXECUTION_BACKENDS = frozenset({"native-local"})
+
+#: What one staging verdict is called on the wire.
+_STAGE_VERDICTS: dict[AssetStageVerdict, CellStageVerdict] = {
+    AssetStageVerdict.OK: CellStageVerdict.OK,
+    AssetStageVerdict.REFUSED: CellStageVerdict.REFUSED,
+    AssetStageVerdict.INCONCLUSIVE: CellStageVerdict.INCONCLUSIVE,
+}
+
+
+class CellStageDriver(tp.Protocol):
+    """The host-side half of managed staging, as this agent uses it."""
+
+    def measure(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
+
+    def stage(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
+
+    def evict(self, cell_id: str, asset: str) -> AssetStageResult: ...
+
 
 MutationRequest: tp.TypeAlias = CapacityRequest | CheckpointRequest | WorkloadMutationRequest | WorkloadRequest
 GangMemberKey: tp.TypeAlias = tuple[str, str, int, str] | tuple[str, str, int, str, str]
@@ -154,6 +198,10 @@ class CellAgentService:
         executors: ExecutionDriverResolver | None = None,
         settings: EyvanSettings | None = None,
         remote_retire: tp.Callable[[str, str, WorkloadMutationRequest], None] | None = None,
+        #: Puts named assets on this host's disk and takes them off again.
+        #: Built for a host-local execution backend when omitted, and left unset
+        #: for every other backend -- see ``_HOST_LOCAL_EXECUTION_BACKENDS``.
+        stager: CellStageDriver | None = None,
     ):
         settings = settings or EyvanSettings.from_env()
         self.settings = settings
@@ -177,6 +225,16 @@ class CellAgentService:
         self.execution_backend = canonical_execution_backend(capacity.capabilities().executor)
         self.executors = executors
         self._remote_retire = remote_retire or self._retire_on_source_agent
+        if stager is None and self.execution_backend in _HOST_LOCAL_EXECUTION_BACKENDS:
+            candidate = LocalAssetStageExecutor.from_environment(Path(settings.agent_state_dir).expanduser() / "stages")
+            # An empty source allowlist is the off switch, and it must read as
+            # *no executor* rather than as a refusal of every asset. A refusal is
+            # terminal -- it blocks the stage permanently, and nothing unblocks
+            # it short of replacing the cell -- so an operator who sized a cache
+            # before declaring what may be fetched would poison the ledger for
+            # every asset in the fleet and have no way back.
+            stager = candidate if candidate.allowed_prefixes else None
+        self.stager = stager
 
     @staticmethod
     def _observation(value: CellObservation) -> AgentObservation:
@@ -596,6 +654,60 @@ class CellAgentService:
             return executor.logs(remote_id)
         finally:
             self._close_gang_executor(executor)
+
+    def stage_asset(self, cell_id: str, request: CellStageActionRequest) -> CellStageActionResult:
+        """Measure, materialize or remove one named asset on this cell's disk.
+
+        The generation is the fence, and it is read from this agent's own
+        durable record rather than taken from the request. Equality, not
+        "at least": a request planned against an older generation names a
+        machine that has been replaced, and one planned against a newer
+        generation names a machine this agent has not built yet. Staging on
+        either writes bytes nobody asked for and confirms a stage on a host that
+        does not hold it -- so a stale generation can neither stage nor evict.
+
+        Nothing here advances the fence. Staging is a cache operation, not a
+        capacity mutation, and stamping the cell's generation from it would let
+        a warm-up round trip silently take ownership away from the lifecycle
+        command that actually owns the host.
+
+        Raises:
+            UnsupportedCapabilityError: This agent has no executor for this
+                cell's disk, which the control plane reads as "no executor"
+                rather than as a failed action.
+            StaleMutationError: The request's generation does not own the cell.
+        """
+
+        if self.stager is None:
+            raise UnsupportedCapabilityError(
+                f"execution backend {self.execution_backend!r} does not stage assets on this agent's host"
+            )
+        observation = self.capacity.observe(cell_id)
+        if observation.state is CapacityStatus.ABSENT:
+            raise StaleMutationError(f"cell {cell_id!r} does not exist on this agent")
+        if observation.generation != request.mutation.generation:
+            raise StaleMutationError(
+                f"staging generation {request.mutation.generation} does not own cell {cell_id!r} "
+                f"generation {observation.generation}"
+            )
+        if request.action is CellStageAction.MEASURE:
+            result = self.stager.measure(cell_id, request.asset, max_bytes=request.max_bytes)
+        elif request.action is CellStageAction.STAGE:
+            result = self.stager.stage(cell_id, request.asset, max_bytes=request.max_bytes)
+        else:
+            result = self.stager.evict(cell_id, request.asset)
+        return CellStageActionResult(
+            asset=request.asset,
+            action=request.action,
+            verdict=_STAGE_VERDICTS[result.verdict],
+            # An eviction frees bytes rather than placing them, and reporting
+            # what it removed as bytes now present would charge the budget for a
+            # disk that was just emptied.
+            size_bytes=0 if request.action is CellStageAction.EVICT else result.size_bytes,
+            digest=None if request.action is CellStageAction.EVICT else result.digest,
+            detail=result.detail[:2048],
+            path=result.path,
+        )
 
     def _executor(self, cell_id: str) -> ExecutionDriver:
         return self.executors.resolve(cell_id, self.capacity.observe(cell_id))
