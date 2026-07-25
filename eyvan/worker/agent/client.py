@@ -20,6 +20,9 @@ from eyvan.worker.agent.models import (
     AgentObservation,
     CapacityProviderFailure,
     CapacityRequest,
+    CellStageAction,
+    CellStageActionRequest,
+    CellStageActionResult,
     CheckpointRequest,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
@@ -29,6 +32,24 @@ from eyvan.worker.agent.models import (
     WorkloadObservation,
     WorkloadRequest,
 )
+
+#: How long one staging action may take, by what it does.
+#:
+#: A fetch is minutes of network for a large asset, so it gets the ceiling
+#: reconciliation and submission already use rather than the generic 30 seconds
+#: -- a timeout there is recorded as *inconclusive*, which is honest but costs
+#: the transfer.
+#:
+#: Measuring and evicting must not inherit that patience. They are a stat and an
+#: unlink, and they are what a hung agent is discovered by: the staging phase
+#: shares a leader cycle with placement and takes up to
+#: ``MAX_STAGE_ACTIONS_PER_PASS`` round trips, so a generous timeout on the cheap
+#: half is how one unreachable fleet delays every other phase for an hour.
+_STAGE_TIMEOUTS: dict[CellStageAction, float] = {
+    CellStageAction.MEASURE: 60.0,
+    CellStageAction.STAGE: 1800.0,
+    CellStageAction.EVICT: 300.0,
+}
 
 
 class CellAgentBusyError(RuntimeError):
@@ -64,6 +85,22 @@ class CellAgentInvalidConfigurationError(RuntimeError):
     reason: retrying an unchanged provider option cannot start working. Carrying
     the agent's own sentence matters more here than anywhere else, because the
     fix is a line of YAML and the message names it exactly.
+    """
+
+
+class CellAgentStagingUnsupportedError(RuntimeError):
+    """This agent has no staging executor for this cell -- not a failed action.
+
+    Raised for exactly two answers, because they mean the same thing to a
+    control plane: HTTP 404, which is an agent that predates the staging wire
+    method entirely, and HTTP 501, which is a current agent whose execution
+    backend does not run workloads on the disk this process owns.
+
+    It exists so neither is read as a failure. An agent mid-rollout must look
+    like a deployment that configured no executor -- nothing staged, nothing
+    recorded, nothing charged, nothing retried -- rather than like a fleet that
+    is refusing to answer, which would write an unproven row against every cell
+    and charge its budget for bytes nobody attempted to fetch.
     """
 
 
@@ -374,6 +411,38 @@ class CellAgentClient:
         if not is_json_object(payload):
             raise ValueError("cell agent process status must be a JSON object")
         return payload
+
+    def stage_asset(self, cell_id: str, request: CellStageActionRequest) -> CellStageActionResult:
+        """Measure, materialize or remove one named asset on one cell's disk.
+
+        Raises:
+            CellAgentStagingUnsupportedError: This agent has no staging executor
+                for this cell, either because it predates the wire method or
+                because its backend does not own the disk. Read as "no
+                executor", never as a failed action.
+            CellAgentStaleMutationError: The generation no longer owns the cell.
+            CellAgentUnavailableError: The agent could not answer at all.
+        """
+
+        try:
+            response = self._send(
+                "POST",
+                f"/api/v1/cells/{cell_id}/stage-actions",
+                json=request.model_dump(mode="json"),
+                timeout=_STAGE_TIMEOUTS[request.action],
+            )
+        except CellAgentUnsupportedCapabilityError as exc:
+            raise CellAgentStagingUnsupportedError(str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                # An agent that predates managed staging, or a proxy in front of
+                # one. Either way this control plane has no executor here, which
+                # is a fact about the deployment rather than about the asset.
+                raise CellAgentStagingUnsupportedError(
+                    f"cell agent for {cell_id!r} does not implement managed staging"
+                ) from exc
+            raise
+        return CellStageActionResult.model_validate_json(response.content)
 
     def drain(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
         response = self._send("POST", f"/api/v1/cells/{cell_id}/drain", json=request.model_dump(mode="json"))

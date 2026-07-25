@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 import typing as tp
 from urllib.parse import urlsplit
 
@@ -16,8 +17,11 @@ from pydantic import JsonValue as PydanticJsonValue
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, ExecutionWorkloadStatus
+from eyvan.records import MAX_CELL_STAGE_ASSET_LENGTH
 
 WireJsonObject: tp.TypeAlias = dict[str, PydanticJsonValue]
+
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class AgentModel(BaseModel):
@@ -213,3 +217,99 @@ class WorkloadReference(AgentModel):
     """Minimal response returned after submission or checkpoint creation."""
 
     remote_id: str = Field(min_length=1)
+
+
+class CellStageAction(StrEnum):
+    """Which of the three staging operations one request asks for.
+
+    One RPC with a named action rather than three routes, because all three
+    share the same fence, the same asset and the same byte bound, and an agent
+    that implements one implements all three. A control plane that finds the
+    route missing therefore learns one fact -- this agent has no staging
+    executor -- instead of three, which is what makes the rolling upgrade a
+    single question.
+    """
+
+    #: Report what the asset would occupy, fetching nothing.
+    MEASURE = "measure"
+    #: Materialize the asset and report the bytes that are provably present.
+    STAGE = "stage"
+    #: Remove every copy of the asset from this host.
+    EVICT = "evict"
+
+
+class CellStageVerdict(StrEnum):
+    """What a staging action established, in the only three shapes there are.
+
+    Carried in a 200 body rather than mapped onto status codes, because the two
+    failures mean opposite things to the control plane -- terminal versus
+    transient -- and every status code that already carries meaning on this
+    wire (409 stale, 501 unsupported, 5xx unreachable) is spoken for. A
+    refusal is the agent answering, not the agent failing.
+    """
+
+    #: The action completed; the reported bytes are a fact about that disk.
+    OK = "ok"
+    #: This request can never succeed as written; do not retry it unchanged.
+    REFUSED = "refused"
+    #: Nothing was established. Presence is unproven in both directions.
+    INCONCLUSIVE = "inconclusive"
+
+
+class CellStageActionRequest(AgentModel):
+    """One fenced, byte-bounded staging instruction for one cell.
+
+    ``max_bytes`` is a term of the request, not a hint: it is the smaller of the
+    control plane's per-action ceiling and the headroom left in this cell's
+    budget, and an agent that honours it cannot overrun the budget.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mutation: MutationModel
+    action: CellStageAction
+    asset: str = Field(min_length=1, max_length=MAX_CELL_STAGE_ASSET_LENGTH)
+    max_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_values(self) -> CellStageActionRequest:
+        """Reject an asset name that is untrimmed or carries a NUL byte."""
+
+        if self.asset != self.asset.strip():
+            raise ValueError("a staged asset must be trimmed")
+        if "\x00" in self.asset:
+            raise ValueError("a staged asset must not contain NUL bytes")
+        return self
+
+
+class CellStageActionResult(AgentModel):
+    """What one staging action established on one host.
+
+    ``size_bytes`` and ``digest`` describe bytes read back off that host's disk.
+    Neither is ever the size or digest the asset *declared*: the control plane
+    charges its budget against this number and scores placement on it, so an
+    expectation reported as an observation is a lie it would then act on.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    asset: str = Field(min_length=1, max_length=MAX_CELL_STAGE_ASSET_LENGTH)
+    action: CellStageAction
+    verdict: CellStageVerdict
+    size_bytes: int = Field(default=0, ge=0)
+    #: ``sha256:<hex>`` over the observed bytes, or ``None`` when the action did
+    #: not read them. ``None`` is unknown content, never "no content".
+    digest: str | None = None
+    detail: str = Field(default="", max_length=2048)
+    #: Where the asset lives on that host, when it is present.
+    path: str | None = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def validate_values(self) -> CellStageActionResult:
+        """Reject a malformed digest and bytes claimed without a verdict to hold them."""
+
+        if self.digest is not None and _SHA256_DIGEST.fullmatch(self.digest) is None:
+            raise ValueError("a stage digest must be sha256:<64 lowercase hex characters>")
+        if self.verdict is not CellStageVerdict.OK and (self.size_bytes or self.digest is not None):
+            raise ValueError("only a completed stage action may report observed bytes")
+        return self

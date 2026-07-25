@@ -21,17 +21,35 @@ Two phases rather than one, because they fail differently. Staging that cannot
 reach a host costs a cache miss; eviction that deletes the wrong thing costs a
 running job its data. So eviction plans first, deletes only when an operator has
 switched deletion on, and never touches an asset a live workload declared.
+
+**Deployment order: agents first, controller second.** Staging reaches a host
+through one cell-agent wire method, ``POST /api/v1/cells/{cell_id}/stage-actions``,
+which older agents do not serve. :class:`CellAgentStageExecutor` reports that as
+:class:`CellStageUnsupportedError`, and every phase here treats it exactly as it
+treats an unconfigured executor: nothing staged, nothing recorded, nothing
+charged, nothing counted. A control plane upgraded first is therefore inert
+rather than broken, and the feature appears when the agents beneath it are
+upgraded.
+
+The binding itself changes no default. A deployment that leaves
+``EYVAN_CELL_STAGE_BUDGET_BYTES`` at zero -- which is every deployment until an
+operator sizes a cache -- never reaches the executor at all, because a zero
+budget disables the policy before any of this runs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import typing as tp
 from datetime import datetime
+
+import httpx
 
 from eyvan._internal.observability import trace_span
 from eyvan.capacity.stage_policy import CellStagePolicy
 from eyvan.records import (
+    MAX_CELL_STAGE_ASSET_LENGTH,
     CellRecord,
     CellStageRecord,
     CellStageState,
@@ -43,7 +61,9 @@ from eyvan.records import (
 from eyvan.server.controller._support import logger
 from eyvan.server.service.stage import (
     MAX_STAGE_ACTIONS_PER_PASS,
+    CellStageError,
     CellStageEvictionPlan,
+    CellStageExecutor,
     CellStageInconclusiveError,
     CellStageMeasurement,
     CellStageRefusedError,
@@ -54,10 +74,143 @@ from eyvan.server.service.stage import (
     plan_eviction,
     stage_headroom_bytes,
 )
+from eyvan.worker.agent.client import (
+    CellAgentClient,
+    CellAgentStagingUnsupportedError,
+    CellAgentStaleMutationError,
+    CellAgentUnavailableError,
+)
+from eyvan.worker.agent.models import (
+    CellStageAction,
+    CellStageActionRequest,
+    CellStageActionResult,
+    CellStageVerdict,
+    MutationModel,
+)
 
 #: Cell states a stage may be acted on in. A cell that is not ready has no disk
 #: worth talking to, and one being released is about to lose the bytes anyway.
 _STAGEABLE_CELL_STATES = frozenset({CellState.READY})
+
+
+class CellStageUnsupportedError(CellStageError):
+    """There is no executor for this cell, so no action was attempted.
+
+    The fourth answer, and the one the protocol did not have. The other three
+    are all statements about an *action* -- it will never work, it did not
+    finish, it was fenced out -- and every one of them writes a row. This says
+    there was nothing to attempt, which is a fact about the deployment: an agent
+    that predates managed staging, a backend that does not own the workload's
+    disk, or a cell with no agent endpoint at all.
+
+    It must not be spelled as any of the others. A refusal would block the asset
+    permanently on evidence about the *control plane*, and an inconclusive
+    result would charge the cell's budget for bytes nobody attempted to fetch --
+    both of which outlive the rolling upgrade that caused them.
+    """
+
+
+def _measurement(result: CellStageActionResult) -> CellStageMeasurement:
+    """Project one agent answer onto the executor contract, or raise its verdict."""
+
+    if result.verdict is CellStageVerdict.REFUSED:
+        raise CellStageRefusedError(result.detail or f"the agent refused to stage {result.asset!r}")
+    if result.verdict is CellStageVerdict.INCONCLUSIVE:
+        raise CellStageInconclusiveError(result.detail or f"staging {result.asset!r} ended without an answer")
+    return CellStageMeasurement(size_bytes=result.size_bytes, digest=result.digest, detail=result.detail)
+
+
+class CellAgentStageExecutor:
+    """Reach one fleet's cell agents to stage, measure and evict named assets.
+
+    The implementation of :class:`~eyvan.server.service.stage.CellStageExecutor`
+    that ships, and the reason the protocol was left injectable: staging is a
+    property of the asset store, so this is *an* executor rather than *the* one.
+    A deployment with a different store binds its own and this class is never
+    constructed.
+
+    Endpoints come from a snapshot the caller already read, never from a fresh
+    query. Every method here runs on a worker thread outside every transaction,
+    where an async repository read is not available and would be a database call
+    held open across a network fetch if it were. The snapshot is one leader pass
+    old at most, and a cell that moved within it is caught by the generation
+    check on the way out rather than by a stale endpoint on the way in.
+    """
+
+    def __init__(
+        self,
+        cells: tp.Mapping[str, CellRecord],
+        agent: tp.Callable[[CellRecord], CellAgentClient],
+    ) -> None:
+        self._cells = dict(cells)
+        self._agent = agent
+
+    def _client(self, request: CellStageRequest) -> tuple[CellRecord, CellAgentClient]:
+        """Resolve the agent holding one cell, refusing to guess about the rest."""
+
+        cell = self._cells.get(request.cell_id)
+        if cell is None or cell.generation != request.cell_generation:
+            raise CellStageStaleError(f"cell {request.cell_id!r} is no longer at generation {request.cell_generation}")
+        if not cell.endpoint:
+            raise CellStageUnsupportedError(f"cell {request.cell_id!r} has no agent endpoint to stage through")
+        try:
+            return cell, self._agent(cell)
+        except (RuntimeError, ValueError) as exc:
+            raise CellStageUnsupportedError(f"cell {request.cell_id!r} has no reachable agent: {exc}") from exc
+
+    def _act(self, request: CellStageRequest, action: CellStageAction) -> CellStageActionResult:
+        """Issue one fenced staging action and translate how the agent answered."""
+
+        cell, client = self._client(request)
+        # The asset is fingerprinted rather than spelled out: an asset name may
+        # be 512 characters and an idempotency key may be 256, and truncating a
+        # name is how two different assets come to share one key.
+        fingerprint = hashlib.sha256(request.asset.encode("utf-8")).hexdigest()[:32]
+        wire = CellStageActionRequest(
+            mutation=MutationModel(
+                idempotency_key=f"stage:{action.value}:{request.cell_generation}:{fingerprint}",
+                generation=request.cell_generation,
+                fencing_token=request.fencing_token,
+            ),
+            action=action,
+            asset=request.asset,
+            max_bytes=request.max_bytes,
+        )
+        try:
+            return client.stage_asset(cell.id, wire)
+        except CellAgentStagingUnsupportedError as exc:
+            raise CellStageUnsupportedError(str(exc)) from exc
+        except CellAgentStaleMutationError as exc:
+            raise CellStageStaleError(str(exc)) from exc
+        except CellAgentUnavailableError as exc:
+            # The agent did not answer, so nothing was learned. Never a refusal:
+            # an unreachable agent says nothing about whether the asset could be
+            # staged, and blocking on it would outlive the outage.
+            raise CellStageInconclusiveError(str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if 400 <= status < 500:
+                # The agent read the request and rejected it. Retrying the same
+                # bytes gets the same answer, which is what blocked means.
+                raise CellStageRefusedError(f"the cell agent rejected this staging request: HTTP {status}") from exc
+            raise CellStageInconclusiveError(f"the cell agent answered HTTP {status}") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise CellStageInconclusiveError(f"the cell agent could not be asked: {exc}") from exc
+
+    def measure(self, request: CellStageRequest) -> CellStageMeasurement:
+        """Return what this asset would occupy on this cell, fetching nothing."""
+
+        return _measurement(self._act(request, CellStageAction.MEASURE))
+
+    def stage(self, request: CellStageRequest) -> CellStageMeasurement:
+        """Materialize the asset and return the bytes the host proved present."""
+
+        return _measurement(self._act(request, CellStageAction.STAGE))
+
+    def evict(self, request: CellStageRequest) -> None:
+        """Remove the asset, returning only once the host says the bytes are gone."""
+
+        _measurement(self._act(request, CellStageAction.EVICT))
 
 
 class _ControllerStaging:
@@ -82,6 +235,24 @@ class _ControllerStaging:
 
         return f"cell:{cell.id}:{cell.generation}"
 
+    def _resolved_stage_executor(self, cells: tp.Mapping[str, CellRecord]) -> CellStageExecutor:
+        """Return the executor this pass will use, injected or agent-backed.
+
+        An explicitly injected executor always wins: a deployment whose assets
+        live somewhere the cell agent cannot reach binds its own, and silently
+        replacing it would be worse than ignoring it.
+
+        Otherwise the cell agents are the executor. This is the whole of the
+        binding, and it changes no default: everything above it is already
+        gated on a stage budget an operator had to set, and a fleet whose agents
+        predate the staging wire method degrades to no executor at all rather
+        than to a failure.
+        """
+
+        if self._stage_executor is not None:
+            return self._stage_executor
+        return CellAgentStageExecutor(cells, self._agent_factory)
+
     async def stage_cell_assets_once(self, *, now: datetime | None = None) -> dict[str, int]:
         """Materialize the assets running workloads declared on the cells they hold.
 
@@ -99,7 +270,7 @@ class _ControllerStaging:
 
         policy = self._stage_policy()
         outcome = StageOutcome()
-        if self._stage_executor is None or not policy.enabled:
+        if not policy.enabled:
             return outcome.as_counts()
         moment = now or utcnow()
         async with self.repository.transaction() as transaction:
@@ -107,6 +278,7 @@ class _ControllerStaging:
             leases = await transaction.list_leases()
             workloads = await transaction.list_workloads()
             stages = await transaction.list_cell_stages()
+        executor = self._resolved_stage_executor(known)
         stageable = {cell_id: cell for cell_id, cell in known.items() if cell.state in _STAGEABLE_CELL_STATES}
         wanted = _desired_stages(stageable, workloads, leases)
         by_cell: dict[str, list[CellStageRecord]] = {}
@@ -129,7 +301,14 @@ class _ControllerStaging:
                     logger.info("cell staging reached its %s action budget for this pass", MAX_STAGE_ACTIONS_PER_PASS)
                     return outcome.as_counts()
                 with trace_span("eyvan.cell_stage", cell=cell_id, asset=asset):
-                    await self._stage_one_asset(cell, asset, policy=policy, now=moment, outcome=outcome)
+                    await self._stage_one_asset(
+                        cell,
+                        asset,
+                        executor=executor,
+                        policy=policy,
+                        now=moment,
+                        outcome=outcome,
+                    )
         return outcome.as_counts()
 
     async def _discard_superseded_stages(
@@ -176,6 +355,7 @@ class _ControllerStaging:
         cell: CellRecord,
         asset: str,
         *,
+        executor: CellStageExecutor,
         policy: CellStagePolicy,
         now: datetime,
         outcome: StageOutcome,
@@ -233,7 +413,7 @@ class _ControllerStaging:
             max_bytes=headroom,
         )
         outcome.actions += 1
-        measured = await self._measure_stage(request, outcome=outcome, now=now)
+        measured = await self._measure_stage(request, executor=executor, outcome=outcome, now=now)
         if measured is None:
             return
         if measured.size_bytes > headroom:
@@ -256,7 +436,13 @@ class _ControllerStaging:
             return
         outcome.actions += 1
         try:
-            written = await asyncio.to_thread(self._stage_executor.stage, request)
+            written = await asyncio.to_thread(executor.stage, request)
+        except CellStageUnsupportedError as exc:
+            # Reachable only when an agent is upgraded away mid-pass, because
+            # the measurement above goes through the same wire method. Recorded
+            # nowhere, for the same reason it is recorded nowhere there.
+            logger.info("no staging executor for cell %s: %s", cell.id, exc)
+            return
         except CellStageStaleError as exc:
             logger.info("staging %s on cell %s was fenced out: %s", asset, cell.id, exc)
             return
@@ -280,13 +466,21 @@ class _ControllerStaging:
         self,
         request: CellStageRequest,
         *,
+        executor: CellStageExecutor,
         outcome: StageOutcome,
         now: datetime,
     ) -> CellStageMeasurement | None:
         """Ask what the asset would cost, outside every transaction."""
 
         try:
-            return await asyncio.to_thread(self._stage_executor.measure, request)
+            return await asyncio.to_thread(executor.measure, request)
+        except CellStageUnsupportedError as exc:
+            # No executor for this cell -- an agent that predates the staging
+            # wire method, or a backend that does not own the workload's disk.
+            # Nothing was attempted, so nothing is written and nothing counted:
+            # the same silence a deployment with no executor configured keeps.
+            logger.debug("no staging executor for cell %s: %s", request.cell_id, exc)
+            return None
         except CellStageStaleError as exc:
             logger.info("measuring %s on cell %s was fenced out: %s", request.asset, request.cell_id, exc)
             return None
@@ -400,6 +594,25 @@ class _ControllerStaging:
             )
         outcome.staged += 1
 
+    async def _restore_stage(self, stored: CellStageRecord, *, now: datetime) -> None:
+        """Put one row back as it was, after an action that never ran.
+
+        Only for an eviction that found no executor at all. The row was marked
+        ``EVICTING`` before the round trip, because a delete that is attempted
+        and then loses its answer must stay unproven -- but nothing was
+        attempted here, and a row left claiming an eviction is in flight would
+        be planned again on every pass against an executor that will never
+        answer, which is the unbounded retry this design refuses.
+        """
+
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_cell_stage(stored.cell_id, stored.asset)
+            if current is None or current.cell_generation != stored.cell_generation:
+                return
+            if current.state is not CellStageState.EVICTING:
+                return
+            await transaction.put_cell_stage(stored.model_copy(update={"updated_at": now}))
+
     async def _record_stage(
         self,
         request: CellStageRequest,
@@ -477,7 +690,7 @@ class _ControllerStaging:
         """
 
         policy = self._stage_policy()
-        if self._stage_executor is None or not policy.enabled:
+        if not policy.enabled:
             return ()
         moment = now or utcnow()
         async with self.repository.transaction() as transaction:
@@ -485,6 +698,7 @@ class _ControllerStaging:
             leases = await transaction.list_leases()
             workloads = await transaction.list_workloads()
             stages = await transaction.list_cell_stages()
+        executor = self._resolved_stage_executor({cell.id: cell for cell in cells})
         by_cell: dict[str, list[CellStageRecord]] = {}
         for stage in stages:
             by_cell.setdefault(stage.cell_id, []).append(stage)
@@ -519,7 +733,7 @@ class _ControllerStaging:
                 continue
             deleted += len(plan.victims)
             with trace_span("eyvan.cell_stage_eviction", cell=cell.id):
-                await self._execute_eviction(cell, plan, now=moment)
+                await self._execute_eviction(cell, plan, executor=executor, now=moment)
         return tuple(plans)
 
     async def _execute_eviction(
@@ -527,6 +741,7 @@ class _ControllerStaging:
         cell: CellRecord,
         plan: CellStageEvictionPlan,
         *,
+        executor: CellStageExecutor,
         now: datetime,
     ) -> None:
         """Delete one plan's victims, re-checking protection against fresh state.
@@ -575,9 +790,22 @@ class _ControllerStaging:
                 max_bytes=victim.reserved_bytes,
             )
             try:
-                await asyncio.to_thread(self._stage_executor.evict, request)
+                await asyncio.to_thread(executor.evict, request)
+            except CellStageUnsupportedError as exc:
+                # Nothing was attempted, so the row must go back exactly as it
+                # was. Leaving it in ``EVICTING`` would make the next pass plan
+                # the same deletion against the same absent executor forever --
+                # an unbounded retry loop begun by a rolling upgrade.
+                logger.info("no staging executor for cell %s: %s", cell.id, exc)
+                await self._restore_stage(stored, now=now)
+                continue
             except CellStageStaleError as exc:
+                # Fenced out before anything was deleted, so the row goes back
+                # as it was -- which is what :class:`CellStageStaleError` has
+                # always promised and what stops the next pass planning the same
+                # deletion against the same refusal on every cycle.
                 logger.info("evicting %s from cell %s was fenced out: %s", victim.asset, cell.id, exc)
+                await self._restore_stage(stored, now=now)
                 continue
             except (CellStageInconclusiveError, OSError) as exc:
                 # The bytes may or may not be gone, so the row stays charged and
@@ -613,13 +841,28 @@ def _desired_stages(
     Read straight off live leases, so the wish list cannot outlive the work that
     justified it: a workload that ended stops asking without anything having to
     remember to withdraw its request.
+
+    An asset longer than the ledger's key is dropped here rather than attempted.
+    ``WorkloadDefinition.named_assets`` is unbounded user input while a stage row
+    keys on at most :data:`MAX_CELL_STAGE_ASSET_LENGTH` characters, so one
+    over-long name would fetch successfully and then fail to persist -- taking
+    the whole pass, every cell and every other asset, down with it. Skipped and
+    logged: that claims nothing about the asset and costs one cache entry.
     """
 
     wanted: dict[str, set[str]] = {}
     for cell_id in cells:
         for asset in declared_assets_on_cell(cell_id, workloads, leases):
+            if len(asset) > MAX_CELL_STAGE_ASSET_LENGTH:
+                logger.warning(
+                    "not staging an asset on cell %s: its name is %s characters and a stage row keys on %s",
+                    cell_id,
+                    len(asset),
+                    MAX_CELL_STAGE_ASSET_LENGTH,
+                )
+                continue
             wanted.setdefault(cell_id, set()).add(asset)
     return wanted
 
 
-__all__ = ("_ControllerStaging",)
+__all__ = ("CellAgentStageExecutor", "CellStageUnsupportedError", "_ControllerStaging")
