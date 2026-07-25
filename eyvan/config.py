@@ -280,6 +280,21 @@ class EyvanSettings:
     #: an Eyvan-reserved status, and the executors report the distinct terminal
     #: reason "the gang never formed" instead of an ordinary workload failure.
     gang_init_fatal: bool = False
+    #: Host replacements one scope may make inside ``host_replacement_window_s``.
+    #: Zero -- the default -- means a machine that names an unrecoverable fault in
+    #: its own output is still only retried, which is today's behaviour. The bound
+    #: exists because each replacement costs a provision *and* a destroy, so a
+    #: zone of bad hosts must not become an infinite provision loop.
+    host_replacement_budget: int = 0
+    host_replacement_window_s: int = 3600
+    #: Sources a cell may stage a named asset from, comma separated. Empty -- the
+    #: default -- reads as "no executor", not as a refusal: a refusal is terminal
+    #: and would block every asset in a fleet over one unset variable. Named
+    #: assets are user input, so an executor that fetched anything would be an
+    #: arbitrary-read primitive; only these prefixes are reachable.
+    cell_stage_sources: str = ""
+    #: Where a cell keeps staged bytes. Empty uses the agent's own state directory.
+    cell_stage_dir: str = ""
 
     def mutual_tls_files(self) -> MutualTlsFiles:
         """Return this process's mutual-TLS paths, never its key material."""
@@ -541,4 +556,10 @@ class EyvanSettings:
             gang_init_deadline_s=int(os.getenv("EYVAN_GANG_INIT_DEADLINE_S", defaults.gang_init_deadline_s)),
             gang_heartbeat_timeout_s=int(os.getenv("EYVAN_GANG_HEARTBEAT_TIMEOUT_S", defaults.gang_heartbeat_timeout_s)),
             gang_init_fatal=truthy("EYVAN_GANG_INIT_FATAL", defaults.gang_init_fatal),
+            host_replacement_budget=int(os.getenv("EYVAN_HOST_REPLACEMENT_BUDGET", defaults.host_replacement_budget)),
+            host_replacement_window_s=int(
+                os.getenv("EYVAN_HOST_REPLACEMENT_WINDOW_S", defaults.host_replacement_window_s)
+            ),
+            cell_stage_sources=os.getenv("EYVAN_CELL_STAGE_SOURCES", defaults.cell_stage_sources),
+            cell_stage_dir=os.getenv("EYVAN_CELL_STAGE_DIR", defaults.cell_stage_dir),
         )

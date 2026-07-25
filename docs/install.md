@@ -178,6 +178,22 @@ production `Dockerfile` builds the static dashboard. From an installed wheel,
 `eyvan dashboard` opens that hosted UI; `eyvan dashboard-dev` is explicitly
 source-checkout-only.
 
+## Capacity behaviour that ships disabled
+
+Four settings gate behaviour that exists but is off, so an upgrade changes
+nothing until an operator opts in. Each is off because it trades one failure for
+another and only the operator knows which they prefer.
+
+| Setting | Default | What turning it on does |
+|---|---|---|
+| `EYVAN_HOST_REPLACEMENT_BUDGET` | `0` | A machine whose own output names an unrecoverable accelerator fault is replaced instead of retried. Zero keeps today's retry. Each replacement costs a provision *and* a destroy, so the budget bounds a zone of bad hosts from becoming an infinite provision loop. |
+| `EYVAN_HOST_REPLACEMENT_WINDOW_S` | `3600` | The window the budget above is counted over, per pool (or per provider/zone when a cell has no pool). |
+| `EYVAN_CELL_STAGE_SOURCES` | empty | Comma-separated prefixes a cell may stage a named asset from. Named assets are user input, so an executor that fetched anything would be an arbitrary-read primitive. Empty reads as "no executor", never as a refusal: a refusal is terminal and would block every asset in the fleet over one unset variable. |
+| `EYVAN_CELL_STAGE_DIR` | agent state directory | Where a cell keeps staged bytes. |
+
+Staging additionally requires `EYVAN_CELL_STAGE_BUDGET_BYTES` above zero; with
+the default of zero the staging phase plans nothing at all.
+
 ## Reproducible local checks
 
 Run the focused Python checks plus the mandatory pinned deployment and artifact

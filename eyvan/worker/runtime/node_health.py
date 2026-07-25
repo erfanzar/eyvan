@@ -427,9 +427,12 @@ class HostReplacementBudget:
     def from_env(cls) -> HostReplacementBudget:
         """Load the budget from ``EYVAN_HOST_REPLACEMENT_*``.
 
-        Read here rather than added to :class:`~eyvan.config.EyvanSettings` on
-        purpose: both defaults are "off", so a deployment that sets neither is
-        byte-identical to one built before this existed.
+        A fallback, not the documented path. Both names now live in
+        :class:`~eyvan.config.EyvanSettings` so ``docs/install.md`` can describe
+        them at all -- that document is checked against the settings loader, so a
+        knob read only through :func:`os.getenv` is a knob no operator can be told
+        about. This reader stays for a host-side process that has no settings
+        object, and both defaults remain "off".
         """
 
         budget = os.getenv("EYVAN_HOST_REPLACEMENT_BUDGET")
@@ -438,6 +441,21 @@ class HostReplacementBudget:
             max_replacements=_DEFAULT_REPLACEMENTS if budget is None else int(budget),
             window_s=_DEFAULT_WINDOW_S if window is None else float(window),
         )
+
+
+def host_replacement_budget_from_settings(settings: tp.Any) -> HostReplacementBudget:
+    """Build a budget from a settings object, falling back to the environment.
+
+    Typed as ``Any`` deliberately: ``eyvan.worker`` may not import the control
+    plane or the SDK, and a settings import would cross that CI-enforced contract
+    for one attribute read.
+    """
+
+    budget = getattr(settings, "host_replacement_budget", None)
+    window = getattr(settings, "host_replacement_window_s", None)
+    if budget is None or window is None:
+        return HostReplacementBudget.from_env()
+    return HostReplacementBudget(max_replacements=int(budget), window_s=float(window))
 
 
 def host_replacement_scope(pool_id: str | None, provider: str, zone: str) -> str:
