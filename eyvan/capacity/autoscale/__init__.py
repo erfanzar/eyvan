@@ -11,6 +11,14 @@ from eyvan.capacity.autoscale.cache import (
     GeneratedAutoscaleCache,
     QueueAdmissionDenialCache,
 )
+from eyvan.capacity.autoscale.cluster_capacity import (
+    DEFAULT_MAX_OBSERVATION_AGE_S,
+    MAX_OBSERVATION_SKEW_S,
+    ClusterCapacityAdvice,
+    ClusterCapacityPolicy,
+    advise_launch,
+    observation_age,
+)
 from eyvan.capacity.autoscale.compiler import (
     generate_autoscale_config,
     generate_zone_autoscale_config,
@@ -50,7 +58,9 @@ from eyvan.capacity.autoscale.service import AutoscaleGenerationResult, Autoscal
 __all__ = (
     "DEFAULT_AUTOSCALE_CACHE_ROOT",
     "DEFAULT_AUTOSCALE_DEFAULTS_PATH",
+    "DEFAULT_MAX_OBSERVATION_AGE_S",
     "DEFAULT_TPU_PROFILES",
+    "MAX_OBSERVATION_SKEW_S",
     "QUEUED_TPU_PROFILE_CATALOG",
     "AutoscaleConfigCache",
     "AutoscaleDefaults",
@@ -62,6 +72,8 @@ __all__ = (
     "AutoscaleSkipReason",
     "AutoscaleZoneRequest",
     "CachedAutoscaleConfig",
+    "ClusterCapacityAdvice",
+    "ClusterCapacityPolicy",
     "GeneratedAutoscaleCache",
     "GeneratedAutoscaleConfig",
     "GeneratedZoneAutoscaleConfig",
@@ -76,8 +88,10 @@ __all__ = (
     "TpuProfile",
     "TpuProfileResolution",
     "TpuQuotaDiscovery",
+    "advise_launch",
     "generate_autoscale_config",
     "generate_zone_autoscale_config",
+    "observation_age",
     "render_autoscale_yaml",
     "resolve_queued_tpu_profile",
     "select_profiles",
