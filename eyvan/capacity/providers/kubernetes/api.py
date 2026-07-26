@@ -18,6 +18,12 @@ looks like an unrelated permissions problem.
 ``replace`` of a live Job returns 422 rather than converging. The lifecycle is
 create-if-absent, then a single-field patch guarded by a ``resourceVersion``
 precondition, then delete.
+
+**Mutating reads raise; describing reads do not.** ``get``/``create``/``delete``
+serve a cell mutation and must not proceed on a guess, so they raise. The
+``observe_*`` family serves *description* of a cluster Eyvan does not own, where
+the only safe answer to "I could not look" is that nothing was established --
+never that the cluster is full and never that it is empty.
 """
 
 from __future__ import annotations
@@ -38,9 +44,55 @@ from eyvan.capacity.providers.kubernetes.workers import (
     GENERATION_LABEL,
 )
 
+#: Longest provider reason kept on an unreadable observation. The whole point of
+#: the value is to name a cause an operator can act on; a full API-server error
+#: body would land in a cell detail, a log line, and a dashboard panel.
+_MAX_REASON = 300
+
 #: Where a projected service-account token is mounted in a pod by default.
 DEFAULT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 DEFAULT_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+#: Where Kueue publishes ClusterQueue and ResourceFlavor objects.
+KUEUE_API = "/apis/kueue.x-k8s.io/v1beta1"
+
+#: Most nodes one capacity observation will read. A node list is only ever used
+#: to describe capacity, never to change it, so a cluster larger than this is
+#: reported as a partial reading rather than paged through: an observation that
+#: costs the API server twenty round trips is an observation an operator turns
+#: off.
+MAX_OBSERVED_NODES = 500
+
+
+@dataclass(frozen=True, slots=True)
+class ApiObservation:
+    """The result of one read whose only purpose is to describe the cluster.
+
+    Separate from :meth:`KubernetesApi.get` on purpose. ``get`` raises, because
+    its callers are mutating a cell and must not proceed on a guess. A capacity
+    *observation* has the opposite requirement: a cluster Eyvan cannot read is
+    an unknown cluster, and an exception there would either abort a
+    reconciliation that has nothing to do with cluster capacity or -- worse --
+    be caught somewhere that turns "I could not look" into "there is no room".
+
+    Attributes:
+        payload: The decoded object, or ``None`` when it does not exist or could
+            not be read.
+        readable: Whether the answer is authoritative. ``True`` with a ``None``
+            payload means the object genuinely is not there; ``False`` means
+            nothing was established.
+        reason: Why the read established nothing. Empty when ``readable``.
+    """
+
+    payload: JsonObject | None
+    readable: bool
+    reason: str = ""
+
+    @property
+    def unreadable(self) -> bool:
+        """Return whether this read failed to establish anything at all."""
+
+        return not self.readable
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +290,75 @@ class KubernetesApi:
 
         return self.get(f"/apis/batch/v1/namespaces/{namespace}/jobs/{name}")
 
+    def observe(self, path: str, *, params: tp.Mapping[str, str] | None = None) -> ApiObservation:
+        """Read one object for description only, degrading to unreadable.
+
+        Every failure mode collapses to the same answer -- *nothing was
+        established* -- with the cause kept for the operator. That includes RBAC:
+        a ServiceAccount without ``get clusterqueues`` is the ordinary state of a
+        cluster where Eyvan was installed before Kueue, and it must degrade the
+        capacity signal rather than fail an unrelated reconciliation or be
+        mistaken for an empty queue.
+
+        Args:
+            path: Absolute API path, already namespaced where applicable.
+            params: Optional query parameters, such as a label selector.
+
+        Returns:
+            An :class:`ApiObservation`. A 404 is a readable "it does not exist";
+            anything else that went wrong is unreadable with a reason.
+        """
+
+        try:
+            response = self.request("GET", path, params=params)
+        except CapacityProviderError as exc:
+            return ApiObservation(payload=None, readable=False, reason=str(exc)[:_MAX_REASON])
+        if response.status_code == 404:
+            return ApiObservation(payload=None, readable=True)
+        if response.status_code >= 400:
+            return ApiObservation(
+                payload=None,
+                readable=False,
+                reason=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            return ApiObservation(payload=None, readable=False, reason="response body is not JSON")
+        if not is_json_object(payload):
+            return ApiObservation(payload=None, readable=False, reason="response body is not a JSON object")
+        return ApiObservation(payload=payload, readable=True)
+
+    def observe_cluster_queue(self, name: str) -> ApiObservation:
+        """Read one Kueue ClusterQueue for capacity description only."""
+
+        return self.observe(f"{KUEUE_API}/clusterqueues/{name}")
+
+    def observe_resource_flavor(self, name: str) -> ApiObservation:
+        """Read one Kueue ResourceFlavor for capacity description only."""
+
+        return self.observe(f"{KUEUE_API}/resourceflavors/{name}")
+
+    def observe_nodes(self, *, label_selector: str = "", limit: int = MAX_OBSERVED_NODES) -> ApiObservation:
+        """Read a bounded node list for capacity description only.
+
+        Args:
+            label_selector: Kubernetes label selector, normally a ResourceFlavor's
+                ``spec.nodeLabels`` rendered as ``key=value`` pairs. Empty reads
+                every node.
+            limit: Hard ceiling on nodes returned. The response carries
+                ``metadata.continue`` when it was truncated, which the reader
+                turns into a partial rather than a complete observation.
+
+        Returns:
+            An :class:`ApiObservation` holding a ``NodeList``.
+        """
+
+        params = {"limit": str(max(1, min(limit, MAX_OBSERVED_NODES)))}
+        if label_selector:
+            params["labelSelector"] = label_selector
+        return self.observe("/api/v1/nodes", params=params)
+
     def create(self, path: str, manifest: JsonObject) -> bool:
         """Create one object, returning ``False`` for an unverified conflict.
 
@@ -306,6 +427,9 @@ class KubernetesApi:
 __all__ = (
     "DEFAULT_CA_PATH",
     "DEFAULT_TOKEN_PATH",
+    "KUEUE_API",
+    "MAX_OBSERVED_NODES",
+    "ApiObservation",
     "JobStatus",
     "KubernetesApi",
     "capacity_state",
