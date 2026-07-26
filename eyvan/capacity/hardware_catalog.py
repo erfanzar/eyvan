@@ -29,9 +29,23 @@ than not checking, because it looks like a provider fault.
 
 CPU and memory are different: both participate in admission, so every built-in
 shape must carry positive per-VM values plus the provider document and version
-that establish them. A future GPU entry has the same requirement. Hardware the
-catalog does not describe remains usable only through an explicit, complete fleet
+that establish them. A GPU entry has the same requirement. Hardware the catalog
+does not describe remains usable only through an explicit, complete fleet
 resource vector; provider discovery alone is not evidence for host resources.
+
+**GPU cell profiles are keyed by machine type, not by GPU model.** A cell is a
+host, and on GCP the GPU *model* (``nvidia-l4``) fixes none of the three numbers
+admission needs: ``g2-standard-4`` and ``g2-standard-96`` carry the same L4 and
+differ by 24x in vCPU and 8x in attached devices. The machine type fixes all
+three, so it is the key, and ``gpu_model`` records which accelerator is attached.
+This also means no name that an existing pool already puts in
+``accelerator_type`` gains a catalog entry here, so no deployment's write
+boundary changes meaning on upgrade.
+
+**Nothing in this file is hardware-qualified.** The GPU rows are transcribed from
+the provider's published machine-shape table. No GPU has executed an Eyvan
+workload, so treat a GPU row as a reviewable description of a host, not as
+evidence that a run on that host works.
 """
 
 from __future__ import annotations
@@ -57,6 +71,18 @@ class HardwareCatalogError(ValueError):
     """Raised when the catalog cannot be loaded or does not describe itself."""
 
 
+#: Accelerator kinds this catalog can describe. Anything else is refused rather
+#: than stored: ``kind`` selects the resource dimension a shape is counted in
+#: (``schedulable_tpu`` / ``schedulable_gpu``) and the admission boundary reads
+#: it with ``getattr``, so an unrecognised kind would silently count as nothing.
+SUPPORTED_KINDS: tp.Final = frozenset({"gpu", "tpu"})
+
+#: Capacity backends that provision an ordinary VM. A GPU host is one of these:
+#: there is no queued-resource path for GPUs, and a GPU row declaring the Cloud
+#: TPU backend would compile into a request no driver can serve.
+_COMPUTE_BACKENDS: tp.Final = frozenset({"compute", "gcp", "gcp-compute"})
+
+
 @dataclass(frozen=True, slots=True)
 class AcceleratorShape:
     """The dimensions of one accelerator type.
@@ -66,11 +92,23 @@ class AcceleratorShape:
     v5e/v6e one -- and conflating them is why a v5p-16 pool asking for 16 TPUs
     would silently request twice the hardware.
 
-    ``host_cpu`` and ``host_memory_gib`` are the resources of one TPU VM host,
-    not a sum across a multi-host slice. Eyvan launches the native workload on
-    every host, so admission must ensure the per-host request fits each host.
+    ``host_cpu`` and ``host_memory_gib`` are the resources of one VM host, not a
+    sum across a multi-host slice. Eyvan launches the native workload on every
+    host, so admission must ensure the per-host request fits each host.
     ``source_url`` and ``source_version`` make those otherwise easy-to-guess
     numbers reviewable and make unsourced future accelerator entries invalid.
+
+    A ``kind="gpu"`` row obeys every rule a TPU row obeys and three more, because
+    a GPU host is one VM rather than a slice: it must record ``hosts=1`` with
+    ``chips_per_host`` equal to ``chips`` (so per-rank device assignment has an
+    exact device count instead of a guess), it must name the attached
+    ``gpu_model``, and it must name the ``machine_type`` that fixes its CPU,
+    memory and device count. Refusing at construction rather than defaulting is
+    the same rule TPU host resources already obey: a shape that will not state
+    its host is not a shape, and a zero would make every workload unschedulable
+    on a pool that looks healthy.
+
+    No GPU row is hardware-qualified. Nothing has executed on a GPU under Eyvan.
     """
 
     accelerator_type: str
@@ -93,6 +131,9 @@ class AcceleratorShape:
     gpu_model: str | None = None
 
     def __post_init__(self) -> None:
+        if self.kind not in SUPPORTED_KINDS:
+            known = ", ".join(sorted(SUPPORTED_KINDS))
+            raise HardwareCatalogError(f"{self.accelerator_type}: kind {self.kind!r} is not one of {known}")
         if self.chips <= 0 or self.quota_units <= 0:
             raise HardwareCatalogError(f"{self.accelerator_type}: chips and quota_units must be positive")
         # A whole number, because a host has whole CPUs and ``TpuProfile``
@@ -128,7 +169,11 @@ class AcceleratorShape:
                     f"{self.accelerator_type}: {self.chips} chips is not {self.hosts} hosts "
                     f"x {self.chips_per_host} chips per host"
                 )
+        if self.kind == "gpu":
+            self._validate_gpu_host()
         if self.kind == "tpu":
+            if self.gpu_model is not None:
+                raise HardwareCatalogError(f"{self.accelerator_type}: a TPU shape cannot name a gpu_model")
             # Imported here, not at module scope. ``tpu_types`` lives under the
             # GCP provider package, whose ``__init__`` reaches back into modules
             # that consume this catalog -- so a module-level import makes the
@@ -151,6 +196,52 @@ class AcceleratorShape:
                     f"but its name says {parsed.generation!r}"
                 )
 
+    def _validate_gpu_host(self) -> None:
+        """Refuse a GPU row that does not describe one addressable VM host.
+
+        Every clause is here because the value it guards is read later by
+        something that cannot ask again. ``chips_per_host`` becomes a rank's
+        device list; ``machine_type`` is what a provider is asked to create;
+        ``gpu_model`` is the only record of which accelerator a pool holds once
+        the fleet document is compiled away.
+
+        Raises:
+            HardwareCatalogError: If the row is not a complete single-VM GPU
+                host description.
+        """
+
+        if self.hosts is None or self.chips_per_host is None:
+            raise HardwareCatalogError(
+                f"{self.accelerator_type}: a GPU shape must record hosts and chips_per_host; "
+                "a rank cannot be given an exact device list from an unknown device count"
+            )
+        if self.hosts != 1:
+            raise HardwareCatalogError(f"{self.accelerator_type}: a GPU shape describes one VM host, not {self.hosts}")
+        # GPU quota is counted one unit per attached device, unlike v4/v5p TPU
+        # quota. Recording anything else would size a pool against a ceiling the
+        # provider never applies.
+        if self.quota_units != self.chips:
+            raise HardwareCatalogError(
+                f"{self.accelerator_type}: a GPU shape bills one quota unit per device, "
+                f"so {self.quota_units} quota units cannot describe {self.chips} devices"
+            )
+        if self.multislice_capable:
+            raise HardwareCatalogError(f"{self.accelerator_type}: multislice is a Cloud TPU concept, not a GPU one")
+        backend = self.capacity_backend.strip().lower().replace("_", "-")
+        if backend not in _COMPUTE_BACKENDS:
+            raise HardwareCatalogError(
+                f"{self.accelerator_type}: a GPU shape is provisioned as a VM, "
+                f"so capacity_backend {self.capacity_backend!r} cannot serve it"
+            )
+        for field_name in ("gpu_model", "machine_type"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise HardwareCatalogError(
+                    f"{self.accelerator_type}: a GPU shape must name a non-empty trimmed {field_name}"
+                )
+        if self.tpu_type is not None:
+            raise HardwareCatalogError(f"{self.accelerator_type}: a GPU shape cannot name a tpu_type")
+
     @property
     def schedulable_tpu(self) -> int:
         """Return the TPU resource count Eyvan schedules against.
@@ -159,6 +250,29 @@ class AcceleratorShape:
         """
 
         return self.chips if self.kind == "tpu" else 0
+
+    @property
+    def schedulable_gpu(self) -> int:
+        """Return the GPU resource count Eyvan schedules against.
+
+        Zero for a TPU shape, for the same reason :attr:`schedulable_tpu` is
+        zero for a GPU one: a caller asking "how much of dimension X does this
+        shape offer" must get an answer that is safe to add up.
+        """
+
+        return self.chips if self.kind == "gpu" else 0
+
+    @property
+    def devices_per_host(self) -> int | None:
+        """Return accelerators on one host, or ``None`` when it is not recorded.
+
+        ``None`` is a real answer and must stay one. A GPU row always records it
+        because per-rank device assignment cannot be derived without it; several
+        TPU rows deliberately do not, and turning that absence into a number is
+        how Eyvan would start pinning ranks to devices that do not exist.
+        """
+
+        return self.chips_per_host
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +492,7 @@ def validate_accelerator_write_boundary(
 __all__: tp.Final = (
     "CATALOG_PATH",
     "SUPPORTED_CATALOG_VERSION",
+    "SUPPORTED_KINDS",
     "AcceleratorShape",
     "HardwareCatalog",
     "HardwareCatalogError",

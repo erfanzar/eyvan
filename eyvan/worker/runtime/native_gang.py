@@ -3,7 +3,21 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Coordinated native execution across several independently managed cells."""
+"""Coordinated native execution across several independently managed cells.
+
+A gang is heterogeneous by construction: each member is an independently
+allocated cell with its own fence, and nothing requires two members to hold the
+same accelerator. What was missing was the environment a GPU member's rank needs
+-- which devices it owns, and where the collective rendezvous is -- so a gang
+containing a GPU cell formed a JAX cluster and then left every rank to guess its
+devices.
+
+**Nothing in the GPU path is hardware-qualified.** No GPU has executed an Eyvan
+workload. What is claimed here, and tested, is that the per-rank device
+assignment is exact and non-overlapping and that a submission cannot spoof it.
+Whether a real multi-GPU host then trains is unknown and is not asserted
+anywhere in this file.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +37,12 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadStatus,
     MutationContext,
 )
-from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.distributed_environment import (
+    GpuDevicePlan,
+    plan_gpu_devices,
+    without_distributed_topology_overrides,
+    without_gpu_topology_overrides,
+)
 from eyvan.worker.runtime._multihost_site import (
     DEFAULT_GANG_INITIALIZATION,
     GangInitializationPolicy,
@@ -82,12 +101,36 @@ class NativeGangWorkloadResult(ExecutionWorkloadResult):
 
 @dataclass(frozen=True, slots=True)
 class NativeGangMember:
-    """Native-worker endpoints and fence owned by one execution cell."""
+    """Native-worker endpoints and fence owned by one execution cell.
+
+    ``gpu_devices_per_host`` is how many GPUs each of this member's hosts
+    carries, taken from the hardware catalog entry for the cell's accelerator
+    type (:attr:`AcceleratorShape.devices_per_host`). Leaving it ``None`` is the
+    shipped behaviour and means "this member is not GPU-coordinated": no GPU
+    variable is written and no GPU variable is stripped, so a gang built the way
+    every existing caller builds one behaves exactly as it does today.
+
+    ``None`` is deliberately not "zero devices". An unknown device count is
+    unknown; a zero would be a claim that the host has no GPU, and it would be
+    delivered as an empty ``CUDA_VISIBLE_DEVICES``, which is how a rank ends up
+    on the CPU while its peers wait for it at a collective.
+
+    Attributes:
+        cell_id: The execution cell that owns these endpoints.
+        endpoints: One native-worker endpoint per host in the cell.
+        secret: The cell-scoped native-worker bearer token.
+        context: The cell-scoped mutation fence.
+        gpu_devices_per_host: GPUs on each of this member's hosts, or ``None``
+            when the member is not GPU-coordinated.
+        gpu_model: The attached accelerator's provider name, when recorded.
+    """
 
     cell_id: str
     endpoints: tuple[str, ...]
     secret: str
     context: MutationContext
+    gpu_devices_per_host: int | None = None
+    gpu_model: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cell_id, str) or not self.cell_id.strip():
@@ -100,6 +143,18 @@ class NativeGangMember:
             raise ValueError("native gang member worker endpoints must be unique")
         if not isinstance(self.secret, str) or not self.secret.strip():
             raise ValueError("native gang member requires a non-empty worker bearer secret")
+        if self.gpu_devices_per_host is not None and (
+            isinstance(self.gpu_devices_per_host, bool)
+            or not isinstance(self.gpu_devices_per_host, int)
+            or self.gpu_devices_per_host <= 0
+        ):
+            raise ValueError("native gang member GPU device count must be a positive integer or absent")
+        if self.gpu_model is not None and (
+            not isinstance(self.gpu_model, str) or not self.gpu_model.strip() or self.gpu_model != self.gpu_model.strip()
+        ):
+            raise ValueError("native gang member GPU model must be non-empty and trimmed or absent")
+        if self.gpu_model is not None and self.gpu_devices_per_host is None:
+            raise ValueError("native gang member naming a GPU model must also state its device count")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +166,8 @@ class _GangWorker:
     endpoint: str
     context: MutationContext
     executor: NativeRemoteExecutor
+    gpu_devices: int | None = None
+    gpu_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,9 +366,22 @@ class NativeGangExecutor:
         if coordinator.scheme not in {"http", "https"} or not coordinator.hostname:
             raise ValueError("native gang coordinator endpoint must be an HTTP URL with a host")
 
+        declared_gpu = [member.gpu_devices_per_host is not None for member in ordered_members]
+        if any(declared_gpu) and not all(declared_gpu):
+            # Partial knowledge is the dangerous state: the declared members
+            # would be pinned to exact devices while the undeclared ones kept
+            # whatever the submission said, and the gang would look coordinated.
+            # An unknown device count stays unknown for the whole gang.
+            undeclared = ", ".join(member.cell_id for member in ordered_members if member.gpu_devices_per_host is None)
+            raise ValueError(
+                "native gang GPU coordination requires every member to declare its device count; "
+                f"missing for cell(s) {undeclared}"
+            )
+
         self.members = ordered_members
         self.endpoints = endpoints
         self.initialization = initialization
+        self._coordinator_host = coordinator.hostname
         self._coordinator_address = f"{coordinator.hostname}:{_COORDINATOR_PORT}"
         supplied_clients = clients or (None,) * len(flattened)
         self._workers = tuple(
@@ -321,9 +391,17 @@ class NativeGangExecutor:
                 endpoint=endpoint,
                 context=member.context,
                 executor=NativeRemoteExecutor(endpoint, secret=member.secret, client=client),
+                gpu_devices=member.gpu_devices_per_host,
+                gpu_model=member.gpu_model,
             )
             for (member, cell_index, endpoint), client in zip(flattened, supplied_clients, strict=True)
         )
+        gpu_devices_per_rank = [
+            member.gpu_devices_per_host for member, _, _ in flattened if member.gpu_devices_per_host is not None
+        ]
+        # Every member declared, so one entry per flattened host: a member with
+        # four hosts contributes its device count four times, once per rank.
+        self.gpu_plan: GpuDevicePlan | None = plan_gpu_devices(gpu_devices_per_rank) if all(declared_gpu) else None
 
     def health(self) -> bool:
         """Return whether every native worker accepts its cell-scoped credential."""
@@ -347,6 +425,11 @@ class NativeGangExecutor:
                 raise ValueError("native gang workload environment must be a string mapping")
             environment[key] = value
         environment = without_distributed_topology_overrides(environment)
+        if self.gpu_plan is not None:
+            # Stripped here, before anything is written back, for the same
+            # reason the JAX topology is: a value the submission chose must not
+            # survive into a rank whose devices Eyvan has decided.
+            environment = without_gpu_topology_overrides(environment)
         python_path = environment.get("PYTHONPATH", "")
         environment.update(
             {
@@ -372,6 +455,14 @@ class NativeGangExecutor:
         # prefix is Eyvan's -- and could otherwise hand every rank a one-second
         # barrier and blame the fleet.
         environment.update(self.initialization.environment())
+        if self.gpu_plan is not None:
+            environment.update(
+                self.gpu_plan.rank_environment(
+                    rank,
+                    rendezvous_host=self._coordinator_host,
+                    gpu_model=worker.gpu_model,
+                )
+            )
         payload["environment"] = environment
         return payload
 
