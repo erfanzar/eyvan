@@ -625,7 +625,6 @@ class FleetStateStore:
         self.backend.update(update)
         return result.get("record")
 
-
     def tombstone_record(
         self,
         name: str,
