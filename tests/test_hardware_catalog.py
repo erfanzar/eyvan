@@ -372,6 +372,40 @@ def test_chips_and_quota_units_are_kept_distinct() -> None:
     assert shape.schedulable_tpu == 8
 
 
+def test_every_shipped_shape_states_the_host_it_describes() -> None:
+    """The invariant, applied to every kind rather than to the rows that existed.
+
+    ``EXPECTED`` above names TPU rows one by one; a GPU row added without a host
+    CPU or memory figure would simply not be listed there and would ship. This
+    is the check that does not need updating when a kind is added.
+    """
+
+    for shape in hardware_catalog().shapes:
+        assert shape.kind in {"gpu", "tpu"}, shape.accelerator_type
+        assert shape.host_cpu > 0, shape.accelerator_type
+        assert shape.host_memory_gib > 0, shape.accelerator_type
+        assert shape.source_url.startswith("https://"), shape.accelerator_type
+        assert shape.source_version.strip(), shape.accelerator_type
+        # Exactly one dimension, so a caller adding shapes up cannot double-count.
+        assert (shape.schedulable_tpu > 0) != (shape.schedulable_gpu > 0), shape.accelerator_type
+
+
+def test_a_gpu_shape_never_becomes_a_queued_tpu_autoscale_worker() -> None:
+    """Queued resources are a Cloud TPU mechanism; a GPU row must not reach it.
+
+    ``DEFAULT_TPU_PROFILES`` and the discovery path both read the whole catalog,
+    so adding a kind to the catalog is exactly when a filter that was previously
+    unobservable starts to matter.
+    """
+
+    gpu_types = {shape.accelerator_type for shape in hardware_catalog().shapes if shape.kind == "gpu"}
+
+    assert gpu_types, "the catalog no longer ships a GPU row and this test is checking nothing"
+    assert gpu_types.isdisjoint({profile.accelerator_type for profile in DEFAULT_TPU_PROFILES})
+    for accelerator_type in gpu_types:
+        assert tpu_profile_from_accelerator_type(accelerator_type) is None, accelerator_type
+
+
 def test_the_catalog_is_packaged_in_the_wheel() -> None:
     """Data beside code is only shipped if the build backend is told.
 
