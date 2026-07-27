@@ -3,14 +3,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""A DAG's entry fan-out is bounded, and its progress survives a restart.
+"""A DAG's fan-out is bounded wherever it happens, and survives a restart.
 
 A DAG with five hundred independent roots floods the queue exactly like an array
-does, so the same wave bounds it. What waves do *not* touch is a node released
-because its predecessors succeeded: that gate is the dependency, not the plan,
-and holding such a node back would stall a pipeline mid-flight. This asserts
-both -- the bound on the entry, and the deliberate absence of a bound on the
-dependency path -- so neither is mistaken for the other later.
+does, so the same wave bounds it. So does one root fanning out to five hundred
+dependents: the dependency is what decides a node is *eligible*, and the wave is
+what decides how many eligible nodes compete at once. Both paths read the same
+plan and count the same occupancy, so a stage completing cannot exceed the bound
+its expansion was admitted under.
+
+What the wave *phase* still does not do is release a dependent node. Its gate is
+its predecessor, and releasing it early would run a stage before the stage it
+waits for. This asserts both halves so neither is mistaken for the other later.
 """
 
 from __future__ import annotations
@@ -41,6 +45,18 @@ def _principal() -> Principal:
         subject="alice",
         grants=(
             RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),
+            RoleGrant(role=Role.FLEET_ADMIN),
+        ),
+    )
+
+
+def _other_principal() -> Principal:
+    """A second tenant, in its own organization and project."""
+
+    return Principal(
+        subject="bob",
+        grants=(
+            RoleGrant(role=Role.PROJECT_OPERATOR, org_id="globex", project_id="ops"),
             RoleGrant(role=Role.FLEET_ADMIN),
         ),
     )
@@ -207,6 +223,189 @@ async def test_dag_progress_is_derivable_after_a_control_plane_restart() -> None
     assert admission is not None
     assert admission.released_children == 4
     assert admission.state is ExpansionAdmissionState.ADMITTING
+
+
+async def _competing(service: ControlPlaneService, parent_id: str) -> list[str]:
+    """Return the names of one DAG's children that are holding a queue place."""
+
+    async with service.repository.transaction() as tx:
+        children = await tx.list_child_workloads(parent_id)
+    return sorted(
+        child.spec.name
+        for child in children
+        if child.schedulable
+        and child.state not in {WorkloadState.SUCCEEDED, WorkloadState.FAILED, WorkloadState.CANCELLED}
+    )
+
+
+async def _release_events(service: ControlPlaneService) -> list[str]:
+    """Return every workload a DAG release was recorded for, with repeats."""
+
+    async with service.repository.transaction() as tx:
+        events = await tx.list_events(entity_type="workload", limit=1000)
+    return [event.entity_id for event in events if event.action == "workload.dag_released"]
+
+
+async def test_a_completing_stage_does_not_exceed_the_wave() -> None:
+    """The defect: a stage finishing used to release every dependent it unblocked.
+
+    One root fanning out to a wide second stage is the same flood as a wide entry
+    fan-out, and the wave the expansion was admitted under has to bound both.
+    """
+
+    service = await _service(wave=2)
+    parent, nodes = await service.submit_dag(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        nodes=[
+            DagNode(name="root-a", template=_template()),
+            DagNode(name="root-b", template=_template()),
+            DagNode(name="root-c", template=_template()),
+            *[DagNode(name=f"fan-{index}", template=_template(), depends_on=("root-a",)) for index in range(4)],
+        ],
+        idempotency_key="dag-1",
+        name_prefix="wide",
+    )
+    controller = _controller(service)
+    stages = _by_name(nodes)
+    assert await _competing(service, parent.id) == ["wide-root-a", "wide-root-b"]
+
+    await _succeed(service, stages["wide-root-a"].id)
+
+    # root-a's place is free and root-b still holds the other, so exactly one of
+    # the four dependents it unblocked may compete.
+    assert await controller.release_ready_dag_nodes_once() == 1
+    assert await _competing(service, parent.id) == ["wide-fan-0", "wide-root-b"]
+    assert await controller.release_ready_dag_nodes_once() == 0
+    assert await _competing(service, parent.id) == ["wide-fan-0", "wide-root-b"]
+
+    await _succeed(service, stages["wide-root-b"].id)
+    assert await controller.release_ready_dag_nodes_once() == 1
+    assert await _competing(service, parent.id) == ["wide-fan-0", "wide-fan-1"]
+
+
+async def test_an_interrupted_dependent_release_neither_loses_nor_duplicates_a_node() -> None:
+    """Nothing about a half-released stage lives in the leader that released it.
+
+    The whole decision -- the plan, the occupancy, and which node is next -- is
+    read back out of durable rows, so a replacement leader resumes at the node
+    the dead one stopped at instead of re-releasing what it already flipped or
+    skipping what it had not.
+    """
+
+    service = await _service(wave=2)
+    repository = service.repository
+    parent, nodes = await service.submit_dag(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        nodes=[
+            DagNode(name="root-a", template=_template()),
+            DagNode(name="root-b", template=_template()),
+            DagNode(name="root-c", template=_template()),
+            *[DagNode(name=f"fan-{index}", template=_template(), depends_on=("root-a",)) for index in range(5)],
+        ],
+        idempotency_key="dag-1",
+        name_prefix="pipeline",
+    )
+    stages = _by_name(nodes)
+    await _succeed(service, stages["pipeline-root-a"].id, stages["pipeline-root-b"].id)
+
+    drained: list[str] = []
+    for _ in range(5):
+        # A fresh service and controller over the same rows on every pass: the
+        # leader that released the previous nodes is gone, and nothing it knew
+        # survived except the rows it committed.
+        restarted = ControlPlaneService(repository)
+        await _controller(restarted).release_ready_dag_nodes_once()
+        competing = await _competing(restarted, parent.id)
+        assert len(competing) <= 2, "a restart must not release past the wave"
+        drained.extend(competing)
+        await _succeed(restarted, *[stages[name].id for name in competing])
+
+    released = await _release_events(service)
+    assert sorted(released) == sorted(set(released)), "no node was released twice"
+    assert set(drained) == {f"pipeline-fan-{index}" for index in range(5)}, "no node was lost"
+    async with repository.transaction() as tx:
+        stored = [await tx.get_workload(stages[f"pipeline-fan-{index}"].id) for index in range(5)]
+    assert all(item is not None and item.schedulable for item in stored)
+
+
+async def test_a_dag_admitted_immediately_releases_its_dependents_unbounded() -> None:
+    """The boundary of the bound, stated rather than implied.
+
+    A wave plan is durable and is written only for an expansion that was
+    actually admitted under one. A DAG whose entry fan-out already fitted in a
+    wave was admitted immediately and has no plan, so its dependent releases are
+    unbounded -- which is what its submitter was told at admission. Re-planning
+    it here from live configuration would bound a running expansion by a setting
+    it was never admitted against.
+    """
+
+    service = await _service(wave=2)
+    parent, nodes = await service.submit_dag(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        nodes=[
+            DagNode(name="root", template=_template()),
+            *[DagNode(name=f"fan-{index}", template=_template(), depends_on=("root",)) for index in range(4)],
+        ],
+        idempotency_key="dag-1",
+        name_prefix="immediate",
+    )
+    controller = _controller(service)
+    async with service.repository.transaction() as tx:
+        assert await tx.get_expansion_admission(parent.id) is None
+
+    await _succeed(service, _by_name(nodes)["immediate-root"].id)
+
+    assert await controller.release_ready_dag_nodes_once() == 4
+    assert await _competing(service, parent.id) == [f"immediate-fan-{index}" for index in range(4)]
+
+
+async def test_a_second_tenant_is_unaffected_while_a_large_dag_drains() -> None:
+    """The bound is per expansion, so one tenant's backlog is not another's."""
+
+    service = await _service(wave=1)
+    big, big_nodes = await service.submit_dag(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        nodes=[
+            *[DagNode(name=f"root-{index}", template=_template()) for index in range(8)],
+            *[DagNode(name=f"fan-{index}", template=_template(), depends_on=("root-0",)) for index in range(8)],
+        ],
+        idempotency_key="dag-big",
+        name_prefix="big",
+    )
+    small, small_nodes = await service.submit_dag(
+        _other_principal(),
+        org_id="globex",
+        project_id="ops",
+        nodes=[
+            DagNode(name="prepare", template=_template()),
+            DagNode(name="spare-a", template=_template()),
+            DagNode(name="spare-b", template=_template()),
+            DagNode(name="train", template=_template(), depends_on=("prepare",)),
+        ],
+        idempotency_key="dag-small",
+        name_prefix="small",
+    )
+    controller = _controller(service)
+    async with service.repository.transaction() as tx:
+        assert (await tx.get_expansion_admission(big.id)).wave_size == 1
+        assert (await tx.get_expansion_admission(small.id)).wave_size == 1
+    await _succeed(service, _by_name(big_nodes)["big-root-0"].id, _by_name(small_nodes)["small-prepare"].id)
+
+    assert await controller.release_ready_dag_nodes_once() == 2
+
+    # Each DAG gets exactly the one place its own wave allows: the small one's
+    # stage is not held behind the large one's eight-deep backlog, and the large
+    # one does not borrow the small one's place.
+    assert await _competing(service, big.id) == ["big-fan-0"]
+    assert await _competing(service, small.id) == ["small-train"]
 
 
 async def test_an_unbounded_dag_keeps_todays_shape_exactly() -> None:

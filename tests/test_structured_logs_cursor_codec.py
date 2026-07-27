@@ -28,6 +28,11 @@ from eyvan.worker.runtime.log_records import (
     _LOG_CURSOR_MAX_BYTES,
     _LOG_CURSOR_MAX_ENTRIES,
     _LOG_CURSOR_MAX_VALUE_BYTES,
+    ARCHIVE_OFFSET_PREFIX,
+    ARCHIVE_POSITION_AMBIGUOUS,
+    ARCHIVE_POSITION_BEYOND_ARCHIVE,
+    ARCHIVE_POSITION_MALFORMED,
+    ARCHIVE_POSITION_UNKNOWN,
     CURSOR_ATTEMPT_CHANGED,
     CURSOR_DUPLICATE_KEY,
     CURSOR_DUPLICATE_RANK,
@@ -53,6 +58,8 @@ from eyvan.worker.runtime.log_records import (
     CURSOR_WORKLOAD_MISMATCH,
     INVALID_LOG_RANK,
     LOG_CURSOR_V2_EMISSION_ENV,
+    ArchiveGap,
+    ArchiveOffset,
     CursorContext,
     CursorFresh,
     CursorIncompatible,
@@ -60,10 +67,14 @@ from eyvan.worker.runtime.log_records import (
     CursorPosition,
     CursorResume,
     decode_log_cursor,
+    encode_archive_offset,
     encode_log_cursor,
+    encode_unplaced_archive_position,
+    is_archive_position,
     join_log_cursor,
     log_cursor_v2_emission_enabled,
     log_page_from_json,
+    resolve_archive_position,
 )
 
 _PREFIX = "eyvan-log-v2."
@@ -695,3 +706,81 @@ def test_a_boolean_pid_is_not_read_as_process_one() -> None:
     page = log_page_from_json({"records": [{"message": "a", "pid": True}]})
 
     assert page.records[0].pid is None
+
+
+# --------------------------------------------------------------------------- archive positions
+
+
+def test_an_empty_position_starts_the_archive_from_its_first_line() -> None:
+    """The only input that means "start", here as in the cursor decoder."""
+
+    assert resolve_archive_position("", ["c0", "c1"], rank=2) == ArchiveOffset(rank=2, offset=0)
+
+
+def test_a_source_position_resumes_at_the_line_after_the_one_it_names() -> None:
+    """The handover: every archived line keeps the position its backend issued."""
+
+    assert resolve_archive_position("c1", ["c0", "c1", "c2"], rank=0) == ArchiveOffset(rank=0, offset=2)
+
+
+def test_a_source_position_no_archived_line_carries_is_a_gap_not_offset_zero() -> None:
+    """Offset zero replays the object, and the receiver cannot tell it happened."""
+
+    outcome = resolve_archive_position("c9", ["c0", "c1"], rank=3)
+
+    assert isinstance(outcome, ArchiveGap)
+    assert outcome.reason == ARCHIVE_POSITION_UNKNOWN
+    assert (outcome.rank, outcome.position) == (3, "c9")
+
+
+def test_a_position_two_archived_lines_carry_is_a_gap_rather_than_a_choice() -> None:
+    """One answer duplicates lines and the other drops them; neither is known."""
+
+    outcome = resolve_archive_position("same", ["same", "other", "same"], rank=0)
+
+    assert isinstance(outcome, ArchiveGap)
+    assert outcome.reason == ARCHIVE_POSITION_AMBIGUOUS
+
+
+def test_an_offset_past_the_end_of_the_object_is_a_gap() -> None:
+    """The object cannot have served more lines than it holds."""
+
+    outcome = resolve_archive_position(encode_archive_offset(3), ["c0", "c1"], rank=0)
+
+    assert isinstance(outcome, ArchiveGap)
+    assert outcome.reason == ARCHIVE_POSITION_BEYOND_ARCHIVE
+
+
+def test_an_offset_at_the_end_of_the_object_is_a_caught_up_follower() -> None:
+    """ "Nothing new" and "cannot be placed" are different answers."""
+
+    assert resolve_archive_position(encode_archive_offset(2), ["c0", "c1"], rank=0) == ArchiveOffset(rank=0, offset=2)
+
+
+@pytest.mark.parametrize("text", ["", "-1", "01", " 1", "1_0", "1.0"])
+def test_a_malformed_offset_is_a_gap_rather_than_a_guess(text: str) -> None:
+    """Two spellings of one offset, or none at all, must not both resolve."""
+
+    outcome = resolve_archive_position(f"{ARCHIVE_OFFSET_PREFIX}{text}", ["c0"], rank=0)
+
+    assert isinstance(outcome, ArchiveGap)
+    assert outcome.reason == ARCHIVE_POSITION_MALFORMED
+
+
+def test_an_archive_position_is_recognisable_without_a_bound_envelope() -> None:
+    """The default envelope carries no mode, so the value has to say what it is."""
+
+    assert is_archive_position(encode_archive_offset(4))
+    assert is_archive_position(encode_unplaced_archive_position("s=journal;i=9"))
+    assert not is_archive_position("s=journal;i=9")
+    assert not is_archive_position("4")
+
+
+def test_an_unplaced_position_is_retained_verbatim_behind_its_tag() -> None:
+    """It has to survive the round trip, or the next poll is a first read again."""
+
+    tagged = encode_unplaced_archive_position("s=journal;i=9")
+
+    assert tagged.endswith("s=journal;i=9")
+    assert encode_unplaced_archive_position(tagged) == tagged
+    assert resolve_archive_position(tagged, ["s=journal;i=9"], rank=0) == ArchiveOffset(rank=0, offset=1)

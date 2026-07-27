@@ -25,6 +25,13 @@ time, so a ten-thousand-task array does not bury another tenant's single job
 behind ten thousand queue entries. The rest are released as earlier children
 finish.
 
+The bound is on *competing*, not on how a child came to compete. A DAG node
+released because its predecessors succeeded holds a place in the queue exactly
+like an entry root does, so both paths ask this module the same question and
+count against the same occupancy. Bounding only the entry fan-out would let one
+root fanning out to five hundred dependents exceed its own plan the moment a
+stage finished.
+
 Waves are off by default (``wave_size=0``), which is exactly today's behaviour:
 every child admitted immediately. An operator who turns them on is choosing to
 trade an array's own start latency for the queue's.
@@ -41,6 +48,11 @@ from dataclasses import dataclass
 
 from eyvan.records import ExpansionMode
 from eyvan.server.service.errors import InputError
+
+#: One child of an expansion, whatever record type the caller holds. The wave
+#: arithmetic never reads a field, so this module stays a pure planner rather
+#: than a second place workload records are interpreted.
+_ChildT = tp.TypeVar("_ChildT")
 
 #: Default ceiling on children created by one expansion. Matches the historical
 #: ``batch.DEFAULT_MAX_FAN_OUT`` so an operator who configures nothing keeps the
@@ -201,6 +213,60 @@ def wave_size_for(
     return max(min(candidates), 1)
 
 
+def wave_openings(wave_size: int | None, *, competing: int) -> int | None:
+    """Return how many more children of one expansion may compete right now.
+
+    ``None`` in either direction means *unbounded*: an expansion no wave plan
+    governs is not an expansion with a wave of zero, and reporting it as one
+    would stall every DAG in a deployment that never turned waves on.
+
+    ``competing`` is counted from the children themselves -- every child holding
+    a place in the queue, however it got there. A counter would be a second
+    opinion about the same fact, and the two disagree exactly when a leader dies
+    between flipping a child and committing the count.
+
+    Args:
+        wave_size: How many children this expansion may have competing at once,
+            or ``None`` when nothing bounds it.
+        competing: Children of this expansion that are competing now.
+
+    Returns:
+        The number of further children that may be released, never negative, or
+        ``None`` when the expansion is unbounded.
+    """
+
+    if wave_size is None:
+        return None
+    return max(wave_size - max(competing, 0), 0)
+
+
+def bounded_release(
+    ready: tp.Sequence[_ChildT],
+    *,
+    competing: int,
+    wave_size: int | None,
+) -> tuple[_ChildT, ...]:
+    """Return the prefix of ``ready`` that fits under one expansion's wave.
+
+    ``ready`` must already be in the children's own stable order, because that
+    order *is* the decision about which child goes next: the same rows produce
+    the same prefix on every replica and after every restart, so a release that
+    was interrupted resumes at the child it stopped at rather than at whatever a
+    counter last recorded.
+
+    Args:
+        ready: Children eligible for release, in their stable order.
+        competing: Children of the same expansion already competing.
+        wave_size: The expansion's wave, or ``None`` when unbounded.
+
+    Returns:
+        The children to release in this pass, possibly empty.
+    """
+
+    openings = wave_openings(wave_size, competing=competing)
+    return tuple(ready) if openings is None else tuple(ready[:openings])
+
+
 def quota_headroom_children(
     limits: tp.Mapping[str, float],
     usage: tp.Mapping[str, float],
@@ -238,7 +304,9 @@ __all__ = (
     "ExpansionLimits",
     "ExpansionMode",
     "ExpansionRefused",
+    "bounded_release",
     "plan_expansion",
     "quota_headroom_children",
+    "wave_openings",
     "wave_size_for",
 )

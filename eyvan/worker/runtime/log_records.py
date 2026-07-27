@@ -879,6 +879,184 @@ def join_log_cursor(attempt: int, cursors: tp.Mapping[int, str]) -> str:
     return encode_log_cursor(cursors, context=CursorContext(attempt=attempt))
 
 
+# --------------------------------------------------------------------------- archive positions
+#
+# A live position addresses a backend journal; an archive position addresses an
+# immutable object. The handover between them is where a follower that outlives
+# its cell either continues or starts printing the whole archive again on every
+# poll, so the two are never conflated: a live position is *translated* into an
+# archive offset by finding the line it names, and a position that cannot be
+# translated is a named gap rather than a rewind to zero.
+
+#: Marks a position as an offset into an archived rank object: how many of that
+#: rank's archived lines the follower has already been served.
+ARCHIVE_OFFSET_PREFIX = "eyvan-archive-offset:"
+#: Marks a source position that could not be placed in the archive, retained
+#: verbatim behind the tag. Dropping it would present the next poll as a first
+#: read and replay the whole object; rewriting it as an offset would invent a
+#: place for it. Kept, so the same gap is reported again instead of either.
+ARCHIVE_SOURCE_PREFIX = "eyvan-archive-source:"
+
+#: Stable reasons one rank's archived continuation could not be served. Routed
+#: on by callers; the detail carries the human sentence.
+ARCHIVE_POSITION_UNKNOWN = "archive_position_unknown"
+ARCHIVE_POSITION_AMBIGUOUS = "archive_position_ambiguous"
+ARCHIVE_POSITION_BEYOND_ARCHIVE = "archive_position_beyond_archive"
+ARCHIVE_POSITION_MALFORMED = "archive_position_malformed"
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveOffset:
+    """Where one rank's archived replay resumes.
+
+    Attributes:
+        rank: Global rank inside the attempt's flattened rank space.
+        offset: Lines of that rank's object already served. ``0`` is a first
+            read; ``len(object)`` is a follower that is fully caught up.
+    """
+
+    rank: int
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveGap:
+    """Why one rank's archived continuation cannot be served.
+
+    An explicit outcome rather than an offset of zero. The two are opposites: a
+    zero offset replays the rank from its first line, which is precisely the
+    duplicate output the translation exists to prevent, and it is
+    indistinguishable from a first read to the follower receiving it.
+
+    Attributes:
+        rank: Global rank whose position could not be placed.
+        reason: Stable machine-readable code.
+        detail: One human sentence naming what failed.
+        position: The source position, retained so the next poll reports the
+            same gap instead of restarting the object.
+    """
+
+    rank: int
+    reason: str
+    detail: str
+    position: str = ""
+
+
+ArchivePlacement = ArchiveOffset | ArchiveGap
+
+
+def encode_archive_offset(offset: int) -> str:
+    """Return the tagged position meaning "``offset`` lines already served".
+
+    Args:
+        offset: Lines of one rank's archived object already served.
+
+    Returns:
+        The tagged position.
+
+    Raises:
+        ValueError: If ``offset`` is not a non-negative integer.
+    """
+
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("an archive offset must be a non-negative integer")
+    return f"{ARCHIVE_OFFSET_PREFIX}{offset}"
+
+
+def encode_unplaced_archive_position(position: str) -> str:
+    """Return ``position`` tagged as a source position the archive could not place."""
+
+    if not isinstance(position, str):
+        raise ValueError("an archive source position must be a string")
+    if position.startswith(ARCHIVE_SOURCE_PREFIX):
+        return position
+    return f"{ARCHIVE_SOURCE_PREFIX}{position}"
+
+
+def is_archive_position(value: object) -> bool:
+    """Return whether ``value`` was minted by an archive read.
+
+    The tag is on the value, not only on the envelope, because the envelope
+    emitted by default carries no ``mode`` field. Without it a reader meeting a
+    bare integer could not tell an archive offset from a backend cursor that
+    happens to be numeric, and would hand one to the other's reader.
+    """
+
+    return isinstance(value, str) and value.startswith((ARCHIVE_OFFSET_PREFIX, ARCHIVE_SOURCE_PREFIX))
+
+
+def resolve_archive_position(
+    position: str,
+    line_cursors: tp.Sequence[str],
+    *,
+    rank: int,
+) -> ArchivePlacement:
+    """Place one presented position inside one rank's archived object.
+
+    Three inputs are accepted and told apart without guessing: empty (a first
+    read), a tagged archive offset (a follower already reading the archive), and
+    a backend cursor (a follower crossing the live-to-archive boundary). The last
+    is translated by finding the archived line that carries exactly that cursor,
+    which is what makes the handover continue rather than restart -- every
+    archived record keeps the position its backend issued for it.
+
+    A position that matches no line, or more than one, is a
+    :class:`ArchiveGap`. Both are honestly unknown: the first cannot be placed at
+    all, and the second names two different places in the same object. Resolving
+    either to an offset would silently duplicate or silently drop lines, and the
+    receiver could not tell which.
+
+    Args:
+        position: The presented position for this rank.
+        line_cursors: The backend cursor of each archived line, in file order.
+        rank: Global rank being placed, carried into the outcome.
+
+    Returns:
+        The offset to resume from, or the gap that explains why there is none.
+    """
+
+    if not position:
+        return ArchiveOffset(rank=rank, offset=0)
+    if position.startswith(ARCHIVE_OFFSET_PREFIX):
+        text = position.removeprefix(ARCHIVE_OFFSET_PREFIX)
+        if not _CANONICAL_DECIMAL.match(text):
+            return ArchiveGap(
+                rank=rank,
+                reason=ARCHIVE_POSITION_MALFORMED,
+                detail=f"archive offset {text!r} for rank {rank} is not a decimal integer",
+                position=position,
+            )
+        offset = int(text)
+        if offset > len(line_cursors):
+            return ArchiveGap(
+                rank=rank,
+                reason=ARCHIVE_POSITION_BEYOND_ARCHIVE,
+                detail=(
+                    f"rank {rank}'s archive holds {len(line_cursors)} line(s), "
+                    f"fewer than the {offset} this position claims were already served"
+                ),
+                position=position,
+            )
+        return ArchiveOffset(rank=rank, offset=offset)
+    source = position.removeprefix(ARCHIVE_SOURCE_PREFIX)
+    matches = [index for index, cursor in enumerate(line_cursors) if cursor and cursor == source]
+    if not matches:
+        return ArchiveGap(
+            rank=rank,
+            reason=ARCHIVE_POSITION_UNKNOWN,
+            detail=f"no archived line for rank {rank} carries the presented source position",
+            position=source,
+        )
+    if len(matches) > 1:
+        return ArchiveGap(
+            rank=rank,
+            reason=ARCHIVE_POSITION_AMBIGUOUS,
+            detail=f"rank {rank}'s archive carries the presented source position {len(matches)} times",
+            position=source,
+        )
+    return ArchiveOffset(rank=rank, offset=matches[0] + 1)
+
+
 def _stream_from_wire(value: object) -> LogStream:
     """Accept a stream name the sender already decoded.
 
@@ -1078,6 +1256,12 @@ def _optional_int(value: object) -> int | None:
 
 
 __all__ = (
+    "ARCHIVE_OFFSET_PREFIX",
+    "ARCHIVE_POSITION_AMBIGUOUS",
+    "ARCHIVE_POSITION_BEYOND_ARCHIVE",
+    "ARCHIVE_POSITION_MALFORMED",
+    "ARCHIVE_POSITION_UNKNOWN",
+    "ARCHIVE_SOURCE_PREFIX",
     "CURSOR_ATTEMPT_CHANGED",
     "CURSOR_DUPLICATE_KEY",
     "CURSOR_DUPLICATE_RANK",
@@ -1104,6 +1288,9 @@ __all__ = (
     "CURSOR_WORKLOAD_MISMATCH",
     "INVALID_LOG_RANK",
     "LOG_CURSOR_V2_EMISSION_ENV",
+    "ArchiveGap",
+    "ArchiveOffset",
+    "ArchivePlacement",
     "CursorContext",
     "CursorFresh",
     "CursorIncompatible",
@@ -1115,12 +1302,16 @@ __all__ = (
     "LogRecord",
     "LogStream",
     "decode_log_cursor",
+    "encode_archive_offset",
     "encode_log_cursor",
+    "encode_unplaced_archive_position",
+    "is_archive_position",
     "join_log_cursor",
     "log_cursor_v2_emission_enabled",
     "log_page_from_json",
     "merge_pages",
     "parse_journal_json",
+    "resolve_archive_position",
     "split_log_cursor",
     "stream_for_priority",
 )
