@@ -796,10 +796,27 @@ async def test_archive_overflow_is_trimmed_per_rank_and_replays_as_visibly_parti
         await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
     replayed = await controller.workload_log_page("wl-1")
 
-    assert len(replayed["records"]) == 2 * _LOG_ARCHIVE_LINE_LIMIT
+    # ``limit`` bounds an archived read exactly as it bounds a live one, per
+    # rank, and the page carries the cursor that continues it. Replaying all two
+    # thousand lines on every poll -- with no cursor to continue from -- is the
+    # behaviour this endpoint had before the archive honoured either.
+    assert len(replayed["records"]) == 2 * 200
     assert replayed["truncated_ranks"] == [0, 1]
     assert replayed["unavailable"] is False
-    by_rank = {rank: [record for record in replayed["records"] if record["rank"] == rank] for rank in (0, 1)}
+    assert replayed["next_cursor"]
+
+    seen = list(replayed["records"])
+    cursor = replayed["next_cursor"]
+    for _ in range(10):
+        page = await controller.workload_log_page("wl-1", after=cursor)
+        if not page["records"]:
+            break
+        seen.extend(page["records"])
+        cursor = page["next_cursor"]
+
+    keyed = [(record["rank"], record["message"]) for record in seen]
+    assert len(keyed) == len(set(keyed)) == 2 * _LOG_ARCHIVE_LINE_LIMIT, "no line served twice, none skipped"
+    by_rank = {rank: [record for record in seen if record["rank"] == rank] for rank in (0, 1)}
     for rank, records in by_rank.items():
         assert records[0]["message"] == f"rank-{rank}-line-1"
         assert records[-1]["message"] == f"rank-{rank}-line-{_LOG_ARCHIVE_LINE_LIMIT}"
@@ -991,6 +1008,472 @@ async def test_the_release_path_itself_archives(tmp_path) -> None:
 
     stored = access.store.get(log_uri("wl-1", 1, 0), org_id="acme", project_id="research")
     assert b"final line" in stored
+
+
+# --------------------------------------------------------------------------- live to archive
+
+
+class _JournalAgent:
+    """A cell whose journal is a fixed list of lines, each with its own position.
+
+    Reads resume strictly after the presented position, which is what a real
+    backend does and what makes the handover to the archive assertable: the
+    controller has to place that same position inside the archived object.
+    """
+
+    def __init__(self, lines: list[tuple[str, str]]) -> None:
+        self.lines = lines
+        self.calls: list[tuple[str, int]] = []
+
+    def log_page(self, _cell_id, _remote_id, *, after="", limit=200):
+        self.calls.append((after, limit))
+        start = 0
+        if after:
+            positions = [cursor for _message, cursor in self.lines]
+            start = positions.index(after) + 1 if after in positions else len(self.lines)
+        window = self.lines[start : start + limit]
+        return {
+            "records": [
+                {"message": message, "stream": "stdout", "cursor": cursor, "rank": 0, "pid": 7}
+                for message, cursor in window
+            ],
+            "next_cursor": window[-1][1] if window else "",
+            "unavailable": False,
+            "detail": "",
+            "truncated_ranks": [],
+        }
+
+
+async def _released(controller) -> None:
+    """Release the cell, so the journal the follower was reading is gone."""
+
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-1")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None}))
+        lease = await transaction.get_lease("lease-1")
+        await transaction.put_lease(lease.model_copy(update={"state": lease.state.__class__.RELEASED}))
+
+
+async def _journal_controller(tmp_path, lines: list[tuple[str, str]]):
+    """A workload whose cell serves ``lines`` and whose archive is already written."""
+
+    controller = await _controller_with(_JournalAgent(lines))
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
+    return controller
+
+
+async def test_a_follower_crossing_into_the_archive_neither_duplicates_nor_skips(tmp_path) -> None:
+    """The defect this translation exists for.
+
+    An archived read used to ignore ``after`` entirely, so a follower that
+    outlived its cell was served the whole archive again on every poll -- and
+    got no cursor back, so it could not have continued even if it wanted to. The
+    live position it is holding names a line that is *in* the archive, so the
+    read continues from that line instead of from the first one.
+    """
+
+    lines = [(f"line-{index}", f"c{index}") for index in range(5)]
+    controller = await _journal_controller(tmp_path, lines)
+
+    live = await controller.workload_log_page("wl-1", limit=2)
+    assert [record["message"] for record in live["records"]] == ["line-0", "line-1"]
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    handover = await controller.workload_log_page("wl-1", after=live["next_cursor"])
+
+    assert [record["message"] for record in handover["records"]] == ["line-2", "line-3", "line-4"]
+    assert handover["detail"].startswith("archived")
+    assert handover["truncated_ranks"] == []
+    assert handover["next_cursor"] and handover["next_cursor"] != live["next_cursor"]
+
+    # And the poll after that is empty rather than a second copy of the tail.
+    caught_up = await controller.workload_log_page("wl-1", after=handover["next_cursor"])
+    assert caught_up["records"] == []
+    assert caught_up["unavailable"] is False
+    assert caught_up["next_cursor"]
+
+    seen = [record["message"] for record in (*live["records"], *handover["records"], *caught_up["records"])]
+    assert seen == [message for message, _cursor in lines], "every line exactly once, in order"
+
+
+async def test_an_archived_read_honours_its_limit_and_continues(tmp_path) -> None:
+    """A page bound is a page bound wherever the bytes come from."""
+
+    lines = [(f"line-{index}", f"c{index}") for index in range(5)]
+    controller = await _journal_controller(tmp_path, lines)
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    pages: list[list[str]] = []
+    cursor = ""
+    for _ in range(4):
+        page = await controller.workload_log_page("wl-1", after=cursor, limit=2)
+        pages.append([record["message"] for record in page["records"]])
+        cursor = page["next_cursor"]
+
+    assert pages == [["line-0", "line-1"], ["line-2", "line-3"], ["line-4"], []]
+
+
+async def test_an_untranslatable_position_is_a_named_gap_not_a_replay(tmp_path) -> None:
+    """Unknown is reported, never resolved to "start from the beginning".
+
+    The two are indistinguishable to the follower receiving them, and the second
+    is a silent replay of the whole object. The position is kept, so the next
+    poll reports the same gap rather than rewinding.
+    """
+
+    from eyvan.worker.runtime.log_records import join_log_cursor
+
+    lines = [(f"line-{index}", f"c{index}") for index in range(3)]
+    controller = await _journal_controller(tmp_path, lines)
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    stranded = join_log_cursor(workload.attempt, {0: "a-position-no-archived-line-carries"})
+    page = await controller.workload_log_page("wl-1", after=stranded)
+
+    assert page["records"] == [], "the archive is not replayed behind a position that was not placed"
+    assert page["truncated_ranks"] == [0]
+    assert "archive_position_unknown" in page["detail"]
+
+    # The gap is stable: the next poll reports it again instead of restarting.
+    again = await controller.workload_log_page("wl-1", after=page["next_cursor"])
+    assert again["records"] == []
+    assert again["truncated_ranks"] == [0]
+    assert "archive_position_unknown" in again["detail"]
+
+
+async def test_each_rank_crosses_into_the_archive_at_its_own_position(tmp_path) -> None:
+    """Two ranks are two journals and two archived objects.
+
+    The failure a single-rank test cannot see: one position placed in another
+    rank's object either replays that rank or skips it, and the page looks
+    complete either way. The frozen rank space is what maps a cell's position
+    onto the global rank whose object holds it.
+    """
+
+    class _GangJournalAgent:
+        """A per-cell journal, each with its own positions."""
+
+        def __init__(self) -> None:
+            self.lines = {
+                "cell-a": [("a0", "ca0"), ("a1", "ca1"), ("a2", "ca2")],
+                "cell-b": [("b0", "cb0"), ("b1", "cb1"), ("b2", "cb2")],
+            }
+
+        def log_page(self, cell_id, _remote_id, *, after="", limit=200):
+            lines = self.lines[cell_id]
+            positions = [cursor for _message, cursor in lines]
+            start = (positions.index(after) + 1) if after in positions else 0
+            window = lines[start : start + limit]
+            return {
+                "records": [
+                    {"message": message, "stream": "stdout", "cursor": cursor, "rank": 0, "pid": 7}
+                    for message, cursor in window
+                ],
+                "next_cursor": window[-1][1] if window else "",
+                "unavailable": False,
+                "detail": "",
+                "truncated_ranks": [],
+            }
+
+    controller = await _gang_controller(_GangJournalAgent())
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
+
+    live = await controller.workload_log_page("wl-gang", limit=2)
+    assert [(record["rank"], record["message"]) for record in live["records"]] == [
+        (0, "a0"),
+        (0, "a1"),
+        (1, "b0"),
+        (1, "b1"),
+    ]
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-gang")
+    await controller._archive_terminal_logs(workload)
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-gang")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None, "lease_ids": []}))
+
+    handover = await controller.workload_log_page("wl-gang", after=live["next_cursor"])
+
+    assert [(record["rank"], record["message"]) for record in handover["records"]] == [(0, "a2"), (1, "b2")]
+    assert handover["truncated_ranks"] == []
+    assert (await controller.workload_log_page("wl-gang", after=handover["next_cursor"]))["records"] == []
+
+
+async def test_a_cell_with_no_frozen_rank_space_restarts_once_and_says_so(tmp_path) -> None:
+    """The one position that can never be made valid, answered the way DR-0002 does.
+
+    An attempt dispatched before its rank space was frozen has cell positions and
+    no map from cells to ranks, so every cell after the first cannot be placed --
+    and no later poll will place it either. Refusing would strand that follower
+    forever, so the ranks behind it restart and the page names them. It happens
+    at most once: this page hands back a cursor that does place every rank, which
+    is the difference from the read that replayed the archive on every poll.
+    """
+
+    class _GangJournalAgent:
+        def __init__(self) -> None:
+            self.lines = {
+                "cell-a": [("a0", "ca0"), ("a1", "ca1")],
+                "cell-b": [("b0", "cb0"), ("b1", "cb1")],
+            }
+
+        def log_page(self, cell_id, _remote_id, *, after="", limit=200):
+            lines = self.lines[cell_id]
+            positions = [cursor for _message, cursor in lines]
+            start = (positions.index(after) + 1) if after in positions else 0
+            window = lines[start : start + limit]
+            return {
+                "records": [
+                    {"message": message, "stream": "stdout", "cursor": cursor, "rank": 0, "pid": 7}
+                    for message, cursor in window
+                ],
+                "next_cursor": window[-1][1] if window else "",
+                "unavailable": False,
+                "detail": "",
+                "truncated_ranks": [],
+            }
+
+    controller = await _gang_controller(_GangJournalAgent(), freeze_topology=False)
+    _attach_artifact_access(controller, _artifact_access(tmp_path))
+
+    live = await controller.workload_log_page("wl-gang", limit=1)
+    assert [record["message"] for record in live["records"]] == ["a0", "b0"]
+
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-gang")
+    await controller._archive_terminal_logs(workload)
+    async with controller.repository.transaction() as transaction:
+        stored = await transaction.get_workload("wl-gang")
+        await transaction.put_workload(stored.model_copy(update={"lease_id": None, "lease_ids": []}))
+
+    handover = await controller.workload_log_page("wl-gang", after=live["next_cursor"])
+
+    # Rank zero is placed and continues; rank one belongs to a cell this attempt
+    # cannot place, so it restarts -- and the page says which cell.
+    assert [(record["rank"], record["message"]) for record in handover["records"]] == [
+        (0, "a1"),
+        (1, "b0"),
+        (1, "b1"),
+    ]
+    assert "never froze" in handover["detail"]
+
+    # At most once: the cursor this page returned places every rank.
+    assert (await controller.workload_log_page("wl-gang", after=handover["next_cursor"]))["records"] == []
+
+
+async def test_the_default_archive_cursor_stays_readable_by_a_replica_that_predates_it(tmp_path) -> None:
+    """Stage one of the rollout: the envelope does not change, only its contents.
+
+    Emission of the bound envelope is off by default, so an archive cursor goes
+    out in the shape every replica already decodes. What makes it recognisable as
+    an archive position on the way back is the tag on the *value*, which a
+    replica that predates archive positions simply hands to the archive read that
+    ignores it -- exactly what it does today.
+    """
+
+    from eyvan.worker.runtime.log_records import ARCHIVE_OFFSET_PREFIX, split_log_cursor
+
+    controller = await _journal_controller(tmp_path, [("first", "c0"), ("second", "c1")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    page = await controller.workload_log_page("wl-1")
+
+    assert split_log_cursor(page["next_cursor"]) == (1, {0: f"{ARCHIVE_OFFSET_PREFIX}2"})
+    assert (await controller.workload_log_page("wl-1", after=page["next_cursor"]))["records"] == []
+
+
+async def test_the_bound_archive_cursor_declares_the_read_mode_it_was_minted_for(tmp_path, monkeypatch) -> None:
+    """The ``mode`` the strict envelope has always carried, finally emitted.
+
+    Without it an archive position and a live position are one opaque string, and
+    the only thing standing between a follower and the wrong journal is which
+    branch happened to run.
+    """
+
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_MODE_ARCHIVE,
+        LOG_CURSOR_V2_EMISSION_ENV,
+        CursorResume,
+        decode_log_cursor,
+    )
+
+    monkeypatch.setenv(LOG_CURSOR_V2_EMISSION_ENV, "1")
+    controller = await _journal_controller(tmp_path, [("first", "c0"), ("second", "c1")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    page = await controller.workload_log_page("wl-1", limit=1)
+    outcome = decode_log_cursor(page["next_cursor"], expected=None)
+
+    assert isinstance(outcome, CursorResume)
+    assert (outcome.mode, outcome.workload, outcome.attempt) == (CURSOR_MODE_ARCHIVE, "wl-1", 1)
+    assert [record["message"] for record in page["records"]] == ["first"]
+    resumed = await controller.workload_log_page("wl-1", after=page["next_cursor"], limit=1)
+    assert [record["message"] for record in resumed["records"]] == ["second"]
+
+
+async def test_a_stream_reconnecting_after_the_cell_is_gone_preflights_its_archive_cursor(tmp_path) -> None:
+    """The preflight and the served page must agree about every cursor.
+
+    The stream validates a reconnecting browser's position before the response
+    is committed. Checked against the live read, the archive cursor this very
+    endpoint issued would be refused as belonging to another read mode -- and the
+    follower would be told to reset by the replica that gave it the position.
+    """
+
+    from eyvan.server.service.errors import LogCursorRejectedError
+
+    controller = await _journal_controller(tmp_path, [("first", "c0"), ("second", "c1")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    issued = (await controller.workload_log_page("wl-1", limit=1))["next_cursor"]
+
+    await controller.validate_log_cursor("wl-1", issued)
+
+    # And a position minted for a different attempt's archive is still refused
+    # rather than quietly resolved to the beginning of this one.
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_KIND_WORKLOAD_LOG,
+        CURSOR_MODE_ARCHIVE,
+        CursorContext,
+        encode_archive_offset,
+        encode_log_cursor,
+    )
+
+    foreign = encode_log_cursor(
+        {0: encode_archive_offset(1)},
+        context=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_ARCHIVE,
+            attempt=workload.attempt,
+            workload="wl-somebody-else",
+        ),
+        bound=True,
+    )
+    with pytest.raises(LogCursorRejectedError):
+        await controller.validate_log_cursor("wl-1", foreign)
+
+
+async def test_an_archive_cursor_is_refused_when_it_belongs_to_another_workload(tmp_path) -> None:
+    """Opacity is not addressing on the archive path either."""
+
+    from eyvan.server.service.errors import LogCursorRejectedError
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_KIND_WORKLOAD_LOG,
+        CURSOR_MODE_ARCHIVE,
+        CursorContext,
+        encode_archive_offset,
+        encode_log_cursor,
+    )
+
+    controller = await _journal_controller(tmp_path, [("only", "c0")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    foreign = encode_log_cursor(
+        {0: encode_archive_offset(1)},
+        context=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_ARCHIVE,
+            attempt=workload.attempt,
+            workload="wl-somebody-else",
+        ),
+        bound=True,
+    )
+
+    with pytest.raises(LogCursorRejectedError):
+        await controller.workload_log_page("wl-1", after=foreign)
+
+
+async def test_an_archive_cursor_from_a_superseded_attempt_restarts(tmp_path) -> None:
+    """A retry archives different objects, so the old offsets name other bytes."""
+
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_KIND_WORKLOAD_LOG,
+        CURSOR_MODE_ARCHIVE,
+        CursorContext,
+        encode_archive_offset,
+        encode_log_cursor,
+    )
+
+    controller = await _journal_controller(tmp_path, [("only", "c0")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+    await controller._archive_terminal_logs(workload)
+    await _released(controller)
+
+    stale = encode_log_cursor(
+        {0: encode_archive_offset(1)},
+        context=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_ARCHIVE,
+            attempt=workload.attempt + 1,
+            workload=workload.id,
+        ),
+        bound=True,
+    )
+    page = await controller.workload_log_page("wl-1", after=stale)
+
+    assert page["attempt_changed"] is True
+    assert [record["message"] for record in page["records"]] == ["only"]
+
+
+async def test_an_archive_cursor_does_not_strand_a_follower_on_a_live_retry(tmp_path) -> None:
+    """A retry's journals are new, and they may still be on a cell.
+
+    Answering an attempt change out of the previous attempt's archive would show
+    a follower "this attempt has no archived logs" while the retry it asked about
+    was printing.
+    """
+
+    from eyvan.worker.runtime.log_records import (
+        CURSOR_KIND_WORKLOAD_LOG,
+        CURSOR_MODE_ARCHIVE,
+        CursorContext,
+        encode_archive_offset,
+        encode_log_cursor,
+    )
+
+    controller = await _journal_controller(tmp_path, [("retry line", "c0")])
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+
+    stale = encode_log_cursor(
+        {0: encode_archive_offset(1)},
+        context=CursorContext(
+            kind=CURSOR_KIND_WORKLOAD_LOG,
+            mode=CURSOR_MODE_ARCHIVE,
+            attempt=workload.attempt + 1,
+            workload=workload.id,
+        ),
+        bound=True,
+    )
+    page = await controller.workload_log_page("wl-1", after=stale)
+
+    assert page["attempt_changed"] is True
+    assert [record["message"] for record in page["records"]] == ["retry line"]
+    assert page["detail"] != "archived", "the live cell still holds this attempt"
 
 
 # --------------------------------------------------------------------------- retention

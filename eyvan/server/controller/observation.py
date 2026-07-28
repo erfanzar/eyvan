@@ -12,7 +12,7 @@ import hashlib
 import json
 import typing as tp
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 from eyvan._internal.json_types import JsonObject
@@ -35,6 +35,7 @@ from eyvan.records import (
     CellRecord,
     CellState,
     CoordinationKind,
+    ExpansionAdmissionState,
     LeaseRecord,
     LeaseState,
     WorkloadAttemptTopology,
@@ -53,6 +54,8 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import ConflictError, LogCursorRejectedError, NotFoundError
+from eyvan.server.service.expansion import bounded_release
+from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
@@ -67,12 +70,14 @@ from eyvan.worker.agent.models import (
 from eyvan.worker.runtime.log_records import (
     CURSOR_ATTEMPT_CHANGED,
     CURSOR_KIND_WORKLOAD_LOG,
+    CURSOR_MODE_ARCHIVE,
     CURSOR_MODE_LIVE,
     CURSOR_RESET_REQUIRED,
     CURSOR_UNKNOWN_RANK,
     LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
     LOG_ARCHIVE_MANIFEST_KEY,
     LOG_ARCHIVE_MANIFEST_VERSION,
+    ArchiveGap,
     CursorContext,
     CursorFresh,
     CursorIncompatible,
@@ -82,10 +87,14 @@ from eyvan.worker.runtime.log_records import (
     LogPage,
     LogRecord,
     decode_log_cursor,
+    encode_archive_offset,
     encode_log_cursor,
+    encode_unplaced_archive_position,
+    is_archive_position,
     log_cursor_v2_emission_enabled,
     log_page_from_json,
     merge_pages,
+    resolve_archive_position,
 )
 from eyvan.worker.runtime.log_records import (
     join_log_cursor as _join_log_cursor,
@@ -188,6 +197,26 @@ def _cell_leaf_positions(next_cursor: str, *, width: int) -> tuple[dict[int, str
     if not isinstance(outcome, CursorResume) or not outcome.positions:
         return {}, False
     return outcome.cursors, True
+
+
+def _leading_cell_leaf_positions(value: str) -> tuple[dict[int, str], bool]:
+    """Split the first cell's cursor with no frozen width to check it against.
+
+    The first cell's global rank offset is zero by construction, so its inner
+    ranks *are* global ranks whatever its width turns out to be -- that much
+    needs no witness, and it is the whole of a single-cell attempt. Only the
+    envelope a multi-host cell emits is unpacked; anything else is one journal's
+    opaque position, exactly as :func:`_cell_leaf_positions` treats a
+    single-process cell, so a backend cursor that happens to look like one of
+    ours survives the round trip.
+    """
+
+    if not value:
+        return {}, True
+    outcome = decode_log_cursor(value, expected=None)
+    if isinstance(outcome, CursorResume) and outcome.version != 1 and outcome.positions:
+        return outcome.cursors, True
+    return {0: value}, True
 
 
 def _log_page_from_document(payload: JsonObject, *, rank: int, runtime_process_count: int = 1) -> LogPage:
@@ -300,6 +329,104 @@ def _log_page_document(
         "completeness_unknown": topology_state == _TOPOLOGY_UNKNOWN,
     }
     return document
+
+
+def _archive_cursor_context(workload: WorkloadRecord) -> CursorContext:
+    """Describe the archive read a cursor is minted for, or presented against.
+
+    Archive positions address immutable objects, not backend journals, so the
+    mode is part of the cursor's identity: a live position replayed against the
+    archive addresses nothing, and an archive offset handed to journald is not a
+    journald cursor. The attempt is carried for the same reason the live read
+    carries it -- a retry archives separately, and its objects are different
+    objects.
+
+    The topology digest is deliberately not constrained. An archive's rank space
+    is the manifest's, which survives the cells the frozen topology describes.
+    """
+
+    return CursorContext(
+        kind=CURSOR_KIND_WORKLOAD_LOG,
+        mode=CURSOR_MODE_ARCHIVE,
+        attempt=workload.attempt,
+        workload=workload.id,
+    )
+
+
+def _is_archive_cursor(after: str) -> bool:
+    """Return whether a presented cursor was minted by an archive read.
+
+    Either half is proof. A bound envelope says so in its ``mode``; the envelope
+    emitted by default carries no mode, so the tagged positions say it instead.
+    Deciding this wrong in either direction is the whole failure: a live cursor
+    read as archive positions places nothing, and archive offsets read as cell
+    positions are handed to a journal that never issued them.
+    """
+
+    if not after:
+        return False
+    outcome = decode_log_cursor(after, expected=None)
+    if not isinstance(outcome, CursorResume):
+        return False
+    if outcome.mode == CURSOR_MODE_ARCHIVE:
+        return True
+    values = [position.cursor for position in outcome.positions if position.cursor]
+    return bool(values) and all(is_archive_position(value) for value in values)
+
+
+def _archived_entries(payload: bytes) -> list[object]:
+    """Decode one archived object into the JSON values it holds, line by line."""
+
+    decoded: list[object] = []
+    for line in payload.decode(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            decoded.append(json.loads(line))
+        except ValueError:
+            continue
+    return decoded
+
+
+def _archived_rank_records(entries: tp.Sequence[object], *, rank: int) -> tuple[LogRecord, ...]:
+    """Rebuild one rank's archived lines, in the order they were written.
+
+    File order is the archive's own order and the only thing an offset can name,
+    so it is preserved here rather than sorted: chronological interleaving is the
+    merged page's job, and doing it before the offsets are computed would make a
+    resumed read skip lines.
+    """
+
+    page = log_page_from_json({"records": [entry for entry in entries if isinstance(entry, dict)]})
+    return tuple(replace(record, rank=rank) for record in page.records)
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveReplay:
+    """One attempt's archive as it stands, before a follower's window is applied.
+
+    Attributes:
+        ranks: Every readable rank's lines, in file order.
+        truncated: Ranks whose output is known to be incomplete or absent.
+        detail: The sentence describing this archive, already composed.
+        unavailable: Whether the writer recorded that it could read nothing.
+    """
+
+    ranks: dict[int, tuple[LogRecord, ...]] = field(default_factory=dict)
+    truncated: frozenset[int] = frozenset()
+    detail: str = ""
+    unavailable: bool = False
+
+
+def _dag_release_order(node: WorkloadRecord) -> tuple[str, str]:
+    """Return the stable order dependent nodes are released in.
+
+    Read off the nodes themselves so a bounded release resumes where it stopped.
+    Names are unique inside one DAG submission; the id breaks the tie for a node
+    whose name is not, so two replicas never disagree about which node is next.
+    """
+
+    return (node.spec.name, node.id)
 
 
 def _topology_mismatch(frozen: WorkloadTopologyCell, current: CellRecord, observed_endpoints: tuple[str, ...]) -> str:
@@ -1358,6 +1485,7 @@ class _ControllerObservation:
                 if any(workload.id in node.depends_on for node in gated)
             }
 
+        ready: list[WorkloadRecord] = []
         for node in gated:
             states = [predecessor_states.get(predecessor) for predecessor in node.depends_on]
             if any(state in {WorkloadState.FAILED, WorkloadState.CANCELLED} or state is None for state in states):
@@ -1376,16 +1504,75 @@ class _ControllerObservation:
                 continue
             if not all(state is WorkloadState.SUCCEEDED for state in states):
                 continue
-            async with self.repository.transaction() as transaction:
-                current = await transaction.get_workload(node.id)
-                if current is None or current.schedulable or current.state is not WorkloadState.PENDING:
+            ready.append(node)
+
+        # Grouped by coordinator because the bound is per expansion. An
+        # abandonment above is deliberately outside the bound: cancelling a node
+        # frees a place in the queue rather than taking one.
+        for coordinator_id in sorted({node.parent_workload_id or "" for node in ready}):
+            released += await self._release_dag_nodes_for(
+                coordinator_id or None,
+                [node for node in ready if (node.parent_workload_id or "") == coordinator_id],
+            )
+        return released
+
+    async def _release_dag_nodes_for(
+        self,
+        coordinator_id: str | None,
+        ready: tp.Sequence[WorkloadRecord],
+    ) -> int:
+        """Release one DAG's ready nodes, bounded by the wave that admitted it.
+
+        Every input is a durable row read inside this transaction. The plan comes
+        from the expansion ledger, the occupancy from the coordinator's children,
+        and which node goes next from the nodes' own stable order -- so a leader
+        that dies here resumes with the same answer instead of re-deriving one
+        from a counter it may not have committed.
+
+        The whole release is one transaction. A leader that dies mid-release
+        therefore commits all of it or none of it: nothing is released twice, and
+        a node that was not released is still gated for the next pass.
+
+        Args:
+            coordinator_id: The DAG coordinator these nodes belong to, or
+                ``None`` for a node with no coordinator, which no plan governs.
+            ready: Nodes whose predecessors have all succeeded.
+
+        Returns:
+            How many nodes were made schedulable.
+        """
+
+        async with self.repository.transaction() as transaction:
+            wave_size: int | None = None
+            competing = 0
+            if coordinator_id is not None:
+                ledger = await transaction.get_expansion_admission(coordinator_id)
+                if ledger is not None and ledger.state is ExpansionAdmissionState.ADMITTING:
+                    wave_size = ledger.wave_size
+                    # Counted over *every* child of the expansion: an entry root
+                    # the wave phase released and a dependent this phase released
+                    # occupy the queue identically, and the two paths bound each
+                    # other only if they measure the same thing.
+                    competing = sum(
+                        1
+                        for child in await transaction.list_child_workloads(coordinator_id)
+                        if child.schedulable and child.state not in TERMINAL_WORKLOAD_STATES
+                    )
+            current: list[WorkloadRecord] = []
+            for node in sorted(ready, key=_dag_release_order):
+                stored = await transaction.get_workload(node.id)
+                if stored is None or stored.schedulable or stored.state is not WorkloadState.PENDING:
                     continue
+                current.append(stored)
+            releasing = bounded_release(current, competing=competing, wave_size=wave_size)
+            now = utcnow()
+            for child in releasing:
                 await transaction.put_workload(
-                    current.model_copy(
+                    child.model_copy(
                         update={
                             "schedulable": True,
                             "scheduling_reason": "dependencies satisfied; waiting for scheduling",
-                            "updated_at": utcnow(),
+                            "updated_at": now,
                         }
                     )
                 )
@@ -1393,15 +1580,14 @@ class _ControllerObservation:
                     AuditEvent(
                         id=f"evt_{uuid.uuid4().hex}",
                         actor=self._principal.subject,
-                        org_id=current.org_id,
-                        project_id=current.project_id,
+                        org_id=child.org_id,
+                        project_id=child.project_id,
                         entity_type="workload",
-                        entity_id=current.id,
+                        entity_id=child.id,
                         action="workload.dag_released",
                     )
                 )
-            released += 1
-        return released
+            return len(releasing)
 
     async def release_admitted_groups_once(self) -> int:
         """Release a heterogeneous group once every member can be placed.
@@ -1553,7 +1739,29 @@ class _ControllerObservation:
                 expected_ranks=frozen_ranks,
             )
 
+        archive_attempt_changed = False
+        if _is_archive_cursor(after):
+            # A follower already reading the archive. Its positions address
+            # immutable objects, so there is no live journal to consult and no
+            # cell whose absence has to be discovered first.
+            archive_attempt_changed, archive_positions = self._decoded_archive_cursor(after, workload)
+            if not archive_attempt_changed:
+                archived = await self._archived_log_page(workload, positions=archive_positions, limit=limit)
+                return _log_page_document(
+                    archived,
+                    attempt=workload.attempt,
+                    next_cursor=archived.next_cursor,
+                    topology_state=frozen_state,
+                    topology_digest=frozen_digest,
+                    expected_ranks=frozen_ranks,
+                )
+            # A retry. Its journals are new objects, and they may still be live,
+            # so the read restarts on the ordinary path instead of inside the
+            # previous attempt's archive.
+            after = ""
+
         attempt_changed, cursors, cursor_is_flat = self._decoded_cursor(after, workload, topology)
+        attempt_changed = attempt_changed or archive_attempt_changed
 
         try:
             members = await self._load_workload_members(workload)
@@ -1564,10 +1772,26 @@ class _ControllerObservation:
             # archive exists.
             members = ()
         if not members:
+            # The handover. The follower is holding live positions and the
+            # journals they name are gone, so they are translated into the
+            # archive's own offsets rather than discarded -- discarding them is
+            # what replayed the whole archive on every poll.
+            positions, position_gap = self._archive_positions_from_live(
+                {} if attempt_changed else cursors,
+                cursor_is_flat=cursor_is_flat,
+                topology=topology,
+            )
+            archived = await self._archived_log_page(
+                workload,
+                positions=positions,
+                position_gap=position_gap,
+                limit=limit,
+            )
             return _log_page_document(
-                await self._archived_log_page(workload),
+                archived,
                 attempt=workload.attempt,
                 attempt_changed=attempt_changed,
+                next_cursor=archived.next_cursor,
                 topology_state=frozen_state,
                 topology_digest=frozen_digest,
                 expected_ranks=frozen_ranks,
@@ -1671,6 +1895,102 @@ class _ControllerObservation:
                     expected_ranks=topology.total_rank_count,
                 )
         return False, positions, outcome.bound
+
+    def _decoded_archive_cursor(self, after: str, workload: WorkloadRecord) -> tuple[bool, dict[int, str]]:
+        """Decode a cursor presented against this attempt's archive.
+
+        The same discipline as the live decode, against the archive read instead:
+        only empty input starts from the beginning, an attempt change is reported
+        and restarted because the retry archived different objects, and anything
+        else is refused rather than collapsed into a first read.
+
+        Returns:
+            Whether the attempt changed, and the per-rank archive positions.
+
+        Raises:
+            LogCursorRejectedError: If the cursor cannot address this archive.
+        """
+
+        outcome = decode_log_cursor(after, expected=_archive_cursor_context(workload))
+        if isinstance(outcome, CursorFresh):
+            return False, {}
+        if isinstance(outcome, CursorIncompatible) and outcome.reason == CURSOR_ATTEMPT_CHANGED:
+            return True, {}
+        if isinstance(outcome, (CursorInvalid, CursorIncompatible)):
+            raise LogCursorRejectedError(
+                reason=outcome.reason,
+                detail=outcome.detail,
+                incompatible=isinstance(outcome, CursorIncompatible),
+                workload_id=workload.id,
+                attempt=workload.attempt,
+            )
+        return False, outcome.cursors
+
+    def _archive_positions_from_live(
+        self,
+        cursors: tp.Mapping[int, str],
+        *,
+        cursor_is_flat: bool,
+        topology: WorkloadAttemptTopology | None,
+    ) -> tuple[dict[int, str], str]:
+        """Express a live cursor's positions in the archive's global rank space.
+
+        A bound cursor already names global ranks. A per-cell cursor names cells,
+        and only the frozen topology says which ranks a cell held. Without it,
+        the first cell is still placeable -- its global rank offset is zero by
+        construction -- and every later cell is not, because the widths in front
+        of it were never recorded.
+
+        A cell that cannot be placed is *named on the page*, and the ranks behind
+        it are served from the archive's first line. That is the same answer the
+        live decode gives a cursor from before the rank space was frozen, and for
+        the same reason: refusing would leave that follower holding a position it
+        can never make valid. The repetition happens at most once, because this
+        page returns an archive cursor that does place every rank -- unlike the
+        read this replaces, which replayed the whole archive on every poll and
+        returned no cursor at all.
+
+        Returns:
+            The positions by global rank, and the sentence naming any cell that
+            could not be placed (``""`` when all of them were).
+        """
+
+        if not cursors:
+            return {}, ""
+        if cursor_is_flat:
+            return {rank: value for rank, value in cursors.items() if value}, ""
+        positions: dict[int, str] = {}
+        unplaced: list[int] = []
+        for index, value in sorted(cursors.items()):
+            if not value:
+                continue
+            frozen = topology.cells[index] if topology is not None and 0 <= index < len(topology.cells) else None
+            if frozen is None and index != 0:
+                # Only the first cell's global rank offset is knowable without a
+                # frozen rank space: it is zero by construction. Every later cell
+                # begins after widths this attempt never recorded, and inventing
+                # them would give one rank another rank's archived lines.
+                unplaced.append(index)
+                continue
+            leaves, understood = (
+                _leading_cell_leaf_positions(value)
+                if frozen is None
+                else _cell_leaf_positions(value, width=frozen.runtime_process_count)
+            )
+            if not understood:
+                unplaced.append(index)
+                continue
+            offset = 0 if frozen is None else frozen.global_rank_offset
+            for local, leaf in leaves.items():
+                positions[offset + local] = leaf
+        gap = ""
+        if unplaced:
+            gap = (
+                "the presented cursor names cell(s) whose ranks this attempt never froze ("
+                + ", ".join(str(index) for index in unplaced)
+                + "), so those ranks are served from the start of the archive"
+            )
+        return positions, gap
 
     async def _frozen_log_page(
         self,
@@ -1938,10 +2258,16 @@ class _ControllerObservation:
             )
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
+        if _is_archive_cursor(after):
+            # A browser reconnecting to a workload that finished while it was
+            # away is holding an archive position. Preflighting it against the
+            # live read would refuse the cursor this endpoint just issued.
+            self._decoded_archive_cursor(after, workload)
+            return
         self._decoded_cursor(after, workload, topology)
 
-    async def _manifest_archived_log_page(self, workload: WorkloadRecord) -> LogPage | None:
-        """Replay a terminal archive from its schema-2 manifest, or ``None``.
+    async def _manifest_archive_replay(self, workload: WorkloadRecord) -> _ArchiveReplay | None:
+        """Read a terminal archive from its schema-2 manifest, or ``None``.
 
         ``None`` means "there is no manifest to read" and hands the caller back to
         the embedded-index decoder. Every other outcome is answered here, because
@@ -1952,6 +2278,10 @@ class _ControllerObservation:
         Bytes are verified against the digest and size the writer recorded. A
         mismatch is reported as a gap and never replayed -- an archive that does
         not match its own manifest is not evidence about what a rank printed.
+
+        Records stay separated by rank rather than merged here, because a
+        follower resumes per rank: merging first would lose each line's place in
+        its own object, which is the only thing an archive offset can name.
         """
 
         if self.artifact_access is None:
@@ -1968,20 +2298,20 @@ class _ControllerObservation:
             # A manifest that exists but cannot be read conclusively must not fall
             # through to the embedded index: that index describes fewer ranks, so
             # the reply would look more complete than the evidence supports.
-            return LogPage(unavailable=True, detail="the archive manifest could not be read conclusively")
+            return _ArchiveReplay(detail="the archive manifest could not be read conclusively", unavailable=True)
 
         try:
             document = json.loads(payload.decode())
         except (UnicodeDecodeError, ValueError):
-            return LogPage(unavailable=True, detail="the archive manifest is unreadable")
+            return _ArchiveReplay(detail="the archive manifest is unreadable", unavailable=True)
         if not isinstance(document, dict) or document.get("schema") != _LOG_ARCHIVE_MANIFEST_SCHEMA_V2:
-            return LogPage(unavailable=True, detail="the archive manifest is not a schema-2 log manifest")
+            return _ArchiveReplay(detail="the archive manifest is not a schema-2 log manifest", unavailable=True)
 
         raw_entries = document.get("ranks")
         if not isinstance(raw_entries, list):
-            return LogPage(unavailable=True, detail="the archive manifest declares no ranks")
+            return _ArchiveReplay(detail="the archive manifest declares no ranks", unavailable=True)
 
-        pages: dict[int, LogPage] = {}
+        ranks: dict[int, tuple[LogRecord, ...]] = {}
         truncated: set[int] = set()
         gaps: list[str] = []
         for item in raw_entries:
@@ -2027,22 +2357,10 @@ class _ControllerObservation:
                     truncated.add(rank)
                     gaps.append(f"{rank} (digest mismatch)")
                     continue
-            records: list[JsonObject] = []
-            for line in blob.decode(errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(entry, dict):
-                    records.append(entry)
-            page = log_page_from_json({"records": records})
-            pages[rank] = LogPage(records=tuple(replace(record, rank=rank) for record in page.records))
+            ranks[rank] = _archived_rank_records(_archived_entries(blob), rank=rank)
             if status == _ARCHIVE_STATUS_TRUNCATED:
                 truncated.add(rank)
 
-        merged = merge_pages(pages).records if pages else ()
         detail = "archived"
         if document.get("complete") is not True:
             detail += "; the archive is incomplete"
@@ -2053,29 +2371,20 @@ class _ControllerObservation:
             detail += "; the expected rank list was capped"
         if gaps:
             detail += "; rank archives could not be replayed: " + ", ".join(gaps)
-        return LogPage(
-            records=tuple(merged),
-            unavailable=bool(document.get("unavailable") or truncated) and not merged,
+        return _ArchiveReplay(
+            ranks=ranks,
+            truncated=frozenset(truncated),
             detail=detail,
-            truncated_ranks=tuple(sorted(truncated)),
+            unavailable=bool(document.get("unavailable")),
         )
 
-    async def _archived_log_page(self, workload: WorkloadRecord) -> LogPage:
-        """Read one attempt's archived logs back out of managed storage.
+    async def _indexed_archive_replay(self, workload: WorkloadRecord) -> _ArchiveReplay:
+        """Read an archive that carries its index inside rank zero's own object.
 
-        A schema-2 manifest object is authoritative when present: it names every
-        *expected* rank, its fate, and its object's digest and size, so a rank
-        that printed nothing is distinguishable from one whose host was never
-        reached, and bytes that contradict it are reported as a gap rather than
-        replayed. Older archives carry a manifest in rank zero. It records the exact sparse
-        global-rank set and which ranks were unavailable at collection time, so
-        replay does not turn a partial live read into a complete-looking one.
-        Archives written before the manifest remain readable through the former
-        contiguous-rank scan.
+        The shape written before the standalone manifest, and the only shape
+        already-terminal attempts have. Kept exactly as it was, per rank, so an
+        upgrade does not make an existing archive unreadable.
         """
-
-        if self.artifact_access is None:
-            return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
 
         async def read_rank(rank: int) -> bytes:
             return await self.service.read_managed_artifact(
@@ -2084,33 +2393,16 @@ class _ControllerObservation:
                 uri=log_uri(workload.id, workload.attempt, rank),
             )
 
-        manifest_page = await self._manifest_archived_log_page(workload)
-        if manifest_page is not None:
-            return manifest_page
-
         try:
             first_payload = await read_rank(0)
         except NotFoundError:
-            return LogPage(unavailable=True, detail="this attempt has no archived logs")
+            return _ArchiveReplay(detail="this attempt has no archived logs", unavailable=True)
         except Exception:
-            return LogPage(unavailable=True, detail="archived logs could not be read conclusively")
+            return _ArchiveReplay(detail="archived logs could not be read conclusively", unavailable=True)
 
-        def entries(payload: bytes) -> list[object]:
-            decoded: list[object] = []
-
-            for line in payload.decode(errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    decoded.append(json.loads(line))
-                except ValueError:
-                    continue
-            return decoded
-
-        first_entries = entries(first_payload)
         manifest: JsonObject | None = None
         record_entries: dict[int, list[JsonObject]] = {0: []}
-        for entry in first_entries:
+        for entry in _archived_entries(first_payload):
             if (
                 isinstance(entry, list)
                 and len(entry) == 2
@@ -2146,7 +2438,9 @@ class _ControllerObservation:
             unavailable = bool(manifest.get("unavailable"))
             for rank in sorted(ranks - {0}):
                 try:
-                    record_entries[rank] = [entry for entry in entries(await read_rank(rank)) if isinstance(entry, dict)]
+                    record_entries[rank] = [
+                        entry for entry in _archived_entries(await read_rank(rank)) if isinstance(entry, dict)
+                    ]
                 except Exception:
                     # The manifest says this rank existed. Losing its object is
                     # therefore explicit truncation, not the end of a contiguous
@@ -2159,21 +2453,139 @@ class _ControllerObservation:
             # readable after the control plane is upgraded.
             for rank in range(1, _ARCHIVED_RANK_SCAN_LIMIT):
                 try:
-                    record_entries[rank] = [entry for entry in entries(await read_rank(rank)) if isinstance(entry, dict)]
+                    record_entries[rank] = [
+                        entry for entry in _archived_entries(await read_rank(rank)) if isinstance(entry, dict)
+                    ]
                 except Exception:
                     break
 
-        archived_pages: dict[int, LogPage] = {}
-        for rank, archived_entries in sorted(record_entries.items()):
-            page = log_page_from_json({"records": archived_entries})
-            archived_pages[rank] = LogPage(records=tuple(replace(record, rank=rank) for record in page.records))
-        records = merge_pages(archived_pages).records
         detail = "archived"
         if missing_archives:
             detail += "; rank archives could not be read: " + ", ".join(str(rank) for rank in missing_archives)
+        return _ArchiveReplay(
+            ranks={rank: _archived_rank_records(entries, rank=rank) for rank, entries in sorted(record_entries.items())},
+            truncated=frozenset(truncated),
+            detail=detail,
+            unavailable=unavailable,
+        )
+
+    async def _archived_log_page(
+        self,
+        workload: WorkloadRecord,
+        *,
+        positions: tp.Mapping[int, str] | None = None,
+        position_gap: str = "",
+        limit: int | None = None,
+    ) -> LogPage:
+        """Read one attempt's archived logs back out of managed storage.
+
+        A schema-2 manifest object is authoritative when present: it names every
+        *expected* rank, its fate, and its object's digest and size, so a rank
+        that printed nothing is distinguishable from one whose host was never
+        reached, and bytes that contradict it are reported as a gap rather than
+        replayed. Older archives carry a manifest in rank zero. It records the exact sparse
+        global-rank set and which ranks were unavailable at collection time, so
+        replay does not turn a partial live read into a complete-looking one.
+        Archives written before the manifest remain readable through the former
+        contiguous-rank scan.
+
+        ``positions`` is where a follower had reached, expressed per global rank,
+        and is what makes a live-to-archive handover continue instead of starting
+        the archive again on every poll. The returned page carries the archive
+        cursor to present next.
+
+        Args:
+            workload: The attempt whose archive is being read.
+            positions: Per-rank positions the follower presented. Empty or
+                ``None`` is a first read of the archive.
+            position_gap: Which part of the presented cursor could not be
+                expressed per rank at all, when any of it could not. Carried onto
+                the page, so a read that restarted part of the archive says so.
+            limit: Most lines to serve per rank, or ``None`` for all of them.
+
+        Returns:
+            The page, whose ``next_cursor`` is the archive position to resume at.
+        """
+
+        if self.artifact_access is None:
+            return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
+        replay = await self._manifest_archive_replay(workload)
+        if replay is None:
+            replay = await self._indexed_archive_replay(workload)
+        return self._archive_window(
+            workload,
+            replay,
+            positions=positions or {},
+            position_gap=position_gap,
+            limit=limit,
+        )
+
+    def _archive_window(
+        self,
+        workload: WorkloadRecord,
+        replay: _ArchiveReplay,
+        *,
+        positions: tp.Mapping[int, str],
+        position_gap: str,
+        limit: int | None,
+    ) -> LogPage:
+        """Serve the slice of one archive a follower has not been shown yet.
+
+        Each rank is placed independently and advanced independently, because
+        that is how the objects are written: one immutable object per rank, in
+        the order its lines were captured. A rank whose position cannot be placed
+        contributes no lines and keeps its position, so the gap is reported again
+        on the next poll rather than becoming a silent replay of that object.
+
+        ``limit`` bounds each rank rather than the merged page, matching the live
+        read -- which passes the same number to every cell it fans out to -- so
+        one chatty rank cannot consume another rank's share of the page.
+        """
+
+        served: dict[int, LogPage] = {}
+        advanced: dict[int, str] = {}
+        truncated = set(replay.truncated)
+        gaps: list[str] = []
+        for rank in sorted(replay.ranks):
+            lines = replay.ranks[rank]
+            placement = resolve_archive_position(
+                positions.get(rank, ""),
+                [record.cursor for record in lines],
+                rank=rank,
+            )
+            if isinstance(placement, ArchiveGap):
+                truncated.add(rank)
+                gaps.append(f"{rank} ({placement.reason})")
+                advanced[rank] = encode_unplaced_archive_position(placement.position)
+                continue
+            taken = lines[placement.offset :] if limit is None else lines[placement.offset : placement.offset + limit]
+            reached = placement.offset + len(taken)
+            if taken:
+                served[rank] = LogPage(records=taken)
+            if reached:
+                # A rank still at zero needs no position: an absent one already
+                # means "from the start", and emitting one per silent rank would
+                # put a rank of the attempt's whole width into every cursor.
+                advanced[rank] = encode_archive_offset(reached)
+        for rank, presented in positions.items():
+            if rank in replay.ranks or not presented:
+                continue
+            # A position for a rank this archive does not hold. Retained rather
+            # than dropped: a later settlement can still land that object, and a
+            # dropped position would replay it from the first line when it does.
+            advanced[rank] = presented if is_archive_position(presented) else encode_unplaced_archive_position(presented)
+
+        detail = replay.detail
+        if gaps:
+            detail += "; archived positions could not be placed: " + ", ".join(gaps)
+        if position_gap:
+            detail += f"; {position_gap}"
         return LogPage(
-            records=tuple(records),
-            unavailable=(unavailable or bool(truncated)) and not records,
+            records=merge_pages(served).records if served else (),
+            next_cursor=encode_log_cursor(advanced, context=_archive_cursor_context(workload)),
+            # Read from the whole archive, never from this window: a follower that
+            # has already been served every line is caught up, not unable to read.
+            unavailable=(replay.unavailable or bool(truncated)) and not any(replay.ranks.values()),
             detail=detail,
             truncated_ranks=tuple(sorted(truncated)),
         )
