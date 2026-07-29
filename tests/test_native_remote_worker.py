@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shlex
@@ -13,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -26,6 +28,7 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadStatus,
     MutationContext,
     StaleMutationError,
+    UnsupportedCapabilityError,
 )
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.records import NativeContainerConfig
@@ -33,6 +36,7 @@ from eyvan.worker.agent.models import MutationModel, WorkloadRequest
 from eyvan.worker.agent.service import CellAgentService
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 from eyvan.worker.runtime.native_worker import create_native_worker_app
+from eyvan.worker.runtime.stage_executor import AssetStageVerdict, LocalAssetStageExecutor
 from eyvan.worker.runtime.systemd_transient import SystemdCommandResult, SystemdTransientServiceExecutor
 
 
@@ -485,3 +489,184 @@ def test_native_worker_main_warns_when_the_secret_file_cannot_be_removed(
         record for record in caplog.records if record.levelno == logging.WARNING and "secret file" in record.message
     )
     assert str(secret_path) in warning.message
+
+
+# --------------------------------------------------------------------- managed staging
+
+
+def _stage_worker(
+    tmp_path: Path,
+    *,
+    allowed: tuple[str, ...] = (),
+    secret: str = "worker-secret",
+    client_secret: str | None = None,
+) -> tuple[TestClient, NativeRemoteExecutor]:
+    """A native worker holding the real staging executor, and the driver that calls it."""
+
+    stager = LocalAssetStageExecutor(root=tmp_path / "worker-disk", allowed_prefixes=allowed) if allowed else None
+    app = create_native_worker_app(state_dir=tmp_path / "worker", secret=secret, stager=stager)
+    transport = TestClient(app)
+    return transport, NativeRemoteExecutor("http://testserver", secret=client_secret or secret, client=transport)
+
+
+def test_the_native_worker_measures_stages_and_evicts_over_one_route(tmp_path: Path) -> None:
+    """The worker half of managed staging, driven the way the agent drives it.
+
+    Every number here is read back off the worker's disk rather than taken from
+    the request: the size, the digest, and the path the workload will open. An
+    executor that reported what it *expected* would be handing the control plane
+    evidence it then charges a budget and steers placement on.
+    """
+
+    payload = b"shard-0000" * 96
+    source = tmp_path / "assets" / "shard.bin"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    _transport, driver = _stage_worker(tmp_path, allowed=(str(tmp_path / "assets"),))
+
+    measured = driver.measure("cell-a", str(source), max_bytes=1 << 20)
+    staged = driver.stage("cell-a", str(source), max_bytes=1 << 20)
+    landed = Path(staged.path or "")
+    evicted = driver.evict("cell-a", str(source))
+
+    assert measured.verdict is AssetStageVerdict.OK
+    assert measured.size_bytes == len(payload)
+    assert staged.verdict is AssetStageVerdict.OK
+    assert staged.size_bytes == len(payload)
+    assert staged.digest == f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    assert landed.is_relative_to(tmp_path / "worker-disk")
+    assert evicted.verdict is AssetStageVerdict.OK
+    assert not landed.exists()
+
+
+def test_a_native_worker_without_declared_sources_has_no_staging_executor(tmp_path: Path) -> None:
+    """Empty is the off switch, and it is absence rather than refusal.
+
+    A refusal is terminal: it blocks the stage permanently, and nothing unblocks
+    it short of replacing the cell. Answering that way would poison the ledger
+    for every asset in the fleet over one unset environment variable.
+    """
+
+    transport, driver = _stage_worker(tmp_path)
+
+    response = transport.post(
+        "/api/v1/cells/cell-a/stage-actions",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={"action": "stage", "asset": "/data/pile", "max_bytes": 1024},
+    )
+    with pytest.raises(UnsupportedCapabilityError, match="no staging executor"):
+        driver.stage("cell-a", "/data/pile", max_bytes=1024)
+
+    assert response.status_code == 501
+    assert "EYVAN_CELL_STAGE_SOURCES" in response.json()["detail"]
+
+
+def test_a_native_worker_that_predates_the_route_has_no_staging_executor(tmp_path: Path) -> None:
+    """Rolling upgrade: workers first, then agents. A 404 is absence, not failure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    driver = NativeRemoteExecutor(
+        "http://worker",
+        secret="worker-secret",
+        client=httpx.Client(base_url="http://worker", transport=httpx.MockTransport(handler)),
+    )
+
+    for call in (
+        lambda: driver.measure("cell-a", "/data/pile", max_bytes=1024),
+        lambda: driver.stage("cell-a", "/data/pile", max_bytes=1024),
+        lambda: driver.evict("cell-a", "/data/pile"),
+    ):
+        with pytest.raises(UnsupportedCapabilityError, match="no staging executor"):
+            call()
+
+
+def test_a_credential_the_native_worker_rejects_is_unknown_rather_than_refused(tmp_path: Path) -> None:
+    """A worker that would not talk has said nothing about the asset.
+
+    The bearer credential is derived per provider generation, so a worker
+    rebuilt under a new one answers 401 to a driver still holding the old.
+    Recording that as a refusal would block the asset permanently on evidence
+    about a credential, and the block would outlive the rebuild that caused it.
+    """
+
+    _transport, driver = _stage_worker(
+        tmp_path,
+        allowed=(str(tmp_path),),
+        client_secret="a-previous-generations-secret",
+    )
+
+    result = driver.stage("cell-a", str(tmp_path / "assets" / "shard.bin"), max_bytes=1024)
+
+    assert result.verdict is AssetStageVerdict.INCONCLUSIVE
+    assert result.size_bytes == 0
+    assert result.digest is None
+    assert "401" in result.detail
+
+
+def test_a_request_the_native_worker_rejects_is_refused(tmp_path: Path) -> None:
+    """The worker read it and said no, so the same bytes get the same answer tomorrow."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "unprocessable"})
+
+    driver = NativeRemoteExecutor(
+        "http://worker",
+        secret="worker-secret",
+        client=httpx.Client(base_url="http://worker", transport=httpx.MockTransport(handler)),
+    )
+
+    result = driver.stage("cell-a", "/data/pile", max_bytes=1024)
+
+    assert result.verdict is AssetStageVerdict.REFUSED
+    assert "422" in result.detail
+
+
+def test_a_native_worker_failure_or_unreadable_answer_is_inconclusive(tmp_path: Path) -> None:
+    """Neither a 5xx nor a body that will not parse is evidence about a disk."""
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream unavailable")
+
+    def garbled(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="{not json")
+
+    results = [
+        NativeRemoteExecutor(
+            "http://worker",
+            secret="worker-secret",
+            client=httpx.Client(base_url="http://worker", transport=httpx.MockTransport(handler)),
+        ).measure("cell-a", "/data/pile", max_bytes=1024)
+        for handler in (failing, garbled)
+    ]
+
+    assert [result.verdict for result in results] == [AssetStageVerdict.INCONCLUSIVE] * 2
+    assert all(result.size_bytes == 0 and result.digest is None for result in results)
+
+
+def test_the_native_worker_builds_its_staging_executor_from_its_own_environment(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The allowlist and the directory belong to the host that opens the file.
+
+    On a Compute fleet those two variables are declared on the worker VM, so
+    this is the binding a real fleet actually uses -- the injected executor
+    every other test here passes is a convenience, not the shipped path.
+    """
+
+    payload = b"declared-on-the-worker"
+    source = tmp_path / "assets" / "shard.bin"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    monkeypatch.setenv("EYVAN_CELL_STAGE_SOURCES", str(tmp_path / "assets"))
+    monkeypatch.setenv("EYVAN_CELL_STAGE_DIR", str(tmp_path / "declared-disk"))
+    app = create_native_worker_app(state_dir=tmp_path / "worker", secret="worker-secret")
+    with TestClient(app) as transport:
+        driver = NativeRemoteExecutor("http://testserver", secret="worker-secret", client=transport)
+        staged = driver.stage("cell-a", str(source), max_bytes=1 << 20)
+
+    assert staged.verdict is AssetStageVerdict.OK
+    assert Path(staged.path or "").read_bytes() == payload
+    assert Path(staged.path or "").is_relative_to((tmp_path / "declared-disk").resolve())

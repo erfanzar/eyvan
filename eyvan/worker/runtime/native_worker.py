@@ -3,7 +3,36 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Authenticated HTTP transport for one Eyvan native execution worker."""
+"""Authenticated HTTP transport for one Eyvan native execution worker.
+
+**Deployment order: native workers first, then agents, then the controller.**
+This serves one wire method that did not exist before --
+``POST /api/v1/cells/{cell_id}/stage-actions``, the second hop of managed
+staging. A worker that predates it answers HTTP 404, which
+:class:`~eyvan.worker.runtime.native_remote.NativeRemoteExecutor` reports to its
+agent as *this worker has no staging executor*, and which the agent reports on
+to the control plane the same way: absence of a capability, never a failed
+action. So an agent upgraded ahead of its workers stages nothing and records
+nothing, exactly as it does today, and the feature appears once the workers
+underneath it serve the route.
+
+The executor behind that route is
+:class:`~eyvan.worker.runtime.stage_executor.LocalAssetStageExecutor`, built
+from this host's own environment and not a second implementation of it. Every
+guarantee it makes therefore survives the hop unchanged: the bounded fetch, the
+resume point fsynced before a failure propagates, the size and digest read back
+off this disk rather than declared, quarantine on a digest mismatch, and the
+source allowlist -- which matters most of all here, because a named asset is
+user input and an executor that fetched whatever it was handed would be an
+arbitrary-read primitive on a machine holding a fleet's accelerators.
+
+``EYVAN_CELL_STAGE_SOURCES`` is that allowlist and is empty by default, so a
+worker that ships with this route still stages nothing until an operator
+declares what may be fetched *on the worker host*. On a Compute fleet the
+worker unit reads ``/etc/eyvan-native/systemd-runtime.env``, and the fleet's
+declarative runtime setup runs after that file is written and before the unit
+starts, so a line appended there is how the variable reaches this process.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +51,12 @@ from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionDriver, ExecutionWorkloadReport, MutationContext, StaleMutationError
 from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 from eyvan.worker.agent.models import (
+    CellStageAction,
+    CellStageActionResult,
+    CellStageVerdict,
     CheckpointRequest,
     MutationConflictCode,
+    NativeStageActionRequest,
     NativeWorkerHealth,
     WorkloadMutationRequest,
     WorkloadReference,
@@ -31,9 +64,26 @@ from eyvan.worker.agent.models import (
 )
 from eyvan.worker.runtime.local_process import LocalProcessExecutor
 from eyvan.worker.runtime.registry import IntrospectableExecutionDriver
+from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
 from eyvan.worker.runtime.systemd_transient import SystemdLogsUnavailableError, SystemdTransientServiceExecutor
 
 logger = logging.getLogger(__name__)
+
+#: Where this worker keeps staged bytes when the operator names no directory.
+#:
+#: Under the workload's own directory rather than under the worker's state
+#: directory, because the point of staging here is that the *workload* can read
+#: the bytes. ``EYVAN_NATIVE_WORKLOAD_DIRECTORY`` is the tree the workload user
+#: owns and runs in; the state directory is installed ``0700`` for root and a
+#: dataset written there would be invisible to the job that asked for it.
+_DEFAULT_WORKLOAD_DIRECTORY = "/var/lib/eyvan/workload"
+
+#: What one staging verdict is called on the wire out of this worker.
+_STAGE_VERDICTS: dict[AssetStageVerdict, CellStageVerdict] = {
+    AssetStageVerdict.OK: CellStageVerdict.OK,
+    AssetStageVerdict.REFUSED: CellStageVerdict.REFUSED,
+    AssetStageVerdict.INCONCLUSIVE: CellStageVerdict.INCONCLUSIVE,
+}
 
 
 def _context(request: WorkloadRequest | WorkloadMutationRequest | CheckpointRequest) -> MutationContext:
@@ -112,7 +162,7 @@ def _load_container_runtime(path: Path) -> tuple[NativeContainerConfig, tuple[st
 def _base_environment(runtime_env: tp.Mapping[str, str]) -> dict[str, str]:
     """Return workload defaults injected below job-specific environment values."""
 
-    workload_directory = os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", "/var/lib/eyvan/workload")
+    workload_directory = os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", _DEFAULT_WORKLOAD_DIRECTORY)
     workload_user = os.getenv("EYVAN_NATIVE_WORKLOAD_USER", "eyvan-workload")
     return {
         **runtime_env,
@@ -128,6 +178,21 @@ def _base_environment(runtime_env: tp.Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _default_stager() -> AssetStageDriver | None:
+    """Build this host's staging executor, or ``None`` when it declares no sources.
+
+    An empty allowlist is the off switch, and it has to read as *no executor*
+    rather than as a refusal of every asset. A refusal is terminal -- it blocks
+    the stage permanently, and nothing unblocks it short of replacing the cell --
+    so an operator who sized a cache before declaring what may be fetched would
+    poison the ledger for every asset in the fleet and have no way back.
+    """
+
+    workload_directory = os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", _DEFAULT_WORKLOAD_DIRECTORY)
+    candidate = LocalAssetStageExecutor.from_environment(Path(workload_directory) / "stages")
+    return candidate if candidate.allowed_prefixes else None
+
+
 def create_native_worker_app(
     executor: ExecutionDriver | None = None,
     *,
@@ -138,6 +203,7 @@ def create_native_worker_app(
     runtime_env: tp.Mapping[str, str] | None = None,
     runtime_container: NativeContainerConfig | None = None,
     container_artifact_mounts: tp.Sequence[str] = (),
+    stager: AssetStageDriver | None = None,
 ) -> FastAPI:
     """Create one native execution-worker application.
 
@@ -162,6 +228,13 @@ def create_native_worker_app(
             fleet YAML. It requires the production systemd worker path.
         container_artifact_mounts: Staged host artifact paths automatically
             made read-only at the same paths inside the container.
+        stager: Managed-staging executor for the cells whose disk this worker
+            owns. Built from this host's environment when omitted, and left
+            unset when that environment declares no source prefixes -- which is
+            the default, and which the staging route reports as *no executor*.
+            Independent of ``executor``: staging writes bytes for a workload
+            rather than running one, so a deployment may select one without
+            selecting the other.
 
     Returns:
         The configured FastAPI application.
@@ -217,8 +290,10 @@ def create_native_worker_app(
             )
         else:
             executor = LocalProcessExecutor(state_dir=state_dir)
+    stager = _default_stager() if stager is None else stager
     app = FastAPI(title="Eyvan Native Worker", version="1.0.0", docs_url=None, redoc_url=None)
     app.state.executor = executor
+    app.state.stager = stager
 
     def authenticate(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {secret}"
@@ -250,6 +325,50 @@ def create_native_worker_app(
     @app.get("/api/v1/health", dependencies=[Depends(authenticate)])
     def authenticated_health() -> NativeWorkerHealth:
         return NativeWorkerHealth(status="ok", runtime="native-worker")
+
+    @app.post("/api/v1/cells/{cell_id}/stage-actions", dependencies=[Depends(authenticate)])
+    def stage_asset(cell_id: str, body: NativeStageActionRequest) -> CellStageActionResult:
+        """Measure, materialize or remove one named asset on this worker's disk.
+
+        The second hop of managed staging, and the reason a real fleet can stage
+        at all: on ``eyvan-native`` the workload runs here rather than beside the
+        agent, so this is the only process whose disk a stage row can honestly
+        describe. The agent has already fenced the request against its own
+        durable record of the cell before it arrives.
+
+        A 501 when this host declares no source prefixes, never a refusal. The
+        agent reports it as *no executor*, so nothing is staged, recorded or
+        charged -- which is also the answer a worker that predates the route
+        gives, by answering 404. A refusal would instead block every asset in
+        the fleet permanently over one unset environment variable.
+        """
+
+        if stager is None:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "this native worker declares no managed staging sources; "
+                    "set EYVAN_CELL_STAGE_SOURCES on the worker host to the prefixes this fleet may fetch"
+                ),
+            )
+        if body.action is CellStageAction.MEASURE:
+            result = stager.measure(cell_id, body.asset, max_bytes=body.max_bytes)
+        elif body.action is CellStageAction.STAGE:
+            result = stager.stage(cell_id, body.asset, max_bytes=body.max_bytes)
+        else:
+            result = stager.evict(cell_id, body.asset)
+        return CellStageActionResult(
+            asset=body.asset,
+            action=body.action,
+            verdict=_STAGE_VERDICTS[result.verdict],
+            # An eviction frees bytes rather than placing them, and reporting
+            # what it removed as bytes now present would charge the budget for a
+            # disk that was just emptied.
+            size_bytes=0 if body.action is CellStageAction.EVICT else result.size_bytes,
+            digest=None if body.action is CellStageAction.EVICT else result.digest,
+            detail=result.detail[:2048],
+            path=result.path,
+        )
 
     @app.post("/api/v1/workloads", dependencies=[Depends(authenticate)])
     def submit(body: WorkloadRequest) -> WorkloadReference:
