@@ -134,10 +134,12 @@ async def test_a_dependent_node_is_never_released_by_the_wave_phase() -> None:
     controller = _controller(service)
     stages = _by_name(nodes)
 
-    # One root, one wave: nothing is deferred, so no plan is opened at all.
+    # A plan is opened because the DAG is larger than one wave; the wave phase
+    # still must not touch a dependent, whose gate is its predecessor.
     assert [node.schedulable for node in nodes] == [True, False, False]
     async with service.repository.transaction() as tx:
-        assert await tx.get_expansion_admission(parent.id) is None
+        admission = await tx.get_expansion_admission(parent.id)
+    assert admission is not None and admission.total_children == 3
 
     assert await controller.release_expansion_waves_once() == 0
     async with service.repository.transaction() as tx:
@@ -332,15 +334,14 @@ async def test_an_interrupted_dependent_release_neither_loses_nor_duplicates_a_n
     assert all(item is not None and item.schedulable for item in stored)
 
 
-async def test_a_dag_admitted_immediately_releases_its_dependents_unbounded() -> None:
-    """The boundary of the bound, stated rather than implied.
+async def test_a_dag_plans_over_every_node_so_dependents_are_bounded_too() -> None:
+    """The case that actually floods a queue.
 
-    A wave plan is durable and is written only for an expansion that was
-    actually admitted under one. A DAG whose entry fan-out already fitted in a
-    wave was admitted immediately and has no plan, so its dependent releases are
-    unbounded -- which is what its submitter was told at admission. Re-planning
-    it here from live configuration would bound a running expansion by a setting
-    it was never admitted against.
+    Bounding the entry fan-out alone left one root fanning out to N dependents
+    entirely unbounded: the roots fitted in a wave, so the DAG was admitted
+    immediately, no plan was written, and every dependent was released the
+    moment its predecessor succeeded. A dependent's predecessor says *when* it
+    may run and nothing about *how many* may run at once.
     """
 
     service = await _service(wave=2)
@@ -356,13 +357,20 @@ async def test_a_dag_admitted_immediately_releases_its_dependents_unbounded() ->
         name_prefix="immediate",
     )
     controller = _controller(service)
+
+    # A plan now exists precisely because the DAG is larger than one wave, even
+    # though its single root was never going to flood anything by itself.
     async with service.repository.transaction() as tx:
-        assert await tx.get_expansion_admission(parent.id) is None
+        admission = await tx.get_expansion_admission(parent.id)
+    assert admission is not None
+    assert admission.total_children == 5
 
     await _succeed(service, _by_name(nodes)["immediate-root"].id)
 
-    assert await controller.release_ready_dag_nodes_once() == 4
-    assert await _competing(service, parent.id) == [f"immediate-fan-{index}" for index in range(4)]
+    released = await controller.release_ready_dag_nodes_once()
+
+    assert released < 4, "the dependents were released without a bound"
+    assert len(await _competing(service, parent.id)) <= 2
 
 
 async def test_a_second_tenant_is_unaffected_while_a_large_dag_drains() -> None:

@@ -1504,17 +1504,19 @@ class ControlPlaneService:
             # nothing was created while the pipeline runs.
             self._refuse_oversized_expansion(len(nodes), subject="DAG")
             roots = tuple(name for name in order if not by_name[name].depends_on)
-            # Waves bound the *entry* fan-out: a DAG's roots are the nodes that
-            # would otherwise all hit the queue at once. Nodes with predecessors
-            # are already gated by their dependencies and are released by the DAG
-            # phase when those succeed -- this plan neither delays nor governs
-            # them, and says so rather than implying a bound it does not enforce.
+            # The plan governs every node, not just the roots. Bounding the entry
+            # fan-out alone left the case that actually floods a queue unbounded:
+            # a DAG whose roots fit in one wave was admitted IMMEDIATE, no ledger
+            # row was written, and one root fanning out to five hundred dependents
+            # released all five hundred the moment it succeeded. A dependent is
+            # gated by its predecessor, which says *when* it may run and nothing
+            # about *how many* may run at once.
             plan = await self._plan_expansion(
                 tx,
                 org_id=org_id,
                 project_id=project_id,
                 spec=by_name[roots[0]].template if roots else by_name[order[0]].template,
-                requested=max(len(roots), 1),
+                requested=max(len(order), 1),
                 requested_ceiling=max_fan_out,
                 subject="DAG",
             )
@@ -1549,7 +1551,7 @@ class ControlPlaneService:
                 parent,
                 plan,
                 kind=CoordinationKind.DAG,
-                governed_children=len(roots),
+                governed_children=len(order),
             )
             return parent, children
 
