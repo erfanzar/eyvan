@@ -940,6 +940,10 @@ class _ControllerObservation:
                 return False
             scope = host_replacement_scope(current.pool_id, current.provider, current.zone or current.region)
             spent, complete = await self._host_replacements_spent(transaction, scope, now, budget)
+            # Declared before the branches so the audit write below cannot read an
+            # unbound name: a refusal leaves the cell exactly as it was, and only
+            # the promoting branch produces a new record.
+            updated: CellRecord | None = None
             if not complete:
                 refusal = (
                     current,
@@ -985,7 +989,7 @@ class _ControllerObservation:
                     entity_id=cell_id,
                     action=(HOST_FAULT_REPLACEMENT_DECLINED if refusal is not None else HOST_FAULT_HOST_QUARANTINED),
                     previous_state=current.state.value,
-                    new_state=(current if refusal is not None else updated).state.value,
+                    new_state=(updated or current).state.value,
                     payload={
                         "code": fault.code.value,
                         "diagnosis": fault.diagnosis,
