@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import typing as tp
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +18,8 @@ from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue
 from eyvan.capacity import CapacityStatus
 from eyvan.domain.availability import ProvisionOutcome
+
+logger = logging.getLogger(__name__)
 
 
 def canonical_execution_backend(name: str) -> str:
@@ -306,6 +309,214 @@ class CellObservation:
     #: describes a successful observation -- and a spot preemption is a
     #: successful observation of a reclaimed machine, not an error.
     failure_code: CapacityProviderFailureCode | None = None
+
+
+#: Metadata key under which a driver publishes what its cell's hosts carry.
+#:
+#: A wire *addition*, so it is staged: agents start reporting it before anything
+#: reads it, and every reader treats its absence as **unknown**. Absence is not
+#: "this cell has no accelerator" -- an agent that predates this key would then
+#: be read as evidence about hardware it was never asked about.
+CELL_ACCELERATOR_METADATA_KEY: tp.Final = "cell_accelerator"
+
+
+@dataclass(frozen=True, slots=True)
+class CellAccelerator:
+    """What the shipped hardware catalog says one cell's hosts carry.
+
+    Derived at observation time from the catalog, never persisted and never
+    inferred from the shape of a name: :func:`describe_cell_accelerator` looks a
+    type up, and a type with no row produces nothing at all. Parsing ``4`` out
+    of ``g2-standard-48`` would be a guess, and a wrong device count is dispatched
+    to a rank as an exact device list nobody can correct downstream.
+
+    ``devices_per_host`` is optional because the catalog deliberately leaves it
+    out for TPU generations this repository cannot ground. Optional is not zero:
+    zero would reach a rank as an empty ``CUDA_VISIBLE_DEVICES``, which is how a
+    process ends up on the CPU while its peers wait for it at a collective.
+
+    Nothing here is hardware-qualified. No GPU has executed an Eyvan workload;
+    this is a description of a host, not evidence that a run on it works.
+
+    Attributes:
+        kind: The catalog's accelerator kind, ``"gpu"`` or ``"tpu"`` today. Read
+            as an open string so a newer agent's vocabulary is unknown rather
+            than invalid.
+        accelerator_type: The catalog row that produced this description.
+        catalog_revision: The catalog revision the numbers came from, so a
+            dispatched device count can be traced back to a reviewed row.
+        devices_per_host: Accelerators on one host, or ``None`` when the catalog
+            does not record it.
+        gpu_model: The attached accelerator's provider name, GPU rows only.
+    """
+
+    kind: str
+    accelerator_type: str
+    catalog_revision: str
+    devices_per_host: int | None = None
+    gpu_model: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a description that cannot be acted on.
+
+        Raises:
+            ValueError: If a field is empty, untrimmed, not a count, or claims a
+                GPU model without the device count that makes it usable.
+        """
+
+        for field_name in ("kind", "accelerator_type", "catalog_revision"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise ValueError(f"cell accelerator {field_name} must be non-empty and trimmed")
+        if self.devices_per_host is not None and (
+            isinstance(self.devices_per_host, bool)
+            or not isinstance(self.devices_per_host, int)
+            or self.devices_per_host <= 0
+        ):
+            raise ValueError("cell accelerator device count must be a positive integer or absent")
+        if self.gpu_model is not None and (
+            not isinstance(self.gpu_model, str) or not self.gpu_model.strip() or self.gpu_model != self.gpu_model.strip()
+        ):
+            raise ValueError("cell accelerator GPU model must be non-empty and trimmed or absent")
+        if self.gpu_model is not None and self.kind != "gpu":
+            raise ValueError(f"cell accelerator kind {self.kind!r} cannot name a GPU model")
+        if self.kind == "gpu" and self.devices_per_host is None:
+            raise ValueError("a GPU cell accelerator must state how many devices one host carries")
+
+    @property
+    def gpu_devices_per_host(self) -> int | None:
+        """Return GPUs on one host, or ``None`` when this is not a GPU shape.
+
+        Named after the field it feeds, ``NativeGangMember.gpu_devices_per_host``,
+        so the one value that pins a rank to devices is not re-derived by each
+        caller. A TPU cell answers ``None`` here, which is the same answer an
+        unknown cell gives, and both mean "not GPU-coordinated".
+        """
+
+        return self.devices_per_host if self.kind == "gpu" else None
+
+    def as_metadata(self) -> JsonObject:
+        """Return the JSON block a driver publishes in ``CellObservation.metadata``.
+
+        Returns:
+            The block keyed by :data:`CELL_ACCELERATOR_METADATA_KEY`. Optional
+            fields are omitted rather than written as ``null``, so a reader can
+            never mistake "not recorded" for a recorded empty value.
+        """
+
+        block: JsonObject = {
+            "kind": self.kind,
+            "accelerator_type": self.accelerator_type,
+            "catalog_revision": self.catalog_revision,
+        }
+        if self.devices_per_host is not None:
+            block["devices_per_host"] = self.devices_per_host
+        if self.gpu_model is not None:
+            block["gpu_model"] = self.gpu_model
+        return block
+
+
+def describe_cell_accelerator(
+    *,
+    accelerator_type: str | None,
+    machine_type: str | None = None,
+    attached_device_count: int | None = None,
+) -> CellAccelerator | None:
+    """Describe one cell's accelerator from the shipped hardware catalog.
+
+    Two lookup keys because the catalog uses two: TPU rows are keyed by the
+    accelerator type a pool already declares (``v5p-16``), while GPU rows are
+    keyed by *machine type*, because the GPU model fixes none of the numbers --
+    ``g2-standard-4`` and ``g2-standard-96`` carry the same L4 and differ by 8x
+    in attached devices. A cell that declares ``nvidia-l4`` is therefore found
+    through its machine type or not at all.
+
+    Args:
+        accelerator_type: The cell's declared accelerator type, tried first.
+        machine_type: The machine type the cell was provisioned as, tried when
+            the declared type has no catalog row.
+        attached_device_count: Devices the provider was asked for and verified
+            on the instance, when one is configured. Used only to *contradict*
+            the catalog, never to supply a count the catalog does not have.
+
+    Returns:
+        The description, or ``None`` when this build cannot state one. ``None``
+        means unknown: the catalog has no row, the row records no host device
+        count, or the two available sources disagree. It never means "no
+        accelerator", and callers must not turn it into a zero.
+    """
+
+    # Imported here rather than at module scope for the reason the catalog
+    # itself documents: it is a leaf that reaches into the GCP provider package
+    # for TPU name parsing, and this module is imported by the host-side worker
+    # runtime, which has no reason to pay for reading a YAML catalog.
+    from eyvan.capacity.hardware_catalog import hardware_catalog
+
+    catalog = hardware_catalog()
+    shape = None
+    for candidate in (accelerator_type, machine_type):
+        if isinstance(candidate, str) and candidate.strip():
+            shape = catalog.get(candidate)
+            if shape is not None:
+                break
+    if shape is None or shape.devices_per_host is None:
+        return None
+    if attached_device_count is not None and attached_device_count != shape.devices_per_host:
+        # Two sources that should agree do not, and there is no way to tell here
+        # which one is wrong. Reporting either would hand a rank an exact device
+        # list built on the loser of a coin flip.
+        logger.warning(
+            "cell accelerator %r is described by catalog row %r as %d devices per host "
+            "but %d are attached; reporting the accelerator as unknown",
+            accelerator_type,
+            shape.accelerator_type,
+            shape.devices_per_host,
+            attached_device_count,
+        )
+        return None
+    return CellAccelerator(
+        kind=shape.kind,
+        accelerator_type=shape.accelerator_type,
+        catalog_revision=catalog.revision,
+        devices_per_host=shape.devices_per_host,
+        gpu_model=shape.gpu_model,
+    )
+
+
+def read_cell_accelerator(metadata: tp.Mapping[str, JsonValue]) -> CellAccelerator | None:
+    """Read one cell's accelerator description back out of observation metadata.
+
+    Total by construction: every failure returns ``None``, which the whole GPU
+    path reads as *unknown* and answers with the behaviour it had before this key
+    existed. That is what makes the rollout safe in both directions -- an agent
+    older than the key reports nothing, and an agent newer than this reader
+    reports a vocabulary it does not have to understand.
+
+    Args:
+        metadata: One :class:`CellObservation`'s metadata mapping.
+
+    Returns:
+        The description, or ``None`` when it is absent or unreadable. Never a
+        zero-device description.
+    """
+
+    block = metadata.get(CELL_ACCELERATOR_METADATA_KEY)
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        logger.warning("cell accelerator metadata is not a mapping; reading the accelerator as unknown")
+        return None
+    try:
+        return CellAccelerator(
+            kind=block.get("kind"),  # type: ignore[arg-type]
+            accelerator_type=block.get("accelerator_type"),  # type: ignore[arg-type]
+            catalog_revision=block.get("catalog_revision"),  # type: ignore[arg-type]
+            devices_per_host=block.get("devices_per_host"),  # type: ignore[arg-type]
+            gpu_model=block.get("gpu_model"),  # type: ignore[arg-type]
+        )
+    except ValueError as exc:
+        logger.warning("cell accelerator metadata is unusable (%s); reading the accelerator as unknown", exc)
+        return None
 
 
 class CapacityDriver(tp.Protocol):

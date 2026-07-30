@@ -33,7 +33,14 @@ from eyvan._internal.compat import UTC
 from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
-from eyvan.capacity.drivers.base import CellCapabilities, CellObservation, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.base import (
+    CELL_ACCELERATOR_METADATA_KEY,
+    CellCapabilities,
+    CellObservation,
+    MutationContext,
+    StaleMutationError,
+    describe_cell_accelerator,
+)
 from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
     FleetCellRecord,
@@ -104,6 +111,26 @@ class ManualCapacityDriver:
     def _observation(self, record: FleetCellRecord) -> CellObservation:
         endpoints = record.metadata.get("native_worker_endpoints")
         hosts = tuple(endpoints) if isinstance(endpoints, list) else ()
+        metadata: JsonObject = {
+            "provider": self.provider_name,
+            "capacity_backend": self.provider_name,
+            "resource_id": f"manual:{record.name}",
+            "desired_state": record.desired_state,
+            "provider_generation": record.provider_generation,
+            **record.metadata,
+        }
+        # The operator's declaration is the evidence that these hosts are that
+        # shape; the catalog is the authority for what the shape *is*. Eyvan
+        # still describes nothing it has no row for, so declaring a type this
+        # build does not know leaves the cell exactly as unknown as it is today
+        # rather than turning a name into a device count. Derived either way,
+        # including the removal: a copy persisted by some other build must not
+        # outlive this build's ability to state it.
+        accelerator = describe_cell_accelerator(accelerator_type=record.accelerator_type)
+        if accelerator is None:
+            metadata.pop(CELL_ACCELERATOR_METADATA_KEY, None)
+        else:
+            metadata[CELL_ACCELERATOR_METADATA_KEY] = accelerator.as_metadata()
         return CellObservation(
             cell_id=record.name,
             state=record.state,
@@ -111,14 +138,7 @@ class ManualCapacityDriver:
             execution_endpoint=hosts[0] if len(hosts) == 1 else record.execution_endpoint,
             observed_at=datetime.now(UTC),
             runtime_process_count=len(hosts) if hosts else 1,
-            metadata={
-                "provider": self.provider_name,
-                "capacity_backend": self.provider_name,
-                "resource_id": f"manual:{record.name}",
-                "desired_state": record.desired_state,
-                "provider_generation": record.provider_generation,
-                **record.metadata,
-            },
+            metadata=metadata,
         )
 
     @staticmethod

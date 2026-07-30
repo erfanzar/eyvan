@@ -18,12 +18,14 @@ from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity import READY_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import (
+    CELL_ACCELERATOR_METADATA_KEY,
     CapacityProviderFailureCode,
     CellCapabilities,
     CellObservation,
     MutationContext,
     StaleMutationError,
     canonical_execution_backend,
+    describe_cell_accelerator,
 )
 from eyvan.capacity.fleet_state import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
 from eyvan.capacity.providers.gcp import (
@@ -256,6 +258,27 @@ class GcpTpuCapacityDriver:
 
     @staticmethod
     def _observation(record: FleetCellRecord, *, detail: str = "") -> CellObservation:
+        metadata: JsonObject = {
+            **record.metadata,
+            "project": record.project,
+            "zone": record.zone,
+            "accelerator_type": record.accelerator_type,
+            "capacity_class": record.capacity_class,
+            "capacity_backend": record.metadata.get("capacity_backend", "gcp-tpu"),
+            "resource_id": record.qr_id,
+            "qr_id": record.qr_id,
+            "desired_state": record.desired_state,
+            "provider_generation": record.provider_generation,
+            "head_ip": record.head_ip,
+        }
+        # Derived last and unconditionally, including the removal: a copy
+        # persisted by some other build must never outrank this build's catalog,
+        # and a build that cannot describe the cell must not leave one standing.
+        accelerator = GcpTpuCapacityDriver._accelerator_metadata(record)
+        if accelerator is None:
+            metadata.pop(CELL_ACCELERATOR_METADATA_KEY, None)
+        else:
+            metadata[CELL_ACCELERATOR_METADATA_KEY] = accelerator
         return CellObservation(
             cell_id=record.name,
             state=record.state,
@@ -266,20 +289,49 @@ class GcpTpuCapacityDriver:
             observed_tpu_vms=GcpTpuCapacityDriver._observed_tpu_vms(record),
             runtime_process_count=GcpTpuCapacityDriver._runtime_process_count(record),
             failure_code=GcpTpuCapacityDriver._failure_code(record),
-            metadata={
-                **record.metadata,
-                "project": record.project,
-                "zone": record.zone,
-                "accelerator_type": record.accelerator_type,
-                "capacity_class": record.capacity_class,
-                "capacity_backend": record.metadata.get("capacity_backend", "gcp-tpu"),
-                "resource_id": record.qr_id,
-                "qr_id": record.qr_id,
-                "desired_state": record.desired_state,
-                "provider_generation": record.provider_generation,
-                "head_ip": record.head_ip,
-            },
+            metadata=metadata,
         )
+
+    @staticmethod
+    def _accelerator_metadata(record: FleetCellRecord) -> JsonObject | None:
+        """Return what the hardware catalog says this cell's hosts carry.
+
+        Two keys are offered to the catalog because a GCP cell can be named two
+        ways. A TPU cell's ``accelerator_type`` *is* the catalog row (``v5p-16``).
+        A GPU cell's is the GPU model the pool declared (``nvidia-l4``), which
+        the catalog deliberately does not describe -- the model fixes neither the
+        host nor the device count -- so its row is found through the machine type
+        the instance was actually created as.
+
+        The configured GPU count is passed as a contradiction check, not as a
+        source. It is worth checking because it is provider-verified:
+        ``GcloudComputeProvider._validate_instance`` refuses an instance whose
+        ``guestAccelerators`` differ from the configured type and count, so a
+        cell that reached HEALTHY carries what its config says.
+
+        Args:
+            record: The durable cell record being observed.
+
+        Returns:
+            The accelerator block, or ``None`` when this build cannot state one.
+            ``None`` means unknown, never "no accelerator".
+        """
+
+        machine_type: str | None = None
+        attached_device_count: int | None = None
+        config = record.metadata.get("compute_config")
+        if is_json_object(config):
+            raw_machine_type = config.get("machine_type")
+            machine_type = raw_machine_type if isinstance(raw_machine_type, str) else None
+            raw_gpu_count = config.get("gpu_count")
+            if isinstance(raw_gpu_count, int) and not isinstance(raw_gpu_count, bool) and raw_gpu_count > 0:
+                attached_device_count = raw_gpu_count
+        accelerator = describe_cell_accelerator(
+            accelerator_type=record.accelerator_type,
+            machine_type=machine_type,
+            attached_device_count=attached_device_count,
+        )
+        return None if accelerator is None else accelerator.as_metadata()
 
     @staticmethod
     def _failure_code(record: FleetCellRecord) -> CapacityProviderFailureCode | None:
