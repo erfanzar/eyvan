@@ -282,6 +282,37 @@ class CellStageActionRequest(AgentModel):
         return self
 
 
+class NativeStageActionRequest(AgentModel):
+    """One byte-bounded staging instruction for the native worker that owns a disk.
+
+    The same three terms as :class:`CellStageActionRequest` and deliberately not
+    its fence. A native worker holds no cell record, so it has no generation to
+    compare against, and carrying one it could only ignore would make the hop
+    look fenced twice when it is fenced once. The fence is the agent's: it
+    checks the request against its own durable capacity record before
+    forwarding. The bearer credential on this hop is a second, narrower guard --
+    :func:`~eyvan.worker.runtime.native_bootstrap.derive_native_worker_token`
+    derives it per provider generation, so a worker rebuilt under a new one does
+    not accept a credential minted for the old.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: CellStageAction
+    asset: str = Field(min_length=1, max_length=MAX_CELL_STAGE_ASSET_LENGTH)
+    max_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_values(self) -> NativeStageActionRequest:
+        """Reject an asset name that is untrimmed or carries a NUL byte."""
+
+        if self.asset != self.asset.strip():
+            raise ValueError("a staged asset must be trimmed")
+        if "\x00" in self.asset:
+            raise ValueError("a staged asset must not contain NUL bytes")
+        return self
+
+
 class CellStageActionResult(AgentModel):
     """What one staging action established on one host.
 

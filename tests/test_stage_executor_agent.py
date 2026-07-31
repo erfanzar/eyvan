@@ -61,7 +61,7 @@ from eyvan.server.service.stage import CellStageRequest, charged_bytes
 from eyvan.worker.agent.app import create_agent_app
 from eyvan.worker.agent.client import CellAgentClient
 from eyvan.worker.agent.service import CellAgentService
-from eyvan.worker.runtime.stage_executor import LocalAssetStageExecutor
+from eyvan.worker.runtime.stage_executor import AssetStageResult, AssetStageVerdict, LocalAssetStageExecutor
 
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 _SECRET = "stage-secret"
@@ -556,27 +556,74 @@ async def test_an_agent_without_the_route_stages_nothing_and_records_nothing(tmp
     assert await _stages(repository) == []
 
 
-async def test_an_agent_whose_backend_cannot_stage_reads_as_no_executor(tmp_path: Path) -> None:
-    """A current agent that does not own the workload's disk says so, and is believed.
+async def test_an_agent_never_stages_a_remote_workload_onto_its_own_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend that does not own the workload's disk hands the work on, and writes nothing.
 
     Staging onto the agent's own disk when the workload runs on another machine
     would manufacture exactly the confident false hit the design refuses: a row
     saying this cell holds the asset, steering placement, describing a directory
-    the job cannot read.
+    the job cannot read. So even with this host's own sources declared, an
+    ``eyvan-native`` agent builds no executor of its own and forwards to the
+    driver for that cell instead -- the hop ``test_stage_executor_native``
+    exercises end to end.
     """
 
+    class _RecordingDriver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        def measure(self, cell_id: str, asset: str, *, max_bytes: int):
+            self.calls.append(("measure", asset, max_bytes))
+            return AssetStageResult(verdict=AssetStageVerdict.OK, size_bytes=64, detail="the worker declares 64 bytes")
+
+        def stage(self, cell_id: str, asset: str, *, max_bytes: int):
+            self.calls.append(("stage", asset, max_bytes))
+            return AssetStageResult(
+                verdict=AssetStageVerdict.OK,
+                size_bytes=64,
+                digest=_digest(b"x" * 64),
+                detail="staged",
+                path="/var/lib/eyvan/workload/stages/cell-a/assets/pile",
+            )
+
+        def evict(self, cell_id: str, asset: str):
+            raise AssertionError("this test does not evict")
+
+    class _RemoteExecutors:
+        def __init__(self, driver: _RecordingDriver) -> None:
+            self.driver = driver
+
+        def resolve(self, _cell_id, _observation):
+            return self.driver
+
+    monkeypatch.setenv("EYVAN_CELL_STAGE_SOURCES", "/data")
+    monkeypatch.setenv("EYVAN_CELL_STAGE_DIR", str(tmp_path / "agent-disk"))
+    driver = _RecordingDriver()
+    settings = EyvanSettings(agent_shared_secret=_SECRET, agent_state_dir=str(tmp_path / "agent"))
+    service = CellAgentService(
+        capacity=_Capacity(executor="eyvan-native"),  # type: ignore[arg-type]
+        state=FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        executors=_RemoteExecutors(driver),  # type: ignore[arg-type]
+        settings=settings,
+    )
+    transport = TestClient(create_agent_app(service, settings), headers={"Authorization": f"Bearer {_SECRET}"})
+    client = CellAgentClient("http://agent", client=transport)
     repository = InMemoryRepository()
     await repository.open()
-    _service, client = _agent(tmp_path, capacity=_Capacity(executor="eyvan-native"))
     controller = _controller(repository, client)
     await _seed(repository, cells=[_cell()], workloads=[_workload("/data/pile")], leases=[_lease()])
 
     counts = await controller.stage_cell_assets_once(now=NOW)
+    stored = (await _stages(repository))[0]
 
-    assert _service.stager is None
-    assert counts["inconclusive"] == 0
-    assert counts["blocked"] == 0
-    assert await _stages(repository) == []
+    assert service.stager is None
+    assert driver.calls == [("measure", "/data/pile", 1 << 20), ("stage", "/data/pile", 1 << 20)]
+    assert counts["staged"] == 1
+    assert stored.observed_bytes == 64
+    assert [path for path in tmp_path.rglob("agent-disk/**/*") if path.is_file()] == []
 
 
 async def test_an_eviction_that_finds_no_executor_puts_the_row_back(tmp_path: Path) -> None:

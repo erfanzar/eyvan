@@ -11,14 +11,25 @@ machine, the byte budget, the eviction policy, the fence and the durable ledger
 protocol with no implementation, so every stage read as absent and placement
 never changed. This module is the half that touches a disk.
 
-**Deployment order: agents first, controller second.** This ships a new cell
-agent wire method (``POST /api/v1/cells/{cell_id}/stage-actions``). A control
-plane that asks an agent which does not serve it yet gets HTTP 404, which the
-client reports as *this agent has no staging executor* -- absence of a
-capability, not a failed action. Nothing is recorded, nothing is charged and
-nothing is retried, which is exactly the behaviour of a deployment that
-configures no executor at all. Upgrading the controller first is therefore
-harmless but pointless; upgrading agents first is what makes the feature appear.
+**Deployment order: native workers first, then agents, then the controller.**
+Staging reaches a disk over two hops, and each is a wire method an older process
+does not serve. The agent serves
+``POST /api/v1/cells/{cell_id}/stage-actions``; a native worker serves the same
+path for the cells whose disk it owns. Either one, when it predates its route,
+answers HTTP 404, which the caller reports as *this host has no staging
+executor* -- absence of a capability, not a failed action. Nothing is recorded,
+nothing is charged and nothing is retried, which is exactly the behaviour of a
+deployment that configures no executor at all. Every prefix of the order above
+is therefore inert rather than broken, and the feature appears from the disk
+upwards.
+
+Which hop an agent uses is decided by whose disk the workload runs on.
+``native-local`` runs it as a child of the agent process, so the agent holds the
+executor itself. ``eyvan-native`` runs it on another machine, so the agent
+fences the request against its own durable record and forwards it to that
+machine's worker, which holds the executor. The class below is the same class in
+both cases: there is one implementation of fetch, measure and evict, and the
+second deployment shape is a route to it rather than a copy of it.
 
 Four rules decide every answer here, and each exists because its opposite is a
 lie the control plane would then act on:
@@ -430,6 +441,27 @@ class _AssetPaths:
     quarantined: Path
 
 
+@tp.runtime_checkable
+class AssetStageDriver(tp.Protocol):
+    """The host-side half of managed staging, as anything forwarding to it sees it.
+
+    :class:`LocalAssetStageExecutor` satisfies it by running on the disk, and
+    :class:`~eyvan.worker.runtime.native_remote.NativeRemoteExecutor` satisfies
+    it by forwarding to the worker that does. Runtime-checkable so a caller can
+    ask a resolved execution driver whether it stages at all, the way
+    ``runtime/registry`` already asks about structured logs and process
+    introspection -- an execution backend that cannot stage says so by not
+    satisfying this, rather than by returning something that looks like a
+    result.
+    """
+
+    def measure(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
+
+    def stage(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
+
+    def evict(self, cell_id: str, asset: str) -> AssetStageResult: ...
+
+
 @dataclass(slots=True)
 class LocalAssetStageExecutor:
     """Materialize, measure and remove named assets on the disk it runs on.
@@ -440,9 +472,10 @@ class LocalAssetStageExecutor:
 
     Deliberately not the cell-agent client and deliberately not the control
     plane's ``CellStageExecutor``: this is the host-side half, and the wire
-    between them is one agent RPC. Keeping them apart is what lets the same
-    class serve an agent that runs workloads locally today and a native worker
-    reached over HTTP later, without either one importing the control plane.
+    between them is one RPC. Keeping them apart is what lets the same class
+    serve an agent that runs workloads as its own children and a native worker
+    reached over HTTP, without either one importing the control plane. Both
+    deployment shapes construct this class; neither reimplements it.
     """
 
     root: Path
@@ -720,6 +753,7 @@ __all__ = (
     "AssetReference",
     "AssetRefusedError",
     "AssetSource",
+    "AssetStageDriver",
     "AssetStageResult",
     "AssetStageVerdict",
     "AssetStream",

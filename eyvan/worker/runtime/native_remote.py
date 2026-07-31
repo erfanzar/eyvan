@@ -3,7 +3,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""HTTP execution driver for one Eyvan native worker."""
+"""HTTP execution driver for one Eyvan native worker.
+
+**Deployment order: native workers first, then agents, then the controller.**
+This driver calls one route older workers do not serve --
+``POST /api/v1/cells/{cell_id}/stage-actions``, the worker half of managed
+staging. A worker that predates it answers 404 and a worker that declares no
+source prefixes answers 501, and both become
+:class:`~eyvan.capacity.drivers.base.UnsupportedCapabilityError` here, which the
+agent above reports to the control plane as *no staging executor*: absence of a
+capability, never a failed action. So an agent upgraded ahead of its workers
+stages nothing, records nothing and charges nothing.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +25,22 @@ import httpx
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
-from eyvan.capacity.drivers.base import ExecutionWorkloadObservation, MutationContext, StaleMutationError
+from eyvan.capacity.drivers.base import (
+    ExecutionWorkloadObservation,
+    MutationContext,
+    StaleMutationError,
+    UnsupportedCapabilityError,
+)
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
+    CellStageAction,
+    CellStageActionResult,
+    CellStageVerdict,
     CheckpointRequest,
     MutationConflict,
     MutationConflictCode,
     MutationModel,
+    NativeStageActionRequest,
     NativeWorkerHealth,
     WorkloadMutationRequest,
     WorkloadReference,
@@ -28,10 +48,40 @@ from eyvan.worker.agent.models import (
 )
 from eyvan.worker.agent.models import WorkloadObservation as AgentWorkloadObservation
 from eyvan.worker.runtime.log_records import LogPage, log_page_from_json
+from eyvan.worker.runtime.stage_executor import AssetStageResult, AssetStageVerdict
+
+#: Wall-clock bound on one staging hop, per action. A dataset pull is minutes of
+#: network, a measurement is one HEAD, and an eviction is a few unlinks.
+#:
+#: Each is deliberately under the control plane's own bound on the outer hop, so
+#: a fetch that runs long ends here first and the agent still answers. An
+#: inconclusive verdict is something the ledger can record against a named host;
+#: an outer request that died says nothing about which disk holds what.
+_STAGE_TIMEOUTS: dict[CellStageAction, float] = {
+    CellStageAction.MEASURE: 45.0,
+    CellStageAction.STAGE: 1500.0,
+    CellStageAction.EVICT: 240.0,
+}
+
+#: What one staging verdict off the worker's wire means to this host.
+_STAGE_VERDICTS: dict[CellStageVerdict, AssetStageVerdict] = {
+    CellStageVerdict.OK: AssetStageVerdict.OK,
+    CellStageVerdict.REFUSED: AssetStageVerdict.REFUSED,
+    CellStageVerdict.INCONCLUSIVE: AssetStageVerdict.INCONCLUSIVE,
+}
 
 
 class NativeRemoteExecutor:
-    """Delegate fenced workload operations to one native worker over HTTP."""
+    """Delegate fenced workload operations to one native worker over HTTP.
+
+    Also the agent's route to that worker's disk. ``measure``, ``stage`` and
+    ``evict`` satisfy
+    :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver`, so an agent
+    whose workloads run on another machine forwards staging exactly as it
+    forwards every other operation: to the process that owns the thing being
+    acted on. The executor itself stays on the worker -- there is one
+    implementation of fetch, measure and evict, and this is a route to it.
+    """
 
     def __init__(
         self,
@@ -220,6 +270,94 @@ class NativeRemoteExecutor:
         if response.status_code >= 400:
             return LogPage(unavailable=True, detail=f"native worker answered {response.status_code}")
         return log_page_from_json(response.json())
+
+    def measure(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult:
+        """Return what this asset would occupy on the worker's disk, fetching nothing."""
+
+        return self._stage_action(cell_id, CellStageAction.MEASURE, asset, max_bytes=max_bytes)
+
+    def stage(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult:
+        """Materialize the asset on the worker's disk and report the bytes it proved."""
+
+        return self._stage_action(cell_id, CellStageAction.STAGE, asset, max_bytes=max_bytes)
+
+    def evict(self, cell_id: str, asset: str) -> AssetStageResult:
+        """Remove every copy of the asset from the worker's disk."""
+
+        return self._stage_action(cell_id, CellStageAction.EVICT, asset, max_bytes=0)
+
+    def _stage_action(
+        self,
+        cell_id: str,
+        action: CellStageAction,
+        asset: str,
+        *,
+        max_bytes: int,
+    ) -> AssetStageResult:
+        """Issue one staging action against the worker that owns this cell's disk.
+
+        The three answers this hop can add to the executor's own are separated
+        on purpose, because the control plane acts on each differently.
+
+        *No executor* -- 404 from a worker that predates the route, 501 from one
+        that declares no source prefixes -- is raised rather than returned. It is
+        not a verdict about the asset, and returning it as one would either
+        block the asset permanently or charge a budget for bytes nobody
+        attempted to fetch.
+
+        *A rejected request* -- 400 or 422 -- is refused. The worker read it and
+        said no, and the same bytes get the same answer tomorrow.
+
+        *Anything else* -- a credential the worker would not accept, a 5xx, a
+        timeout, a body that will not parse -- is inconclusive. None of it is
+        evidence about the disk. A worker rebuilt under a new provider
+        generation answers 401 to a driver still holding the old credential, and
+        that says nothing about whether the asset could be staged; recording it
+        as a refusal would block the asset long after the rebuild that caused
+        it.
+        """
+
+        request = NativeStageActionRequest(action=action, asset=asset, max_bytes=max_bytes)
+        try:
+            response = self._request(
+                "POST",
+                f"/api/v1/cells/{cell_id}/stage-actions",
+                json=model_json(request),
+                timeout=_STAGE_TIMEOUTS[action] if self._owns_client else None,
+            )
+        except httpx.HTTPError as error:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=f"native worker was unreachable: {error}",
+            )
+        if response.status_code in {404, 501}:
+            raise UnsupportedCapabilityError(
+                f"the native worker holding cell {cell_id!r} has no staging executor: {response.text[:500]}"
+            )
+        if response.status_code in {400, 422}:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.REFUSED,
+                detail=f"the native worker rejected this staging request: HTTP {response.status_code}",
+            )
+        if response.status_code >= 400:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=f"native worker answered HTTP {response.status_code}",
+            )
+        try:
+            result = CellStageActionResult.model_validate_json(response.content)
+        except (ValidationError, ValueError) as error:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=f"native worker returned an unreadable staging result: {error}",
+            )
+        return AssetStageResult(
+            verdict=_STAGE_VERDICTS[result.verdict],
+            size_bytes=result.size_bytes,
+            digest=result.digest,
+            detail=result.detail,
+            path=result.path,
+        )
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return live process detail for one workload on this host."""

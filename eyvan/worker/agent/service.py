@@ -5,13 +5,21 @@
 
 """Cell-agent service composed from independent capacity, state, and execution backends.
 
-**Deployment order for managed staging: agents first, controller second.** This
-module serves one wire method the control plane did not previously call --
-``stage_asset``, reached at ``POST /api/v1/cells/{cell_id}/stage-actions``. An
-agent that predates it answers 404, which the client reports as *this agent has
-no staging executor*: absence of a capability, never a failed action. So a
-control plane upgraded first stages nothing and records nothing, exactly as it
-does today, and the feature appears when the agents underneath it are upgraded.
+**Deployment order for managed staging: native workers first, then agents, then
+the controller.** This module serves one wire method the control plane did not
+previously call -- ``stage_asset``, reached at
+``POST /api/v1/cells/{cell_id}/stage-actions``. An agent that predates it
+answers 404, which the client reports as *this agent has no staging executor*:
+absence of a capability, never a failed action. So a control plane upgraded
+first stages nothing and records nothing, exactly as it does today.
+
+For ``eyvan-native`` the same request travels one hop further, because the
+workload's disk belongs to a native worker on another machine rather than to
+this process. This agent fences the request against its own durable record and
+forwards it to that worker's identical route; a worker that predates the route
+answers 404 and one that declares no source prefixes answers 501, and both come
+back here as *no executor* and are reported on unchanged. Every prefix of the
+deployment order above is therefore inert rather than broken.
 """
 
 from __future__ import annotations
@@ -62,7 +70,7 @@ from eyvan.worker.runtime.registry import (
     NativeGangCell,
     StructuredLogExecutionDriver,
 )
-from eyvan.worker.runtime.stage_executor import AssetStageResult, AssetStageVerdict, LocalAssetStageExecutor
+from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
 
 if tp.TYPE_CHECKING:
     from eyvan.worker.runtime.native_gang import NativeGangWorkloadResult
@@ -73,10 +81,22 @@ if tp.TYPE_CHECKING:
 #: asset A*, and placement is steered by it, so an agent that wrote the bytes to
 #: a disk the workload cannot read would be manufacturing exactly the confident
 #: false hit the whole design refuses. ``native-local`` runs the workload as a
-#: child of this process; ``eyvan-native`` reaches a worker on another machine,
-#: and putting bytes there needs a wire method on that worker which this wave
-#: does not add -- so it reports no executor rather than staging the wrong disk.
+#: child of this process, so this agent's disk is the workload's disk and the
+#: executor is built here.
 _HOST_LOCAL_EXECUTION_BACKENDS = frozenset({"native-local"})
+
+#: Execution backends whose workloads run on a disk some other process owns.
+#:
+#: The same rule from the other side: the bytes have to land where the workload
+#: will read them, so this agent forwards to the execution driver it already
+#: resolves for that cell rather than writing anything itself. Whether that
+#: driver can stage is a question asked of the driver -- a resolved executor
+#: that does not satisfy
+#: :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver` reads as no
+#: executor. That is what a multi-host native slice does today: it spans several
+#: workers with no single disk this agent could name, so it stages nothing until
+#: something teaches it which host an asset belongs on.
+_REMOTE_STAGING_EXECUTION_BACKENDS = frozenset({"eyvan-native"})
 
 #: What one staging verdict is called on the wire.
 _STAGE_VERDICTS: dict[AssetStageVerdict, CellStageVerdict] = {
@@ -86,14 +106,12 @@ _STAGE_VERDICTS: dict[AssetStageVerdict, CellStageVerdict] = {
 }
 
 
-class CellStageDriver(tp.Protocol):
-    """The host-side half of managed staging, as this agent uses it."""
-
-    def measure(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
-
-    def stage(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult: ...
-
-    def evict(self, cell_id: str, asset: str) -> AssetStageResult: ...
+#: The host-side half of managed staging, as this agent uses it.
+#:
+#: Defined beside the executor rather than here, because both things that
+#: satisfy it live there: the executor that runs on a disk, and the native
+#: worker driver that forwards to the process which does.
+CellStageDriver: tp.TypeAlias = AssetStageDriver
 
 
 MutationRequest: tp.TypeAlias = CapacityRequest | CheckpointRequest | WorkloadMutationRequest | WorkloadRequest
@@ -198,9 +216,12 @@ class CellAgentService:
         executors: ExecutionDriverResolver | None = None,
         settings: EyvanSettings | None = None,
         remote_retire: tp.Callable[[str, str, WorkloadMutationRequest], None] | None = None,
-        #: Puts named assets on this host's disk and takes them off again.
-        #: Built for a host-local execution backend when omitted, and left unset
-        #: for every other backend -- see ``_HOST_LOCAL_EXECUTION_BACKENDS``.
+        #: Puts named assets on the workload's disk and takes them off again.
+        #: Built here for a host-local execution backend when omitted; for a
+        #: backend whose workloads run elsewhere it is left unset and resolved
+        #: per cell from that cell's execution driver -- see
+        #: ``_HOST_LOCAL_EXECUTION_BACKENDS`` and
+        #: ``_REMOTE_STAGING_EXECUTION_BACKENDS``.
         stager: CellStageDriver | None = None,
     ):
         settings = settings or EyvanSettings.from_env()
@@ -672,14 +693,21 @@ class CellAgentService:
         a warm-up round trip silently take ownership away from the lifecycle
         command that actually owns the host.
 
+        Fenced before the hop, never after. For ``eyvan-native`` the executor is
+        on another machine, so the check has to happen on the way out: a request
+        forwarded first and fenced afterwards would already have written bytes
+        to a host it does not own.
+
         Raises:
-            UnsupportedCapabilityError: This agent has no executor for this
-                cell's disk, which the control plane reads as "no executor"
-                rather than as a failed action.
+            UnsupportedCapabilityError: There is no executor for this cell's
+                disk -- this agent binds none, the worker holding it predates
+                the route, or that worker declares no source prefixes. The
+                control plane reads all three as "no executor" rather than as a
+                failed action.
             StaleMutationError: The request's generation does not own the cell.
         """
 
-        if self.stager is None:
+        if self.stager is None and self.execution_backend not in _REMOTE_STAGING_EXECUTION_BACKENDS:
             raise UnsupportedCapabilityError(
                 f"execution backend {self.execution_backend!r} does not stage assets on this agent's host"
             )
@@ -691,12 +719,13 @@ class CellAgentService:
                 f"staging generation {request.mutation.generation} does not own cell {cell_id!r} "
                 f"generation {observation.generation}"
             )
+        stager = self.stager if self.stager is not None else self._remote_stager(cell_id, observation)
         if request.action is CellStageAction.MEASURE:
-            result = self.stager.measure(cell_id, request.asset, max_bytes=request.max_bytes)
+            result = stager.measure(cell_id, request.asset, max_bytes=request.max_bytes)
         elif request.action is CellStageAction.STAGE:
-            result = self.stager.stage(cell_id, request.asset, max_bytes=request.max_bytes)
+            result = stager.stage(cell_id, request.asset, max_bytes=request.max_bytes)
         else:
-            result = self.stager.evict(cell_id, request.asset)
+            result = stager.evict(cell_id, request.asset)
         return CellStageActionResult(
             asset=request.asset,
             action=request.action,
@@ -709,6 +738,29 @@ class CellAgentService:
             detail=result.detail[:2048],
             path=result.path,
         )
+
+    def _remote_stager(self, cell_id: str, observation: CellObservation) -> CellStageDriver:
+        """Return the route to the disk the workload on this cell will actually read.
+
+        The already-fenced observation is passed in rather than re-read. It is
+        the same object the generation check just ran against, so the driver
+        this resolves is the one that observation names -- and a second
+        ``observe`` would be a second provider round trip per staging action,
+        against a machine that had no reason to have moved in between.
+
+        Raises:
+            UnsupportedCapabilityError: The resolved execution driver does not
+                stage. A multi-host native slice is the live example: it spans
+                several workers, and this agent has no basis for choosing which
+                one an asset belongs on.
+        """
+
+        driver = self.executors.resolve(cell_id, observation)
+        if not isinstance(driver, AssetStageDriver):
+            raise UnsupportedCapabilityError(
+                f"the {self.execution_backend!r} execution driver for cell {cell_id!r} does not stage assets"
+            )
+        return driver
 
     def _executor(self, cell_id: str) -> ExecutionDriver:
         return self.executors.resolve(cell_id, self.capacity.observe(cell_id))
