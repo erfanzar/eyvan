@@ -14,15 +14,18 @@ import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
+from urllib.parse import urlparse
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan._internal.network import format_http_ip_endpoint
 from eyvan.capacity.drivers.base import (
+    CellAccelerator,
     CellObservation,
     ExecutionDriver,
     MutationContext,
     UnsupportedCapabilityError,
     canonical_execution_backend,
+    read_cell_accelerator,
 )
 from eyvan.worker.runtime._multihost_site import DEFAULT_GANG_INITIALIZATION, GangInitializationPolicy
 from eyvan.worker.runtime.log_records import LogPage
@@ -404,7 +407,17 @@ class ExecutionDriverResolver:
         return driver
 
     def resolve_gang(self, cells: tp.Sequence[NativeGangCell]):
-        """Resolve one native executor spanning independently fenced execution cells."""
+        """Resolve one native executor spanning independently fenced execution cells.
+
+        The gang becomes GPU-coordinated only when every cell's observation
+        carries a catalog GPU shape (see :meth:`_gang_gpu_accelerators`). A cell
+        whose agent predates the accelerator metadata, or whose machine type has
+        no catalog row, reports nothing, and the whole gang then takes the path
+        it has always taken: no GPU variable written, none stripped.
+
+        Nothing here is hardware-qualified. No GPU has executed an Eyvan
+        workload; what this method decides is which bytes a rank is dispatched.
+        """
 
         if self.backend != "eyvan-native":
             raise UnsupportedCapabilityError(
@@ -418,30 +431,101 @@ class ExecutionDriverResolver:
 
         from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMember
 
-        members = []
+        cell_endpoints: dict[str, tuple[str, ...]] = {}
         for cell in ordered:
             raw_endpoints = cell.observation.metadata.get("native_worker_endpoints")
             if raw_endpoints is None:
                 endpoint = cell.observation.execution_endpoint
                 if not isinstance(endpoint, str) or not endpoint.strip():
                     raise ValueError(f"native gang cell {cell.cell_id!r} has no execution endpoint")
-                endpoints = (endpoint.strip(),)
+                cell_endpoints[cell.cell_id] = (endpoint.strip(),)
             else:
-                endpoints = _worker_endpoints(
+                cell_endpoints[cell.cell_id] = _worker_endpoints(
                     raw_endpoints,
                     field_name=f"native gang cell {cell.cell_id!r}",
                     require_trimmed=True,
                     allow_empty=False,
                 )
-            members.append(
-                NativeGangMember(
-                    cell_id=cell.cell_id,
-                    endpoints=endpoints,
-                    secret=self._native_worker_token(cell.observation),
-                    context=cell.context,
-                )
+        accelerators = self._gang_gpu_accelerators(ordered, cell_endpoints)
+        members = [
+            NativeGangMember(
+                cell_id=cell.cell_id,
+                endpoints=cell_endpoints[cell.cell_id],
+                secret=self._native_worker_token(cell.observation),
+                context=cell.context,
+                gpu_devices_per_host=(
+                    accelerators[cell.cell_id].gpu_devices_per_host if cell.cell_id in accelerators else None
+                ),
+                gpu_model=accelerators[cell.cell_id].gpu_model if cell.cell_id in accelerators else None,
             )
+            for cell in ordered
+        ]
         return NativeGangExecutor(members, initialization=self.gang_initialization)
+
+    @staticmethod
+    def _gang_gpu_accelerators(
+        cells: tp.Sequence[NativeGangCell],
+        cell_endpoints: tp.Mapping[str, tuple[str, ...]],
+    ) -> dict[str, CellAccelerator]:
+        """Return the GPU description of every cell, or nothing for the whole gang.
+
+        This is the only place a dispatched gang becomes GPU-coordinated, and it
+        is all-or-nothing on purpose. A gang where some members carry a known GPU
+        shape and others do not is exactly the state
+        :class:`~eyvan.worker.runtime.native_gang.NativeGangExecutor` refuses to
+        construct -- the known ranks would be pinned to exact devices while the
+        rest kept whatever the submission said, and the gang would look
+        coordinated. Here that state is *downgraded* rather than refused: these
+        are observations, not a hand-built gang, and partial knowledge is the
+        expected state of a fleet whose agents are being upgraded one at a time
+        or whose machine type has no catalog row. Refusing would turn a rolling
+        upgrade into a dispatch failure for a gang that runs today.
+
+        Distinct hosts are required for the same reason the counts are.
+        ``plan_gpu_devices`` gives every rank its host's devices ``0..n-1``, which
+        is exact only while one rank owns one host; two endpoints on one host
+        would each be told they own all of it. Eyvan does not launch more than
+        one process per host and does not model device isolation between two
+        workloads packed onto one cell, so a gang that cannot be shown to be
+        one-rank-per-host is left uncoordinated instead of given a claim Eyvan
+        cannot keep.
+
+        Args:
+            cells: The gang's cells, in dispatch order.
+            cell_endpoints: Each cell's validated native-worker endpoints.
+
+        Returns:
+            One :class:`CellAccelerator` per cell when every cell is a known GPU
+            shape on its own host, otherwise an empty mapping. Empty means
+            "not GPU-coordinated", which is today's path, and never "no GPU".
+        """
+
+        accelerators: dict[str, CellAccelerator] = {}
+        for cell in cells:
+            accelerator = read_cell_accelerator(cell.observation.metadata)
+            if accelerator is not None and accelerator.gpu_devices_per_host is not None:
+                accelerators[cell.cell_id] = accelerator
+        if not accelerators:
+            return {}
+        if len(accelerators) != len(cells):
+            logger.warning(
+                "native gang is not GPU-coordinated: %d of %d cells report a catalog GPU shape; cells without one: %s",
+                len(accelerators),
+                len(cells),
+                ", ".join(sorted(cell.cell_id for cell in cells if cell.cell_id not in accelerators)),
+            )
+            return {}
+        hosts = [urlparse(endpoint).hostname for endpoints in cell_endpoints.values() for endpoint in endpoints]
+        named = [host for host in hosts if host]
+        if len(named) != len(hosts) or len(set(named)) != len(hosts):
+            logger.warning(
+                "native gang is not GPU-coordinated: its %d worker endpoints name %d distinct hosts, "
+                "so two ranks could be given the same devices",
+                len(hosts),
+                len(set(named)),
+            )
+            return {}
+        return accelerators
 
     def _native_worker_token(self, observation: CellObservation) -> str:
         """Derive the per-cell worker token from the agent's shared secret."""

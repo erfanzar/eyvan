@@ -67,6 +67,17 @@ class LocalCapacityDriver:
 
     @classmethod
     def _observation(cls, record: FleetCellRecord) -> CellObservation:
+        """Return the local cell's observation, deliberately without an accelerator.
+
+        Every other driver publishes ``cell_accelerator`` so a gang can be pinned
+        to exact devices. This one does not, and the omission is the honest
+        answer rather than an oversight: an operator declaring
+        ``accelerator_type: a3-highgpu-8g`` on a development cell is naming the
+        fleet they are modelling, not eight H100s in the machine this agent runs
+        on, and this driver makes no isolation claim that would let it be asked.
+        Absence reads as *unknown* everywhere it is read, which is correct here.
+        """
+
         return CellObservation(
             cell_id=record.name,
             state=record.state,
