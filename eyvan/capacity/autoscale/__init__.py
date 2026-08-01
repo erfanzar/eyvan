@@ -43,6 +43,17 @@ from eyvan.capacity.autoscale.models import (
     TpuProfile,
     validate_gcp_project_id,
 )
+from eyvan.capacity.autoscale.pool_capacity import (
+    CLUSTER_CAPACITY_MAX_AGE_ENV,
+    CLUSTER_CAPACITY_PLANNING_ENV,
+    DEFAULT_NAMESPACE,
+    KUBERNETES_BACKENDS,
+    KUBERNETES_NAMESPACE_ENV,
+    ClusterCapacityPass,
+    PoolCapacityTarget,
+    cluster_capacity_policy_from_env,
+    kubernetes_capacity_target,
+)
 from eyvan.capacity.autoscale.profiles import (
     DEFAULT_TPU_PROFILES,
     QUEUED_TPU_PROFILE_CATALOG,
@@ -56,10 +67,15 @@ from eyvan.capacity.autoscale.queue_admission import QueueAdmissionDenialRecorde
 from eyvan.capacity.autoscale.service import AutoscaleGenerationResult, AutoscaleGenerationService, TpuQuotaDiscovery
 
 __all__ = (
+    "CLUSTER_CAPACITY_MAX_AGE_ENV",
+    "CLUSTER_CAPACITY_PLANNING_ENV",
     "DEFAULT_AUTOSCALE_CACHE_ROOT",
     "DEFAULT_AUTOSCALE_DEFAULTS_PATH",
     "DEFAULT_MAX_OBSERVATION_AGE_S",
+    "DEFAULT_NAMESPACE",
     "DEFAULT_TPU_PROFILES",
+    "KUBERNETES_BACKENDS",
+    "KUBERNETES_NAMESPACE_ENV",
     "MAX_OBSERVATION_SKEW_S",
     "QUEUED_TPU_PROFILE_CATALOG",
     "AutoscaleConfigCache",
@@ -73,11 +89,13 @@ __all__ = (
     "AutoscaleZoneRequest",
     "CachedAutoscaleConfig",
     "ClusterCapacityAdvice",
+    "ClusterCapacityPass",
     "ClusterCapacityPolicy",
     "GeneratedAutoscaleCache",
     "GeneratedAutoscaleConfig",
     "GeneratedZoneAutoscaleConfig",
     "GenerationQuotaSnapshot",
+    "PoolCapacityTarget",
     "QueueAdmissionDenial",
     "QueueAdmissionDenialCache",
     "QueueAdmissionDenialKey",
@@ -89,8 +107,10 @@ __all__ = (
     "TpuProfileResolution",
     "TpuQuotaDiscovery",
     "advise_launch",
+    "cluster_capacity_policy_from_env",
     "generate_autoscale_config",
     "generate_zone_autoscale_config",
+    "kubernetes_capacity_target",
     "observation_age",
     "render_autoscale_yaml",
     "resolve_queued_tpu_profile",

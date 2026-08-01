@@ -15,6 +15,7 @@ from eyvan.capacity import (
     CapacityStatus,
 )
 from eyvan.capacity.audit import CapacityLifecycleEvent, CapacityReplacementReason
+from eyvan.capacity.autoscale.pool_capacity import ClusterCapacityPass
 from eyvan.capacity.planning import (
     CapacityPlanner,
     CapacitySimulation,
@@ -282,6 +283,22 @@ class _ControllerFleets:
                 )
         return [released_by_id.get(cell.id, cell) for cell in cells]
 
+    def _cluster_capacity(self) -> ClusterCapacityPass:
+        """Return the pool cluster-capacity pass, built from the environment once.
+
+        Lazy rather than constructed with the controller so that enabling an
+        observed cluster as a plan input stays one file. A pass assigned before
+        the first reconciliation -- which is what a test does, and what an
+        embedder with its own Kubernetes credentials would do -- is used
+        unchanged.
+        """
+
+        existing: ClusterCapacityPass | None = getattr(self, "_cluster_capacity_pass", None)
+        if existing is None:
+            existing = ClusterCapacityPass.from_env()
+            self._cluster_capacity_pass = existing
+        return existing
+
     async def reconcile_capacity_pools_once(self) -> dict[str, int]:
         """Reconcile declarative pools against global submitted workload demand."""
 
@@ -359,6 +376,16 @@ class _ControllerFleets:
         plans = planner.plan(demand_by_pool)
         await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)
 
+        # Kueue's own view of the cluster, read once per Kubernetes pool. Taken
+        # here on purpose: every transaction above is closed and the launch loop
+        # below has not opened one, so a slow API server delays a pass instead of
+        # holding a lease. Off unless an operator enabled it, in which case this
+        # returns an empty mapping and issues no request at all.
+        cluster_capacity = await asyncio.to_thread(
+            self._cluster_capacity().advise_launches,
+            [(pool, plans[pool.id].launch_worker_counts) for pool in pool_records],
+        )
+
         launched = 0
         drained = 0
         deleted = 0
@@ -376,9 +403,23 @@ class _ControllerFleets:
             # id out twice; the second holder then inherited the first's provider
             # resource under that name.
             next_index = next_pool_cell_index(pool, cells)
+            advice = cluster_capacity.get(pool.id)
+            # An unknown cluster keeps the planner's own number. Only a fresh,
+            # exact reading that proved the cluster admits fewer cells than were
+            # planned withholds any, and it withholds from the tail so the
+            # workload-bearing launches the planner ordered first survive.
+            allowed = len(plan.launch_worker_counts) if advice is None else advice.allowed_cells
+            if advice is not None and advice.withheld_cells:
+                logger.info(
+                    "pool %s is holding back %s of %s planned cell(s): %s",
+                    pool.id,
+                    advice.withheld_cells,
+                    advice.requested_cells,
+                    advice.reason,
+                )
             for worker_count, autoscale_request_workload_id in zip(
-                plan.launch_worker_counts,
-                plan.launch_workload_ids,
+                plan.launch_worker_counts[:allowed],
+                plan.launch_workload_ids[:allowed],
                 strict=True,
             ):
                 # `pool_cell_id` carries a per-pool-record epoch. Without it the

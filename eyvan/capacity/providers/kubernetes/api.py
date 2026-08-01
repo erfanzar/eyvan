@@ -56,6 +56,13 @@ DEFAULT_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 #: Where Kueue publishes ClusterQueue and ResourceFlavor objects.
 KUEUE_API = "/apis/kueue.x-k8s.io/v1beta1"
 
+#: The label Kueue reads to route a Job into a queue, and the one
+#: ``workers.job_manifest`` writes. It names a **LocalQueue**, never a
+#: ClusterQueue: the two are different objects and only the LocalQueue is
+#: namespaced. Reading it as a ClusterQueue name is the mistake that makes a
+#: capacity observation describe a queue that does not exist.
+QUEUE_NAME_LABEL = "kueue.x-k8s.io/queue-name"
+
 #: Most nodes one capacity observation will read. A node list is only ever used
 #: to describe capacity, never to change it, so a cluster larger than this is
 #: reported as a partial reading rather than paged through: an observation that
@@ -111,6 +118,18 @@ class JobStatus:
     #: Set when Kueue refused or evicted the workload, with its own wording kept
     #: so an operator can find it in Kueue's own logs.
     kueue_reason: str = ""
+    #: The Job's ``kueue.x-k8s.io/queue-name`` label, which is the **LocalQueue**
+    #: this cell was admitted through. Empty when the Job carries no label, which
+    #: is every cell in a cluster without Kueue. The ClusterQueue behind it is one
+    #: further read (:meth:`KubernetesApi.observe_local_queue`); without this
+    #: field a driver observing a queued cell cannot name the queue at all, since
+    #: the pool's ``queue_name`` is read only at create time.
+    queue_label: str = ""
+    #: The cell's per-pod resource request, as a Job container states it. A tuple
+    #: of pairs rather than a mapping so the status stays hashable and immutable
+    #: like every other field here. Empty when nothing readable was declared,
+    #: which must be read as *unknown*, never as a request for nothing.
+    resource_requests: tuple[tuple[str, str], ...] = ()
     api_version: str = ""
     kind: str = ""
     name: str = ""
@@ -173,6 +192,8 @@ def interpret_job(payload: JsonObject | None) -> JobStatus:
         parallelism=_count(spec.get("parallelism")),
         suspended=spec.get("suspend") is True,
         kueue_reason=_kueue_reason(status),
+        queue_label=str(labels.get(QUEUE_NAME_LABEL, "")),
+        resource_requests=_resource_requests(spec),
         generation_label=str(labels.get(GENERATION_LABEL, "")),
         fence_fingerprint=str(annotations.get(FENCE_ANNOTATION, "")),
         resource_version=str(metadata.get("resourceVersion", "")),
@@ -181,6 +202,54 @@ def interpret_job(payload: JsonObject | None) -> JobStatus:
 
 def _count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _resource_requests(spec: tp.Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    """Return the first container's resource request from a Job spec.
+
+    ``requests`` with a fallback to ``limits`` because Kubernetes defaults the
+    former to the latter, and ``workers.job_manifest`` writes both.
+
+    The *first* container only. An Eyvan cell has exactly one, and summing over
+    a pod Eyvan did not build would need quantity arithmetic that lives in
+    :mod:`eyvan.capacity.providers.kubernetes.kueue`. If a future sidecar ever
+    appears the answer understates the pod's request, which can only make a
+    cluster look roomier than it is -- never fuller, which is the direction that
+    would let a capacity reading invent a shortage.
+
+    Args:
+        spec: A Job's ``spec``.
+
+    Returns:
+        ``(resource, quantity)`` pairs in sorted order, or empty when nothing
+        readable was declared. Non-scalar values are dropped rather than
+        stringified into a quantity nothing can parse.
+    """
+
+    template = spec.get("template") if is_json_object(spec.get("template")) else {}
+    assert isinstance(template, dict)
+    pod_spec = template.get("spec") if is_json_object(template.get("spec")) else {}
+    assert isinstance(pod_spec, dict)
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or not containers:
+        return ()
+    container = containers[0]
+    if not is_json_object(container):
+        return ()
+    resources = container.get("resources") if is_json_object(container.get("resources")) else {}
+    assert isinstance(resources, dict)
+    for key in ("requests", "limits"):
+        declared = resources.get(key)
+        if not is_json_object(declared):
+            continue
+        pairs = tuple(
+            (str(name), str(value))
+            for name, value in sorted(declared.items())
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+        )
+        if pairs:
+            return pairs
+    return ()
 
 
 def _kueue_reason(status: tp.Mapping[str, object]) -> str:
@@ -196,6 +265,33 @@ def _kueue_reason(status: tp.Mapping[str, object]) -> str:
         if reason in {"Inadmissible", "Evicted", "Preempted"} and condition.get("status") == "True":
             return reason
     return ""
+
+
+def local_queue_cluster_queue(observation: ApiObservation) -> str | None:
+    """Return the ClusterQueue one LocalQueue routes into, or ``None``.
+
+    ``None`` covers every way the answer was not established: the LocalQueue was
+    unreadable, it does not exist, or it names no ``spec.clusterQueue``. All
+    three must stay ``None`` rather than fall back to the LocalQueue's own name
+    -- a capacity reading taken against the wrong object is worse than no
+    reading, because it answers with numbers.
+
+    Args:
+        observation: The result of :meth:`KubernetesApi.observe_local_queue`.
+
+    Returns:
+        The ClusterQueue name, or ``None`` when nothing was established.
+    """
+
+    if observation.unreadable or observation.payload is None:
+        return None
+    spec = observation.payload.get("spec")
+    if not is_json_object(spec):
+        return None
+    cluster_queue = spec.get("clusterQueue")
+    if not isinstance(cluster_queue, str) or not cluster_queue.strip():
+        return None
+    return cluster_queue.strip()
 
 
 def capacity_state(status: JobStatus, *, provisioning: bool = True) -> tuple[CapacityStatus, str]:
@@ -334,6 +430,26 @@ class KubernetesApi:
 
         return self.observe(f"{KUEUE_API}/clusterqueues/{name}")
 
+    def observe_local_queue(self, namespace: str, name: str) -> ApiObservation:
+        """Read one Kueue LocalQueue for capacity description only.
+
+        The Job's ``kueue.x-k8s.io/queue-name`` label names a LocalQueue, and a
+        LocalQueue is namespaced while the ClusterQueue holding the actual quota
+        is not. This is the read that turns the one name a running cell carries
+        into the one name the capacity signal can be taken against.
+
+        Args:
+            namespace: Namespace the LocalQueue lives in -- the cell's own.
+            name: LocalQueue name, from the Job's queue label.
+
+        Returns:
+            An :class:`ApiObservation`. Same never-raises contract as every other
+            ``observe_*``: a LocalQueue Eyvan cannot read establishes nothing,
+            which is neither a full cluster nor an empty one.
+        """
+
+        return self.observe(f"{KUEUE_API}/namespaces/{namespace}/localqueues/{name}")
+
     def observe_resource_flavor(self, name: str) -> ApiObservation:
         """Read one Kueue ResourceFlavor for capacity description only."""
 
@@ -429,10 +545,12 @@ __all__ = (
     "DEFAULT_TOKEN_PATH",
     "KUEUE_API",
     "MAX_OBSERVED_NODES",
+    "QUEUE_NAME_LABEL",
     "ApiObservation",
     "JobStatus",
     "KubernetesApi",
     "capacity_state",
     "interpret_job",
+    "local_queue_cluster_queue",
     "read_token",
 )

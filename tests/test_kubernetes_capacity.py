@@ -33,7 +33,15 @@ from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, MutationContext, StaleMutationError
 from eyvan.capacity.drivers.kubernetes import MAX_WORKERS, KubernetesCapacityDriver
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
-from eyvan.capacity.providers.kubernetes.api import JobStatus, capacity_state, interpret_job
+from eyvan.capacity.providers.kubernetes.api import (
+    KUEUE_API,
+    QUEUE_NAME_LABEL,
+    ApiObservation,
+    JobStatus,
+    capacity_state,
+    interpret_job,
+    local_queue_cluster_queue,
+)
 from eyvan.capacity.providers.kubernetes.kueue import foreign_workloads, inspect_cluster_queue
 from eyvan.capacity.providers.kubernetes.workers import (
     CELL_ID_ANNOTATION,
@@ -411,6 +419,91 @@ def test_malformed_status_counts_do_not_crash_interpretation() -> None:
     assert status.failed == 0
 
 
+# --- what a queued cell carries about its own queue and shape ---------------
+
+
+def test_the_queue_label_the_manifest_writes_is_the_one_interpretation_reads() -> None:
+    """One spelling, proven by round trip rather than by two matching literals.
+
+    ``job_manifest`` writes the label and ``interpret_job`` reads it back; a
+    silent drift between the two would leave every queued cell reporting no
+    queue at all, which is indistinguishable from a cluster without Kueue.
+    """
+
+    status = interpret_job(_job(queue_name="research-lq"))
+
+    assert status.queue_label == "research-lq"
+    assert _job(queue_name="research-lq")["metadata"]["labels"][QUEUE_NAME_LABEL] == "research-lq"
+
+
+def test_a_job_created_without_kueue_reports_no_queue() -> None:
+    """Kueue is opt-in, and an absent label is not an empty queue name to guess at."""
+
+    assert interpret_job(_job()).queue_label == ""
+
+
+def test_the_cells_request_is_read_from_the_job_the_driver_already_fetched() -> None:
+    """No second GET: the shape a cell asks the cluster for is in its own Job."""
+
+    status = interpret_job(_job(resources={"google.com/tpu": "4", "cpu": "8"}))
+
+    assert status.resource_requests == (("cpu", "8"), ("google.com/tpu", "4"))
+
+
+def test_a_job_declaring_only_limits_reports_them_as_the_request() -> None:
+    """Kubernetes defaults requests to limits, so reading nothing would be wrong."""
+
+    payload = copy.deepcopy(_job())
+    container = payload["spec"]["template"]["spec"]["containers"][0]
+    container["resources"] = {"limits": {"google.com/tpu": 4}}
+
+    assert interpret_job(payload).resource_requests == (("google.com/tpu", "4"),)
+
+
+def test_an_unquantifiable_resource_value_is_dropped_rather_than_stringified() -> None:
+    """A dict is not a quantity, and ``str()`` of one is a quantity nothing can parse."""
+
+    payload = copy.deepcopy(_job())
+    container = payload["spec"]["template"]["spec"]["containers"][0]
+    container["resources"] = {"requests": {"google.com/tpu": {"amount": 4}, "cpu": "8"}}
+
+    assert interpret_job(payload).resource_requests == (("cpu", "8"),)
+
+
+def test_a_job_with_no_readable_container_reports_no_request() -> None:
+    """Unknown shape, never a request for nothing."""
+
+    payload = copy.deepcopy(_job())
+    payload["spec"]["template"]["spec"]["containers"] = []
+
+    assert interpret_job(payload).resource_requests == ()
+
+
+def test_a_local_queue_names_the_cluster_queue_that_holds_the_quota() -> None:
+    """The label on a Job is a LocalQueue; the quota is on the ClusterQueue."""
+
+    observation = ApiObservation(payload={"spec": {"clusterQueue": "research-cq"}}, readable=True)
+
+    assert local_queue_cluster_queue(observation) == "research-cq"
+
+
+@pytest.mark.parametrize(
+    ("observation", "why"),
+    [
+        (ApiObservation(payload=None, readable=False, reason="HTTP 403"), "unreadable"),
+        (ApiObservation(payload=None, readable=True), "absent"),
+        (ApiObservation(payload={"spec": {}}, readable=True), "no clusterQueue"),
+        (ApiObservation(payload={"spec": {"clusterQueue": "   "}}, readable=True), "blank clusterQueue"),
+        (ApiObservation(payload={"spec": "research"}, readable=True), "malformed spec"),
+    ],
+)
+def test_a_local_queue_that_names_no_cluster_queue_resolves_to_nothing(observation: ApiObservation, why: str) -> None:
+    """Never the LocalQueue's own name: a reading taken against the wrong object
+    answers with numbers, which is worse than not answering."""
+
+    assert local_queue_cluster_queue(observation) is None, why
+
+
 # --- Kueue preconditions -----------------------------------------------------
 
 
@@ -477,7 +570,50 @@ class _FakeApi:
         self.deletion_pending: set[str] = set()
         self.got: list[str] = []
         self.get_overrides: dict[str, object] = {}
+        #: Every describing read, in order. Separate from ``got`` because these
+        #: never mutate and never raise, and their *count* is the property the
+        #: capacity cache exists to bound.
+        self.observed: list[str] = []
+        self.observations: dict[str, ApiObservation] = {}
         self._next_uid = 1
+
+    # -- describing reads: never raise, and a 404 is a readable answer --------
+
+    def observe(self, path: str, *, params: tp.Mapping[str, str] | None = None) -> ApiObservation:
+        del params
+        self.observed.append(path)
+        return self.observations.get(path, ApiObservation(payload=None, readable=True))
+
+    def observe_local_queue(self, namespace: str, name: str) -> ApiObservation:
+        return self.observe(f"{KUEUE_API}/namespaces/{namespace}/localqueues/{name}")
+
+    def observe_cluster_queue(self, name: str) -> ApiObservation:
+        return self.observe(f"{KUEUE_API}/clusterqueues/{name}")
+
+    def observe_resource_flavor(self, name: str) -> ApiObservation:
+        return self.observe(f"{KUEUE_API}/resourceflavors/{name}")
+
+    def observe_nodes(self, *, label_selector: str = "", limit: int = 500) -> ApiObservation:
+        del limit
+        return self.observe(f"/api/v1/nodes?{label_selector}")
+
+    def publish_queue(
+        self,
+        *,
+        namespace: str = "eyvan",
+        local_queue: str = "research",
+        cluster_queue: str = "research-cq",
+        payload: JsonObject | None = None,
+    ) -> None:
+        """Install a LocalQueue that routes into a ClusterQueue with a reading."""
+
+        self.observations[f"{KUEUE_API}/namespaces/{namespace}/localqueues/{local_queue}"] = ApiObservation(
+            payload={"spec": {"clusterQueue": cluster_queue}}, readable=True
+        )
+        if payload is not None:
+            self.observations[f"{KUEUE_API}/clusterqueues/{cluster_queue}"] = ApiObservation(
+                payload=payload, readable=True
+            )
 
     def _store(self, path: str, manifest: JsonObject) -> JsonObject:
         stored = copy.deepcopy(manifest)
