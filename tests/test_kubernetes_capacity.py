@@ -26,6 +26,7 @@ import re
 import threading
 import typing as tp
 
+import httpx
 import pytest
 
 from eyvan._internal.json_types import JsonObject
@@ -1414,3 +1415,67 @@ def test_job_status_defaults_are_not_silently_healthy() -> None:
     """A default-constructed status must never read as a ready cell."""
 
     assert capacity_state(JobStatus(exists=True))[0] is not CapacityStatus.HEALTHY
+
+
+def test_a_create_carrying_a_queue_resolves_the_local_queue_before_judging_it(tmp_path) -> None:
+    """The safety check read a LocalQueue name as a ClusterQueue name.
+
+    ``job_manifest`` writes ``queue_name`` to ``kueue.x-k8s.io/queue-name``,
+    which is the only queue name a Job may carry -- a LocalQueue. Reading it as a
+    ClusterQueue meant that unless a deployment happened to give both objects one
+    name, the GET 404'd and every create carrying a queue was refused: the check
+    that exists to keep Kueue from evicting Eyvan's work made the supported
+    configuration unusable.
+    """
+
+    class _QueueReadingApi(_FakeApi):
+        """Answers the ClusterQueue safety GET, recording the path it was asked for."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested: list[str] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
+            del kwargs
+            self.requested.append(path)
+            return httpx.Response(
+                200,
+                json={"spec": {"preemption": {"reclaimWithinCohort": "Never", "withinClusterQueue": "Never"}}},
+                request=httpx.Request(method, f"https://cluster{path}"),
+            )
+
+    api = _QueueReadingApi()
+    api.publish_queue(namespace="eyvan", local_queue="research", cluster_queue="research-cq")
+    driver = _driver(tmp_path, api)
+
+    driver.apply_capacity(
+        "cell-a",
+        _desired(provider_options={"worker_count": 2, "resources": {"google.com/tpu": "4"}, "queue_name": "research"}),
+        _context(),
+    )
+
+    assert f"{KUEUE_API}/namespaces/eyvan/localqueues/research" in api.observed
+    assert api.requested == [f"{KUEUE_API}/clusterqueues/research-cq"], (
+        "the safety check must read the ClusterQueue the LocalQueue routes into"
+    )
+
+
+def test_a_local_queue_that_cannot_be_resolved_refuses_the_create(tmp_path) -> None:
+    """Nothing established means nothing may be assumed.
+
+    An unresolvable LocalQueue is the same class of not-knowing as an unreadable
+    ClusterQueue: the guarantee that Kueue cannot evict Eyvan's work has not been
+    checked, so the cell is not created.
+    """
+
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+
+    with pytest.raises(CapacityProviderError, match="could not resolve LocalQueue"):
+        driver.apply_capacity(
+            "cell-a",
+            _desired(
+                provider_options={"worker_count": 2, "resources": {"google.com/tpu": "4"}, "queue_name": "missing"}
+            ),
+            _context(),
+        )

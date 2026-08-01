@@ -1396,7 +1396,7 @@ class KubernetesCapacityDriver:
                 namespace = self.namespace
                 queue_name = self._optional_option(options, "queue_name")
                 revalidate("before ClusterQueue validation")
-                self._require_safe_queue(queue_name)
+                self._require_safe_queue(queue_name, namespace)
                 revalidate("after ClusterQueue validation")
 
                 service = headless_service_manifest(
@@ -1470,7 +1470,7 @@ class KubernetesCapacityDriver:
         except StaleFenceError as exc:
             raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease during apply") from exc
 
-    def _require_safe_queue(self, queue_name: str | None) -> None:
+    def _require_safe_queue(self, queue_name: str | None, namespace: str) -> None:
         """Refuse a ClusterQueue that could evict Eyvan's work.
 
         Kueue eviction destroys a pod with no checkpoint hook, bypassing the
@@ -1488,10 +1488,28 @@ class KubernetesCapacityDriver:
         A queue Eyvan cannot read is not treated as safe -- an unreadable
         ClusterQueue is exactly the case where assuming the best silently loses
         the guarantee.
+
+        ``queue_name`` is a *LocalQueue*: it is what ``job_manifest`` writes to
+        ``kueue.x-k8s.io/queue-name``, which is the only name a Job may carry.
+        This check read it as a ClusterQueue name, so unless a deployment
+        happened to give both objects one name the read 404'd and every create
+        carrying a queue was refused -- the safety check made the supported
+        configuration unusable. The LocalQueue is resolved to the ClusterQueue it
+        routes into first, and a LocalQueue that cannot be resolved is refused
+        for the same reason an unreadable ClusterQueue is: nothing was
+        established, so nothing may be assumed.
         """
 
         if not queue_name:
             return
+        resolved = local_queue_cluster_queue(self.api.observe_local_queue(namespace, queue_name))
+        if resolved is None:
+            raise CapacityProviderError(
+                f"could not resolve LocalQueue {queue_name!r} in namespace {namespace!r} to a ClusterQueue "
+                "to verify it cannot evict Eyvan's work",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+            )
+        queue_name = resolved
         response = self.api.request("GET", f"{_KUEUE_API}/clusterqueues/{queue_name}")
         if response.status_code == 404:
             payload = None

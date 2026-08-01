@@ -777,15 +777,25 @@ def secret_proof(
 @click.option("--ca-file", type=click.Path(exists=True, dir_okay=False), required=True)
 @click.option("--safe-queue", default="eyvan-safe", show_default=True)
 @click.option("--unsafe-queue", default="eyvan-unsafe", show_default=True)
-def kubernetes_proof(api_server: str, token_file: str, ca_file: str, safe_queue: str, unsafe_queue: str) -> None:
+@click.option("--namespace", default="eyvan", show_default=True)
+def kubernetes_proof(
+    api_server: str,
+    token_file: str,
+    ca_file: str,
+    safe_queue: str,
+    unsafe_queue: str,
+    namespace: str,
+) -> None:
     """P7 -- drive the real Kubernetes transport against a real API server.
 
     Credentials are files rather than arguments for the same reason the secret
     proof takes a file: a bearer token on a command line lands in shell history
     and in every process listing on the host.
 
-    Needs a cluster with Kueue installed and two ClusterQueues -- one with
-    preemption Never/Never, one with preemption enabled. Everything this decides
+    Needs a cluster with Kueue installed and two LocalQueues in ``--namespace``,
+    routing into two ClusterQueues -- one with preemption Never/Never, one with
+    preemption enabled. The names given here are LocalQueue names, because that
+    is what a Job may carry and therefore what the driver resolves from. Everything this decides
     is driver-to-API-server, so no workload has to run and no worker has to
     reach the control plane.
     """
@@ -798,7 +808,7 @@ def kubernetes_proof(api_server: str, token_file: str, ca_file: str, safe_queue:
 
     def probe(queue: str | None) -> str | None:
         try:
-            driver._require_safe_queue(queue)
+            driver._require_safe_queue(queue, namespace)
         except CapacityProviderError as error:
             return error.code.value
         return None
