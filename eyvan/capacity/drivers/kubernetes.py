@@ -33,17 +33,33 @@ turns an invisible correctness hazard into a refusal at the point of use.
 ``eyvan doctor`` also reports it, but only as a warning: it runs on an
 operator's machine and cannot read the cluster.
 
-**Honest cost, stated here and in the README.** Eyvan's budgets and fair share
+**Honest cost, and what has been paid down.** Eyvan's budgets and fair share
 reason about cells it asked for, not the cluster's real free capacity, so an
 Eyvan pool can sit WAITING while the cluster is full of non-Eyvan work.
-``CapacityBelief`` will *learn* that -- repeated timeouts raise ``route_priority``
--- but Eyvan will never *plan* around it.
+``CapacityBelief`` *learns* that -- repeated timeouts raise ``route_priority``.
+Two things now also *read* it, both through
+:mod:`eyvan.capacity.providers.kubernetes.kueue`:
+
+* ``observe`` names the cause on a WAITING cell instead of restating Eyvan's own
+  state, resolving the Job's ``kueue.x-k8s.io/queue-name`` label -- a *LocalQueue*
+  -- to the ClusterQueue that holds the quota. Every failure in that chain leaves
+  the detail exactly as it was: it is a diagnostic, and a diagnostic that can
+  break an observation is worse than no diagnostic.
+* the autoscale pass (:mod:`eyvan.capacity.autoscale.pool_capacity`) takes one
+  reading per Kubernetes pool before launching. That half is default-off and
+  issues no request at all until an operator enables it.
+
+Neither ever concludes "full" from a reading it could not take. An unreadable
+cluster is UNKNOWN, and UNKNOWN changes nothing.
 """
 
 from __future__ import annotations
 
 import base64
 import copy
+import logging
+import os
+import time
 import typing as tp
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,8 +83,21 @@ from eyvan.capacity.fleet_state import (
     FleetStateStore,
     StaleFenceError,
 )
-from eyvan.capacity.providers.kubernetes.api import JobStatus, KubernetesApi, capacity_state, interpret_job
-from eyvan.capacity.providers.kubernetes.kueue import inspect_cluster_queue
+from eyvan.capacity.providers.kubernetes.api import (
+    JobStatus,
+    KubernetesApi,
+    capacity_state,
+    interpret_job,
+    local_queue_cluster_queue,
+)
+from eyvan.capacity.providers.kubernetes.kueue import (
+    ClusterCapacityExplanation,
+    ClusterCapacityReading,
+    cell_capacity_state,
+    explain_cluster_capacity,
+    inspect_cluster_queue,
+    observe_cluster_capacity,
+)
 from eyvan.capacity.providers.kubernetes.workers import (
     API_CLIENT_LABEL,
     CELL_ID_ANNOTATION,
@@ -98,6 +127,46 @@ _Revalidate = tp.Callable[[str], None]
 _PENDING_CREATES_KEY = "kubernetes_pending_creates"
 _TOMBSTONE_CLEANUP_KEY = "kubernetes_cleanup"
 
+#: How long a LocalQueue -> ClusterQueue mapping and a ClusterQueue reading stay
+#: usable. One reconcile pass observes every cell in a pool and they all share
+#: one queue, so an uncached diagnostic issues two describing GETs *per cell*
+#: against an API server Eyvan does not own. Seconds rather than minutes because
+#: the reading's whole value is that it describes the cluster *now*: the planner
+#: refuses anything older than
+#: :data:`~eyvan.capacity.autoscale.cluster_capacity.DEFAULT_MAX_OBSERVATION_AGE_S`
+#: anyway, and a stale explanation on a cell detail is a wrong explanation.
+CLUSTER_CAPACITY_TTL_S = 5.0
+
+#: Most (namespace, queue) mappings and ClusterQueue readings held at once. An
+#: agent serves one namespace and a handful of queues; the bound exists so a
+#: misconfigured fleet that names a new queue every pass cannot grow the cache
+#: without limit.
+_MAX_CACHED_QUEUES = 64
+
+#: Longest cell detail this driver will emit once a capacity explanation has been
+#: appended. ``CellRecord.unavailable_detail`` is capped at 2048 and a lifecycle
+#: reason lands in a log line, a dashboard panel, and an audit row; an
+#: explanation that names four resources with remedies can run long enough to
+#: crowd out the state it was meant to qualify.
+_MAX_DETAIL = 512
+
+#: Set to a false value to restore the pre-W3 wording exactly: a WAITING cell
+#: then says "job is suspended pending kueue admission" and nothing more, and no
+#: capacity GET is issued at all. On by default because the addition is a
+#: *diagnostic suffix* on a free-text field -- it never changes a cell's state,
+#: a decision, or a wire field's meaning -- but an operator who wants the old
+#: bytes should not need a rebuild to get them.
+CLUSTER_CAPACITY_DETAIL_ENV = "EYVAN_KUBERNETES_CLUSTER_CAPACITY_DETAIL"
+
+_FALSE = frozenset({"0", "false", "no", "off"})
+
+#: Distinguishes "this key holds ``None``" from "this key is not cached". Both
+#: caches store ``None`` as a real answer -- an unresolvable queue and an
+#: unreadable cluster are exactly the entries worth remembering.
+_MISSING = object()
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class _CreateOwnership:
@@ -123,6 +192,10 @@ class KubernetesCapacityDriver:
         namespace: str = "eyvan",
         image: str = "",
         shared_secret: str | None = None,
+        #: Whether a WAITING cell's detail may name the cluster's free capacity.
+        #: ``None`` reads :data:`CLUSTER_CAPACITY_DETAIL_ENV`, which defaults on.
+        cluster_capacity_detail: bool | None = None,
+        cluster_capacity_ttl_s: float = CLUSTER_CAPACITY_TTL_S,
     ):
         self.state = state or FleetStateStore.from_uri(None)
         self.api = api or KubernetesApi()
@@ -130,6 +203,18 @@ class KubernetesCapacityDriver:
         self.image = image
         self.shared_secret = shared_secret
         self._mutation_lock = RLock()
+        self.cluster_capacity_detail = (
+            os.getenv(CLUSTER_CAPACITY_DETAIL_ENV, "").strip().lower() not in _FALSE
+            if cluster_capacity_detail is None
+            else cluster_capacity_detail
+        )
+        self.cluster_capacity_ttl_s = max(float(cluster_capacity_ttl_s), 0.0)
+        # Separate from ``_mutation_lock``: this guards two read caches and is
+        # never held across an HTTP call, so a slow API server cannot serialize
+        # observation behind it.
+        self._capacity_lock = RLock()
+        self._local_queue_cache: dict[tuple[str, str], tuple[float, str | None]] = {}
+        self._reading_cache: dict[str, tuple[float, ClusterCapacityReading | None]] = {}
 
     def capabilities(self) -> CellCapabilities:
         """Describe Kubernetes-backed capacity.
@@ -241,7 +326,136 @@ class KubernetesCapacityDriver:
                 ready=0,
             )
         state, detail = capacity_state(status)
+        if state is CapacityStatus.WAITING:
+            # The one state whose detail restates Eyvan's own state ("suspended
+            # pending kueue admission") instead of naming a cause. Every other
+            # state already says something an operator can act on, and reading
+            # cluster capacity to qualify a HEALTHY cell would spend describing
+            # GETs on a question nobody asked.
+            detail = self._explained_waiting_detail(status, detail)
         return self._observation(record, state, detail, worker_count=status.parallelism, ready=status.ready)
+
+    # ---- cluster capacity, as a diagnostic that can only add ---------------
+
+    def _explained_waiting_detail(self, status: JobStatus, detail: str) -> str:
+        """Return the WAITING detail, with the cluster's free capacity if provable.
+
+        Every failure anywhere in the chain -- no queue label, an unreadable
+        LocalQueue, an unreadable ClusterQueue, a queue that has not published
+        its reservation, an unparseable request -- returns ``detail`` byte for
+        byte. This is a diagnostic layered on top of an observation the control
+        plane acts on, and a diagnostic that can break an observation is worse
+        than no diagnostic.
+
+        Args:
+            status: The interpreted Job.
+            detail: Today's detail, which is also the answer whenever the cluster
+                establishes nothing.
+
+        Returns:
+            ``detail``, or ``detail`` followed by the observed reason there is no
+            room, bounded by :data:`_MAX_DETAIL`.
+        """
+
+        try:
+            explanation = self._cluster_capacity_explanation(status)
+            if explanation is None:
+                return detail
+            _, explained = cell_capacity_state(status, explanation)
+        except Exception:  # the diagnostic must never fail the observation
+            # Deliberately broad. The read path below is contractually
+            # never-raises, so reaching here means something upstream broke its
+            # own contract -- and the correct answer to that is still the cell's
+            # real state with today's wording, not a failed reconciliation.
+            logger.debug("cluster capacity diagnostic failed for a queued Kubernetes cell", exc_info=True)
+            return detail
+        return explained if len(explained) <= _MAX_DETAIL else f"{explained[: _MAX_DETAIL - 3]}..."
+
+    def _cluster_capacity_explanation(self, status: JobStatus) -> ClusterCapacityExplanation | None:
+        """Return an observed cluster explanation for this cell, or ``None``.
+
+        Returns:
+            A ``ClusterCapacityExplanation`` when the cluster's free capacity was
+            read against the right ClusterQueue for a request this cell actually
+            declares, otherwise ``None``.
+        """
+
+        if not self.cluster_capacity_detail or not status.queue_label:
+            return None
+        request = {name: value for name, value in status.resource_requests}
+        if not request:
+            return None
+        namespace = status.namespace or self.namespace
+        cluster_queue = self._cluster_queue_for(namespace, status.queue_label)
+        if not cluster_queue:
+            return None
+        reading = self._cluster_capacity_reading(cluster_queue)
+        if reading is None:
+            return None
+        return explain_cluster_capacity(reading, request)
+
+    def _cluster_queue_for(self, namespace: str, local_queue: str) -> str | None:
+        """Return the ClusterQueue behind one LocalQueue, cached for a few seconds.
+
+        A failed resolution is cached exactly as a successful one is. A cluster
+        where Eyvan has no ``get localqueues`` refuses identically for every cell
+        in the pool, and re-asking once per cell would spend the whole cost the
+        cache exists to avoid on the answer that establishes nothing.
+        """
+
+        key = (namespace, local_queue)
+        cached = self._cached(self._local_queue_cache, key)
+        if cached is not _MISSING:
+            return tp.cast("str | None", cached)
+        resolved = local_queue_cluster_queue(self.api.observe_local_queue(namespace, local_queue))
+        self._store(self._local_queue_cache, key, resolved)
+        return resolved
+
+    def _cluster_capacity_reading(self, cluster_queue: str) -> ClusterCapacityReading | None:
+        """Return one ClusterQueue's capacity, cached for a few seconds.
+
+        No ResourceFlavor is named, so no node list is read: the node reading
+        only ever produces the "this quota is not backed by hardware" remedy, and
+        paying a third GET per pool for a sentence is not a trade a cell
+        observation should make.
+        """
+
+        cached = self._cached(self._reading_cache, cluster_queue)
+        if cached is not _MISSING:
+            return tp.cast("ClusterCapacityReading | None", cached)
+        reading = observe_cluster_capacity(self.api, cluster_queue)
+        self._store(self._reading_cache, cluster_queue, reading)
+        return reading
+
+    def _cached(self, cache: dict[tp.Any, tuple[float, tp.Any]], key: tp.Any) -> tp.Any:
+        """Return a live cache entry, or ``_MISSING`` when there is none."""
+
+        if self.cluster_capacity_ttl_s <= 0:
+            return _MISSING
+        now = time.monotonic()
+        with self._capacity_lock:
+            entry = cache.get(key)
+            if entry is None:
+                return _MISSING
+            expires_at, value = entry
+            if expires_at <= now:
+                cache.pop(key, None)
+                return _MISSING
+            return value
+
+    def _store(self, cache: dict[tp.Any, tuple[float, tp.Any]], key: tp.Any, value: tp.Any) -> None:
+        """Cache one value for :data:`CLUSTER_CAPACITY_TTL_S`, bounded in size."""
+
+        if self.cluster_capacity_ttl_s <= 0:
+            return
+        now = time.monotonic()
+        with self._capacity_lock:
+            for stale, (expires_at, _value) in list(cache.items()):
+                if expires_at <= now:
+                    cache.pop(stale, None)
+            if len(cache) >= _MAX_CACHED_QUEUES and key not in cache:
+                cache.pop(next(iter(cache)), None)
+            cache[key] = (now + self.cluster_capacity_ttl_s, value)
 
     def _job_ownership_error(self, record: FleetCellRecord, status: JobStatus) -> str | None:
         """Return why an observed Job cannot be tied to the durable cell fence."""

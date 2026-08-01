@@ -29,7 +29,7 @@ import httpx
 import pytest
 
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
-from eyvan.capacity.providers.kubernetes.api import KubernetesApi, read_token
+from eyvan.capacity.providers.kubernetes.api import KubernetesApi, local_queue_cluster_queue, read_token
 
 
 def _api(handler, tmp_path, *, token: str = "sa-token-value") -> KubernetesApi:
@@ -253,3 +253,68 @@ def test_a_success_with_an_empty_body_decodes_rather_than_raising(tmp_path) -> N
         return httpx.Response(200, text="")
 
     _api(handler, tmp_path).delete("/apis/batch/v1/namespaces/eyvan/jobs/cell-a")
+
+
+# --------------------------------------------------------------------------- the LocalQueue
+
+
+def test_a_local_queue_is_read_from_its_own_namespaced_path(tmp_path) -> None:
+    """A LocalQueue is namespaced and a ClusterQueue is not.
+
+    The Job carries only the LocalQueue name, so this is the read that turns the
+    one name a queued cell has into the one name the quota is published under.
+    """
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"spec": {"clusterQueue": "research-cq"}})
+
+    observation = _api(handler, tmp_path).observe_local_queue("eyvan", "research")
+
+    assert seen == ["/apis/kueue.x-k8s.io/v1beta1/namespaces/eyvan/localqueues/research"]
+    assert local_queue_cluster_queue(observation) == "research-cq"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+def test_an_unreadable_local_queue_establishes_nothing_and_does_not_raise(tmp_path, status: int) -> None:
+    """Same never-raises contract as every other describing read.
+
+    A ServiceAccount without ``get localqueues`` is the ordinary state of a
+    cluster where Eyvan was installed before Kueue, and it must degrade the
+    capacity signal rather than fail an unrelated reconciliation.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"message": "denied"})
+
+    observation = _api(handler, tmp_path).observe_local_queue("eyvan", "research")
+
+    assert observation.unreadable is True
+    assert str(status) in observation.reason
+    assert local_queue_cluster_queue(observation) is None
+
+
+def test_a_local_queue_that_is_not_there_is_readable_and_still_names_nothing(tmp_path) -> None:
+    """A 404 answers "does this exist"; it does not answer "is the cluster full"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"reason": "NotFound"})
+
+    observation = _api(handler, tmp_path).observe_local_queue("eyvan", "research")
+
+    assert observation.readable is True
+    assert local_queue_cluster_queue(observation) is None
+
+
+def test_a_severed_connection_reading_a_local_queue_is_unreadable_not_an_exception(tmp_path) -> None:
+    """A transport failure here must not escape into a cell reconciliation."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    observation = _api(handler, tmp_path).observe_local_queue("eyvan", "research")
+
+    assert observation.unreadable is True
+    assert local_queue_cluster_queue(observation) is None
