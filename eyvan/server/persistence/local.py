@@ -41,6 +41,8 @@ from eyvan.records import (
     ProjectRecord,
     QuotaRecord,
     RoleGrantRecord,
+    ServiceDecisionRecord,
+    ServiceReplicaHealthRecord,
     UserProgressReport,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -70,7 +72,18 @@ LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION = 3
 #: strand an expansion's remaining children or release them all at once. A
 #: document that cannot carry them refuses them rather than silently omitting them.
 LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION = 4
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
+#: Emitted only once a service has actually been probed or scaled.
+#:
+#: Same reasoning again, one collection later. Durable replica health and the
+#: decision log have no place in v4, and dropping them silently would turn a
+#: probed replica into an unprobed one and a cooldown into no cooldown after a
+#: single restart -- which is how a rate limit becomes a restart loop. A version
+#: of its own rather than two more fields inside v4: v4 is already published, and
+#: one version tag standing for two different schemas is the ambiguity every
+#: reader here refuses. A fleet that has never enabled health checks or
+#: autoscaling keeps writing the version it wrote before.
+LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION = 5
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -363,7 +376,9 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
         v3 has nowhere to put them. Forgetting an unresolved rotation is how a
         restart lets two rotations interleave, and a dropped ledger is an
         expansion whose remaining children are either stranded or released all at
-        once.
+        once. Durable service health and decisions are refused here too, one
+        version further on: a silent omission would turn a probed replica into an
+        unprobed one and a cooldown into no cooldown after a single restart.
         """
 
         if state.cell_stages:
@@ -372,6 +387,8 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
             raise ValueError("credential rotations require the v4 local control-plane document")
         if state.expansion_admissions:
             raise ValueError("expansion admission ledgers require the v4 local control-plane document")
+        if state.service_replica_health or state.service_decisions:
+            raise ValueError("durable service health and decisions require the v5 local control-plane document")
         topologies = tuple(state.workload_topologies[key] for key in sorted(state.workload_topologies))
         without_topologies = replace(state, workload_topologies={})
         base = LocalControlPlaneDocument.from_state(without_topologies)
@@ -447,16 +464,67 @@ class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
         return state
 
 
+class LocalControlPlaneV5Document(LocalControlPlaneV4Document):
+    """Schema-v5 document: v4 plus durable service health and the decision log.
+
+    Additive again, and again with a version of its own. v4 is already written by
+    deployed builds, so adding two collections inside it would leave one version
+    tag standing for two different schemas -- the exact ambiguity every reader in
+    this module refuses. A fleet that has never probed or scaled a service keeps
+    emitting v4, which an older build still reads.
+    """
+
+    version: Literal[5] = LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION
+    service_replica_health: tuple[ServiceReplicaHealthRecord, ...] = ()
+    service_decisions: tuple[ServiceDecisionRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v5_document(self) -> LocalControlPlaneV5Document:
+        """Reject duplicate complete identities before restoration merges them."""
+
+        health_keys = [record.key for record in self.service_replica_health]
+        if len(set(health_keys)) != len(health_keys):
+            raise ValueError("local control-plane service health rows must have unique service/replica identities")
+        decision_keys = [record.key for record in self.service_decisions]
+        if len(set(decision_keys)) != len(decision_keys):
+            raise ValueError("local control-plane service decisions must have unique service/sequence identities")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV5Document:
+        """Encode one snapshot including every durable service observation."""
+
+        health = tuple(state.service_replica_health[key] for key in sorted(state.service_replica_health))
+        decisions = tuple(state.service_decisions[key] for key in sorted(state.service_decisions))
+        base = LocalControlPlaneV4Document.from_state(replace(state, service_replica_health={}, service_decisions={}))
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            service_replica_health=health,
+            service_decisions=decisions,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v4 aggregates plus every durable service observation."""
+
+        state = super().to_state()
+        state.service_replica_health = {record.key: record for record in self.service_replica_health}
+        state.service_decisions = {record.key: record for record in self.service_decisions}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
     older build still reads; the first frozen topology moves the file to v3, the
     first managed stage, credential rotation, or bounded fan-out moves it to v4,
-    and an older build then refuses it by version instead of silently discarding
-    durable state it does not understand.
+    the first probed or scaled service moves it to v5, and an older build then
+    refuses it by version instead of silently discarding durable state it does
+    not understand.
     """
 
+    if state.service_replica_health or state.service_decisions:
+        return LocalControlPlaneV5Document.from_state(state)
     if state.cell_stages or state.credential_rotations or state.expansion_admissions:
         return LocalControlPlaneV4Document.from_state(state)
     if state.workload_topologies:
@@ -465,7 +533,11 @@ def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneD
 
 
 _LocalControlPlaneReadableDocument: tp.TypeAlias = (
-    _LocalControlPlaneV1Document | LocalControlPlaneDocument | LocalControlPlaneV3Document | LocalControlPlaneV4Document
+    _LocalControlPlaneV1Document
+    | LocalControlPlaneDocument
+    | LocalControlPlaneV3Document
+    | LocalControlPlaneV4Document
+    | LocalControlPlaneV5Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -595,6 +667,7 @@ class LocalControlPlaneStore:
                 LOCAL_CONTROL_PLANE_SCHEMA_VERSION: LocalControlPlaneDocument,
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
                 LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION: LocalControlPlaneV4Document,
+                LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION: LocalControlPlaneV5Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -1037,6 +1110,7 @@ __all__ = (
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
     "LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION",
@@ -1049,6 +1123,7 @@ __all__ = (
     "LocalControlPlaneStore",
     "LocalControlPlaneV3Document",
     "LocalControlPlaneV4Document",
+    "LocalControlPlaneV5Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",

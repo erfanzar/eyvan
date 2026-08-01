@@ -31,6 +31,8 @@ from eyvan.records import (
     ProjectRecord,
     QuotaRecord,
     RoleGrantRecord,
+    ServiceDecisionRecord,
+    ServiceReplicaHealthRecord,
     UserProgressReport,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -308,6 +310,42 @@ class RepositorySession(tp.Protocol):
         The state filter is what keeps the leader's wave phase from reading every
         expansion the fleet has ever run: a completed ledger is absorbing, so the
         scan is over the expansions still owing children and nothing else.
+        """
+        ...
+
+    async def list_service_replica_health(self, service_id: str) -> list[ServiceReplicaHealthRecord]:
+        """Return every replica health record for one service, in replica-id order."""
+        ...
+
+    async def put_service_replica_health(self, record: ServiceReplicaHealthRecord) -> None:
+        """Upsert one replica's durable probe counters, keyed by (service, replica)."""
+        ...
+
+    async def delete_service_replica_health(self, service_id: str, replica_id: str) -> bool:
+        """Forget one replica's health. Returns whether a row was removed.
+
+        Health belongs to a replica, and a replica that no longer exists has
+        none. Without this the table would grow by one row per restart forever,
+        which for a service -- the one workload shape designed to restart -- is
+        unbounded growth by construction.
+        """
+        ...
+
+    async def list_service_decisions(self, service_id: str, *, limit: int = 50) -> list[ServiceDecisionRecord]:
+        """Return one service's committed decisions, newest first, bounded."""
+        ...
+
+    async def put_service_decision(self, record: ServiceDecisionRecord) -> None:
+        """Append one explained decision, keyed by (service, sequence)."""
+        ...
+
+    async def delete_service_decisions_before(self, service_id: str, *, sequence: int) -> int:
+        """Drop decisions older than ``sequence`` and return how many went.
+
+        Called in the same transaction as the append, so the audit is bounded by
+        construction rather than by a retention sweep someone has to remember to
+        wire up -- which is exactly how three other sweeps in this package came
+        to be implemented, tested, and never called.
         """
         ...
 

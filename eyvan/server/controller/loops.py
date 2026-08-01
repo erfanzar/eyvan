@@ -79,6 +79,39 @@ class _ControllerLoops:
             # settlement above, so a child that finished this cycle has already
             # freed its place in the wave rather than holding it for a full interval.
             LeaderPhase("release-expansion-waves", self.release_expansion_waves_once),
+            # Health first, so a replica probed this cycle is judged in it. The
+            # probe is the only phase here that talks to anything outside the
+            # database, and it does so strictly between transactions.
+            LeaderPhase(
+                "probe-service-health",
+                self.probe_service_health_once,
+                interval_s=self.settings.service_health_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
+            # Then lifecycle, which reads the observations the probe just wrote
+            # and retires replicas whose claim on a host is provably gone. Before
+            # the replica-count reconciler so the successor is started in the
+            # same cycle the predecessor is retired.
+            LeaderPhase(
+                "reconcile-service-replicas",
+                self.reconcile_service_replicas_once,
+                interval_s=self.settings.service_replica_lifecycle_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
+            # Then autoscaling, which changes the declared count the reconciler
+            # below is about to converge on. After lifecycle deliberately: a
+            # replacement is a disturbance, and sizing a service from a view that
+            # includes a replica already known to be doomed decides on a number
+            # that was about to change anyway.
+            LeaderPhase(
+                "autoscale-services",
+                self.autoscale_services_once,
+                interval_s=self.settings.service_autoscale_interval_s,
+                zero_interval_disables=True,
+                isolate_failures=True,
+            ),
             # Before scheduling: a replica started this cycle should be placed
             # in it rather than a full interval later, which for a service is
             # the difference between a blip and a visible outage.

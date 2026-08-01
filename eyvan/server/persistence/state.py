@@ -35,6 +35,8 @@ from eyvan.records import (
     ProjectRecord,
     QuotaRecord,
     RoleGrantRecord,
+    ServiceDecisionRecord,
+    ServiceReplicaHealthRecord,
     UserProgressReport,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -86,6 +88,14 @@ class ControlPlaneState:
     #: under. Keyed by coordinator because one expansion has exactly one plan,
     #: and a replayed submission must rebind that plan rather than open a second.
     expansion_admissions: dict[str, ExpansionAdmissionRecord] = field(default_factory=dict)
+    #: (service id, replica id) -> that replica's durable probe counters. Keyed
+    #: by the replica rather than by the service so one probe result touches one
+    #: entry, and so forgetting a retired replica is a delete rather than a
+    #: rewrite of the whole service's history.
+    service_replica_health: dict[tuple[str, str], ServiceReplicaHealthRecord] = field(default_factory=dict)
+    #: (service id, sequence) -> one committed, explained scale or replace
+    #: decision. Bounded per service by the transaction that appends to it.
+    service_decisions: dict[tuple[str, int], ServiceDecisionRecord] = field(default_factory=dict)
     plane_peers: dict[str, PlanePeerRecord] = field(default_factory=dict)
     budget_grants: dict[str, BudgetGrantRecord] = field(default_factory=dict)
     quota_grants: dict[str, QuotaGrantRecord] = field(default_factory=dict)
@@ -333,6 +343,30 @@ class StateSession(RepositorySession):
     ) -> list[ExpansionAdmissionRecord]:
         records = sorted(self._state.expansion_admissions.values(), key=lambda record: record.id)
         return [record for record in records if state is None or record.state is state]
+
+    async def list_service_replica_health(self, service_id: str) -> list[ServiceReplicaHealthRecord]:
+        return [record for key, record in sorted(self._state.service_replica_health.items()) if key[0] == service_id]
+
+    async def put_service_replica_health(self, record: ServiceReplicaHealthRecord) -> None:
+        self._state.service_replica_health[record.key] = record
+
+    async def delete_service_replica_health(self, service_id: str, replica_id: str) -> bool:
+        return self._state.service_replica_health.pop((service_id, replica_id), None) is not None
+
+    async def list_service_decisions(self, service_id: str, *, limit: int = 50) -> list[ServiceDecisionRecord]:
+        if limit <= 0:
+            return []
+        records = [record for key, record in self._state.service_decisions.items() if key[0] == service_id]
+        return sorted(records, key=lambda record: record.sequence, reverse=True)[:limit]
+
+    async def put_service_decision(self, record: ServiceDecisionRecord) -> None:
+        self._state.service_decisions[record.key] = record
+
+    async def delete_service_decisions_before(self, service_id: str, *, sequence: int) -> int:
+        stale = [key for key in self._state.service_decisions if key[0] == service_id and key[1] < sequence]
+        for key in stale:
+            del self._state.service_decisions[key]
+        return len(stale)
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         return self._state.plane_peers.get(plane_id)
