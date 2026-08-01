@@ -99,10 +99,26 @@ def _queued_desired(**options: object) -> dict[str, tp.Any]:
 
 
 def _queued_cell(tmp_path, api: _FakeApi, cell_id: str = "cell-a", **options: object) -> KubernetesCapacityDriver:
-    """Create one cell whose Job is suspended behind Kueue admission."""
+    """Create one cell whose Job is suspended behind Kueue admission.
+
+    The create-time safety check resolves the LocalQueue to its ClusterQueue and
+    refuses when it cannot, so the cell is created against a queue that resolves
+    and the test then breaks the reading it wants to exercise. That is also the
+    real sequence: a cell outlives the RBAC grant or the object that let it be
+    created, and the observation has to degrade rather than the cell vanish.
+    """
 
     driver = _driver(tmp_path, api)
+    observations = dict(api.observations)
+    api.publish_queue(namespace="eyvan", local_queue="research", cluster_queue="research-cq")
     driver.apply_capacity(cell_id, _queued_desired(**options), _context(key=f"apply-{cell_id}"))
+    api.observations = observations
+    # Every test below counts what *observing* reads. The create-time safety
+    # check resolves the same LocalQueue, and leaving its read in the record
+    # would make the observation look like it had asked for something it did not.
+    api.observed.clear()
+    driver._local_queue_cache.clear()
+    driver._reading_cache.clear()
     return driver
 
 
@@ -116,6 +132,28 @@ def _unsuspend(api: _FakeApi, cell_id: str = "cell-a") -> None:
 
 
 # --------------------------------------------------------------- failing costs nothing
+
+
+def _create_cells(api: _FakeApi, cold: KubernetesCapacityDriver, count: int) -> None:
+    """Create N queued cells against a queue that resolves, then forget the reads.
+
+    The create-time safety check resolves the LocalQueue to the ClusterQueue it
+    routes into and refuses when it cannot, so a cell cannot be brought into
+    existence against an unresolvable queue at all. Every test here is about what
+    *observing* an existing cell costs and says, so the cell is created against a
+    queue that resolves and the reading the test wants is armed afterwards --
+    which is also the real sequence: a cell outlives the grant or the object that
+    let it be created.
+    """
+
+    observations = dict(api.observations)
+    api.publish_queue(namespace="eyvan", local_queue="research", cluster_queue="research-cq")
+    for index in range(count):
+        cold.apply_capacity(f"cell-{index}", _queued_desired(), _context(key=f"apply-{index}"))
+    api.observations = observations
+    api.observed.clear()
+    cold._local_queue_cache.clear()
+    cold._reading_cache.clear()
 
 
 def test_an_unreadable_local_queue_leaves_todays_detail_byte_identical(tmp_path) -> None:
@@ -200,11 +238,20 @@ def test_an_api_that_raises_leaves_the_detail_alone_rather_than_failing_the_obse
     """
 
     class _BrokenApi(_KueueApi):
+        """Breaks the never-raises contract, but only once the cell exists."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.broken = False
+
         def observe(self, path: str, *, params: tp.Mapping[str, str] | None = None) -> ApiObservation:
-            raise RuntimeError("the describing read broke its own contract")
+            if self.broken:
+                raise RuntimeError("the describing read broke its own contract")
+            return super().observe(path, params=params)
 
     api = _BrokenApi()
     driver = _queued_cell(tmp_path, api)
+    api.broken = True
 
     observation = driver.observe("cell-a")
 
@@ -308,8 +355,7 @@ def test_every_cell_in_one_pool_shares_one_reading(tmp_path) -> None:
         shared_secret="agent-secret",
         cluster_capacity_detail=False,
     )
-    for index in range(4):
-        cold.apply_capacity(f"cell-{index}", _queued_desired(), _context(key=f"apply-{index}"))
+    _create_cells(api, cold, 4)
     assert api.observed == []
 
     driver = _driver(tmp_path, api)
@@ -357,8 +403,7 @@ def test_an_unresolvable_queue_is_remembered_for_the_pass_rather_than_re_asked_p
         shared_secret="agent-secret",
         cluster_capacity_detail=False,
     )
-    for index in range(3):
-        cold.apply_capacity(f"cell-{index}", _queued_desired(), _context(key=f"apply-{index}"))
+    _create_cells(api, cold, 3)
 
     driver = _driver(tmp_path, api)
     details = [driver.observe(f"cell-{index}").detail for index in range(3)]

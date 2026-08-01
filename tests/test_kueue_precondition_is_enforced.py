@@ -30,17 +30,31 @@ from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderF
 
 
 class _QueueApi(_FakeApi):
-    """A fake that also answers ClusterQueue reads."""
+    """A fake that answers ClusterQueue reads, behind a resolvable LocalQueue.
 
-    def __init__(self, *, status: int = 200, payload: object | None = None) -> None:
+    The pool's ``queue_name`` is a LocalQueue -- it is what a Job may carry --
+    so the driver resolves it to the ClusterQueue it routes into before judging
+    that queue's preemption. A fake that answered ClusterQueue reads directly
+    under the LocalQueue's name would test a lookup Kueue does not have.
+    """
+
+    def __init__(
+        self,
+        *,
+        status: int = 200,
+        payload: object | None = None,
+        local_queue_resolves: bool = True,
+    ) -> None:
         super().__init__()
         self._status = status
         self._payload = payload
         self.queue_reads: list[str] = []
+        if local_queue_resolves:
+            self.publish_queue(namespace="eyvan", local_queue="research", cluster_queue="research-cq")
 
     def request(self, method: str, path: str, **_kwargs: object) -> httpx.Response:
         self.queue_reads.append(path)
-        return httpx.Response(self._status, json=self._payload)
+        return httpx.Response(self._status, json=self._payload, request=httpx.Request(method, f"https://k8s{path}"))
 
 
 def _queue_desired() -> dict:
@@ -72,7 +86,7 @@ def test_a_safe_queue_is_accepted_and_the_job_is_created(tmp_path) -> None:
 
     _driver(tmp_path, api).apply_capacity("cell-a", _queue_desired(), _context())
 
-    assert any("clusterqueues/research" in path for path in api.queue_reads)
+    assert any("clusterqueues/research-cq" in path for path in api.queue_reads)
     assert any(path.endswith("/jobs") for path, _manifest in api.created)
 
 
