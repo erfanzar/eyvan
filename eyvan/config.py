@@ -155,6 +155,30 @@ class EyvanSettings:
     interval rather than on every scheduling pass.
     """
 
+    #: How often service replicas are probed for health. **Zero, which disables
+    #: it**, and that is deliberate: probing is what makes a replica replaceable
+    #: for being unhealthy, so switching it on by default would change what an
+    #: upgrade does to a running fleet. An operator turns it on when they have
+    #: decided what their replicas' health endpoints mean.
+    service_health_interval_s: float = 0.0
+    #: How many replicas may be probed at once. Bounded because a fleet with a
+    #: thousand replicas would otherwise open a thousand sockets from the leader
+    #: on every pass.
+    service_health_concurrency: int = 8
+    #: How often a replica whose lease, cell generation or health says it no
+    #: longer owns its host is replaced. Zero disables it, which is today's
+    #: behaviour: nothing replaced such a replica at all.
+    service_replica_lifecycle_interval_s: float = 0.0
+    #: How often services are resized from their durable load observations. Zero
+    #: disables it, and it is off by default *twice* -- here and per service --
+    #: because an autoscaler nobody asked for spends money nobody budgeted.
+    service_autoscale_interval_s: float = 0.0
+    #: How many explained decisions are kept per service. The audit is bounded in
+    #: the transaction that appends to it rather than by a retention sweep,
+    #: because three sweeps in this package were implemented, tested, and never
+    #: called.
+    service_decision_history: int = 50
+
     grant_expiry_interval_s: float = 300.0
     """How often expired federated budget grants are swept. 0 disables it.
 
@@ -320,6 +344,22 @@ class EyvanSettings:
                 raise ValueError(f"{name} must not be negative; use 0 to disable pruning")
         if self.retention_batch_limit <= 0:
             raise ValueError("retention_batch_limit must be positive")
+        if self.service_health_concurrency <= 0:
+            raise ValueError("service_health_concurrency must be positive")
+        if self.service_decision_history <= 0:
+            # Zero would append a decision and delete it in the same transaction,
+            # so every scaling action would be unexplainable the moment it
+            # happened -- worse than no audit, because the table would look like
+            # one.
+            raise ValueError("service_decision_history must be positive")
+        for name in (
+            "service_health_interval_s",
+            "service_replica_lifecycle_interval_s",
+            "service_autoscale_interval_s",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative; use 0 to disable the phase")
         if not math.isfinite(self.credential_rotation_overlap_s) or self.credential_rotation_overlap_s < 0:
             raise ValueError("credential_rotation_overlap_s must be finite and non-negative")
         timeout_s = self.provider_metadata_identity_timeout_s
@@ -499,6 +539,22 @@ class EyvanSettings:
             service_reconcile_interval_s=float(
                 os.getenv("EYVAN_SERVICE_RECONCILE_INTERVAL_S", defaults.service_reconcile_interval_s)
             ),
+            service_health_interval_s=float(
+                os.getenv("EYVAN_SERVICE_HEALTH_INTERVAL_S", defaults.service_health_interval_s)
+            ),
+            service_health_concurrency=int(
+                os.getenv("EYVAN_SERVICE_HEALTH_CONCURRENCY", defaults.service_health_concurrency)
+            ),
+            service_replica_lifecycle_interval_s=float(
+                os.getenv(
+                    "EYVAN_SERVICE_REPLICA_LIFECYCLE_INTERVAL_S",
+                    defaults.service_replica_lifecycle_interval_s,
+                )
+            ),
+            service_autoscale_interval_s=float(
+                os.getenv("EYVAN_SERVICE_AUTOSCALE_INTERVAL_S", defaults.service_autoscale_interval_s)
+            ),
+            service_decision_history=int(os.getenv("EYVAN_SERVICE_DECISION_HISTORY", defaults.service_decision_history)),
             metrics_export_interval_s=float(
                 os.getenv("EYVAN_METRICS_EXPORT_INTERVAL_S", defaults.metrics_export_interval_s)
             ),

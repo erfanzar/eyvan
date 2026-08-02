@@ -404,6 +404,7 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
         "test_queue_trend.py",
         "test_scoped_artifact_migration_postgres.py",
         "test_secret_dispatch_transactions.py",
+        "test_services_operations_postgres.py",
         "test_sql_retention.py",
     }
     assert all(name in postgres[0]["run"] for name in expected_contracts)

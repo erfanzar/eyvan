@@ -108,6 +108,10 @@ from eyvan.records import (
     Role,
     RoleGrant,
     RoleGrantRecord,
+    ServiceDecisionKind,
+    ServiceDecisionRecord,
+    ServiceObservation,
+    ServiceReplicaHealthState,
     UserProgressReport,
     WarmthReport,
     WorkerResourceScope,
@@ -169,7 +173,14 @@ from eyvan.server.service.locality import build_index as locality_index
 from eyvan.server.service.locality import preferred_cells_for
 from eyvan.server.service.pricing_resolver import accelerator_unit_price
 from eyvan.server.service.scheduling import SchedulingService
-from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, service_metadata, service_policy
+from eyvan.server.service.services import (
+    CHILD_REVISION,
+    ServicePolicy,
+    replica_health_state,
+    scaled_service_metadata,
+    service_metadata,
+    service_policy,
+)
 from eyvan.server.service.state import (
     ACTIVE_LEASE_STATES,
     TERMINAL_WORKLOAD_STATES,
@@ -4898,6 +4909,230 @@ class ControlPlaneService:
                 }
             )
         return endpoints
+
+    async def service_health(self, principal: Principal, service_id: str) -> list[JsonObject]:
+        """Return what is durably known about each replica's health.
+
+        Read-only and deliberately unopinionated: it reports the counters and the
+        derived state, including ``unknown``, rather than a boolean. A boolean
+        would have to choose a side for every replica nobody could reach, and the
+        whole point of the record is that there is a third answer.
+        """
+
+        service = await self.get_workload(principal, service_id)
+        policy = service_policy(service.spec.metadata)
+        async with self.repository.transaction() as tx:
+            children = await tx.list_child_workloads(service_id)
+            health = {record.replica_id: record for record in await tx.list_service_replica_health(service_id)}
+        replicas: list[JsonObject] = []
+        for child in children:
+            if child.state in TERMINAL_WORKLOAD_STATES:
+                continue
+            record = health.get(child.id)
+            state = ServiceReplicaHealthState.UNKNOWN if policy is None else replica_health_state(child, record, policy)
+            replicas.append(
+                {
+                    "workload_id": child.id,
+                    "generation": child.generation,
+                    "revision": child.spec.metadata.get(CHILD_REVISION, ""),
+                    "endpoint": child.service_endpoint,
+                    "health": state.value,
+                    "last_outcome": None if record is None else record.last_outcome.value,
+                    "last_detail": None if record is None else record.last_detail,
+                    "consecutive_failures": 0 if record is None else record.consecutive_failures,
+                    "consecutive_unknowns": 0 if record is None else record.consecutive_unknowns,
+                    "last_success_at": None if record is None else record.last_success_at,
+                    "observed_at": None if record is None else record.observed_at,
+                    "observed_load": None if record is None else record.observed_load,
+                }
+            )
+        return replicas
+
+    async def service_decisions(
+        self,
+        principal: Principal,
+        service_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[ServiceDecisionRecord]:
+        """Return the newest committed decisions about one service.
+
+        Every scale and every replacement, with what was observed and why. A
+        decision an operator cannot reconstruct is a decision they can only
+        respond to by turning the whole mechanism off.
+        """
+
+        await self.get_workload(principal, service_id)
+        async with self.repository.transaction() as tx:
+            return await tx.list_service_decisions(service_id, limit=limit)
+
+    async def replace_service_replica(
+        self,
+        principal: Principal,
+        *,
+        service_id: str,
+        replica_id: str,
+        expected_generation: int,
+        reason: str,
+        observed: ServiceObservation,
+        history_limit: int = 50,
+    ) -> ServiceDecisionRecord | None:
+        """Retire one replica whose claim on its host is provably gone.
+
+        Fenced on the replica's generation inside the same transaction that acts,
+        exactly as workload dispatch is fenced on a cell's. Without that, a
+        preemption requeue between observing a replica and retiring it means the
+        control plane kills the *replacement* -- the record it read was at
+        generation 3, the process now on the host is generation 4, and the
+        cancellation lands on the live one.
+
+        Returns the committed decision, or ``None`` when the fence refused --
+        which is an ordinary outcome and not an error: the observation was
+        superseded and the next pass will observe the current state instead.
+
+        Retiring rather than duplicating is the whole shape. The replacement is
+        started by the ordinary replica-count reconciliation once this one is
+        terminal, so at no point do two processes believe they are the same
+        replica.
+        """
+
+        if not reason.strip():
+            raise InputError("a replica replacement must record why")
+        async with self.repository.transaction() as tx:
+            service = await tx.get_workload(service_id)
+            if service is None or service.coordination_kind is not CoordinationKind.SERVICE:
+                raise NotFoundError(f"service {service_id!r} was not found")
+            self.authorizer.require(principal, Permission.OPERATE, org_id=service.org_id, project_id=service.project_id)
+            replica = await tx.get_workload(replica_id)
+            if replica is None or replica.parent_workload_id != service_id:
+                return None
+            if replica.generation != expected_generation:
+                return None
+            if replica.state in TERMINAL_WORKLOAD_STATES or replica.state is WorkloadState.CANCELLING:
+                return None
+            if await self._preemption_execution_started(tx, replica):
+                # Preemption owns this record's transitions until it finishes.
+                # Racing it would leave the plan settling a victim it no longer
+                # owns, which that path raises on rather than tolerates.
+                return None
+            await self._cancel_one(tx, principal, replica, "service.replica_replaced")
+            declared = service_policy(service.spec.metadata)
+            replicas = 0 if declared is None else declared.replicas
+            decision = await self._append_service_decision(
+                tx,
+                ServiceDecisionRecord(
+                    service_id=service_id,
+                    sequence=await self._next_service_decision_sequence(tx, service_id),
+                    kind=ServiceDecisionKind.REPLACE_REPLICA,
+                    from_replicas=replicas,
+                    to_replicas=replicas,
+                    replica_id=replica_id,
+                    replica_generation=expected_generation,
+                    reason=reason[:512],
+                    observed=observed,
+                ),
+                history_limit=history_limit,
+            )
+            return decision
+
+    async def scale_service(
+        self,
+        principal: Principal,
+        *,
+        service_id: str,
+        expected_generation: int,
+        from_replicas: int,
+        to_replicas: int,
+        reason: str,
+        observed: ServiceObservation,
+        history_limit: int = 50,
+    ) -> ServiceDecisionRecord | None:
+        """Commit one bounded change to a service's declared replica count.
+
+        The count and its explanation are written in one transaction, so a
+        service can never be found at a size no row accounts for. Fenced twice:
+        on the service record's generation, and on the count actually still being
+        the one the decision was taken from -- an operator who resized by hand in
+        the meantime has said something more recent than any observation.
+
+        Returns ``None`` when either fence refuses, which is ordinary.
+        """
+
+        if not reason.strip():
+            raise InputError("a scaling decision must record why")
+        if to_replicas < 0:
+            raise InputError("a service cannot be scaled to a negative replica count")
+        async with self.repository.transaction() as tx:
+            service = await tx.get_workload(service_id)
+            if service is None or service.coordination_kind is not CoordinationKind.SERVICE:
+                raise NotFoundError(f"service {service_id!r} was not found")
+            self.authorizer.require(principal, Permission.OPERATE, org_id=service.org_id, project_id=service.project_id)
+            if service.generation != expected_generation or service.state in TERMINAL_WORKLOAD_STATES:
+                return None
+            declared = service_policy(service.spec.metadata)
+            if declared is None or declared.replicas != from_replicas or to_replicas == from_replicas:
+                return None
+            scaled = service.spec.model_copy(
+                update={"metadata": scaled_service_metadata(service.spec.metadata, replicas=to_replicas)}
+            )
+            await tx.put_workload(service.model_copy(update={"spec": scaled, "updated_at": utcnow()}))
+            decision = await self._append_service_decision(
+                tx,
+                ServiceDecisionRecord(
+                    service_id=service_id,
+                    sequence=await self._next_service_decision_sequence(tx, service_id),
+                    kind=(
+                        ServiceDecisionKind.SCALE_OUT if to_replicas > from_replicas else ServiceDecisionKind.SCALE_IN
+                    ),
+                    from_replicas=from_replicas,
+                    to_replicas=to_replicas,
+                    reason=reason[:512],
+                    observed=observed,
+                ),
+                history_limit=history_limit,
+            )
+            await self._audit(
+                tx,
+                principal,
+                service,
+                "service.scaled",
+                payload={
+                    "from_replicas": from_replicas,
+                    "to_replicas": to_replicas,
+                    "reason": decision.reason,
+                    "decision_sequence": decision.sequence,
+                },
+            )
+            return decision
+
+    @staticmethod
+    async def _next_service_decision_sequence(tx: RepositorySession, service_id: str) -> int:
+        """Return the next per-service decision sequence.
+
+        Read inside the acting transaction, so two leaders cannot mint the same
+        one: the loser's insert collides on the primary key and its whole
+        decision is rolled back rather than silently overwriting the winner's.
+        """
+
+        newest = await tx.list_service_decisions(service_id, limit=1)
+        return 1 if not newest else newest[0].sequence + 1
+
+    @staticmethod
+    async def _append_service_decision(
+        tx: RepositorySession,
+        decision: ServiceDecisionRecord,
+        *,
+        history_limit: int,
+    ) -> ServiceDecisionRecord:
+        """Append one decision and bound the service's history in the same breath."""
+
+        await tx.put_service_decision(decision)
+        if history_limit > 0 and decision.sequence > history_limit:
+            await tx.delete_service_decisions_before(
+                decision.service_id,
+                sequence=decision.sequence - history_limit + 1,
+            )
+        return decision
 
     async def submit_child_workload(
         self,

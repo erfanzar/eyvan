@@ -3270,3 +3270,178 @@ def expansion_admission_id(workload_id: str) -> str:
     """
 
     return f"exp_{hashlib.sha256(workload_id.encode()).hexdigest()[:28]}"
+
+
+# --------------------------------------------------------------------------- managed services
+#
+# Everything below describes *operating* a service -- proving a replica answers,
+# replacing one whose claim on its host is gone, and changing how many there
+# are. All of it lives in tables of its own rather than in fields on
+# ``WorkloadRecord``: that document is decoded with ``extra='forbid'``, so the
+# first write of a new field makes every workload unreadable to a rolled-back
+# replica, and a control plane that cannot read its workloads schedules nothing.
+
+
+class ServiceProbeOutcome(StrEnum):
+    """What one completed health probe established, including "nothing"."""
+
+    #: The endpoint answered and said it was serving.
+    SUCCESS = "success"
+    #: The endpoint answered and said it was not. A definite negative.
+    FAILURE = "failure"
+    #: The probe did not complete: a timeout, a refused connection, a DNS
+    #: failure, an unreadable body. Deliberately *not* a failure -- the control
+    #: plane learned nothing about the process, only about its own reachability
+    #: of it, and tearing a replica down on that is how a network blip becomes
+    #: an outage.
+    UNKNOWN = "unknown"
+
+
+class ServiceReplicaHealthState(StrEnum):
+    """The health verdict derived from a replica's durable probe counters."""
+
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+class ServiceReplicaHealthRecord(EyvanModel):
+    """Durable probe history for one replica of one service.
+
+    Keyed by ``(service_id, replica_id)`` and carrying the *replica generation*
+    the counters were gathered at. A requeued replica is a different process on
+    a different host, so its predecessor's failures say nothing about it; the
+    generation is what makes "these counters are stale" representable instead of
+    silently carrying a verdict across a restart.
+    """
+
+    service_id: str = Field(max_length=96)
+    replica_id: str = Field(max_length=96)
+    replica_generation: int = Field(ge=1)
+    #: The address that was probed, recorded so an operator can tell a replica
+    #: that moved from one that stopped answering.
+    endpoint: str = Field(default="", max_length=512)
+    last_outcome: ServiceProbeOutcome = ServiceProbeOutcome.UNKNOWN
+    last_detail: str = Field(default="", max_length=512)
+    #: Definite failures since the last definite success. An unknown probe
+    #: neither raises this nor clears it: raising it would record "I could not
+    #: reach this" as "this said no", and clearing it would grant a recovery the
+    #: endpoint never demonstrated. Only a probe that completed moves it.
+    consecutive_failures: int = Field(default=0, ge=0)
+    #: Probes in a row that established nothing. Reported, never acted on.
+    consecutive_unknowns: int = Field(default=0, ge=0)
+    last_success_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    #: When any probe last completed, whatever it established.
+    observed_at: datetime = Field(default_factory=utcnow)
+    #: Utilization the replica reported about itself, in ``[0, 1]``. ``None``
+    #: means the replica did not report one, which is the only honest default:
+    #: the control plane cannot see inside a serving process, and inventing a
+    #: number here would be inventing the input an autoscaler multiplies.
+    observed_load: float | None = Field(default=None, ge=0.0, le=1.0)
+    load_observed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_health(self) -> ServiceReplicaHealthRecord:
+        _validate_string(self.service_id, field_name="service health service id")
+        _validate_string(self.replica_id, field_name="service health replica id")
+        if (self.observed_load is None) != (self.load_observed_at is None):
+            raise ValueError("a reported service replica load requires the moment it was reported")
+        if self.last_outcome is ServiceProbeOutcome.SUCCESS and self.last_success_at is None:
+            raise ValueError("a successful service probe requires its success timestamp")
+        if self.last_outcome is ServiceProbeOutcome.FAILURE and self.last_failure_at is None:
+            raise ValueError("a failed service probe requires its failure timestamp")
+        return self
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Return the complete durable identity of one replica's health."""
+
+        return (self.service_id, self.replica_id)
+
+
+class ServiceDecisionKind(StrEnum):
+    """What a recorded service decision actually did."""
+
+    SCALE_OUT = "scale_out"
+    SCALE_IN = "scale_in"
+    REPLACE_REPLICA = "replace_replica"
+
+
+class ServiceObservation(EyvanModel):
+    """The durable facts one service decision was taken from.
+
+    Stored beside the decision rather than recomputed later. A decision explained
+    by today's state is not explained at all: by the time anyone reads it, the
+    replicas it counted are gone.
+    """
+
+    live_replicas: int = Field(ge=0)
+    healthy_replicas: int = Field(ge=0)
+    unhealthy_replicas: int = Field(ge=0)
+    #: Replicas whose health could not be established. Carried separately from
+    #: unhealthy on purpose: collapsing the two is the defect this whole record
+    #: set exists to make impossible.
+    unknown_replicas: int = Field(ge=0)
+    #: Replicas that reported a load, and the mean of what they reported.
+    loaded_replicas: int = Field(ge=0)
+    average_load: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Oldest load observation that was counted, so staleness is auditable.
+    oldest_load_observed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> ServiceObservation:
+        if (self.average_load is None) != (self.loaded_replicas == 0):
+            raise ValueError("an average service load requires at least one reporting replica")
+        if self.loaded_replicas and self.oldest_load_observed_at is None:
+            raise ValueError("counted service load observations require their oldest timestamp")
+        return self
+
+
+class ServiceDecisionRecord(EyvanModel):
+    """One committed, explained decision about a service.
+
+    Append-only per service and bounded per service, so the audit cannot become
+    the table that fills the disk. The newest row is also the durable cooldown
+    clock: a decision and the moment it may next be revisited are the same fact,
+    and keeping them apart is how a cooldown ends up not surviving a restart.
+    """
+
+    service_id: str = Field(max_length=96)
+    sequence: int = Field(ge=1)
+    kind: ServiceDecisionKind
+    #: Declared replica counts before and after. Equal for a replacement, which
+    #: changes which replicas exist rather than how many.
+    from_replicas: int = Field(ge=0)
+    to_replicas: int = Field(ge=0)
+    #: The replaced replica and the generation it was replaced at, for a
+    #: replacement. ``None`` for a scaling decision.
+    replica_id: str | None = Field(default=None, max_length=96)
+    replica_generation: int | None = Field(default=None, ge=1)
+    reason: str = Field(min_length=1, max_length=512)
+    observed: ServiceObservation
+    decided_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> ServiceDecisionRecord:
+        _validate_string(self.service_id, field_name="service decision service id")
+        _validate_string(self.replica_id, field_name="service decision replica id", optional=True)
+        if self.kind is ServiceDecisionKind.REPLACE_REPLICA:
+            if self.replica_id is None or self.replica_generation is None:
+                raise ValueError("a replacement decision must name the replica and the generation it was fenced at")
+            if self.from_replicas != self.to_replicas:
+                raise ValueError("a replacement decision does not change the declared replica count")
+        else:
+            if self.replica_id is not None or self.replica_generation is not None:
+                raise ValueError("a scaling decision is about a count, not about one replica")
+            if self.kind is ServiceDecisionKind.SCALE_OUT and self.to_replicas <= self.from_replicas:
+                raise ValueError("a scale-out decision must raise the declared replica count")
+            if self.kind is ServiceDecisionKind.SCALE_IN and self.to_replicas >= self.from_replicas:
+                raise ValueError("a scale-in decision must lower the declared replica count")
+        return self
+
+    @property
+    def key(self) -> tuple[str, int]:
+        """Return the complete durable identity of one decision."""
+
+        return (self.service_id, self.sequence)

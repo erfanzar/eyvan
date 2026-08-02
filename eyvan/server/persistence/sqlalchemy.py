@@ -63,6 +63,8 @@ from eyvan.records import (
     ProjectRecord,
     QuotaRecord,
     RoleGrantRecord,
+    ServiceDecisionRecord,
+    ServiceReplicaHealthRecord,
     UserProgressReport,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -72,7 +74,7 @@ from eyvan.records import (
 from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0017_merge_stage_rot"
+SCHEMA_REVISION = "0018_service_operations"
 
 
 @tp.runtime_checkable
@@ -288,6 +290,29 @@ class ExpansionAdmissionRow(Base):
     state: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     total_children: Mapped[int] = mapped_column(Integer, nullable=False)
     wave_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ServiceReplicaHealthRow(Base):
+    __tablename__ = "service_replica_health"
+    #: Composite key on the replica, so one probe result upserts one row and a
+    #: retired replica is forgotten by deleting exactly its own.
+    service_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    replica_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ServiceDecisionRow(Base):
+    __tablename__ = "service_decisions"
+    __table_args__ = (CheckConstraint("sequence >= 1", name="ck_service_decisions_sequence_positive"),)
+    service_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    #: Per-service and monotonic. Not a global BIGSERIAL: the newest row for one
+    #: service is the cooldown clock, and reading it must be a primary-key range
+    #: scan rather than a sort over every service's history.
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    #: A real column so "when did this service last scale out" is answerable in
+    #: SQL by an operator who is not going to extract JSON at 3am.
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -974,6 +999,71 @@ class SqlAlchemySession:
             statement = statement.where(ExpansionAdmissionRow.state == state.value)
         rows = (await self.session.scalars(statement)).all()
         return _decode_rows(ExpansionAdmissionRecord, rows, table="expansion_admissions")
+
+    async def list_service_replica_health(self, service_id: str) -> list[ServiceReplicaHealthRecord]:
+        statement = (
+            select(ServiceReplicaHealthRow)
+            .where(ServiceReplicaHealthRow.service_id == service_id)
+            .order_by(ServiceReplicaHealthRow.replica_id)
+            .with_for_update()
+        )
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_rows(ServiceReplicaHealthRecord, rows, table="service_replica_health")
+
+    async def put_service_replica_health(self, record: ServiceReplicaHealthRecord) -> None:
+        await self.session.merge(
+            ServiceReplicaHealthRow(
+                service_id=record.service_id,
+                replica_id=record.replica_id,
+                data=_dump(record),
+            )
+        )
+
+    async def delete_service_replica_health(self, service_id: str, replica_id: str) -> bool:
+        row = await self._get_locked(
+            ServiceReplicaHealthRow,
+            {"service_id": service_id, "replica_id": replica_id},
+        )
+        if row is None:
+            return False
+        await self.session.delete(row)
+        return True
+
+    async def list_service_decisions(self, service_id: str, *, limit: int = 50) -> list[ServiceDecisionRecord]:
+        if limit <= 0:
+            return []
+        statement = (
+            select(ServiceDecisionRow)
+            .where(ServiceDecisionRow.service_id == service_id)
+            .order_by(ServiceDecisionRow.sequence.desc())
+            .limit(limit)
+            .with_for_update()
+        )
+        rows = (await self.session.scalars(statement)).all()
+        decoded = _decode_rows(ServiceDecisionRecord, rows, table="service_decisions")
+        return sorted(decoded, key=lambda record: record.sequence, reverse=True)
+
+    async def put_service_decision(self, record: ServiceDecisionRecord) -> None:
+        await self.session.merge(
+            ServiceDecisionRow(
+                service_id=record.service_id,
+                sequence=record.sequence,
+                kind=record.kind.value,
+                data=_dump(record),
+            )
+        )
+
+    async def delete_service_decisions_before(self, service_id: str, *, sequence: int) -> int:
+        statement = (
+            select(ServiceDecisionRow)
+            .where(ServiceDecisionRow.service_id == service_id)
+            .where(ServiceDecisionRow.sequence < sequence)
+            .with_for_update()
+        )
+        rows = (await self.session.scalars(statement)).all()
+        for row in rows:
+            await self.session.delete(row)
+        return len(rows)
 
     async def get_plane_peer(self, plane_id: str) -> PlanePeerRecord | None:
         row = await self._get_locked(PlanePeerRow, plane_id)
