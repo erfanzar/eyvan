@@ -219,17 +219,29 @@ configured; they are enumerated in `docs/install.md`.
 ### Submit work
 
 ```bash
-# one workload
-uv run eyvan workload submit --pool research/cpu --command "python train.py" \
-    --cpu 4 --memory-gib 16
+# one workload: you state the shape you need, not the pool it lands on --
+# placement is the scheduler's decision, made against quota and fair share
+uv run eyvan workload submit --org acme --project research \
+    --name train --command "python train.py" --cpu 4 --memory-gib 16
+
+# a TPU gang: two v5p-16 slices, checkpointed so a preemption is survivable
+uv run eyvan workload submit --org acme --project research \
+    --name pretrain --command "python train.py" \
+    --accelerator-type v5p-16 --replicas 2 --capacity-class spot \
+    --checkpointable --checkpoint-output-uri gs://bucket/ckpt \
+    --max-preemption-retries 8
 
 # an array of N identical tasks; each sees EYVAN_BATCH_INDEX
-uv run eyvan workload submit-batch --pool research/cpu --count 64 \
-    --command "python shard.py"
+uv run eyvan workload submit-batch --org acme --project research \
+    --count 64 --command "python shard.py" --cpu 2 --memory-gib 8
 
-# a pipeline, in one transaction
-uv run eyvan workload submit-dag --file pipeline.yaml
+# a pipeline of dependent nodes, admitted in one transaction
+uv run eyvan workload submit-dag --org acme --project research --file pipeline.yaml
 ```
+
+Note what is *absent*: there is no `--pool`. You declare the shape and the class;
+the scheduler chooses the cell, because it is the only component that can see
+quota, fair share, warmth, locality, and live capacity at once.
 
 ### Watch it
 
@@ -256,7 +268,7 @@ job = client.run("research", "tpu-workers", command="python train.py")
 job.wait()
 ```
 
-Or submit a trusted callable directly, with no Ray and no eray:
+Or submit a trusted callable directly -- a decorator, no Ray and no eray:
 
 ```python
 from eyvan import execute, TpuConfig

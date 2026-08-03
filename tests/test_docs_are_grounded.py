@@ -46,6 +46,11 @@ def _command_paths(text: str) -> set[tuple[str, ...]]:
 
     found: set[tuple[str, ...]] = set()
     for line in text.splitlines():
+        # `from eyvan import EyvanClient` is Python, not an invocation. Reading it
+        # as one made the checker demand a CLI command named `import`, which would
+        # push a correct example out of the documentation to satisfy a test.
+        if re.match(r"\s*(from eyvan\b|import eyvan\b)", line):
+            continue
         for match in re.finditer(r"`?\beyvan((?: [a-z][a-z0-9-]*)+)", line):
             words = tuple(match.group(1).split())
             if words:
