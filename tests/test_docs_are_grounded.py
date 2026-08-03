@@ -333,3 +333,52 @@ def test_the_proofs_page_does_not_promote_local_or_historical_runs_to_hardware_p
     # No row may quietly acquire a result without an exact-candidate receipt.
     for claimed in ("verified on hardware", "confirmed on hardware", "passed on v5p", "proven on v5p"):
         assert claimed not in proofs
+
+
+def _python_blocks(text: str) -> list[str]:
+    """Every fenced ```python block in one page."""
+
+    return re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+
+
+@pytest.mark.parametrize("page", _pages(), ids=lambda page: page.name)
+def test_every_documented_keyword_argument_exists(page: pathlib.Path) -> None:
+    """A Python example may not invent a keyword the constructor does not take.
+
+    The command and flag checks above cover the CLI, and the Python examples had
+    nothing at all -- so a guide could document
+    ``TpuConfig(accelerator=..., slices=...)`` against a class whose fields are
+    ``type`` and ``pods``, and every test would still pass. It did.
+    """
+
+    import dataclasses
+
+    import eyvan
+
+    def accepted(target: object) -> set[str] | None:
+        """Return the keywords a constructor takes, or None if it is not ours.
+
+        Both shapes are asked for on purpose. The first version of this check
+        looked only for ``model_fields``, so every dataclass config -- which is
+        all of them -- fell through the "not an Eyvan model" branch and was
+        skipped. It passed against the very example that motivated it.
+        """
+
+        fields = getattr(target, "model_fields", None)
+        if fields is not None:
+            return set(fields)
+        if dataclasses.is_dataclass(target):
+            return {field.name for field in dataclasses.fields(target)}
+        return None
+
+    unknown: list[str] = []
+    for block in _python_blocks(page.read_text(encoding="utf-8")):
+        for name, arguments in re.findall(r"\b([A-Z][A-Za-z0-9_]*)\(([^)]*)\)", block):
+            fields = accepted(getattr(eyvan, name, None))
+            if fields is None:
+                continue  # not an exported Eyvan config; the other checks own it
+            for keyword in re.findall(r"(\w+)\s*=", arguments):
+                if keyword not in fields:
+                    unknown.append(f"{name}(...{keyword}=...)")
+
+    assert not unknown, f"{page.name} passes keywords that do not exist: {', '.join(sorted(set(unknown)))}"

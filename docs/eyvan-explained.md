@@ -268,12 +268,14 @@ job = client.run("research", "tpu-workers", command="python train.py")
 job.wait()
 ```
 
-Or submit a trusted callable directly -- a decorator, no Ray and no eray:
+Or submit a trusted callable directly -- a decorator, no Ray and no eray.
+``pods=N`` is one atomic Cloud TPU Multislice cell of N complete slices, not N
+loose workers:
 
 ```python
 from eyvan import execute, TpuConfig
 
-@execute(TpuConfig(accelerator="v5p-16", slices=2))
+@execute(TpuConfig(type="v5p-16", pods=2))
 def train():
     import jax
     print(jax.device_count())
