@@ -209,12 +209,25 @@ anything unproved stays `QUARANTINED`.
 ```bash
 uv sync
 uv run eyvan up                 # loopback development fleet, no cloud account
-uv run eyvan status
+uv run eyvan cells              # every registered execution cell
+uv run eyvan leases             # who is holding what
 uv run eyvan dashboard          # hosted UI
 ```
 
 `eyvan up` needs nothing configured. A *network* deployment needs fifteen things
 configured; they are enumerated in `docs/install.md`.
+
+Note which reads are fleet-scoped and which are not. `eyvan cells` and
+`eyvan leases` answer for the whole control plane, while `eyvan status` reports
+one fleet and therefore requires it:
+
+```bash
+uv run eyvan status configs/eyvan-live-cpu-us-east5-a.yaml   # or the fleet name
+```
+
+A fleet is a declared unit of capacity, so "status" without one has no subject --
+which is why the argument is required rather than defaulted to something that
+would quietly report on a fleet you did not mean.
 
 ### Submit work
 

@@ -45,7 +45,7 @@ characters, and an existing output unless `--force` is explicit. It writes mode
 0600 and never applies the result. Commands below that name a config refer to
 that rendered output, not to the `.in` template. Applying a GCP fleet provisions
 billable resources; obtain operator approval before `eyvan up`, out-of-band host
-failure, `eyvan down`, or any direct live harness. The live Python harnesses also require
+failure, `eyvan down CONFIG`, or any direct live harness. The live Python harnesses also require
 `--confirm-provider-mutations`.
 
 All proof fleets are spot unless a proof explicitly states otherwise.
@@ -72,7 +72,7 @@ real hardware produces that case.
 eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan capacity pool get research/v5p --json     # resources from the catalog, not the YAML
 eyvan cells                              # observed_tpu_vms == catalog hosts
-eyvan down --yes
+eyvan down CONFIG --yes
 ```
 
 ```
@@ -114,7 +114,7 @@ eyvan workload submit --name logs --command 'python -c "import time;[print(i) or
 eyvan workload log-page <id>              # records attributed per rank
 # kill one host out of band, then:
 eyvan workload log-page <id> --after <cursor>
-eyvan down --yes
+eyvan down CONFIG --yes
 ```
 
 **Passes when** the second page reports the killed rank as unavailable while
@@ -171,11 +171,11 @@ disturbing it.
 eyvan up configs/eyvan-live-cpu-us-east5-a.yaml
 # a callable submitted with can_submit_children=True that fans out three ways
 eyvan workload children <parent>          # created_by is the parent's owner
-eyvan down --yes
+eyvan down CONFIG --yes
 
 eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload exec <id> -- py-spy dump --pid <pid>
-eyvan down --yes
+eyvan down CONFIG --yes
 ```
 
 ```
@@ -214,7 +214,7 @@ eyvan workload submit --name secret-proof --command 'python -c "import os;print(
   --secret HF_TOKEN=gcp-secret://<project>/eyvan-proof-token --tpu 8
 eyvan workload logs <id>                         # the length, never the value
 eyvan events --org <org> --project <project> | grep secret.               # one secret.issued, one secret.read
-eyvan down --yes
+eyvan down CONFIG --yes
 ```
 
 ```
@@ -300,7 +300,7 @@ eyvan capacity warmth --json                     # window_active, floor held
 # after the window closes
 eyvan capacity warmth --json                     # window_active false, floor released
 eyvan capacity billing --json                    # idle cost matches the window
-eyvan down --yes
+eyvan down CONFIG --yes
 ```
 
 ```

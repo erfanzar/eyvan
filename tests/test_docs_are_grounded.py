@@ -382,3 +382,52 @@ def test_every_documented_keyword_argument_exists(page: pathlib.Path) -> None:
                     unknown.append(f"{name}(...{keyword}=...)")
 
     assert not unknown, f"{page.name} passes keywords that do not exist: {', '.join(sorted(set(unknown)))}"
+
+
+@pytest.mark.parametrize("page", _pages(), ids=lambda page: page.name)
+def test_every_documented_invocation_supplies_its_required_arguments(page: pathlib.Path) -> None:
+    """A documented command that cannot run is worse than an undocumented one.
+
+    ``eyvan status`` takes a required FLEET_OR_CONFIG, and the guide showed it
+    bare -- so the first thing a reader copied exited with a usage error. The
+    command existed and every flag existed, which is exactly why the two checks
+    above passed it.
+    """
+
+    missing: list[str] = []
+    for line in page.read_text(encoding="utf-8").splitlines():
+        if re.match(r"\s*(from eyvan\b|import eyvan\b)", line):
+            continue
+        match = re.search(r"\beyvan((?: [a-z][a-z0-9-]*)+)(.*)$", line)
+        if match is None:
+            continue
+        node: click.Command = cli.main
+        words = match.group(1).split()
+        consumed = 0
+        for word in words:
+            if not isinstance(node, click.Group):
+                break
+            child = node.commands.get(word)
+            if child is None:
+                node = cli.main  # not a real path; the command check owns that
+                break
+            node = child
+            consumed += 1
+        if node is cli.main or isinstance(node, click.Group):
+            continue
+        required = [p for p in node.params if isinstance(p, click.Argument) and p.required]
+        if not required:
+            continue
+        # Everything after the command path, minus flags and their values, is
+        # what the reader would actually pass positionally.
+        tail = " ".join(words[consumed:]) + " " + match.group(2)
+        tail = tail.split("#")[0]
+        positional = [
+            token
+            for token in tail.split()
+            if not token.startswith("-") and token not in {"\\", "|", "&&"} and "=" not in token
+        ]
+        if len(positional) < len(required):
+            missing.append(f"eyvan {' '.join(words)} (needs {', '.join(p.name for p in required)})")
+
+    assert not missing, f"{page.name} documents invocations that cannot run: {'; '.join(sorted(set(missing)))}"
