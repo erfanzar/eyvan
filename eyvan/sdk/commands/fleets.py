@@ -438,13 +438,64 @@ def down_fleet(
     )
 
 
+def _running_fleets(session: CliSession) -> list[str]:
+    """Return the fleet names this scope may see, or an empty list.
+
+    A discovery read, so it never turns a missing answer into a failure: if the
+    control plane cannot be asked, the caller falls back to reporting that it
+    needs a fleet named explicitly, which is exactly the state it was in before.
+    """
+
+    scope = session.workload_scope()
+    try:
+        payload = session.client.request(
+            "GET",
+            "/api/v1/fleets",
+            params={"org_id": scope.org_id, "project_id": scope.project_id},
+        )
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return sorted({str(name) for name in payload if isinstance(name, str) and name})
+
+
 @click.command("status")
-@click.argument("fleet_or_config")
+@click.argument("fleet_or_config", required=False)
 @click.option("--json", "as_json", is_flag=True, help="Emit the full server-side fleet record as JSON.")
 @click.option("--cache-dir", type=click.Path(path_type=Path, file_okay=False), help="Override ~/.eyvan/autoscale.")
 @click.pass_obj
-def fleet_status(session: CliSession, fleet_or_config: str, as_json: bool, cache_dir: Path | None) -> None:
-    """Show server-side pool and cell status for a fleet."""
+def fleet_status(
+    session: CliSession,
+    fleet_or_config: str | None,
+    as_json: bool,
+    cache_dir: Path | None,
+) -> None:
+    """Show server-side pool and cell status for a fleet.
+
+    With no argument the running fleets are discovered. One is reported
+    directly; several are listed for the caller to choose between, because
+    picking one for them would report on a fleet they did not mean -- and the
+    two most likely reasons to run this command are that a fleet is misbehaving
+    and that the caller is not certain which fleets exist.
+    """
+
+    if fleet_or_config is None:
+        running = _running_fleets(session)
+        if not running:
+            raise click.ClickException(
+                "no running fleet was found for this scope; name a fleet or its config path, "
+                "or create one with `eyvan up CONFIG`"
+            )
+        if len(running) > 1:
+            listing = "\n".join(f"  {name}" for name in running)
+            raise click.ClickException(
+                f"{len(running)} fleets are running; name the one you mean:\n{listing}\n"
+                f"  eyvan status {running[0]}"
+            )
+        fleet_or_config = running[0]
+        if not as_json and fleet_status_rendering.is_interactive_output():
+            click.echo(f"Showing the one running fleet, {fleet_or_config!r}.", err=True)
 
     candidate = Path(fleet_or_config).expanduser()
     if candidate.exists():

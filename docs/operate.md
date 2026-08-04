@@ -23,7 +23,7 @@ existing deployment.
 ## Every day
 
 ```
-eyvan status FLEET            # fleet-level summary; a fleet name or its config path
+eyvan status                  # fleet-level summary; discovers the running fleet
 eyvan workload list             # what is queued and running
 eyvan capacity list             # pools this project may submit to
 ```

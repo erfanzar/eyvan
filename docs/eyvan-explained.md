@@ -222,12 +222,14 @@ Note which reads are fleet-scoped and which are not. `eyvan cells` and
 one fleet and therefore requires it:
 
 ```bash
-uv run eyvan status configs/eyvan-live-cpu-us-east5-a.yaml   # or the fleet name
+uv run eyvan status                                          # discovers it
+uv run eyvan status configs/eyvan-live-cpu-us-east5-a.yaml   # or name it
 ```
 
-A fleet is a declared unit of capacity, so "status" without one has no subject --
-which is why the argument is required rather than defaulted to something that
-would quietly report on a fleet you did not mean.
+With no argument the running fleets are discovered: one is reported directly,
+and several are listed for you to choose between rather than picked for you --
+the two most likely reasons to run this command are that a fleet is misbehaving
+and that you are not certain which fleets exist.
 
 ### Submit work
 
