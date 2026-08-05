@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
+import sys
 import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +34,28 @@ from eyvan._internal.compat import StrEnum
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan"
+
+
+class MigrationConnectionError(RuntimeError):
+    """The configured database could not be reached at all.
+
+    Distinct from a refused *migration*: nothing about the schema was
+    established, so the caller is told which URL was tried, where that URL came
+    from, and the one configuration that makes this expected rather than broken.
+    """
+
+
+def _redacted_url(url: str) -> str:
+    """Return a database URL with any password removed.
+
+    An error message is the most-copied string a tool emits -- into issues, chat,
+    and logs -- so it must not be the thing that leaks a credential.
+    """
+
+    match = re.match(r"^(?P<scheme>[^:]+://)(?P<user>[^:@/]+)(?::[^@]*)?@(?P<rest>.*)$", url)
+    if match is None:
+        return url
+    return f"{match.group('scheme')}{match.group('user')}:***@{match.group('rest')}"
 
 
 class UnsafeAutomaticMigrationError(RuntimeError):
@@ -306,7 +330,22 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
             "online migration targets are fixed to packaged head; use --sql for offline rehearsal"
         )
 
-    state = inspect_database_state(config)
+    try:
+        state = inspect_database_state(config)
+    except OSError as exc:
+        # A refused connection is an operational condition, not a defect, and a
+        # sixty-line asyncpg traceback answers neither "what should I do" nor
+        # "which database did it even try". It also has one overwhelmingly likely
+        # cause: this deployment has no PostgreSQL, because a --local-daemon
+        # control plane keeps its state in a versioned JSON document that this
+        # command does not manage and does not need to.
+        url = str(config.get_main_option("sqlalchemy.url") or "")
+        source = "EYVAN_DATABASE_URL" if os.getenv("EYVAN_DATABASE_URL") else "the local-development default"
+        raise MigrationConnectionError(
+            f"could not reach the control-plane database at {_redacted_url(url)} (from {source}): {exc}.\n"
+            "If this control plane runs with --local-daemon its state is a versioned local document, "
+            "which needs no migration. Otherwise start PostgreSQL or pass --database-url."
+        ) from exc
     require_safe_migration(state, maintenance_acknowledged=args.maintenance_acknowledged)
     if args.check:
         status = {
@@ -320,5 +359,22 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     return 0
 
 
+def console_main(argv: tp.Sequence[str] | None = None) -> int:
+    """Entry point for the ``eyvan-migrate`` script.
+
+    Separate from :func:`main` on purpose. ``main`` raises, because a caller in
+    Python wants the typed error and the tests assert on it. An operator at a
+    terminal wants a sentence: a refused connection and a refused migration are
+    both ordinary answers, and answering either with a sixty-line traceback
+    buries the one line that says what to do next.
+    """
+
+    try:
+        return main(argv)
+    except (MigrationConnectionError, UnsafeAutomaticMigrationError) as error:
+        print(f"eyvan-migrate: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(console_main())

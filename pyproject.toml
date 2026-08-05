@@ -37,7 +37,7 @@ eyvan = "eyvan.sdk.cli:main"
 eyvan-server = "eyvan.server.api.app:main"
 eyvan-agent = "eyvan.worker.agent.cli:main"
 eyvan-native-worker = "eyvan.worker.runtime.native_worker:main"
-eyvan-migrate = "eyvan.server.persistence.migrate:main"
+eyvan-migrate = "eyvan.server.persistence.migrate:console_main"
 
 [project.optional-dependencies]
 # aiosqlite gives the SQLAlchemy repository a real database to run against.

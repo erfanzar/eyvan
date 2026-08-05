@@ -124,8 +124,17 @@ def test_eyvan_declares_no_ray_dependency_in_any_extra() -> None:
 
 
 def test_pyproject_registers_migrate_entrypoint() -> None:
+    """The script must point at the wrapper, not the raising entry point.
+
+    ``main`` raises typed errors because a Python caller wants them; an operator
+    at a terminal wants a sentence. Pointing the console script back at ``main``
+    would restore the sixty-line asyncpg traceback that a --local-daemon
+    deployment -- which has no PostgreSQL and needs no migration at all -- sees
+    the very first time it runs this command.
+    """
+
     scripts = _pyproject()["project"]["scripts"]
-    assert scripts.get("eyvan-migrate") == "eyvan.server.persistence.migrate:main"
+    assert scripts.get("eyvan-migrate") == "eyvan.server.persistence.migrate:console_main"
 
 
 def test_alembic_config_points_at_packaged_migrations(monkeypatch: pytest.MonkeyPatch) -> None:
