@@ -70,9 +70,13 @@ export function OverviewPage({
           icon={Server}
         />
         <MetricCard
-          label="Month spend"
-          value={formatMoney(overview.monthlySpend, true)}
-          detail={`${budgetUsed}% of ${formatMoney(overview.monthlyBudget, true)}`}
+          label="Budgeted spend"
+          value={overview.monthlyBudget > 0 ? formatMoney(overview.monthlySpend, true) : "No budget"}
+          detail={
+            overview.monthlyBudget > 0
+              ? `${budgetUsed}% of ${formatMoney(overview.monthlyBudget, true)}`
+              : "cell cost still accrues; see Fleet for what the fleet is spending"
+          }
           icon={CircleDollarSign}
           tone="warning"
         />

@@ -238,7 +238,7 @@ describe("capability-aware actions", () => {
     expect(screen.getByText("Restricted")).toBeDefined();
     expect(screen.getByText("Fleet inventory is restricted")).toBeDefined();
     expect(screen.queryByText("TPU v5p")).toBeNull();
-    expect(screen.getByText("Month spend")).toBeDefined();
+    expect(screen.getByText("Budgeted spend")).toBeDefined();
     expect(screen.getByText(mockWorkloads[0].name)).toBeDefined();
   });
 
