@@ -88,6 +88,7 @@ REASON_CODES: tp.Final[frozenset[str]] = frozenset(
         "availability_budget_exceeded",
         "candidate_identity_missing",
         "cleanup_evidence_missing",
+        "observation_gap",
         "cleanup_incomplete",
         "config_execution_binding_missing",
         "configuration_snapshot_missing",
@@ -668,6 +669,15 @@ class SoakState:
     """Bounded longitudinal state for one proof run."""
 
     ticks: int = 0
+    #: Longest stretch, in seconds, between two consecutive observations. A soak
+    #: measures its duration on the monotonic clock, which on macOS stops while
+    #: the machine sleeps -- so a run that a laptop suspended for thirty-one
+    #: hours still completes its slot count and would otherwise report a clean
+    #: seventy-two hours over a period it spent thirty-one hours not watching.
+    #: An unobserved stretch is exactly "I could not find out", and the receipt
+    #: has to carry it rather than average it away.
+    longest_observation_gap_s: float = 0.0
+    unobserved_s: float = 0.0
     attempts: int = 0
     failures: int = 0
     availability_failures: int = 0
@@ -1036,6 +1046,8 @@ class SoakState:
                 and not evidence_truncated
             ),
             "attempted_observations": self.attempts,
+            "longest_observation_gap_s": round(self.longest_observation_gap_s, 3),
+            "unobserved_s": round(self.unobserved_s, 3),
             "unreachable_observations": self.availability_failures,
             "availability_budgeted_observations": self.availability_failures,
             "non_transient_failed_observations": self.non_transient_failures,
@@ -1271,6 +1283,12 @@ def run_soak(
     return current
 
 
+#: How far past one interval two observations may sit before the stretch counts
+#: as unobserved. Two intervals absorbs ordinary scheduling jitter and a slow
+#: poll; anything beyond it is time the fleet genuinely was not watched.
+_OBSERVATION_GAP_TOLERANCE: tp.Final[float] = 2.0
+
+
 def _finite_monotonic(monotonic: tp.Callable[[], float]) -> float:
     value = monotonic()
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -1312,6 +1330,8 @@ def run_soak_for_duration(
     if not math.isfinite(deadline):
         raise ValueError("the monotonic deadline overflowed")
     slot = 0
+    previous: float | None = None
+    interval_float = _rational_to_finite_float(interval_numerator, interval_denominator, name="observation interval")
     while slot < total_slots:
         scheduled = started + slot_offset(slot)
         now = _finite_monotonic(monotonic)
@@ -1329,6 +1349,17 @@ def run_soak_for_duration(
             else:
                 high = middle
         slot = max(slot, low - 1)
+        # Measured on the same clock the deadline uses, so it answers the
+        # question that clock cannot: a monotonic deadline is immune to NTP
+        # steps, and on macOS it also stops while the machine sleeps. A run that
+        # suspends still completes every slot, so without this the receipt would
+        # describe a full-length soak over hours it spent not watching.
+        if previous is not None:
+            gap = now - previous
+            if gap > interval_float * _OBSERVATION_GAP_TOLERANCE:
+                current.longest_observation_gap_s = max(current.longest_observation_gap_s, gap)
+                current.unobserved_s += gap - interval_float
+        previous = now
         try:
             current.observe(observe())
         except Exception as error:
@@ -1484,6 +1515,12 @@ def build_soak_receipt(
 
     failures: dict[str, int] = {}
     inconclusive: dict[str, int] = dict(_input_reason_counts(inputs))
+    if state.longest_observation_gap_s > 0:
+        # Inconclusive, not failed. Nothing was observed to be wrong during the
+        # gap -- and nothing was observed to be right either, which is the whole
+        # objection: a soak's claim is that invariants held *continuously*, and
+        # it cannot make that claim about hours it did not watch.
+        _add_reason(inconclusive, "observation_gap")
     if state.confirmed:
         _add_reason(failures, "persistent_invariant_violation", len(state.confirmed))
     if state.longitudinal_findings:
