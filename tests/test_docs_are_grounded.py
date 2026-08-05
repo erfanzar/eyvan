@@ -431,3 +431,52 @@ def test_every_documented_invocation_supplies_its_required_arguments(page: pathl
             missing.append(f"eyvan {' '.join(words)} (needs {', '.join(p.name for p in required)})")
 
     assert not missing, f"{page.name} documents invocations that cannot run: {'; '.join(sorted(set(missing)))}"
+
+
+_CONSOLE_SCRIPTS = ("eyvan-migrate", "eyvan-server", "eyvan-agent", "eyvan-native-worker")
+
+
+@pytest.mark.parametrize("page", _pages(), ids=lambda page: page.name)
+def test_every_documented_console_script_invocation_parses(page: pathlib.Path) -> None:
+    """The four argparse binaries were documented and checked by nothing.
+
+    Every check above walks the click CLI, so `eyvan-migrate upgrade head` -- an
+    Alembic habit, and not this tool's grammar -- would sail through all of them.
+    Its parser takes an optional revision and no subcommand, and online upgrades
+    are fixed to the packaged head regardless.
+    """
+
+    import contextlib
+    import io
+    import shlex
+
+    from eyvan.server.persistence import migrate
+
+    parsers = {"eyvan-migrate": migrate._parser}
+
+    unparsed: list[str] = []
+    for line in page.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip().lstrip("$").strip()
+        for script in _CONSOLE_SCRIPTS:
+            marker = f"{script} "
+            if marker not in stripped or script not in parsers:
+                continue
+            tail = stripped.split(marker, 1)[1].split("#")[0].split("|")[0].split(">")[0]
+            # Prose quotes a command inline as `eyvan-migrate --check`. -- the
+            # trailing backtick and sentence punctuation are the page's, not the
+            # invocation's, and feeding them to argparse invents a failure.
+            tail = tail.split("`")[0].rstrip(" .,;:)")
+            try:
+                arguments = shlex.split(tail)
+            except ValueError:
+                continue
+            if any(token.startswith("$") or token.startswith("<") for token in arguments):
+                continue  # a placeholder the reader substitutes
+            parser = parsers[script]()
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    parser.parse_args(arguments)
+                except SystemExit:
+                    unparsed.append(f"{script} {tail.strip()}")
+
+    assert not unparsed, f"{page.name} documents invocations the parser rejects: {'; '.join(sorted(set(unparsed)))}"
