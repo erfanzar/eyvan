@@ -33,17 +33,17 @@ entry describes only the named persistence contract, never the whole capability.
 | native single-host, multi-host, and TPU Multislice execution | C | durable state/fence contracts | U | U: CPU/GPU/TPU | workspace journal; no external receipt |
 | hardware catalog | C for sourced entries | n/a | U | U: breadth and corrected-resource rerun | workspace journal; no provider receipt |
 | preemption, retry, checkpoint, and resume | C | durable retry contracts | U | U: reclamation/recovery | workspace journal; no provider receipt |
-| structured logs and progress | P: M1.3 rank/cursor/archive surface | persistence contracts | U | U: strict topology binding/manifest and multi-host loss | workspace journal; no hardware receipt |
+| structured logs and progress | C: strict codec, frozen topology, schema-2 manifest | persistence contracts | U | U: real multi-host loss; P2 at exit 2 | workspace journal; no hardware receipt |
 | explain and launch-latency reporting | C; historical samples only | query contracts | U | U; no guaranteed ETA | workspace journal |
 | current pool/class portfolios | C for current surface | policy-state contracts | U | U; broader routes deferred | workspace journal |
 | predictive warmth | P; advisory/off by default | policy-state contracts | U | U: backtest/spend/provider | no qualification receipt |
-| locality-aware cache | P: soft named-asset hints | state contracts | U | U: managed staging/eviction absent | no qualification receipt |
-| managed services | P | persistence contracts | U | U: health/autoscaling/lifecycle | no qualification receipt |
-| batch, DAG, and groups | P | persistence contracts | U | U: bounded map/backpressure/atomic heterogeneity | no qualification receipt |
+| locality-aware cache | C: managed staging, budget, eviction, worker executor | state contracts | U | U: no fleet has staged bytes | no qualification receipt |
+| managed services | C: health with explicit unknown, replica lifecycle, bounded autoscaling | persistence contracts | U | U: no deployed service | no qualification receipt |
+| batch, DAG, and groups | C: admission ceiling, bounded waves, atomic heterogeneous placement | persistence contracts | U | U: no fleet-scale run | no qualification receipt |
 | economics and carbon | P/advisory | persistence contracts | U | U: prices/reconciliation/webhooks/carbon source | no qualification receipt |
 | artifact lifecycle | C | C: exact M1.6 receipt | U | U: GCS/destructive collection | workspace M1.6 PostgreSQL receipt only |
-| CPU/GPU configs and coordinated groups | P | n/a | U | U: GPU/heterogeneous runtime | no qualification receipt |
-| provider plugins | P built-ins; static Kubernetes render C | n/a | U | U: external ABI/GKE lifecycle | static evidence only |
+| CPU/GPU configs and coordinated groups | C: GPU catalog, per-rank devices, reached from an observation | n/a | U | U: no GPU has executed | no qualification receipt |
+| provider plugins | C: published ABI, conformance suite, on-prem provider | n/a | U | U: no external provider written | static evidence only |
 | secret delivery and workload identity | secret delivery C; provider identity P | C: dispatch transactions | U | U: identity/rotation/metadata/mTLS | workspace journal; no provider receipt |
 | federation | D/off | local-record tests only | U | U: PKI/witness/failover absent | design record only |
 | resilience certification | P: host chaos/evaluator | PostgreSQL fault contracts | U | U: provider certificate/final soak | no qualification receipt |
