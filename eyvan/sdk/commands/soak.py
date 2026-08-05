@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -1825,26 +1826,70 @@ def execute_soak(
 
     status = "completed"
     run_codes: list[str] = []
-    try:
-        run_soak_for_duration(
-            observe,
-            duration_s=inputs.requested_duration_decimal,
-            interval_s=inputs.interval_decimal,
-            sleep=sleep,
-            monotonic=monotonic,
-            on_tick=checkpoint,
-            state=state,
-        )
-    except KeyboardInterrupt:
-        status = "interrupted"
-    except Exception as error:
-        status = "interrupted"
-        category = _exception_category(error, filesystem=True)
-        run_codes.append("runner_filesystem_error" if category == "filesystem" else "runner_internal_error")
+    # A long soak is started in the background, and a background job inherits
+    # SIGINT ignored -- so the KeyboardInterrupt path below, which is the one that
+    # writes the receipt, is unreachable for exactly the runs that need it most.
+    # SIGTERM is what an operator actually sends, and its default action ends the
+    # process with the whole longitudinal state still in memory: the terminated
+    # P8 lost the identities of three persistent violations that way. Raising
+    # KeyboardInterrupt from the handler routes SIGTERM into the same graceful
+    # exit, so the receipt is written either way.
+    with _terminate_as_interrupt():
+        try:
+            run_soak_for_duration(
+                observe,
+                duration_s=inputs.requested_duration_decimal,
+                interval_s=inputs.interval_decimal,
+                sleep=sleep,
+                monotonic=monotonic,
+                on_tick=checkpoint,
+                state=state,
+            )
+        except KeyboardInterrupt:
+            status = "interrupted"
+        except Exception as error:
+            status = "interrupted"
+            category = _exception_category(error, filesystem=True)
+            run_codes.append("runner_filesystem_error" if category == "filesystem" else "runner_internal_error")
     final = receipt(status, codes=run_codes)
     if output is not None:
         write_receipt_atomic(output, final)
     return final
+
+
+@contextlib.contextmanager
+def _terminate_as_interrupt() -> tp.Iterator[None]:
+    """Route SIGTERM into the interrupt path, and restore what was there.
+
+    Installed only for the duration of the run, and only when this is the main
+    thread of the main interpreter, because that is the only place
+    :func:`signal.signal` is allowed. A handler left installed afterwards would
+    change how the process behaves for every later caller, and a soak embedded in
+    a larger program must not do that.
+    """
+
+    import signal as _signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise_interrupt(_number: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = _signal.signal(_signal.SIGTERM, _raise_interrupt)
+    except (ValueError, OSError):
+        # No signal facility here -- a soak still runs, it just cannot be asked
+        # to stop gracefully, which is exactly the state it was in before.
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError, OSError):
+            _signal.signal(_signal.SIGTERM, previous)
 
 
 def _parse_cli_enum(value: str, allowed: tuple[str, ...]) -> str:
