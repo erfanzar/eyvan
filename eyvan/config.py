@@ -17,6 +17,7 @@ from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
 from eyvan.capacity.stage_policy import CellStagePolicy, StageEvictionPolicy
 from eyvan.identity.mtls import MutualTlsFiles, MutualTlsMode, parse_mutual_tls_mode
+from eyvan.soak_evidence import DEFAULT_EVIDENCE_MAX_AGE_S
 from eyvan.worker.runtime._multihost_site import GangInitializationPolicy
 
 DEFAULT_LOCAL_CONTROL_PLANE_PATH = Path("~/.eyvan/control-plane.json")
@@ -111,6 +112,13 @@ class EyvanSettings:
     outbox_retention_s: int = 7 * 24 * 3600
     audit_retention_s: int = 90 * 24 * 3600
     idempotency_retention_s: int = 30 * 24 * 3600
+    #: How old the externally measured P8 sample may be and still be published
+    #: as ``p8_evidence``. Past it the soak route reports ``null`` again, which
+    #: is what a dead monitor should read as: a sample from an hour ago is the
+    #: last thing something happened to see, not a statement about now. Nothing
+    #: changes for a fleet with no monitor -- with no sample stored the response
+    #: is byte-identical to today's.
+    soak_evidence_max_age_s: float = DEFAULT_EVIDENCE_MAX_AGE_S
     #: This control plane's identity among its peers. Empty means "not federated",
     #: which is the default and the only mode most fleets ever need: one plane per
     #: region with projects pinned to one region already works by construction.
@@ -520,6 +528,7 @@ class EyvanSettings:
             outbox_retention_s=int(os.getenv("EYVAN_OUTBOX_RETENTION_S", defaults.outbox_retention_s)),
             audit_retention_s=int(os.getenv("EYVAN_AUDIT_RETENTION_S", defaults.audit_retention_s)),
             idempotency_retention_s=int(os.getenv("EYVAN_IDEMPOTENCY_RETENTION_S", defaults.idempotency_retention_s)),
+            soak_evidence_max_age_s=float(os.getenv("EYVAN_SOAK_EVIDENCE_MAX_AGE_S", defaults.soak_evidence_max_age_s)),
             plane_id=os.getenv("EYVAN_PLANE_ID", defaults.plane_id),
             kubernetes_namespace=os.getenv("EYVAN_KUBERNETES_NAMESPACE", defaults.kubernetes_namespace),
             kubernetes_worker_image=os.getenv("EYVAN_KUBERNETES_WORKER_IMAGE", defaults.kubernetes_worker_image),

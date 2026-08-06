@@ -414,26 +414,78 @@ growth within its bound, reconciled spend, cleanup complete, and final provider
 inventory exactly zero. Missing evidence is never inferred from `cell_count` or
 from an absent error.
 
-The current `/api/v1/system/invariants/soak` response returns
-`p8_evidence: null` deliberately. It has no trustworthy process/DB-size or live
-provider-inventory source. Consequently current live invocations end
-`inconclusive`/exit 2 with explicit codes including
-`rss_growth_evidence_missing`, `fd_growth_evidence_missing`,
+`/api/v1/system/invariants/soak` still returns `p8_evidence: null` on its own,
+and deliberately: the control plane has no trustworthy view of its own process
+size and cannot see provider inventory without a provider call. It only
+republishes what an external monitor measured and posted.
+
+### The external monitor
+
+`eyvan soak-monitor` is that monitor. It runs as a separate process beside the
+control plane, measures it from outside, and posts one closed
+`eyvan.soak.external-evidence.v1` sample per interval to
+`/api/v1/system/soak-evidence` (fleet administration, authenticated):
+
+```
+eyvan soak-monitor \
+  --proof-id sha256:<64-lowercase-hex> \
+  --control-plane-pid-file <supervisor-pid-file> \
+  --database-url <postgresql-url> \
+  --provider-inventory-command <script printing the provider's live cell count> \
+  --interval-s 30
+```
+
+- `rss_bytes` / `fd_count` — read from `/proc/<pid>` where it exists, `ps` and
+  `lsof` otherwise, always for the control plane's pid and never the monitor's
+  own. `--control-plane-pid-file` is re-read every tick so a deliberately
+  restarted control plane keeps being measured; `--control-plane-pid` pins one
+  process instead.
+- `database_bytes` — `pg_database_size(current_database())` with
+  `--database-url`, or the size of the local state document with
+  `--state-path`. Exactly one of the two.
+- `spend_reconciled` — the control plane's own ledger: invariant `I5` not
+  violated **and** no cell contributing zero cost for want of a unit price. The
+  terminated run's `$3.68` was a floor with 42 of 46 cells unpriced, which is
+  not a reconciled ledger.
+- `provider_inventory_count` — whatever the operator's command prints on
+  stdout, as a single bounded integer. It is a provider call by construction:
+  the argv is executed without a shell, and a non-zero exit, unparseable
+  output, or timeout is unknown rather than zero.
+- `cleanup_complete` — every cell the control plane lists has reached
+  `deleted`. `deleting` counts as outstanding, and a cell state this build does
+  not recognise makes the field unknown rather than complete.
+
+**A partial sample is not a sample.** The schema has no encoding for "unknown",
+so a monitor that cannot establish one field posts nothing, prints
+`{"outcome": "incomplete", "unmeasurable": [...]}`, and exits non-zero for a
+bounded `--samples` run. The evaluator then reports the specific
+`*_evidence_missing` code, which is the honest outcome. No zero is substituted
+and no previous value is carried forward.
+
+**A stale sample is not evidence.** The control plane keeps only the most
+recent sample, only in the replica that received it, and republishes it only to
+the run whose `proof_id` it names. Past `EYVAN_SOAK_EVIDENCE_MAX_AGE_S`
+(default 300s) it reports `null` again, so a monitor that died an hour ago
+reads as missing rather than as the last thing it happened to see. Age is the
+larger of the monotonic and wall-clock deltas, because `CLOCK_MONOTONIC` does
+not advance while a host sleeps — which is how the terminated run lost 31.5
+hours. The sample is deliberately not durable: it is a current measurement, not
+fleet state, and a restarted replica has stopped having one rather than lost a
+record. Run the monitor and the evaluator against the same replica.
+
+Without a monitor running, every response is byte-identical to what it was
+before this route existed, and live invocations still end `inconclusive`/exit 2
+with `rss_growth_evidence_missing`, `fd_growth_evidence_missing`,
 `database_growth_evidence_missing`, `spend_reconciliation_evidence_missing`,
-`provider_inventory_evidence_missing`, and `cleanup_evidence_missing`. The docs
-do **not** define exit 0 from the current endpoint as P8.
+`provider_inventory_evidence_missing` and `cleanup_evidence_missing`.
 
-Future work may connect a bounded, authenticated external monitor that emits the
-closed `eyvan.soak.external-evidence.v1` sample. Only after that source is
-implemented, independently reviewed, and exercised against the frozen candidate
-may exit 0 mean that the **evaluator criteria** passed. Provider operation and
-CPU/TPU hardware qualification still require their own immutable evidence; the
-durable state receipt alone is not attestation.
-
-**Passes when** a future reviewed external monitor supplies every proof-bound
-sample, the evaluator returns exit 0 with every closed criterion satisfied, and
-the separate immutable provider/hardware evidence confirms the claimed CPU/TPU
-operations. The current endpoint cannot meet this criterion and exits 2.
+**Passes when** the monitor supplies a proof-bound sample at every successful
+observation, the evaluator returns exit 0 with every closed criterion
+satisfied, and the separate immutable provider/hardware evidence confirms the
+claimed CPU/TPU operations. Exit 0 means the **evaluator criteria** passed and
+nothing more: it is not provider operation evidence and not hardware
+attestation, and it still requires a mixed CPU + TPU fleet and 72 hours with no
+unobserved gap. No qualifying receipt exists.
 
 **Shape** Release-candidate mixed CPU + TPU fleet for 72 hours, exercising short
 callables, a checkpointed trainer, batch/DAG/service activity, artifact

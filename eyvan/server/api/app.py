@@ -12,6 +12,7 @@ import asyncio
 import collections
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import secrets
@@ -178,6 +179,7 @@ from eyvan.soak_contract import (
     participant_manifest_sha256,
     safe_scope_id,
 )
+from eyvan.soak_evidence import MAX_EVIDENCE_BODY_BYTES, ExternalEvidenceSample, SoakEvidenceStore
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +274,7 @@ def create_app(
     server_bind: ServerBindPolicy | None = None,
     automatic_loopback_auth: bool = False,
     platform_config: EyvanPlatformConfig | None = None,
+    soak_evidence: SoakEvidenceStore | None = None,
 ) -> FastAPI:
     """Build an application with injectable auth, service, and persistence adapters.
 
@@ -345,6 +348,7 @@ def create_app(
         )
     registry = metrics_registry or CollectorRegistry(auto_describe=True)
     metrics = metrics or EyvanMetrics(registry=registry)
+    soak_evidence = soak_evidence or SoakEvidenceStore(max_age_s=settings.soak_evidence_max_age_s)
     if settings.secret_token_ttl_s <= 0:
         raise ValueError("EYVAN_SECRET_TOKEN_TTL_S must be positive")
     token_key = _artifact_token_key(settings)
@@ -1541,6 +1545,54 @@ def create_app(
             },
         }
 
+    @app.post("/api/v1/system/soak-evidence", tags=["system"])
+    async def record_soak_evidence(
+        raw_request: Request,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, tp.Any]:
+        """Accept one externally measured, proof-bound P8 sample.
+
+        The control plane cannot be the source of its own resource evidence: a
+        process reporting its own RSS proves nothing about a process that is
+        leaking, and no amount of durable state tells it what a provider still
+        bills for. So this route only *stores* what a separate monitor measured
+        and posted, and :func:`proof_scoped_fleet_invariants` republishes it
+        unchanged. Nothing here infers, defaults, or completes a sample.
+
+        The body is bounded while it is read rather than after it is buffered,
+        the eight closed keys must be exactly right, and every value must
+        already have the type it will be republished with -- numeric text is
+        refused rather than coerced, because a stored ``12`` and a posted
+        ``"12"`` would be two different pieces of evidence.
+
+        Only the most recent sample is kept, and only in this process. It is a
+        measurement, not fleet state: a replica that restarts has not lost a
+        record, it has stopped having a current one, and reporting no evidence
+        until the monitor posts again is the truthful answer.
+        """
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        received = bytearray()
+        async for chunk in raw_request.stream():
+            received.extend(chunk)
+            if len(received) > MAX_EVIDENCE_BODY_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail=f"a soak evidence sample may not exceed {MAX_EVIDENCE_BODY_BYTES} bytes",
+                )
+        try:
+            payload = json.loads(bytes(received))
+        except ValueError as error:
+            raise InputError("the soak evidence sample is not a JSON document") from error
+        try:
+            sample = ExternalEvidenceSample.from_dict(payload)
+        except ValueError as error:
+            # The parser's message names only a closed field name, never a
+            # submitted value, so a hostile body cannot echo itself back.
+            raise InputError(f"the soak evidence sample was refused: {error}") from error
+        soak_evidence.record(sample)
+        return {"accepted": True, "proof_id": sample.proof_id}
+
     @app.post("/api/v1/system/invariants/soak", tags=["system"])
     async def proof_scoped_fleet_invariants(
         payload: dict[str, tp.Any],
@@ -1593,6 +1645,7 @@ def create_app(
             coverage_truncated = True
         if snapshot.participant_manifest_sha256 != manifest_sha256:
             raise RuntimeError("proof-scoped snapshot returned a mismatched participant manifest")
+        evidence = soak_evidence.latest(proof_id=proof_id)
 
         return {
             "checked": [invariant.value for invariant in Invariant],
@@ -1630,7 +1683,14 @@ def create_app(
                     ],
                     "truncated": coverage_truncated,
                 },
-                "p8_evidence": None,
+                # Republished exactly as an external monitor measured it, and
+                # only for this run: a sample bound to another proof, or one
+                # older than the freshness bound, reads as absent rather than as
+                # the last thing something happened to see. The evaluator then
+                # reports its explicit *_evidence_missing codes, which is what a
+                # dead monitor honestly means. With no monitor running this is
+                # None, exactly as it was before the route existed.
+                "p8_evidence": (evidence.as_dict() if evidence is not None else None),
             },
         }
 

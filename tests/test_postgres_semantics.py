@@ -808,3 +808,21 @@ async def test_a_confirmed_eviction_actually_deletes_the_row(database) -> None:
         remaining = await tx.list_cell_stages()
 
     assert remaining == []
+
+
+async def test_the_p8_monitor_reads_a_real_pg_database_size(postgres_url: str) -> None:
+    """``pg_database_size`` is the P8 monitor's only source for database bytes.
+
+    The soak evaluator judges database growth against an explicit bound, so a
+    figure the external monitor cannot actually obtain from the production
+    dialect is the difference between a bounded claim and no claim at all.
+    Every other property of that probe is asserted in ``test_soak_monitor``;
+    this is where the number comes from a real server.
+    """
+
+    from eyvan.sdk.commands.soak_monitor import measure_postgres_database_bytes
+
+    measured = await asyncio.to_thread(measure_postgres_database_bytes, postgres_url, timeout_s=30.0)
+
+    assert measured is not None
+    assert measured > 0
