@@ -1,12 +1,38 @@
 # Eyvan (ایوان)
 
-Eyvan is a durable, standalone global control plane for CPU and accelerator
-workloads across GCP Compute Engine and Cloud TPU fleets. Its name comes from
-the Persian eyvan: a vaulted gateway into the infrastructure it manages. Eyvan
-combines global admission, priority, hierarchical fair share, budgets,
-whole-gang placement, checkpoint-aware preemption, capacity leases, native GCP
-CPU/GPU/TPU lifecycle management, and native local execution for single-host
-development.
+Eyvan is a durable, standalone global control plane for CPU, GPU, and TPU
+workloads. Its name comes from the Persian eyvan: a vaulted gateway into the
+infrastructure it manages. Eyvan combines global admission, priority,
+hierarchical fair share, budgets, whole-gang placement, checkpoint-aware
+preemption, capacity leases, accelerator lifecycle management, and native local
+execution for single-host development.
+
+## Where it runs
+
+Eyvan is not tied to one cloud. One workload path runs over every substrate --
+a native worker in a Kubernetes pod and a native worker on a TPU VM speak the
+same protocol -- so the substrate is a capacity concern that execution never
+sees.
+
+| backend | what it provisions | qualification |
+|---|---|---|
+| `gcp-tpu` | Cloud TPU queued resources, including Multislice | live v5p-16, P1 exit 0 |
+| `gcp-compute` | Compute Engine CPU and GPU instances | live, P6 exit 0 |
+| `kubernetes` / `k8s` | one cell per Indexed Job on **any** conformant cluster; Kueue admits capacity, Eyvan admits workloads | live GKE, P7 exit 0 |
+| `onprem-ssh` | hosts you already own, claimed over SSH with a fenced incarnation marker | host-tested; no run against a real SSH host |
+| `manual` | capacity an operator registers by hand | host-tested |
+| `local` | single-host development; `eyvan up` needs no cloud account | host-tested |
+
+Anything else is an out-of-tree plugin: `eyvan.capacity_providers` is a
+published entry-point ABI with a version contract and a conformance suite an
+external provider imports and must pass. See
+[docs/providers.md](docs/providers.md).
+
+GCP has the most depth because it is where the hardware evidence was gathered,
+not because the design assumes it. The parts that are hard to get right --
+fencing, leak detection, inconclusive-versus-failed reporting -- are
+backend-neutral, and the Kubernetes driver is deliberately a near-clone of the
+manual one to keep proving that.
 
 ## Documentation
 
@@ -32,8 +58,8 @@ start:
 ## Authority boundary
 
 - Eyvan owns workload admission, capacity envelopes, leases, policy,
-  placement, preemption, durable desired state, GCP Compute instances and TPU
-  queued resources, and cell execution.
+  placement, preemption, durable desired state, provider capacity of every
+  registered backend, and cell execution.
 - Cell agents reconcile provider capacity and execution through Eyvan-owned
   backend contracts. The generic `gcp` capacity backend routes each cell to
   Compute Engine or Cloud TPU; capacity and execution backends are selected
