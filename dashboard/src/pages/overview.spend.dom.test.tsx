@@ -8,14 +8,14 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { OverviewSnapshot } from "../types";
+import type { OverviewData } from "../types";
 import { OverviewPage } from "./OverviewPage";
 
 // A fleet spent $3.68 over seventy-eight hours while this card read "$0".
 // It was not wrong about its own definition -- the headline sums budget.spent,
 // and no budget existed -- but an operator reads it as what the fleet cost, and
 // it under-reports silently and only ever in that direction.
-const snapshot = (overrides: Partial<OverviewSnapshot> = {}): OverviewSnapshot =>
+const snapshot = (overrides: Partial<OverviewData> = {}): OverviewData =>
   ({
     queued: 0,
     running: 0,
@@ -28,7 +28,7 @@ const snapshot = (overrides: Partial<OverviewSnapshot> = {}): OverviewSnapshot =
     fleetBreakdown: [],
     alerts: [],
     ...overrides,
-  }) as OverviewSnapshot;
+  }) as OverviewData;
 
 afterEach(cleanup);
 
