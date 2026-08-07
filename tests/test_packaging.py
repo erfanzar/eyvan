@@ -628,3 +628,26 @@ def test_the_worker_image_stages_the_multi_host_initialization_hook() -> None:
     assert f"{GANG_PATH}/eyvan_distributed_environment.py" in worker
     assert f"{GANG_PATH}/sitecustomize.py" in worker
     assert "initialize_worker_runtime()" in worker
+
+
+def test_every_image_pins_an_interpreter_inside_the_supported_range() -> None:
+    """`uv venv` alone takes the newest interpreter uv knows about.
+
+    That became 3.14 -- outside this package's own ``>=3.10,<3.14`` -- and the
+    hashed exports carry wheels for supported versions only, so the first real
+    image build fell through to compiling httptools from source in a base image
+    with no compiler. Local wheel and sdist smoke never saw it: they run in the
+    workspace's own interpreter.
+    """
+
+    import re
+
+    from packaging.specifiers import SpecifierSet
+
+    supported = SpecifierSet(_pyproject()["project"]["requires-python"])
+    for name in ("Dockerfile", "Dockerfile.agent", "Dockerfile.worker"):
+        content = (EYVAN_ROOT / name).read_text()
+        pinned = re.findall(r"uv venv --python (\S+)", content)
+        assert pinned, f"{name} does not pin an interpreter for uv venv"
+        for version in pinned:
+            assert f"{version}.0" in supported, f"{name} pins {version}, outside {supported}"
