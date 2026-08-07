@@ -490,8 +490,7 @@ def fleet_status(
         if len(running) > 1:
             listing = "\n".join(f"  {name}" for name in running)
             raise click.ClickException(
-                f"{len(running)} fleets are running; name the one you mean:\n{listing}\n"
-                f"  eyvan status {running[0]}"
+                f"{len(running)} fleets are running; name the one you mean:\n{listing}\n  eyvan status {running[0]}"
             )
         fleet_or_config = running[0]
         if not as_json and fleet_status_rendering.is_interactive_output():
