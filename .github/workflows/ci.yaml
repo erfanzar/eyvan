@@ -1,0 +1,115 @@
+name: CI
+
+# The standalone Eyvan repository has no uv.lock -- it is a subtree of a uv
+# workspace whose lock lives at the monorepo root. Every install here therefore
+# comes from the hash-pinned exports that ship with the package, which is
+# stricter than a lock anyway: --require-hashes refuses a substituted artifact.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python:
+    name: Python suite
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+
+      - name: Install from the hashed exports
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-dev.txt
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          uv pip install --python .venv/bin/python --no-build-isolation --no-deps .
+
+      - name: Suite, against the production backend
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+          NO_COLOR: "1"
+          PYTHONHASHSEED: "0"
+          TZ: UTC
+          LC_ALL: C
+        run: .venv/bin/python -m pytest -q -rs tests
+
+      - name: Ruff
+        run: |
+          uv tool run --from ruff==0.15.16 ruff check eyvan tests
+          uv tool run --from ruff==0.15.16 ruff format --check eyvan tests
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm --prefix dashboard ci
+      - run: npm --prefix dashboard test
+      - run: npm --prefix dashboard run build
+      - run: npm --prefix dashboard audit --audit-level=low
+
+  package:
+    name: Package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+
+      - name: Build with the locked backend, never a resolved one
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
+            uv build --no-build-isolation --wheel --sdist --out-dir dist .
+
+      - name: Every entry point answers from an installed wheel
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .smoke
+          uv pip install --python .smoke/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .smoke/bin/python --no-deps dist/*.whl
+          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+            .smoke/bin/"$entry" --help >/dev/null
+          done
+          .smoke/bin/python -c "import eyvan; print(eyvan.__version__)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: distributions
+          path: dist/

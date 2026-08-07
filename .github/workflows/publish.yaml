@@ -1,0 +1,70 @@
+name: Publish
+
+# Tag-driven, and trusted-publishing only: no PyPI token exists in this
+# repository, so a compromised workflow has nothing to steal. The tag must name
+# the version the source declares, and the wheel is built with the locked
+# backend rather than whatever PEP 517 would resolve.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish; must equal the version in pyproject.toml
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+
+      - name: The tag and the source must agree
+        run: |
+          set -euo pipefail
+          SOURCE="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CLAIMED="${GITHUB_REF_NAME#v}"
+          else
+            CLAIMED="${{ github.event.inputs.version }}"
+          fi
+          test "$SOURCE" = "$CLAIMED" || {
+            echo "tag claims $CLAIMED but pyproject declares $SOURCE" >&2; exit 1; }
+
+      - name: Build with the locked backend
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
+            uv build --no-build-isolation --wheel --sdist --out-dir dist .
+          test "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)" -eq 2
+
+      - name: Install the built wheel and exercise every entry point
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .smoke
+          uv pip install --python .smoke/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .smoke/bin/python --no-deps dist/*.whl
+          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+            .smoke/bin/"$entry" --help >/dev/null
+          done
+
+      - name: Publish
+        run: uv publish --trusted-publishing always dist/*
