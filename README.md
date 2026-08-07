@@ -267,6 +267,20 @@ cells it asked for, not the cluster's true free capacity, so a pool can sit
 WAITING while the cluster is full of non-Eyvan work. It observes that capacity
 and explains it; it does not plan around it.
 
+### One fleet-state URI per agent
+
+`EYVAN_FLEET_STATE_URI` is a per-agent namespace, not a fleet-wide one. Two
+agents sharing one share a `FleetCellRecord` namespace, which makes `exclusive()`
+a cross-backend lock and lets one backend's agent resurrect another's cell
+record. Give each agent its own URI. An agent cannot see its peers, so this
+cannot be enforced in code — it is a deployment requirement.
+
+Relatedly, one agent endpoint serves exactly one capacity backend *family*.
+`gcp`, `gcp-tpu`, and `gcp-compute` share a driver and may share an endpoint;
+`kubernetes` and `k8s` likewise. Mixing families on one endpoint is rejected
+when the fleet config is parsed, because it would otherwise validate cleanly and
+then fail forever in the outbox with an opaque `ValueError`.
+
 ---
 
 ## What is guaranteed, and what is not
