@@ -212,11 +212,31 @@ blocking receipt before the first request and after every attempt.
 The evaluator also requires bounded RSS peak growth, FD peak growth, database
 peak growth and artifact net growth; reconciled spend; and final cleanup with an
 empty provider inventory. These values must arrive as proof-bound
-`eyvan.soak.external-evidence.v1` samples. The current control-plane invariant
-endpoint deliberately returns `p8_evidence: null`: it cannot truthfully infer
-process/DB size or provider inventory from durable cell rows. Therefore a run
-against the current endpoint exits **2 / inconclusive** with explicit
-`*_evidence_missing` codes. It must not be called a P8 result.
+`eyvan.soak.external-evidence.v1` samples, and the control plane never invents
+them: it cannot truthfully infer its own process size or provider inventory from
+durable cell rows. With no external monitor running the invariant endpoint
+returns `p8_evidence: null` and the run exits **2 / inconclusive** with explicit
+`*_evidence_missing` codes.
+
+Run the producer beside the control plane for the whole soak:
+
+```
+eyvan soak-monitor \
+  --proof-id sha256:<64-lowercase-hex> \
+  --control-plane-pid-file <supervisor-pid-file> \
+  --database-url <postgresql-url> \
+  --provider-inventory-command <script printing the provider's live cell count> \
+  --interval-s 30
+```
+
+It measures RSS and open descriptors of the control-plane *process* from
+outside it, database bytes from PostgreSQL (or `--state-path` for a local
+plane), spend reconciliation from the ledger, live cell count from the
+provider, and cleanup from the fleet's own cells. A field it cannot establish
+suppresses the whole sample rather than becoming a zero, and a sample older
+than `EYVAN_SOAK_EVIDENCE_MAX_AGE_S` reads as absent, so a dead monitor makes a
+run inconclusive rather than passing on its last reading. Post and poll the same
+replica: the sample is held in the process that received it.
 
 Verdicts are:
 

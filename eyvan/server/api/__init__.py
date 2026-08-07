@@ -21,6 +21,7 @@ if tp.TYPE_CHECKING:
     from eyvan.server.api.server_bind import ServerBindPolicy
     from eyvan.server.persistence.base import Repository
     from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.soak_evidence import SoakEvidenceStore
 
 
 def create_app(
@@ -35,6 +36,7 @@ def create_app(
     server_bind: ServerBindPolicy | None = None,
     automatic_loopback_auth: bool = False,
     platform_config: EyvanPlatformConfig | None = None,
+    soak_evidence: SoakEvidenceStore | None = None,
 ) -> FastAPI:
     """Import and build the control-plane application on demand.
 
@@ -55,6 +57,7 @@ def create_app(
         server_bind=server_bind,
         automatic_loopback_auth=automatic_loopback_auth,
         platform_config=platform_config,
+        soak_evidence=soak_evidence,
     )
 
 
