@@ -67,6 +67,7 @@ from eyvan.records import (
     CarbonReport,
     CellBillingReport,
     CellRecord,
+    CoordinationKind,
     LaunchLatencyReport,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -79,6 +80,7 @@ from eyvan.records import (
     QuotaRecord,
     Role,
     RoleGrantRecord,
+    ServiceDecisionRecord,
     UserProgressReport,
     WarmthReport,
     WorkloadEstimate,
@@ -126,6 +128,7 @@ from eyvan.server.api.schemas import (
     QuotaPutRequest,
     RoleGrantIssueRequest,
     ServiceEndpointRequest,
+    ServiceHealthResponse,
     SessionResponse,
     WorkloadEstimateRequest,
     WorkloadExecRequest,
@@ -167,6 +170,7 @@ from eyvan.server.service.expansion import ExpansionLimits
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 from eyvan.server.service.groups import GroupRole
 from eyvan.server.service.scheduling import CoreSchedulingService
+from eyvan.server.service.services import ServicePolicy, service_policy
 from eyvan.server.service.workload_progress import WorkloadProgressResolver
 from eyvan.soak_contract import (
     MAX_BUDGET_SCOPES,
@@ -2090,6 +2094,69 @@ def create_app(
         """List the replicas of a service that are currently able to serve."""
 
         return await service.service_endpoints(principal, workload_id)
+
+    async def managed_service(principal: Principal, workload_id: str) -> tuple[WorkloadRecord, ServicePolicy]:
+        """Resolve one workload as a managed service, or refuse it as absent.
+
+        Reads through the ordinary authorized workload lookup, so a caller with
+        no READ on the owning project is refused before the record's shape is
+        disclosed. An ordinary workload is a 404 rather than an empty document:
+        "this job has no replicas" and "this job is not the kind of thing that
+        has replicas" are different answers, and returning the empty one for
+        both is how a mistyped id reads as a healthy service with nothing in it.
+        """
+
+        record = await service.get_workload(principal, workload_id)
+        policy = (
+            None if record.coordination_kind is not CoordinationKind.SERVICE else service_policy(record.spec.metadata)
+        )
+        if policy is None:
+            raise NotFoundError(f"workload {workload_id!r} is not a managed service")
+        return record, policy
+
+    @app.get(
+        "/api/v1/workloads/{workload_id}/service-health",
+        response_model=ServiceHealthResponse,
+        tags=["workloads"],
+    )
+    async def get_service_health(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> ServiceHealthResponse:
+        """Report each replica's durable health, with UNKNOWN kept distinct.
+
+        Read-only, and it never converts an absence into a verdict: a service
+        that declares no health path comes back ``probing_enabled=false`` with
+        every replica ``unknown`` and ``probed=false``, which says nothing was
+        asked -- not that anything failed.
+        """
+
+        record, policy = await managed_service(principal, workload_id)
+        return ServiceHealthResponse.build(
+            service=record,
+            policy=policy,
+            replicas=await service.service_health(principal, workload_id),
+        )
+
+    @app.get(
+        "/api/v1/workloads/{workload_id}/service-decisions",
+        response_model=list[ServiceDecisionRecord],
+        tags=["workloads"],
+    )
+    async def list_service_decisions(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        limit: tp.Annotated[int, Query(ge=1, le=500)] = 50,
+    ) -> list[ServiceDecisionRecord]:
+        """List what was observed, what was decided, and why -- newest first.
+
+        The decision carries the observation it was taken from rather than a
+        pointer to state that has since moved on, so an operator reading it
+        tomorrow reconstructs the call instead of guessing at it.
+        """
+
+        await managed_service(principal, workload_id)
+        return await service.service_decisions(principal, workload_id, limit=limit)
 
     @app.post(
         "/api/v1/workloads/{workload_id}/children",

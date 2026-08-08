@@ -268,6 +268,29 @@ eyvan workload exec <id> -- py-spy dump --pid ...   # a diagnostic beside it
 process sharing the unit's memory allocation could take the trainer down with
 it.
 
+## Reading a managed service
+
+```
+eyvan workload endpoints <id>          # the replicas currently able to serve
+eyvan service health <id>              # per-replica health, three-valued
+eyvan service decisions <id>           # what was observed, decided, and why
+eyvan service decisions <id> --limit 5 # the newest few
+```
+
+`service health` reports `healthy`, `unhealthy` and `unknown` as three separate
+counts that add up to the number of replicas listed. **`unknown` is not a soft
+`unhealthy`.** It means this control plane could not establish the replica's
+state -- a timeout, a refused connection, or a service that declares no health
+path and is therefore never probed at all. A replica that has never been asked
+anything reports `"probed": false`, and `probing_enabled` is `false` for the
+whole service. Nothing in that picture is a reason to destroy an accelerator; a
+`503` from a replica that answered is.
+
+`service decisions` returns the newest committed scale and replacement
+decisions, each carrying the observation it was taken from rather than a pointer
+to state that has since moved on. That is what makes "why did it scale in at
+04:12" answerable the next morning.
+
 ## Break glass
 
 ```
