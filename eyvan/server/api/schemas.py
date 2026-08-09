@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import collections
 import typing as tp
 from datetime import datetime
 from typing import Annotated
@@ -34,6 +35,8 @@ from eyvan.records import (
     Role,
     RoleGrant,
     RoleGrantRecord,
+    ServiceProbeOutcome,
+    ServiceReplicaHealthState,
     WarmWindow,
     WorkloadDefinition,
     WorkloadRecord,
@@ -43,6 +46,7 @@ from eyvan.records import (
 from eyvan.server.api.server_startup import ServerControllerMode
 from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 from eyvan.server.service.errors import ServiceErrorCode
+from eyvan.server.service.services import ServicePolicy
 
 
 class ApiModel(BaseModel):
@@ -429,6 +433,106 @@ class ServiceEndpointRequest(ApiModel):
     """Where a replica says it can be reached."""
 
     endpoint: str = Field(min_length=1, max_length=512)
+
+
+class ServiceReplicaHealth(ApiModel):
+    """What is durably known about one replica, with UNKNOWN as its own answer.
+
+    ``health`` has three values and the two counters are carried side by side,
+    so an operator can tell "this replica answered that it is not serving" from
+    "nobody could reach this replica". Collapsing those into a boolean is the
+    defect the durable record exists to prevent, and a transport model that
+    re-collapses them would undo it at the last hop.
+    """
+
+    workload_id: str
+    generation: int = Field(ge=1)
+    revision: str
+    #: Where the replica registered itself, or ``None`` before it has.
+    endpoint: str | None = None
+    health: ServiceReplicaHealthState
+    #: Whether any probe has ever completed against this replica. ``False`` is
+    #: *not probed*: nothing was asked and nothing was learned, which is neither
+    #: a failure nor a success, and is why the counters below read zero.
+    probed: bool
+    last_outcome: ServiceProbeOutcome | None = None
+    last_detail: str | None = None
+    consecutive_failures: int = Field(default=0, ge=0)
+    consecutive_unknowns: int = Field(default=0, ge=0)
+    last_success_at: datetime | None = None
+    observed_at: datetime | None = None
+    #: The load the replica reported about itself. ``None`` means it reported
+    #: none, and is never rendered as ``0.0`` -- that would be a number nothing
+    #: observed, handed to a reader who cannot tell it from a measurement.
+    observed_load: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class ServiceHealthResponse(ApiModel):
+    """One managed service's replica health, as an operator can read it.
+
+    The three counts are separate fields that must account for every replica
+    exactly once. A summary that reported only ``healthy`` would make an
+    unreachable fleet indistinguishable from a dead one at exactly the moment
+    the difference decides whether accelerators get destroyed.
+    """
+
+    service_id: str
+    revision: str
+    #: The declared replica count, which is what the service is *supposed* to
+    #: have. It is not the length of ``replicas``, and a difference between them
+    #: is the reconciler mid-flight rather than an error.
+    declared_replicas: int = Field(ge=0)
+    #: The path probes are sent to. Empty means this service declares none.
+    health_path: str = ""
+    #: ``False`` when the service declares no health path. Every replica then
+    #: reads ``unknown`` and ``probed=False``, which is *not probed* rather than
+    #: unhealthy: this service has never been asked anything.
+    probing_enabled: bool = False
+    healthy: int = Field(ge=0)
+    unhealthy: int = Field(ge=0)
+    #: Replicas whose health is not established. Its own count, never folded
+    #: into ``unhealthy`` and never silently dropped.
+    unknown: int = Field(ge=0)
+    replicas: list[ServiceReplicaHealth] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ServiceHealthResponse:
+        if self.healthy + self.unhealthy + self.unknown != len(self.replicas):
+            raise ValueError("every reported service replica must be counted in exactly one health bucket")
+        return self
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        service: WorkloadRecord,
+        policy: ServicePolicy,
+        replicas: tp.Sequence[tp.Mapping[str, object]],
+    ) -> ServiceHealthResponse:
+        """Assemble the operator-facing answer from durable rows and policy.
+
+        Every reported entry is validated against :class:`ServiceReplicaHealth`,
+        which forbids unknown keys. That makes the coupling loud: a field added
+        to the durable read and not to the wire fails here rather than becoming
+        one more fact only SQL can see.
+        """
+
+        views = [
+            ServiceReplicaHealth.model_validate({**replica, "probed": replica.get("last_outcome") is not None})
+            for replica in replicas
+        ]
+        counted = collections.Counter(view.health for view in views)
+        return cls(
+            service_id=service.id,
+            revision=policy.revision,
+            declared_replicas=policy.replicas,
+            health_path=policy.health_path,
+            probing_enabled=bool(policy.health_path),
+            healthy=counted[ServiceReplicaHealthState.HEALTHY],
+            unhealthy=counted[ServiceReplicaHealthState.UNHEALTHY],
+            unknown=counted[ServiceReplicaHealthState.UNKNOWN],
+            replicas=views,
+        )
 
 
 class ChildWorkloadSubmitRequest(ApiModel):
