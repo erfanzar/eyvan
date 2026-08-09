@@ -21,6 +21,7 @@ import yaml
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.autoscale.compiler import render_autoscale_yaml
 from eyvan.capacity.autoscale.models import (
     DEFAULT_AUTOSCALE_CACHE_ROOT,
@@ -64,7 +65,7 @@ class AutoscaleDefaultsRepository:
     def save(self, defaults: AutoscaleDefaults) -> Path:
         """Atomically write one owner-only defaults document."""
 
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         _atomic_write(self.path, yaml.safe_dump(defaults.as_document(), sort_keys=False), mode=0o600)
         return self.path
 
@@ -81,7 +82,7 @@ class GeneratedAutoscaleCache:
     def store(self, generated: GeneratedAutoscale) -> CachedAutoscaleConfig:
         """Atomically persist one generated config and its non-secret metadata."""
 
-        self.configs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.configs_dir)
         try:
             os.chmod(self.root, 0o700)
             os.chmod(self.configs_dir, 0o700)
@@ -282,7 +283,7 @@ class QueueAdmissionDenialCache:
     def _ensure_root(self) -> None:
         """Create the owner-only cache directory before taking its file lock."""
 
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.root)
         try:
             os.chmod(self.root, 0o700)
         except OSError:

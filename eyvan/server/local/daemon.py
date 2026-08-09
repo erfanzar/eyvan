@@ -29,6 +29,7 @@ import httpx
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.workspace import create_private_directory
 from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
 from eyvan.server.local.profile import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
 
@@ -342,7 +343,7 @@ class VerifiedProcessStopOutcome(StrEnum):
 def prepare_owner_only_directory(directory: Path) -> None:
     """Create an owner-only local state directory without following a file path."""
 
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    create_private_directory(directory)
     try:
         os.chmod(directory, 0o700)
     except OSError:

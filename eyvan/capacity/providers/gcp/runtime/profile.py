@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.workspace import create_private_directory
 
 DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH = Path("~/.eyvan/gcp-native-runtime.json")
 GCP_NATIVE_RUNTIME_PROFILE_SCHEMA = "eyvan.gcp-native-runtime-profile"
@@ -272,7 +273,7 @@ class GcpNativeRuntimeProfileStore:
 
         parent = self.path.parent
         try:
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            create_private_directory(parent)
             descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as exc:
             raise GcpNativeRuntimeProfileError(

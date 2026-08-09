@@ -12,6 +12,7 @@ import secrets
 import stat
 from pathlib import Path
 
+from eyvan._internal.workspace import create_private_directory
 from eyvan.config import DEFAULT_LOCAL_ARTIFACT_TOKEN_KEY_PATH, DEFAULT_LOCAL_CONTROL_PLANE_PATH
 
 
@@ -28,7 +29,7 @@ class LocalArtifactTokenKeyStore:
     def load_or_create(self) -> bytes:
         """Return one owner-only 32-byte key, creating it exactly once when absent."""
 
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:

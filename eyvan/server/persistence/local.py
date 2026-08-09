@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.json_types import is_json_object
+from eyvan._internal.workspace import create_private_directory
 from eyvan.records import (
     ArtifactReferenceRecord,
     AuditEvent,
@@ -839,7 +840,7 @@ class LocalControlPlaneStore:
         )
 
     def _ensure_parent(self) -> None:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:
@@ -971,7 +972,7 @@ class LocalControlPlaneLease:
 
         if self._handle is not None:
             return
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:

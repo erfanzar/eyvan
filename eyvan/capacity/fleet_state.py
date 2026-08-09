@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import DriverBusyError
 
@@ -229,7 +230,7 @@ class LocalBackend:
         return _validate_document(value), None
 
     def _write(self, document: JsonObject) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         with tempfile.NamedTemporaryFile(
             "w",
             dir=self.path.parent,
@@ -246,7 +247,7 @@ class LocalBackend:
     def update(self, mutate: tp.Callable[[JsonObject], None]) -> JsonObject:
         import fcntl
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        create_private_directory(self.path.parent)
         with self._lock_path.open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             document, _ = self.read()

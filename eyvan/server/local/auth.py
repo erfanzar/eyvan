@@ -14,6 +14,8 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from eyvan._internal.workspace import create_private_directory
+
 DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH = Path("~/.eyvan/local-development-credential")
 LOCAL_DEVELOPMENT_CREDENTIAL_HEADER = "X-Eyvan-Local-Credential"
 _CREDENTIAL_BYTES = 32
@@ -111,7 +113,7 @@ class LocalDevelopmentCredentialStore:
 
         parent = self.path.parent
         try:
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            create_private_directory(parent)
             descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as exc:
             raise LocalDevelopmentCredentialError(

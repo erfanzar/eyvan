@@ -19,6 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from eyvan._internal.json_types import JsonValue, is_json_value
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.fleet_config import validate_fleet_name
 
 CONTEXT_CONFIG_VERSION = 1
@@ -178,7 +179,7 @@ class FileContextStore:
         """Atomically write ``config`` with owner-only permissions."""
 
         target = self.resolved_path
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_private_directory(target.parent)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         temporary = Path(temporary_name)
         try:

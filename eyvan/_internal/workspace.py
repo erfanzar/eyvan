@@ -395,5 +395,40 @@ __all__ = (
     "WorkspaceArchive",
     "WorkspaceError",
     "build_workspace",
+    "create_private_directory",
     "extract_workspace",
 )
+
+
+def create_private_directory(path: Path, *, mode: int = 0o700) -> Path:
+    """Create ``path`` and every missing parent at ``mode``, not just the leaf.
+
+    ``Path.mkdir(mode=..., parents=True)`` applies the mode to the final
+    directory only; every parent it creates gets ``0o777 & ~umask``. Creating
+    ``~/.eyvan/autoscale`` therefore left ``~/.eyvan`` at 0755 under the ordinary
+    umask, and the credential store -- correctly -- then refused to use a profile
+    directory the group could read. A first run could lock itself out by running
+    an autoscale command before a credentialed one.
+
+    Existing directories are left exactly as they are. Widening or narrowing a
+    directory this process did not create is not this function's business, and
+    ``$HOME`` is one of the parents it walks.
+
+    Args:
+        path: Directory to create.
+        mode: Permission bits for directories this call creates.
+
+    Returns:
+        Path: ``path``.
+    """
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=mode, exist_ok=True)
+    return path
