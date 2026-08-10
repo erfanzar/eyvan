@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eyvan"
-version = "0.1.0"
+version = "0.0.1"
 description = "A policy-aware global fleet control plane with native GCP CPU, GPU, and TPU capacity"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"

@@ -2,8 +2,8 @@ apiVersion: v2
 name: eyvan
 description: The Eyvan fleet control plane, its cell agent, and the schema migration that must precede both.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.0.1
+appVersion: "0.0.1"
 home: https://github.com/erfanzar/eyvan
 sources:
   - https://github.com/erfanzar/eyvan
