@@ -3,15 +3,41 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Versioned pricing samples used for admission and budget reservation."""
+"""Versioned pricing samples used for admission and budget reservation.
+
+There is deliberately **no fleet-wide fallback price constructor here.** One used
+to exist -- ``configured_price``, which built a ``PriceSample`` scoped to nothing
+but provider/accelerator/class -- and nothing ever called it. It is removed
+rather than wired, for two reasons that are both about what a price *means*.
+
+First, this catalog is not on the costing path and cannot be put on it by
+declaring a fallback. A quote here is one hourly rate for one accelerator
+dimension; ``CellRecord.hourly_cost`` sums a *vector* -- cpu, memory, gpu, tpu,
+and any custom dimension -- against ``unit_prices``. Turning a single quote into
+that vector means supplying the dimensions the quote does not mention, and the
+only available value for them is zero, which understates the bill silently. That
+is the same partial-pricing mistake ``NodeTypeBase._warn_about_unpriced_resources``
+already warns about, and it would be introduced by the thing meant to fix it.
+
+Second, a fallback is not an observation. An operator who declares a price
+declares it on the pool, where the accelerator type, region and zone that make it
+true are also declared; that mechanism exists, is durable, and is what
+``catalog_from_pools`` reads. A number attached to nothing narrower than a
+provider is a guess wearing a price's clothes, and this package refuses to write
+"I could not find out" down as a fact.
+
+So a cell whose pool declares no ``unit_prices`` stays unpriced. It contributes
+zero, and it is *reported* as unpriced by ``CellBillingReport.unpriced_cells``,
+by ``eyvan doctor``, and by the spend-reconciled proof verdict, which requires
+zero unpriced cells before it will call a ledger reconciled. That is the correct
+behaviour and the only honest one available without a price source.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-
-from eyvan._internal.compat import UTC
 
 
 def _money(value: Decimal | int | float | str) -> Decimal:
@@ -124,19 +150,9 @@ class PricingCatalog:
         )
 
 
-def configured_price(
-    provider: str,
-    accelerator_type: str,
-    capacity_class: str,
-    hourly_unit_usd: Decimal | int | float | str,
-    *,
-    source: str = "configured",
-) -> PriceSample:
-    """Construct a global fallback price sample."""
-
-    return PriceSample(
-        key=PriceKey(provider, accelerator_type, capacity_class),
-        hourly_unit_usd=_money(hourly_unit_usd),
-        source=source,
-        observed_at=datetime.now(UTC),
-    )
+__all__ = (
+    "CostProjection",
+    "PriceKey",
+    "PriceSample",
+    "PricingCatalog",
+)

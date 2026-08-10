@@ -158,11 +158,33 @@ def without_gpu_topology_overrides(environment: tp.Mapping[str, str]) -> dict[st
     return {name: value for name, value in environment.items() if not is_gpu_topology_environment_name(name)}
 
 
+#: Rendezvous port for the JAX coordinator every native gang forms. Held here,
+#: beside the GPU port, because the two are one operator-visible fact: these are
+#: the ports a deployment's firewall must open *between gang hosts*, and
+#: ``worker/runtime/registry.py`` records what happens when they are not -- every
+#: rank died in ``RegisterTask`` with DEADLINE_EXCEEDED against an address no
+#: rule permitted. Neither number is derived from a workload, so a firewall
+#: written once keeps working; that is the property, and it is why the collision
+#: below is refused rather than dodged by moving a port.
+DEFAULT_NATIVE_COORDINATOR_PORT = 12345
+
 #: Rendezvous port for GPU collectives. Deliberately not the JAX coordinator
 #: port: a workload is free to initialize JAX *and* a torch process group, and
 #: two services asking for one port is a failure that would look like a network
 #: fault. Eyvan owns both numbers, so it can simply not collide with itself.
 DEFAULT_GPU_RENDEZVOUS_PORT = 12346
+
+#: Every port a native gang's rendezvous occupies on its coordinator's host, in
+#: the order an operator opens them.
+#:
+#: Both are constants, so two gangs whose coordinators land on one machine are
+#: handed the *same* endpoint and a rank of one can join the other's coordinator.
+#: Nothing in this module can see a second gang, so nothing here can detect that;
+#: what this tuple exists for is to let the one component that can -- gang
+#: dispatch, in ``server/controller/workload_commands.py`` -- name the exact
+#: sockets it is refusing to hand out twice, from this definition rather than
+#: from a second copy of the numbers.
+NATIVE_RENDEZVOUS_PORTS: tuple[int, ...] = (DEFAULT_NATIVE_COORDINATOR_PORT, DEFAULT_GPU_RENDEZVOUS_PORT)
 
 
 class GpuRankLayout(StrEnum):
@@ -543,8 +565,10 @@ def remove_gce_tpu_topology_overrides(environment: tp.MutableMapping[str, str]) 
 __all__ = (
     "DEFAULT_GPU_RANK_LAYOUT",
     "DEFAULT_GPU_RENDEZVOUS_PORT",
+    "DEFAULT_NATIVE_COORDINATOR_PORT",
     "DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES",
     "GPU_TOPOLOGY_ENVIRONMENT_NAMES",
+    "NATIVE_RENDEZVOUS_PORTS",
     "RUNTIME_OWNED_ENVIRONMENT_NAMES",
     "GpuDeviceAssignment",
     "GpuDevicePlan",

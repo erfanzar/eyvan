@@ -49,6 +49,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.worker.distributed_environment import (
     DEFAULT_GPU_RANK_LAYOUT,
+    DEFAULT_NATIVE_COORDINATOR_PORT,
     GpuDevicePlan,
     GpuRankLayout,
     plan_gpu_devices,
@@ -75,7 +76,11 @@ from eyvan.worker.runtime.log_records import (
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
-_COORDINATOR_PORT = 12345
+#: The one definition now lives beside the GPU rendezvous port, because the two
+#: numbers are one operator-visible fact -- the ports a firewall must open
+#: between gang hosts -- and because gang dispatch has to name both when it
+#: refuses to hand one endpoint to two gangs. Same value, same wire bytes.
+_COORDINATOR_PORT = DEFAULT_NATIVE_COORDINATOR_PORT
 _RETIRE_SUMMARY_LIMIT = 4
 _FAILED_STATUSES = frozenset({ExecutionWorkloadStatus.FAILED})
 _LOST_STATUSES = frozenset({ExecutionWorkloadStatus.LOST, ExecutionWorkloadStatus.NOT_FOUND})

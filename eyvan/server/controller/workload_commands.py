@@ -39,6 +39,7 @@ from eyvan.records import (
 from eyvan.server.controller._support import (
     StaleOutboxCommand,
 )
+from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 from eyvan.worker.agent.models import (
     CheckpointRequest,
     GangWorkloadMember,
@@ -48,6 +49,7 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
     WorkloadRequest,
 )
+from eyvan.worker.distributed_environment import NATIVE_RENDEZVOUS_PORTS
 
 if tp.TYPE_CHECKING:
     from eyvan.server.persistence import RepositorySession
@@ -75,15 +77,52 @@ _DISPATCH_RESERVATION_KEY = "dispatch_reservation"
 _RETRIABLE_DISPATCH_OUTBOX_STATES = frozenset({OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED})
 
 
-class AttemptRankSpaceTooLarge(RuntimeError):
+class PermanentDispatchRefusal(RuntimeError):
+    """A dispatch that cannot be made to succeed by trying it again.
+
+    The outbox retries a failed command forever with a capped backoff and has no
+    dead letter, so a refusal raised as a bare error would hold the lease and keep
+    its cell undeletable indefinitely -- the same stuck-lease shape that already
+    blocks ``eyvan down``. Every subclass is instead settled by
+    :meth:`_ControllerWorkloadCommands._settle_unlaunchable_attempt`, which fails
+    the workload with the reason attached and gives the capacity back.
+
+    Subclassing rather than one class per site because the *handling* is the
+    shared decision -- "do not retry this, say why" -- while the reasons are
+    unrelated and an operator has to be able to tell them apart in
+    ``failure_reason``.
+    """
+
+
+class AttemptRankSpaceTooLarge(PermanentDispatchRefusal):
     """The composed rank space of an attempt is above the ceiling.
 
     Permanent by construction: the width comes from the leased cells, so retrying
-    the same dispatch produces the same refusal. The outbox retries a failed
-    command forever with a capped backoff, so raising a bare error here would hold
-    the lease and keep the cell undeletable indefinitely -- the same stuck-lease
-    shape that already blocks ``eyvan down``. Dispatch settles the workload as
-    failed instead of retrying it.
+    the same dispatch produces the same refusal.
+    """
+
+
+class GangRendezvousCollision(PermanentDispatchRefusal):
+    """Two native gangs would be told to meet at one rendezvous endpoint.
+
+    A gang's ranks meet at ``<coordinator host>:<port>``, and both ports are
+    fixed constants (:data:`~eyvan.worker.distributed_environment.NATIVE_RENDEZVOUS_PORTS`)
+    because a firewall has to be able to open them once. Two gangs whose
+    coordinators land on one machine are therefore handed the *same* socket, and
+    a rank of one gang can register with the other gang's coordinator -- two jobs
+    silently exchanging tensors, which fails as a wrong answer rather than as an
+    error.
+
+    Refused here rather than dodged by moving a port. ``worker/runtime/registry.py``
+    records what a port no firewall permits costs: every rank of every ``pods=1``
+    run died in ``RegisterTask`` with DEADLINE_EXCEEDED on 2026-08-02. A port
+    that moves per workload has that failure mode in every deployment whose rules
+    name these two numbers.
+
+    Permanent in the sense that matters: the placement that produced it is one
+    the scheduler is configured never to make (see ``exclusive_workloads``), so a
+    retry re-runs the same placement and refuses again. Failing the workload with
+    the reason names the configuration to change instead of looping on it.
     """
 
 
@@ -158,6 +197,102 @@ class _ControllerWorkloadCommands:
         if len(endpoints) != cell.runtime_process_count or len(set(endpoints)) != len(endpoints):
             return ()
         return endpoints
+
+    @classmethod
+    def _rendezvous_site(cls, cell: CellRecord) -> tuple[str, str]:
+        """Return what identifies the machine one gang's rendezvous would bind on.
+
+        A gang's coordinator is the lexicographically first of its leased cells,
+        and the agent forms the rendezvous address from that cell's first native
+        worker endpoint. So two gangs collide exactly when these two values are
+        equal, and the value has two spellings because the control plane knows
+        the host for some providers and only the cell for others:
+
+        * ``("host", h)`` when the provider *names* the cell's per-host worker
+          endpoints. Two different cells on one machine collide, and only this
+          spelling can see that.
+        * ``("cell", id)`` otherwise. Deliberately not a guessed host: an
+          unnamed endpoint is unknown, and an unknown host that was read as
+          "some host of its own" would answer "no collision" without evidence.
+
+        The consequence of the fallback is stated rather than hidden: for a
+        provider that does not publish its hosts, two gangs on two *different*
+        cells of one machine are not detected here. What is detected in every
+        case is two gangs on one cell, which is the state ``exclusive_workloads``
+        exists to prevent.
+        """
+
+        endpoints = cls._cell_worker_endpoints(cell)
+        host = urlparse(endpoints[0]).hostname if endpoints else None
+        return ("host", host) if host else ("cell", cell.id)
+
+    async def _refuse_shared_gang_rendezvous(
+        self,
+        transaction: RepositorySession,
+        workload: WorkloadRecord,
+        coordinator_cell: CellRecord,
+    ) -> None:
+        """Refuse a native gang that would be handed a live gang's rendezvous endpoint.
+
+        This is the enforcement of a property that until now was only *masked*.
+        ``server/service/scheduling.py`` marks every ``native-local`` and
+        ``eyvan-native`` cell ``exclusive_workloads``, and ``domain/scheduler.py``
+        will not place a second workload on a busy exclusive cell -- so no two
+        gangs share a coordinator today, and the fixed rendezvous ports are safe
+        by consequence rather than by decision. The moment that flag is off, the
+        second gang is handed the first gang's socket and nothing says so.
+
+        Only another *gang* is a conflict. A single-cell workload forms no
+        rendezvous -- ``NativeGangExecutor`` is the only thing that writes
+        ``JAX_COORDINATOR_ADDRESS`` and ``MASTER_ADDR`` for a cell group -- so
+        one sharing the machine is left alone.
+
+        Terminal workloads are skipped even when a lease has not been released
+        yet. Their ranks are gone, the endpoint is free, and refusing on a
+        settling lease would fail a workload permanently over a few seconds of
+        bookkeeping.
+
+        Args:
+            transaction: The dispatch transaction; this reads durable rows only.
+            workload: The gang being dispatched.
+            coordinator_cell: Its coordinator cell -- the lexicographically first
+                of its leased cells, whose host the rendezvous is formed on.
+
+        Raises:
+            GangRendezvousCollision: If a live gang already holds that endpoint.
+        """
+
+        site = self._rendezvous_site(coordinator_cell)
+        cells_by_workload: dict[str, list[str]] = {}
+        for lease in await transaction.list_leases():
+            if lease.workload_id == workload.id or lease.state not in ACTIVE_LEASE_STATES:
+                continue
+            cells_by_workload.setdefault(lease.workload_id, []).append(lease.cell_id)
+        for other_id, cell_ids in sorted(cells_by_workload.items()):
+            if len(cell_ids) < 2:
+                continue
+            other = await transaction.get_workload(other_id)
+            if other is None or other.state in TERMINAL_WORKLOAD_STATES:
+                continue
+            if other.spec.required_executor != "eyvan-native":
+                continue
+            # The same rule dispatch itself uses: the coordinator is the
+            # lexicographically first cell of the group, so it is derived rather
+            # than remembered, and stays right across a re-dispatch.
+            other_cell = await transaction.get_cell(min(cell_ids))
+            if other_cell is None or self._rendezvous_site(other_cell) != site:
+                continue
+            ports = ", ".join(str(port) for port in NATIVE_RENDEZVOUS_PORTS)
+            where = f"host {site[1]!r}" if site[0] == "host" else f"cell {site[1]!r}"
+            raise GangRendezvousCollision(
+                f"workload {workload.id!r} would form its gang rendezvous on {where}, where native gang "
+                f"{other_id!r} already holds one; both are handed the same fixed ports ({ports}), so a rank "
+                f"of one gang can join the other gang's coordinator. Native execution cells are marked "
+                f"exclusive_workloads precisely so a second workload is never placed on a busy one; this "
+                f"dispatch means either exclusive_workloads is off for these cells, or two cells name one "
+                f"machine. Eyvan will not move the rendezvous port to work around it -- these numbers are "
+                f"what a deployment's firewall opens."
+            )
 
     @classmethod
     def _freeze_attempt_topology(
@@ -878,6 +1013,17 @@ class _ControllerWorkloadCommands:
             leader_lease = members[0]
             leader_cell = concrete_cells[0]
             self._refuse_unreachable_callback(workload, leader_cell)
+            # One definition of "the coordinator", used by the rendezvous refusal
+            # below and by the request built further down. Two derivations of the
+            # same rule is how a check ends up guarding a different cell from the
+            # one that is dispatched.
+            paired = tuple(sorted(zip(members, concrete_cells, strict=True), key=lambda item: item[0].cell_id))
+            coordinator_lease, coordinator_cell = paired[0]
+            # Before anything is reserved or written, and before the agent is
+            # contacted: a colliding environment must never be emitted, and a
+            # refusal after the reservation would leave a dispatch marker for a
+            # launch that never happened.
+            await self._refuse_shared_gang_rendezvous(transaction, workload, coordinator_cell)
             reservation = self._new_dispatch_reservation(command, workload, lease_ids)
             reserved = await self._persist_dispatch_reservation(
                 transaction,
@@ -906,8 +1052,6 @@ class _ControllerWorkloadCommands:
                     "eyvan_lease_ids": ",".join(lease.id for lease in members),
                 },
             }
-            paired = tuple(sorted(zip(members, concrete_cells, strict=True), key=lambda item: item[0].cell_id))
-            coordinator_lease, coordinator_cell = paired[0]
             request = GangWorkloadRequest(
                 members=tuple(
                     GangWorkloadMember(
@@ -1071,15 +1215,17 @@ class _ControllerWorkloadCommands:
         self,
         command: OutboxRecord,
         lease_ids: tp.Sequence[str],
-        refusal: AttemptRankSpaceTooLarge,
+        refusal: PermanentDispatchRefusal,
     ) -> None:
-        """Fail a workload whose rank space can never be dispatched.
+        """Fail a workload whose dispatch cannot be made to succeed by retrying.
 
-        Retrying is pointless -- the width is a property of the leased cells --
-        and a command that retries forever holds the lease, which keeps the cell
-        draining and blocks ``eyvan down``. Settling here converts a permanent
-        refusal into a terminal state with the reason attached, so the capacity
-        comes back and the operator is told what to change.
+        Retrying is pointless -- the rank width is a property of the leased cells,
+        and a rendezvous collision is a property of a placement the scheduler is
+        configured never to make -- and a command that retries forever holds the
+        lease, which keeps the cell draining and blocks ``eyvan down``. Settling
+        here converts a permanent refusal into a terminal state with the reason
+        attached, so the capacity comes back and the operator is told what to
+        change.
         """
 
         workload_id = str(command.payload["workload_id"])
@@ -1107,7 +1253,7 @@ class _ControllerWorkloadCommands:
         recovered_cells = await self._recover_quarantined_dispatch_cells(command, (lease_id,))
         try:
             prepared = await self._prepare_single_dispatch(command, recovered_cells=recovered_cells)
-        except AttemptRankSpaceTooLarge as exc:
+        except PermanentDispatchRefusal as exc:
             await self._settle_unlaunchable_attempt(command, (lease_id,), exc)
             return
         if prepared is None:
@@ -1126,7 +1272,7 @@ class _ControllerWorkloadCommands:
         recovered_cells = await self._recover_quarantined_dispatch_cells(command, lease_ids)
         try:
             prepared = await self._prepare_gang_dispatch(command, lease_ids, recovered_cells=recovered_cells)
-        except AttemptRankSpaceTooLarge as exc:
+        except PermanentDispatchRefusal as exc:
             await self._settle_unlaunchable_attempt(command, lease_ids, exc)
             return
         if prepared is None:
