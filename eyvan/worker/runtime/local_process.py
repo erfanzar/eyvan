@@ -260,6 +260,23 @@ def _process_start_marker(pid: int) -> str | None:
     return f"ps:{marker}" if result.returncode == 0 and marker else None
 
 
+def _arguments_carry_token(arguments: tp.Sequence[bytes], expected: bytes) -> bool:
+    """Return whether any argument carries the nonce, substring included.
+
+    The token is spelled ``--worker-token=<nonce>``, so it is part of an argument
+    and never an argument by itself. Comparing it against whole ``/proc`` argv
+    elements therefore never matched on Linux, and every ownership check there
+    answered "not my worker": ``stop`` set the message and signalled nothing, and
+    ``retire`` waited its full timeout before declaring the workload
+    INDETERMINATE without ever sending SIGKILL. macOS has no ``/proc`` and fell
+    through to the ``ps`` branch, which compares against the whole command line
+    and matched -- so the platform Eyvan does not deploy on was the only one that
+    could stop a workload.
+    """
+
+    return any(expected in argument for argument in arguments)
+
+
 def _process_has_worker_token(pid: int, worker_token: str) -> bool:
     """Check that a live process still carries the worker launch nonce."""
 
@@ -268,7 +285,7 @@ def _process_has_worker_token(pid: int, worker_token: str) -> bool:
     expected = worker_token.encode()
     try:
         arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        return expected in arguments
+        return _arguments_carry_token(arguments, expected)
     except OSError:
         pass
     try:
