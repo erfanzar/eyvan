@@ -12,11 +12,21 @@ same accelerator. What was missing was the environment a GPU member's rank needs
 containing a GPU cell formed a JAX cluster and then left every rank to guess its
 devices.
 
+Ranks are placed by host. Which is to say: a gang may now run more than one
+process on one machine, each holding a disjoint slice of that machine's devices,
+where before both would have been told they owned all of them and the gang was
+declined instead. Whether that is even expressible depends on what a rank *is*,
+which is a deployment's choice and defaults to the one every release so far has
+made -- see
+:class:`~eyvan.worker.distributed_environment.GpuRankLayout`.
+
 **Nothing in the GPU path is hardware-qualified.** No GPU has executed an Eyvan
 workload. What is claimed here, and tested, is that the per-rank device
 assignment is exact and non-overlapping and that a submission cannot spoof it.
 Whether a real multi-GPU host then trains is unknown and is not asserted
-anywhere in this file.
+anywhere in this file. Nor is device isolation between two *workloads* packed
+onto one cell: this file places the ranks of one gang, and Eyvan records no
+per-lease device range.
 """
 
 from __future__ import annotations
@@ -38,7 +48,9 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
 )
 from eyvan.worker.distributed_environment import (
+    DEFAULT_GPU_RANK_LAYOUT,
     GpuDevicePlan,
+    GpuRankLayout,
     plan_gpu_devices,
     without_distributed_topology_overrides,
     without_gpu_topology_overrides,
@@ -313,6 +325,48 @@ def _augment_error_detail(error: BaseException, detail: str) -> None:
         error.args = (*error.args, detail)
 
 
+def _refuse_unplaceable_gpu_ranks(
+    endpoints: tp.Sequence[str],
+    rank_hosts: tp.Sequence[str],
+    *,
+    layout: GpuRankLayout,
+) -> None:
+    """Refuse a GPU gang whose ranks cannot be placed on the hosts it names.
+
+    Both refusals are about a state that is *proven* wrong rather than unknown,
+    and both are raised at construction so a plan that would hand two ranks the
+    same cards cannot exist. Before per-host grouping, two endpoints on one host
+    produced exactly that plan, and only the resolver's own check kept it off
+    the wire.
+
+    Args:
+        endpoints: The gang's worker endpoints, in rank order.
+        rank_hosts: The host each endpoint names, empty where none was parsed.
+        layout: What a rank is in this deployment.
+
+    Raises:
+        ValueError: If a host carries several ranks under a layout with no name
+            for the second, or if a rank's host cannot be named under a layout
+            that places ranks by host.
+    """
+
+    if layout is GpuRankLayout.HOST_LAUNCHER:
+        shared = sorted({host for host in rank_hosts if host and rank_hosts.count(host) > 1})
+        if shared:
+            raise ValueError(
+                f"native gang worker endpoints place several ranks on host(s) {', '.join(shared)}; "
+                f"the {GpuRankLayout.HOST_LAUNCHER.value!r} GPU rank layout supports one rank per host, "
+                f"and {GpuRankLayout.RANK_PROCESS.value!r} supports several"
+            )
+        return
+    unnamed = sorted(endpoint for endpoint, host in zip(endpoints, rank_hosts, strict=True) if not host)
+    if unnamed:
+        raise ValueError(
+            f"the {GpuRankLayout.RANK_PROCESS.value!r} GPU rank layout groups ranks by host, so every worker "
+            f"endpoint must name one; these do not: {', '.join(unnamed)}"
+        )
+
+
 def _reported_exit_status(detail: JsonObject) -> int | None:
     """Return one host's reported process exit status, or ``None`` if unknown.
 
@@ -335,6 +389,12 @@ class NativeGangExecutor:
     context that created its TPU slice. This differs from
     :class:`NativeSliceExecutor`, whose endpoints all belong to one cell and
     therefore share one token and fence.
+
+    ``gpu_rank_layout`` decides what a GPU rank is, and therefore whether two
+    worker endpoints may name the same machine. It defaults to the layout every
+    dispatch used before per-host grouping existed, under which a host carries
+    one rank and a second one on the same machine is refused rather than handed
+    the same devices. See :class:`~eyvan.worker.distributed_environment.GpuRankLayout`.
     """
 
     def __init__(
@@ -343,9 +403,12 @@ class NativeGangExecutor:
         *,
         clients: tp.Sequence[httpx.Client | None] | None = None,
         initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
+        gpu_rank_layout: GpuRankLayout = DEFAULT_GPU_RANK_LAYOUT,
     ) -> None:
         if not isinstance(initialization, GangInitializationPolicy):
             raise TypeError("native gang initialization must be a GangInitializationPolicy")
+        if not isinstance(gpu_rank_layout, GpuRankLayout):
+            raise TypeError("native gang GPU rank layout must be a GpuRankLayout")
         ordered_members = tuple(sorted(members, key=lambda member: member.cell_id))
         if len(ordered_members) < 2:
             raise ValueError("native gang execution requires at least two execution cells")
@@ -378,9 +441,18 @@ class NativeGangExecutor:
                 f"missing for cell(s) {undeclared}"
             )
 
+        rank_hosts = tuple(urlparse(endpoint).hostname or "" for endpoint in endpoints)
+        if all(declared_gpu):
+            # Only a GPU-coordinated gang is placed by host. A gang that is not
+            # -- a TPU slice pair, or any member whose device count is unknown --
+            # is dispatched exactly as it was before per-host grouping existed,
+            # including when two of its endpoints share a machine.
+            _refuse_unplaceable_gpu_ranks(endpoints, rank_hosts, layout=gpu_rank_layout)
+
         self.members = ordered_members
         self.endpoints = endpoints
         self.initialization = initialization
+        self.gpu_rank_layout = gpu_rank_layout
         self._coordinator_host = coordinator.hostname
         self._coordinator_address = f"{coordinator.hostname}:{_COORDINATOR_PORT}"
         supplied_clients = clients or (None,) * len(flattened)
@@ -401,7 +473,14 @@ class NativeGangExecutor:
         ]
         # Every member declared, so one entry per flattened host: a member with
         # four hosts contributes its device count four times, once per rank.
-        self.gpu_plan: GpuDevicePlan | None = plan_gpu_devices(gpu_devices_per_rank) if all(declared_gpu) else None
+        # The hosts are passed only when every endpoint names one -- a rank whose
+        # host cannot be named is not evidence that it is alone on a machine, so
+        # the plan is told nothing rather than told something convenient.
+        self.gpu_plan: GpuDevicePlan | None = (
+            plan_gpu_devices(gpu_devices_per_rank, rank_hosts=rank_hosts if all(rank_hosts) else None)
+            if all(declared_gpu)
+            else None
+        )
 
     def health(self) -> bool:
         """Return whether every native worker accepts its cell-scoped credential."""
@@ -461,6 +540,7 @@ class NativeGangExecutor:
                     rank,
                     rendezvous_host=self._coordinator_host,
                     gpu_model=worker.gpu_model,
+                    layout=self.gpu_rank_layout,
                 )
             )
         payload["environment"] = environment

@@ -125,6 +125,32 @@ Read `collectable` before enabling collection, not after. It is the only view
 that distinguishes "unreferenced and past its window" from "still referenced by
 a queued workload", and those look identical in a bucket listing.
 
+## Several GPU ranks on one host
+
+A GPU gang places one process per native-worker endpoint. By default a host
+carries one of them: that process is handed every device Eyvan gave the machine
+and is expected to launch one worker per device, so `WORLD_SIZE` counts devices
+and `RANK`/`LOCAL_RANK` are left to that launcher. A gang whose endpoints name
+one machine twice is *not* GPU-coordinated -- both ranks would be told they own
+all of it -- and is dispatched with whatever device visibility the submission
+sent, which is the behaviour every release so far has had.
+
+Set `EYVAN_GPU_RANK_LAYOUT=rank-process` on an **agent** to say the opposite:
+that the process Eyvan starts is itself the rank. Several ranks may then share a
+host, each gets a disjoint slice of that host's devices, `LOCAL_RANK` names which
+slice, and `WORLD_SIZE` counts processes rather than devices. A host whose device
+count does not divide evenly among the ranks placed on it, or whose two cells
+disagree about what it carries, is left uncoordinated rather than split on a
+guess. The variable is spelled `host-launcher` or `rank-process`; anything else
+is refused when the agent starts rather than read as the default.
+
+This is a device *assignment*. No GPU has executed an Eyvan workload; see
+[proofs.md](proofs.md).
+
+Two independently scheduled workloads packed onto the same cell are two gangs,
+and they are still given the same devices -- Eyvan records no per-lease device
+range.
+
 ## Durability
 
 ```

@@ -33,6 +33,8 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import dataclass
 
+from eyvan._internal.compat import StrEnum
+
 DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES = frozenset(
     {
         "EYVAN_DISTRIBUTED_PROCESS_COUNT",
@@ -163,6 +165,43 @@ def without_gpu_topology_overrides(environment: tp.Mapping[str, str]) -> dict[st
 DEFAULT_GPU_RENDEZVOUS_PORT = 12346
 
 
+class GpuRankLayout(StrEnum):
+    """What a "rank" is, and therefore what ``WORLD_SIZE`` counts.
+
+    Two readings of one gang are both legitimate and they are not compatible,
+    so the deployment picks one instead of the code guessing.
+
+    :attr:`HOST_LAUNCHER` is what Eyvan has always dispatched. A rank is a
+    host-local *launcher*: it is handed every device Eyvan gave that host and is
+    expected to fan out to one worker per device, so ``WORLD_SIZE`` counts
+    devices, ``LOCAL_WORLD_SIZE`` counts this host's devices, and ``RANK`` and
+    ``LOCAL_RANK`` are deliberately unset -- they name a worker process inside a
+    launcher Eyvan does not run. It follows that a host can hold only one rank:
+    two launchers on one host have no way to say which of them is which.
+
+    :attr:`RANK_PROCESS` says a rank is the process Eyvan actually starts. That
+    is the reading under which several ranks can share a host: each gets its own
+    slice of that host's devices, ``LOCAL_RANK`` names which slice, and
+    ``WORLD_SIZE`` counts processes, because a ``RANK`` that does not index into
+    ``WORLD_SIZE`` is how a collective hangs instead of failing.
+
+    The device facts do not move between the two: ``CUDA_VISIBLE_DEVICES`` and
+    the ``EYVAN_GPU_*`` device counts mean the same thing in both, so nothing a
+    workload needs to know about hardware is lost by choosing one.
+
+    Neither layout is hardware-qualified. No GPU has executed an Eyvan workload.
+    """
+
+    HOST_LAUNCHER = "host-launcher"
+    RANK_PROCESS = "rank-process"
+
+
+#: The layout every dispatch used before this existed, and the default
+#: everywhere. Opting in is a deployment decision because it changes
+#: ``WORLD_SIZE`` from a device count to a process count.
+DEFAULT_GPU_RANK_LAYOUT = GpuRankLayout.HOST_LAUNCHER
+
+
 @dataclass(frozen=True, slots=True)
 class GpuDeviceAssignment:
     """The devices one rank of a GPU gang may use, host-local and gang-wide.
@@ -174,21 +213,40 @@ class GpuDeviceAssignment:
     index ``0``, and only the global ordinals can say whether that is one device
     or two.
 
+    ``host_index`` and ``local_rank`` are what let a host carry more than one
+    rank. They are separate from ``rank`` because the three answer different
+    questions -- which process am I in the gang, which machine am I on, and
+    which process am I on that machine -- and they coincide only while every
+    host holds exactly one rank, which is the shape Eyvan dispatched before
+    per-host grouping existed.
+
     Attributes:
         rank: The gang rank this assignment belongs to.
-        host_devices: Host-local device indices, ascending from zero.
+        host_devices: Host-local device indices, ascending.
         global_devices: Gang-wide device ordinals, ascending and contiguous.
+        host_index: Position of this rank's host in the gang's host order.
+        local_rank: Position of this rank among the ranks on its own host.
+        local_rank_count: How many ranks share this rank's host.
     """
 
     rank: int
     host_devices: tuple[int, ...]
     global_devices: tuple[int, ...]
+    host_index: int
+    local_rank: int
+    local_rank_count: int
 
     def __post_init__(self) -> None:
         if self.rank < 0:
             raise ValueError("a GPU device assignment rank cannot be negative")
         if not self.host_devices or len(self.host_devices) != len(self.global_devices):
             raise ValueError("a GPU device assignment must map every host device to one global device")
+        if self.host_index < 0:
+            raise ValueError("a GPU device assignment host index cannot be negative")
+        if self.local_rank_count < 1:
+            raise ValueError("a GPU device assignment host must carry at least one rank")
+        if not 0 <= self.local_rank < self.local_rank_count:
+            raise ValueError("a GPU device assignment local rank must index the ranks on its own host")
 
     @property
     def device_count(self) -> int:
@@ -215,7 +273,18 @@ class GpuDevicePlan:
 
     @property
     def host_count(self) -> int:
-        """Return how many hosts this plan covers."""
+        """Return how many distinct hosts this plan covers.
+
+        Not the number of ranks. The two are equal exactly while every host
+        holds one rank, which is the only shape that existed before per-host
+        grouping, so this keeps reporting what it always reported there.
+        """
+
+        return len({assignment.host_index for assignment in self.assignments})
+
+    @property
+    def rank_count(self) -> int:
+        """Return how many ranks -- dispatched processes -- this plan covers."""
 
         return len(self.assignments)
 
@@ -225,6 +294,12 @@ class GpuDevicePlan:
 
         return sum(assignment.device_count for assignment in self.assignments)
 
+    @property
+    def shares_a_host(self) -> bool:
+        """Return whether any host in this plan carries more than one rank."""
+
+        return any(assignment.local_rank_count > 1 for assignment in self.assignments)
+
     def rank_environment(
         self,
         rank: int,
@@ -232,33 +307,54 @@ class GpuDevicePlan:
         rendezvous_host: str,
         rendezvous_port: int = DEFAULT_GPU_RENDEZVOUS_PORT,
         gpu_model: str | None = None,
+        layout: GpuRankLayout = DEFAULT_GPU_RANK_LAYOUT,
     ) -> dict[str, str]:
         """Return the GPU coordination environment Eyvan owns for one rank.
 
-        What is written back is only what Eyvan can state without guessing the
-        workload's launcher. Device visibility, the device counts, the host
-        index and the rendezvous endpoint all follow from the placement Eyvan
-        made. ``RANK`` and ``LOCAL_RANK`` do not: they identify a *process*
-        within a host-local launcher that Eyvan does not run, so they are
-        stripped and left unset rather than filled with the host's index, which
-        would be wrong for every process but the first.
+        What is written back is only what Eyvan can state without guessing. The
+        device visibility, the device counts, the host index and the rendezvous
+        endpoint follow from the placement Eyvan made, and are identical under
+        both layouts.
+
+        What differs is who a "rank" is, which is :class:`GpuRankLayout`'s whole
+        subject. Under :attr:`~GpuRankLayout.HOST_LAUNCHER` -- the default, and
+        every dispatch before per-host grouping existed -- ``RANK`` and
+        ``LOCAL_RANK`` stay unset because they name a worker inside a launcher
+        Eyvan does not run, and filling them with the host's index would be
+        right for the first worker and wrong for every other one. Under
+        :attr:`~GpuRankLayout.RANK_PROCESS` the rank *is* the process Eyvan
+        started, so both are facts about Eyvan's own dispatch and are written,
+        along with the ``WORLD_SIZE`` they have to index into.
 
         Args:
             rank: The gang rank to render.
             rendezvous_host: Host part of the collective rendezvous endpoint.
             rendezvous_port: Port part of that endpoint.
             gpu_model: The attached accelerator, when the catalog records one.
+            layout: What a rank is in this deployment.
 
         Returns:
             A mapping of environment variable names to values.
 
         Raises:
             IndexError: If ``rank`` is not in this plan.
-            ValueError: If the rendezvous host is empty.
+            ValueError: If the rendezvous host is empty, or if a host carries
+                several ranks under a layout that has no name for the second
+                one.
         """
 
         if not rendezvous_host or rendezvous_host != rendezvous_host.strip():
             raise ValueError("a GPU rendezvous host must be non-empty and trimmed")
+        if not isinstance(layout, GpuRankLayout):
+            raise TypeError("a GPU rank environment layout must be a GpuRankLayout")
+        if layout is GpuRankLayout.HOST_LAUNCHER and self.shares_a_host:
+            # Refused rather than rendered: both ranks would be told they are
+            # node zero of that host and be handed the launcher contract, under
+            # which nothing distinguishes them.
+            raise ValueError(
+                f"the {GpuRankLayout.HOST_LAUNCHER.value!r} GPU rank layout has no name for a second rank on one "
+                f"host; use {GpuRankLayout.RANK_PROCESS.value!r} to place several ranks per host"
+            )
         assignment = self.assignments[rank]
         visible = ",".join(str(index) for index in assignment.host_devices)
         environment = {
@@ -268,44 +364,132 @@ class GpuDevicePlan:
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "CUDA_VISIBLE_DEVICES": visible,
             "NVIDIA_VISIBLE_DEVICES": visible,
-            "LOCAL_WORLD_SIZE": str(assignment.device_count),
-            "NODE_RANK": str(assignment.rank),
-            "WORLD_SIZE": str(self.device_count),
-            "MASTER_ADDR": rendezvous_host,
-            "MASTER_PORT": str(rendezvous_port),
-            "EYVAN_GPU_HOST_COUNT": str(self.host_count),
-            "EYVAN_GPU_HOST_INDEX": str(assignment.rank),
-            "EYVAN_GPU_LOCAL_DEVICE_COUNT": str(assignment.device_count),
-            "EYVAN_GPU_GLOBAL_DEVICE_COUNT": str(self.device_count),
-            "EYVAN_GPU_GLOBAL_DEVICE_OFFSET": str(assignment.global_device_offset),
         }
+        if layout is GpuRankLayout.RANK_PROCESS:
+            environment.update(
+                {
+                    "RANK": str(assignment.rank),
+                    "LOCAL_RANK": str(assignment.local_rank),
+                    # Processes on this host, not devices on it. The device count
+                    # is still stated, under EYVAN_GPU_LOCAL_DEVICE_COUNT below.
+                    "LOCAL_WORLD_SIZE": str(assignment.local_rank_count),
+                    "WORLD_SIZE": str(self.rank_count),
+                    "GROUP_RANK": str(assignment.host_index),
+                    "NODE_RANK": str(assignment.host_index),
+                }
+            )
+        else:
+            environment.update(
+                {
+                    "LOCAL_WORLD_SIZE": str(assignment.device_count),
+                    "NODE_RANK": str(assignment.rank),
+                    "WORLD_SIZE": str(self.device_count),
+                }
+            )
+        environment.update(
+            {
+                "MASTER_ADDR": rendezvous_host,
+                "MASTER_PORT": str(rendezvous_port),
+                "EYVAN_GPU_HOST_COUNT": str(self.host_count),
+                "EYVAN_GPU_HOST_INDEX": str(assignment.host_index),
+                "EYVAN_GPU_LOCAL_DEVICE_COUNT": str(assignment.device_count),
+                "EYVAN_GPU_GLOBAL_DEVICE_COUNT": str(self.device_count),
+                "EYVAN_GPU_GLOBAL_DEVICE_OFFSET": str(assignment.global_device_offset),
+            }
+        )
         if gpu_model is not None:
             environment["EYVAN_GPU_MODEL"] = gpu_model
         return environment
 
 
-def plan_gpu_devices(devices_per_rank: tp.Sequence[int]) -> GpuDevicePlan:
+def gpu_rank_placement_error(
+    devices_per_rank: tp.Sequence[int],
+    rank_hosts: tp.Sequence[str],
+) -> str | None:
+    """Return why these ranks cannot be given disjoint device slices, or ``None``.
+
+    Separate from :func:`plan_gpu_devices` because two callers need the same
+    answer for opposite reasons. A hand-built gang is *refused* when it cannot
+    be placed, because its author stated something impossible; a gang the
+    resolver assembles from observations is *downgraded* to the uncoordinated
+    dispatch it gets today, because partial or awkward knowledge about a fleet
+    is ordinary and failing the dispatch would break a workload that runs now.
+    Both need the reason, and neither should re-derive it.
+
+    Args:
+        devices_per_rank: Device count of each rank's host, in rank order.
+        rank_hosts: The host each rank lands on, in the same order. Ranks
+            sharing a value share a machine.
+
+    Returns:
+        An operator-readable reason, or ``None`` when every host's devices
+        divide evenly among the ranks placed on it.
+    """
+
+    if len(devices_per_rank) != len(rank_hosts):
+        return f"{len(rank_hosts)} rank hosts cannot describe {len(devices_per_rank)} ranks"
+    declared: dict[str, int] = {}
+    ranks_per_host: dict[str, int] = {}
+    for rank, (host, count) in enumerate(zip(rank_hosts, devices_per_rank, strict=True)):
+        if not isinstance(host, str) or not host.strip() or host != host.strip():
+            return f"rank {rank} must name a non-empty trimmed host, not {host!r}"
+        ranks_per_host[host] = ranks_per_host.get(host, 0) + 1
+        if host in declared and declared[host] != count:
+            # One machine cannot carry two different numbers of devices, so this
+            # is two sources disagreeing and there is nothing here that can
+            # arbitrate. Splitting either number would pin a rank to devices
+            # chosen by the loser of a coin flip.
+            return f"host {host!r} is declared with both {declared[host]} and {count} GPUs"
+        declared[host] = count
+    for host, count in declared.items():
+        ranks = ranks_per_host[host]
+        if count % ranks:
+            # An uneven split is expressible and is still refused: the leftover
+            # devices would either sit idle behind a plan that claims to cover
+            # the host, or make one rank larger than its peers, and a collective
+            # sized by the smallest rank would then be silently wrong.
+            return f"host {host!r} carries {count} GPUs, which {ranks} ranks cannot divide evenly"
+    return None
+
+
+def plan_gpu_devices(
+    devices_per_rank: tp.Sequence[int],
+    *,
+    rank_hosts: tp.Sequence[str] | None = None,
+) -> GpuDevicePlan:
     """Assign every gang rank an exact, non-overlapping set of GPU devices.
 
-    One rank per host, which is the shape Eyvan launches: the native worker runs
-    one process per endpoint, and a host-local launcher inside it fans out to
-    the devices this function made visible. Hosts may hold different numbers of
+    Without ``rank_hosts`` this is one rank per host, which is the only shape
+    Eyvan dispatched before per-host grouping: the native worker runs one
+    process per endpoint, and a host-local launcher inside it fans out to the
+    devices this function made visible. Hosts may hold different numbers of
     devices -- a single-GPU host and an eight-GPU host in one gang is the
     heterogeneous case -- so the gang-wide ordinals are accumulated rather than
     assumed uniform.
 
+    With ``rank_hosts``, ranks that name the same host split that host's devices
+    between them: the first rank on a host takes its first share, the second the
+    next, and so on. ``devices_per_rank`` still states what the *host* carries,
+    not what the rank ends up with -- it is read from one catalog row per cell,
+    and the row describes a machine. A plan built with all-distinct hosts is
+    identical to one built without them, which is what keeps the shape that
+    ships today unchanged.
+
     Args:
         devices_per_rank: Device count of each rank's host, in rank order.
+        rank_hosts: The host each rank lands on, in rank order, or ``None`` when
+            no rank shares a host with another.
 
     Returns:
         The plan covering every rank.
 
     Raises:
-        ValueError: If no rank was given, or any host's device count is not a
-            positive integer. A host whose device count is unknown is refused
-            rather than treated as zero: an unobservable device count is not
-            evidence of an empty host, and a zero would silently hand the rank
-            an empty ``CUDA_VISIBLE_DEVICES``, which means "no GPU at all".
+        ValueError: If no rank was given, if any host's device count is not a
+            positive integer, or if the ranks placed on one host cannot divide
+            its devices. A host whose device count is unknown is refused rather
+            than treated as zero: an unobservable device count is not evidence
+            of an empty host, and a zero would silently hand the rank an empty
+            ``CUDA_VISIBLE_DEVICES``, which means "no GPU at all".
     """
 
     counts = tuple(devices_per_rank)
@@ -314,17 +498,37 @@ def plan_gpu_devices(devices_per_rank: tp.Sequence[int]) -> GpuDevicePlan:
     for rank, count in enumerate(counts):
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             raise ValueError(f"rank {rank} must declare a positive integer GPU device count, not {count!r}")
+    # Without hosts, every rank is keyed by itself, which is the same statement
+    # as "no rank shares a machine" and keeps one code path below instead of two.
+    hosts = tuple(rank_hosts) if rank_hosts is not None else tuple(f"rank-{rank}" for rank in range(len(counts)))
+    if rank_hosts is not None:
+        reason = gpu_rank_placement_error(counts, hosts)
+        if reason is not None:
+            raise ValueError(f"a GPU device plan cannot place these ranks: {reason}")
+    host_indices: dict[str, int] = {}
+    ranks_per_host: dict[str, int] = {}
+    for host in hosts:
+        host_indices.setdefault(host, len(host_indices))
+        ranks_per_host[host] = ranks_per_host.get(host, 0) + 1
     assignments: list[GpuDeviceAssignment] = []
+    local_ranks: dict[str, int] = {}
     offset = 0
-    for rank, count in enumerate(counts):
+    for rank, (host, count) in enumerate(zip(hosts, counts, strict=True)):
+        local_rank = local_ranks.get(host, 0)
+        local_ranks[host] = local_rank + 1
+        share = count // ranks_per_host[host]
+        first = local_rank * share
         assignments.append(
             GpuDeviceAssignment(
                 rank=rank,
-                host_devices=tuple(range(count)),
-                global_devices=tuple(range(offset, offset + count)),
+                host_devices=tuple(range(first, first + share)),
+                global_devices=tuple(range(offset, offset + share)),
+                host_index=host_indices[host],
+                local_rank=local_rank,
+                local_rank_count=ranks_per_host[host],
             )
         )
-        offset += count
+        offset += share
     return GpuDevicePlan(assignments=tuple(assignments))
 
 
@@ -337,12 +541,15 @@ def remove_gce_tpu_topology_overrides(environment: tp.MutableMapping[str, str]) 
 
 
 __all__ = (
+    "DEFAULT_GPU_RANK_LAYOUT",
     "DEFAULT_GPU_RENDEZVOUS_PORT",
     "DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES",
     "GPU_TOPOLOGY_ENVIRONMENT_NAMES",
     "RUNTIME_OWNED_ENVIRONMENT_NAMES",
     "GpuDeviceAssignment",
     "GpuDevicePlan",
+    "GpuRankLayout",
+    "gpu_rank_placement_error",
     "is_distributed_topology_environment_name",
     "is_gpu_topology_environment_name",
     "is_runtime_owned_environment_name",
