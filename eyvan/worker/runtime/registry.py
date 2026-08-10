@@ -27,11 +27,52 @@ from eyvan.capacity.drivers.base import (
     canonical_execution_backend,
     read_cell_accelerator,
 )
+from eyvan.worker.distributed_environment import (
+    DEFAULT_GPU_RANK_LAYOUT,
+    GpuRankLayout,
+    gpu_rank_placement_error,
+)
 from eyvan.worker.runtime._multihost_site import DEFAULT_GANG_INITIALIZATION, GangInitializationPolicy
 from eyvan.worker.runtime.log_records import LogPage
 
 ExecutorFactory = tp.Callable[..., ExecutionDriver]
 logger = logging.getLogger(__name__)
+
+#: Agent-side switch for what a GPU rank is. Absent means the layout every
+#: dispatch used before per-host grouping existed, so an agent upgraded without
+#: being reconfigured keeps sending exactly what it sends today.
+GPU_RANK_LAYOUT_ENV = "EYVAN_GPU_RANK_LAYOUT"
+
+
+def gpu_rank_layout_from_environment(environment: tp.Mapping[str, str] | None = None) -> GpuRankLayout:
+    """Read the GPU rank layout an agent was configured with.
+
+    Refused rather than defaulted when the value is not a layout, for the reason
+    every other spelling-sensitive switch in this repository is refused at
+    startup: a typo that silently reads as "off" turns a deliberate operator
+    decision into a behaviour nobody chose, and the fleet reports nothing.
+
+    Args:
+        environment: The process environment to read, or ``None`` for
+            :data:`os.environ`.
+
+    Returns:
+        The configured layout, or the shipped default when the variable is
+        absent or empty.
+
+    Raises:
+        ValueError: If the variable names something that is not a layout.
+    """
+
+    source = os.environ if environment is None else environment
+    raw = source.get(GPU_RANK_LAYOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_GPU_RANK_LAYOUT
+    try:
+        return GpuRankLayout(raw)
+    except ValueError:
+        choices = ", ".join(layout.value for layout in GpuRankLayout)
+        raise ValueError(f"{GPU_RANK_LAYOUT_ENV} must be one of: {choices}; got {raw!r}") from None
 
 
 def _uses_gce_tpu_cluster_detection(observation: CellObservation) -> bool:
@@ -298,11 +339,16 @@ class ExecutionDriverResolver:
         native_worker_port: int = 8100,
         native_worker_token: str | None = None,
         gang_initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
+        gpu_rank_layout: GpuRankLayout | None = None,
     ) -> None:
         if native_worker_port <= 0 or native_worker_port > 65535:
             raise ValueError("native worker port must be between 1 and 65535")
         if not isinstance(gang_initialization, GangInitializationPolicy):
             raise TypeError("gang initialization must be a GangInitializationPolicy")
+        if gpu_rank_layout is None:
+            gpu_rank_layout = gpu_rank_layout_from_environment()
+        if not isinstance(gpu_rank_layout, GpuRankLayout):
+            raise TypeError("gpu rank layout must be a GpuRankLayout")
         self.backend = _normalize_name(backend)
         if self.backend == "eyvan-native" and (
             not isinstance(native_worker_token, str) or not native_worker_token.strip()
@@ -316,6 +362,7 @@ class ExecutionDriverResolver:
         self.native_worker_port = native_worker_port
         self.native_worker_token = native_worker_token
         self.gang_initialization = gang_initialization
+        self.gpu_rank_layout = gpu_rank_layout
         self._drivers: dict[tuple[str, ...], ExecutionDriver] = {}
         self._lock = RLock()
 
@@ -446,7 +493,7 @@ class ExecutionDriverResolver:
                     require_trimmed=True,
                     allow_empty=False,
                 )
-        accelerators = self._gang_gpu_accelerators(ordered, cell_endpoints)
+        accelerators = self._gang_gpu_accelerators(ordered, cell_endpoints, layout=self.gpu_rank_layout)
         members = [
             NativeGangMember(
                 cell_id=cell.cell_id,
@@ -460,12 +507,18 @@ class ExecutionDriverResolver:
             )
             for cell in ordered
         ]
-        return NativeGangExecutor(members, initialization=self.gang_initialization)
+        return NativeGangExecutor(
+            members,
+            initialization=self.gang_initialization,
+            gpu_rank_layout=self.gpu_rank_layout,
+        )
 
     @staticmethod
     def _gang_gpu_accelerators(
         cells: tp.Sequence[NativeGangCell],
         cell_endpoints: tp.Mapping[str, tuple[str, ...]],
+        *,
+        layout: GpuRankLayout = DEFAULT_GPU_RANK_LAYOUT,
     ) -> dict[str, CellAccelerator]:
         """Return the GPU description of every cell, or nothing for the whole gang.
 
@@ -481,30 +534,42 @@ class ExecutionDriverResolver:
         or whose machine type has no catalog row. Refusing would turn a rolling
         upgrade into a dispatch failure for a gang that runs today.
 
-        Distinct hosts are required for the same reason the counts are.
-        ``plan_gpu_devices`` gives every rank its host's devices ``0..n-1``, which
-        is exact only while one rank owns one host; two endpoints on one host
-        would each be told they own all of it. Eyvan does not launch more than
-        one process per host and does not model device isolation between two
-        workloads packed onto one cell, so a gang that cannot be shown to be
-        one-rank-per-host is left uncoordinated instead of given a claim Eyvan
-        cannot keep.
+        Hosts are required to be *nameable* for the same reason the counts are.
+        Ranks are placed by host, and an endpoint whose host cannot be parsed is
+        not evidence that it is alone on a machine -- so a gang with one is left
+        uncoordinated rather than placed against a hostname nobody read.
+
+        What "nameable" then buys depends on ``layout``. Under
+        :attr:`~eyvan.worker.distributed_environment.GpuRankLayout.HOST_LAUNCHER`,
+        the shipped default, a rank is a host-local launcher that owns its host's
+        whole device set, so two endpoints on one host would each be told they
+        own all of it and the gang is left uncoordinated -- exactly as it was
+        before per-host grouping existed. Under
+        :attr:`~eyvan.worker.distributed_environment.GpuRankLayout.RANK_PROCESS`
+        several ranks may share a host and split its devices, so the check
+        becomes whether that split exists: the ranks on one host must agree on
+        what that host carries, and the count must divide among them.
 
         Args:
             cells: The gang's cells, in dispatch order.
             cell_endpoints: Each cell's validated native-worker endpoints.
+            layout: What a rank is in this deployment.
 
         Returns:
             One :class:`CellAccelerator` per cell when every cell is a known GPU
-            shape on its own host, otherwise an empty mapping. Empty means
-            "not GPU-coordinated", which is today's path, and never "no GPU".
+            shape and the gang's ranks can be placed, otherwise an empty
+            mapping. Empty means "not GPU-coordinated", which is today's path,
+            and never "no GPU".
         """
 
         accelerators: dict[str, CellAccelerator] = {}
+        devices_by_cell: dict[str, int] = {}
         for cell in cells:
             accelerator = read_cell_accelerator(cell.observation.metadata)
-            if accelerator is not None and accelerator.gpu_devices_per_host is not None:
+            devices = accelerator.gpu_devices_per_host if accelerator is not None else None
+            if accelerator is not None and devices is not None:
                 accelerators[cell.cell_id] = accelerator
+                devices_by_cell[cell.cell_id] = devices
         if not accelerators:
             return {}
         if len(accelerators) != len(cells):
@@ -515,15 +580,38 @@ class ExecutionDriverResolver:
                 ", ".join(sorted(cell.cell_id for cell in cells if cell.cell_id not in accelerators)),
             )
             return {}
-        hosts = [urlparse(endpoint).hostname for endpoints in cell_endpoints.values() for endpoint in endpoints]
-        named = [host for host in hosts if host]
-        if len(named) != len(hosts) or len(set(named)) != len(hosts):
+        # One entry per rank -- the gang dispatches one process per endpoint --
+        # carrying the host it lands on and what the catalog says that host
+        # holds. A member with four hosts contributes its device count four
+        # times, exactly as the executor flattens it.
+        hosts: list[str] = []
+        devices_per_rank: list[int] = []
+        for cell in cells:
+            for endpoint in cell_endpoints[cell.cell_id]:
+                hosts.append(urlparse(endpoint).hostname or "")
+                devices_per_rank.append(devices_by_cell[cell.cell_id])
+        if not all(hosts):
             logger.warning(
-                "native gang is not GPU-coordinated: its %d worker endpoints name %d distinct hosts, "
-                "so two ranks could be given the same devices",
+                "native gang is not GPU-coordinated: %d of its %d worker endpoints do not name a host, "
+                "so their ranks cannot be placed on one",
+                sum(1 for host in hosts if not host),
                 len(hosts),
-                len(set(named)),
             )
+            return {}
+        if layout is GpuRankLayout.HOST_LAUNCHER:
+            if len(set(hosts)) != len(hosts):
+                logger.warning(
+                    "native gang is not GPU-coordinated: its %d worker endpoints name %d distinct hosts, "
+                    "and the %r GPU rank layout would give two ranks on one host the same devices",
+                    len(hosts),
+                    len(set(hosts)),
+                    GpuRankLayout.HOST_LAUNCHER.value,
+                )
+                return {}
+            return accelerators
+        reason = gpu_rank_placement_error(devices_per_rank, hosts)
+        if reason is not None:
+            logger.warning("native gang is not GPU-coordinated: %s", reason)
             return {}
         return accelerators
 
@@ -586,6 +674,7 @@ def available_execution_drivers() -> tuple[str, ...]:
 
 __all__ = (
     "DEFAULT_EXECUTION_RUNTIMES",
+    "GPU_RANK_LAYOUT_ENV",
     "ConfiguredExecutionResolver",
     "ExecutionDriverResolver",
     "ExecutionRuntimeRegistry",
@@ -593,4 +682,5 @@ __all__ = (
     "StructuredLogExecutionDriver",
     "available_execution_drivers",
     "create_execution_driver",
+    "gpu_rank_layout_from_environment",
 )
