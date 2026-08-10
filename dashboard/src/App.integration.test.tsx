@@ -202,7 +202,11 @@ function renderApp(client: EyvanApiClient) {
 }
 
 async function showPanel(name: string) {
-  fireEvent.click(screen.getByRole("button", { name }));
+  // findByRole retries; getByRole asserts the render already happened. The
+  // navigation button appears when control-plane state resolves, so querying it
+  // synchronously races a slow machine -- which is how this failed on CI while
+  // passing on every developer machine.
+  fireEvent.click(await screen.findByRole("button", { name }));
   await waitFor(() => expect(screen.getByRole("heading", { name })).toBeDefined());
 }
 
