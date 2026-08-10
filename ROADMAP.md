@@ -37,12 +37,12 @@ entry describes only the named persistence contract, never the whole capability.
 | explain and launch-latency reporting | C; historical samples only | query contracts | U | U; no guaranteed ETA | workspace journal |
 | current pool/class portfolios | C for current surface | policy-state contracts | U | U; broader routes deferred | workspace journal |
 | predictive warmth | P; advisory/off by default | policy-state contracts | U | U: backtest/spend/provider | no qualification receipt |
-| locality-aware cache | C: managed staging, budget, eviction, worker executor | state contracts | U | U: no fleet has staged bytes | no qualification receipt |
-| managed services | C: health with explicit unknown, replica lifecycle, bounded autoscaling | persistence contracts | U | U: no deployed service | no qualification receipt |
+| locality-aware cache | C: managed staging, budget, eviction, worker executor, multi-host slice fan-out | state contracts | U | U: no fleet has staged bytes | no qualification receipt |
+| managed services | C: health with explicit unknown, replica lifecycle, bounded autoscaling, HTTP routes and CLI | persistence contracts | U | U: no deployed service | no qualification receipt |
 | batch, DAG, and groups | C: admission ceiling, bounded waves, atomic heterogeneous placement | persistence contracts | U | U: no fleet-scale run | no qualification receipt |
 | economics and carbon | P/advisory | persistence contracts | U | U: prices/reconciliation/webhooks/carbon source | no qualification receipt |
 | artifact lifecycle | C | C: exact M1.6 receipt | U | U: GCS/destructive collection | workspace M1.6 PostgreSQL receipt only |
-| CPU/GPU configs and coordinated groups | C: GPU catalog, per-rank devices, reached from an observation | n/a | U | U: no GPU has executed | no qualification receipt |
+| CPU/GPU configs and coordinated groups | C: GPU catalog, per-rank devices including several ranks per host, reached from an observation | n/a | U | U: no GPU has executed; no per-lease device isolation | no qualification receipt |
 | provider plugins | C: published ABI, conformance suite, on-prem provider | n/a | U | U: no external provider written | static evidence only |
 | secret delivery and workload identity | secret delivery C; provider identity P | C: dispatch transactions | U | U: identity/rotation/metadata/mTLS | workspace journal; no provider receipt |
 | federation | D/off | local-record tests only | U | U: PKI/witness/failover absent | design record only |
@@ -95,7 +95,7 @@ entry describes only the named persistence contract, never the whole capability.
 3. **Partial, soft placement hints only: Locality-aware caches.** Cache runtime images, callable artifacts,
    datasets, and checkpoints near workers; make cache state a placement input
    without weakening tenant isolation.
-4. **Partial: Services as a workload kind.** Add long-lived deployments, health checks,
+4. **Partial; health and decisions now reachable over HTTP and the CLI: Services as a workload kind.** Add long-lived deployments, health checks,
    rolling updates, request/queue/accelerator-utilization autoscaling, and
    explicit disruption budgets.
 5. **Partial: Batch primitives.** Provide map, array-job, and small DAG APIs whose tasks
