@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from eyvan._internal.workspace import create_private_directory
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.worker.runtime.callables import CallableArtifact
 
@@ -141,7 +142,7 @@ class LocalArtifactStore:
         """Write one immutable digest-named object and re-verify what landed."""
 
         target = self.root / kind / f"{sha256}{extension}"
-        target.parent.mkdir(parents=True, exist_ok=True)
+        create_private_directory(target.parent)
         if not target.exists():
             temporary_path: Path | None = None
             try:
@@ -189,7 +190,7 @@ class LocalArtifactStore:
 
         _validate_invocation_id(invocation_id)
         results = self.root / "results"
-        results.mkdir(parents=True, exist_ok=True)
+        create_private_directory(results)
         return (results / f"{invocation_id}.result").as_uri()
 
 

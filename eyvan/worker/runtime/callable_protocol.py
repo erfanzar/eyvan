@@ -322,7 +322,18 @@ class UriArtifactTransfer:
             _request_bytes(request)
             return
         path = _local_path(uri)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # Inlined rather than imported: this module is copied into the OCI
+        # callable runner, which must not import eyvan. mkdir(parents=True)
+        # applies its mode to the leaf only, so each level is made explicitly.
+        _missing: list[Path] = []
+        _current = path.parent
+        while not _current.exists():
+            _missing.append(_current)
+            if _current.parent == _current:
+                break
+            _current = _current.parent
+        for _directory in reversed(_missing):
+            _directory.mkdir(mode=0o700, exist_ok=True)
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
             temporary.write(payload)
             temporary.flush()

@@ -341,7 +341,7 @@ def extract_workspace(
             f"workspace destination {root} is not empty; extraction never removes files, and a leftover "
             "module from a previous bundle would stay importable"
         )
-    root.mkdir(parents=True, exist_ok=True)
+    create_private_directory(root)
 
     written = 0
     members = 0

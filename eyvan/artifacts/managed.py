@@ -31,6 +31,7 @@ from urllib.request import url2pathname
 import httpx
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.workspace import create_private_directory
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims, verify_signature
 
 _CALLABLE_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -854,7 +855,7 @@ class LocalManagedArtifactStore:
 
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        create_private_directory(self.root)
 
     @staticmethod
     def _directory_open_flags() -> int:

@@ -29,6 +29,7 @@ from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.drivers.base import (
     ExecutionWorkloadObservation,
     ExecutionWorkloadStatus,
@@ -119,7 +120,7 @@ def _record_name(remote_id: str) -> str:
 
 
 def _atomic_write_json(path: Path, value: tp.Mapping[str, JsonValue]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    create_private_directory(path.parent)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -146,7 +147,7 @@ def _load_json(path: Path) -> JsonObject | None:
 
 @contextmanager
 def _file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    create_private_directory(path.parent)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
@@ -211,7 +212,7 @@ def _persisted_message(remote_id: str, record: tp.Mapping[str, JsonValue]) -> st
 
 
 def _owner_active(owner_path: Path) -> bool:
-    owner_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    create_private_directory(owner_path.parent)
     descriptor = os.open(owner_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
@@ -441,7 +442,7 @@ class LocalProcessExecutor:
         self.owners_dir = self.state_dir / "owners"
         self.workloads_dir = self.state_dir / "workloads"
         for directory in (self.state_dir, self.jobs_dir, self.logs_dir, self.owners_dir, self.workloads_dir):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            create_private_directory(directory)
             directory.chmod(0o700)
         self._lock = RLock()
         # Retaining direct children until terminal state lets this live worker

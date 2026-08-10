@@ -74,6 +74,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.workspace import create_private_directory
 
 logger = logging.getLogger(__name__)
 
@@ -646,8 +647,8 @@ class LocalAssetStageExecutor:
                 verdict=AssetStageVerdict.REFUSED,
                 detail=f"asset needs {declared} bytes; this cell may admit {max_bytes}",
             )
-        paths.partial.parent.mkdir(parents=True, exist_ok=True)
-        paths.published.parent.mkdir(parents=True, exist_ok=True)
+        create_private_directory(paths.partial.parent)
+        create_private_directory(paths.published.parent)
         resume = paths.partial.stat().st_size if paths.partial.is_file() else 0
         if resume > declared:
             # The source is shorter than what is already on disk, so it is not
@@ -728,7 +729,7 @@ class LocalAssetStageExecutor:
         permanently wrong cannot fill the disk by being retried.
         """
 
-        paths.quarantined.parent.mkdir(parents=True, exist_ok=True)
+        create_private_directory(paths.quarantined.parent)
         os.replace(source, paths.quarantined)
         logger.warning(
             "quarantined asset %s: declared %s, observed %s; kept at %s",

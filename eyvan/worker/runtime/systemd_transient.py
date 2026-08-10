@@ -30,6 +30,7 @@ from pathlib import Path
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.drivers.base import (
     ExecutionWorkloadObservation,
     ExecutionWorkloadStatus,
@@ -251,7 +252,7 @@ def _open_directory_no_follow(directory: Path) -> int:
 def _ensure_private_directory(directory: Path) -> None:
     """Create or tighten one process-owned runtime-state directory safely."""
 
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    create_private_directory(directory)
     try:
         descriptor = _open_directory_no_follow(directory)
     except OSError:

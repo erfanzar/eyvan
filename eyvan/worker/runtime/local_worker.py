@@ -18,6 +18,7 @@ from pathlib import Path
 from types import FrameType
 
 from eyvan._internal.json_types import JsonObject
+from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
 from eyvan.worker.runtime.local_process import _mutate_record, _read_record, _utcnow
 
@@ -28,7 +29,7 @@ _STOP_GRACE_S = 30.0
 
 
 def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str) -> int:
-    owner_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    create_private_directory(owner_path.parent)
     owner_descriptor = os.open(owner_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(owner_descriptor, 0o600)
     fcntl.flock(owner_descriptor, fcntl.LOCK_EX)
@@ -88,7 +89,7 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
             current["started_at"] = _utcnow()
 
         _mutate_record(record_path, running)
-        log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        create_private_directory(log_path.parent)
         # Create the log with owner-only permissions from birth: a plain open
         # followed by chmod leaves a window where workload output is readable
         # under the process umask. fchmod also tightens a pre-existing file,

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import click
 
+from eyvan._internal.workspace import create_private_directory
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.soak_contract import (
@@ -422,7 +423,7 @@ class ConfigCapture:
         """Atomically create and verify a read-only content-addressed snapshot."""
 
         snapshot_root = Path(root)
-        snapshot_root.mkdir(parents=True, exist_ok=True)
+        create_private_directory(snapshot_root)
         target = snapshot_root / self.combined_sha256.removeprefix("sha256:")
         manifest = {
             "schema": "eyvan.soak.config-snapshot.v1",

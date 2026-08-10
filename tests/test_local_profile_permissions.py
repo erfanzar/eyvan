@@ -79,3 +79,47 @@ def test_an_existing_directory_is_left_exactly_as_it_is(tmp_path) -> None:
     create_private_directory(existing)
 
     assert _mode(existing) == 0o755
+
+
+def test_the_artifact_store_does_not_widen_the_profile_directory(tmp_path, permissive_umask) -> None:
+    """The default artifact store lives at ``~/.eyvan/managed-artifacts``.
+
+    It created its tree with no mode at all, so it -- not the autoscale cache --
+    was what actually locked a clean CI runner out of its own profile directory.
+    """
+
+    from eyvan.artifacts.managed import LocalManagedArtifactStore
+
+    profile = tmp_path / ".eyvan"
+    LocalManagedArtifactStore(profile / "managed-artifacts")
+
+    assert not _mode(profile) & 0o077
+    assert not _mode(profile / "managed-artifacts") & 0o077
+
+
+def test_the_staged_callable_runner_imports_only_files_that_travel_with_it() -> None:
+    """``callable_protocol`` is copied flat into the OCI runner directory.
+
+    It may import a module only if the stager stages that module too, and only
+    through the sibling-first form that survives being flattened. Importing the
+    shared directory helper would have been the tidy change; it broke every
+    staged callable, which is why that one walk is inlined.
+    """
+
+    import ast
+    import pathlib as _pathlib
+
+    from eyvan.worker.runtime import callable_protocol, oci_callable_stager
+
+    staged = {
+        "http_retry",
+        "workspace",
+        _pathlib.Path(oci_callable_stager.OCI_CALLABLE_PROTOCOL_FILENAME).stem,
+    }
+    tree = ast.parse(_pathlib.Path(callable_protocol.__file__).read_text(encoding="utf-8"))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("eyvan"):
+            assert node.module is not None
+            leaf = node.module.rsplit(".", 1)[-1]
+            assert leaf in staged, f"callable_protocol imports {node.module}, which the stager does not stage"
