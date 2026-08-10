@@ -64,6 +64,7 @@ from eyvan.worker.agent.models import (
     WorkloadObservation,
     WorkloadRequest,
 )
+from eyvan.worker.runtime.native_slice import MultiHostStageCapableDriver
 from eyvan.worker.runtime.registry import (
     ExecCapableExecutionDriver,
     IntrospectableExecutionDriver,
@@ -93,9 +94,15 @@ _HOST_LOCAL_EXECUTION_BACKENDS = frozenset({"native-local"})
 #: driver can stage is a question asked of the driver -- a resolved executor
 #: that does not satisfy
 #: :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver` reads as no
-#: executor. That is what a multi-host native slice does today: it spans several
-#: workers with no single disk this agent could name, so it stages nothing until
-#: something teaches it which host an asset belongs on.
+#: executor.
+#:
+#: A cell with several hosts answers it differently from one with a single host,
+#: which is why there are two questions in ``_remote_stager`` rather than one. A
+#: slice has no single disk to name, so it does not satisfy that protocol
+#: directly; it satisfies
+#: :class:`~eyvan.worker.runtime.native_slice.MultiHostStageCapableDriver`
+#: instead and hands back a view bound to the generation this agent just fenced
+#: against, which then fans every action to every one of its machines.
 _REMOTE_STAGING_EXECUTION_BACKENDS = frozenset({"eyvan-native"})
 
 #: What one staging verdict is called on the wire.
@@ -696,7 +703,11 @@ class CellAgentService:
         Fenced before the hop, never after. For ``eyvan-native`` the executor is
         on another machine, so the check has to happen on the way out: a request
         forwarded first and fenced afterwards would already have written bytes
-        to a host it does not own.
+        to a host it does not own. A cell with several machines is fenced here
+        once, before any of them is contacted, and then again between hosts by
+        the view :meth:`_remote_stager` binds -- a fetch is minutes long, and a
+        fan-out that began under a generation this agent no longer owns must
+        stop rather than finish writing to somebody else's machines.
 
         Raises:
             UnsupportedCapabilityError: There is no executor for this cell's
@@ -740,7 +751,7 @@ class CellAgentService:
         )
 
     def _remote_stager(self, cell_id: str, observation: CellObservation) -> CellStageDriver:
-        """Return the route to the disk the workload on this cell will actually read.
+        """Return the route to the disk (or disks) the workload on this cell will read.
 
         The already-fenced observation is passed in rather than re-read. It is
         the same object the generation check just ran against, so the driver
@@ -748,19 +759,49 @@ class CellAgentService:
         ``observe`` would be a second provider round trip per staging action,
         against a machine that had no reason to have moved in between.
 
+        A cell with several hosts is resolved first and separately. It has no
+        single disk to forward to, so it does not satisfy ``AssetStageDriver``
+        directly; it hands back a view bound to the generation checked above,
+        which fans each action to every one of its machines and reduces the
+        answers to one. Binding it here rather than caching it is the point:
+        the slice executor itself is cached across generations, and a staging
+        surface hanging off it would carry no fence.
+
         Raises:
             UnsupportedCapabilityError: The resolved execution driver does not
-                stage. A multi-host native slice is the live example: it spans
-                several workers, and this agent has no basis for choosing which
-                one an asset belongs on.
+                stage at all -- a backend with no staging surface of either
+                shape. Read as absence of a capability, never as a failure.
         """
 
         driver = self.executors.resolve(cell_id, observation)
+        if isinstance(driver, MultiHostStageCapableDriver):
+            return driver.asset_stage_driver(
+                generation=observation.generation,
+                fence=lambda: self._staging_fence(cell_id),
+            )
         if not isinstance(driver, AssetStageDriver):
             raise UnsupportedCapabilityError(
                 f"the {self.execution_backend!r} execution driver for cell {cell_id!r} does not stage assets"
             )
         return driver
+
+    def _staging_fence(self, cell_id: str) -> int:
+        """Return the generation this agent currently believes owns one cell.
+
+        The re-check a multi-host fan-out makes between hosts, read from the
+        same place the first check was: an agent that fenced against its
+        capacity record and then re-checked against something else could
+        contradict itself halfway through a fetch.
+
+        Raises:
+            StaleMutationError: The cell is gone from this agent, which is not a
+                generation and must not be reported as one.
+        """
+
+        observation = self.capacity.observe(cell_id)
+        if observation.state is CapacityStatus.ABSENT:
+            raise StaleMutationError(f"cell {cell_id!r} no longer exists on this agent")
+        return observation.generation
 
     def _executor(self, cell_id: str) -> ExecutionDriver:
         return self.executors.resolve(cell_id, self.capacity.observe(cell_id))

@@ -3,7 +3,51 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Coordinated native execution across every host in one TPU slice group."""
+"""Coordinated native execution across every host in one TPU slice group.
+
+A slice is *one cell with several machines*. Every other layer treats it as a
+single unit -- one fence, one lease, one stage row -- while the bytes and the
+processes live on `n` hosts, and this module is where the one and the `n` meet.
+
+Managed staging is the second thing to cross that boundary, after execution
+itself. W4 and W5 shipped an executor that puts an asset on a disk and a route
+that reaches the worker owning it, but the agent could only bind a stage driver
+when a cell had exactly *one* worker endpoint. A cell with more resolved to
+:class:`NativeSliceExecutor`, which did not satisfy ``AssetStageDriver``, so it
+read as *no staging executor*: correct, honest, and the reason every real TPU
+slice -- a ``v5p-16`` is already two hosts -- staged nothing at all.
+
+:class:`NativeSliceStageDriver` is the missing half. It fans one action to every
+host and answers once, and the whole of its difficulty is in refusing to
+average:
+
+**Partial success is not success.** A stage row says *this cell holds this
+asset*, and placement is steered by it. Three hosts of four holding a dataset is
+a cell that does not hold it -- rank 3 opens nothing -- so the aggregate is
+unproven, exactly as a truncated single-host fetch is. Unproven still charges
+the budget, because the bytes that did land are on real disks.
+
+**Disagreement is a refusal, not a vote.** Two hosts that hash the same asset
+name to different bytes are not a cell holding one asset; they are two objects
+sharing a name, and a collective that reads them will produce silently wrong
+numbers. The first answer to arrive is not the truth, and neither is the average
+of the sizes.
+
+**Eviction is unanimous or unproven.** A host that could not be reached may
+still hold the bytes, so the row stays charged and stays present rather than
+being deleted on the strength of the hosts that did answer.
+
+**Fenced per host.** The agent checks the cell's generation before any host is
+contacted, and the driver re-checks it between hosts for the two actions that
+touch a disk. A fan-out that began under a generation this agent no longer owns
+stops where it is and reports what it cannot prove, rather than continuing to
+write to machines that belong to somebody else's plan.
+
+Hosts are visited one at a time, as every other fan-out here does. That makes a
+wide, slow stage take the sum of its hosts rather than the longest of them, and
+a fetch that outlives the control plane's patience is reported as unproven --
+never as a false hit.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +67,7 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadResult,
     ExecutionWorkloadStatus,
     MutationContext,
+    UnsupportedCapabilityError,
 )
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime._multihost_site import (
@@ -43,6 +88,7 @@ from eyvan.worker.runtime.log_records import (
     merge_pages,
 )
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageResult, AssetStageVerdict
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
 #: Where a resuming workload is told to read its checkpoint from. Must be
@@ -64,6 +110,24 @@ _RUNNING_STATUSES = frozenset(
     }
 )
 _MutationAction: tp.TypeAlias = tp.Literal["stop", "retire"]
+
+#: How many hosts one aggregated staging detail spells out before it is elided.
+#:
+#: The same bound the retire summary uses, and for the same reason: this string
+#: is persisted in a stage row whose detail column is truncated, and a slice can
+#: be hundreds of hosts wide. Four names are enough to tell an operator which
+#: rank to go and look at.
+_STAGE_SUMMARY_LIMIT = 4
+
+#: Which of the three staging operations one fan-out is performing.
+_StageAction: tp.TypeAlias = tp.Literal["measure", "stage", "evict"]
+
+#: Re-reads the generation that currently owns the cell being staged.
+#:
+#: Supplied by whoever already fenced the request -- the cell agent -- because
+#: this module holds no capacity record of its own. Raising means the fence
+#: could not be established, which is never read as "it still holds".
+StageFence: tp.TypeAlias = tp.Callable[[], int]
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +314,459 @@ def _reported_exit_status(detail: JsonObject) -> int | None:
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
+@dataclass(frozen=True, slots=True)
+class _HostStageAnswer:
+    """What one host of the slice answered about one asset."""
+
+    rank: int
+    endpoint: str
+    result: AssetStageResult
+
+    def describe(self, render: tp.Callable[[AssetStageResult], str] | None = None) -> str:
+        """Render this host's answer for an aggregated detail line.
+
+        ``render`` names the value being compared instead of the verdict, which
+        is what a disagreement has to say. "rank 2 = ok" tells an operator
+        nothing about which machine to go and look at; the digest it answered
+        with does.
+        """
+
+        if render is not None:
+            return f"rank {self.rank} ({self.endpoint})={render(self.result)}"
+        rendered = f"rank {self.rank} ({self.endpoint})={self.result.verdict.value}"
+        detail = self.result.detail.strip()
+        return f"{rendered}: {detail}" if detail else rendered
+
+
+def _observed_digest(result: AssetStageResult) -> str:
+    """Name the digest one host proved, or say that it proved none."""
+
+    return result.digest or "no digest"
+
+
+def _observed_size(result: AssetStageResult) -> str:
+    """Name the number of bytes one host reported."""
+
+    return f"{result.size_bytes} bytes"
+
+
+def _stage_summary(
+    answers: tp.Sequence[_HostStageAnswer],
+    render: tp.Callable[[AssetStageResult], str] | None = None,
+) -> str:
+    """Render a bounded per-host summary of one staging fan-out."""
+
+    rendered = [answer.describe(render) for answer in answers[:_STAGE_SUMMARY_LIMIT]]
+    remaining = len(answers) - _STAGE_SUMMARY_LIMIT
+    if remaining > 0:
+        rendered.append(f"+{remaining} more")
+    return "; ".join(rendered)
+
+
+def _sole_value(values: tp.Sequence[object]) -> tuple[bool, object]:
+    """Return whether every host reported the same thing, and what it was.
+
+    ``(False, None)`` for a disagreement, which every caller treats as a fact
+    about the *cell* rather than as a value to pick a winner from.
+    """
+
+    distinct = set(values)
+    if len(distinct) == 1:
+        return True, next(iter(distinct))
+    return False, None
+
+
+@dataclass(frozen=True, slots=True)
+class _SliceStageFanout:
+    """Every host's answer to one staging action, and whether all were asked."""
+
+    hosts: int
+    answers: tuple[_HostStageAnswer, ...]
+    #: Why the remaining hosts were never contacted. Empty when every one was.
+    stopped: str = ""
+
+    @property
+    def complete(self) -> bool:
+        """Return whether every host in this cell answered."""
+
+        return not self.stopped and len(self.answers) == self.hosts
+
+    def matching(self, verdict: AssetStageVerdict) -> tuple[_HostStageAnswer, ...]:
+        """Return the hosts that answered with one verdict."""
+
+        return tuple(answer for answer in self.answers if answer.result.verdict is verdict)
+
+    def unreached(self) -> AssetStageResult:
+        """Report a fan-out that stopped early as having proved nothing.
+
+        Never a refusal and never a success. The hosts that were asked may hold
+        bytes and the ones that were not may hold anything at all, so the only
+        honest aggregate is that presence on this cell is unknown.
+        """
+
+        detail = f"only {len(self.answers)} of {self.hosts} hosts were asked: {self.stopped}"
+        summary = _stage_summary(self.answers)
+        return AssetStageResult(
+            verdict=AssetStageVerdict.INCONCLUSIVE,
+            detail=f"{detail}; {summary}" if summary else detail,
+        )
+
+
+class NativeSliceStageDriver:
+    """Materialize, measure and remove one named asset on every host of one cell.
+
+    Satisfies :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver`, so
+    an agent forwards to it exactly as it forwards to the single-worker route:
+    the cell is the unit the control plane records, and this is what makes that
+    record true of a cell with more than one machine behind it.
+
+    Bound to the generation the caller fenced against, and constructed per
+    action rather than cached. :class:`NativeSliceExecutor` is cached by the
+    agent's resolver across generations -- the cache key is the endpoint set and
+    the worker credential, not the fence -- so a staging view that outlived one
+    generation would be the way a plan for a replaced machine reaches the
+    machine that replaced it.
+
+    Holds no transport of its own. The per-host executors belong to the slice
+    executor that produced this view, and closing them here would shut the
+    execution path for the workload as a side effect of a cache operation.
+    """
+
+    def __init__(
+        self,
+        workers: tp.Sequence[NativeRemoteExecutor],
+        endpoints: tp.Sequence[str],
+        *,
+        generation: int,
+        fence: StageFence | None = None,
+    ) -> None:
+        """Bind one staging view to the hosts and the generation it may act for.
+
+        Args:
+            workers: One native-worker driver per host, in rank order.
+            endpoints: The matching endpoints, used only to name a host in a
+                result an operator will read.
+            generation: The cell generation this view is allowed to act for.
+            fence: Re-reads the generation that owns the cell now. ``None``
+                disables the between-host re-check, which is what a caller that
+                cannot cheaply re-read its own record must ask for explicitly.
+
+        Raises:
+            ValueError: There are no hosts, or the endpoints do not match them.
+        """
+
+        if len(workers) != len(endpoints):
+            raise ValueError("native slice staging needs one endpoint per worker")
+        if not workers:
+            raise ValueError("native slice staging requires at least one host")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError("native slice staging generation must be a non-negative integer")
+        self._workers = tuple(workers)
+        self._endpoints = tuple(endpoints)
+        self._generation = generation
+        self._fence = fence
+
+    def measure(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult:
+        """Return what this asset would occupy on this cell, fetching nothing."""
+
+        return self._reduce_measure(self._fanout("measure", cell_id, asset, max_bytes=max_bytes, mutating=False))
+
+    def stage(self, cell_id: str, asset: str, *, max_bytes: int) -> AssetStageResult:
+        """Materialize the asset on every host and report what the cell can prove."""
+
+        return self._reduce_stage(self._fanout("stage", cell_id, asset, max_bytes=max_bytes, mutating=True))
+
+    def evict(self, cell_id: str, asset: str) -> AssetStageResult:
+        """Remove the asset from every host, or leave the stage unproven."""
+
+        return self._reduce_evict(self._fanout("evict", cell_id, asset, max_bytes=0, mutating=True))
+
+    def _fanout(
+        self,
+        action: _StageAction,
+        cell_id: str,
+        asset: str,
+        *,
+        max_bytes: int,
+        mutating: bool,
+    ) -> _SliceStageFanout:
+        """Apply one staging action to every host, in rank order.
+
+        ``max_bytes`` is handed to each host unchanged rather than divided among
+        them. A slice holds one copy of the asset per machine and the ledger
+        charges one copy per cell, so the bound the control plane computed is
+        the bound each host must honour; dividing it would refuse an asset that
+        fits every disk it is going to land on.
+
+        ``mutating`` separates the two actions that touch a disk from the one
+        that only asks, and it decides two things.
+
+        The fence is re-read between hosts for a mutating action, and never
+        before the first: the caller checked it immediately before resolving
+        this view, so a second read there would buy nothing and cost a provider
+        round trip. Measuring skips the re-check entirely, because there is no
+        mutation for a moved fence to protect a machine from.
+
+        A host with no staging route is absence of a capability -- *if nothing
+        has happened yet*. Once a mutating action has reached a disk the same
+        answer is no longer "nothing was attempted", and reporting it that way
+        would put an untouched row back for a cell that has already been partly
+        emptied. So after the first host has acted it stops the fan-out and
+        reads as unproven, exactly as an unreachable host does.
+
+        Raises:
+            UnsupportedCapabilityError: A host has no staging route and nothing
+                had been done to any disk. The cell cannot hold an asset one of
+                its machines will not fetch, so this is absence of a capability
+                for the whole cell -- nothing recorded, nothing charged --
+                exactly as it is for a cell with one host.
+        """
+
+        answers: list[_HostStageAnswer] = []
+        for rank, (endpoint, worker) in enumerate(zip(self._endpoints, self._workers, strict=True)):
+            if rank and mutating:
+                moved = self._fence_moved()
+                if moved:
+                    return self._stopped(action, asset, cell_id, rank, answers, moved)
+            try:
+                result = self._act(worker, action, cell_id, asset, max_bytes=max_bytes)
+            except UnsupportedCapabilityError as exc:
+                reason = (
+                    f"rank {rank} of cell {cell_id!r} ({endpoint}) has no staging executor, so this cell has none: {exc}"
+                )
+                if not mutating or not answers:
+                    raise UnsupportedCapabilityError(reason) from exc
+                return self._stopped(action, asset, cell_id, rank, answers, reason)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                result = AssetStageResult(
+                    verdict=AssetStageVerdict.INCONCLUSIVE,
+                    detail=f"native worker {endpoint} could not be asked: {type(exc).__name__}: {exc}",
+                )
+            answers.append(_HostStageAnswer(rank=rank, endpoint=endpoint, result=result))
+        return _SliceStageFanout(hosts=len(self._workers), answers=tuple(answers))
+
+    def _stopped(
+        self,
+        action: _StageAction,
+        asset: str,
+        cell_id: str,
+        rank: int,
+        answers: tp.Sequence[_HostStageAnswer],
+        reason: str,
+    ) -> _SliceStageFanout:
+        """Record a fan-out that stopped at one host, and say so out loud."""
+
+        logger.warning(
+            "native slice %s of %s on cell %s stopped at rank %s after %s hosts: %s",
+            action,
+            asset,
+            cell_id,
+            rank,
+            len(answers),
+            reason,
+        )
+        return _SliceStageFanout(hosts=len(self._workers), answers=tuple(answers), stopped=reason)
+
+    @staticmethod
+    def _act(
+        worker: NativeRemoteExecutor,
+        action: _StageAction,
+        cell_id: str,
+        asset: str,
+        *,
+        max_bytes: int,
+    ) -> AssetStageResult:
+        """Apply one closed staging action to one host."""
+
+        if action == "measure":
+            return worker.measure(cell_id, asset, max_bytes=max_bytes)
+        if action == "stage":
+            return worker.stage(cell_id, asset, max_bytes=max_bytes)
+        if action == "evict":
+            return worker.evict(cell_id, asset)
+        raise ValueError(f"unsupported native slice staging action {action!r}")
+
+    def _fence_moved(self) -> str:
+        """Return why this view no longer owns the cell, or an empty string.
+
+        A fence that cannot be read is treated as moved. It is not evidence that
+        the generation changed, and it is deliberately not evidence that it did
+        not: continuing to write to hosts on the strength of a failed check is
+        how an unobservable state becomes an assumed one.
+        """
+
+        if self._fence is None:
+            return ""
+        try:
+            current = self._fence()
+        except Exception as exc:
+            # Deliberately every exception. The fence is somebody else's
+            # callable, and a fan-out that continued because the check itself
+            # broke in an unforeseen way is the exact failure this guards.
+            return f"the cell's generation could not be re-read: {type(exc).__name__}: {exc}"
+        if current != self._generation:
+            return f"the cell moved to generation {current} while generation {self._generation} was acting"
+        return ""
+
+    def _reduce_measure(self, fanout: _SliceStageFanout) -> AssetStageResult:
+        """Return what the whole cell would have to admit to hold this asset.
+
+        The largest declared size, not the first and not the mean. Hosts
+        legitimately disagree here -- one may already hold the asset and report
+        its own file, another reads the source -- and the number the control
+        plane reserves against has to cover the host that needs the most.
+        Disagreement is therefore reported rather than refused; it is
+        :meth:`_reduce_stage` that treats it as a fact about the bytes, because
+        only there is it an *observation* of what landed.
+        """
+
+        if not fanout.complete:
+            return fanout.unreached()
+        refused = fanout.matching(AssetStageVerdict.REFUSED)
+        if refused:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.REFUSED,
+                detail=(
+                    f"{len(refused)} of {fanout.hosts} hosts will never hold this asset, "
+                    f"so this cell cannot: {_stage_summary(refused)}"
+                ),
+            )
+        unproven = fanout.matching(AssetStageVerdict.INCONCLUSIVE)
+        if unproven:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=(
+                    f"{len(unproven)} of {fanout.hosts} hosts could not say what this asset would cost: "
+                    f"{_stage_summary(unproven)}"
+                ),
+            )
+        sizes = [answer.result.size_bytes for answer in fanout.answers]
+        largest = max(sizes)
+        detail = f"every one of {fanout.hosts} hosts can be asked; the largest declares {largest} bytes"
+        agreed, _ = _sole_value(sizes)
+        if not agreed:
+            detail = f"{detail}; hosts declare {_stage_summary(fanout.answers, _observed_size)}"
+        return AssetStageResult(verdict=AssetStageVerdict.OK, size_bytes=largest, detail=detail)
+
+    def _reduce_stage(self, fanout: _SliceStageFanout) -> AssetStageResult:
+        """Return one answer about the cell, refusing to average its hosts.
+
+        Three hosts of four is not a cache hit. The workload's rank on the
+        fourth machine opens nothing, so the cell does not hold the asset -- and
+        the bytes that did land are on real disks, so the control plane's
+        unproven row keeps charging for them exactly as it does for a truncated
+        single-host fetch.
+        """
+
+        if not fanout.complete:
+            return fanout.unreached()
+        refused = fanout.matching(AssetStageVerdict.REFUSED)
+        if refused:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.REFUSED,
+                detail=(
+                    f"{len(refused)} of {fanout.hosts} hosts refused this asset, so this cell will never hold it: "
+                    f"{_stage_summary(refused)}"
+                ),
+            )
+        unproven = fanout.matching(AssetStageVerdict.INCONCLUSIVE)
+        if unproven:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=(
+                    f"{fanout.hosts - len(unproven)} of {fanout.hosts} hosts staged this asset, so the cell does "
+                    f"not hold it: {_stage_summary(unproven)}"
+                ),
+            )
+        agreed_size, size = _sole_value([answer.result.size_bytes for answer in fanout.answers])
+        if not agreed_size:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.REFUSED,
+                detail=(
+                    "this cell's hosts hold different numbers of bytes under one asset name, so they are not one "
+                    f"asset: {_stage_summary(fanout.answers, _observed_size)}"
+                ),
+            )
+        digests = [answer.result.digest for answer in fanout.answers]
+        if any(digest is None for digest in digests) and any(digest is not None for digest in digests):
+            # Absence of a digest is not disagreement, and manufacturing one
+            # from the hosts that did answer would be inventing the very
+            # evidence this comparison exists to demand.
+            return AssetStageResult(
+                verdict=AssetStageVerdict.INCONCLUSIVE,
+                detail=(
+                    "some of this cell's hosts proved no digest, so its copies cannot be shown to match: "
+                    f"{_stage_summary(fanout.answers, _observed_digest)}"
+                ),
+            )
+        agreed_digest, digest = _sole_value(digests)
+        if not agreed_digest:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.REFUSED,
+                detail=(
+                    "this cell's hosts hold different bytes under one asset name, so they are not one asset: "
+                    f"{_stage_summary(fanout.answers, _observed_digest)}"
+                ),
+            )
+        _, path = _sole_value([answer.result.path for answer in fanout.answers])
+        return AssetStageResult(
+            verdict=AssetStageVerdict.OK,
+            size_bytes=tp.cast(int, size),
+            digest=tp.cast("str | None", digest),
+            detail=f"staged on every one of {fanout.hosts} hosts in this cell",
+            path=tp.cast("str | None", path),
+        )
+
+    def _reduce_evict(self, fanout: _SliceStageFanout) -> AssetStageResult:
+        """Confirm removal only when every host confirmed it.
+
+        Anything short of unanimous is unproven rather than refused, whatever
+        the individual hosts said. The caller's question is whether the bytes
+        are gone from this cell, a host that did not answer may still hold them,
+        and the row that survives an unproven eviction is what stops the ledger
+        claiming a disk it never emptied. The reason each host gave is kept in
+        the detail, and the control plane's attempt budget is what stops an
+        eviction that can never complete from being retried forever.
+        """
+
+        proven = fanout.matching(AssetStageVerdict.OK)
+        if fanout.complete and len(proven) == fanout.hosts:
+            return AssetStageResult(
+                verdict=AssetStageVerdict.OK,
+                size_bytes=sum(answer.result.size_bytes for answer in proven),
+                detail=f"removed from every one of {fanout.hosts} hosts in this cell",
+            )
+        if not fanout.complete:
+            return fanout.unreached()
+        remaining = tuple(answer for answer in fanout.answers if answer.result.verdict is not AssetStageVerdict.OK)
+        return AssetStageResult(
+            verdict=AssetStageVerdict.INCONCLUSIVE,
+            detail=(
+                f"{len(proven)} of {fanout.hosts} hosts confirmed removal, so this asset may still be on the cell: "
+                f"{_stage_summary(remaining)}"
+            ),
+        )
+
+
+@tp.runtime_checkable
+class MultiHostStageCapableDriver(tp.Protocol):
+    """An execution driver that stages across the several hosts of one cell.
+
+    The seam between "this driver can put bytes somewhere" and "this driver
+    knows *where*". A single-worker driver answers the first by satisfying
+    :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver` directly,
+    because its one host is the answer to the second. A slice cannot: it must be
+    told which generation it is acting for before it may touch any of its hosts,
+    so it offers this instead and hands back a view bound to that fence.
+
+    Runtime-checkable for the same reason the rest of ``runtime/registry``'s
+    capability protocols are: a backend that cannot do this says so by not
+    satisfying it, rather than by returning something that looks like a result.
+    """
+
+    def asset_stage_driver(self, *, generation: int, fence: StageFence | None = None) -> AssetStageDriver: ...
+
+
 class NativeSliceExecutor:
     """Fan one fenced workload out to every host in an atomic TPU slice group.
 
@@ -294,6 +811,30 @@ class NativeSliceExecutor:
         """Return whether every host accepts authenticated native-worker requests."""
 
         return all(worker.health() for worker in self._workers)
+
+    def asset_stage_driver(self, *, generation: int, fence: StageFence | None = None) -> NativeSliceStageDriver:
+        """Return a staging view over this slice, bound to one cell generation.
+
+        Deliberately a separate object rather than three more methods on this
+        class. This executor is cached by the agent's driver resolver and
+        outlives a generation bump that leaves the endpoints and the worker
+        credential unchanged, so a staging surface hanging off it directly would
+        carry no fence at all -- and staging is the one cell operation whose
+        wire has no generation of its own to check on arrival.
+
+        Args:
+            generation: The cell generation the caller has already fenced
+                against, and the only one the returned view may act for.
+            fence: Re-reads the generation that owns the cell now, consulted
+                between hosts while an action that touches a disk is in flight.
+
+        Returns:
+            A driver satisfying
+            :class:`~eyvan.worker.runtime.stage_executor.AssetStageDriver` that
+            fans each action to every host in this slice and answers once.
+        """
+
+        return NativeSliceStageDriver(self._workers, self.endpoints, generation=generation, fence=fence)
 
     def _ranked_spec(self, spec: tp.Mapping[str, JsonValue], rank: int) -> JsonObject:
         """Copy one JSON workload spec and add its rank-local environment."""
@@ -681,4 +1222,9 @@ class NativeSliceExecutor:
             worker.close()
 
 
-__all__ = ("NativeSliceExecutor",)
+__all__ = (
+    "MultiHostStageCapableDriver",
+    "NativeSliceExecutor",
+    "NativeSliceStageDriver",
+    "StageFence",
+)
