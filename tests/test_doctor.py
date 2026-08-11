@@ -108,6 +108,10 @@ def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
 
     assert report.ok is True
     assert _by_name(report) == {
+        # A default-host preflight: a loopback server requires nothing beyond
+        # what is already here. tests/test_startup_preflight.py covers the
+        # network bind this check exists for.
+        "server-startup-settings": CheckStatus.PASS,
         "control-plane-url": CheckStatus.PASS,
         "control-plane-reachable": CheckStatus.PASS,
         "controller-mode": CheckStatus.PASS,

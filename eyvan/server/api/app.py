@@ -136,7 +136,11 @@ from eyvan.server.api.schemas import (
 )
 from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
-from eyvan.server.api.server_startup import DevelopmentAuthMode, ServerStartupSettings
+from eyvan.server.api.server_startup import (
+    NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY,
+    DevelopmentAuthMode,
+    ServerStartupSettings,
+)
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
 from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
@@ -260,10 +264,11 @@ def _artifact_token_key(settings: EyvanSettings) -> bytes:
             "development process stop verifying as soon as it exits"
         )
         return secrets.token_bytes(32)
-    raise ValueError(
-        "EYVAN_ARTIFACT_TOKEN_KEY must be set when the Eyvan repository backend is not local; an ephemeral "
-        "per-process signing key would break managed-artifact token validation across replicas and restarts"
-    )
+    # The same sentence the network-bind preflight lists, from the same constant.
+    # A loopback bind reaches only this refusal, so the two must not drift: an
+    # operator who fixed what `eyvan doctor` reported would otherwise meet a
+    # differently worded version of a requirement they had already satisfied.
+    raise ValueError(NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY)
 
 
 def create_app(

@@ -131,9 +131,12 @@ def test_network_startup_requires_an_explicit_postgres_repository(monkeypatch) -
     bind = ServerBindPolicy.from_host("0.0.0.0")
     monkeypatch.delenv("EYVAN_DEV_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("EYVAN_REPOSITORY_BACKEND", raising=False)
-    # A network bind separately requires a metrics token; this test is about the
-    # repository, so satisfy that requirement rather than assert it here.
+    # A network bind separately requires a metrics token and an artifact signing
+    # key; this test is about the repository, so satisfy those requirements
+    # rather than assert them here. tests/test_startup_preflight.py asserts that
+    # all three are reported together.
     monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
+    monkeypatch.setenv("EYVAN_ARTIFACT_TOKEN_KEY", "k" * 32)
 
     with pytest.raises(ValueError, match="EYVAN_REPOSITORY_BACKEND=postgres"):
         ServerStartupSettings.from_environment(bind)

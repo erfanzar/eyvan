@@ -4,17 +4,39 @@ A network-bound deployment needs fifteen separately configured things. Local
 `eyvan up` needs none of them; it is a loopback development path, not a remote
 installation recipe.
 
+## Ask before you start
+
+Three of the fifteen are refused at startup rather than defaulted, and they used
+to be discovered one restart at a time. They are now reported together, and the
+same list can be asked for before anything is running:
+
+```bash
+eyvan doctor --server-host 0.0.0.0     # the address eyvan-server will bind
+```
+
+The check reads this machine's `EYVAN_*` environment and reports every
+requirement a server bound to that address would refuse without --
+`EYVAN_REPOSITORY_BACKEND=postgres`, `EYVAN_METRICS_TOKEN`, and
+`EYVAN_ARTIFACT_TOKEN_KEY` -- each with the reason it exists. It exits non-zero
+when any is unsatisfied. With no `--server-host` it answers for `eyvan-server`'s
+own default of `127.0.0.1`, which requires none of them.
+
+The server refuses on exactly the same set, from the same code, in one message
+rather than three. Nothing here is optional on a network bind: a preflight that
+passes is not a substitute for the refusal, it is the same answer delivered
+earlier.
+
 ## The fifteen
 
 | # | What | Why it cannot be defaulted | Missing looks like |
 |---|------|---------------------------|--------------------|
-| 1 | PostgreSQL and `EYVAN_DATABASE_URL` | The local repository has no cross-replica leader election. | Startup refuses a network bind/backend mismatch. |
+| 1 | PostgreSQL and `EYVAN_DATABASE_URL` | The local repository has no cross-replica leader election. | Startup refuses a network bind/backend mismatch, naming `EYVAN_REPOSITORY_BACKEND`. |
 | 2 | The schema, managed by `eyvan-migrate` | Production disables auto-create. Existing-schema changes require maintenance acknowledgement. | Startup reports `SchemaRevisionMismatch`, or the migration safety gate refuses. |
 | 3 | `EYVAN_OIDC_ISSUER` | Development auth is refused on a network bind. | Every request is 401. |
 | 4 | `EYVAN_OIDC_AUDIENCE` | A token for another service must not authenticate here. | IdP-valid tokens are rejected by Eyvan. |
 | 5 | The non-secret `EYVAN_OIDC_DASHBOARD_CLIENT_ID` | The browser is a public PKCE client and must know its client identifier at runtime. | Hosted dashboard login cannot start. |
 | 6 | An IdP `eyvan_grants` claim or durable grants from `eyvan grant add` | Roles need an authoritative source. | Authenticated requests are 403. |
-| 7 | One artifact signing key of at least 32 bytes, identical on every replica | Capability tokens are HMACs. | Intermittent artifact/secret 403s track replica count. |
+| 7 | One artifact signing key of at least 32 bytes, identical on every replica, as `EYVAN_ARTIFACT_TOKEN_KEY` | Capability tokens are HMACs. | Startup refuses a network bind naming the setting; an accepted per-process key would give intermittent artifact/secret 403s tracking replica count. |
 | 8 | `EYVAN_ARTIFACT_STORE_URI` (`gs://...`) | A pod filesystem is not shared. | One replica cannot read another's result. |
 | 9 | `EYVAN_PUBLIC_URL` over HTTPS | Jobs receive capability URLs built from it. | Jobs cannot fetch callables or secrets. |
 | 10 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | A pickled callable executes arbitrary code; empty trusts nobody. | Callable submissions are refused; command workloads still work. |

@@ -14,6 +14,13 @@ Every check reports one of three outcomes and never guesses. ``FAIL`` means a
 submission cannot work; ``WARN`` means it may work but something is
 unconventional; ``SKIP`` means the check could not be run and says why, which is
 deliberately distinct from passing.
+
+One check comes before all of that and asks about this machine instead: given
+the address a server would bind, which of the settings that server requires are
+not configured. It is answered by the same function the server refuses to start
+with, so ``doctor`` cannot report ready for an environment the server will
+reject -- and it can be asked before anything has been started at all, which is
+the moment the question actually matters.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from pydantic import ValidationError
 from eyvan._internal.client_version import client_version
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.capacity.providers.gcp.runtime.profile import DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
+from eyvan.config import EyvanSettings
 from eyvan.records import CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
@@ -37,7 +45,23 @@ from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.terminal import stream_is_terminal
+from eyvan.server.api.server_bind import ServerBindPolicy
+from eyvan.server.api.server_startup import (
+    StartupConfigurationSource,
+    format_requirement_bullets,
+    unsatisfied_startup_requirements,
+)
 from eyvan.server.service.pricing_resolver import audit_price_drift
+
+#: Bind address ``eyvan-server`` uses when ``--host`` is not passed. The startup
+#: check answers for the server this operator would actually start, so its
+#: default has to be that server's default: a loopback plane requires nothing
+#: extra, and reporting network requirements against it would be noise on every
+#: development machine.
+DEFAULT_SERVER_BIND_HOST = "127.0.0.1"
+
+#: One check name, used by the CLI, the JSON report, and the divergence test.
+SERVER_STARTUP_CHECK = "server-startup-settings"
 
 
 def _positive_resource(document: dict[str, JsonValue], name: str) -> bool:
@@ -132,6 +156,72 @@ class DoctorCommandService:
 
     session: CliSession
     renderer: JsonRenderer = field(default_factory=JsonRenderer)
+    server_bind_host: str = DEFAULT_SERVER_BIND_HOST
+
+    def _server_startup_check(self) -> CheckResult:
+        """Report every setting a server bound to ``server_bind_host`` would refuse without.
+
+        The one check here that answers a question about *this machine* rather
+        than about a running control plane, and therefore the only one that is
+        useful before anything has been started. It runs first for that reason:
+        an operator standing a head up has no endpoint to reach yet, and the
+        checks below would all skip.
+
+        The answer comes from ``unsatisfied_startup_requirements``, the same
+        function the server refuses with. A second list here would be a list that
+        drifts, and drift on this surface reads as "doctor says I am ready" a
+        moment before the server says otherwise.
+        """
+
+        try:
+            bind = ServerBindPolicy.from_host(self.server_bind_host)
+        except ValueError as error:
+            return CheckResult(
+                SERVER_STARTUP_CHECK,
+                CheckStatus.FAIL,
+                f"{self.server_bind_host!r} is not a usable bind address: {error}",
+                "pass the address the server will bind, as in `eyvan doctor --server-host 0.0.0.0`",
+            )
+        if bind.is_loopback:
+            # No remedy: a passing check that advertises a flag on every local run
+            # is noise, and the server's own refusal already names this command.
+            return CheckResult(
+                SERVER_STARTUP_CHECK,
+                CheckStatus.PASS,
+                f"a server started here on {bind.host} needs no further configuration",
+            )
+        try:
+            settings = EyvanSettings.from_env()
+        except ValueError as error:
+            return CheckResult(
+                SERVER_STARTUP_CHECK,
+                CheckStatus.FAIL,
+                f"the EYVAN_* environment does not parse: {error}",
+                "correct the setting named above; the server reads the same variables",
+            )
+        missing = unsatisfied_startup_requirements(
+            bind,
+            settings,
+            source=StartupConfigurationSource.ENVIRONMENT,
+        )
+        if not missing:
+            return CheckResult(
+                SERVER_STARTUP_CHECK,
+                CheckStatus.PASS,
+                f"this environment satisfies every requirement of a {bind.host} bind",
+            )
+        noun = "setting" if len(missing) == 1 else "settings"
+        names = ", ".join(requirement.environment_variable for requirement in missing)
+        # "started here", not "is broken": this reads *this* machine's EYVAN_*
+        # environment, which is the environment of the server an operator is
+        # about to start, and says nothing about a plane running elsewhere.
+        return CheckResult(
+            SERVER_STARTUP_CHECK,
+            CheckStatus.FAIL,
+            f"a server started here on {bind.host} would refuse; "
+            f"{len(missing)} {noun} unset or wrong in this environment: {names}",
+            format_requirement_bullets(missing),
+        )
 
     def _endpoint_check(self) -> CheckResult:
         url = self.session.base_url
@@ -587,6 +677,10 @@ class DoctorCommandService:
         """Run every check in dependency order and collect the outcomes."""
 
         report = DoctorReport()
+        # First, and never skipped: it is the only check that answers before a
+        # control plane exists, which is exactly when an operator is standing one
+        # up and every check below would report "unreachable".
+        report.checks.append(self._server_startup_check())
         endpoint = self._endpoint_check()
         report.checks.append(endpoint)
         if endpoint.status is CheckStatus.FAIL:
@@ -618,8 +712,13 @@ class DoctorCommandService:
         if stream_is_terminal(stream):
             for check in report.checks:
                 click.echo(f"  {check.status.value.upper():5} {check.name}  {check.detail}", file=stream)
-                if check.remedy:
-                    click.echo(f"        -> {check.remedy}", file=stream)
+                # A remedy that lists several settings is several lines; printing
+                # it as one would wrap the whole preflight into a wall. Identical
+                # output for every single-line remedy.
+                prefix = "        -> "
+                for line in check.remedy.splitlines():
+                    click.echo(f"{prefix}{line}", file=stream)
+                    prefix = "           "
         self.renderer.emit(report.as_json())
         if not report.ok:
             raise SystemExit(1)
@@ -672,11 +771,17 @@ def _fleet_names(payload: JsonValue) -> tuple[str, ...]:
 
 
 @click.command("doctor")
+@click.option(
+    "--server-host",
+    default=DEFAULT_SERVER_BIND_HOST,
+    show_default=True,
+    help="Bind address to preflight a server for; the same value `eyvan-server --host` takes.",
+)
 @click.pass_obj
-def doctor(session: CliSession) -> None:
+def doctor(session: CliSession, server_host: str) -> None:
     """Check credentials, connectivity, and fleet readiness before submitting."""
 
-    DoctorCommandService(session).run()
+    DoctorCommandService(session, server_bind_host=server_host).run()
 
 
 def register_doctor_commands(group: click.Group) -> None:
@@ -686,6 +791,8 @@ def register_doctor_commands(group: click.Group) -> None:
 
 
 __all__ = (
+    "DEFAULT_SERVER_BIND_HOST",
+    "SERVER_STARTUP_CHECK",
     "CheckResult",
     "CheckStatus",
     "DoctorCommandService",
