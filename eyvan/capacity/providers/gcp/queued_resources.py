@@ -31,7 +31,19 @@ RUNTIME_VERSION_BY_FAMILY = {
     "v5p": "v2-alpha-tpuv5",
     "v6e": "v2-alpha-tpuv6e",
 }
-_BOOTSTRAP_EGRESS_MODES = frozenset({"cloud-nat", "private-google-access", "public-internet"})
+#: How a native worker VM reaches Eyvan's artifacts and control plane. There is
+#: no default: each choice needs infrastructure the operator has to have built
+#: (a Cloud NAT gateway, Private Google Access on the subnet, or an external
+#: address), so guessing one produces a VM that provisions and then never
+#: registers. Also the canonical source for the Compute path and the fleet
+#: schema, which used to keep their own copies of this set.
+BOOTSTRAP_EGRESS_MODES: tuple[str, ...] = ("cloud-nat", "private-google-access", "public-internet")
+
+
+def bootstrap_egress_choices() -> str:
+    """Render the legal ``bootstrap_egress`` values for an operator-facing message."""
+
+    return ", ".join(BOOTSTRAP_EGRESS_MODES)
 
 
 class GcpQueuedResourceState(StrEnum):
@@ -216,7 +228,11 @@ def normalize_tpu_config(desired: tp.Mapping[str, ProviderOptionValue]) -> TpuPr
         raise ValueError("TPU provider options must be a mapping")
     unknown = sorted(str(key) for key in nested if key not in _TPU_OPTION_KEYS)
     if unknown:
-        raise ValueError(f"unknown TPU provider option: {unknown[0]}")
+        # Naming the accepted keys costs one line here and removes a round trip
+        # through the source for whoever typed the wrong one.
+        raise ValueError(
+            f"unknown TPU provider option: {unknown[0]}; accepted keys are {', '.join(sorted(_TPU_OPTION_KEYS))}"
+        )
     options: dict[str, ProviderOptionValue] = dict(nested)
     for key in _TPU_OPTION_KEYS:
         if key in desired:
@@ -256,9 +272,8 @@ def normalize_tpu_config(desired: tp.Mapping[str, ProviderOptionValue]) -> TpuPr
     bootstrap_egress = _string(options.get("bootstrap_egress"), "bootstrap_egress", optional=True)
     if bootstrap_egress is not None:
         bootstrap_egress = bootstrap_egress.lower().replace("_", "-")
-        if bootstrap_egress not in _BOOTSTRAP_EGRESS_MODES:
-            choices = ", ".join(sorted(_BOOTSTRAP_EGRESS_MODES))
-            raise ValueError(f"TPU option 'bootstrap_egress' must be one of: {choices}")
+        if bootstrap_egress not in BOOTSTRAP_EGRESS_MODES:
+            raise ValueError(f"TPU option 'bootstrap_egress' must be one of: {bootstrap_egress_choices()}")
         normalized["bootstrap_egress"] = bootstrap_egress
     return normalized
 

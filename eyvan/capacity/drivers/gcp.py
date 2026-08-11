@@ -43,7 +43,11 @@ from eyvan.capacity.providers.gcp import (
     endpoint_mode_from_metadata,
     normalize_compute_config,
 )
-from eyvan.capacity.providers.gcp.queued_resources import TpuProviderConfig, normalize_tpu_config
+from eyvan.capacity.providers.gcp.queued_resources import (
+    TpuProviderConfig,
+    bootstrap_egress_choices,
+    normalize_tpu_config,
+)
 from eyvan.config import EyvanSettings
 from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 
@@ -992,7 +996,7 @@ class GcpTpuCapacityDriver:
         if not isinstance(egress, str) or not egress:
             raise ValueError(
                 "eyvan-native TPU capacity requires provider_options.bootstrap_egress "
-                "(cloud-nat, private-google-access, or public-internet)"
+                f"(one of: {bootstrap_egress_choices()})"
             )
         if config.get("internal_ips", False) and egress == "public-internet":
             raise ValueError("internal-only eyvan-native TPU capacity cannot use bootstrap_egress=public-internet")
@@ -1360,7 +1364,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         if not isinstance(egress, str) or not egress:
             raise ValueError(
                 "eyvan-native Compute capacity requires provider_options.bootstrap_egress "
-                "(cloud-nat, private-google-access, or public-internet)"
+                f"(one of: {bootstrap_egress_choices()})"
             )
         if config.get("internal_ip_only", True) and egress == "public-internet":
             raise ValueError("internal-only eyvan-native Compute capacity cannot use bootstrap_egress=public-internet")

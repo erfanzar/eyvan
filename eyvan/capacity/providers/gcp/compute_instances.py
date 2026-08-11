@@ -26,10 +26,12 @@ from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
 from eyvan.capacity.providers.gcp.queued_resources import (
+    BOOTSTRAP_EGRESS_MODES,
     GcloudError,
     ProviderObservation,
     ProviderOptionValue,
     Runner,
+    bootstrap_egress_choices,
     decode_gcloud_object,
 )
 
@@ -69,7 +71,6 @@ _INSTANCE_NAME_PATTERN = re.compile(r"[^a-z0-9-]+")
 _NATIVE_SECRET_NAME_PATTERN = re.compile(r"[^a-z0-9-]+")
 _PROJECT_NUMBER_PATTERN = re.compile(r"^[1-9][0-9]*$")
 _GCS_BUCKET_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{1,61}[a-z0-9])?$")
-_BOOTSTRAP_EGRESS_MODES = frozenset({"cloud-nat", "private-google-access", "public-internet"})
 
 
 class GcpComputeInstanceStatus(StrEnum):
@@ -274,7 +275,11 @@ def normalize_compute_config(desired: tp.Mapping[str, ProviderOptionValue]) -> C
         raise ValueError("Compute provider options must be a mapping")
     unknown = sorted(str(key) for key in nested if key not in _COMPUTE_OPTION_KEYS)
     if unknown:
-        raise ValueError(f"unknown Compute provider option: {unknown[0]}")
+        # Naming the accepted keys costs one line here and removes a round trip
+        # through the source for whoever typed the wrong one.
+        raise ValueError(
+            f"unknown Compute provider option: {unknown[0]}; accepted keys are {', '.join(sorted(_COMPUTE_OPTION_KEYS))}"
+        )
     options: dict[str, ProviderOptionValue] = dict(nested)
     for key in _COMPUTE_OPTION_KEYS:
         if key in desired:
@@ -342,9 +347,8 @@ def normalize_compute_config(desired: tp.Mapping[str, ProviderOptionValue]) -> C
     bootstrap_egress = _string(options.get("bootstrap_egress"), "bootstrap_egress", optional=True)
     if bootstrap_egress is not None:
         bootstrap_egress = bootstrap_egress.lower().replace("_", "-")
-        if bootstrap_egress not in _BOOTSTRAP_EGRESS_MODES:
-            choices = ", ".join(sorted(_BOOTSTRAP_EGRESS_MODES))
-            raise ValueError(f"Compute option 'bootstrap_egress' must be one of: {choices}")
+        if bootstrap_egress not in BOOTSTRAP_EGRESS_MODES:
+            raise ValueError(f"Compute option 'bootstrap_egress' must be one of: {bootstrap_egress_choices()}")
 
     if machine_type is None:
         raise AssertionError("required Compute machine type passed validation without a value")

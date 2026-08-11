@@ -231,7 +231,45 @@ own systemd unit already runs. Spot is not offered -- hardware you own is not
 preemptible by a provider, and saying otherwise would let the scheduler make an
 interruption promise with no meaning.
 
-## 8. Known limits
+## 8. `provider_options` on the in-tree GCP backends
+
+`provider_options` is a per-node-type mapping, validated when the fleet config
+is loaded rather than when a VM is created, so a typo fails when
+the configuration is read and not forty seconds into a provision. An unknown
+key is refused with the accepted keys listed in the message.
+
+### `bootstrap_egress` (required for `executor: eyvan-native`)
+
+How a native worker reaches Eyvan's artifact bucket, its control plane, and
+PyPI during bootstrap. There is no default, because every value needs
+infrastructure the operator has to have built already, and guessing one
+produces a VM that provisions successfully and then never registers -- the
+most expensive failure shape this backend has.
+
+| value | what the VM uses | what must already exist |
+|---|---|---|
+| `private-google-access` | Google APIs over internal addresses only | Private Google Access enabled on the subnet. Eyvan additionally stages a wheelhouse, because such a VM cannot reach PyPI. |
+| `cloud-nat` | outbound internet through a NAT gateway, no external address | a Cloud NAT gateway on the subnet's region |
+| `public-internet` | an external IP on the instance | nothing; refused when the node type is also internal-only (`internal_ips` for TPU, `internal_ip_only` for Compute), since that combination cannot egress at all |
+
+`_` is accepted in place of `-` and the value is lowercased, so
+`PRIVATE_GOOGLE_ACCESS` is read as `private-google-access`. Anything else is
+refused naming all three.
+
+```yaml
+node_types:
+  cpu:
+    capacity_backend: gcp-compute
+    executor: eyvan-native
+    provider_options:
+      machine_type: n2-standard-8
+      bootstrap_egress: private-google-access
+```
+
+`eyvan autoscale init` asks the same question interactively and writes the
+answer into the generated fleet.
+
+## 9. Known limits
 
 * **A plugin's backend name is `other` in P8 soak receipts.** `SAFE_CAPACITY_BACKENDS`
   in `soak_contract.py` is a closed vocabulary on purpose -- receipts must not

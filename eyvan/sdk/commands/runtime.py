@@ -7,13 +7,20 @@
 
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import typing as tp
+import zipfile
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 import click
@@ -46,6 +53,30 @@ from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, Local
 _DEFAULT_BUILD_TIMEOUT_S = 300.0
 _VALIDATION_AGENT_SECRET = "a" * 32
 _VALIDATION_NATIVE_WORKER_SECRET = "b" * 32
+_RECORD_HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DIST_INFO_SUFFIX = ".dist-info"
+#: Files an installer writes into ``.dist-info`` that the wheel never carried.
+#: PEP 376 defines the first five and PEP 610 ``direct_url.json``; uv adds two
+#: of its own. Repacking them would make the staged wheel depend on which tool
+#: installed Eyvan rather than on Eyvan.
+_INSTALLER_OWNED_DIST_INFO_FILES = frozenset(
+    {
+        "INSTALLER",
+        "RECORD",
+        "RECORD.jws",
+        "RECORD.p7s",
+        "REQUESTED",
+        "direct_url.json",
+        "uv_build.json",
+        "uv_cache.json",
+    }
+)
+#: A wheel is a zip and a zip stores modification times, so repacking the same
+#: installation twice would otherwise produce two different SHA-256 digests --
+#: and the staged object is content-addressed, so every ``runtime deploy`` would
+#: upload a fresh copy of identical bytes.
+_WHEEL_ENTRY_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+_WHEEL_ENTRY_MODE = 0o644
 
 
 class NativeWorkerWheelBuildError(OSError):
@@ -58,6 +89,20 @@ class GcpRuntimeInitializationError(RuntimeError):
 
 class GcpRuntimeRestartError(RuntimeError):
     """A private native GCP runtime cannot be safely restarted."""
+
+
+class NativeWorkerWheelSource(tp.Protocol):
+    """One local Eyvan wheel plus the temporary directory that holds it."""
+
+    def build(self) -> Path:
+        """Produce the wheel that native workers will install."""
+
+        ...
+
+    def close(self) -> None:
+        """Remove whatever the build left on local disk."""
+
+        ...
 
 
 class UvBuildRunner(tp.Protocol):
@@ -141,7 +186,13 @@ class UvNativeWorkerWheelBuilder:
     ):
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
             raise ValueError("timeout_s must be a positive number")
-        self.package_root = (package_root or _default_package_root()).resolve()
+        resolved_root = package_root if package_root is not None else _default_package_root()
+        if resolved_root is None:
+            raise NativeWorkerWheelBuildError(
+                "`uv build` needs a directory containing pyproject.toml and this Eyvan is not running from a source "
+                "checkout; use InstalledDistributionWheelBuilder, which repacks the installed distribution instead"
+            )
+        self.package_root = resolved_root.resolve()
         self._runner = runner
         self.timeout_s = float(timeout_s)
         self._output_directory: Path | None = None
@@ -191,19 +242,307 @@ class UvNativeWorkerWheelBuilder:
             shutil.rmtree(output_directory, ignore_errors=True)
 
 
-def _default_package_root() -> Path:
-    """Return the directory holding Eyvan's ``pyproject.toml``.
+def _default_package_root() -> Path | None:
+    """Return the directory holding Eyvan's ``pyproject.toml``, or ``None``.
 
     Anchored on the package rather than counted in parent hops: a hop encodes
     how deep this module happens to sit, so regrouping the package silently
     pointed ``uv build`` at a directory with no project file in it.
+
+    ``None`` means this Eyvan was installed rather than checked out. Returning
+    the project-less directory anyway -- which is what this used to do -- made
+    ``uv build`` fail with "does not appear to be a Python project", so the
+    published wheel and every image built from it could not run
+    ``eyvan runtime init`` at all. :func:`native_worker_wheel_builder` reads the
+    ``None`` and repacks the installed distribution instead.
     """
 
     root = Path(eyvan.__file__).resolve().parent.parent
     if (root / "pyproject.toml").is_file():
         return root
-    # An installed wheel has no project file; the caller must supply the root.
-    return root
+    return None
+
+
+def installed_eyvan_distribution() -> metadata.Distribution:
+    """Return the installed distribution that provides the running ``eyvan``.
+
+    The identity check is the point. Staging some *other* installed Eyvan would
+    put code on every worker in the fleet that nobody here is running, and the
+    workload would succeed on it -- the drift ``runtime deploy`` exists to
+    remove, reintroduced one layer down.
+    """
+
+    try:
+        distribution = metadata.distribution("eyvan")
+    except metadata.PackageNotFoundError as exc:
+        raise NativeWorkerWheelBuildError(
+            "Eyvan is importable but is not installed as a distribution, so there is nothing to repack into a "
+            "native-worker wheel; install Eyvan from a wheel or run this command from a source checkout"
+        ) from exc
+    installed = Path(os.fspath(distribution.locate_file("eyvan/__init__.py"))).resolve()
+    running = Path(eyvan.__file__).resolve()
+    if installed != running:
+        raise NativeWorkerWheelBuildError(
+            f"the installed Eyvan distribution provides {installed}, but this process imported {running}; "
+            "staging the installed one would deploy code this command is not running"
+        )
+    return distribution
+
+
+class InstalledDistributionWheelBuilder:
+    """Repack the installed Eyvan distribution into one wheel, with no source tree.
+
+    ``uv build`` needs a project directory and an installed wheel has none, so
+    the distribution this project publishes could not provision a fleet with
+    itself. It needs no project directory: the native-worker wheel *is* this
+    distribution, and every byte of it is already on disk, named and hashed by
+    the installer in ``RECORD``. Repacking those bytes reproduces the wheel that
+    was installed rather than building a second one that might differ from it.
+
+    The result is byte-stable for a given installation, because the staged GCS
+    object is addressed by its SHA-256 and a wheel whose hash moved on every
+    invocation would re-upload identical bytes forever.
+    """
+
+    def __init__(self, distribution: metadata.Distribution):
+        self._distribution = distribution
+        self._output_directory: Path | None = None
+
+    def build(self) -> Path:
+        """Return one repacked wheel in a private temporary directory."""
+
+        self.close()
+        install_root = Path(os.fspath(self._distribution.locate_file(""))).resolve()
+        rows = self._record_rows()
+        dist_info = self._dist_info_directory(rows)
+        self._refuse_files_installed_outside_the_root(rows)
+        recorded = self._recorded_files(rows, dist_info=dist_info, install_root=install_root)
+        if not any(name.startswith("eyvan/") for name, _path, _digest in recorded):
+            raise NativeWorkerWheelBuildError(
+                f"the Eyvan distribution installed at {install_root} records no packaged module files -- an editable "
+                "or otherwise source-linked install cannot be repacked; run this command from its source checkout"
+            )
+        wheel_name = f"{dist_info[: -len(_DIST_INFO_SUFFIX)]}-{self._wheel_tag(install_root / dist_info)}.whl"
+        output_directory = Path(tempfile.mkdtemp(prefix="eyvan-native-worker-"))
+        self._output_directory = output_directory
+        wheel_path = output_directory / wheel_name
+        self._write_wheel(wheel_path, recorded, dist_info=dist_info)
+        return wheel_path
+
+    def close(self) -> None:
+        """Remove the temporary local wheel directory once staging is complete."""
+
+        output_directory = self._output_directory
+        self._output_directory = None
+        if output_directory is not None:
+            shutil.rmtree(output_directory, ignore_errors=True)
+
+    def _record_rows(self) -> tuple[tuple[str, ...], ...]:
+        """Parse the installer-written ``RECORD`` inventory of this distribution."""
+
+        record = self._distribution.read_text("RECORD")
+        if not record:
+            raise NativeWorkerWheelBuildError(
+                "the installed Eyvan distribution has no RECORD, so its installed files cannot be listed; "
+                "reinstall Eyvan from a wheel or run this command from a source checkout"
+            )
+        return tuple(tuple(row) for row in csv.reader(record.splitlines()) if row)
+
+    @staticmethod
+    def _dist_info_directory(rows: tp.Sequence[tp.Sequence[str]]) -> str:
+        """Read the ``.dist-info`` directory name out of RECORD's own entry."""
+
+        for row in rows:
+            name = row[0]
+            if name.endswith(f"{_DIST_INFO_SUFFIX}/RECORD"):
+                return name[: -len("/RECORD")]
+        raise NativeWorkerWheelBuildError(
+            "the installed Eyvan distribution's RECORD does not name its own .dist-info directory"
+        )
+
+    def _refuse_files_installed_outside_the_root(self, rows: tp.Sequence[tp.Sequence[str]]) -> None:
+        """Refuse an installation that put files anywhere but ``site-packages``.
+
+        Console launchers are the one legitimate case, and dropping them is
+        correct: an installer regenerates them from ``entry_points.txt``.
+        Anything else outside the install root came from a wheel ``.data``
+        directory, and this repack cannot tell which scheme it belonged to --
+        so it would quietly stage a wheel that installs less than the one it
+        was made from. Refusing keeps that from being a silent difference.
+        """
+
+        launchers = {
+            entry_point.name
+            for entry_point in self._distribution.entry_points
+            if entry_point.group in ("console_scripts", "gui_scripts")
+        }
+        stray = sorted(
+            row[0]
+            for row in rows
+            if (row[0].startswith("/") or ".." in row[0].split("/"))
+            and row[0].rsplit("/", 1)[-1].removesuffix(".exe") not in launchers
+        )
+        if stray:
+            raise NativeWorkerWheelBuildError(
+                f"the installed Eyvan distribution placed {stray[0]} outside its package directory; that file came "
+                "from a wheel data directory this repack cannot reconstruct, so no native-worker wheel is staged"
+            )
+
+    @classmethod
+    def _recorded_files(
+        cls,
+        rows: tp.Sequence[tp.Sequence[str]],
+        *,
+        dist_info: str,
+        install_root: Path,
+    ) -> tuple[tuple[str, Path, bytes | None], ...]:
+        """Select the RECORD entries a wheel actually carries, in archive order."""
+
+        selected = [
+            (row[0], install_root.joinpath(*row[0].split("/")), cls._recorded_digest(row[1] if len(row) > 1 else ""))
+            for row in rows
+            if cls._is_wheel_member(row[0], dist_info=dist_info)
+        ]
+        selected.sort(key=lambda entry: entry[0])
+        return tuple(selected)
+
+    @staticmethod
+    def _is_wheel_member(name: str, *, dist_info: str) -> bool:
+        """Return whether one RECORD path belongs inside the repacked wheel.
+
+        Console scripts are recorded as ``../../../bin/eyvan``: they live
+        outside the install root, and an installer regenerates them from
+        ``entry_points.txt``. Bytecode is never shipped in a wheel. Everything
+        else under the install root is exactly what the wheel put there.
+        """
+
+        parts = name.split("/")
+        if not name or "\\" in name or "\x00" in name or any(part in ("", ".", "..") for part in parts):
+            return False
+        if name.endswith(".pyc") or "__pycache__" in parts:
+            return False
+        return not (parts[0] == dist_info and "/".join(parts[1:]) in _INSTALLER_OWNED_DIST_INFO_FILES)
+
+    @staticmethod
+    def _recorded_digest(value: str) -> bytes | None:
+        """Decode a RECORD hash, which installers write base64 *or* hex encoded.
+
+        ``None`` means "recorded with a hash this build cannot check", never
+        "recorded wrong": a corrupt SHA-256 is refused rather than skipped.
+        """
+
+        algorithm, separator, encoded = value.partition("=")
+        if not separator or algorithm != "sha256":
+            return None
+        if _RECORD_HEX_SHA256.fullmatch(encoded):
+            return bytes.fromhex(encoded)
+        try:
+            digest = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        except ValueError as exc:
+            raise NativeWorkerWheelBuildError(f"installed Eyvan RECORD has an undecodable SHA-256 {value!r}") from exc
+        if len(digest) != hashlib.sha256().digest_size:
+            raise NativeWorkerWheelBuildError(f"installed Eyvan RECORD has a truncated SHA-256 {value!r}")
+        return digest
+
+    @staticmethod
+    def _wheel_tag(dist_info_path: Path) -> str:
+        """Rebuild the filename tag triple from the installed ``WHEEL`` metadata."""
+
+        wheel_metadata_path = dist_info_path / "WHEEL"
+        try:
+            wheel_metadata = wheel_metadata_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise NativeWorkerWheelBuildError(f"could not read {wheel_metadata_path}: {exc}") from exc
+        columns: tuple[list[str], list[str], list[str]] = ([], [], [])
+        for line in wheel_metadata.splitlines():
+            key, separator, raw_value = line.partition(":")
+            value = raw_value.strip()
+            if not separator:
+                continue
+            if key.strip() == "Root-Is-Purelib" and value.lower() != "true":
+                raise NativeWorkerWheelBuildError(
+                    f"{wheel_metadata_path} declares Root-Is-Purelib {value!r}; a platlib-rooted Eyvan install "
+                    "cannot be repacked without its original .data layout"
+                )
+            if key.strip() != "Tag":
+                continue
+            parts = value.split("-")
+            if len(parts) != 3 or not all(parts):
+                raise NativeWorkerWheelBuildError(f"{wheel_metadata_path} declares an unusable wheel tag {value!r}")
+            for column, part in zip(columns, parts, strict=True):
+                if part not in column:
+                    column.append(part)
+        if not all(columns):
+            raise NativeWorkerWheelBuildError(f"{wheel_metadata_path} declares no wheel tag to name the repack with")
+        return "-".join(".".join(column) for column in columns)
+
+    @classmethod
+    def _write_wheel(
+        cls,
+        wheel_path: Path,
+        recorded: tp.Sequence[tuple[str, Path, bytes | None]],
+        *,
+        dist_info: str,
+    ) -> None:
+        """Write the repacked archive and the fresh RECORD that describes it."""
+
+        record_lines: list[str] = []
+        with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, path, expected in recorded:
+                payload = cls._read_recorded_file(path, name)
+                digest = hashlib.sha256(payload).digest()
+                if expected is not None and digest != expected:
+                    raise NativeWorkerWheelBuildError(
+                        f"installed file {path} does not match the hash RECORD holds for {name}; reinstall Eyvan "
+                        "before staging a native-worker wheel"
+                    )
+                cls._write_entry(archive, name, payload)
+                encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+                record_lines.append(f"{name},sha256={encoded},{len(payload)}")
+            record_name = f"{dist_info}/RECORD"
+            record_lines.append(f"{record_name},,")
+            cls._write_entry(archive, record_name, ("\n".join(record_lines) + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _write_entry(archive: zipfile.ZipFile, name: str, payload: bytes) -> None:
+        """Add one archive member with pinned metadata so repacks stay byte-stable."""
+
+        entry = zipfile.ZipInfo(name, date_time=_WHEEL_ENTRY_DATE_TIME)
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        entry.external_attr = _WHEEL_ENTRY_MODE << 16
+        archive.writestr(entry, payload)
+
+    @staticmethod
+    def _read_recorded_file(path: Path, name: str) -> bytes:
+        """Read one installed file, refusing anything that is not a regular file."""
+
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise NativeWorkerWheelBuildError(
+                f"installed file {path} recorded as {name} is not readable: {exc}"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise NativeWorkerWheelBuildError(f"installed file {path} recorded as {name} must be a regular file")
+        try:
+            return path.read_bytes()
+        except OSError as exc:
+            raise NativeWorkerWheelBuildError(f"could not read installed file {path}: {exc}") from exc
+
+
+def native_worker_wheel_builder() -> NativeWorkerWheelSource:
+    """Return the wheel source this installation can actually use.
+
+    A source checkout still builds from source, so ``runtime deploy`` keeps
+    meaning "deploy what is in this tree". An installed wheel has no project
+    directory for ``uv build`` and needs none, because the native-worker wheel
+    is this same distribution.
+    """
+
+    package_root = _default_package_root()
+    if package_root is not None:
+        return UvNativeWorkerWheelBuilder(package_root=package_root)
+    return InstalledDistributionWheelBuilder(installed_eyvan_distribution())
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,7 +787,7 @@ def _initialize_native_runtime(
 ) -> RuntimeInitializationResult:
     """Build, preflight, stage, and persist one native GCP runtime profile."""
 
-    wheel_builder = UvNativeWorkerWheelBuilder()
+    wheel_builder = native_worker_wheel_builder()
     try:
         initializer = GcpRuntimeInitializer(
             GcpNativeRuntimeProfileStore(profile_path),
@@ -692,7 +1031,7 @@ def _deploy_native_runtime(*, endpoint: ControlPlaneEndpoint, profile_path: Path
     except GcpNativeRuntimeProfileError as exc:
         raise GcpRuntimeDeployError(f"the private native GCP runtime profile is invalid: {exc}") from exc
 
-    wheel_builder = UvNativeWorkerWheelBuilder()
+    wheel_builder = native_worker_wheel_builder()
     try:
         staged = GcpRuntimeBootstrap(wheel_builder).stage_native_worker_wheel(profile)
     except GcpRuntimeBootstrapError as exc:
@@ -759,12 +1098,16 @@ __all__ = (
     "GcpRuntimeInitializationError",
     "GcpRuntimeInitializer",
     "GcpRuntimeRestartError",
+    "InstalledDistributionWheelBuilder",
     "NativeWorkerWheelBuildError",
+    "NativeWorkerWheelSource",
     "RuntimeDeployResult",
     "RuntimeInitializationResult",
     "RuntimeRestartResult",
     "UvNativeWorkerWheelBuilder",
     "initialize_runtime",
+    "installed_eyvan_distribution",
+    "native_worker_wheel_builder",
     "normalize_runtime_artifact_root",
     "register_runtime_commands",
     "restart_runtime",

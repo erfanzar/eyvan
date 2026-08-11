@@ -78,6 +78,9 @@ def deployed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             return replace(profile, native_worker_wheel_uri=STAGED_WHEEL)
 
     class _Builder:
+        def build(self) -> Path:
+            raise AssertionError("the fake bootstrap stages without building")
+
         def close(self) -> None:
             pass
 
@@ -87,7 +90,7 @@ def deployed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return _restart_result()
 
     monkeypatch.setattr(runtime_commands, "GcpRuntimeBootstrap", _Bootstrap)
-    monkeypatch.setattr(runtime_commands, "UvNativeWorkerWheelBuilder", _Builder)
+    monkeypatch.setattr(runtime_commands, "native_worker_wheel_builder", _Builder)
     monkeypatch.setattr(runtime_commands, "_restart_native_runtime", _restart)
     monkeypatch.setattr(runtime_commands, "stale_components", lambda **_kwargs: ())
     return store, calls

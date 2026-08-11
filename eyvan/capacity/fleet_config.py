@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
 from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_backend_agent_family
 from eyvan.capacity.hardware_catalog import shape_for, validate_accelerator_write_boundary
+from eyvan.capacity.providers.gcp.queued_resources import bootstrap_egress_choices
 from eyvan.records import (
     CanonicalCapacityClass,
     CapacityClass,
@@ -685,7 +686,8 @@ class EyvanFleetConfig(FleetConfigModel):
                 options = node_type.compiled_provider_options
                 if not isinstance(options.get("bootstrap_egress"), str) or not options["bootstrap_egress"].strip():
                     raise ValueError(
-                        f"node type {name!r} requires provider_options.bootstrap_egress for eyvan-native bootstrap"
+                        f"node type {name!r} requires provider_options.bootstrap_egress for eyvan-native bootstrap "
+                        f"(one of: {bootstrap_egress_choices()})"
                     )
             runtime = self._resolved_runtime(node_type)
             if not runtime.is_empty and executor != "eyvan-native":

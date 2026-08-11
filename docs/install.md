@@ -178,6 +178,27 @@ production `Dockerfile` builds the static dashboard. From an installed wheel,
 `eyvan dashboard` opens that hosted UI; `eyvan dashboard-dev` is explicitly
 source-checkout-only.
 
+## Provisioning GCP capacity from an installed wheel
+
+`eyvan runtime init` needs one local Eyvan wheel to stage, because a native
+worker installs Eyvan from GCS rather than from PyPI. Where that wheel comes
+from is decided by the installation running the command, and neither case takes
+a flag:
+
+* **A source checkout** builds it with `uv build`, so `eyvan runtime deploy`
+  keeps meaning "deploy what is in this tree". `uv` must be on `PATH`.
+* **An installed wheel** repacks the installed distribution itself. The
+  native-worker wheel *is* this distribution, and the installer already recorded
+  every file and its SHA-256 in `RECORD`, so nothing is rebuilt, no project
+  directory is needed, and `uv` is not required. A file that no longer matches
+  its recorded hash fails the command rather than being staged.
+
+The repack is byte-stable for a given installation, so re-running
+`eyvan runtime init` or `eyvan runtime deploy` resolves to the same
+content-addressed `gs://…/runtime/wheels/<sha256>/<wheel>` object instead of
+uploading identical bytes again. An editable install has no packaged files to
+repack; run the command from its checkout.
+
 ## Capacity behaviour that ships disabled
 
 Four settings gate behaviour that exists but is off, so an upgrade changes
