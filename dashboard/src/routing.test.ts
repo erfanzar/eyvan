@@ -29,3 +29,17 @@ describe("dashboard routing", () => {
     expect(accessibleRoute({ section: "fleet" }, { fleet: true })).toEqual({ section: "fleet" });
   });
 });
+
+describe("the quota section", () => {
+  it("is a first-class route so a zone choice can be linked to", () => {
+    expect(parseRoute("#/capacity")).toEqual({ section: "capacity" });
+    expect(routeHash({ section: "capacity" })).toBe("#/capacity");
+  });
+
+  it("falls back when the identity cannot read the pools the quota is resolved from", () => {
+    // The route resolves its provider project from capacity pool records, so a
+    // reader without fleet authority must not mount it and issue a 403.
+    expect(accessibleRoute(parseRoute("#/capacity"), { capacity: false })).toEqual({ section: "overview" });
+    expect(accessibleRoute(parseRoute("#/capacity"), { capacity: true })).toEqual({ section: "capacity" });
+  });
+});

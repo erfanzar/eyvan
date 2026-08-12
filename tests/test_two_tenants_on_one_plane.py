@@ -108,6 +108,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/capacity/carbon": "fleet-wide grid intensity",
     "GET /api/v1/capacity/warmth": "fleet-wide warm state",
     "GET /api/v1/capacity/launch-latency": "fleet-wide provisioning latency",
+    "GET /api/v1/capacity/quota": "provider quota for the cloud project the fleet's pools declare",
     "GET /api/v1/fleets/{fleet_name}": "one fleet",
     "PUT /api/v1/fleets/{fleet_name}": "declarative fleet apply",
     "DELETE /api/v1/fleets/{fleet_name}": "delete a fleet",
@@ -557,6 +558,9 @@ def test_capacity_administration_is_refused_to_a_tenant_operator(plane: TestClie
         "orphans": plane.get("/api/v1/capacity/orphans", headers=RIVAL),
         "billing": plane.get("/api/v1/capacity/billing", headers=RIVAL),
         "warmth": plane.get("/api/v1/capacity/warmth", headers=RIVAL),
+        # Provider quota describes the cloud project the fleet's pools declare,
+        # which is fleet property rather than any tenant's.
+        "quota": plane.get("/api/v1/capacity/quota", headers=RIVAL),
         "leases": plane.get("/api/v1/leases", headers=RIVAL),
         "fleet-events": plane.get("/api/v1/fleet/events", headers=RIVAL),
         "reconcile": plane.post("/api/v1/system/reconcile", headers=RIVAL),

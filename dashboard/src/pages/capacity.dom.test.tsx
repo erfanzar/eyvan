@@ -1,0 +1,433 @@
+// Copyright (C) 2026 Erfan Zare Chavoshi
+// This file is part of EasyDeL.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// @vitest-environment jsdom
+
+/**
+ * The quota page, rendered.
+ *
+ * The behaviour every assertion here defends is the same one: a quota limit is
+ * not free capacity. Cloud Quotas reports a ceiling for a zone whether or not
+ * Cloud Monitoring has a usage series for it, so a page that renders a missing
+ * usage as `0 in use` advertises a full zone as entirely available -- and
+ * unlike an empty page, that mistake is confidently wrong and expensive to act
+ * on.
+ *
+ * So: an unmeasured zone never enters the sorted table, is never filtered away
+ * by a fit question it cannot answer, and never prints a zero. And every
+ * measured balance is shown with the age of the observation behind it, because
+ * a cached number presented as a live one is the quietest way this page could
+ * mislead.
+ */
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { apiClient } from "../api/client";
+import { formatAgeSeconds } from "../lib/format";
+import type { TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
+import { CapacityPage } from "./CapacityPage";
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+function entry(overrides: Partial<TpuQuotaEntry> = {}): TpuQuotaEntry {
+  return {
+    zone: "us-central2-b",
+    region: "us-central2",
+    generation: "v6e",
+    accelerator_type: "v6e-8",
+    capacity_class: "spot",
+    metric: "tpu.googleapis.com/tpu-v6e-preemptible",
+    chips_per_slice: 8,
+    limit_chips: 32,
+    in_use_chips: 16,
+    free_chips: 16,
+    free_slices: 2,
+    state: "known",
+    usage_observed_at: "2026-07-29T12:00:00Z",
+    usage_age_s: 300,
+    ...overrides,
+  };
+}
+
+function snapshot(overrides: Partial<TpuQuotaSnapshot> = {}): TpuQuotaSnapshot {
+  return {
+    observed_at: "2026-07-29T12:05:00Z",
+    provider: "gcp",
+    project: "gcp-project",
+    available_projects: ["gcp-project"],
+    status: "ok",
+    refreshed_at: "2026-07-29T12:04:30Z",
+    age_s: 30,
+    cached: false,
+    ttl_s: 120,
+    entries: [entry()],
+    failures: [],
+    ...overrides,
+  };
+}
+
+function renderPage(value: TpuQuotaSnapshot, calls: Array<{ refresh?: boolean } | undefined> = []) {
+  return render(
+    <CapacityPage
+      loadQuota={async (_signal, options) => {
+        calls.push(options);
+        return value;
+      }}
+    />,
+  );
+}
+
+/** The measured table, addressed by the label that describes what it contains. */
+function measuredTable(): HTMLElement {
+  return screen.getByRole("region", { name: "Free capacity by zone" });
+}
+
+function unknownTable(): HTMLElement {
+  return screen.getByRole("region", { name: "Zones with no measurable free balance" });
+}
+
+describe("the quota page", () => {
+  it("reports limit, in use, and free for each zone, type, and purchase class", async () => {
+    renderPage(
+      snapshot({
+        entries: [
+          entry(),
+          entry({
+            zone: "europe-west4-a",
+            region: "europe-west4",
+            capacity_class: "on_demand",
+            metric: "tpu.googleapis.com/tpu-v6e",
+            limit_chips: 8,
+            in_use_chips: 0,
+            free_chips: 8,
+            free_slices: 1,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Provider quota")).toBeDefined());
+    const rows = within(measuredTable()).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(2);
+    // Sorted by free capacity, and Spot is kept apart from on-demand because
+    // they are different provider quotas that cannot be spent interchangeably.
+    const cells = within(rows[0]).getAllByRole("cell").map((cell) => cell.textContent);
+    expect(cells).toEqual(["us-central2-bus-central2", "v6e-8", "Spot", "32", "16", "16", "2 x v6e-8", "5m ago"]);
+    expect(within(rows[1]).getAllByRole("cell")[2].textContent).toBe("On Demand");
+  });
+
+  it("never renders an unmeasured zone as empty, and keeps it out of the sorted table", async () => {
+    // The single most important behaviour on this page. A limit with no usage
+    // series is not a free quota, and a zero here reads as "all 64 are yours".
+    renderPage(
+      snapshot({
+        entries: [
+          entry(),
+          entry({
+            zone: "europe-west4-a",
+            region: "europe-west4",
+            limit_chips: 64,
+            in_use_chips: null,
+            free_chips: null,
+            free_slices: null,
+            state: "usage_unknown",
+            usage_observed_at: null,
+            usage_age_s: null,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Usage unknown")).toBeDefined());
+    const measuredZones = within(measuredTable())
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[0].textContent);
+    expect(measuredZones).toEqual(["us-central2-bus-central2"]);
+
+    const unknownRow = within(unknownTable()).getAllByRole("row")[1];
+    const unknownCells = within(unknownRow).getAllByRole("cell").map((cell) => cell.textContent);
+    expect(unknownCells[0]).toContain("europe-west4-a");
+    // The limit is still worth knowing; the balance is not invented.
+    expect(unknownCells[3]).toBe("64");
+    expect(unknownCells[4]).toBe("unknown");
+    expect(unknownCells.some((text) => text === "0")).toBe(false);
+    expect(unknownCells[5]).toContain("usage unavailable");
+  });
+
+  it("counts unmeasured zones separately instead of folding them into free capacity", async () => {
+    renderPage(
+      snapshot({
+        entries: [
+          entry({ free_chips: 16 }),
+          entry({
+            zone: "europe-west4-a",
+            region: "europe-west4",
+            limit_chips: 64,
+            in_use_chips: null,
+            free_chips: null,
+            free_slices: null,
+            state: "usage_unknown",
+            usage_observed_at: null,
+            usage_age_s: null,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Free chips")).toBeDefined());
+    const freeCard = screen.getByText("Free chips").closest("article");
+    if (!freeCard) throw new Error("the free-capacity metric card is missing");
+    // 16, not 80: the unmeasured limit contributes nothing to a free total.
+    expect(within(freeCard).getByText("16")).toBeDefined();
+    const unknownCard = screen.getByText("Zones with unknown usage").closest("article");
+    if (!unknownCard) throw new Error("the unknown-usage metric card is missing");
+    expect(within(unknownCard).getByText("1")).toBeDefined();
+    expect(screen.getByText("not empty and not full -- nobody could tell")).toBeDefined();
+  });
+
+  it("answers a fit question without letting an unmeasured zone disappear", async () => {
+    // "We could not tell" is a different answer from "it does not fit", and only
+    // one of them should stop an operator trying that zone.
+    renderPage(
+      snapshot({
+        entries: [
+          entry({ zone: "us-central2-b", free_chips: 16, free_slices: 2 }),
+          entry({ zone: "us-east5-a", region: "us-east5", free_chips: 8, in_use_chips: 24, free_slices: 1 }),
+          entry({
+            zone: "europe-west4-a",
+            region: "europe-west4",
+            limit_chips: 64,
+            in_use_chips: null,
+            free_chips: null,
+            free_slices: null,
+            state: "usage_unknown",
+            usage_observed_at: null,
+            usage_age_s: null,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Provider quota")).toBeDefined());
+    fireEvent.change(screen.getByRole("combobox", { name: "Only zones that fit this accelerator type" }), {
+      target: { value: "v6e-8" },
+    });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "How many of that accelerator type" }), {
+      target: { value: "2" },
+    });
+
+    const zones = within(measuredTable())
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[0].textContent);
+    expect(zones).toEqual(["us-central2-bus-central2"]);
+    // The zone with a measured balance of one slice is genuinely excluded.
+    expect(within(measuredTable()).queryByText("us-east5-a")).toBeNull();
+    // The unmeasured zone is still on the page, under its own heading.
+    expect(within(unknownTable()).getByText("europe-west4-a")).toBeDefined();
+  });
+
+  it("says nothing fits while naming the zones nobody could measure", async () => {
+    renderPage(
+      snapshot({
+        entries: [
+          entry({ free_chips: 8, in_use_chips: 24, free_slices: 1 }),
+          entry({
+            zone: "europe-west4-a",
+            region: "europe-west4",
+            limit_chips: 64,
+            in_use_chips: null,
+            free_chips: null,
+            free_slices: null,
+            state: "usage_unknown",
+            usage_observed_at: null,
+            usage_age_s: null,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Provider quota")).toBeDefined());
+    fireEvent.change(screen.getByRole("combobox", { name: "Only zones that fit this accelerator type" }), {
+      target: { value: "v6e-8" },
+    });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "How many of that accelerator type" }), {
+      target: { value: "4" },
+    });
+
+    expect(screen.getByText("No measured zone fits 4 x v6e-8")).toBeDefined();
+    expect(screen.getByText(/could not be measured and are listed below. They are not proven full./)).toBeDefined();
+  });
+
+  it("shows the age of the provider reading rather than presenting it as live", async () => {
+    renderPage(snapshot({ cached: true, age_s: 95 }));
+
+    await waitFor(() => expect(screen.getByText(/Provider read 1m ago/)).toBeDefined());
+    expect(screen.getByText(/cached reading, not re-read for this view/)).toBeDefined();
+  });
+
+  it("marks a reading served past its own refresh window", async () => {
+    // The deadline path: the provider did not answer in time, so the previous
+    // reading was returned. It must not look like a fresh one.
+    renderPage(snapshot({ cached: true, age_s: 900, ttl_s: 120 }));
+
+    await waitFor(() => expect(screen.getByText("Older than the 120s refresh window")).toBeDefined());
+  });
+
+  it("shows how old each usage observation is, per row", async () => {
+    renderPage(snapshot({ entries: [entry({ usage_age_s: 7200 })] }));
+
+    await waitFor(() => expect(screen.getByText("2h ago")).toBeDefined());
+  });
+
+  it("names a failed purchase class instead of quietly reporting only the other one", async () => {
+    renderPage(
+      snapshot({
+        entries: [entry({ capacity_class: "on_demand" })],
+        failures: [{ capacity_class: "spot", reason: "gcloud beta quotas info list failed: PERMISSION_DENIED" }],
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText(/Spot quota could not be read, so no zone below reports it/)).toBeDefined(),
+    );
+    expect(screen.getByText(/PERMISSION_DENIED/)).toBeDefined();
+  });
+
+  it("reports an unreadable snapshot rather than an empty table", async () => {
+    renderPage(
+      snapshot({
+        status: "unavailable",
+        entries: [],
+        failures: [
+          { capacity_class: "spot", reason: "gcloud auth token lookup failed" },
+          { capacity_class: "on_demand", reason: "gcloud auth token lookup failed" },
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getAllByText(/gcloud auth token lookup failed/)).toHaveLength(2));
+    // No summary tile either. "Free chips: 0" beside a failure banner is the
+    // same lie as a zero in a row, one level up.
+    expect(screen.queryByText("Free chips")).toBeNull();
+    expect(screen.getByText("No provider quota could be read")).toBeDefined();
+    expect(
+      screen.getByText(/No zone is counted, listed, or shown as empty, because none of them were read/),
+    ).toBeDefined();
+  });
+
+  it("separates an unconfigured fleet from a fleet with no quota", async () => {
+    renderPage(
+      snapshot({ status: "unconfigured", project: null, available_projects: [], entries: [], refreshed_at: null, age_s: null }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText(/No GCP capacity pool declares a provider project/)).toBeDefined(),
+    );
+    expect(screen.getByText("The provider has not been read")).toBeDefined();
+    // No table and no summary tile, rather than an empty one that reads as
+    // "this fleet has no capacity anywhere".
+    expect(screen.queryByRole("region", { name: "Free capacity by zone" })).toBeNull();
+    expect(screen.queryByText("Free chips")).toBeNull();
+    expect(screen.getByText("This fleet declares no provider project")).toBeDefined();
+  });
+
+  it("reports a request failure instead of rendering a fleet with no capacity", async () => {
+    render(
+      <CapacityPage
+        loadQuota={async () => {
+          throw new Error("Eyvan API request timed out");
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
+    expect(screen.getByText("No zone is shown as empty, because none of them were read.")).toBeDefined();
+  });
+
+  it("re-reads the provider only when asked to", async () => {
+    const calls: Array<{ refresh?: boolean } | undefined> = [];
+    renderPage(snapshot(), calls);
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toEqual({ refresh: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /Re-read provider/ }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toEqual({ refresh: true });
+  });
+
+  it("keeps an unlimited quota out of the free totals it has no number for", async () => {
+    renderPage(
+      snapshot({
+        entries: [
+          entry({
+            zone: "us-east5-a",
+            region: "us-east5",
+            limit_chips: null,
+            in_use_chips: null,
+            free_chips: null,
+            free_slices: null,
+            state: "unlimited",
+            usage_observed_at: null,
+            usage_age_s: null,
+          }),
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("Usage unknown")).toBeDefined());
+    expect(screen.getByText(/no quota ceiling/)).toBeDefined();
+    expect(screen.getByText("No zone reports a measured free balance")).toBeDefined();
+  });
+});
+
+describe("age formatting", () => {
+  it("says unknown rather than inventing a fresh observation", () => {
+    // A row whose usage nobody could read has no age. "0s ago" would present
+    // the absence of a measurement as the most recent possible one.
+    expect(formatAgeSeconds(null)).toBe("unknown");
+    expect(formatAgeSeconds(undefined)).toBe("unknown");
+    expect(formatAgeSeconds(Number.NaN)).toBe("unknown");
+    expect(formatAgeSeconds(-1)).toBe("unknown");
+  });
+
+  it("rounds down so an age is never reported as newer than it is", () => {
+    expect(formatAgeSeconds(0)).toBe("0s ago");
+    expect(formatAgeSeconds(59.9)).toBe("59s ago");
+    expect(formatAgeSeconds(60)).toBe("1m ago");
+    expect(formatAgeSeconds(5399)).toBe("89m ago");
+    expect(formatAgeSeconds(7200)).toBe("2h ago");
+  });
+});
+
+describe("the page and the client method agree", () => {
+  it("loads through the real client method, including the re-read option", async () => {
+    // Not a redundant wiring test: the page receives a loader from App, so a
+    // signature drift between that loader and `apiClient.getTpuQuota` would be
+    // invisible to every test that stubs the loader directly.
+    const spy = vi.spyOn(apiClient, "getTpuQuota").mockResolvedValue(snapshot());
+
+    render(
+      <CapacityPage
+        loadQuota={(signal, options) => apiClient.getTpuQuota(apiClient.getScope(), signal, options)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("Provider quota")).toBeDefined());
+    expect(spy.mock.calls[0][2]).toEqual({ refresh: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /Re-read provider/ }));
+
+    await waitFor(() => expect(spy.mock.calls).toHaveLength(2));
+    expect(spy.mock.calls[1][2]).toEqual({ refresh: true });
+  });
+});

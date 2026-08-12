@@ -971,3 +971,133 @@ describe("workload ordering", () => {
     expect(first).toEqual(["wl-c", "wl-b", "wl-a"]);
   });
 });
+
+describe("provider TPU quota", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function quotaResponse() {
+    return new Response(
+      JSON.stringify({
+        observed_at: "2026-07-29T12:05:00Z",
+        provider: "gcp",
+        project: "gcp-project",
+        available_projects: ["gcp-project"],
+        status: "ok",
+        refreshed_at: "2026-07-29T12:04:00Z",
+        age_s: 60,
+        cached: true,
+        ttl_s: 120,
+        entries: [
+          {
+            zone: "us-central2-b",
+            region: "us-central2",
+            generation: "v6e",
+            accelerator_type: "v6e-8",
+            capacity_class: "spot",
+            metric: "tpu.googleapis.com/tpu-v6e-preemptible",
+            chips_per_slice: 8,
+            limit_chips: 32,
+            in_use_chips: 16,
+            free_chips: 16,
+            free_slices: 2,
+            state: "known",
+            usage_observed_at: "2026-07-29T12:00:00Z",
+            usage_age_s: 300,
+          },
+        ],
+        failures: [],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  it("reads the quota route without asking for a re-read", async () => {
+    const fetch = vi.fn().mockResolvedValue(quotaResponse());
+    vi.stubGlobal("fetch", fetch);
+
+    const snapshot = await new EyvanApiClient("/api/v1", false).getTpuQuota();
+
+    // Quota is a property of the cloud project, not of a tenant scope, so the
+    // request carries no org/project selector -- and the reading it returns
+    // states its own age rather than being presented as live.
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/capacity/quota");
+    expect(snapshot.cached).toBe(true);
+    expect(snapshot.age_s).toBe(60);
+    expect(snapshot.entries[0]).toMatchObject({ free_chips: 16, free_slices: 2, state: "known" });
+  });
+
+  it("asks for a re-read only when the caller does", async () => {
+    const fetch = vi.fn().mockResolvedValue(quotaResponse());
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await client.getTpuQuota(client.getScope(), undefined, { refresh: true, project: "other-project" });
+
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/capacity/quota?project=other-project&refresh=true");
+  });
+
+  it("keeps a missing usage as null rather than decoding it to zero", async () => {
+    // The decode boundary matters as much as the render: a `?? 0` here would
+    // make every renderer downstream honest and still wrong.
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          observed_at: "2026-07-29T12:05:00Z",
+          provider: "gcp",
+          project: "gcp-project",
+          available_projects: [],
+          status: "ok",
+          refreshed_at: "2026-07-29T12:05:00Z",
+          age_s: 0,
+          cached: false,
+          ttl_s: 120,
+          entries: [
+            {
+              zone: "europe-west4-a",
+              region: "europe-west4",
+              generation: "v6e",
+              accelerator_type: "v6e-8",
+              capacity_class: "spot",
+              metric: "tpu.googleapis.com/tpu-v6e-preemptible",
+              chips_per_slice: 8,
+              limit_chips: 64,
+              in_use_chips: null,
+              free_chips: null,
+              free_slices: null,
+              state: "usage_unknown",
+              usage_observed_at: null,
+              usage_age_s: null,
+            },
+          ],
+          failures: [{ capacity_class: "on_demand", reason: "gcloud auth token lookup failed" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const snapshot = await new EyvanApiClient("/api/v1", false).getTpuQuota();
+
+    expect(snapshot.entries[0].free_chips).toBeNull();
+    expect(snapshot.entries[0].limit_chips).toBe(64);
+    expect(snapshot.failures[0].reason).toBe("gcloud auth token lookup failed");
+  });
+
+  it("reports a forbidden quota read as a typed error rather than an empty snapshot", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: "'alice' lacks manage_fleet permission" }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    await expect(new EyvanApiClient("/api/v1", false).getTpuQuota()).rejects.toEqual(
+      expect.objectContaining({ name: "ApiError", status: 403 }),
+    );
+  });
+});

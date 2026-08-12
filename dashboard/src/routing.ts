@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-export type Section = "overview" | "workloads" | "fleet" | "budgets" | "audit";
+export type Section = "overview" | "workloads" | "fleet" | "capacity" | "budgets" | "audit";
 
 export type Route =
   | { section: Section }
@@ -22,7 +22,7 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   if (section === "workloads" && id) {
     return { section: "workloads", workloadId: decodeURIComponent(id) };
   }
-  if (["workloads", "fleet", "budgets", "audit"].includes(section)) {
+  if (["workloads", "fleet", "capacity", "budgets", "audit"].includes(section)) {
     return { section: section as Section };
   }
   return { section: "overview" };

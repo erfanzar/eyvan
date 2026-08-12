@@ -46,6 +46,32 @@ reporting no samples is unmeasured rather than instant. A pool with cells in
 cooldown is not being asked, so its latency figure is frozen at whatever it was
 before the failures started -- which is why that count is on the same line.
 
+## Where can I run this?
+
+```
+eyvan capacity quota                        # provider TPU quota, usage, and free balance
+eyvan capacity quota --fits v6e-8:2         # only zones that fit two of that slice
+eyvan capacity quota --zone us-central2-b   # bound the provider read to one zone
+eyvan capacity quota --refresh              # re-read instead of reusing a cached reading
+```
+
+The same limits and live usage `eyvan autoscale generate` reads, for the person
+choosing a zone rather than only for the generator. Spot and on-demand are
+separate provider quota metrics and are reported separately, because capacity in
+one cannot be spent as the other.
+
+Read the `unknown` rows as carefully as the numbers. A zone can have a published
+quota limit and no usage series behind it, and treating that as zero usage would
+advertise a full zone as entirely free -- so those zones are listed under their
+own heading with no balance at all. They are not proven empty and not proven
+full, and `--fits` keeps them visible rather than answering a question it cannot
+answer.
+
+Every reading states its own age, including a cached one. The provider's usage
+gauge lags by minutes at best, so a balance without its timestamp is a guess
+wearing a number. The same view is on the dashboard's **Quota & capacity** page,
+which reads the same route.
+
 ## Cost
 
 ```

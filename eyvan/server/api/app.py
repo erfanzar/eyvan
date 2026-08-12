@@ -18,7 +18,8 @@ import os
 import secrets
 import typing as tp
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -51,6 +52,12 @@ from eyvan.artifacts.managed import (
 from eyvan.artifacts.secret_capability import SecretCapabilitySigner
 from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
+from eyvan.capacity.autoscale.service import TpuQuotaDiscovery
+from eyvan.capacity.providers.gcp.quota_discovery import (
+    GcloudQuotaError,
+    GcpTpuQuotaDiscovery,
+    TpuQuotaAvailability,
+)
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.identity.rotation import RotatingCredential
@@ -88,6 +95,7 @@ from eyvan.records import (
     WorkloadProgress,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
@@ -130,6 +138,10 @@ from eyvan.server.api.schemas import (
     ServiceEndpointRequest,
     ServiceHealthResponse,
     SessionResponse,
+    TpuQuotaEntry,
+    TpuQuotaFailure,
+    TpuQuotaSnapshot,
+    TpuQuotaStatus,
     WorkloadEstimateRequest,
     WorkloadExecRequest,
     WorkloadSubmitRequest,
@@ -205,6 +217,144 @@ _LOG_STREAM_POLL_S = 1.0
 #: Bound on remembered event ids used to suppress the duplicates that lookback
 #: necessarily re-reads. Comfortably larger than the lookback window.
 _AUDIT_STREAM_DEDUPE_LIMIT = 4096
+
+#: How long one provider TPU quota reading is reused before it is read again.
+#:
+#: Cloud Monitoring's allocation-usage gauge is minutes behind reality anyway,
+#: so a shorter window would buy no accuracy and would let one dashboard turn a
+#: page refresh into a burst of `gcloud` calls. Every response carries the age
+#: of its reading, so reuse is stated rather than hidden.
+TPU_QUOTA_CACHE_TTL_S = 120.0
+
+#: How long a request waits for a provider read before answering without it.
+#:
+#: Quota discovery lists accelerator types per zone and can take minutes on a
+#: project with many quota zones. A browser must not hang on that: past the
+#: deadline the request answers with the previous reading and its real age, or
+#: with a stated failure, while the read continues in the background and lands
+#: in the cache for the next caller.
+TPU_QUOTA_READ_DEADLINE_S = 25.0
+
+
+@dataclass(frozen=True, slots=True)
+class _TpuQuotaReading:
+    """One provider quota read for a single purchase class, or its failure."""
+
+    capacity_class: CapacityClass
+    refreshed_at: datetime
+    rows: tuple[TpuQuotaAvailability, ...] = ()
+    failure: str | None = None
+    cached: bool = False
+
+
+def _read_tpu_quota(
+    discovery: TpuQuotaDiscovery,
+    *,
+    project: str,
+    zones: tuple[str, ...],
+    capacity_class: CapacityClass,
+) -> _TpuQuotaReading:
+    """Read one purchase class, turning a provider failure into a stated reason.
+
+    A raised error here would become a 500 for a read-only panel, which reads
+    as "the control plane is broken" when the truth is almost always "this host
+    cannot talk to the provider". The reason is carried instead.
+    """
+
+    try:
+        rows = discovery.discover(project=project, zones=zones, preemptible=capacity_class is CapacityClass.SPOT)
+    except (GcloudQuotaError, OSError, ValueError) as exc:
+        return _TpuQuotaReading(capacity_class=capacity_class, refreshed_at=utcnow(), failure=str(exc))
+    return _TpuQuotaReading(capacity_class=capacity_class, refreshed_at=utcnow(), rows=tuple(rows))
+
+
+class TpuQuotaCache:
+    """Single-flight, age-stating cache over read-only provider quota discovery.
+
+    Two properties matter and neither is optional. Concurrent callers share one
+    provider read, so a dashboard with several tabs open cannot multiply into a
+    burst of `gcloud` invocations. And a reading that is served again is
+    returned marked as reused, so the route can report its true age instead of
+    presenting it as a fresh observation.
+    """
+
+    def __init__(self, *, ttl_s: float = TPU_QUOTA_CACHE_TTL_S, deadline_s: float = TPU_QUOTA_READ_DEADLINE_S):
+        if ttl_s < 0:
+            raise ValueError("ttl_s must not be negative")
+        if deadline_s <= 0:
+            raise ValueError("deadline_s must be positive")
+        self.ttl_s = ttl_s
+        self.deadline_s = deadline_s
+        self._readings: dict[tuple[str, tuple[str, ...], CapacityClass], _TpuQuotaReading] = {}
+        self._inflight: dict[tuple[str, tuple[str, ...], CapacityClass], asyncio.Task[_TpuQuotaReading]] = {}
+        self._lock = asyncio.Lock()
+
+    async def read(
+        self,
+        *,
+        discovery: TpuQuotaDiscovery,
+        project: str,
+        zones: tuple[str, ...],
+        capacity_class: CapacityClass,
+        refresh: bool = False,
+    ) -> _TpuQuotaReading:
+        """Return a fresh reading, a shared in-flight one, or a dated older one."""
+
+        key = (project, zones, capacity_class)
+        async with self._lock:
+            reading = self._readings.get(key)
+            if reading is not None and not refresh and (utcnow() - reading.refreshed_at).total_seconds() < self.ttl_s:
+                return replace(reading, cached=True)
+            task = self._inflight.get(key)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._refresh(
+                        key,
+                        discovery=discovery,
+                        project=project,
+                        zones=zones,
+                        capacity_class=capacity_class,
+                    )
+                )
+                self._inflight[key] = task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), self.deadline_s)
+        except TimeoutError:
+            # The read is still running and will populate the cache. Answering
+            # with the previous reading and its real age beats hanging, and
+            # beats an empty table that reads as "no capacity anywhere".
+            if reading is not None:
+                return replace(reading, cached=True)
+            return _TpuQuotaReading(
+                capacity_class=capacity_class,
+                refreshed_at=utcnow(),
+                failure=(
+                    f"provider quota discovery for {project!r} did not answer within "
+                    f"{self.deadline_s:.0f}s; it is still running and a later read will report it"
+                ),
+            )
+
+    async def _refresh(
+        self,
+        key: tuple[str, tuple[str, ...], CapacityClass],
+        *,
+        discovery: TpuQuotaDiscovery,
+        project: str,
+        zones: tuple[str, ...],
+        capacity_class: CapacityClass,
+    ) -> _TpuQuotaReading:
+        """Perform one blocking provider read off the event loop and retain it."""
+
+        reading = await asyncio.to_thread(
+            _read_tpu_quota,
+            discovery,
+            project=project,
+            zones=zones,
+            capacity_class=capacity_class,
+        )
+        async with self._lock:
+            self._readings[key] = reading
+        return reading
 
 
 def _route_label(request: Request) -> str:
@@ -284,14 +434,29 @@ def create_app(
     automatic_loopback_auth: bool = False,
     platform_config: EyvanPlatformConfig | None = None,
     soak_evidence: SoakEvidenceStore | None = None,
+    quota_discovery: TpuQuotaDiscovery | None = None,
 ) -> FastAPI:
     """Build an application with injectable auth, service, and persistence adapters.
 
     Programmatic builds default to a loopback bind; network exposure requires an explicit
     ``server_bind`` (or the ``create_network_app`` factory) and a production configuration.
+
+    ``quota_discovery`` is constructed on first use rather than here, so a plane
+    that never opens the capacity panel never builds a provider client and an
+    injected one is the only thing an offline test can reach.
     """
 
     server_bind = server_bind or ServerBindPolicy.from_host("127.0.0.1")
+    quota_cache = TpuQuotaCache(ttl_s=TPU_QUOTA_CACHE_TTL_S, deadline_s=TPU_QUOTA_READ_DEADLINE_S)
+    resolved_quota_discovery: list[TpuQuotaDiscovery] = [quota_discovery] if quota_discovery is not None else []
+
+    def resolve_quota_discovery() -> TpuQuotaDiscovery:
+        """Return the injected provider reader, or build the default one once."""
+
+        if not resolved_quota_discovery:
+            resolved_quota_discovery.append(GcpTpuQuotaDiscovery())
+        return resolved_quota_discovery[0]
+
     if automatic_loopback_auth:
         if settings is None:
             raise ValueError("automatic loopback authentication requires explicit local daemon settings")
@@ -988,6 +1153,89 @@ def create_app(
         """
 
         return await service.cell_billing_report(principal, pool_id=pool_id)
+
+    @app.get("/api/v1/capacity/quota", response_model=TpuQuotaSnapshot, tags=["capacity"])
+    async def tpu_quota_snapshot(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        project: tp.Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        zone: tp.Annotated[list[str] | None, Query()] = None,
+        refresh: bool = False,
+    ) -> TpuQuotaSnapshot:
+        """Report provider TPU quota, live usage, and free balance per zone and type.
+
+        The numbers ``eyvan autoscale generate`` already reads, answered for the
+        operator choosing where to run instead of only for the generator. Two
+        provider reads back it -- Spot and on-demand are separate quota metrics --
+        and either may fail on its own, so a failed class is reported beside the
+        rows that succeeded rather than collapsing the whole snapshot.
+
+        A zone whose Cloud Monitoring usage series is missing is reported as
+        ``usage_unknown`` with no free balance at all. It is never reported as
+        zero usage, because a quota limit presented as free capacity is the one
+        answer here that costs money to act on.
+
+        Read-only and cached for ``TPU_QUOTA_CACHE_TTL_S``: every response states
+        when the provider was actually read, so a cached number is never
+        presented as a live one. Authorized exactly as the pool listing it reads
+        its provider projects from.
+        """
+
+        pools = await service.list_capacity_pools(principal)
+        projects = sorted(
+            {
+                pool.provider_project
+                for pool in pools
+                if pool.provider == "gcp" and pool.provider_project is not None and pool.provider_project.strip()
+            }
+        )
+        selected = (project or "").strip() or (projects[0] if projects else None)
+        moment = utcnow()
+        if selected is None:
+            return TpuQuotaSnapshot(
+                observed_at=moment,
+                project=None,
+                available_projects=projects,
+                status=TpuQuotaStatus.UNCONFIGURED,
+                ttl_s=TPU_QUOTA_CACHE_TTL_S,
+            )
+        zones = tuple(sorted({value.strip() for value in (zone or []) if value.strip()}))
+        readings = [
+            await quota_cache.read(
+                discovery=resolve_quota_discovery(),
+                project=selected,
+                zones=zones,
+                capacity_class=capacity_class,
+                refresh=refresh,
+            )
+            for capacity_class in (CapacityClass.SPOT, CapacityClass.ON_DEMAND)
+        ]
+        observed_at = utcnow()
+        entries = [
+            TpuQuotaEntry.from_availability(row, capacity_class=reading.capacity_class, observed_at=observed_at)
+            for reading in readings
+            for row in reading.rows
+        ]
+        entries.sort(key=lambda entry: (entry.zone, entry.accelerator_type, entry.capacity_class))
+        failures = [
+            TpuQuotaFailure(capacity_class=reading.capacity_class, reason=reading.failure)
+            for reading in readings
+            if reading.failure is not None
+        ]
+        refreshed_at = min(reading.refreshed_at for reading in readings)
+        return TpuQuotaSnapshot(
+            observed_at=observed_at,
+            project=selected,
+            available_projects=projects,
+            # One failed purchase class is a partial answer, not an unusable one.
+            # Only a snapshot with nothing readable at all is unavailable.
+            status=TpuQuotaStatus.UNAVAILABLE if len(failures) == len(readings) else TpuQuotaStatus.OK,
+            refreshed_at=refreshed_at,
+            age_s=max((observed_at - refreshed_at).total_seconds(), 0.0),
+            cached=any(reading.cached for reading in readings),
+            ttl_s=TPU_QUOTA_CACHE_TTL_S,
+            entries=entries,
+            failures=failures,
+        )
 
     @app.get("/api/v1/artifacts", response_model=list[ManagedArtifactRecord], tags=["artifacts"])
     async def list_managed_artifacts(

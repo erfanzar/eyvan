@@ -126,6 +126,175 @@ def list_capacity(
         )
 
 
+#: Rendered wherever a quota row has no usable usage observation. Never "0":
+#: a missing Cloud Monitoring series says nothing about how full a zone is, and
+#: a zero there is the one wrong answer that costs money to act on.
+UNKNOWN_QUOTA = "unknown"
+
+
+def _quota_number(value: object) -> str:
+    """Render a quota figure, or the explicit unknown marker for a missing one."""
+
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else UNKNOWN_QUOTA
+
+
+def _quota_age(seconds: object) -> str:
+    """Render an observation age in whole units without pretending precision."""
+
+    if not isinstance(seconds, int | float) or isinstance(seconds, bool) or seconds < 0:
+        return UNKNOWN_QUOTA
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m ago"
+    return f"{int(seconds // 3600)}h ago"
+
+
+def _quota_fits(row: dict[str, object], accelerator_type: str | None, count: int) -> bool | None:
+    """Return whether one row fits the request, or ``None`` when unknowable.
+
+    ``None`` is the answer for a row with no measured balance, and it is
+    deliberately not ``False``: "nobody could measure this zone" is a different
+    answer from "this zone does not fit", and only one of them should stop an
+    operator trying it.
+    """
+
+    if accelerator_type is not None and row.get("accelerator_type") != accelerator_type:
+        return False
+    slices = row.get("free_slices")
+    if not isinstance(slices, int) or isinstance(slices, bool):
+        return None
+    return slices >= count
+
+
+def _parse_fits(value: str) -> tuple[str, int]:
+    """Parse ``TYPE`` or ``TYPE:COUNT`` into an explicit shape and multiplicity."""
+
+    accelerator_type, separator, raw = value.strip().partition(":")
+    if not accelerator_type:
+        raise click.ClickException("--fits needs an accelerator type, for example v6e-8 or v6e-8:2")
+    if not separator:
+        return accelerator_type, 1
+    try:
+        count = int(raw)
+    except ValueError as exc:
+        raise click.ClickException("--fits count must be a positive integer, for example v6e-8:2") from exc
+    if count < 1:
+        raise click.ClickException("--fits count must be a positive integer, for example v6e-8:2")
+    return accelerator_type, count
+
+
+@capacity.command("quota")
+@click.option("--project", help="GCP project to read. Defaults to the one this fleet's pools declare.")
+@click.option("--zone", "zones", multiple=True, help="Restrict the provider read to these zones.")
+@click.option("--generation", "generations", multiple=True, help="Only rows for these TPU generations.")
+@click.option(
+    "--capacity-class",
+    "capacity_classes",
+    multiple=True,
+    help="Only spot or on_demand rows. Both are read; this filters what is printed.",
+)
+@click.option("--fits", help="Only zones that fit TYPE or TYPE:COUNT, for example v6e-8:2.")
+@click.option("--refresh", is_flag=True, help="Re-read the provider instead of reusing a cached reading.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def capacity_quota(
+    session: CliSession,
+    project: str | None,
+    zones: tuple[str, ...],
+    generations: tuple[str, ...],
+    capacity_classes: tuple[str, ...],
+    fits: str | None,
+    refresh: bool,
+    as_json: bool,
+) -> None:
+    """Show provider TPU quota, live usage, and free capacity per zone and type.
+
+    The numbers ``eyvan autoscale generate`` already reads, answered for the
+    person choosing where to run. Spot and on-demand are separate provider quota
+    metrics and are reported separately.
+
+    A zone whose usage cannot be read prints ``unknown`` rather than a free
+    balance, and ``--fits`` keeps those rows under a separate heading instead of
+    dropping them: "we could not tell" is a different answer from "it does not
+    fit", and only one of them should stop you trying.
+    """
+
+    params: dict[str, str | list[str]] = {"refresh": "true" if refresh else "false"}
+    if project:
+        params["project"] = project
+    if zones:
+        params["zone"] = list(zones)
+    payload = session.client.request("GET", "/api/v1/capacity/quota", params=params)
+    if not isinstance(payload, dict):
+        raise click.ClickException("control plane returned an unexpected quota response")
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return
+
+    status = payload.get("status")
+    if status == "unconfigured":
+        click.echo("No GCP capacity pool declares a provider project, and --project was not given.")
+        return
+    wanted_generations = {value.strip().lower() for value in generations if value.strip()}
+    wanted_classes = {value.strip().lower().replace("-", "_") for value in capacity_classes if value.strip()}
+    # A zero floor with no type keeps every *measured* row, including one whose
+    # balance is a measured zero -- a full zone is a real answer, unlike an
+    # unmeasured one.
+    fits_type, fits_count = _parse_fits(fits) if fits else (None, 0)
+    raw_rows = payload.get("entries")
+    rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+    rows = [
+        row
+        for row in rows
+        if (not wanted_generations or str(row.get("generation", "")).lower() in wanted_generations)
+        and (not wanted_classes or str(row.get("capacity_class", "")).lower() in wanted_classes)
+    ]
+    fitting = [row for row in rows if _quota_fits(row, fits_type, fits_count) is True]
+    # Unknown usage is reported separately rather than filtered away. A zone
+    # nobody could measure is not a zone that does not fit.
+    unknown = [row for row in rows if _quota_fits(row, fits_type, fits_count) is None]
+
+    project_name = payload.get("project")
+    age = _quota_age(payload.get("age_s"))
+    source = "cached" if payload.get("cached") else "read now"
+    click.echo(f"TPU quota for {project_name or 'the configured project'} -- provider read {age} ({source})")
+    for failure in payload.get("failures") or []:
+        if isinstance(failure, dict):
+            click.echo(f"  {failure.get('capacity_class', 'capacity')} quota could not be read: {failure.get('reason')}")
+    if status == "unavailable":
+        raise click.ClickException("no TPU quota could be read for this project")
+
+    _echo_quota_rows("Free capacity" if not fits else f"Fits {fits_count} x {fits_type}", fitting)
+    _echo_quota_rows("Usage unknown -- not proven empty and not proven full", unknown)
+    if not fitting and not unknown:
+        click.echo("  no quota rows match those filters")
+
+
+def _echo_quota_rows(heading: str, rows: list[dict[str, object]]) -> None:
+    """Print one quota section, leaving an unknown balance explicitly unknown."""
+
+    if not rows:
+        return
+    click.echo(f"\n{heading}:")
+    click.echo(f"  {'ZONE':18} {'TYPE':14} {'CLASS':10} {'LIMIT':>8} {'IN USE':>8} {'FREE':>8} {'SLICES':>7}  USAGE")
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            -(item.get("free_chips") if isinstance(item.get("free_chips"), int) else -1),
+            str(item.get("zone")),
+            str(item.get("accelerator_type")),
+        ),
+    ):
+        click.echo(
+            f"  {row.get('zone', '-')!s:18} {row.get('accelerator_type', '-')!s:14} "
+            f"{row.get('capacity_class', '-')!s:10} "
+            f"{_quota_number(row.get('limit_chips')):>8} {_quota_number(row.get('in_use_chips')):>8} "
+            f"{_quota_number(row.get('free_chips')):>8} {_quota_number(row.get('free_slices')):>7}  "
+            f"{_quota_age(row.get('usage_age_s'))}"
+        )
+
+
 @capacity.command("warmth")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj

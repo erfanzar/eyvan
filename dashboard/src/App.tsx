@@ -24,6 +24,7 @@ import { useLiveRefresh } from "./lib/useLiveRefresh";
 import { useVisibilityPolling } from "./lib/useVisibilityPolling";
 import { AuditPage } from "./pages/AuditPage";
 import { BudgetsPage } from "./pages/BudgetsPage";
+import { CapacityPage } from "./pages/CapacityPage";
 import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { WorkloadDetailPage } from "./pages/WorkloadDetailPage";
@@ -613,6 +614,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
     workloads: canReadSelectedScope || capabilities.submitWorkloads,
     budgets: canReadSelectedScope,
     fleet: capabilities.manageFleet && (data?.access.fleetInventory ?? true),
+    // Provider quota is a property of the cloud project this fleet's pools
+    // declare, so it is gated by the same authority that can read those pools.
+    capacity: capabilities.manageFleet,
     audit: canReadSelectedScope,
   };
   const routed = accessibleRoute(route, sectionAvailability);
@@ -912,6 +916,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
     (signal: AbortSignal) => withAuthorityRefresh(() => client.getLaunchLatency(fleetScope, signal)),
     [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
+  const loadQuota = useCallback(
+    (signal: AbortSignal, options?: { refresh?: boolean }) =>
+      withAuthorityRefresh(() => client.getTpuQuota(fleetScope, signal, options)),
+    [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
+  );
   const explanationScope = selectedWorkload
     ? { orgId: selectedWorkload.org, projectId: selectedWorkload.project }
     : fleetScope;
@@ -997,6 +1006,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadLaunchLatency={loadLaunchLatency}
           />
         );
+        break;
+      case "capacity":
+        content = <CapacityPage loadQuota={loadQuota} />;
         break;
       case "budgets":
         content = (

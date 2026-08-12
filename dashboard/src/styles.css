@@ -1083,6 +1083,18 @@ code,
   font-size: 12px;
 }
 
+/* The multiplicity beside a "fits this accelerator" selector. It sits in the
+   same control row as the selects, so it has to read as one of them. */
+.select-field input[type="number"] {
+  width: 78px;
+  height: 100%;
+  padding: 0 8px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 12px;
+}
+
 .search-field:focus-within,
 .select-field:focus-within,
 .field input:focus,

@@ -271,7 +271,7 @@ def test_the_dashboard_calls_the_panels_it_gained() -> None:
     pages = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src" / "pages").rglob("*.tsx")
     source = "\n".join(page.read_text(encoding="utf-8") for page in pages)
 
-    for method in ("explainWorkload", "getWarmth", "getBilling"):
+    for method in ("explainWorkload", "getWarmth", "getBilling", "getTpuQuota"):
         assert f"apiClient.{method}" in source or f".{method}(" in source, (
             f"apiClient.{method} exists and no page calls it"
         )

@@ -105,6 +105,56 @@ function policyFor(scope: AuthScope): SchedulingPolicy {
   };
 }
 
+/** One measured zone and one nobody could measure, which is the realistic case. */
+function quotaSnapshot() {
+  return {
+    observed_at: "2026-01-01T00:00:00Z",
+    provider: "gcp",
+    project: "gcp-project",
+    available_projects: ["gcp-project"],
+    status: "ok" as const,
+    refreshed_at: "2026-01-01T00:00:00Z",
+    age_s: 0,
+    cached: false,
+    ttl_s: 120,
+    entries: [
+      {
+        zone: "us-central2-b",
+        region: "us-central2",
+        generation: "v6e",
+        accelerator_type: "v6e-8",
+        capacity_class: "spot" as const,
+        metric: "tpu.googleapis.com/tpu-v6e-preemptible",
+        chips_per_slice: 8,
+        limit_chips: 32,
+        in_use_chips: 16,
+        free_chips: 16,
+        free_slices: 2,
+        state: "known" as const,
+        usage_observed_at: "2026-01-01T00:00:00Z",
+        usage_age_s: 120,
+      },
+      {
+        zone: "europe-west4-a",
+        region: "europe-west4",
+        generation: "v6e",
+        accelerator_type: "v6e-8",
+        capacity_class: "spot" as const,
+        metric: "tpu.googleapis.com/tpu-v6e-preemptible",
+        chips_per_slice: 8,
+        limit_chips: 64,
+        in_use_chips: null,
+        free_chips: null,
+        free_slices: null,
+        state: "usage_unknown" as const,
+        usage_observed_at: null,
+        usage_age_s: null,
+      },
+    ],
+    failures: [],
+  };
+}
+
 type FakeOverrides = Partial<{
   getSessionAuthority: EyvanApiClient["getSessionAuthority"];
   listWorkloads: EyvanApiClient["listWorkloads"];
@@ -172,6 +222,7 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     getWarmth: vi.fn(async () => ({ observed_at: "2026-01-01T00:00:00Z", pools: [] })),
     getBilling: vi.fn(async () => ({ observed_at: "2026-01-01T00:00:00Z", accrued_cost: 0, idle_cost: 0 })),
     getLaunchLatency: vi.fn(async () => ({ observed_at: "2026-01-01T00:00:00Z", pools: [] })),
+    getTpuQuota: vi.fn(async () => quotaSnapshot()),
     submitWorkload: vi.fn(
       overrides.submitWorkload ??
         (async (input, scope) => scopedWorkload(scope ?? { orgId: "acme", projectId: input.project }, input.name)),
@@ -259,8 +310,29 @@ describe("App composes server session authority", () => {
         await showPanel("Fleet");
         expect(screen.getByText("Fleet topology")).toBeDefined();
       }
+      // Quota is resolved from capacity pool records, so it is gated by the
+      // authority that can read them and never offered to anyone else.
+      expect(screen.queryByRole("button", { name: "Quota & capacity" }) !== null).toBe(canManageFleet);
     },
   );
+
+  it("answers where a slice fits, and never shows an unmeasured zone as empty", async () => {
+    const { client, calls } = fakeClient(authority("fleet_admin"));
+    renderApp(client);
+
+    await showPanel("Quota & capacity");
+
+    await waitFor(() => expect(calls.getTpuQuota).toHaveBeenCalled());
+    const measured = within(screen.getByRole("region", { name: "Free capacity by zone" }));
+    expect(measured.getByText("us-central2-b")).toBeDefined();
+    expect(measured.getByText("2 x v6e-8")).toBeDefined();
+    // The zone whose usage nobody could read is on the page and carries no free
+    // balance -- neither hidden, nor sorted among the measured rows as a zero.
+    expect(measured.queryByText("europe-west4-a")).toBeNull();
+    const unknown = within(screen.getByRole("region", { name: "Zones with no measurable free balance" }));
+    expect(unknown.getByText("europe-west4-a")).toBeDefined();
+    expect(unknown.getByText("64")).toBeDefined();
+  });
 
   it.each([
     ["project_viewer", false],

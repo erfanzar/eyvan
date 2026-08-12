@@ -32,6 +32,7 @@ import type {
   SessionAuthority,
   SessionPermission,
   SubmitWorkloadInput,
+  TpuQuotaSnapshot,
   WarmthReport,
   WorkloadExplanation,
   WorkloadProcessStatus,
@@ -803,6 +804,32 @@ export class EyvanApiClient {
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<BillingReport>("/capacity/billing", { signal });
+  }
+
+  /**
+   * Provider TPU quota, live usage, and free balance per zone and type.
+   *
+   * The numbers `eyvan autoscale generate` has always read, for the person
+   * choosing where to run. Deliberately not merged into any other panel: a
+   * quota ceiling is a property of the cloud project, not of this fleet's
+   * cells, and the two disagree constantly.
+   *
+   * `refresh` re-reads the provider instead of reusing a cached reading. It is
+   * an explicit action because a read costs a burst of provider calls, and
+   * because the snapshot already states its own age.
+   */
+  async getTpuQuota(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+    options: { project?: string; refresh?: boolean } = {},
+  ): Promise<TpuQuotaSnapshot> {
+    const requestScope = this.scopeSnapshot(scope);
+    void requestScope;
+    const query = new URLSearchParams();
+    if (options.project) query.set("project", options.project);
+    if (options.refresh) query.set("refresh", "true");
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return this.request<TpuQuotaSnapshot>(`/capacity/quota${suffix}`, { signal });
   }
 
   async listCells(

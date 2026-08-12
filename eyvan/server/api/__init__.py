@@ -16,6 +16,7 @@ if tp.TYPE_CHECKING:
     from eyvan._internal.observability import EyvanMetrics
     from eyvan._internal.platform import EyvanPlatformConfig
     from eyvan.artifacts.transfers import ManagedArtifactAccess
+    from eyvan.capacity.autoscale.service import TpuQuotaDiscovery
     from eyvan.config import EyvanSettings
     from eyvan.server.api.auth import TokenVerifier
     from eyvan.server.api.server_bind import ServerBindPolicy
@@ -37,6 +38,7 @@ def create_app(
     automatic_loopback_auth: bool = False,
     platform_config: EyvanPlatformConfig | None = None,
     soak_evidence: SoakEvidenceStore | None = None,
+    quota_discovery: TpuQuotaDiscovery | None = None,
 ) -> FastAPI:
     """Import and build the control-plane application on demand.
 
@@ -58,6 +60,7 @@ def create_app(
         automatic_loopback_auth=automatic_loopback_auth,
         platform_config=platform_config,
         soak_evidence=soak_evidence,
+        quota_discovery=quota_discovery,
     )
 
 

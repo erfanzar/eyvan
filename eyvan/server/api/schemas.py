@@ -14,7 +14,10 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from eyvan._internal.compat import StrEnum
 from eyvan.capacity.hardware_catalog import validate_accelerator_write_boundary
+from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
+from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.records import (
     DEFAULT_MAX_RETRIES,
     BudgetRecord,
@@ -399,6 +402,178 @@ class CapacityResponse(ApiModel):
     """Advertised capacity inventory across all applied fleets."""
 
     pools: list[CapacityPoolResponse]
+
+
+class TpuQuotaState(StrEnum):
+    """What one quota row is actually able to say about free capacity.
+
+    ``USAGE_UNKNOWN`` is the reason this enum exists. Cloud Quotas reports a
+    limit for a zone whether or not Cloud Monitoring has a matching usage
+    series, and a row that renders a missing usage as zero claims the entire
+    quota is free -- the most expensive wrong answer this data can give. The
+    state is carried on the wire so no renderer has to infer it from a null.
+    """
+
+    KNOWN = "known"
+    USAGE_UNKNOWN = "usage_unknown"
+    UNLIMITED = "unlimited"
+
+
+class TpuQuotaStatus(StrEnum):
+    """Whether a snapshot describes provider truth, and why not when it does not."""
+
+    OK = "ok"
+    UNAVAILABLE = "unavailable"
+    UNCONFIGURED = "unconfigured"
+
+
+def _quota_region(zone: str) -> str:
+    """Return the region prefix of a provider zone, or the zone when it has none."""
+
+    region, separator, suffix = zone.rpartition("-")
+    return region if separator and region and suffix else zone
+
+
+class TpuQuotaEntry(ApiModel):
+    """One zone and accelerator type's quota ceiling, usage, and free balance.
+
+    Chips are Cloud TPU quota units, which use the public accelerator suffix:
+    one ``v6e-8`` slice consumes eight units. ``free_slices`` is that division
+    already done, because the question an operator actually has is "how many of
+    these fit", not "how many units are left".
+    """
+
+    zone: str = Field(min_length=1, max_length=128)
+    region: str = Field(min_length=1, max_length=128)
+    generation: str = Field(min_length=1, max_length=64)
+    accelerator_type: str = Field(min_length=1, max_length=128)
+    capacity_class: CanonicalCapacityClass
+    metric: str = Field(min_length=1, max_length=256)
+    chips_per_slice: int = Field(ge=1)
+    #: ``None`` means the provider reports no ceiling, never "zero".
+    limit_chips: int | None = Field(default=None, ge=0)
+    #: Derived as ``limit - free``: the balance is what the provider observes.
+    in_use_chips: int | None = Field(default=None, ge=0)
+    free_chips: int | None = Field(default=None, ge=0)
+    free_slices: int | None = Field(default=None, ge=0)
+    state: TpuQuotaState
+    usage_observed_at: datetime | None = None
+    #: How old the usage observation was when this snapshot was assembled.
+    usage_age_s: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_state(self) -> TpuQuotaEntry:
+        """Keep an unknown or unlimited row from carrying an invented number."""
+
+        counted = (self.in_use_chips, self.free_chips, self.free_slices)
+        if self.state is TpuQuotaState.UNLIMITED:
+            if self.limit_chips is not None:
+                raise ValueError("an unlimited quota row must not carry a limit")
+            if any(value is not None for value in counted) or self.usage_observed_at is not None:
+                raise ValueError("an unlimited quota row must not carry a usage observation")
+            return self
+        if self.limit_chips is None:
+            raise ValueError("a limited quota row requires a limit")
+        if self.state is TpuQuotaState.USAGE_UNKNOWN:
+            if any(value is not None for value in counted) or self.usage_observed_at is not None:
+                raise ValueError("an unknown-usage quota row must not carry a usage number")
+            return self
+        if any(value is None for value in counted):
+            raise ValueError("a known quota row requires usage and free balances")
+        assert self.free_chips is not None and self.in_use_chips is not None
+        if self.free_chips > self.limit_chips or self.in_use_chips > self.limit_chips:
+            raise ValueError("a known quota row must not exceed its own limit")
+        return self
+
+    @classmethod
+    def from_availability(
+        cls,
+        availability: TpuQuotaAvailability,
+        *,
+        capacity_class: CapacityClass,
+        observed_at: datetime,
+    ) -> TpuQuotaEntry:
+        """Convert one provider observation without inventing a missing usage."""
+
+        parsed = parse_tpu_accelerator_type(availability.accelerator_type)
+        chips_per_slice = parsed.size if parsed is not None else 1
+        common = {
+            "zone": availability.zone,
+            "region": _quota_region(availability.zone),
+            "generation": availability.generation,
+            "accelerator_type": availability.accelerator_type,
+            "capacity_class": capacity_class,
+            "metric": availability.metric,
+            "chips_per_slice": chips_per_slice,
+        }
+        if availability.quota_tpus is None:
+            return cls(**common, limit_chips=None, state=TpuQuotaState.UNLIMITED)
+        if availability.available_tpus is None:
+            return cls(**common, limit_chips=availability.quota_tpus, state=TpuQuotaState.USAGE_UNKNOWN)
+        free = availability.available_tpus
+        usage_observed_at = availability.usage_observed_at
+        return cls(
+            **common,
+            limit_chips=availability.quota_tpus,
+            in_use_chips=availability.quota_tpus - free,
+            free_chips=free,
+            free_slices=free // chips_per_slice,
+            state=TpuQuotaState.KNOWN,
+            usage_observed_at=usage_observed_at,
+            usage_age_s=(
+                None if usage_observed_at is None else max((observed_at - usage_observed_at).total_seconds(), 0.0)
+            ),
+        )
+
+
+class TpuQuotaFailure(ApiModel):
+    """One purchase class whose provider read did not succeed.
+
+    Reported beside the rows that did succeed rather than collapsing the whole
+    snapshot: a fleet whose Spot usage is unreadable still has readable
+    on-demand quota, and hiding one behind the other is how an operator ends up
+    believing a zone is empty.
+    """
+
+    capacity_class: CanonicalCapacityClass
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+class TpuQuotaSnapshot(ApiModel):
+    """Provider TPU quota, usage, and free balance for one project.
+
+    ``refreshed_at`` is when the provider was read and ``observed_at`` is when
+    this response was assembled; ``age_s`` is the distance between them. A
+    cached snapshot therefore states its own age instead of being presented as
+    live, which is the difference between "no capacity" and "nobody has looked
+    recently".
+    """
+
+    observed_at: datetime
+    provider: str = Field(default="gcp", min_length=1, max_length=64)
+    project: str | None = Field(default=None, max_length=128)
+    #: Every provider project this fleet's pools declare, so the caller can ask
+    #: about a second one without reading pool records by hand.
+    available_projects: list[str] = Field(default_factory=list)
+    status: TpuQuotaStatus
+    refreshed_at: datetime | None = None
+    age_s: float | None = Field(default=None, ge=0)
+    cached: bool = False
+    ttl_s: float = Field(default=0.0, ge=0)
+    entries: list[TpuQuotaEntry] = Field(default_factory=list)
+    failures: list[TpuQuotaFailure] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> TpuQuotaSnapshot:
+        """Keep a failed or unconfigured snapshot from looking like an empty fleet."""
+
+        if self.status is TpuQuotaStatus.UNAVAILABLE and not self.failures:
+            raise ValueError("an unavailable quota snapshot must name at least one failure")
+        if self.status is TpuQuotaStatus.UNCONFIGURED and (self.entries or self.project is not None):
+            raise ValueError("an unconfigured quota snapshot describes no project")
+        if self.entries and self.status is not TpuQuotaStatus.OK:
+            raise ValueError("quota rows are only reported by an ok snapshot")
+        return self
 
 
 class PolicyPutRequest(ApiModel):

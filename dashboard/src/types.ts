@@ -328,3 +328,59 @@ export interface BillingReport {
   idle_cost: number;
   [key: string]: unknown;
 }
+
+/**
+ * What one quota row is able to say about free capacity.
+ *
+ * `usage_unknown` is the reason this union exists rather than a nullable
+ * number. Cloud Quotas reports a limit for a zone whether or not Cloud
+ * Monitoring has a matching usage series, so a row rendered as zero usage
+ * claims the whole quota is free -- the one wrong answer here that costs money
+ * to act on.
+ */
+export type TpuQuotaState = "known" | "usage_unknown" | "unlimited";
+
+export type TpuQuotaStatus = "ok" | "unavailable" | "unconfigured";
+
+export interface TpuQuotaEntry {
+  zone: string;
+  region: string;
+  generation: string;
+  accelerator_type: string;
+  capacity_class: "reserved" | "on_demand" | "spot";
+  metric: string;
+  /** Quota units one slice of this type consumes; the public accelerator suffix. */
+  chips_per_slice: number;
+  /** Null means the provider reports no ceiling -- never zero. */
+  limit_chips: number | null;
+  /** Null means nobody could measure it. Never render this as 0. */
+  in_use_chips: number | null;
+  free_chips: number | null;
+  /** How many whole slices of this type the free balance fits. */
+  free_slices: number | null;
+  state: TpuQuotaState;
+  usage_observed_at: string | null;
+  /** How old the usage observation was when the snapshot was assembled. */
+  usage_age_s: number | null;
+}
+
+export interface TpuQuotaFailure {
+  capacity_class: "reserved" | "on_demand" | "spot";
+  reason: string;
+}
+
+export interface TpuQuotaSnapshot {
+  observed_at: string;
+  provider: string;
+  project: string | null;
+  available_projects: string[];
+  status: TpuQuotaStatus;
+  /** When the provider was actually read; null when it never was. */
+  refreshed_at: string | null;
+  /** Distance between the provider read and this response. */
+  age_s: number | null;
+  cached: boolean;
+  ttl_s: number;
+  entries: TpuQuotaEntry[];
+  failures: TpuQuotaFailure[];
+}

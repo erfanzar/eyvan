@@ -51,3 +51,17 @@ export function titleCase(value: string): string {
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }
+
+/**
+ * Render an age in seconds, or say it is unknown.
+ *
+ * `unknown` is a value here, not a fallback. A quota row whose usage nobody
+ * could read has no age, and rendering that as "0s ago" would present the
+ * absence of a measurement as a fresh one.
+ */
+export function formatAgeSeconds(seconds: number | null | undefined): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "unknown";
+  if (seconds < 60) return `${Math.floor(seconds)}s ago`;
+  if (seconds < 5400) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
