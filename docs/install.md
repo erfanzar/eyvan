@@ -49,6 +49,85 @@ earlier.
 TLS termination, secret-manager integration, and mTLS in front of every external
 agent are additional platform prerequisites.
 
+## One command, for a GCP head
+
+The table above is the honest cost of a *production* deployment. It is also
+fifteen chances to stop, and the first head this repository ever stood up by
+hand needed six separate restarts to get past three of them.
+
+`eyvan head up` does the whole sequence for one small CPU VM on GCP: it creates
+or adopts a labelled instance in the fleet's own project and zone, restricts
+ingress on the control-plane port to the VPC's internal ranges, generates the
+credentials the server refuses to start without, points the server at
+PostgreSQL, runs the migration, and starts the control plane under systemd so it
+survives both ssh exit and reboot.
+
+**This command has not been run against real GCP.** It is covered against an
+injected command boundary -- the sequence, the ownership refusals, the
+idempotent re-run, the ingress scope, and the mid-sequence failure path are all
+tested -- but no run against a real project has been performed, so provider
+acceptance of the exact gcloud invocations is unverified. Read the plan first:
+
+```bash
+eyvan head up fleet.yaml --dry-run
+```
+
+`--dry-run` issues no command at all, not merely no mutating command. It prints
+every action and every resource name it would use, so the whole thing is
+reviewable before any of it is affordable.
+
+```bash
+eyvan head up fleet.yaml --yes
+eyvan head status fleet.yaml
+eyvan head down fleet.yaml --yes
+```
+
+`head down` requires `--yes` and never infers confirmation from a terminal: the
+head keeps the control plane's durable state on its own disk.
+
+### What it decides for you, and what it refuses to
+
+* **Credentials.** `EYVAN_METRICS_TOKEN`, `EYVAN_ARTIFACT_TOKEN_KEY` and
+  `EYVAN_AGENT_SHARED_SECRET` are generated from the system CSPRNG and delivered
+  on stdin, never in a command argument where `ps` would show them. They are
+  written to `/etc/eyvan/head.env`, mode 0640, root-owned and readable only by
+  the service user. A re-run **keeps** them; rotating a live head's artifact
+  signing key invalidates every capability token already minted, so that needs
+  `--rotate-secrets`.
+* **Persistence.** `EYVAN_REPOSITORY_BACKEND=postgres` and `EYVAN_DATABASE_URL`
+  are set for you. With no `--database-url`, PostgreSQL is installed on the head
+  and a password is generated. With one, the head uses that database and no
+  local server is installed. `eyvan-migrate` runs before the service starts.
+* **Ingress.** Exactly one rule opens the control-plane port, and only to the
+  internal subnet ranges of the VPC in that region -- RFC 1918 or the shared
+  100.64.0.0/10 space, nothing else. A discovered range outside those, or a
+  region with no subnet at all, is a refusal with the reason stated, never a
+  wider rule. `0.0.0.0/0` is not reachable through any flag. `--source-range`
+  narrows it further and is validated the same way. With `--iap-ssh` (the
+  default) a second rule admits Google's fixed IAP forwarding range on port 22
+  so the installer can reach a VM that has no external address; `--no-iap-ssh`
+  removes it and assumes you already have connectivity.
+* **Ownership.** The instance is labelled `eyvan-managed=control-plane-head` and
+  `eyvan-head-fleet=<fleet>`; managed firewall rules carry a matching
+  description. A same-named VM or rule without those markers is refused, not
+  adopted and not modified. Running the command twice therefore produces one
+  head, and never reconfigures somebody else's.
+* **Egress.** `--egress` takes exactly `cloud-nat`, `private-google-access`, or
+  `public-internet` -- the same three values `provider_options.bootstrap_egress`
+  accepts on a pool -- and defaults to whatever every pool in the fleet file
+  already declares. `public-internet` gives the head an external address for
+  package installs; it does **not** widen ingress, which stays internal either
+  way.
+
+### What it does not do
+
+It does not configure identity. Without `--oidc-issuer` the head starts and
+answers every authenticated request with 401, because development
+authentication is refused on a network bind; the command says so on the way out
+rather than reporting a head that is running and useless. It does not terminate
+TLS, does not register the head with a secret manager, and does not create the
+artifact bucket that `--artifact-store-uri` points at.
+
 ## Secret and non-secret configuration
 
 The raw manifests deliberately do not create credentials. Provision these after
