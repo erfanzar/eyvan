@@ -333,7 +333,7 @@ v5p-16, whose two hosts are two ranks in one cell. P2 is genuinely blocked on TP
 capacity, and this section exists so the next person spends ten minutes reading
 it rather than an hour finding out.
 
-## What P3's exec half actually needs, measured on hardware
+## P3's exec half passed on 2026-08-13
 
 Attempted 2026-08-13 against a live v5p-16 in `us-central1-a` with a trainer
 running on both hosts. It did not pass, and the run replaced a guess with a
@@ -369,8 +369,32 @@ in the slice and gang executors. The fan-out has a template beside it --
 rather than dropping it, which is the same shape exec needs and the same shape
 P2 qualified.
 
-**Shape** any multi-host TPU slice, once the route exists. Until then this half
-is blocked on that feature rather than on capacity.
+The route was written the same afternoon and the half then passed on a second
+v5p-16, both ranks answering from their own host with the trainer still RUNNING:
+
+```
+rank 0  exit_code 0  stdout "exec-ran host=t1v-n-cfc9d529-w-0"
+rank 1  exit_code 0  stdout "exec-ran host=t1v-n-cfc9d529-w-1"
+state: running
+```
+
+Then the harder half. With rank 1's worker stopped out of band, exec reports it
+**in place**:
+
+```
+rank 0  exit_code 0  stdout "alive"
+rank 1  observed false  "native worker is unreachable: ConnectError: [Errno 111] Connection refused"
+```
+
+Named and numbered rather than dropped, so a caller counting ranks sees two and
+knows which is missing. That is the rule P2 qualified the same morning, and it
+matters more here than for logs: exec is reached for precisely when one rank is
+suspected of differing from the rest, so returning only the healthy host would be
+the worst answer available.
+
+**Passes when** every rank answers with the trainer still RUNNING, and a rank
+that cannot answer is reported in its place rather than omitted.
+**Shape** any multi-host TPU slice; v5p-16 is two hosts. **~30 minutes.**
 
 ## P2 passed on 2026-08-13, on the seventh attempt
 
