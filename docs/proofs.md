@@ -224,6 +224,50 @@ the job it was provisioned for should refuse the work rather than accept it and
 be quiet about it. Neither a missing driver nor a missing worker was reported by
 anything the plane could see.
 
+## A wedged unattended-upgrades takes the cell, on any image
+
+Root cause for both bootstrap failures seen on 2026-08-13, found on a v5p-16 in
+`us-central1-a` and applying to every fresh VM Eyvan provisions.
+
+The native worker bootstrap needs a venv. When the image has no `ensurepip` it
+installs `python3-venv` with apt, and apt cannot get the dpkg lock:
+
+```
+E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), is another process using it?
+Eyvan native worker could not install python3-venv from apt
+Eyvan native worker could not install Python venv support
+```
+
+`eyvan_apt_get` already passes `DPkg::Lock::Timeout=300`, and that is not the
+problem. The lock holder was `unattended-upgrade`, still running **thirty
+minutes** after boot, with its log stopped on
+
+```
+WARNING package grub-efi-amd64-bin upgradable but fails to be marked for upgrade
+(E:Error, pkgProblemResolver::Resolve generated breaks, this may be caused by held packages.)
+```
+
+and `/var/log/dpkg.log` empty of any transaction since. It is wedged, not busy.
+`systemctl stop` and a plain `pkill` did not clear it. **No lock timeout fixes
+this and neither does retrying**, because the holder never finishes.
+
+This unifies the two failures seen earlier the same day, which had looked
+different. On the GPU cell `apt-get update` lost the race and left an index with
+`Candidate: (none)`, which read as a missing package; here `update` succeeded and
+`install` lost it, which read as a lock error. One cause, two symptoms, and the
+second only became legible because the diagnostic that names Eyvan had been made
+reachable that morning -- before that fix the script died on apt's own sentence.
+
+The consequence is the shape already recorded above for a GPU cell whose driver
+could not see its GPU: the cell registers as capacity, accepts a lease, bills for
+a full `provisioning_timeout_s`, and reports nothing an operator can act on. Here
+it cost a v5p-16 that had taken six attempts across five zone/shape combinations
+to obtain.
+
+What it argues for is not a longer timeout. Either the bootstrap stops depending
+on apt for a venv, or it refuses to hand back a cell whose worker never started
+-- the same cell-side check the GPU finding asks for.
+
 ## Three gates decide whether a shape can be requested, not one
 
 Worth writing down because getting this wrong cost a session. Quota is the gate
