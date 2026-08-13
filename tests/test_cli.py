@@ -1794,6 +1794,9 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
         "max_retries": 0,
         "max_failure_retries": 0,
         "max_preemption_retries": 10,
+        # Sent explicitly like every other option-backed field, so the wire says
+        # the capability was declined rather than merely omitted.
+        "can_submit_children": False,
     }
 
 
