@@ -476,3 +476,87 @@ def test_a_failed_venv_install_does_not_abort_before_eyvans_own_message(tmp_path
     assert result.returncode == 0, result.stderr
     assert "REACHED-THE-NEXT-CHECK" in result.stdout
     assert "could not install python3-venv from apt" in result.stderr
+
+
+def test_a_python_without_ensurepip_falls_back_to_one_that_has_it(tmp_path: Path) -> None:
+    """apt is the last resort, not the first, and on 2026-08-13 it cost a slice.
+
+    The TPU image that motivated this ships `python3` as 3.10 without ensurepip
+    *and* /usr/bin/python3.11 with it. The bootstrap asked only `python3`, went to
+    apt, and apt could not get the dpkg lock because `unattended-upgrade` had
+    wedged holding it -- thirty minutes after boot, stopped on a resolver error,
+    with no dpkg transaction since. `DPkg::Lock::Timeout` cannot help with a
+    holder that never finishes, so the cell registered as capacity, took a lease
+    and never ran anything. A usable interpreter was on the host the whole time.
+
+    Runs the generated selection against stub interpreters rather than asserting
+    on its text: one that fails ensurepip named `python3`, one that succeeds named
+    like a versioned sibling.
+    """
+
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    (stub_dir / "python3").write_text("#!/bin/sh\nexit 1\n")
+    (stub_dir / "python3.11").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("python3", "python3.11"):
+        (stub_dir / name).chmod(0o755)
+
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
+    )
+    selection = _interpreter_selection(script)
+    assert "ensurepip" in selection, selection
+
+    probe = f'set -eu\nPATH="{stub_dir}:$PATH"\n{selection}\necho "SELECTED=${{eyvan_python}}"\n'
+    bash = shutil.which("bash")
+    assert bash is not None
+
+    result = subprocess.run([bash], input=probe, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert f"SELECTED={stub_dir}/python3.11" in result.stdout, result.stdout
+    assert "has no ensurepip" in result.stderr
+
+
+def test_the_default_interpreter_is_kept_when_it_already_works(tmp_path: Path) -> None:
+    """The search must not move a host that was never broken onto a sibling."""
+
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    (stub_dir / "python3").write_text("#!/bin/sh\nexit 0\n")
+    (stub_dir / "python3").chmod(0o755)
+
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
+    )
+    selection = _interpreter_selection(script)
+
+    probe = f'set -eu\nPATH="{stub_dir}:$PATH"\n{selection}\necho "SELECTED=${{eyvan_python}}"\n'
+    result = subprocess.run([shutil.which("bash")], input=probe, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "SELECTED=python3" in result.stdout
+
+
+def _interpreter_selection(script: str) -> str:
+    """Return the interpreter-selection block, ending where the apt guard begins.
+
+    Sliced on the guard rather than on a closing ``fi``: the block contains a
+    nested ``if`` inside a ``for``, so the first ``fi`` closes the wrong one and
+    the extracted fragment will not parse.
+    """
+
+    lines = script.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.strip() == "eyvan_python=python3")
+    end = next(
+        index
+        for index in range(start + 1, len(lines))
+        if lines[index].strip().startswith('if ! "${eyvan_python}" -m ensurepip')
+    )
+    return "\n".join(line.strip() for line in lines[start:end])

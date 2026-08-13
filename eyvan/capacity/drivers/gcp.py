@@ -203,6 +203,7 @@ class GcpTpuCapacityDriver:
         self.state = state or FleetStateStore.from_uri(settings.fleet_state_uri)
         self.provider: CapacityProvider = provider or GcloudTpuProvider()
         self.execution_backend = canonical_execution_backend(execution_backend or settings.execution_backend)
+        self.supports_exec = settings.capacity_supports_exec
         self.native_worker_port = native_worker_port if native_worker_port is not None else settings.native_worker_port
         self.native_worker_package = native_worker_package or settings.native_worker_package
         self.native_worker_package_sha256 = native_worker_package_sha256 or settings.native_worker_package_sha256
@@ -244,8 +245,11 @@ class GcpTpuCapacityDriver:
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
-            # they are willing to have diagnostics run on.
-            supports_exec=False,
+            # they are willing to have diagnostics run on. The turning-on is what
+            # was missing -- this was a literal False, so the sentence above
+            # described a control nobody had and `eyvan workload exec` was
+            # refused on every GCP fleet while the native runtime implemented it.
+            supports_exec=self.supports_exec,
             resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
         )
 
@@ -1567,6 +1571,9 @@ class GcpCapacityDriver:
             native_worker_public_ingress=native_worker_public_ingress,
         )
         self.execution_backend = self.tpu.execution_backend
+        # Delegated rather than re-read: a router that disagreed with the
+        # driver it routes to would admit exec the backend then refuses.
+        self.supports_exec = self.tpu.supports_exec
 
     def capabilities(self) -> CellCapabilities:
         if self.mode == "tpu":
@@ -1581,8 +1588,11 @@ class GcpCapacityDriver:
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
-            # they are willing to have diagnostics run on.
-            supports_exec=False,
+            # they are willing to have diagnostics run on. The turning-on is what
+            # was missing -- this was a literal False, so the sentence above
+            # described a control nobody had and `eyvan workload exec` was
+            # refused on every GCP fleet while the native runtime implemented it.
+            supports_exec=self.supports_exec,
             resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
         )
 

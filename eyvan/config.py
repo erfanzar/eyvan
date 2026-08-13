@@ -265,6 +265,13 @@ class EyvanSettings:
     fleet_state_uri: str | None = None
     capacity_backend: str = "gcp"
     execution_backend: str = "eyvan-native"
+    #: Operator consent to run diagnostic commands beside a running workload on
+    #: this fleet's cells. Off by default, and deliberately an admission choice
+    #: rather than a capability one: the native runtime has implemented
+    #: ``exec_in_workload`` all along, and the GCP driver declared the capability
+    #: absent with a comment saying an operator turns it on -- which nothing
+    #: could do, so `eyvan workload exec` was refused on every GCP fleet.
+    capacity_supports_exec: bool = False
     agent_state_dir: str = "~/.eyvan/agent"
     #: Operator consent to send managed-artifact capability tokens over plain
     #: HTTP. Off by default. It exists because the alternative was worse: the
@@ -600,6 +607,10 @@ class EyvanSettings:
             cell_stage_eviction_enabled=truthy(
                 "EYVAN_CELL_STAGE_EVICTION_ENABLED",
                 defaults.cell_stage_eviction_enabled,
+            ),
+            capacity_supports_exec=truthy(
+                "EYVAN_CAPACITY_SUPPORTS_EXEC",
+                defaults.capacity_supports_exec,
             ),
             cell_stage_max_attempts=int(os.getenv("EYVAN_CELL_STAGE_MAX_ATTEMPTS", defaults.cell_stage_max_attempts)),
             retention_batch_limit=int(os.getenv("EYVAN_RETENTION_BATCH_LIMIT", defaults.retention_batch_limit)),

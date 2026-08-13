@@ -436,7 +436,29 @@ def build_native_worker_startup_script(
             *runtime_container_lines,
             f"if ! {venv_python} -m pip --version >/dev/null 2>&1; then",
             f"  rm -rf {venv_dir}",
+            # Ask every interpreter on the host before asking apt for one. The
+            # image that motivated this ships `python3` as 3.10 without
+            # `ensurepip` *and* a 3.11 that has it, so the bootstrap reached for
+            # apt while a usable interpreter sat beside it -- and apt then lost
+            # the dpkg lock to a wedged `unattended-upgrade`, which cost a
+            # v5p-16 that had taken six attempts to obtain. Nothing here needs
+            # the network or a package manager.
+            "  eyvan_python=python3",
             "  if ! python3 -m ensurepip --version >/dev/null 2>&1; then",
+            "    for eyvan_dir in $(printf '%s' \"${PATH}\" | tr ':' ' ') /usr/local/bin /usr/bin; do",
+            '     for candidate in "${eyvan_dir}"/python3.*; do',
+            '      [ -x "${candidate}" ] || continue',
+            '      if "${candidate}" -m ensurepip --version >/dev/null 2>&1; then',
+            '        eyvan_python="${candidate}"',
+            '        echo "Eyvan native worker is using ${candidate} for its virtual environment; "\\',
+            '             "python3 has no ensurepip" >&2',
+            "        break",
+            "      fi",
+            "     done",
+            '     if [ "${eyvan_python}" != python3 ]; then break; fi',
+            "    done",
+            "  fi",
+            '  if ! "${eyvan_python}" -m ensurepip --version >/dev/null 2>&1; then',
             "    if ! command -v apt-get >/dev/null 2>&1; then",
             "      echo 'Eyvan native worker requires Python venv support and apt-get is unavailable' >&2",
             "      exit 1",
@@ -454,11 +476,11 @@ def build_native_worker_startup_script(
             "      echo 'Eyvan native worker could not install python3-venv from apt' >&2",
             "    fi",
             "  fi",
-            "  if ! python3 -m ensurepip --version >/dev/null 2>&1; then",
+            '  if ! "${eyvan_python}" -m ensurepip --version >/dev/null 2>&1; then',
             "    echo 'Eyvan native worker could not install Python venv support' >&2",
             "    exit 1",
             "  fi",
-            f"  python3 -m venv --system-site-packages {venv_dir}",
+            f'  "${{eyvan_python}}" -m venv --system-site-packages {venv_dir}',
             "fi",
             _install_command(
                 package,

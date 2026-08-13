@@ -797,3 +797,32 @@ def test_the_sync_client_sends_every_pool_field_it_accepts_on_a_callable() -> No
         expected = list(value) if isinstance(value, tuple) else value
         assert payload.get(field) == expected, f"submit_pool_callable dropped {field}"
     assert payload.get("priority_band") == "batch"
+
+
+def test_an_operator_can_turn_on_exec_for_a_gcp_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The comment beside the flag promised a control that did not exist.
+
+    `AgentCapabilities.supports_exec` is the *admission* gate and
+    `ExecCapableExecutionDriver` the *implementation* one, and the runtime has
+    implemented `exec_in_workload` all along -- `systemd_transient` provides it,
+    which is what GCP cells run. The GCP driver nonetheless declared the
+    capability a literal `False` under a comment reading "an operator turns this
+    on for a fleet they are willing to have diagnostics run on". Nothing could,
+    so `eyvan workload exec` was refused on every GCP fleet with a message
+    telling the operator to set a flag that was not settable. Observed against a
+    live v5p-16 on 2026-08-13.
+    """
+
+    from eyvan.capacity.drivers.gcp import GcpTpuCapacityDriver
+
+    monkeypatch.setenv("EYVAN_CAPACITY_SUPPORTS_EXEC", "1")
+    assert GcpTpuCapacityDriver().capabilities().supports_exec is True
+
+
+def test_exec_stays_off_for_a_fleet_that_did_not_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Running arbitrary commands beside a trainer is opt-in, not a default."""
+
+    from eyvan.capacity.drivers.gcp import GcpTpuCapacityDriver
+
+    monkeypatch.delenv("EYVAN_CAPACITY_SUPPORTS_EXEC", raising=False)
+    assert GcpTpuCapacityDriver().capabilities().supports_exec is False
