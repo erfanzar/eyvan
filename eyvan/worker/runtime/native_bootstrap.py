@@ -441,8 +441,18 @@ def build_native_worker_startup_script(
             "      echo 'Eyvan native worker requires Python venv support and apt-get is unavailable' >&2",
             "      exit 1",
             "    fi",
-            "    eyvan_apt_get update",
-            "    eyvan_apt_get install -y --no-install-recommends python3-venv",
+            # Both inside the condition, so `set -e` does not abort here. The
+            # message below is written for exactly this failure and was
+            # unreachable: on a GPU cell on 2026-08-13 the install exited 100
+            # with apt's own "Package 'python3-venv' has no installation
+            # candidate", the script died on that line, and the operator got a
+            # message naming neither Eyvan nor what to do about it. apt also
+            # exits 0 from `update` when individual index fetches fail, so the
+            # install is the first place the trouble surfaces and the last place
+            # that should be the one reporting it.
+            "    if ! eyvan_apt_get update || ! eyvan_apt_get install -y --no-install-recommends python3-venv; then",
+            "      echo 'Eyvan native worker could not install python3-venv from apt' >&2",
+            "    fi",
             "  fi",
             "  if ! python3 -m ensurepip --version >/dev/null 2>&1; then",
             "    echo 'Eyvan native worker could not install Python venv support' >&2",

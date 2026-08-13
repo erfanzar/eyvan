@@ -422,3 +422,57 @@ def test_the_forced_reinstall_does_not_rebuild_the_dependency_tree() -> None:
     forced = [line for line in script.splitlines() if "--force-reinstall" in line]
     assert forced, "the forced reinstall must be present for this to mean anything"
     assert all("--no-deps" in line for line in forced)
+
+
+def test_a_failed_venv_install_does_not_abort_before_eyvans_own_message(tmp_path: Path) -> None:
+    """The diagnostic written for this failure was unreachable when it happened.
+
+    On a GPU cell on 2026-08-13 the install exited 100 with apt's "Package
+    'python3-venv' has no installation candidate". Being a bare command under
+    ``set -euo pipefail``, it killed the script on that line, so the next check --
+    which exists precisely to say ``Eyvan native worker could not install Python
+    venv support`` and exit 1 -- never ran. The operator got apt's sentence, which
+    names neither Eyvan nor the cell nor what to do.
+
+    Runs the generated conditional rather than asserting on its text, and locates
+    it by a literal the assertions also pin, so a restructure fails here loudly
+    instead of quietly testing nothing.
+    """
+
+    fake_apt = tmp_path / "apt-get"
+    fake_apt.write_text('#!/bin/sh\nexit "${EYVAN_APT_EXIT_CODE:-0}"\n')
+    fake_apt.chmod(0o755)
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/project-a/secrets/eyvan-native-cell/versions/latest",
+    )
+    lines = script.splitlines()
+    opener = next(index for index, line in enumerate(lines) if "no-install-recommends python3-venv" in line)
+    assert "eyvan_apt_get update" in lines[opener], "the update must share the conditional, not precede it"
+    guarded = "\n".join(line.strip() for line in lines[opener : opener + 3])
+    assert guarded.endswith("fi"), guarded
+
+    preamble = "\n".join(
+        (
+            "set -euo pipefail",
+            'eyvan_apt_get() { command apt-get -o DPkg::Lock::Timeout=300 "$@"; }',
+        )
+    )
+    probe = f"{preamble}\n{guarded}\necho REACHED-THE-NEXT-CHECK\n"
+    bash = shutil.which("bash")
+    assert bash is not None
+
+    result = subprocess.run(
+        [bash],
+        input=probe,
+        text=True,
+        capture_output=True,
+        env={"PATH": str(tmp_path), "EYVAN_APT_EXIT_CODE": "100"},
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "REACHED-THE-NEXT-CHECK" in result.stdout
+    assert "could not install python3-venv from apt" in result.stderr
