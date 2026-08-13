@@ -483,6 +483,19 @@ class _StubPlane:
             raise click.ClickException(f"404 for {path}")
         return self.responses[path]
 
+    def request_text(self, method: str, path: str, **kwargs: object) -> str:
+        """The plain-text sibling, kept distinct the way the real client is.
+
+        ``/logs`` is declared ``PlainTextResponse``, so a caller that decodes it
+        as JSON fails against the real plane. A stub whose two accessors behaved
+        identically would let that mistake pass here.
+        """
+
+        body = self.request(method, path, **kwargs)
+        if not isinstance(body, str):
+            raise AssertionError(f"{path} is not a plain-text route")
+        return body
+
     def replace_identity_headers(self, headers: object) -> None:
         del headers
 
