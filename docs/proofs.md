@@ -471,7 +471,11 @@ appears in no durable record, log line or API response; that the ledger shows on
 issuance and one read; and that the capability is refused once the attempt ends.
 
 ```
-eyvan policy set --allow-secret-reference gcp-secret://<project>/eyvan-proof-
+# A root is matched by scheme/authority/path *segment*, never as a raw string
+# prefix, so a trailing partial segment like `eyvan-proof-` matches nothing and
+# the submission below is refused with 403. Name the whole segment, or stop at
+# the authority to allow every secret in the project.
+eyvan policy set --allow-secret-reference gcp-secret://<project>/eyvan-proof-token
 eyvan up configs/eyvan-live-v5p16-us-east5-a.yaml
 eyvan workload submit --name secret-proof --command 'python -c "import os;print(len(os.environ[\"HF_TOKEN\"]))"' \
   --secret HF_TOKEN=gcp-secret://<project>/eyvan-proof-token --tpu 8
