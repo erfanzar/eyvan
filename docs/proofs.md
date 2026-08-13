@@ -192,11 +192,17 @@ Script "startup-script" failed with error: exit status 100
 ```
 
 There were no `eyvan*` units on the host at all and the native worker was
-inactive, so nothing ever connected. **The workload sat in `connecting`
-indefinitely rather than failing.** A cell that cannot run a worker still
-registered as capacity, took the lease, and looked exactly like a slow one --
-the same shape as the driver hazard above, where a broken cell is
-indistinguishable from a working one until someone reads the output by hand.
+inactive, so nothing ever connected. The workload was still in `connecting`
+twenty minutes later, when the run was stopped.
+
+It would not have waited forever, and the first write-up of this said it would,
+which was wrong: `cell_provides_pool_supply` stops counting a `REGISTERING` cell
+as supply once `provisioning_timeout_s` elapses -- thirty minutes by default, so
+ten minutes past where this was observed. The accurate complaint is narrower and
+still worth fixing: a cell that cannot run a worker registers as capacity, takes
+the lease, bills a GPU for a full provisioning timeout, and reports nothing an
+operator could act on. It is indistinguishable from a slow cell for half an hour,
+which is the same shape as the driver hazard above.
 
 The apt failure itself is *not* explained. The bootstrap does run
 `eyvan_apt_get update` before the install and the script runs under
