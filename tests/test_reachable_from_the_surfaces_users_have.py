@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Three complete features nothing could reach.
+"""Four complete features nothing could reach.
 
 Each was built, validated and exported, and each was walled off by exactly one
 line somewhere else:
@@ -18,6 +18,11 @@ line somewhere else:
 * ``create_schema`` stamped ``schema_revisions`` and never ``alembic_version``,
   so a database it bootstrapped could never be migrated afterwards -- Alembic
   would replay every migration against tables that already existed.
+* ``can_submit_children`` gated all of in-job submission -- capability minting,
+  ``EYVAN_CHILDREN_URL``, ``submit_child()``, the 256-live ceiling, the depth
+  guard, generation fencing -- and no CLI option or SDK config set it. The only
+  workloads that ever carried it were services, which settlement grants it to
+  on their behalf, so every path a person could type left the feature off.
 """
 
 from __future__ import annotations
@@ -278,3 +283,50 @@ def test_the_submit_command_can_set_the_failure_budget(monkeypatch: pytest.Monke
     assert result.exit_code == 0, result.output
     request = WorkloadSubmitRequest.model_validate(_json_argument(fake.calls[0]))
     assert request.spec.max_failure_retries == 4
+
+
+def _submit(monkeypatch: pytest.MonkeyPatch, *extra: str):
+    """Run ``workload submit`` against a fake client and return the request."""
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient, _json_argument
+
+    from eyvan.sdk import cli
+    from eyvan.server.api.schemas import WorkloadSubmitRequest
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            *["--user", "alice", "--org", "acme", "--project", "research"],
+            *["workload", "submit", "--name", "launcher", "--command", "python launch.py"],
+            *extra,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return WorkloadSubmitRequest.model_validate(_json_argument(fake.calls[0]))
+
+
+def test_the_submit_command_can_request_the_child_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole of in-job submission was reachable only by hand-written HTTP.
+
+    The server side is complete and tested: the capability is minted per attempt,
+    delivered as ``EYVAN_CHILDREN_URL`` plus a token, fenced by generation, capped
+    at 256 live children and at a maximum tree depth, and every child is created
+    under the parent's owner rather than the workload. None of it could be turned
+    on by anything a person types -- ``grep can_submit_children eyvan/sdk/``
+    returned nothing, exactly as ``max_failure_retries`` once did.
+    """
+
+    assert _submit(monkeypatch, "--can-submit-children").spec.can_submit_children is True
+
+
+def test_the_child_capability_stays_off_when_it_is_not_asked_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A credential nobody asked for is one nobody is watching.
+
+    The flag has to be the only thing that turns it on; a default that leaked to
+    ``True`` would hand every ordinary job a token it never requested.
+    """
+
+    assert _submit(monkeypatch).spec.can_submit_children is False

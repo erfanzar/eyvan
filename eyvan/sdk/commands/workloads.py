@@ -641,6 +641,16 @@ def estimate_workload(
         "allowed_secret_references must permit the reference."
     ),
 )
+@click.option(
+    "--can-submit-children",
+    is_flag=True,
+    default=False,
+    help=(
+        "Hand this job a capability to submit children of its own. Children run under this workload's owner "
+        "rather than the workload, inherit its scope and quota, are cancelled with it, and are capped at 256 "
+        "live at once. Off by default: a credential nobody asked for is one nobody is watching."
+    ),
+)
 @click.option("--idempotency-key")
 @click.pass_obj
 def submit_workload(
@@ -668,6 +678,7 @@ def submit_workload(
     max_failure_retries: int,
     max_preemption_retries: int,
     secret_mounts: tuple[str, ...],
+    can_submit_children: bool,
     idempotency_key: str | None,
 ) -> None:
     """Submit a workload with explicit resource and placement intent."""
@@ -699,6 +710,7 @@ def submit_workload(
                 max_failure_retries=max_failure_retries,
                 max_preemption_retries=max_preemption_retries,
                 secret_mounts=mounts,
+                can_submit_children=can_submit_children,
             ),
         )
     except (ValidationError, ValueError) as exc:
