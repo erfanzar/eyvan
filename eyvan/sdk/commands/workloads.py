@@ -185,6 +185,9 @@ class WorkloadCommandService:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: str = PriorityBand.INTERACTIVE.value,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
     ) -> None:
         """Submit one pool-targeted command using context and fleet defaults."""
 
@@ -207,6 +210,9 @@ class WorkloadCommandService:
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
                 can_submit_children=can_submit_children,
+                priority_band=PriorityBand(priority_band),
+                intra_band_priority=intra_band_priority,
+                checkpoint_grace_seconds=checkpoint_grace_seconds,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -395,6 +401,21 @@ class WorkloadCommandService:
     default=False,
     help="Hand this job a capability to submit children of its own, under this workload's owner.",
 )
+@click.option(
+    "--priority-band",
+    type=click.Choice(tuple(band.value for band in PriorityBand)),
+    default=PriorityBand.INTERACTIVE.value,
+    show_default=True,
+    help="Which band this job competes in. A long training run belongs in batch, and the pool cannot know that.",
+)
+@click.option("--intra-band-priority", type=int, default=0, show_default=True)
+@click.option(
+    "--checkpoint-grace-seconds",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Seconds the checkpoint hook is given before the job is stopped.",
+)
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
@@ -412,6 +433,9 @@ def run_workload(
     checkpoint_hook: str | None,
     checkpoint_output_uri: str | None,
     can_submit_children: bool,
+    priority_band: str,
+    intra_band_priority: int,
+    checkpoint_grace_seconds: int,
     command: tuple[str, ...],
 ) -> None:
     """Queue COMMAND on TYPE or FLEET/TYPE using applied fleet defaults."""
@@ -431,6 +455,9 @@ def run_workload(
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
         can_submit_children=can_submit_children,
+        priority_band=priority_band,
+        intra_band_priority=intra_band_priority,
+        checkpoint_grace_seconds=checkpoint_grace_seconds,
     )
 
 

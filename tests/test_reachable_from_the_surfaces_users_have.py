@@ -531,6 +531,47 @@ def _pool_record():
     )
 
 
+def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Threading a field to the schema is not the same as making it reachable.
+
+    Written after doing exactly that: the checkpoint contract, the child
+    capability and the band all reached ``PoolWorkloadSubmitRequest`` and the two
+    clients while ``eyvan run`` still had no flags for the last three, so the
+    field was settable by everything except the thing a person types. This
+    asserts the whole surface at once, because the gap is always the last hop.
+    """
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient, _json_argument
+
+    from eyvan.sdk import cli
+    from eyvan.server.api.schemas import PoolWorkloadSubmitRequest
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            *["--user", "alice", "--org", "acme", "--project", "research"],
+            *["run", "dev-fleet/gpu-workers"],
+            *["--checkpointable", "--checkpoint-hook", "python -m ckpt"],
+            *["--checkpoint-output-uri", "gs://ckpt/run-1", "--checkpoint-grace-seconds", "120"],
+            *["--can-submit-children", "--priority-band", "batch", "--intra-band-priority", "7"],
+            *["--", "python", "train.py"],
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    request = PoolWorkloadSubmitRequest.model_validate(_json_argument(fake.calls[0]))
+    assert request.checkpointable is True
+    assert request.checkpoint_hook == "python -m ckpt"
+    assert request.checkpoint_output_uri == "gs://ckpt/run-1"
+    assert request.checkpoint_grace_seconds == 120
+    assert request.can_submit_children is True
+    assert request.priority_band.value == "batch"
+    assert request.intra_band_priority == 7
+
+
 def test_a_spot_first_job_can_say_it_would_rather_fall_back_than_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """The capacity portfolio, which nothing typeable could express.
 
