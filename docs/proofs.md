@@ -131,6 +131,35 @@ What it did **not** establish: anything about multislice, TPU provisioning, or
 any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
 is here so nobody reads it as one.
 
+## Three gates decide whether a shape can be requested, not one
+
+Worth writing down because getting this wrong cost a session. Quota is the gate
+people check, and it is the least decisive of the three. A request needs all of:
+
+1. **Quota** for the metric in that region. Read it from the Cloud Quotas API,
+   not `gcloud compute regions describe` -- the regions endpoint reports only
+   v5e (`TPU_LITE_*`) and shows nothing for v5p or v6e. Note also that a
+   per-zone *override* does not mean other zones have none: the metric's
+   `defaultLimit` applies to every zone in `supportedLocations`. Reading the
+   `us-east5-a` override as the only grant is what sent every attempt into the
+   one congested zone.
+2. **The zone offering the shape.** `gcloud compute tpus accelerator-types list
+   --zone Z`. `europe-west4-a` has v5p quota and offers no v5p at all -- only
+   v2, v3, v5litepod and v6e. GCP says so exactly: *"the accelerator v5p-16 was
+   not found in zone europe-west4-a"*.
+3. **Permission to submit into that queue.** Separate from both. `europe-west4-b`
+   does offer v5p-16 and the project does have the quota, and the request is
+   still refused: *"User does not have permission to submit requests into this
+   queue for accelerator type v5p-16 in location europe-west4-b."*
+
+For this project, v5p-16 passes all three only in `us-east5-a`.
+
+Eyvan's handling of gates 2 and 3 is worth noting since both were exercised: the
+provider error is surfaced verbatim with its EID, the cell is marked
+PROVIDER_ERROR, the apply is **not** retried -- a request that can never succeed
+is not retried -- and `capacity_loss_count` stays 0, so a permission refusal is
+not charged to the workload as a preemption.
+
 ## What blocked P2 on 2026-08-13
 
 Worth recording, because "not attempted" and "attempted and blocked" call for
