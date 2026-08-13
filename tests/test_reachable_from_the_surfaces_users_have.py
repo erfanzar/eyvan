@@ -698,3 +698,97 @@ def test_naming_regions_while_pinning_one_is_refused_rather_than_silently_ranked
     )
 
     assert result.exit_code != 0
+
+
+def _sent_payload(method: str, **arguments) -> dict:
+    """Call one sync-client method against a mock transport, return its body."""
+
+    import json
+
+    import httpx
+
+    from eyvan.records import WorkloadDefinition, WorkloadRecord
+    from eyvan.records import CommandExecution as _Command
+    from eyvan.sdk import EyvanClient
+
+    stored = WorkloadRecord(
+        id="wl-1",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="t", execution=_Command(command="python train.py")),
+        created_by="alice",
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(201, json=stored.model_dump(mode="json"))
+
+    client = EyvanClient(client=httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test"))
+    try:
+        getattr(client, method)(**arguments)
+    finally:
+        client.close()
+    return json.loads(seen[0].content)
+
+
+#: Every field threaded through the pool path today, with a value that is not its
+#: default. A default-valued assertion cannot tell "wired" from "accepted and
+#: dropped", and these were threaded by scripted replacement across six files.
+_NON_DEFAULT = {
+    "checkpointable": True,
+    "checkpoint_hook": "python -m ckpt",
+    "checkpoint_output_uri": "gs://ckpt/run-1",
+    "checkpoint_grace_seconds": 120,
+    "can_submit_children": True,
+    "intra_band_priority": 7,
+    "estimated_duration_seconds": 60,
+    "named_assets": ("gs://corpus/shard-0",),
+}
+
+
+def test_the_sync_client_sends_every_pool_field_it_accepts_on_a_command() -> None:
+    """A parameter a method accepts and drops is unreachable with extra steps.
+
+    The existing payload tests pin the defaults, which is exactly the shape that
+    cannot catch this: a field accepted into the signature and never passed to
+    the request builder still serializes to its default and still matches.
+    """
+
+    payload = _sent_payload(
+        "run",
+        fleet_name="research",
+        node_type="cpu",
+        command="python train.py",
+        org_id="acme",
+        project_id="research",
+        priority_band="batch",
+        **_NON_DEFAULT,
+    )
+
+    for field, value in _NON_DEFAULT.items():
+        expected = list(value) if isinstance(value, tuple) else value
+        assert payload.get(field) == expected, f"run dropped {field}"
+    assert payload.get("priority_band") == "batch"
+
+
+def test_the_sync_client_sends_every_pool_field_it_accepts_on_a_callable() -> None:
+    """The same for the path ``@execute`` uses."""
+
+    from eyvan.records import CallableExecution
+
+    payload = _sent_payload(
+        "submit_pool_callable",
+        fleet_name="research",
+        accelerator_type="v5p-8",
+        execution=CallableExecution(artifact_uri="gs://a/train.pkl", sha256="a" * 64, python="3.12"),
+        org_id="acme",
+        project_id="research",
+        priority_band="batch",
+        **_NON_DEFAULT,
+    )
+
+    for field, value in _NON_DEFAULT.items():
+        expected = list(value) if isinstance(value, tuple) else value
+        assert payload.get(field) == expected, f"submit_pool_callable dropped {field}"
+    assert payload.get("priority_band") == "batch"
