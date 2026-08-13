@@ -320,6 +320,13 @@ eyvan workload exec <id> -- py-spy dump --pid ...   # a diagnostic beside it
 process sharing the unit's memory allocation could take the trainer down with
 it.
 
+It is off until a fleet asks for it. Set `EYVAN_CAPACITY_SUPPORTS_EXEC=1` in the
+head's environment and restart `eyvan-head.service`; without it the plane refuses
+with *"this fleet does not permit exec"*. Off by default because the command runs
+whatever it is given on a machine holding someone's training job, so it is an
+admission decision an operator makes for a fleet rather than a capability that
+arrives switched on.
+
 ## Reading a managed service
 
 ```
