@@ -612,6 +612,7 @@ def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch:
             *["--checkpointable", "--checkpoint-hook", "python -m ckpt"],
             *["--checkpoint-output-uri", "gs://ckpt/run-1", "--checkpoint-grace-seconds", "120"],
             *["--can-submit-children", "--priority-band", "batch", "--intra-band-priority", "7"],
+            *["--duration-s", "60", "--named-asset", "gs://corpus/shard-0"],
             *["--", "python", "train.py"],
         ],
     )
@@ -625,6 +626,10 @@ def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch:
     assert request.can_submit_children is True
     assert request.priority_band.value == "batch"
     assert request.intra_band_priority == 7
+    # Added to `eyvan run` after this test was first written, which is exactly
+    # how a last-hop gap survives: the schema and the client had them already.
+    assert request.estimated_duration_seconds == 60
+    assert request.named_assets == ("gs://corpus/shard-0",)
 
 
 def test_a_spot_first_job_can_say_it_would_rather_fall_back_than_wait(monkeypatch: pytest.MonkeyPatch) -> None:
