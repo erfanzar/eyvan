@@ -12,8 +12,9 @@ were tied to their own candidates and some ended with exit 2. **No historical
 run qualifies the current candidate without an immutable exact-candidate
 receipt.**
 
-**The criteria are executable.** `eyvan proof catalog | preemption | warm-window
-| secret` evaluates the stated criterion against the live plane and exits 0 on
+**The criteria are executable.** `eyvan proof catalog | children | logs |
+preemption | warm-window | secret | kubernetes` evaluates the stated criterion
+against the live plane and exits 0 on
 pass, 1 on failure, and **2 when the run did not exercise the behaviour at all**.
 That third verdict is the one that matters: a spot slice that was never
 reclaimed, a pool that never got a cell, an observation taken outside the warm
