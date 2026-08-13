@@ -237,6 +237,13 @@ class PoolWorkloadSubmitRequest(ApiModel):
     intra_band_priority: int = Field(default=0, ge=0)
     #: Seconds the checkpoint hook is given before the job is stopped.
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
+    #: How long the job is expected to run. Every cost figure is an estimate
+    #: over this number, so a pool submission that could not state it was
+    #: estimated at the default hour whatever it actually was.
+    estimated_duration_seconds: int = Field(default=3600, ge=0)
+    #: Logical names of large inputs this job pulls. A hint only: cells that
+    #: recently ran something naming the same asset are preferred.
+    named_assets: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
@@ -280,6 +287,13 @@ class PoolCallableSubmitRequest(ApiModel):
     intra_band_priority: int = Field(default=0, ge=0)
     #: Seconds the checkpoint hook is given before the job is stopped.
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
+    #: How long the job is expected to run. Every cost figure is an estimate
+    #: over this number, so a pool submission that could not state it was
+    #: estimated at the default hour whatever it actually was.
+    estimated_duration_seconds: int = Field(default=3600, ge=0)
+    #: Logical names of large inputs this job pulls. A hint only: cells that
+    #: recently ran something naming the same asset are preferred.
+    named_assets: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:

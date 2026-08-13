@@ -2041,6 +2041,8 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "priority_band": "interactive",
         "intra_band_priority": 0,
         "checkpoint_grace_seconds": 0,
+        "estimated_duration_seconds": 3600,
+        "named_assets": [],
     }
     assert (
         not {

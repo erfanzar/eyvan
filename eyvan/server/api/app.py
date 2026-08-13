@@ -2173,6 +2173,8 @@ def create_app(
             priority_band=request.priority_band,
             intra_band_priority=request.intra_band_priority,
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
+            estimated_duration_seconds=request.estimated_duration_seconds,
+            named_assets=request.named_assets,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2222,6 +2224,8 @@ def create_app(
             priority_band=request.priority_band,
             intra_band_priority=request.intra_band_priority,
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
+            estimated_duration_seconds=request.estimated_duration_seconds,
+            named_assets=request.named_assets,
             idempotency_key=idempotency_key,
         )
         if replayed:

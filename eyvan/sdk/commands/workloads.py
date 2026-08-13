@@ -188,6 +188,8 @@ class WorkloadCommandService:
         priority_band: str = PriorityBand.INTERACTIVE.value,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        estimated_duration_seconds: int = 3600,
+        named_assets: tuple[str, ...] = (),
     ) -> None:
         """Submit one pool-targeted command using context and fleet defaults."""
 
@@ -213,6 +215,8 @@ class WorkloadCommandService:
                 priority_band=PriorityBand(priority_band),
                 intra_band_priority=intra_band_priority,
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
+                estimated_duration_seconds=estimated_duration_seconds,
+                named_assets=named_assets,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -416,6 +420,20 @@ class WorkloadCommandService:
     show_default=True,
     help="Seconds the checkpoint hook is given before the job is stopped.",
 )
+@click.option(
+    "--duration-s",
+    "estimated_duration_seconds",
+    type=int,
+    default=3600,
+    show_default=True,
+    help="How long this job is expected to run. Every cost figure is an estimate over it.",
+)
+@click.option(
+    "--named-asset",
+    "named_assets",
+    multiple=True,
+    help="A large input this job pulls, so cells that recently pulled it are preferred. A hint, never a pin.",
+)
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
@@ -436,6 +454,8 @@ def run_workload(
     priority_band: str,
     intra_band_priority: int,
     checkpoint_grace_seconds: int,
+    estimated_duration_seconds: int,
+    named_assets: tuple[str, ...],
     command: tuple[str, ...],
 ) -> None:
     """Queue COMMAND on TYPE or FLEET/TYPE using applied fleet defaults."""
@@ -458,6 +478,8 @@ def run_workload(
         priority_band=priority_band,
         intra_band_priority=intra_band_priority,
         checkpoint_grace_seconds=checkpoint_grace_seconds,
+        estimated_duration_seconds=estimated_duration_seconds,
+        named_assets=named_assets,
     )
 
 

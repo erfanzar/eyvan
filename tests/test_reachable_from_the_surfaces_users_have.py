@@ -531,6 +531,61 @@ def _pool_record():
     )
 
 
+#: Spec fields a pool submitter is not meant to set, and why. Anything else that
+#: ``WorkloadDefinition`` carries has to be expressible on the pool path, because
+#: that path is what ``@execute`` and ``eyvan run`` use.
+_PLANE_OWNED = {
+    # Written by the control plane while placing and settling the workload.
+    "preferred_cells",
+    "preferred_labels",
+    "required_labels",
+    "worker_resource_scope",
+    "backend_options",
+}
+_POOL_DERIVED = {
+    # Dictated by the pool the caller named. That is the whole point of naming
+    # one: the fleet YAML owns shape, provider and machine type.
+    "provider",
+    "region",
+    "accelerator_type",
+    "gang",
+    "execution",
+    "worker_count",
+    "capacity_class",
+    "required_executor",
+    "allowed_regions",
+    "allowed_zones",
+    "allowed_accelerator_types",
+    "additional_capacity_classes",
+    "cell_group_count",
+}
+
+
+def test_the_pool_schemas_carry_every_field_a_submitter_owns() -> None:
+    """The audit that found four of the defects above, kept as a test.
+
+    Each one was a field added to ``WorkloadDefinition`` and honoured by the
+    server whose request schema was never widened, so the feature worked
+    everywhere except where a user could ask for it. Adding a spec field and
+    running the suite should now say so.
+
+    A new field belongs in one of three places: settable on the pool path, listed
+    in ``_PLANE_OWNED`` because the plane writes it, or in ``_POOL_DERIVED``
+    because the pool dictates it. Adding a name to either set is a claim worth
+    arguing for in review -- which is the point of making it explicit rather than
+    letting the omission pass unnoticed.
+    """
+
+    from eyvan.records import WorkloadDefinition
+    from eyvan.server.api.schemas import PoolCallableSubmitRequest, PoolWorkloadSubmitRequest
+
+    owned = set(WorkloadDefinition.model_fields) - _PLANE_OWNED - _POOL_DERIVED
+    assert not owned - set(PoolWorkloadSubmitRequest.model_fields)
+    # A callable ships its working tree inside CallableExecution rather than as a
+    # separate ref, so `workspace` is the one field this path legitimately lacks.
+    assert not owned - set(PoolCallableSubmitRequest.model_fields) - {"workspace"}
+
+
 def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch: pytest.MonkeyPatch) -> None:
     """Threading a field to the schema is not the same as making it reachable.
 

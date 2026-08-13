@@ -91,6 +91,8 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "priority_band": "interactive",
         "intra_band_priority": 0,
         "checkpoint_grace_seconds": 0,
+        "estimated_duration_seconds": 3600,
+        "named_assets": [],
     }
     client.close()
 
@@ -182,6 +184,8 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "priority_band": "interactive",
         "intra_band_priority": 0,
         "checkpoint_grace_seconds": 0,
+        "estimated_duration_seconds": 3600,
+        "named_assets": [],
     }
     client.close()
 

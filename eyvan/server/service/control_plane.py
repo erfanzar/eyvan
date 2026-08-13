@@ -832,6 +832,8 @@ class ControlPlaneService:
         priority_band: PriorityBand = PriorityBand.INTERACTIVE,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        estimated_duration_seconds: int = 3600,
+        named_assets: tuple[str, ...] = (),
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -905,6 +907,8 @@ class ControlPlaneService:
                 priority_band=priority_band,
                 intra_band_priority=intra_band_priority,
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
+                estimated_duration_seconds=estimated_duration_seconds,
+                named_assets=named_assets,
             )
             return await self._store_workload(
                 tx,
@@ -943,6 +947,8 @@ class ControlPlaneService:
         priority_band: PriorityBand = PriorityBand.INTERACTIVE,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        estimated_duration_seconds: int = 3600,
+        named_assets: tuple[str, ...] = (),
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -1109,6 +1115,8 @@ class ControlPlaneService:
                 priority_band=priority_band,
                 intra_band_priority=intra_band_priority,
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
+                estimated_duration_seconds=estimated_duration_seconds,
+                named_assets=named_assets,
             )
             return await self._store_workload(
                 tx,
@@ -1254,6 +1262,8 @@ class ControlPlaneService:
         priority_band: PriorityBand = PriorityBand.INTERACTIVE,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        estimated_duration_seconds: int = 3600,
+        named_assets: tuple[str, ...] = (),
     ) -> WorkloadDefinition:
         """Build a workload whose placement contract is pinned to one fleet pool.
 
@@ -1302,6 +1312,8 @@ class ControlPlaneService:
             priority_band=priority_band,
             intra_band_priority=intra_band_priority,
             checkpoint_grace_seconds=checkpoint_grace_seconds,
+            estimated_duration_seconds=estimated_duration_seconds,
+            named_assets=named_assets,
         )
 
     async def _replayed_workload(

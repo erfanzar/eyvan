@@ -47,6 +47,8 @@ def pool_workload_request(
     priority_band: PriorityBand = PriorityBand.INTERACTIVE,
     intra_band_priority: int = 0,
     checkpoint_grace_seconds: int = 0,
+    estimated_duration_seconds: int = 3600,
+    named_assets: tuple[str, ...] = (),
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -69,6 +71,8 @@ def pool_workload_request(
         priority_band=priority_band,
         intra_band_priority=intra_band_priority,
         checkpoint_grace_seconds=checkpoint_grace_seconds,
+        estimated_duration_seconds=estimated_duration_seconds,
+        named_assets=named_assets,
     )
 
 
@@ -94,6 +98,8 @@ def pool_callable_request(
     priority_band: PriorityBand = PriorityBand.INTERACTIVE,
     intra_band_priority: int = 0,
     checkpoint_grace_seconds: int = 0,
+    estimated_duration_seconds: int = 3600,
+    named_assets: tuple[str, ...] = (),
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -120,6 +126,8 @@ def pool_callable_request(
         priority_band=priority_band,
         intra_band_priority=intra_band_priority,
         checkpoint_grace_seconds=checkpoint_grace_seconds,
+        estimated_duration_seconds=estimated_duration_seconds,
+        named_assets=named_assets,
     )
 
 
