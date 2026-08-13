@@ -408,6 +408,21 @@ class NativeRemoteExecutor:
             raise ValueError("native worker process status must be a JSON object")
         return payload
 
+    def exec_in_workload(self, remote_id: str, command: tp.Sequence[str], *, timeout_s: float = 30.0) -> JsonObject:
+        """Run one diagnostic command beside a workload on this host."""
+
+        response = self._raise_for_status(
+            self._request(
+                "POST",
+                f"/api/v1/workloads/{remote_id}/exec",
+                json={"command": list(command), "timeout_s": timeout_s},
+            )
+        )
+        payload = response.json()
+        if not is_json_object(payload):
+            raise ValueError("native worker exec result must be a JSON object")
+        return payload
+
     def close(self) -> None:
         """Close the internally owned HTTP connection pool."""
 

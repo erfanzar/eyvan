@@ -57,6 +57,7 @@ from eyvan.worker.agent.models import (
     CellStageActionResult,
     CellStageVerdict,
     CheckpointRequest,
+    ExecRequest,
     MutationConflictCode,
     NativeStageActionRequest,
     NativeWorkerHealth,
@@ -65,7 +66,7 @@ from eyvan.worker.agent.models import (
     WorkloadRequest,
 )
 from eyvan.worker.runtime.local_process import LocalProcessExecutor
-from eyvan.worker.runtime.registry import IntrospectableExecutionDriver
+from eyvan.worker.runtime.registry import ExecCapableExecutionDriver, IntrospectableExecutionDriver
 from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
 from eyvan.worker.runtime.systemd_transient import SystemdLogsUnavailableError, SystemdTransientServiceExecutor
 
@@ -490,6 +491,27 @@ def create_native_worker_app(
                 detail="this native execution backend does not expose process introspection",
             )
         return executor.process_status(remote_id)
+
+    @app.post("/api/v1/workloads/{remote_id}/exec", dependencies=[Depends(authenticate)], response_model=None)
+    def exec_in_workload(remote_id: str, body: ExecRequest) -> JsonObject:
+        """Run one diagnostic command beside a workload on this host.
+
+        The route a multi-host slice had no way to call. ``exec_in_workload``
+        was implemented only on the local systemd driver, so a single-host cell
+        could exec and a TPU slice -- reached over this API -- could not, which
+        is the half of P3 that stayed unqualified.
+
+        Same protocol check and same 501 as process introspection beside it: a
+        backend that cannot do this says so, rather than failing somewhere that
+        mentions none of it.
+        """
+
+        if not isinstance(executor, ExecCapableExecutionDriver):
+            raise HTTPException(
+                status_code=501,
+                detail="this native execution backend cannot exec beside a workload",
+            )
+        return executor.exec_in_workload(remote_id, list(body.command), timeout_s=body.timeout_s)
 
     return app
 

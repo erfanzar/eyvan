@@ -863,6 +863,31 @@ class NativeGangExecutor:
             ranks.append({"rank": rank, "cell_id": worker.cell_id, "endpoint": worker.endpoint, "status": detail})
         return {"remote_id": remote_id, "ranks": ranks}
 
+    def exec_in_workload(
+        self,
+        remote_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float = 30.0,
+    ) -> JsonObject:
+        """Run one diagnostic command beside this workload on every rank.
+
+        The multi-cell counterpart of the slice fan-out, and unreachable ranks
+        are reported the same way: named and numbered rather than omitted, so a
+        gang missing a member reads as missing rather than as complete.
+        """
+
+        ranks: list[JsonValue] = []
+        for rank, worker in enumerate(self._workers):
+            try:
+                result: JsonValue = worker.executor.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
+            except httpx.TransportError as exc:
+                result = {"observed": False, "detail": f"native worker is unreachable: {type(exc).__name__}: {exc}"}
+            except (httpx.HTTPStatusError, RuntimeError, ValueError) as exc:
+                result = {"observed": False, "detail": f"exec failed: {type(exc).__name__}: {exc}"}
+            ranks.append({"rank": rank, "endpoint": worker.endpoint, "result": result})
+        return {"remote_id": remote_id, "ranks": ranks}
+
     def close(self) -> None:
         """Close internally owned native-worker clients."""
 

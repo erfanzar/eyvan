@@ -1241,6 +1241,36 @@ class NativeSliceExecutor:
             ranks.append({"rank": rank, "endpoint": endpoint, "status": detail})
         return {"remote_id": remote_id, "ranks": ranks}
 
+    def exec_in_workload(
+        self,
+        remote_id: str,
+        command: tp.Sequence[str],
+        *,
+        timeout_s: float = 30.0,
+    ) -> JsonObject:
+        """Run one diagnostic command beside this workload on every host.
+
+        Every host, because the question exec answers is usually "which rank is
+        stuck", and one rank cannot tell a hung collective from a slow step.
+
+        An unreachable host is reported in place, exactly as ``process_status``
+        and the structured-log fan-out report one. A probe that returned only the
+        hosts it could reach would show a complete-looking answer for a
+        half-dead slice, which is the failure P2 exists to prevent and the one it
+        qualified against on 2026-08-13.
+        """
+
+        ranks: list[JsonValue] = []
+        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
+            try:
+                result: JsonValue = worker.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
+            except httpx.TransportError as exc:
+                result = {"observed": False, "detail": f"native worker is unreachable: {type(exc).__name__}: {exc}"}
+            except (httpx.HTTPStatusError, RuntimeError, ValueError) as exc:
+                result = {"observed": False, "detail": f"exec failed: {type(exc).__name__}: {exc}"}
+            ranks.append({"rank": rank, "endpoint": endpoint, "result": result})
+        return {"remote_id": remote_id, "ranks": ranks}
+
     def close(self) -> None:
         """Close internally owned native-worker clients."""
 
