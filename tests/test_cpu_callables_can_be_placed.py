@@ -34,7 +34,7 @@ from eyvan.records import (
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
-from eyvan.server.service.errors import ConflictError
+from eyvan.server.service.errors import ConflictError, NoMatchingCapacityPoolError
 
 
 def _operator() -> Principal:
@@ -327,3 +327,39 @@ def test_the_placeable_kinds_are_not_refused(config_name: str) -> None:
     from eyvan.sdk.execution import _refuse_unplaceable_config
 
     _refuse_unplaceable_config(CpuConfig() if config_name == "cpu" else TpuConfig(type="v5p-16"))
+
+
+@pytest.mark.asyncio
+async def test_the_no_pool_error_lists_gpu_and_cpu_types_the_fleet_actually_has() -> None:
+    """The hint handed to a caller when nothing matched described a TPU fleet.
+
+    `_callable_accelerator_types` filtered on `_is_complete_tpu_pool`, so a fleet
+    whose pools are GPU or CPU reported an empty list of available types -- while
+    those pools sat there enabled and placeable. Found by reading the diff rather
+    than by running anything, because the list only appears on the failure path.
+    """
+
+    service = _service()
+    admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    for index, pool in enumerate((_gpu_pool(), _cpu_pool())):
+        await service.upsert_capacity_pool(admin, pool, idempotency_key=f"pool-{index}")
+
+    with pytest.raises(NoMatchingCapacityPoolError) as error:
+        await _submit(_service(), [_gpu_pool(), _cpu_pool()], accelerator_type="nvidia-l4")
+
+    available = set(error.value.available_enabled_accelerator_types)
+    assert available == {"nvidia-tesla-p100", "cpu"}
+
+
+@pytest.mark.asyncio
+async def test_a_multi_pod_request_is_only_offered_tpu_types() -> None:
+    """Multi-worker capacity is a multislice allocation with no CPU or GPU analogue.
+
+    Offering `nvidia-tesla-p100` to a caller who asked for two pods would name a
+    shape the record layer refuses outright.
+    """
+
+    with pytest.raises(NoMatchingCapacityPoolError) as error:
+        await _submit(_service(), [_gpu_pool(), _cpu_pool()], accelerator_type="v5p-8", pods=2)
+
+    assert error.value.available_enabled_accelerator_types == ()

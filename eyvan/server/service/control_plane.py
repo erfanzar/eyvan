@@ -1241,23 +1241,49 @@ class ControlPlaneService:
         *,
         pods: int,
     ) -> tuple[str, ...]:
-        """Return unambiguous TPU types that can accept this callable shape."""
+        """Return the unambiguous accelerator types that can accept this shape.
+
+        Every kind, not only TPU. This list is what a caller is handed when no
+        pool matched, so filtering it to TPU told someone with a GPU or CPU fleet
+        that nothing was available while their pool sat there enabled -- an error
+        message that describes a different fleet than the one being addressed.
+
+        Completeness is judged per pool against the kind that pool declares,
+        which is safe *here* and would not be at the placement gate: this answers
+        "what does the fleet offer", where there is no requested type to lose. The
+        gate answers "may this pool serve this request", and deriving the kind
+        from the pool there is what let a pool named for a TPU while declaring
+        something else answer a TPU request.
+        """
 
         complete_pool_counts: dict[str, int] = {}
         compatible: set[str] = set()
         for pool in pools:
             accelerator_type = pool.accelerator_type
-            if not pool.enabled or accelerator_type is None or not cls._is_complete_tpu_pool(pool):
+            if not pool.enabled or accelerator_type is None or not cls._pool_is_complete_for_its_own_type(pool):
                 continue
             complete_pool_counts[accelerator_type] = complete_pool_counts.get(accelerator_type, 0) + 1
             if (
                 pool.max_cells < pods
-                or (pods > 1 and pool.executor != "eyvan-native")
+                # Multi-worker capacity is a TPU multislice allocation and has no
+                # CPU or GPU analogue, so a wider request narrows the list to TPU.
+                or (pods > 1 and (pool.executor != "eyvan-native" or not cls._is_complete_tpu_pool(pool)))
                 or (pool.max_replica_resources is not None and pool.max_replica_resources != pool.allocatable)
             ):
                 continue
             compatible.add(accelerator_type)
         return tuple(accelerator_type for accelerator_type in compatible if complete_pool_counts[accelerator_type] == 1)
+
+    @classmethod
+    def _pool_is_complete_for_its_own_type(cls, pool: CapacityPoolRecord) -> bool:
+        """Return whether a pool is coherent for the kind its own type names."""
+
+        accelerator_type = pool.accelerator_type or ""
+        if accelerator_type == "cpu":
+            return cls._is_complete_cpu_pool(pool)
+        if parse_tpu_accelerator_type(accelerator_type) is not None:
+            return cls._is_complete_tpu_pool(pool)
+        return cls._is_complete_gpu_pool(pool)
 
     @staticmethod
     async def _fleet_pools(tx: RepositorySession, fleet_name: str) -> list[CapacityPoolRecord]:
