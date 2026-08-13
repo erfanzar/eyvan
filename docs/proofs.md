@@ -462,6 +462,42 @@ Inconclusive because two criteria were not exercised: the live-children ceiling
 needs 256 concurrent children, and the `exec` half needs a TPU -- the local
 driver reports `supports_exec: False`, correctly, since a shell on this host is
 already available without asking Eyvan for one.
+
+**Run 2026-08-13, exit 0 (pass) for the children half.** On a real GCE CPU cell
+in `us-central1-a`, against a head running the checkout's own wheel. All five
+criteria the `children` evaluator states passed: 256 children created, every one
+attributed to the parent's owner rather than `workload:<id>`, every one parented
+into the parent's scope, the width ceiling refusing the 257th with 409
+(*"already has 256 live children; at most 256 may run at once"*), and the
+capability refused with 409 once the parent was terminal (*"is cancelled; it
+cannot gain new children"*). Receipt `p3-final.json`, and `eyvan proof verify`
+re-reads it as intact with the criterion and candidate both current.
+
+Three things had to be fixed to run it at all, which is why it sat inconclusive
+for eight days rather than failing:
+
+* **Nothing could request the capability.** `can_submit_children` was complete
+  server-side and set by no CLI option and no SDK config, so the only workloads
+  that ever held it were services, which settlement grants it to on their behalf.
+  `eyvan workload submit --can-submit-children` now asks for it.
+* **The ceiling is not reachable without retrying.** Around 230 children the
+  plane answers a PostgreSQL serialization conflict (40001) with a *retryable*
+  503 -- its own detail says so, and `eyvan.worker.runtime.http_retry` treats it
+  as retryable. A harness posting with bare `urllib` reports that transient
+  conflict as the ceiling and stops 26 short. With the shipped retry policy it
+  reaches exactly 256. The plane is behaving correctly under contention; a
+  launcher fanning out this wide has to use the retry the SDK already ships.
+* **The expiry check cannot live inside the job.** Only the job holds the token,
+  and the runtime stops the workload's transient unit and reaps its whole cgroup,
+  so a detached probe is killed mid-check -- correctly, since a workload runtime
+  that leaked processes past cancellation would be the worse bug. The capability
+  has to be left somewhere that outlives the process and replayed from outside.
+
+Note the two refusals are both 409 and are told apart only by their detail: the
+width ceiling and a terminated parent would otherwise be indistinguishable to
+anything checking status codes.
+
+Still unqualified: the `exec` half, which needs a TPU.
 **Shape** CPU fleet, then v5p-16. **~40 minutes.**
 
 ## P4 — secret delivery, per attempt
