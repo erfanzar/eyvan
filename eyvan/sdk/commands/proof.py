@@ -459,6 +459,20 @@ def evaluate_secret_delivery(
         leaks.append("an audit payload")
     if leaks:
         checks.append(_failed("value-never-recorded", f"the secret value appears in {', '.join(leaks)}"))
+    elif (workload.get("spec") or {}).get("secret_mounts"):
+        # Derived from the spec rather than by matching the plane's wording: a
+        # workload that mounts secrets is served no log output at all, so the
+        # log grep above is vacuous and passing quietly on it would credit an
+        # inspection that did not happen. The stronger fact is worth stating --
+        # a value cannot leak through output the plane refuses to serve -- but
+        # it is a different fact from "the job did not print it".
+        checks.append(
+            _passed(
+                "value-never-recorded",
+                "the value appears in no record or audit payload; the plane serves no log output for a "
+                "secret-bearing workload, so the log half holds by suppression rather than by inspection",
+            )
+        )
     else:
         checks.append(_passed("value-never-recorded", "the value appears in no log, record or audit payload"))
     return ProofResult("P4", tuple(checks))
@@ -1032,7 +1046,14 @@ def secret_proof(
                     ),
                 ),
                 run.seen("workload", session.client.request("GET", f"/api/v1/workloads/{workload_id}")),
-                str(run.seen("logs", session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs"))),
+                # ``request_text``, not ``request``: the logs route is declared
+                # PlainTextResponse, so decoding it as JSON fails for every
+                # workload -- and for this proof's workload in particular, whose
+                # body is the plane's notice that it suppresses output for
+                # secret-bearing execution. Read as JSON that notice surfaced as
+                # "the plane could not answer", which reported a plane that had
+                # answered clearly as unreachable.
+                run.seen("logs", session.client.request_text("GET", f"/api/v1/workloads/{workload_id}/logs")),
                 secret_value=value,
             ),
         ),

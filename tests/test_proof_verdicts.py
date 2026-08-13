@@ -523,6 +523,45 @@ def test_a_value_in_the_workload_record_fails() -> None:
     assert _check(result, "value-never-recorded") is Verdict.FAIL
 
 
+def test_a_suppressed_log_says_so_rather_than_claiming_a_clean_grep() -> None:
+    """The plane serves no output at all for a workload that mounts secrets.
+
+    So the log grep is vacuous for every workload this proof is ever pointed at,
+    and reporting it as "the value appears in no log" credits an inspection that
+    did not happen. The check still passes -- a value cannot leak through output
+    the plane refuses to serve -- but the receipt has to name which fact it is.
+    """
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")],
+        {"id": "wl-1", "spec": {"secret_mounts": {"HF_TOKEN": "gcp-secret://p/t"}}},
+        "[eyvan] logs are suppressed for this workload because it mounts secrets;"
+        " its output may contain their values.",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "value-never-recorded") is Verdict.PASS
+    assert "by suppression rather than by inspection" in _detail(result, "value-never-recorded")
+
+
+def test_suppression_never_masks_a_value_that_did_reach_the_log() -> None:
+    """The ordering that makes the branch above safe.
+
+    If suppression were consulted before the grep, a plane that regressed and
+    served the output anyway would be reported clean by the one proof whose job
+    is to catch exactly that.
+    """
+
+    result = evaluate_secret_delivery(
+        [_event("secret.issued"), _event("secret.read")],
+        {"id": "wl-1", "spec": {"secret_mounts": {"HF_TOKEN": "gcp-secret://p/t"}}},
+        f"printing {_VALUE} for debugging\n",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "value-never-recorded") is Verdict.FAIL
+
+
 def test_a_read_with_no_issuance_in_its_attempt_fails() -> None:
     """The signal a leaked token produces, and the reason both events exist."""
 
