@@ -86,6 +86,11 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
         "can_submit_children": False,
+        # Scheduling intent the pool cannot supply: without these a long
+        # training run submitted here sat in the interactive band.
+        "priority_band": "interactive",
+        "intra_band_priority": 0,
+        "checkpoint_grace_seconds": 0,
     }
     client.close()
 
@@ -172,6 +177,11 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
         "can_submit_children": False,
+        # Scheduling intent the pool cannot supply: without these a long
+        # training run submitted here sat in the interactive band.
+        "priority_band": "interactive",
+        "intra_band_priority": 0,
+        "checkpoint_grace_seconds": 0,
     }
     client.close()
 

@@ -12,7 +12,7 @@ import typing as tp
 from pydantic import BaseModel
 
 from eyvan._internal.json_types import JsonObject, model_json
-from eyvan.records import CallableExecution, CapacityClass, WorkloadState, WorkspaceRef
+from eyvan.records import CallableExecution, CapacityClass, PriorityBand, WorkloadState, WorkspaceRef
 from eyvan.sdk.client.jobs import reject_remote_callable_signature, reject_remote_callable_signing_environment
 from eyvan.sdk.client.types import QueryParams
 from eyvan.server.api.schemas import PoolCallableSubmitRequest, PoolWorkloadSubmitRequest
@@ -44,6 +44,9 @@ def pool_workload_request(
     checkpoint_hook: str | None = None,
     checkpoint_output_uri: str | None = None,
     can_submit_children: bool = False,
+    priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+    intra_band_priority: int = 0,
+    checkpoint_grace_seconds: int = 0,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -63,6 +66,9 @@ def pool_workload_request(
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
         can_submit_children=can_submit_children,
+        priority_band=priority_band,
+        intra_band_priority=intra_band_priority,
+        checkpoint_grace_seconds=checkpoint_grace_seconds,
     )
 
 
@@ -85,6 +91,9 @@ def pool_callable_request(
     checkpoint_hook: str | None = None,
     checkpoint_output_uri: str | None = None,
     can_submit_children: bool = False,
+    priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+    intra_band_priority: int = 0,
+    checkpoint_grace_seconds: int = 0,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -108,6 +117,9 @@ def pool_callable_request(
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
         can_submit_children=can_submit_children,
+        priority_band=priority_band,
+        intra_band_priority=intra_band_priority,
+        checkpoint_grace_seconds=checkpoint_grace_seconds,
     )
 
 

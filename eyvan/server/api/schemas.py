@@ -32,6 +32,7 @@ from eyvan.records import (
     OrganizationRecord,
     Permission,
     PolicyRecord,
+    PriorityBand,
     ProjectRecord,
     QuotaRecord,
     ResourceLimits,
@@ -229,6 +230,13 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: Whether this job may submit children of its own, under its owner's
     #: identity. Same capability the explicit-intent path exposes.
     can_submit_children: bool = False
+    #: Scheduling intent, which the pool cannot supply. Defaults to the
+    #: record's own default, so a long training run submitted here competed
+    #: above batch work with no way to declare itself batch.
+    priority_band: PriorityBand = PriorityBand.INTERACTIVE
+    intra_band_priority: int = Field(default=0, ge=0)
+    #: Seconds the checkpoint hook is given before the job is stopped.
+    checkpoint_grace_seconds: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
@@ -265,6 +273,13 @@ class PoolCallableSubmitRequest(ApiModel):
     #: Whether this job may submit children of its own, under its owner's
     #: identity. Same capability the explicit-intent path exposes.
     can_submit_children: bool = False
+    #: Scheduling intent, which the pool cannot supply. Defaults to the
+    #: record's own default, so a long training run submitted here competed
+    #: above batch work with no way to declare itself batch.
+    priority_band: PriorityBand = PriorityBand.INTERACTIVE
+    intra_band_priority: int = Field(default=0, ge=0)
+    #: Seconds the checkpoint hook is given before the job is stopped.
+    checkpoint_grace_seconds: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:

@@ -2170,6 +2170,9 @@ def create_app(
             checkpoint_hook=request.checkpoint_hook,
             checkpoint_output_uri=request.checkpoint_output_uri,
             can_submit_children=request.can_submit_children,
+            priority_band=request.priority_band,
+            intra_band_priority=request.intra_band_priority,
+            checkpoint_grace_seconds=request.checkpoint_grace_seconds,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2216,6 +2219,9 @@ def create_app(
             checkpoint_hook=request.checkpoint_hook,
             checkpoint_output_uri=request.checkpoint_output_uri,
             can_submit_children=request.can_submit_children,
+            priority_band=request.priority_band,
+            intra_band_priority=request.intra_band_priority,
+            checkpoint_grace_seconds=request.checkpoint_grace_seconds,
             idempotency_key=idempotency_key,
         )
         if replayed:

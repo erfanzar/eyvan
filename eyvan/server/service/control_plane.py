@@ -97,6 +97,7 @@ from eyvan.records import (
     PoolLaunchLatency,
     PoolWarmth,
     Principal,
+    PriorityBand,
     ProjectRecord,
     QueueTrend,
     QueueTrendPoint,
@@ -828,6 +829,9 @@ class ControlPlaneService:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -898,6 +902,9 @@ class ControlPlaneService:
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
                 can_submit_children=can_submit_children,
+                priority_band=priority_band,
+                intra_band_priority=intra_band_priority,
+                checkpoint_grace_seconds=checkpoint_grace_seconds,
             )
             return await self._store_workload(
                 tx,
@@ -933,6 +940,9 @@ class ControlPlaneService:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -1096,6 +1106,9 @@ class ControlPlaneService:
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
                 can_submit_children=can_submit_children,
+                priority_band=priority_band,
+                intra_band_priority=intra_band_priority,
+                checkpoint_grace_seconds=checkpoint_grace_seconds,
             )
             return await self._store_workload(
                 tx,
@@ -1238,6 +1251,9 @@ class ControlPlaneService:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
     ) -> WorkloadDefinition:
         """Build a workload whose placement contract is pinned to one fleet pool.
 
@@ -1283,6 +1299,9 @@ class ControlPlaneService:
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
             can_submit_children=can_submit_children,
+            priority_band=priority_band,
+            intra_band_priority=intra_band_priority,
+            checkpoint_grace_seconds=checkpoint_grace_seconds,
         )
 
     async def _replayed_workload(

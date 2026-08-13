@@ -2036,6 +2036,11 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
         "can_submit_children": False,
+        # Scheduling intent the pool cannot supply: without these a long
+        # training run submitted here sat in the interactive band.
+        "priority_band": "interactive",
+        "intra_band_priority": 0,
+        "checkpoint_grace_seconds": 0,
     }
     assert (
         not {

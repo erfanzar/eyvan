@@ -25,6 +25,7 @@ from eyvan.records import (
     CellRecord,
     LeaseRecord,
     PolicyRecord,
+    PriorityBand,
     WorkloadEstimate,
     WorkloadProgress,
     WorkloadRecord,
@@ -176,6 +177,9 @@ class AsyncEyvanClient:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -195,6 +199,9 @@ class AsyncEyvanClient:
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
             can_submit_children=can_submit_children,
+            priority_band=priority_band,
+            intra_band_priority=intra_band_priority,
+            checkpoint_grace_seconds=checkpoint_grace_seconds,
         )
         response = await self._mutating_request(
             "POST",
@@ -225,6 +232,9 @@ class AsyncEyvanClient:
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
         can_submit_children: bool = False,
+        priority_band: PriorityBand = PriorityBand.INTERACTIVE,
+        intra_band_priority: int = 0,
+        checkpoint_grace_seconds: int = 0,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -247,6 +257,9 @@ class AsyncEyvanClient:
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
             can_submit_children=can_submit_children,
+            priority_band=priority_band,
+            intra_band_priority=intra_band_priority,
+            checkpoint_grace_seconds=checkpoint_grace_seconds,
         )
         response = await self._mutating_request(
             "POST",
