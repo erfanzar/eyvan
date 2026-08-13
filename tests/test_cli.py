@@ -1795,8 +1795,15 @@ def test_workload_submit_sends_capacity_selectors(monkeypatch) -> None:
         "max_failure_retries": 0,
         "max_preemption_retries": 10,
         # Sent explicitly like every other option-backed field, so the wire says
-        # the capability was declined rather than merely omitted.
+        # the capability was declined rather than merely omitted. The placement
+        # breadth below reads the same way: empty is this job naming no
+        # alternative, which is what makes --region a pin.
         "can_submit_children": False,
+        "additional_capacity_classes": [],
+        "allowed_regions": [],
+        "allowed_zones": [],
+        "allowed_accelerator_types": [],
+        "named_assets": [],
     }
 
 

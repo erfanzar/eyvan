@@ -596,6 +596,39 @@ def estimate_workload(
 @click.option("--accelerator-type")
 @click.option("--provider")
 @click.option("--region")
+@click.option(
+    "--additional-capacity-class",
+    "additional_capacity_classes",
+    multiple=True,
+    type=click.Choice(tuple(capacity.value for capacity in CapacityClass)),
+    help="Further capacity classes this job will accept, in preference order after --capacity-class. This is how a "
+    "spot-first job says it would rather fall back than wait: the scheduler has always ranked a portfolio.",
+)
+@click.option(
+    "--allowed-region",
+    "allowed_regions",
+    multiple=True,
+    help="Regions this job will accept. Mutually exclusive with --region, which pins one.",
+)
+@click.option(
+    "--allowed-zone",
+    "allowed_zones",
+    multiple=True,
+    help="Zones this job will accept. Same rule as --allowed-region.",
+)
+@click.option(
+    "--allowed-accelerator-type",
+    "allowed_accelerator_types",
+    multiple=True,
+    help="Accelerator types this job will accept. Mutually exclusive with --accelerator-type.",
+)
+@click.option(
+    "--named-asset",
+    "named_assets",
+    multiple=True,
+    help="Logical names of large inputs this job pulls -- a dataset URI, a checkpoint, an image. Only a hint: cells "
+    "that recently ran something naming the same asset are preferred, so a stale guess costs one pull.",
+)
 @click.option("--required-executor")
 @click.option(
     "--priority-band",
@@ -668,6 +701,11 @@ def submit_workload(
     accelerator_type: str | None,
     provider: str | None,
     region: str | None,
+    additional_capacity_classes: tuple[str, ...],
+    allowed_regions: tuple[str, ...],
+    allowed_zones: tuple[str, ...],
+    allowed_accelerator_types: tuple[str, ...],
+    named_assets: tuple[str, ...],
     required_executor: str | None,
     priority_band: str,
     intra_band_priority: int,
@@ -697,9 +735,14 @@ def submit_workload(
                     per_replica=ResourceVector(cpu=cpu, memory_gib=memory_gib, gpu=gpu, tpu=tpu),
                 ),
                 capacity_class=CapacityClass(capacity_class),
+                additional_capacity_classes=tuple(CapacityClass(value) for value in additional_capacity_classes),
                 accelerator_type=accelerator_type,
                 provider=provider,
                 region=region,
+                allowed_regions=allowed_regions,
+                allowed_zones=allowed_zones,
+                allowed_accelerator_types=allowed_accelerator_types,
+                named_assets=named_assets,
                 required_executor=required_executor,
                 priority_band=PriorityBand(priority_band),
                 intra_band_priority=intra_band_priority,

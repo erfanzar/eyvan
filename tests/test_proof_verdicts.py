@@ -535,8 +535,7 @@ def test_a_suppressed_log_says_so_rather_than_claiming_a_clean_grep() -> None:
     result = evaluate_secret_delivery(
         [_event("secret.issued"), _event("secret.read")],
         {"id": "wl-1", "spec": {"secret_mounts": {"HF_TOKEN": "gcp-secret://p/t"}}},
-        "[eyvan] logs are suppressed for this workload because it mounts secrets;"
-        " its output may contain their values.",
+        "[eyvan] logs are suppressed for this workload because it mounts secrets; its output may contain their values.",
         secret_value=_VALUE,
     )
 

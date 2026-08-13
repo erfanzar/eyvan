@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Four complete features nothing could reach.
+"""Five complete features nothing could reach.
 
 Each was built, validated and exported, and each was walled off by exactly one
 line somewhere else:
@@ -23,6 +23,19 @@ line somewhere else:
   guard, generation fencing -- and no CLI option or SDK config set it. The only
   workloads that ever carried it were services, which settlement grants it to
   on their behalf, so every path a person could type left the feature off.
+* the placement breadth a submitter declares -- ``additional_capacity_classes``,
+  ``allowed_regions``, ``allowed_zones``, ``allowed_accelerator_types`` and
+  ``named_assets`` -- was read by the scheduler and settable by nothing. The
+  first of those is the capacity portfolio, so "spot, but take on-demand rather
+  than sit in a queue" was not a request the CLI could make.
+
+The shape repeats: a field lands on the record and both schemas, the server
+learns to honour it, and the client surface is the step nobody notices is
+missing, because everything downstream of it already works. ``grep <field>
+eyvan/sdk/`` returning nothing is the whole diagnostic, and it is worth running
+against ``WorkloadDefinition.model_fields`` after adding one. Mind the false
+negatives: ``allowed_regions`` appeared to be reachable only because
+``eyvan policy set --allow-region`` names the unrelated *policy* allow-list.
 """
 
 from __future__ import annotations
@@ -330,3 +343,76 @@ def test_the_child_capability_stays_off_when_it_is_not_asked_for(monkeypatch: py
     """
 
     assert _submit(monkeypatch).spec.can_submit_children is False
+
+
+def test_a_spot_first_job_can_say_it_would_rather_fall_back_than_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The capacity portfolio, which nothing typeable could express.
+
+    ``capacity_class_portfolio`` puts it plainly: the core scheduler has always
+    ranked a portfolio -- ``capacity_class_rank`` is the fourth key of
+    ``PlacementScore`` -- and the only thing collapsing it to one entry was the
+    adapter. So the single most common thing a spot user wants, "spot, but take
+    on-demand rather than sit in a queue", could be asked for only by
+    hand-writing the HTTP request.
+    """
+
+    from eyvan.records import CapacityClass
+
+    spec = _submit(
+        monkeypatch,
+        *["--capacity-class", "spot"],
+        *["--additional-capacity-class", "on_demand"],
+        *["--additional-capacity-class", "reserved"],
+    ).spec
+
+    assert spec.capacity_class_portfolio == (CapacityClass.SPOT, CapacityClass.ON_DEMAND, CapacityClass.RESERVED)
+
+
+def test_a_job_can_name_the_places_it_will_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Breadth, as opposed to the pin that ``--region`` already expressed.
+
+    The scheduler reads all three (``scheduling.py`` ranks on zone, region and
+    accelerator type), and a submitter could set none of them. Naming several
+    regions is what lets a job chase capacity across them instead of queueing in
+    the one that happens to be full.
+    """
+
+    spec = _submit(
+        monkeypatch,
+        *["--allowed-region", "us-east5", "--allowed-region", "europe-west4"],
+        *["--allowed-zone", "us-east5-a"],
+        *["--allowed-accelerator-type", "v5p-16", "--allowed-accelerator-type", "v5p-32"],
+        *["--named-asset", "gs://corpus/shard-0"],
+    ).spec
+
+    assert spec.allowed_regions == ("us-east5", "europe-west4")
+    assert spec.allowed_zones == ("us-east5-a",)
+    assert spec.allowed_accelerator_types == ("v5p-16", "v5p-32")
+    assert spec.named_assets == ("gs://corpus/shard-0",)
+
+
+def test_naming_regions_while_pinning_one_is_refused_rather_than_silently_ranked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin is a statement about *the* region; a list beside it contradicts it.
+
+    The record refuses the combination, and the CLI has to surface that as a
+    usage error rather than posting a spec the plane will reject.
+    """
+
+    from click.testing import CliRunner
+    from test_cli import FakeClient
+
+    from eyvan.sdk import cli
+
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: FakeClient())
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            *["--user", "alice", "--org", "acme", "--project", "research"],
+            *["workload", "submit", "--name", "t", "--command", "python train.py"],
+            *["--region", "us-east5", "--allowed-region", "europe-west4"],
+        ],
+    )
+
+    assert result.exit_code != 0
