@@ -128,8 +128,10 @@ attempt, including after restart and terminal collection.
 ## What jobs can do
 
 A job holds exactly the capabilities its spec asked for. `can_submit_children`
-is off by default; `secret_mounts` is empty by default and gated by the
-allow-list above. A child's `created_by` is its *parent's* owner, not a
+is off unless the submission asked for it with
+`eyvan workload submit --can-submit-children`, and a job that did not ask holds
+no token at all rather than an unusable one; `secret_mounts` is empty by default
+and gated by the allow-list above. A child's `created_by` is its *parent's* owner, not a
 synthetic `workload:` subject -- a synthetic one would create a fresh fair-share
 leaf and silently escape per-principal quota.
 

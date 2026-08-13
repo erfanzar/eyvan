@@ -302,6 +302,12 @@ Inside a running workload, `report_progress`, `submit_child`, and
 `in_job_context` let a job report and fan out under its owner's identity, with a
 generation-pinned capability token.
 
+The token is only delivered to a job that asked for one, so submit with
+`eyvan workload submit --can-submit-children`; without it `in_job_context()`
+returns `None` and `submit_child` raises `NotRunningUnderEyvan`. At most 256
+children may be live at once, and the capability stops working as soon as the
+parent is terminal.
+
 ### Operate
 
 ```bash
