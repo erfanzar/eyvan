@@ -333,6 +333,44 @@ v5p-16, whose two hosts are two ranks in one cell. P2 is genuinely blocked on TP
 capacity, and this section exists so the next person spends ten minutes reading
 it rather than an hour finding out.
 
+## P2 passed on 2026-08-13, on the seventh attempt
+
+`us-central1-a`, v5p-16 spot, exit 0 on all six criteria. Receipt
+`p2-rankloss.json`, which `eyvan proof verify` re-reads as intact with criterion
+and candidate current.
+
+```
+98/98 timestamped · stdout/stderr preserved · records carry backend cursors
+2 rank(s) accounted for
+rank(s) [1] reported unavailable        <- had never been exercised anywhere
+```
+
+The rank-loss half is the one that mattered. A worker was stopped on one host of
+the two-host slice out of band, and the next page reported rank 1 **in place** --
+still named, still numbered -- rather than returning the host it could reach and
+looking complete. That is the exact failure the whole aggregation discipline
+exists to prevent, and until this run nothing had ever made it happen.
+
+The zone is the lesson. Six previous attempts went to `us-east5-a` and
+`europe-west4`, because the quota override on `us-east5-a` had been read as the
+only grant. It is not: the metric's `defaultLimit` applies to every zone in
+`supportedLocations`, so `us-central1-a`, `us-east5-b` and `us-east1-d` all carry
+1024 preemptible v5p cores and all offer v5p-16. Reading the Cloud Quotas API
+properly took ten minutes and found three untried zones; the first one granted.
+
+Getting the slice was not the end of it. The cell came up and its worker never
+started, and the two bootstrap defects recorded above -- a wedged
+`unattended-upgrade` holding the dpkg lock, and a bootstrap that asked only
+`python3` for a venv while `python3.11` sat beside it -- had to be worked around
+by hand before anything ran. Both are fixed in the build now; this run predates
+the fix and was unblocked manually, which the receipt cannot know and this
+paragraph records.
+
+**Passes when** every rank appears, records carry timestamps, streams and
+cursors, and a rank taken away mid-stream is reported unavailable rather than
+omitted.
+**Shape** any multi-host TPU slice; v5p-16 is two hosts. **~30 minutes.**
+
 ## What blocked P2 on 2026-08-13
 
 Worth recording, because "not attempted" and "attempted and blocked" call for
