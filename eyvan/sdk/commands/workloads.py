@@ -181,6 +181,9 @@ class WorkloadCommandService:
         command: tuple[str, ...],
         max_failure_retries: int = 0,
         workspace: Path | None = None,
+        checkpointable: bool = False,
+        checkpoint_hook: str | None = None,
+        checkpoint_output_uri: str | None = None,
     ) -> None:
         """Submit one pool-targeted command using context and fleet defaults."""
 
@@ -199,6 +202,9 @@ class WorkloadCommandService:
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
                 workspace=workspace_ref,
+                checkpointable=checkpointable,
+                checkpoint_hook=checkpoint_hook,
+                checkpoint_output_uri=checkpoint_output_uri,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -372,6 +378,15 @@ class WorkloadCommandService:
     default=None,
     help="Upload this directory (respecting .gitignore) and run the command inside it. Bare --workspace means '.'.",
 )
+@click.option(
+    "--checkpointable",
+    is_flag=True,
+    default=False,
+    help="This job can be checkpointed. Pair it with --checkpoint-hook: the scheduler only checkpoints on "
+    "preemption when both are set, so on spot this is the difference between resuming and restarting from zero.",
+)
+@click.option("--checkpoint-hook", help="Command run on the cell to write a checkpoint before the job is stopped.")
+@click.option("--checkpoint-output-uri", help="Where the hook writes, normally a gs:// prefix.")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
@@ -385,6 +400,9 @@ def run_workload(
     max_failure_retries: int,
     idempotency_key: str | None,
     workspace: Path | None,
+    checkpointable: bool,
+    checkpoint_hook: str | None,
+    checkpoint_output_uri: str | None,
     command: tuple[str, ...],
 ) -> None:
     """Queue COMMAND on TYPE or FLEET/TYPE using applied fleet defaults."""
@@ -400,6 +418,9 @@ def run_workload(
         idempotency_key=idempotency_key,
         command=command,
         workspace=workspace,
+        checkpointable=checkpointable,
+        checkpoint_hook=checkpoint_hook,
+        checkpoint_output_uri=checkpoint_output_uri,
     )
 
 

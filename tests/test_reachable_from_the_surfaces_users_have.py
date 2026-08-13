@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Five complete features nothing could reach.
+"""Six complete features nothing could reach.
 
 Each was built, validated and exported, and each was walled off by exactly one
 line somewhere else:
@@ -28,6 +28,14 @@ line somewhere else:
   ``named_assets`` -- was read by the scheduler and settable by nothing. The
   first of those is the capacity portfolio, so "spot, but take on-demand rather
   than sit in a queue" was not a request the CLI could make.
+
+* the job's checkpoint contract -- ``checkpointable``, ``checkpoint_hook``,
+  ``checkpoint_output_uri`` -- was carried by ``eyvan workload submit`` and by
+  neither pool request schema, so ``@execute`` and ``eyvan run`` could not set
+  it. ``_checkpoint`` grants ``ON_PREEMPTION`` only when the flag and a hook are
+  both present, and the callable path defaults to *spot*: every callable ever
+  reclaimed there restarted from zero, with ``max_preemption_retries`` buying
+  more attempts and never a resumption.
 
 The shape repeats: a field lands on the record and both schemas, the server
 learns to honour it, and the client surface is the step nobody notices is
@@ -343,6 +351,144 @@ def test_the_child_capability_stays_off_when_it_is_not_asked_for(monkeypatch: py
     """
 
     assert _submit(monkeypatch).spec.can_submit_children is False
+
+
+def test_a_pool_submitted_spot_job_can_declare_itself_checkpointable() -> None:
+    """Otherwise every ``@execute`` job on spot restarts from zero, forever.
+
+    ``_checkpoint`` in ``scheduling`` grants ``CheckpointMode.ON_PREEMPTION``
+    only when ``checkpointable`` is set *and* a hook is named. The pool path --
+    which is what ``@execute`` and ``eyvan run`` use, and which defaults to spot
+    for callables -- carried neither field, so the mode was unreachable there:
+    ``max_preemption_retries`` bought more attempts and never a resumption.
+    """
+
+    from eyvan.records import CommandExecution, ResourceGang, ResourceVector, WorkloadRecord, WorkloadState
+    from eyvan.server.service.control_plane import ControlPlaneService
+    from eyvan.server.service.scheduling import CheckpointMode
+
+    spec = ControlPlaneService._pinned_pool_workload_spec(
+        pool=_pool_record(),
+        name="train",
+        execution=CommandExecution(kind="command", command="python train.py"),
+        environment={},
+        secret_mounts={},
+        metadata={},
+        max_retries=3,
+        max_failure_retries=0,
+        cell_group_count=1,
+        checkpointable=True,
+        checkpoint_hook="python -m train.checkpoint",
+        checkpoint_output_uri="gs://ckpt/run-1",
+    )
+
+    assert spec.checkpointable is True
+    assert spec.checkpoint_hook == "python -m train.checkpoint"
+
+    record = WorkloadRecord(
+        id="wl-1",
+        org_id="acme",
+        project_id="research",
+        created_by="alice",
+        state=WorkloadState.PENDING,
+        spec=spec.model_copy(update={"gang": ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1))}),
+    )
+    from eyvan.server.service.scheduling import _checkpoint
+
+    assert _checkpoint(record).mode is CheckpointMode.ON_PREEMPTION
+
+
+def test_a_pool_job_that_asks_for_nothing_is_still_not_checkpointed() -> None:
+    """The default has to stay off: a hook that does not exist is worse than none.
+
+    The job would be stopped for a checkpoint it never wrote.
+    """
+
+    from eyvan.records import CommandExecution
+    from eyvan.server.service.control_plane import ControlPlaneService
+
+    spec = ControlPlaneService._pinned_pool_workload_spec(
+        pool=_pool_record(),
+        name="train",
+        execution=CommandExecution(kind="command", command="python train.py"),
+        environment={},
+        secret_mounts={},
+        metadata={},
+        max_retries=3,
+        max_failure_retries=0,
+        cell_group_count=1,
+    )
+
+    assert spec.checkpointable is False
+    assert spec.checkpoint_hook is None
+
+
+@pytest.mark.asyncio
+async def test_a_callable_submitted_through_the_service_keeps_its_checkpoint_contract() -> None:
+    """The same thing through the public entry point rather than the builder.
+
+    ``submit_pool_callable`` is what the callable path actually calls, so this is
+    the assertion that the fields survive the whole submission and land on the
+    durable record -- not merely that a helper accepts them.
+    """
+
+    from eyvan.records import CallableExecution, Principal, Role, RoleGrant
+    from eyvan.server.persistence import InMemoryRepository
+    from eyvan.server.service import ControlPlaneService
+    from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    await service.upsert_capacity_pool(admin, _pool_record(), idempotency_key="pool-0")
+
+    workload, _ = await service.submit_pool_callable(
+        Principal(
+            subject="alice",
+            grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+        ),
+        fleet_name="research",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-8",
+        pods=1,
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12"),
+        checkpointable=True,
+        checkpoint_hook="python -m train.checkpoint",
+        checkpoint_output_uri="gs://ckpt/run-1",
+        idempotency_key="ckpt-callable-1",
+    )
+
+    assert workload.spec.checkpointable is True
+    assert workload.spec.checkpoint_hook == "python -m train.checkpoint"
+    assert workload.spec.checkpoint_output_uri == "gs://ckpt/run-1"
+
+
+def _pool_record():
+    """One enabled spot pool, which is what the callable path defaults to."""
+
+    from eyvan.records import CapacityPoolRecord, ResourceVector
+
+    resources = ResourceVector(cpu=8, memory_gib=32, tpu=4)
+    return CapacityPoolRecord(
+        id="research/v5p",
+        fleet_name="research",
+        node_type="v5p",
+        provider="gcp",
+        capacity_backend="gcp-tpu",
+        provider_project="p",
+        region="us-east5",
+        zone="us-east5-a",
+        capacity=resources,
+        allocatable=resources,
+        accelerator_type="v5p-8",
+        capacity_class="spot",
+        executor="eyvan-native",
+        agent_endpoint="http://agent:8090",
+        max_cells=4,
+    )
 
 
 def test_a_spot_first_job_can_say_it_would_rather_fall_back_than_wait(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -65,6 +65,9 @@ class AcceleratorConfig(tp.Protocol):
     max_preemption_retries: int
     capacity_class: CapacityClass
     secret_mounts: tp.Mapping[str, str]
+    checkpointable: bool
+    checkpoint_hook: str | None
+    checkpoint_output_uri: str | None
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -128,6 +131,15 @@ class TpuConfig:
     #: variables on the cell. Unlike a value passed through ``environment``, a
     #: reference is what gets persisted -- which is the whole point.
     secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
+    #: Whether this job can be checkpointed, and the hook that does it. The
+    #: scheduler grants ``ON_PREEMPTION`` only when ``checkpointable`` is set and
+    #: a hook is named, so a job that declares neither restarts from zero on
+    #: every reclamation -- ``max_preemption_retries`` buys it more attempts, not
+    #: a resumption. Off by default because a hook that does not exist is worse
+    #: than none: the job would be stopped for a checkpoint it never wrote.
+    checkpointable: bool = False
+    checkpoint_hook: str | None = None
+    checkpoint_output_uri: str | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
@@ -161,6 +173,15 @@ class GpuConfig:
     #: variables on the cell. Unlike a value passed through ``environment``, a
     #: reference is what gets persisted -- which is the whole point.
     secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
+    #: Whether this job can be checkpointed, and the hook that does it. The
+    #: scheduler grants ``ON_PREEMPTION`` only when ``checkpointable`` is set and
+    #: a hook is named, so a job that declares neither restarts from zero on
+    #: every reclamation -- ``max_preemption_retries`` buys it more attempts, not
+    #: a resumption. Off by default because a hook that does not exist is worse
+    #: than none: the job would be stopped for a checkpoint it never wrote.
+    checkpointable: bool = False
+    checkpoint_hook: str | None = None
+    checkpoint_output_uri: str | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
@@ -184,6 +205,15 @@ class CpuConfig:
     #: variables on the cell. Unlike a value passed through ``environment``, a
     #: reference is what gets persisted -- which is the whole point.
     secret_mounts: tp.Mapping[str, str] = field(default_factory=dict)
+    #: Whether this job can be checkpointed, and the hook that does it. The
+    #: scheduler grants ``ON_PREEMPTION`` only when ``checkpointable`` is set and
+    #: a hook is named, so a job that declares neither restarts from zero on
+    #: every reclamation -- ``max_preemption_retries`` buys it more attempts, not
+    #: a resumption. Off by default because a hook that does not exist is worse
+    #: than none: the job would be stopped for a checkpoint it never wrote.
+    checkpointable: bool = False
+    checkpoint_hook: str | None = None
+    checkpoint_output_uri: str | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)

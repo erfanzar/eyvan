@@ -2029,6 +2029,12 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         # pure command intent, with the working tree an explicit opt-in rather
         # than something a submission carries by surprise.
         "workspace": None,
+        # Job intent, not placement, so these do not cross the boundary this
+        # test draws: the pool still supplies provider, region, accelerator and
+        # gang. Whether a job can be checkpointed is a fact about the job.
+        "checkpointable": False,
+        "checkpoint_hook": None,
+        "checkpoint_output_uri": None,
     }
     assert (
         not {

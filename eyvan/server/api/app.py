@@ -2166,6 +2166,9 @@ def create_app(
             max_failure_retries=request.max_failure_retries,
             max_preemption_retries=request.max_preemption_retries,
             workspace=request.workspace,
+            checkpointable=request.checkpointable,
+            checkpoint_hook=request.checkpoint_hook,
+            checkpoint_output_uri=request.checkpoint_output_uri,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2208,6 +2211,9 @@ def create_app(
             max_retries=request.max_retries,
             max_failure_retries=request.max_failure_retries,
             max_preemption_retries=request.max_preemption_retries,
+            checkpointable=request.checkpointable,
+            checkpoint_hook=request.checkpoint_hook,
+            checkpoint_output_uri=request.checkpoint_output_uri,
             idempotency_key=idempotency_key,
         )
         if replayed:

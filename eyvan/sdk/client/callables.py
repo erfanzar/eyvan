@@ -463,6 +463,9 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 max_retries=request.tpu.max_retries,
                 max_failure_retries=request.tpu.max_failure_retries,
                 max_preemption_retries=request.tpu.max_preemption_retries,
+                checkpointable=request.tpu.checkpointable,
+                checkpoint_hook=request.tpu.checkpoint_hook,
+                checkpoint_output_uri=request.tpu.checkpoint_output_uri,
                 idempotency_key=request.invocation_id,
             )
         except EyvanHTTPError as error:

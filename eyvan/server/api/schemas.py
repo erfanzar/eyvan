@@ -218,6 +218,14 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: Working tree to materialize on the host before the command runs. Uploaded
     #: separately to the content-addressed workspace route, then referenced here.
     workspace: WorkspaceRef | None = None
+    #: Whether this job can be checkpointed, and the hook that does it. A
+    #: property of the job rather than of the pool it names, which is why they
+    #: are here and not derived: the scheduler grants ``ON_PREEMPTION`` only when
+    #: both are set, so a spot job missing them restarts from zero on every
+    #: reclamation no matter how many preemption retries it is allowed.
+    checkpointable: bool = False
+    checkpoint_hook: str | None = Field(default=None, max_length=4096)
+    checkpoint_output_uri: str | None = Field(default=None, max_length=2048)
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
@@ -246,6 +254,11 @@ class PoolCallableSubmitRequest(ApiModel):
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
     max_preemption_retries: int = Field(default=10, ge=0)
+    #: The job's own checkpoint contract; see PoolWorkloadSubmitRequest. It
+    #: matters most here, because this path defaults to Spot.
+    checkpointable: bool = False
+    checkpoint_hook: str | None = Field(default=None, max_length=4096)
+    checkpoint_output_uri: str | None = Field(default=None, max_length=2048)
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:

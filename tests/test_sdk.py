@@ -79,6 +79,12 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         # Explicit opt-in: the SDK sends command intent only, so a submission
         # never carries a working tree the caller did not ask to ship.
         "workspace": None,
+        # The job's own checkpoint contract. Off unless asked for, because a
+        # hook that does not exist is worse than none: the job would be stopped
+        # for a checkpoint it never wrote.
+        "checkpointable": False,
+        "checkpoint_hook": None,
+        "checkpoint_output_uri": None,
     }
     client.close()
 
@@ -161,6 +167,9 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "max_retries": 3,
         "max_failure_retries": 0,
         "max_preemption_retries": 10,
+        "checkpointable": False,
+        "checkpoint_hook": None,
+        "checkpoint_output_uri": None,
     }
     client.close()
 

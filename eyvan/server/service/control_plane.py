@@ -824,6 +824,9 @@ class ControlPlaneService:
         max_failure_retries: int = 0,
         max_preemption_retries: int = 10,
         workspace: WorkspaceRef | None = None,
+        checkpointable: bool = False,
+        checkpoint_hook: str | None = None,
+        checkpoint_output_uri: str | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -890,6 +893,9 @@ class ControlPlaneService:
                 max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 workspace=workspace,
+                checkpointable=checkpointable,
+                checkpoint_hook=checkpoint_hook,
+                checkpoint_output_uri=checkpoint_output_uri,
             )
             return await self._store_workload(
                 tx,
@@ -921,6 +927,9 @@ class ControlPlaneService:
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_failure_retries: int = 0,
         max_preemption_retries: int = 10,
+        checkpointable: bool = False,
+        checkpoint_hook: str | None = None,
+        checkpoint_output_uri: str | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -1080,6 +1089,9 @@ class ControlPlaneService:
                 max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 worker_count=pods,
+                checkpointable=checkpointable,
+                checkpoint_hook=checkpoint_hook,
+                checkpoint_output_uri=checkpoint_output_uri,
             )
             return await self._store_workload(
                 tx,
@@ -1218,8 +1230,20 @@ class ControlPlaneService:
         max_preemption_retries: int = 10,
         worker_count: int = 1,
         workspace: WorkspaceRef | None = None,
+        checkpointable: bool = False,
+        checkpoint_hook: str | None = None,
+        checkpoint_output_uri: str | None = None,
     ) -> WorkloadDefinition:
-        """Build a workload whose placement contract is pinned to one fleet pool."""
+        """Build a workload whose placement contract is pinned to one fleet pool.
+
+        The checkpoint fields are the job's, not the pool's. Everything else here
+        is dictated by the pool a caller named -- provider, region, accelerator,
+        gang -- but whether a job can be checkpointed is a property of the job,
+        and ``_checkpoint`` in ``scheduling`` grants ``ON_PREEMPTION`` only when
+        ``checkpointable`` and ``checkpoint_hook`` are both set. Omitting them
+        from this path meant every pool-submitted spot job restarted from zero on
+        each reclamation, however many preemption retries it was given.
+        """
 
         pool_labels = {
             "eyvan_pool": pool.id,
@@ -1250,6 +1274,9 @@ class ControlPlaneService:
             cell_group_count=cell_group_count,
             worker_count=worker_count,
             worker_resource_scope=WorkerResourceScope.PER_WORKER,
+            checkpointable=checkpointable,
+            checkpoint_hook=checkpoint_hook,
+            checkpoint_output_uri=checkpoint_output_uri,
         )
 
     async def _replayed_workload(

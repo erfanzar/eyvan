@@ -40,6 +40,9 @@ def pool_workload_request(
     max_failure_retries: int = 0,
     max_preemption_retries: int = 10,
     workspace: WorkspaceRef | None = None,
+    checkpointable: bool = False,
+    checkpoint_hook: str | None = None,
+    checkpoint_output_uri: str | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -55,6 +58,9 @@ def pool_workload_request(
         max_failure_retries=max_failure_retries,
         max_preemption_retries=max_preemption_retries,
         workspace=workspace,
+        checkpointable=checkpointable,
+        checkpoint_hook=checkpoint_hook,
+        checkpoint_output_uri=checkpoint_output_uri,
     )
 
 
@@ -73,6 +79,9 @@ def pool_callable_request(
     max_retries: int,
     max_failure_retries: int = 0,
     max_preemption_retries: int = 10,
+    checkpointable: bool = False,
+    checkpoint_hook: str | None = None,
+    checkpoint_output_uri: str | None = None,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -92,6 +101,9 @@ def pool_callable_request(
         max_retries=max_retries,
         max_failure_retries=max_failure_retries,
         max_preemption_retries=max_preemption_retries,
+        checkpointable=checkpointable,
+        checkpoint_hook=checkpoint_hook,
+        checkpoint_output_uri=checkpoint_output_uri,
     )
 
 
