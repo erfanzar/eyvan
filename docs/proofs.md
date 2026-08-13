@@ -246,6 +246,42 @@ PROVIDER_ERROR, the apply is **not** retried -- a request that can never succeed
 is not retried -- and `capacity_loss_count` stays 0, so a permission refusal is
 not charged to the workload as a preemption.
 
+## P2 cannot be moved to CPU, and here is why not
+
+P3's children half and P4 both turned out to need no accelerator at all -- they
+had been queued behind TPU capacity they never required. The same question was
+therefore put to P2, whose rank-loss half had by then cost six failed attempts
+across five zone/shape combinations: its structure is "a workload spanning more
+than one rank, then one rank taken away", and nothing about *ranks* looks
+TPU-specific. The topology agrees at first reading. `WorkloadAttemptTopology.freeze`
+assigns `global_rank_offset` by accumulating each cell's `runtime_process_count`
+over the cells sorted by id, and the structured-log fan-out in `observation.py`
+offsets local ranks into that space. Neither mentions an accelerator.
+
+It does not work, and the reason is one validator. Ranks come from cells, and a
+workload occupies exactly one cell unless `worker_count > 1`, which
+`WorkloadDefinition` refuses without a TPU:
+
+```python
+if self.worker_count > 1:
+    if self.cell_group_count != 1:
+        raise ValueError("multi-worker capacity must use exactly one physical cell")
+    if self.gang.per_replica.tpu <= 0 or self.gang.per_replica.gpu > 0:
+        raise ValueError("multi-worker capacity requires a TPU resource request")
+```
+
+`--replicas` is not the lever it looks like: replicas are placed *within* one
+cell, so `--replicas 2 --cpu 3` against a four-CPU pool asks for six CPU on one
+machine, and the run confirmed it -- the workload sat at
+`no_cells: no capacity cells are registered` and the autoscaler never built
+anything, because no cell it could build would host the gang.
+
+So multi-rank means multi-cell, multi-cell means `worker_count > 1`, and that
+means a TPU -- either a multislice allocation or a multi-host slice such as a
+v5p-16, whose two hosts are two ranks in one cell. P2 is genuinely blocked on TPU
+capacity, and this section exists so the next person spends ten minutes reading
+it rather than an hour finding out.
+
 ## What blocked P2 on 2026-08-13
 
 Worth recording, because "not attempted" and "attempted and blocked" call for
