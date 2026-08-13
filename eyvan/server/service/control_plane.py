@@ -43,6 +43,7 @@ from eyvan.artifacts.managed import (
 )
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.capacity.planning import cell_matches_template, cell_provides_pool_supply
+from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.domain import costing
 from eyvan.domain.availability import p95_latency
 from eyvan.domain.carbon import CarbonSource, CarbonUnavailable, NoCarbonSource, fresh_reading
@@ -1005,29 +1006,35 @@ class ControlPlaneService:
                     requested_accelerator_type=accelerator_type,
                     available_enabled_accelerator_types=self._callable_accelerator_types(fleet_pools, pods=pods),
                 )
-            # `CpuConfig` sends exactly this string and nothing else does, so it
-            # is the one accelerator type whose kind is knowable from the wire.
-            # Deriving the kind for the rest -- from the catalog, say -- would
-            # refuse any TPU type the catalog has not got, which is a live
-            # possibility P1 already treats as inconclusive rather than absent.
-            # So this branch is additive: every non-`cpu` request takes exactly
-            # the path it took before, byte for byte, including GPU types, which
-            # are still refused because no run has ever placed a serialized
-            # callable on a GPU cell.
+            # The requested kind is derived from what the caller asked for, never
+            # from what a pool declares itself to be. A pool mislabelled
+            # `eyvan_resource_kind: gpu` must still not answer a request for
+            # `v5p-16`, and it cannot here, because `v5p-16` is decided to be TPU
+            # before any pool is consulted.
+            #
+            # `cpu` is the sentinel `CpuConfig` sends and nothing else does. TPU
+            # is decided by parsing the accelerator type rather than by catalog
+            # lookup, so a generation the catalog has not got -- a live case P1
+            # treats as inconclusive rather than absent -- still takes the TPU
+            # path. GPU is what remains, and it cannot be catalog-driven either:
+            # the catalog carries no GPU shapes at all.
             wants_cpu = accelerator_type == "cpu"
+            wants_tpu = not wants_cpu and parse_tpu_accelerator_type(accelerator_type) is not None
+            wants_gpu = not wants_cpu and not wants_tpu
+
+            def _is_complete(pool: CapacityPoolRecord) -> bool:
+                if wants_cpu:
+                    return self._is_complete_cpu_pool(pool)
+                if wants_gpu:
+                    return self._is_complete_gpu_pool(pool)
+                return self._is_complete_tpu_pool(pool)
+
             tpu_matches = [
-                pool
-                for pool in exact_matches
-                if (self._is_complete_cpu_pool(pool) if wants_cpu else self._is_complete_tpu_pool(pool))
-                and pool.capacity_class is capacity_class
+                pool for pool in exact_matches if _is_complete(pool) and pool.capacity_class is capacity_class
             ]
             if not tpu_matches:
                 available_capacity_classes = sorted(
-                    {
-                        pool.capacity_class.value
-                        for pool in exact_matches
-                        if (self._is_complete_cpu_pool(pool) if wants_cpu else self._is_complete_tpu_pool(pool))
-                    }
+                    {pool.capacity_class.value for pool in exact_matches if _is_complete(pool)}
                 )
                 if available_capacity_classes:
                     available = ", ".join(available_capacity_classes)
@@ -1035,9 +1042,9 @@ class ControlPlaneService:
                         f"enabled TPU pool for {accelerator_type!r} in fleet {fleet_name!r} does not offer "
                         f"{capacity_class.value!r} capacity; available: {available}"
                     )
+                kind_label = "CPU" if wants_cpu else "GPU" if wants_gpu else "TPU"
                 raise ConflictError(
-                    f"enabled capacity pool for {accelerator_type!r} in fleet {fleet_name!r} is not a "
-                    f"{'CPU' if wants_cpu else 'TPU'} pool"
+                    f"enabled capacity pool for {accelerator_type!r} in fleet {fleet_name!r} is not a {kind_label} pool"
                 )
             if len(tpu_matches) > 1:
                 raise ConflictError(
@@ -1190,6 +1197,24 @@ class ControlPlaneService:
         kind = pool.labels.get("eyvan_resource_kind")
         declared_tpu = kind == "tpu" if kind is not None else pool.capacity_backend == "gcp-tpu"
         return declared_tpu and pool.allocatable.tpu > 0 and pool.allocatable.gpu == 0
+
+    @staticmethod
+    def _is_complete_gpu_pool(pool: CapacityPoolRecord) -> bool:
+        """Return whether a pool can really run a callable that asked for a GPU.
+
+        The third answer to the question the other two ask. Deliberately not
+        derived from the hardware catalog, which carries no GPU shapes at all --
+        ``shape_for('nvidia-tesla-p100')`` is ``None`` -- so a catalog-driven
+        gate would refuse every GPU type there is.
+
+        A pool carrying a TPU is refused even when it declares itself GPU, for
+        the reason the CPU gate refuses an accelerator it did not ask for: the
+        callable would hold hardware nothing accounted to it.
+        """
+
+        kind = pool.labels.get("eyvan_resource_kind")
+        declared_gpu = kind == "gpu" if kind is not None else pool.allocatable.gpu > 0
+        return declared_gpu and pool.allocatable.gpu > 0 and pool.allocatable.tpu == 0
 
     @staticmethod
     def _is_complete_cpu_pool(pool: CapacityPoolRecord) -> bool:

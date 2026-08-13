@@ -148,6 +148,90 @@ async def test_a_tpu_request_is_never_answered_by_a_cpu_pool() -> None:
         await _submit(_service(), [cpu_named_like_a_tpu], accelerator_type="v5p-8")
 
 
+# --------------------------------------------------------------------------- the third kind
+
+
+def _gpu_pool(*, pool_id: str = "gpu-pool", accelerator: ResourceVector | None = None) -> CapacityPoolRecord:
+    resources = accelerator or ResourceVector(cpu=8, memory_gib=32, gpu=1)
+    return CapacityPoolRecord(
+        id=pool_id,
+        fleet_name="research-fleet",
+        node_type="gpu",
+        provider="gcp",
+        capacity_backend="gcp-compute",
+        provider_project="gcp-project-a",
+        region="us-central1",
+        zone="us-central1-a",
+        capacity=resources,
+        allocatable=resources,
+        accelerator_type="nvidia-tesla-p100",
+        capacity_class="spot",
+        executor="eyvan-native",
+        agent_endpoint="http://agent:8090",
+        labels={"eyvan_resource_kind": "gpu"},
+        max_cells=4,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_callable_lands_on_a_gpu_pool() -> None:
+    """The kind that had no gate at all.
+
+    Not decided by the hardware catalog, which carries no GPU shapes whatsoever:
+    ``shape_for('nvidia-tesla-p100')`` is ``None``, so a catalog-driven rule
+    would refuse every GPU type there is.
+    """
+
+    workload, replayed = await _submit(_service(), [_gpu_pool()], accelerator_type="nvidia-tesla-p100")
+
+    assert replayed is False
+    assert workload.spec.required_labels.get("eyvan_pool") == "gpu-pool"
+
+
+@pytest.mark.asyncio
+async def test_a_tpu_generation_the_catalog_never_heard_of_is_still_a_tpu_request() -> None:
+    """The property that makes deriving the kind from the request safe.
+
+    GPU is what remains after CPU and TPU, so anything mistaken for "not a TPU"
+    would silently become a GPU request. The accelerator type is *parsed* rather
+    than looked up precisely so a generation the catalog has not got still takes
+    the TPU path -- P1 already treats a missing catalog entry as inconclusive
+    rather than absent, and this must agree with it.
+    """
+
+    # Named for the unknown generation so the request gets past the exact-match
+    # step and actually reaches the kind gate, which is what is under test.
+    unknown_generation = _gpu_pool().model_copy(update={"accelerator_type": "v99z-8"})
+
+    with pytest.raises(ConflictError, match="is not a TPU pool"):
+        await _submit(_service(), [unknown_generation], accelerator_type="v99z-8")
+
+
+@pytest.mark.asyncio
+async def test_a_pool_mislabelled_gpu_still_cannot_answer_a_tpu_request() -> None:
+    """The regression the first attempt at a general kind gate introduced.
+
+    Deriving the kind from the pool lost the caller's intent, so a pool named for
+    a TPU while declaring something else could answer a TPU request. The kind is
+    decided from the requested type before any pool is consulted, so it cannot.
+    """
+
+    mislabelled = _gpu_pool().model_copy(update={"accelerator_type": "v5p-8"})
+
+    with pytest.raises(ConflictError, match="is not a TPU pool"):
+        await _submit(_service(), [mislabelled], accelerator_type="v5p-8")
+
+
+@pytest.mark.asyncio
+async def test_a_pool_carrying_a_tpu_is_refused_for_a_gpu_callable() -> None:
+    """Same rule the CPU gate applies: no holding hardware nobody asked for."""
+
+    mislabelled = _gpu_pool(accelerator=ResourceVector(cpu=8, memory_gib=32, gpu=1, tpu=4))
+
+    with pytest.raises(ConflictError, match="is not a GPU pool"):
+        await _submit(_service(), [mislabelled], accelerator_type="nvidia-tesla-p100")
+
+
 # --------------------------------------------------------------------------- the kind that is still refused
 
 
