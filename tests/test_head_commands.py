@@ -18,6 +18,8 @@ whether a mock was called.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import shutil
@@ -44,6 +46,7 @@ from eyvan.sdk.commands.head import (
     HeadSecrets,
     HeadSpec,
     HeadStep,
+    _LocalWheel,
     render_head_bootstrap_script,
 )
 
@@ -76,6 +79,18 @@ STUB_SECRETS = HeadSecrets(
     agent_shared_secret="agent-" + "g" * 32,
     database_password="database-" + "d" * 24,
 )
+
+
+#: Tests must never build or upload a real distribution. The digest is what the
+#: fake host will echo back, so the verification path is still exercised.
+_FAKE_WHEEL_BYTES = b"PK\x03\x04 not a real wheel"
+_FAKE_WHEEL_DIGEST = __import__("hashlib").sha256(_FAKE_WHEEL_BYTES).hexdigest()
+
+
+def _fake_wheel() -> _LocalWheel:
+    """Return a deterministic stand-in for this installation's wheel."""
+
+    return _LocalWheel(data=_FAKE_WHEEL_BYTES, digest=_FAKE_WHEEL_DIGEST)
 
 
 def _spec(**overrides: tp.Any) -> HeadSpec:
@@ -156,6 +171,12 @@ class FakeGcloud:
         recorded = Call(args=tuple(args), stdin_text=stdin_text)
         self.calls.append(recorded)
         assert timeout > 0
+        # A real host decodes the wheel and echoes sha256sum. The digest check is
+        # part of the contract, so the double answers it instead of being bypassed.
+        remote_command = args[args.index("--command") + 1] if "--command" in args else ""
+        if "base64 -d" in remote_command and stdin_text is not None:
+            digest = hashlib.sha256(base64.b64decode(stdin_text)).hexdigest()
+            return subprocess.CompletedProcess(list(args), 0, f"{digest}\n", "")
         joined = " ".join(args)
         for fragment, result in self.failures.items():
             if fragment in joined:
@@ -336,6 +357,7 @@ def test_a_dry_run_prints_every_action_and_resource_name_and_issues_no_command(t
         HeadStep.FIREWALL_CREATE,
         HeadStep.SECRET_LOOKUP,
         HeadStep.CONFIGURE,
+        HeadStep.STAGE_WHEEL,
         HeadStep.INSTALL,
         HeadStep.BOOTSTRAP,
         HeadStep.MIGRATE,
@@ -756,7 +778,13 @@ def test_the_installer_carries_no_credential_and_does_not_require_uv() -> None:
     assert "uv build" not in script
     assert "uv pip" not in script
     assert "python3 -m venv /opt/eyvan/venv" in script
-    assert "/opt/eyvan/venv/bin/python -m pip install --disable-pip-version-check --upgrade eyvan" in script
+    # The staged wheel, not the name `eyvan`: that name resolves only from an
+    # index, and a real bootstrap died on "No matching distribution found".
+    assert (
+        "/opt/eyvan/venv/bin/python -m pip install --disable-pip-version-check --upgrade /opt/eyvan/eyvan-head.whl"
+        in script
+    )
+    assert not any(line.rstrip().endswith(" eyvan") for line in script.splitlines() if "pip install" in line)
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required to parse the generated installer")

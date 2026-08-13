@@ -10,11 +10,29 @@ collectives, or your framework. It owns *capacity, admission, placement, and
 lifecycle*, and hands a fenced lease to whatever you actually run.
 
 ```bash
-pip install eyvan            # not yet published; see Installing
+eyvan head up fleet.yaml     # provision a control plane on GCP
 eyvan up fleet.yaml          # reconcile declared capacity
 eyvan run python train.py --accelerator v5p-8
 eyvan status
 ```
+
+## Status, as of this commit
+
+Honest about the line between what runs and what is proven, because the
+difference costs money:
+
+- **Works, verified against real GCP:** `eyvan head up` provisions a control
+  plane end to end — VM, VPC-only firewall, generated secrets, PostgreSQL,
+  migrations, systemd — and `eyvan head down` removes it. It installs the wheel
+  it is running; no package index is involved.
+- **Not yet reachable:** a fresh head has no identity provider, so every
+  authenticated request is refused with 401 until you pass `--oidc-issuer`. The
+  command tells you this when it finishes. Until then `eyvan up` cannot create a
+  fleet, so **no workload has run through a head built this way**.
+- **Not published:** Eyvan is not on PyPI. Install from source, or let
+  `eyvan head up` carry its own wheel.
+- **Not qualified:** no current release has a receipt proving a real TPU, GPU,
+  Kubernetes, or object-store path. See [docs/proofs.md](docs/proofs.md).
 
 ## Where it runs
 

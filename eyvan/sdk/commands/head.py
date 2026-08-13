@@ -26,6 +26,8 @@ is not established here and is not claimed.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import ipaddress
 import json
 import re
@@ -71,7 +73,10 @@ DEFAULT_HEAD_PORT = 8080
 DEFAULT_HEAD_BOOT_DISK_GB = 50
 DEFAULT_HEAD_IMAGE_FAMILY = "ubuntu-2404-lts-amd64"
 DEFAULT_HEAD_IMAGE_PROJECT = "ubuntu-os-cloud"
+#: The default is this installation itself, staged to the head. The name
+#: ``eyvan`` resolves only from an index, and Eyvan is not published to one.
 DEFAULT_HEAD_PACKAGE = "eyvan"
+STAGED_WHEEL_PACKAGE = "@staged-wheel"
 #: Egress mode assumed when only reading or deleting a head, where it is unused.
 DEFAULT_HEAD_EGRESS = "cloud-nat"
 DEFAULT_COMMAND_TIMEOUT_S = 600.0
@@ -84,6 +89,9 @@ DEFAULT_SSH_READY_DELAY_S = 15.0
 #: Where the head keeps the environment the server and migration both read.
 HEAD_ENVIRONMENT_PATH = "/etc/eyvan/head.env"
 HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
+#: Where a staged distribution lands. Owner-only: it is not secret, but a
+#: world-readable wheel is a world-writable install target one bug later.
+HEAD_WHEEL_PATH = "/opt/eyvan/eyvan-head.whl"
 HEAD_VENV_PATH = "/opt/eyvan/venv"
 HEAD_SERVICE_NAME = "eyvan-head.service"
 
@@ -115,6 +123,7 @@ class HeadStep(StrEnum):
     FIREWALL_CREATE = "firewall_create"
     SECRET_LOOKUP = "secret_lookup"
     CONFIGURE = "configure"
+    STAGE_WHEEL = "stage_wheel"
     INSTALL = "install"
     BOOTSTRAP = "bootstrap"
     MIGRATE = "migrate"
@@ -248,7 +257,7 @@ class HeadSpec:
     image_family: str = DEFAULT_HEAD_IMAGE_FAMILY
     image_project: str = DEFAULT_HEAD_IMAGE_PROJECT
     boot_disk_size_gb: int = DEFAULT_HEAD_BOOT_DISK_GB
-    package: str = DEFAULT_HEAD_PACKAGE
+    package: str = STAGED_WHEEL_PACKAGE
     service_account: str | None = None
     database_url: str | None = None
     artifact_store_uri: str | None = None
@@ -256,6 +265,12 @@ class HeadSpec:
     oidc_audience: str = "eyvan"
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
+
+    @property
+    def stages_wheel(self) -> bool:
+        """Whether this run ships its own distribution instead of resolving a name."""
+
+        return self.package == STAGED_WHEEL_PACKAGE
 
     def __post_init__(self) -> None:
         """Reject a spec that could not be provisioned before any command runs."""
@@ -600,6 +615,35 @@ _ENVIRONMENT_PRESENT = "eyvan-head-env-present"
 _ENVIRONMENT_ABSENT = "eyvan-head-env-absent"
 
 
+@dataclass(frozen=True, slots=True)
+class _LocalWheel:
+    """One built wheel and the digest the head must reproduce."""
+
+    data: bytes
+    digest: str
+
+
+def _local_wheel_bytes() -> _LocalWheel:
+    """Return this installation's own wheel, however Eyvan was installed.
+
+    Reuses the source that ``eyvan runtime init`` already uses, so a checkout
+    builds from the tree and a wheel install repacks the distribution it is
+    running. Writing a second copy of that logic here is how the two drift.
+    """
+
+    from eyvan.sdk.commands.runtime import native_worker_wheel_builder
+
+    builder = native_worker_wheel_builder()
+    try:
+        path = builder.build()
+        data = Path(path).read_bytes()
+    finally:
+        close = getattr(builder, "close", None)
+        if callable(close):
+            close()
+    return _LocalWheel(data=data, digest=hashlib.sha256(data).hexdigest())
+
+
 def render_head_bootstrap_script(spec: HeadSpec) -> str:
     """Render the idempotent installer the head runs under ``sudo``.
 
@@ -611,6 +655,8 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
     package = spec.package
     if not package.strip():
         raise ValueError("head package specification must be non-empty")
+    if package == STAGED_WHEEL_PACKAGE:
+        package = HEAD_WHEEL_PATH
     venv_python = f"{HEAD_VENV_PATH}/bin/python"
     after = "network-online.target" if spec.database_url is not None else "network-online.target postgresql.service"
     unit = "\n".join(
@@ -878,6 +924,7 @@ class HeadProvisioner:
         ssh_ready_attempts: int = DEFAULT_SSH_READY_ATTEMPTS,
         ssh_ready_delay_s: float = DEFAULT_SSH_READY_DELAY_S,
         sleep: tp.Callable[[float], None] | None = None,
+        wheel_source: tp.Callable[[], _LocalWheel] | None = None,
     ):
         if isinstance(command_timeout_s, bool) or not isinstance(command_timeout_s, (int, float)):
             raise ValueError("command_timeout_s must be a positive number")
@@ -892,6 +939,7 @@ class HeadProvisioner:
         self.ssh_ready_attempts = ssh_ready_attempts
         self.ssh_ready_delay_s = float(ssh_ready_delay_s)
         self._sleep = sleep if sleep is not None else time.sleep
+        self._wheel_source = wheel_source
         self.spec = spec
         # Resolved here rather than as a default argument, and the difference is
         # not cosmetic: a default binds the module function at import, so a test
@@ -922,6 +970,7 @@ class HeadProvisioner:
             (
                 self._environment_lookup_action(),
                 self._configure_action(),
+                *([self._stage_wheel_action()] if self.spec.stages_wheel else []),
                 self._install_action(),
                 self._bootstrap_action(),
                 self._migrate_action(),
@@ -954,6 +1003,13 @@ class HeadProvisioner:
                 self._configure_action(),
                 stdin_text=head_secrets.environment_file(spec, address=address),
             )
+        if spec.stages_wheel:
+            wheel = (self._wheel_source or _local_wheel_bytes)()
+            observed = self._execute(
+                self._stage_wheel_action(),
+                stdin_text=base64.b64encode(wheel.data).decode("ascii"),
+            ).stdout.strip()
+            self._verify_staged_wheel(sent=wheel.digest, observed=observed)
         self._execute(self._install_action(), stdin_text=render_head_bootstrap_script(spec))
         self._execute(self._bootstrap_action())
         self._execute(self._migrate_action())
@@ -1307,6 +1363,45 @@ class HeadProvisioner:
             sends_stdin=True,
             skipped_when_present=True,
         )
+
+    def _stage_wheel_action(self) -> HeadAction:
+        """Build the delivery of this installation's own wheel.
+
+        The default package used to be the name ``eyvan``, which pip resolves
+        from an index. Eyvan is not published to one, so a real head bootstrap
+        died with "No matching distribution found for eyvan" after every other
+        step had already succeeded. The distribution running this command is the
+        one the head should run, so it is sent rather than looked up.
+
+        Base64 because the stdin boundary carries text, and decoding on the host
+        keeps the wheel out of argv where ``ps`` would show it.
+        """
+
+        return self._ssh_action(
+            HeadStep.STAGE_WHEEL,
+            f"stage this Eyvan distribution as {HEAD_WHEEL_PATH}",
+            "sudo /bin/sh -ec "
+            + shlex.quote(
+                f"umask 077; install -d -m 0755 /opt/eyvan; base64 -d > {HEAD_WHEEL_PATH}.tmp; "
+                f"mv {HEAD_WHEEL_PATH}.tmp {HEAD_WHEEL_PATH}; sha256sum {HEAD_WHEEL_PATH} | cut -d' ' -f1"
+            ),
+            mutates=True,
+            sends_stdin=True,
+        )
+
+    def _verify_staged_wheel(self, *, sent: str, observed: str) -> None:
+        """Refuse a staged wheel whose bytes are not the bytes that were sent.
+
+        Installing an altered or truncated wheel is worse than failing to
+        install one: the head would come up running something nobody built.
+        """
+
+        if observed != sent:
+            raise HeadCommandError(
+                HeadStep.STAGE_WHEEL,
+                f"staged wheel digest {observed or '(none)'} does not match the {sent} that was sent; "
+                "the upload was truncated or altered and was not installed",
+            )
 
     def _install_action(self) -> HeadAction:
         """Build the delivery of the idempotent installer script."""
