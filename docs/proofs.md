@@ -333,6 +333,45 @@ v5p-16, whose two hosts are two ranks in one cell. P2 is genuinely blocked on TP
 capacity, and this section exists so the next person spends ten minutes reading
 it rather than an hour finding out.
 
+## What P3's exec half actually needs, measured on hardware
+
+Attempted 2026-08-13 against a live v5p-16 in `us-central1-a` with a trainer
+running on both hosts. It did not pass, and the run replaced a guess with a
+scope.
+
+Two gates stand between `eyvan workload exec` and a rank, and the run moved
+through the first one:
+
+```
+before:  this fleet does not permit exec; set supports_exec on the capacity backend to allow it
+after:   execution backend 'eyvan-native' cannot exec beside a workload
+```
+
+The first was an *admission* refusal telling the operator to set a flag that had
+no setter -- `supports_exec` was a literal `False` in the GCP driver under a
+comment promising operator control. `EYVAN_CAPACITY_SUPPORTS_EXEC` now provides
+it, off by default, and the error moving to the second gate is what proves it
+works. Note it must reach `eyvan-head-agent.service`, not only
+`eyvan-head.service`: the capacity driver the gate consults lives in the agent,
+and restarting the wrong unit changes nothing.
+
+The second gate is the real remaining work, and it is narrower than "needs a
+TPU". `exec_in_workload` is implemented once, in `systemd_transient`, the driver
+that runs a workload as a local transient unit. A multi-host TPU slice is driven
+by `NativeSliceExecutor` over each host's native worker HTTP API, and that API
+exposes no exec route -- so the slice executor has nothing to fan out to, and
+neither slice nor gang implements the method at all.
+
+Closing it is three pieces, none of them speculative: a route on the native
+worker that reaches its existing systemd driver, a client method, and a fan-out
+in the slice and gang executors. The fan-out has a template beside it --
+`process_status` already asks every host and reports an unreachable one in place
+rather than dropping it, which is the same shape exec needs and the same shape
+P2 qualified.
+
+**Shape** any multi-host TPU slice, once the route exists. Until then this half
+is blocked on that feature rather than on capacity.
+
 ## P2 passed on 2026-08-13, on the seventh attempt
 
 `us-central1-a`, v5p-16 spot, exit 0 on all six criteria. Receipt
