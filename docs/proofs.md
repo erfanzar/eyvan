@@ -176,6 +176,41 @@ Closing it properly needs one of two things: a cell-side check that refuses to
 register a GPU cell whose driver cannot see its GPU, which is the general fix, or
 a default image chosen against the pool's accelerator generation.
 
+### The T4 half, run the same day
+
+The driver theory holds from the other side. A `nvidia-tesla-t4` spot cell on the
+same image reports `Tesla T4, 580.173.02`, six loaded modules and a `/dev/nvidia0`
+-- Turing is supported, Pascal is not, and the default image is right for one and
+wrong for the other. So GPU callables are qualifiable on this project today; the
+P100 was simply the wrong GPU to try them on.
+
+That run did not finish, and why is a second finding. The cell's bootstrap died:
+
+```
+startup-script: E: Package 'python3-venv' has no installation candidate
+Script "startup-script" failed with error: exit status 100
+```
+
+There were no `eyvan*` units on the host at all and the native worker was
+inactive, so nothing ever connected. **The workload sat in `connecting`
+indefinitely rather than failing.** A cell that cannot run a worker still
+registered as capacity, took the lease, and looked exactly like a slow one --
+the same shape as the driver hazard above, where a broken cell is
+indistinguishable from a working one until someone reads the output by hand.
+
+The apt failure itself is *not* explained. The bootstrap does run
+`eyvan_apt_get update` before the install and the script runs under
+`set -euo pipefail`, so `apt-get update` exited 0 and still left an index with no
+candidate for a package that is normally in `main` -- apt reports success when
+individual fetches fail. The P100 cell earlier the same day, on the same image
+family, bootstrapped fine and ran its callable, so this is not universal and one
+observation is not a root cause. Recorded as observed rather than diagnosed.
+
+What both findings share is the thing worth fixing first: a cell that cannot do
+the job it was provisioned for should refuse the work rather than accept it and
+be quiet about it. Neither a missing driver nor a missing worker was reported by
+anything the plane could see.
+
 ## Three gates decide whether a shape can be requested, not one
 
 Worth writing down because getting this wrong cost a session. Quota is the gate
