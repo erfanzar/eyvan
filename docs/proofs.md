@@ -535,13 +535,35 @@ value appeared in no workload record and no audit payload, and one
 whose `EYVAN_PUBLIC_URL` a worker cannot reach cannot run this proof; dispatch
 now refuses such a workload immediately rather than failing eight minutes later.
 
-**Passes when** the job prints the length, `eyvan events` shows exactly one
-`secret.issued` and one `secret.read` for that attempt, and grepping the workload
-record, the audit payloads and the logs finds the value nowhere. The audit
-payloads are the half a person checking by hand forgets, and the one place a
-well-meaning "context" field would put the value -- in the store retained for
-ninety days.
-**Shape** v5p-16. **~30 minutes.**
+**Run 2026-08-13, exit 0 (pass).** On a real GCE CPU cell in `us-central1-a` --
+nothing about this proof is TPU-specific, and the `--tpu 8` above is incidental.
+Delivery, the half that failed in August, worked: the job read `HF_TOKEN` and
+exited 0, where it exits 1 on a missing value. Exactly one `secret.issued` and
+one `secret.read`, the read matched to its issuance, and the value in no workload
+record and no audit payload. Receipt `p4.json`; `eyvan proof verify` re-reads it
+as intact with criterion and candidate current.
+
+Two things had to be corrected first, both in the proof rather than the plane:
+
+* **The proof could not read the logs route.** It decoded
+  `/api/v1/workloads/{id}/logs` as JSON; that route is declared
+  `PlainTextResponse`, so the decode fails for *every* workload. It surfaced only
+  now because the run before this one never got as far as reading logs.
+* **The job cannot prove delivery by printing.** The plane serves no log output
+  at all for a workload that mounts secrets -- deliberately, since the job's own
+  stdout may contain the value -- so "the job prints the length" is not
+  observable for any workload this proof can be pointed at, and the log grep is
+  vacuous for all of them. The exit status carries that evidence instead.
+
+**Passes when** the job exits 0 having read the value (it exits 1 when the
+variable is absent, so the exit status is the delivery evidence -- the log cannot
+be, because the plane suppresses output for secret-bearing workloads),
+`eyvan events` shows exactly one `secret.issued` and one `secret.read` for that
+attempt, and grepping the workload record and the audit payloads finds the value
+nowhere. The audit payloads are the half a person checking by hand forgets, and
+the one place a well-meaning "context" field would put the value -- in the store
+retained for ninety days.
+**Shape** any cell; CPU is enough. **~15 minutes.**
 
 ## P5 — spot reclamation is charged to the preemption budget
 
