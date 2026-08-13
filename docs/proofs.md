@@ -246,7 +246,7 @@ PROVIDER_ERROR, the apply is **not** retried -- a request that can never succeed
 is not retried -- and `capacity_loss_count` stays 0, so a permission refusal is
 not charged to the workload as a preemption.
 
-## P2 cannot be moved to CPU, and here is why not
+## Why P2 cannot be moved to CPU
 
 P3's children half and P4 both turned out to need no accelerator at all -- they
 had been queued behind TPU capacity they never required. The same question was
