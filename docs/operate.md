@@ -320,8 +320,15 @@ eyvan workload exec <id> -- py-spy dump --pid ...   # a diagnostic beside it
 process sharing the unit's memory allocation could take the trainer down with
 it.
 
+It runs on **every rank** by default, because the question exec usually answers
+is "which rank is stuck" and one rank cannot tell a hung collective from a slow
+step. A rank whose host cannot be reached is reported in its place rather than
+omitted, so a half-dead slice reads as half-dead instead of as complete.
+
 It is off until a fleet asks for it. Set `EYVAN_CAPACITY_SUPPORTS_EXEC=1` in the
-head's environment and restart `eyvan-head.service`; without it the plane refuses
+head's environment and restart **both** `eyvan-head.service` and
+`eyvan-head-agent.service` -- the capacity driver the gate consults lives in the
+agent, so restarting the head alone changes nothing. Without it the plane refuses
 with *"this fleet does not permit exec"*. Off by default because the command runs
 whatever it is given on a machine holding someone's training job, so it is an
 admission decision an operator makes for a fleet rather than a capability that
