@@ -335,24 +335,39 @@ def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorC
 
 
 def _refuse_unplaceable_config(config: AcceleratorConfig) -> None:
-    """Refuse a config the control plane will never place, before uploading.
+    """Refuse a config whose GPU the job would not actually be able to use.
 
-    ``GpuConfig`` is exported from the package root and ``@execute`` accepts it,
-    but the callable route requires a TPU or CPU pool, so every GPU submission is
-    refused -- and it was refused *after* the callable had been serialized and
-    uploaded to the artifact store, leaving an object behind and an error that
-    named a pool rather than the limitation.
+    The reason changed on 2026-08-13 and is worth stating exactly, because the
+    original one is now false. Placement *works*: a ``GpuConfig`` callable was
+    serialized, uploaded, placed on a real ``nvidia-tesla-p100`` spot cell, run,
+    and returned its result, and the control plane now has a GPU pool gate beside
+    the CPU and TPU ones.
 
-    Refusing here costs the caller nothing and forecloses nothing: if callable
-    placement on GPU is qualified later, this check is the thing that gets
-    deleted. Until then a limit stated up front is better than an upload that
-    ends in a conflict.
+    What it returned is the problem. ``nvidia-smi`` on that cell reported it
+    could not talk to the driver, and the kernel said why::
+
+        NVRM: The NVIDIA GPU 0000:00:04.0 (PCI ID: 10de:15f8)
+        NVRM: nvidia.ko because it does not include the required GPU
+        NVRM: None of the NVIDIA devices were initialized.
+
+    ``_DEFAULT_GPU_IMAGE`` pins ``...with-nvidia-580``, and the 580 branch
+    dropped Pascal and Volta. So a fleet declaring a P100 or a V100 gets a cell
+    that boots, registers, accepts work and runs it on a GPU no process can open.
+
+    The job *succeeded*, which is the hazard: nothing in the run said the
+    accelerator was missing, and a training job would simply have been slow, or
+    crashed somewhere far from the cause. A refusal a caller can read beats a
+    success they cannot trust. Lifting this needs either a driver the pool's
+    accelerator supports -- ``vm_image`` is settable per pool -- or a cell-side
+    check that refuses to register a GPU cell whose driver cannot see its GPU.
     """
 
     if isinstance(config, GpuConfig):
         raise NotImplementedError(
-            "Eyvan cannot place a callable on a GPU pool: no run has qualified that path, so the control plane "
-            "refuses it. Use TpuConfig or CpuConfig, or submit a command workload with `eyvan workload submit`."
+            "Eyvan places a callable on a GPU pool, but the default GPU image installs NVIDIA driver 580, which "
+            "does not support Pascal or Volta -- a P100 or V100 cell runs the job with an unusable GPU and still "
+            "reports success. Set a pool `vm_image` whose driver supports the accelerator, or use TpuConfig or "
+            "CpuConfig, or submit a command workload with `eyvan workload submit`."
         )
 
 

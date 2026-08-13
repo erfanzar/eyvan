@@ -132,6 +132,50 @@ What it did **not** establish: anything about multislice, TPU provisioning, or
 any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
 is here so nobody reads it as one.
 
+## A GPU cell can run a callable and have no usable GPU
+
+Run 2026-08-13, on a real `nvidia-tesla-p100` spot cell in `us-central1-c`.
+
+The placement half now works. A `GpuConfig` callable was serialized, uploaded,
+placed on that cell, executed and returned its result -- the control plane has a
+GPU pool gate beside the CPU and TPU ones, and the kind is decided from the
+requested accelerator type before any pool is consulted, so a pool declaring
+`eyvan_resource_kind: gpu` still cannot answer a request for `v5p-16`.
+
+The result it returned is the finding:
+
+```
+GPU CALLABLE RESULT: host=research-nvidia-tesla-p100-...  gpu=NVIDIA-SMI has failed
+because it couldn't communicate with the NVIDIA driver.
+```
+
+The GPU is attached -- `lspci` reports `GP100GL [Tesla P100 PCIe 16GB]` -- and
+the cell booted the right image, carrying the `nvidia-580` and
+`ubuntu-2404-lts-accelerated` licences. The kernel says what is wrong:
+
+```
+NVRM: The NVIDIA GPU 0000:00:04.0 (PCI ID: 10de:15f8)
+NVRM: nvidia.ko because it does not include the required GPU
+NVRM: None of the NVIDIA devices were initialized.
+```
+
+`_DEFAULT_GPU_IMAGE` pins `...with-nvidia-580`, and the 580 branch dropped
+Pascal and Volta. This project's GPU quota is `PREEMPTIBLE_NVIDIA_P100_GPUS` (16)
+and `NVIDIA_V100_GPUS` (8) -- both dropped generations -- so every GPU cell it
+can currently afford boots with a driver that cannot open its own GPU. Turing and
+later (T4, L4, A100, H100) are unaffected, and `vm_image` is settable per pool,
+which is the workaround.
+
+**The workload succeeded.** That is the part worth keeping: nothing in the run
+reported a missing accelerator, no probe failed, and the verdict was SUCCEEDED.
+A training job would have been slow, or would have failed somewhere far from the
+cause. The client-side refusal therefore stays, with its reason corrected from
+"cannot place" -- now false -- to what actually goes wrong.
+
+Closing it properly needs one of two things: a cell-side check that refuses to
+register a GPU cell whose driver cannot see its GPU, which is the general fix, or
+a default image chosen against the pool's accelerator generation.
+
 ## Three gates decide whether a shape can be requested, not one
 
 Worth writing down because getting this wrong cost a session. Quota is the gate

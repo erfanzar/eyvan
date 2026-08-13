@@ -232,7 +232,35 @@ async def test_a_pool_carrying_a_tpu_is_refused_for_a_gpu_callable() -> None:
         await _submit(_service(), [mislabelled], accelerator_type="nvidia-tesla-p100")
 
 
-# --------------------------------------------------------------------------- the kind that is still refused
+# --------------------------------------------------------------------------- refused for a different reason now
+
+
+def test_the_refusal_names_the_driver_and_not_placement() -> None:
+    """The reason changed on 2026-08-13 and the old one is now false.
+
+    A ``GpuConfig`` callable was serialized, uploaded, placed on a real
+    ``nvidia-tesla-p100`` spot cell, run, and returned its result -- so "Eyvan
+    cannot place a callable on a GPU pool" would be a lie. What it returned was
+    ``nvidia-smi`` failing to reach the driver, because the default GPU image
+    pins NVIDIA 580 and that branch dropped Pascal and Volta.
+
+    Asserted because the failure mode is a silent one: the job *succeeded*. If
+    someone later restores the old wording, or drops the refusal on the strength
+    of "placement works now", this is what should stop them.
+    """
+
+    from eyvan import GpuConfig
+    from eyvan.sdk.execution import _refuse_unplaceable_config
+
+    with pytest.raises(NotImplementedError) as error:
+        _refuse_unplaceable_config(GpuConfig(type="nvidia-tesla-p100"))
+
+    message = str(error.value)
+    assert "driver 580" in message
+    assert "Pascal" in message
+    assert "vm_image" in message
+    # The claim that is no longer true must not come back.
+    assert "cannot place" not in message
 
 
 def test_a_gpu_callable_is_refused_before_anything_is_uploaded() -> None:
