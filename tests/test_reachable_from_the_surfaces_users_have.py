@@ -707,8 +707,8 @@ def _sent_payload(method: str, **arguments) -> dict:
 
     import httpx
 
-    from eyvan.records import WorkloadDefinition, WorkloadRecord
     from eyvan.records import CommandExecution as _Command
+    from eyvan.records import WorkloadDefinition, WorkloadRecord
     from eyvan.sdk import EyvanClient
 
     stored = WorkloadRecord(
