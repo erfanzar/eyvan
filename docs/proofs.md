@@ -212,6 +212,13 @@ individual fetches fail. The P100 cell earlier the same day, on the same image
 family, bootstrapped fine and ran its callable, so this is not universal and one
 observation is not a root cause. Recorded as observed rather than diagnosed.
 
+A later T4 cell, same image and same fleet, reached ``eyvan-native-worker`` in
+``activating`` -- so the venv install succeeded there. Two successes against one
+failure is weak evidence, and it is the direction the transient reading predicts:
+``apt-get update`` exits 0 when individual index fetches fail, and the install is
+then the first thing to notice. Still not a root cause, and still worth the
+diagnostic being reachable, which is the part that was fixed.
+
 What both findings share is the thing worth fixing first: a cell that cannot do
 the job it was provisioned for should refuse the work rather than accept it and
 be quiet about it. Neither a missing driver nor a missing worker was reported by
