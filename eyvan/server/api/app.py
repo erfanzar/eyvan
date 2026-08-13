@@ -2169,6 +2169,7 @@ def create_app(
             checkpointable=request.checkpointable,
             checkpoint_hook=request.checkpoint_hook,
             checkpoint_output_uri=request.checkpoint_output_uri,
+            can_submit_children=request.can_submit_children,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2214,6 +2215,7 @@ def create_app(
             checkpointable=request.checkpointable,
             checkpoint_hook=request.checkpoint_hook,
             checkpoint_output_uri=request.checkpoint_output_uri,
+            can_submit_children=request.can_submit_children,
             idempotency_key=idempotency_key,
         )
         if replayed:

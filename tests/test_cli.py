@@ -2035,6 +2035,7 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "checkpointable": False,
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
+        "can_submit_children": False,
     }
     assert (
         not {

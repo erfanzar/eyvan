@@ -85,6 +85,7 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "checkpointable": False,
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
+        "can_submit_children": False,
     }
     client.close()
 
@@ -170,6 +171,7 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "checkpointable": False,
         "checkpoint_hook": None,
         "checkpoint_output_uri": None,
+        "can_submit_children": False,
     }
     client.close()
 

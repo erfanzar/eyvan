@@ -466,6 +466,46 @@ async def test_a_callable_submitted_through_the_service_keeps_its_checkpoint_con
     assert workload.spec.checkpoint_output_uri == "gs://ckpt/run-1"
 
 
+@pytest.mark.asyncio
+async def test_a_callable_can_also_ask_for_the_child_capability() -> None:
+    """The half of the earlier fix that was left for a wider API change.
+
+    ``eyvan workload submit --can-submit-children`` reached the field because the
+    explicit-intent schema already carried it. Neither pool schema did, so
+    ``@execute`` -- the surface most likely to want to fan out -- still could not
+    ask. Both halves now go through the same builder.
+    """
+
+    from eyvan.records import CallableExecution, Principal, Role, RoleGrant
+    from eyvan.server.persistence import InMemoryRepository
+    from eyvan.server.service import ControlPlaneService
+    from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    await service.upsert_capacity_pool(admin, _pool_record(), idempotency_key="pool-0")
+
+    workload, _ = await service.submit_pool_callable(
+        Principal(
+            subject="alice",
+            grants=(RoleGrant(role=Role.PROJECT_OPERATOR, org_id="acme", project_id="research"),),
+        ),
+        fleet_name="research",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-8",
+        pods=1,
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12"),
+        can_submit_children=True,
+        idempotency_key="children-callable-1",
+    )
+
+    assert workload.spec.can_submit_children is True
+
+
 def _pool_record():
     """One enabled spot pool, which is what the callable path defaults to."""
 

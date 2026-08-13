@@ -827,6 +827,7 @@ class ControlPlaneService:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -896,6 +897,7 @@ class ControlPlaneService:
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
+                can_submit_children=can_submit_children,
             )
             return await self._store_workload(
                 tx,
@@ -930,6 +932,7 @@ class ControlPlaneService:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -1092,6 +1095,7 @@ class ControlPlaneService:
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
+                can_submit_children=can_submit_children,
             )
             return await self._store_workload(
                 tx,
@@ -1233,6 +1237,7 @@ class ControlPlaneService:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
     ) -> WorkloadDefinition:
         """Build a workload whose placement contract is pinned to one fleet pool.
 
@@ -1277,6 +1282,7 @@ class ControlPlaneService:
             checkpointable=checkpointable,
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
+            can_submit_children=can_submit_children,
         )
 
     async def _replayed_workload(

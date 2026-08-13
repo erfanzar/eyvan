@@ -184,6 +184,7 @@ class WorkloadCommandService:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
     ) -> None:
         """Submit one pool-targeted command using context and fleet defaults."""
 
@@ -205,6 +206,7 @@ class WorkloadCommandService:
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
+                can_submit_children=can_submit_children,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -387,6 +389,12 @@ class WorkloadCommandService:
 )
 @click.option("--checkpoint-hook", help="Command run on the cell to write a checkpoint before the job is stopped.")
 @click.option("--checkpoint-output-uri", help="Where the hook writes, normally a gs:// prefix.")
+@click.option(
+    "--can-submit-children",
+    is_flag=True,
+    default=False,
+    help="Hand this job a capability to submit children of its own, under this workload's owner.",
+)
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
@@ -403,6 +411,7 @@ def run_workload(
     checkpointable: bool,
     checkpoint_hook: str | None,
     checkpoint_output_uri: str | None,
+    can_submit_children: bool,
     command: tuple[str, ...],
 ) -> None:
     """Queue COMMAND on TYPE or FLEET/TYPE using applied fleet defaults."""
@@ -421,6 +430,7 @@ def run_workload(
         checkpointable=checkpointable,
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
+        can_submit_children=can_submit_children,
     )
 
 

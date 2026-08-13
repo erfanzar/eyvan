@@ -175,6 +175,7 @@ class AsyncEyvanClient:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -193,6 +194,7 @@ class AsyncEyvanClient:
             checkpointable=checkpointable,
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
+            can_submit_children=can_submit_children,
         )
         response = await self._mutating_request(
             "POST",
@@ -222,6 +224,7 @@ class AsyncEyvanClient:
         checkpointable: bool = False,
         checkpoint_hook: str | None = None,
         checkpoint_output_uri: str | None = None,
+        can_submit_children: bool = False,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -243,6 +246,7 @@ class AsyncEyvanClient:
             checkpointable=checkpointable,
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
+            can_submit_children=can_submit_children,
         )
         response = await self._mutating_request(
             "POST",

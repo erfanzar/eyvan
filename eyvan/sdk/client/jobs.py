@@ -68,6 +68,7 @@ class AcceleratorConfig(tp.Protocol):
     checkpointable: bool
     checkpoint_hook: str | None
     checkpoint_output_uri: str | None
+    can_submit_children: bool
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -140,6 +141,10 @@ class TpuConfig:
     checkpointable: bool = False
     checkpoint_hook: str | None = None
     checkpoint_output_uri: str | None = None
+    #: Whether this job receives a capability to submit children of its own,
+    #: under its owner's identity. Off by default: a credential nobody asked
+    #: for is one nobody is watching.
+    can_submit_children: bool = False
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
@@ -182,6 +187,10 @@ class GpuConfig:
     checkpointable: bool = False
     checkpoint_hook: str | None = None
     checkpoint_output_uri: str | None = None
+    #: Whether this job receives a capability to submit children of its own,
+    #: under its owner's identity. Off by default: a credential nobody asked
+    #: for is one nobody is watching.
+    can_submit_children: bool = False
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
@@ -214,6 +223,10 @@ class CpuConfig:
     checkpointable: bool = False
     checkpoint_hook: str | None = None
     checkpoint_output_uri: str | None = None
+    #: Whether this job receives a capability to submit children of its own,
+    #: under its owner's identity. Off by default: a credential nobody asked
+    #: for is one nobody is watching.
+    can_submit_children: bool = False
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)

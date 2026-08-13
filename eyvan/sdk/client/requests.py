@@ -43,6 +43,7 @@ def pool_workload_request(
     checkpointable: bool = False,
     checkpoint_hook: str | None = None,
     checkpoint_output_uri: str | None = None,
+    can_submit_children: bool = False,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -61,6 +62,7 @@ def pool_workload_request(
         checkpointable=checkpointable,
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
+        can_submit_children=can_submit_children,
     )
 
 
@@ -82,6 +84,7 @@ def pool_callable_request(
     checkpointable: bool = False,
     checkpoint_hook: str | None = None,
     checkpoint_output_uri: str | None = None,
+    can_submit_children: bool = False,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -104,6 +107,7 @@ def pool_callable_request(
         checkpointable=checkpointable,
         checkpoint_hook=checkpoint_hook,
         checkpoint_output_uri=checkpoint_output_uri,
+        can_submit_children=can_submit_children,
     )
 
 

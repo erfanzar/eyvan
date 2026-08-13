@@ -226,6 +226,9 @@ class PoolWorkloadSubmitRequest(ApiModel):
     checkpointable: bool = False
     checkpoint_hook: str | None = Field(default=None, max_length=4096)
     checkpoint_output_uri: str | None = Field(default=None, max_length=2048)
+    #: Whether this job may submit children of its own, under its owner's
+    #: identity. Same capability the explicit-intent path exposes.
+    can_submit_children: bool = False
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
@@ -259,6 +262,9 @@ class PoolCallableSubmitRequest(ApiModel):
     checkpointable: bool = False
     checkpoint_hook: str | None = Field(default=None, max_length=4096)
     checkpoint_output_uri: str | None = Field(default=None, max_length=2048)
+    #: Whether this job may submit children of its own, under its owner's
+    #: identity. Same capability the explicit-intent path exposes.
+    can_submit_children: bool = False
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:
