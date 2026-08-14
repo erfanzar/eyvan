@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import typing as tp
 
 import httpx
@@ -109,6 +110,29 @@ _DEV_ROLE_ALIASES = {
 }
 
 
+#: The single principal a bootstrap token authenticates. It is one named admin,
+#: not a role a caller may choose: a bootstrap credential that let the holder
+#: pick their own authority would be a general bypass wearing a narrow name.
+BOOTSTRAP_SUBJECT = "eyvan-bootstrap"
+
+
+def bootstrap_principal() -> Principal:
+    """Return the one principal a bootstrap token authenticates.
+
+    A head created by ``eyvan head up`` has no identity provider, so every
+    authenticated request was refused with 401 and the fleet could not be
+    created at all. This closes that gap with possession of a generated secret
+    rather than a trusted header: unlike development auth, the caller cannot
+    name themselves or their roles, so it is safe on a network bind in a way
+    ``EYVAN_DEV_AUTH_ENABLED`` is not.
+    """
+
+    return Principal(
+        subject=BOOTSTRAP_SUBJECT,
+        grants=(RoleGrant(role=Role.FLEET_ADMIN, org_id=None, project_id=None),),
+    )
+
+
 class RequestAuthenticator:
     """Authenticate bearer tokens, or explicit headers when dev auth is enabled."""
 
@@ -122,6 +146,7 @@ class RequestAuthenticator:
         self.settings = settings
         self.verifier = verifier
         self.local_development_credential = local_development_credential
+        self.bootstrap_token = settings.bootstrap_token or None
 
     async def authenticate(self, request: Request) -> Principal:
         authorization = request.headers.get("Authorization", "")
@@ -129,9 +154,15 @@ class RequestAuthenticator:
             scheme, _, token = authorization.partition(" ")
             if scheme.lower() != "bearer" or not token:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid Authorization header")
+            if self.bootstrap_token is not None and secrets.compare_digest(token, self.bootstrap_token):
+                return bootstrap_principal()
             if self.verifier is None:
                 raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="OIDC verifier is not configured"
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        "no identity provider is configured. Set EYVAN_OIDC_ISSUER, or run "
+                        "`eyvan head up --bootstrap-identity` and send its token as a bearer token"
+                    ),
                 )
             try:
                 return await self.verifier.verify(token)

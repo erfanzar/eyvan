@@ -456,11 +456,12 @@ class HeadSecrets:
     artifact_token_key: str
     agent_shared_secret: str
     database_password: str
+    bootstrap_token: str
 
     def __post_init__(self) -> None:
         """Refuse material too short to be worth generating."""
 
-        for name in ("metrics_token", "artifact_token_key", "agent_shared_secret"):
+        for name in ("metrics_token", "artifact_token_key", "agent_shared_secret", "bootstrap_token"):
             value = getattr(self, name)
             if not isinstance(value, str) or len(value) < 32:
                 raise ValueError(f"{name} must be at least 32 characters")
@@ -479,12 +480,16 @@ class HeadSecrets:
             artifact_token_key=secrets.token_urlsafe(32),
             agent_shared_secret=secrets.token_urlsafe(32),
             database_password=secrets.token_urlsafe(24),
+            bootstrap_token=secrets.token_urlsafe(32),
         )
 
     def __repr__(self) -> str:
         """Keep generated material out of tracebacks and debug output."""
 
-        return "HeadSecrets(metrics_token=***, artifact_token_key=***, agent_shared_secret=***, database_password=***)"
+        return (
+            "HeadSecrets(metrics_token=***, artifact_token_key=***, agent_shared_secret=***, "
+            "database_password=***, bootstrap_token=***)"
+        )
 
     def values(self) -> tuple[str, ...]:
         """Return every secret value, for redaction checks only."""
@@ -513,7 +518,11 @@ class HeadSecrets:
             environment["EYVAN_ARTIFACT_STORE_URI"] = spec.artifact_store_uri
         if spec.oidc_issuer is not None:
             environment["EYVAN_OIDC_ISSUER"] = spec.oidc_issuer
-            environment["EYVAN_OIDC_AUDIENCE"] = spec.oidc_audience
+            if spec.oidc_audience is not None:
+                environment["EYVAN_OIDC_AUDIENCE"] = spec.oidc_audience
+        else:
+            # Startup refuses both at once, so this only ever fills the gap.
+            environment["EYVAN_BOOTSTRAP_TOKEN"] = self.bootstrap_token
         return environment
 
     def environment_file(self, spec: HeadSpec, *, address: str) -> str:
@@ -826,8 +835,9 @@ class HeadUpResult:
         if self.spec.oidc_issuer is not None:
             return None
         return (
-            "This head has no EYVAN_OIDC_ISSUER, so every authenticated request will be refused with 401. "
-            "Re-run `eyvan head up` with --oidc-issuer once your identity provider is registered."
+            "This head has no EYVAN_OIDC_ISSUER, so it authenticates with a generated bootstrap token instead. "
+            "Read it from the head with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env -- then export it as "
+            "EYVAN_API_TOKEN locally. Register an identity provider and re-run with --oidc-issuer to retire it."
         )
 
     def as_document(self) -> JsonObject:

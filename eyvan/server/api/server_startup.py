@@ -43,6 +43,12 @@ NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY = (
     "per-process signing key would break managed-artifact token validation across replicas and restarts"
 )
 
+BOOTSTRAP_TOKEN_AND_ISSUER_CONFLICT = (
+    "EYVAN_BOOTSTRAP_TOKEN and EYVAN_OIDC_ISSUER are both set; a bootstrap token exists only to reach a head that "
+    "has no identity provider, and silently preferring one of two configured identities is how a temporary "
+    "credential outlives the gap it was created for"
+)
+
 
 class DevelopmentAuthMode(StrEnum):
     """How development-header authentication was selected for this process."""
@@ -115,6 +121,13 @@ def unsatisfied_startup_requirements(
     elif settings.repository_backend is RepositoryBackend.LOCAL:
         requirements.append(
             StartupRequirement(_REPOSITORY_BACKEND_ENVIRONMENT_VARIABLE, LOCAL_REPOSITORY_IS_LOOPBACK_ONLY)
+        )
+    if settings.bootstrap_token and settings.oidc_issuer:
+        requirements.append(
+            StartupRequirement(
+                "EYVAN_BOOTSTRAP_TOKEN",
+                BOOTSTRAP_TOKEN_AND_ISSUER_CONFLICT,
+            )
         )
     if settings.dev_auth_enabled:
         requirements.append(StartupRequirement(_DEV_AUTH_ENVIRONMENT_VARIABLE, DEVELOPMENT_AUTH_IS_LOOPBACK_ONLY))

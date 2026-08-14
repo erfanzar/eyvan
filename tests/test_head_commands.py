@@ -78,6 +78,7 @@ STUB_SECRETS = HeadSecrets(
     artifact_token_key="artifact-" + "a" * 32,
     agent_shared_secret="agent-" + "g" * 32,
     database_password="database-" + "d" * 24,
+    bootstrap_token="bootstrap-" + "b" * 32,
 )
 
 
@@ -670,8 +671,12 @@ def test_a_head_with_no_issuer_says_so_instead_of_answering_401_silently() -> No
 
     warning = result.authentication_warning
     assert warning is not None
-    assert "401" in warning
-    assert "--oidc-issuer" in warning
+    assert "bootstrap token" in warning
+    assert "--oidc-issuer" in warning, "the warning must name the way to retire the bootstrap token"
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    assert environment["EYVAN_BOOTSTRAP_TOKEN"] == STUB_SECRETS.bootstrap_token
+    assert "EYVAN_OIDC_ISSUER" not in environment
 
 
 def test_configuring_an_issuer_removes_the_warning_and_reaches_the_head() -> None:

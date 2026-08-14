@@ -60,6 +60,9 @@ class EyvanSettings:
     controller_enabled: bool = True
     public_url: str = "http://127.0.0.1:8080"
     oidc_issuer: str | None = None
+    #: Possession-based identity for a head that has no issuer yet. Unlike
+    #: dev auth it trusts a generated secret, not a caller-supplied header.
+    bootstrap_token: str | None = None
     oidc_audience: str = "eyvan"
     oidc_jwks_url: str | None = None
     #: The public OAuth client the *browser* uses. Distinct from the API's
@@ -495,6 +498,7 @@ class EyvanSettings:
             controller_enabled=truthy("EYVAN_CONTROLLER_ENABLED", defaults.controller_enabled),
             public_url=os.getenv("EYVAN_PUBLIC_URL", defaults.public_url),
             oidc_issuer=os.getenv("EYVAN_OIDC_ISSUER"),
+            bootstrap_token=os.getenv("EYVAN_BOOTSTRAP_TOKEN"),
             oidc_dashboard_client_id=os.getenv("EYVAN_OIDC_DASHBOARD_CLIENT_ID"),
             oidc_audience=os.getenv("EYVAN_OIDC_AUDIENCE", defaults.oidc_audience),
             oidc_jwks_url=os.getenv("EYVAN_OIDC_JWKS_URL"),
