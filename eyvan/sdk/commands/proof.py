@@ -289,12 +289,18 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     # in cooldown after a reclamation is the misclassification this proves
     # against -- and it is worse than a wrong label, because a cooled-down pool
     # stops being asked and the fleet quietly shrinks.
+    #
+    # The absence of a cooldown only means something while the cell that was
+    # reclaimed is still in the report. That cell is deleted and awaiting
+    # recreation by the time this runs, so once it is reaped an unhardened
+    # reading of "no cell is cooling" would report a *pass* for a build that
+    # still sets the cooldown -- qualifying the defect by garbage collection.
+    # Passing therefore requires a witness: the reclaimed cell, present and not
+    # cooling. Without one this is inconclusive, not proven.
     pool_ids = {pool["id"] for pool in pools}
-    cooling = [
-        cell["id"]
-        for cell in cells
-        if cell.get("pool_id") in pool_ids and (cell.get("availability") or {}).get("cooldown_until")
-    ]
+    mine = [cell for cell in cells if cell.get("pool_id") in pool_ids]
+    cooling = [cell["id"] for cell in mine if (cell.get("availability") or {}).get("cooldown_until")]
+    witnesses = [cell["id"] for cell in mine if cell.get("provider_failure_code") == "preempted"]
     if cooling:
         checks.append(
             _failed(
@@ -303,8 +309,17 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
                 "an interruption records no failure and sets none",
             )
         )
+    elif not witnesses:
+        checks.append(
+            _unknown(
+                "no-stockout-cooldown",
+                "no cell reports the reclamation any more, so no cell is left to carry a cooldown; "
+                "this settles nothing about whether one was set",
+            )
+        )
     else:
-        checks.append(_passed("no-stockout-cooldown", "no cell entered a cooldown"))
+        witnessed = ", ".join(sorted(witnesses)[:3])
+        checks.append(_passed("no-stockout-cooldown", f"the reclaimed cell(s) {witnessed} carry no cooldown"))
 
     state = workload.get("state")
     if state in {"running", "succeeded"}:

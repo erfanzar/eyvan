@@ -325,6 +325,49 @@ def test_a_cooldown_on_an_unrelated_pool_is_not_this_proof_s_business() -> None:
     assert _check(result, "no-stockout-cooldown") is Verdict.PASS
 
 
+def test_a_reclaimed_cell_that_is_gone_cannot_vouch_for_the_absence_of_a_cooldown() -> None:
+    """The reading that would have qualified the defect this proof exists to catch.
+
+    A reclaimed cell is deleted and awaiting recreation while the proof runs, so
+    it leaves the report on its own. Read naively, its departure turns "the cell
+    is not cooling" into "no cell is cooling" -- and the criterion goes green on
+    a build that still sets the cooldown, with no operator action in between.
+
+    This is the exact shape of a run that establishes nothing and looks clean
+    doing it, so it must settle nothing rather than settle it wrongly. The
+    fleet-wide counters are deliberately still those of a real reclamation: the
+    preemption happened, only the cell that witnessed it has been reaped.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [{"id": "replacement", "pool_id": "research/v5p", "availability": {}}],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.INCONCLUSIVE
+    assert result.verdict is not Verdict.PASS
+
+
+def test_a_surviving_reclaimed_cell_without_a_cooldown_is_a_real_pass() -> None:
+    """The witness distinguishes this from the case above, and nothing else does.
+
+    Same fleet counters, same absence of a cooldown; the only difference is that
+    the cell which carried the reclamation is still there to be asked.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {"id": "cell-a", "pool_id": "research/v5p", "provider_failure_code": "preempted", "availability": {}},
+            {"id": "replacement", "pool_id": "research/v5p", "availability": {}},
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+
+
 def test_a_workload_that_failed_did_not_survive_its_preemption() -> None:
     result = evaluate_spot_preemption(
         _preempted(state="failed"),
