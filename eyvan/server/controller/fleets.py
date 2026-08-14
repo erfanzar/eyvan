@@ -541,7 +541,22 @@ class _ControllerFleets:
                     cell.id,
                     idempotency_key=f"autoscale:drain:{cell.id}:g{cell.generation}",
                 )
-                if not replayed and cell.state is not CellState.READY:
+                # "Never delivered capacity" is the question, and `state` answers a
+                # different one -- what the cell is *now*. A reclaimed spot cell is
+                # draining or NEEDS_RECREATE by the time it reaches here, so a cell
+                # that served a workload for twenty minutes and was then preempted
+                # passed this guard and had a STOCKOUT written against a zone that
+                # had just proven it had capacity. P5 caught it on a real
+                # reclamation on 2026-08-13: the same cell carried both
+                # `interruptions=1.9` from the correct classification and
+                # `consecutive_failures=1` with a cooldown from this path.
+                #
+                # `provision_latencies_s` is appended only on the SUCCESS
+                # transition into READY, so a non-empty list is the durable record
+                # that this cell once delivered. The preempted cell read
+                # `[1427.8]`; a cell that timed out in WAITING reads `[]`.
+                never_delivered = not cell.availability.provision_latencies_s
+                if not replayed and cell.state is not CellState.READY and never_delivered:
                     # This cell is being reclaimed without ever having delivered
                     # capacity -- it exceeded queue_timeout_s or provisioning_timeout_s
                     # and stopped counting as supply. Nothing else records that: the

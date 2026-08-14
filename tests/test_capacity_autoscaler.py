@@ -1500,3 +1500,58 @@ async def test_the_idle_sweep_does_not_clobber_capacity_that_arrived_concurrentl
 
     assert landed["done"], "the test needs the sweep to have re-read the cell"
     assert settled.state is CellState.READY, "the idle sweep discarded a concurrent capacity result"
+
+
+@pytest.mark.asyncio
+async def test_a_cell_reclaimed_after_it_served_records_no_stockout() -> None:
+    """The case the READY check could not see, found by P5 on real hardware.
+
+    The guard asked whether the cell is READY *now*. A reclaimed spot cell is
+    draining or NEEDS_RECREATE by then, so one that served a workload for twenty
+    minutes and was then preempted looked identical to one that never delivered,
+    and a STOCKOUT was written against a zone that had just proven it had
+    capacity.
+
+    On the live run the same cell carried both `interruptions=1.9` from the
+    correct preemption classification and `consecutive_failures=1` with a
+    cooldown from this path -- two sites disagreeing about the same event.
+
+    ``provision_latencies_s`` is the discriminator because it is appended only on
+    the SUCCESS transition into READY. The preempted cell read `[1427.8]`; the
+    replacement that never came up read `[]`.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    await service.apply_fleet(
+        fleet_admin(),
+        "research",
+        (cpu_pool(initial_cells=1).model_copy(update={"provisioning_timeout_s": 60, "idle_timeout_s": 0}),),
+        idempotency_key="fleet-v1",
+    )
+    assert (await controller.reconcile_capacity_pools_once())["launched"] == 1
+
+    async with repository.transaction() as transaction:
+        cell = (await transaction.list_cells())[0]
+        stale = cell.created_at - timedelta(seconds=3600)
+        # Delivered capacity once, then lost it: exactly a spot reclamation.
+        delivered = cell.availability.model_copy(update={"provision_latencies_s": (1427.8,)})
+        await transaction.put_cell(
+            cell.model_copy(
+                update={
+                    "created_at": stale,
+                    "provider_phase_started_at": stale,
+                    "availability": delivered,
+                }
+            )
+        )
+        before = delivered
+
+    await controller.reconcile_capacity_pools_once()
+
+    async with repository.transaction() as transaction:
+        reclaimed = (await transaction.list_cells())[0]
+
+    assert reclaimed.availability.failure_evidence == before.failure_evidence
+    assert reclaimed.availability.cooldown_until is None
