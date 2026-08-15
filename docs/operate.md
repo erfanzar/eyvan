@@ -28,6 +28,33 @@ eyvan workload list             # what is queued and running
 eyvan capacity list             # pools this project may submit to
 ```
 
+## Running a job on accelerators
+
+Two commands. Apply a scale-from-zero fleet, then submit the workload:
+
+```
+uv run --locked eyvan up ~/.eyvan-configs/eyvan-live-v6e8-pods2-us-central2-b.yaml
+uv run python scripts/eyvan_esurge_multislice.py \
+    --accelerator-type v6e-8 --pods 2 --confirm-provider-mutations
+```
+
+The fleet scales from zero, so nothing bills until a workload asks for it, and
+the cell is released when the workload finishes.
+
+**Do not provision with raw `gcloud` instead.** Eyvan is the thing under test:
+driving GCP directly yields evidence about the workload framework and none about
+the control plane, and a hand-run job is not a result. If Eyvan cannot express
+what you need, that gap is the finding — report it rather than working around
+it. A `PreToolUse` hook denies raw TPU provisioning for exactly this reason;
+`list`, `describe`, `ssh` and `delete` remain available for diagnosis and for
+reaping strays after a crash.
+
+Shape guidance, measured 2026-08-15 in `example-project`: request **2x v6e-8**
+(16 chips, a real multislice) rather than 2x v6e-16. The 32-chip shape was
+accepted in all four zones holding v6e spot quota and reclaimed before a host
+finished booting, three separate times; 16 chips were granted in about two
+minutes, repeatedly.
+
 ## When something is queued and not running
 
 `eyvan workload explain <id>` is the first command, always. It reports the
