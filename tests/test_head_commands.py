@@ -2019,3 +2019,105 @@ pools:
         encoding="utf-8",
     )
     return str(path)
+
+
+# ------------------------------------------------------------------ rolling a head back
+
+
+def _rollback_runner(
+    *,
+    previous: str,
+    digests: list[str],
+    calls: list[tuple[str, ...]],
+    instance: dict[str, tp.Any] | None = None,
+):
+    """Answer the reads a rollback makes, recording every command issued."""
+
+    described = (
+        instance
+        if instance is not None
+        else {
+            "status": "RUNNING",
+            "networkInterfaces": [{"networkIP": "10.0.0.2"}],
+            # Eyvan refuses to reconfigure an instance it did not create, so a
+            # fake head has to carry the ownership labels a real one does.
+            "labels": {
+                head_commands.HEAD_MANAGED_LABEL_KEY: head_commands.HEAD_MANAGED_LABEL_VALUE,
+                head_commands.HEAD_FLEET_LABEL_KEY: "research",
+            },
+        }
+    )
+
+    def run(args: tp.Sequence[str], *, stdin_text: str | None, timeout: float):
+        calls.append(tuple(args))
+        joined = " ".join(args)
+        if "describe" in args and "instances" in joined:
+            if instance is None and described is None:
+                return subprocess.CompletedProcess(list(args), 1, "", "not found")
+            return subprocess.CompletedProcess(list(args), 0, json.dumps(described), "")
+        if "build_identity" in joined:
+            return subprocess.CompletedProcess(list(args), 0, digests.pop(0), "")
+        if "-1t" in joined:
+            return subprocess.CompletedProcess(list(args), 0, previous, "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    return run
+
+
+def test_rollback_reinstalls_the_previous_wheel_and_restarts_both_units() -> None:
+    """A head whose API is rolled back and whose agent is not is still broken.
+
+    Both units run the same distribution, and a session was lost this month to
+    restarting only one of them.
+    """
+
+    calls: list[tuple[str, ...]] = []
+    runner = _rollback_runner(
+        previous=f"{head_commands.HEAD_PREVIOUS_WHEEL_DIR}/eyvan-0.0.1-py3-none-any.whl",
+        digests=["sha256:new", "sha256:old"],
+        calls=calls,
+    )
+
+    digest = HeadProvisioner(_spec(), runner=runner).rollback(confirmed=True)
+
+    assert digest == "sha256:old"
+    restarts = [" ".join(call) for call in calls if "systemctl restart" in " ".join(call)]
+    assert len(restarts) == 1
+    assert head_commands.HEAD_SERVICE_NAME in restarts[0]
+    assert head_commands.HEAD_AGENT_SERVICE_NAME in restarts[0], "the agent runs the same wheel and must restart too"
+
+
+def test_rollback_refuses_when_the_digest_did_not_change() -> None:
+    """Reinstalling something and still running the old build is a failed rollback.
+
+    Verifying by ``systemctl is-active`` would call this a success: the unit is
+    active either way. The digest is the only signal that distinguishes builds.
+    """
+
+    runner = _rollback_runner(
+        previous=f"{head_commands.HEAD_PREVIOUS_WHEEL_DIR}/eyvan-0.0.1-py3-none-any.whl",
+        digests=["sha256:same", "sha256:same"],
+        calls=[],
+    )
+
+    with pytest.raises(head_commands.HeadError, match="did not take"):
+        HeadProvisioner(_spec(), runner=runner).rollback(confirmed=True)
+
+
+def test_rollback_refuses_without_confirmation_and_touches_nothing() -> None:
+    calls: list[tuple[str, ...]] = []
+    runner = _rollback_runner(previous="", digests=[], calls=calls)
+
+    with pytest.raises(head_commands.HeadError, match="pass --yes"):
+        HeadProvisioner(_spec(), runner=runner).rollback(confirmed=False)
+
+    assert calls == []
+
+
+def test_rollback_says_so_when_no_wheel_was_retained() -> None:
+    """A head upgraded before retention existed has nothing to go back to."""
+
+    runner = _rollback_runner(previous="", digests=[], calls=[])
+
+    with pytest.raises(head_commands.HeadError, match="no superseded wheel"):
+        HeadProvisioner(_spec(), runner=runner).rollback(confirmed=True)

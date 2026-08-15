@@ -102,6 +102,15 @@ HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
 #: pip refuses "eyvan-head.whl" as not a valid wheel filename -- so the file is
 #: written under its own name in a directory the installer globs.
 HEAD_WHEEL_DIR = "/opt/eyvan/wheels"
+#: Superseded wheels, newest first, so a bad deploy has somewhere to go back to.
+#: Staging used to ``rm -rf`` the wheel directory, which meant a head only ever
+#: held the build it was running: three hand-installed wheels during one P5 run
+#: had no way back except rebuilding the old one from source.
+HEAD_PREVIOUS_WHEEL_DIR = f"{HEAD_WHEEL_DIR}/previous"
+#: How many superseded wheels to keep. Two is enough to undo a bad deploy and
+#: still have the one before it, without letting a long-lived head accumulate
+#: builds on a disk that also holds workload state.
+HEAD_WHEEL_RETENTION = 2
 HEAD_VENV_PATH = "/opt/eyvan/venv"
 #: Where the head unpacks the operations UI it serves at its own root.
 #: The server mounts this only when the directory exists, so a head built
@@ -1671,6 +1680,47 @@ class HeadProvisioner:
             service_state=service_state,
         )
 
+    def rollback(self, *, confirmed: bool) -> str:
+        """Reinstall the wheel this head ran before its current one.
+
+        Verified by build digest rather than by unit state: ``systemctl`` calls
+        a unit active as soon as the process starts, which says nothing about
+        which build it is running, and the point of a rollback is precisely that
+        the running build is the wrong one.
+
+        Both units are restarted. ``eyvan-head-agent.service`` runs the same
+        wheel as ``eyvan-head.service``, and a session was lost this month to
+        restarting only one of them -- leaving a head whose API was rolled back
+        while its cell agent was not.
+        """
+
+        if not confirmed:
+            raise HeadError(
+                HeadStep.INSTALL,
+                "rolling back replaces the running control-plane build; pass --yes to confirm",
+            )
+        instance = self._describe_instance()
+        if instance is None:
+            raise HeadError(HeadStep.INSTALL, f"no head named {self.spec.instance_name} to roll back")
+        previous = self._run(self._previous_wheel_action()).stdout.strip()
+        if not previous:
+            raise HeadError(
+                HeadStep.INSTALL,
+                f"no superseded wheel is retained in {HEAD_PREVIOUS_WHEEL_DIR}; a head keeps one only after it "
+                "has been upgraded at least once since retention was added",
+            )
+        before = self._run(self._build_identity_action()).stdout.strip()
+        self._execute(self._rollback_install_action(previous))
+        self._execute(self._service_restart_action())
+        after = self._run(self._build_identity_action()).stdout.strip()
+        if after == before:
+            raise HeadError(
+                HeadStep.SERVICE_VERIFY,
+                f"the head still reports build {after or 'unknown'} after reinstalling {previous}; the rollback "
+                "did not take, so the units are running the build you tried to leave",
+            )
+        return after
+
     def down(self, *, confirmed: bool) -> HeadDownResult:
         """Delete one head Eyvan owns, and only after explicit confirmation."""
 
@@ -2119,7 +2169,16 @@ class HeadProvisioner:
             f"stage this Eyvan distribution into {HEAD_WHEEL_DIR}",
             "sudo /bin/sh -ec "
             + shlex.quote(
-                f"umask 077; rm -rf {HEAD_WHEEL_DIR}; install -d -m 0755 {HEAD_WHEEL_DIR}; "
+                # Retire the running wheel instead of deleting it. `rm -rf` left
+                # a head holding only the build it was running, so a bad deploy
+                # could only be undone by rebuilding its predecessor from
+                # source. An unmatched glob is the literal string under /bin/sh,
+                # which `[ -e ]` then rejects, so the loop is a no-op on a first
+                # install.
+                f"umask 077; install -d -m 0755 {HEAD_WHEEL_DIR} {HEAD_PREVIOUS_WHEEL_DIR}; "
+                f'for w in {HEAD_WHEEL_DIR}/*.whl; do [ -e "$w" ] && mv -f "$w" {HEAD_PREVIOUS_WHEEL_DIR}/; done; '
+                f"ls -1t {HEAD_PREVIOUS_WHEEL_DIR}/*.whl 2>/dev/null "
+                f"| tail -n +{HEAD_WHEEL_RETENTION + 1} | xargs rm -f; "
                 f"base64 -d > {HEAD_WHEEL_DIR}/{filename}; sha256sum {HEAD_WHEEL_DIR}/{filename} | cut -d' ' -f1"
             ),
             mutates=True,
@@ -2204,6 +2263,59 @@ class HeadProvisioner:
             HeadStep.SERVICE_VERIFY,
             f"report {HEAD_SERVICE_NAME}'s state",
             f"sudo systemctl is-active {HEAD_SERVICE_NAME}",
+        )
+
+    def _previous_wheel_action(self) -> HeadAction:
+        """Build the lookup of the most recently superseded wheel."""
+
+        return self._ssh_action(
+            HeadStep.INSTALL,
+            f"find the newest superseded wheel in {HEAD_PREVIOUS_WHEEL_DIR}",
+            "sudo /bin/sh -ec " + shlex.quote(f"ls -1t {HEAD_PREVIOUS_WHEEL_DIR}/*.whl 2>/dev/null | head -1"),
+        )
+
+    def _build_identity_action(self) -> HeadAction:
+        """Build the read of the source digest the head is actually running.
+
+        ``systemctl is-active`` reports that *a* process started, which is not
+        the question a rollback asks. The digest is the only answer that
+        distinguishes two builds of the same version.
+        """
+
+        return self._ssh_action(
+            HeadStep.SERVICE_VERIFY,
+            "report the head's running build digest",
+            f"sudo {HEAD_VENV_PATH}/bin/python -c "
+            + shlex.quote(
+                "from eyvan._internal.build_identity import build_identity; print(build_identity().source_digest or '')"
+            ),
+        )
+
+    def _rollback_install_action(self, wheel_path: str) -> HeadAction:
+        """Build the reinstall of one retained wheel over the running venv."""
+
+        return self._ssh_action(
+            HeadStep.INSTALL,
+            f"reinstall {wheel_path}",
+            "sudo /bin/sh -ec "
+            + shlex.quote(
+                f"{HEAD_VENV_PATH}/bin/python -m pip install --disable-pip-version-check --force-reinstall "
+                f"--no-deps {shlex.quote(wheel_path)}"
+            ),
+        )
+
+    def _service_restart_action(self) -> HeadAction:
+        """Build the restart of both units a head runs from one wheel.
+
+        The agent runs the same distribution as the API. Restarting only the API
+        leaves a head whose control plane was rolled back and whose cell agent
+        was not, which is the skew this command exists to end.
+        """
+
+        return self._ssh_action(
+            HeadStep.SERVICE_START,
+            f"restart {HEAD_SERVICE_NAME} and {HEAD_AGENT_SERVICE_NAME}",
+            f"sudo systemctl restart {HEAD_SERVICE_NAME} {HEAD_AGENT_SERVICE_NAME}",
         )
 
     # -- provider boundary ------------------------------------------------
@@ -2705,6 +2817,45 @@ def head_status(
     click.echo(f"{spec.instance_name}: {result.instance_status} at {result.address}")
     click.echo(f"  service       {result.service_state or 'unknown'}")
     click.echo(f"  ingress       {', '.join(result.source_ranges) or 'no managed rule'}")
+
+
+@head_group.command("rollback")
+@click.argument("config_path", required=False, type=click.Path(dir_okay=False, path_type=str))
+@click.option("--fleet", help="Name the head without a fleet file; requires --project, --region and --zone.")
+@click.option("--project", help="GCP project that owns the head.")
+@click.option("--region", help="GCP region.")
+@click.option("--zone", help="GCP zone.")
+@click.option("--port", type=int, help=f"Control-plane port. [default: {DEFAULT_HEAD_PORT}]")
+@click.option("--network", help="VPC network the head joined. [default: default]")
+@click.option("--yes", is_flag=True, help="Confirm replacing the running control-plane build.")
+def head_rollback(
+    config_path: str | None,
+    fleet: str | None,
+    project: str | None,
+    region: str | None,
+    zone: str | None,
+    port: int | None,
+    network: str | None,
+    yes: bool,
+) -> None:
+    """Reinstall the wheel this head ran before its current one.
+
+    Verified by the build digest the head reports after restarting, not by
+    whether systemd calls the unit active -- a unit is active the moment its
+    process starts, which says nothing about which build it is.
+    """
+
+    spec = _spec_from_options(
+        config_path,
+        fleet=fleet,
+        overrides=_head_overrides(project=project, region=region, zone=zone, port=port, network=network),
+        require_egress=False,
+    )
+    try:
+        digest = HeadProvisioner(spec).rollback(confirmed=yes)
+    except HeadError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{spec.instance_name} rolled back; now running build {digest}")
 
 
 @head_group.command("down")
