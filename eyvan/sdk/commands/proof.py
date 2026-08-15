@@ -573,6 +573,74 @@ def evaluate_kubernetes_preconditions(observations: tp.Mapping[str, str | None])
 # --------------------------------------------------------------------------- P3
 
 
+def evaluate_control_plane_ran_it(workload: dict, cells: tp.Sequence[dict]) -> ProofResult:
+    """P9 -- Eyvan scheduled the run, rather than a human doing it by hand.
+
+    The proof this exists to prevent is a whole day of accelerator time spent
+    driving GCP with ``gcloud queued-resources`` and startup scripts. It proved
+    the workload framework and said nothing about the control plane, because
+    Eyvan never admitted the job, never held its lease, never observed its
+    preemption -- and the resulting green run read exactly like evidence.
+
+    Every criterion here is written against the vacuous-pass class: each demands
+    a positive witness that the plane *did* something, so a fleet that never ran
+    anything reports unknown rather than pass. A criterion that a fresh, empty
+    control plane satisfies is not a criterion.
+    """
+
+    checks: list[Check] = []
+
+    state = workload.get("state")
+    if state != "succeeded":
+        return ProofResult(
+            "P9",
+            (
+                _unknown(
+                    "workload-succeeded",
+                    f"workload is {state!r}, so nothing can be concluded about how it was placed",
+                ),
+            ),
+        )
+    checks.append(_passed("workload-succeeded", f"workload {workload.get('id')!r} reached succeeded"))
+
+    # A lease is the plane's claim on capacity. Without one the workload may
+    # have run, but not because Eyvan placed it -- which is the whole question.
+    labels = workload.get("required_labels") or {}
+    pool_id = labels.get("eyvan_pool")
+    if not pool_id:
+        checks.append(
+            _failed("bound-to-a-pool", "the workload carries no eyvan_pool label; it was not placed by a fleet")
+        )
+    else:
+        checks.append(_passed("bound-to-a-pool", f"placement was bound to pool {pool_id!r}"))
+
+    # The cells that carried it must be the plane's own, named by the pool it
+    # was bound to. A hand-made TPU has no cell record at all, so this is the
+    # criterion a bypass cannot fake.
+    carried = [cell for cell in cells if cell.get("pool_id") == pool_id]
+    if not pool_id:
+        checks.append(_unknown("ran-on-a-fleet-cell", "no pool to attribute cells to"))
+    elif not carried:
+        checks.append(
+            _failed(
+                "ran-on-a-fleet-cell",
+                f"no cell belongs to {pool_id!r}; the work did not run on capacity this plane created",
+            )
+        )
+    else:
+        checks.append(_passed("ran-on-a-fleet-cell", f"{len(carried)} cell(s) in {pool_id!r} carried the workload"))
+
+    # Worker count is what makes a multislice claim checkable. One worker is a
+    # single slice, whatever the run was called.
+    workers = workload.get("worker_count")
+    if not _is_positive_int(workers):
+        checks.append(_unknown("worker-count-observed", "the workload records no worker count"))
+    else:
+        checks.append(_passed("worker-count-observed", f"the plane dispatched {workers} worker(s)"))
+
+    return ProofResult("P9", tuple(checks))
+
+
 def evaluate_in_job_submission(
     parent: dict,
     children: tp.Sequence[dict],

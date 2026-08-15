@@ -1260,6 +1260,46 @@ duration, or show which criteria were exercised. They are intentionally not
 promoted to qualification claims on this page. Only an immutable versioned
 receipt stored outside git can change the supported evidence matrix.
 
+## P9 — the control plane placed the run, not a person
+
+**Establishes** that a green accelerator run is evidence about Eyvan, by
+requiring that Eyvan admitted the workload, bound it to a fleet pool, and
+carried it on a cell of that pool. Needs whatever accelerator the fleet offers;
+the criterion is about placement, not about the hardware.
+
+**Shape**
+
+```
+eyvan up ~/.eyvan-configs/eyvan-live-v6e8-pods2-us-central2-b.yaml
+uv run python scripts/eyvan_esurge_multislice.py \
+    --accelerator-type v6e-8 --pods 2 --confirm-provider-mutations
+eyvan workload get <id>                          # state, required_labels, worker_count
+eyvan cells                                      # a cell whose pool_id is that pool
+```
+
+**Passes when** the workload reached `succeeded`, carries an `eyvan_pool` label,
+at least one cell names that pool as its `pool_id`, and the plane recorded the
+worker count it dispatched. Evaluated by `evaluate_control_plane_ran_it` in
+`eyvan/sdk/commands/proof.py`.
+
+This proof exists because of what it would have caught. On 2026-08-15 the
+Llama-8B eSurge multislice test was run by hand — `gcloud queued-resources`
+plus a startup script — across most of a day of v5p and v6e time. It produced a
+green, deterministic, coherent result, and it was evidence about EasyDeL and
+about nothing else: Eyvan never admitted the job, never held its lease, never
+observed its preemption. The run *read* like a qualification.
+
+Submitted through `@eyvan.execute` instead, the same work surfaced four defects
+in about an hour — a stale pinned cell-agent wheel reported as "provider
+rejected capacity request", a CLI/head schema skew failing as a raw 422, a local
+daemon recording a PID that was not the listening process, and no readable logs
+for a failed workload.
+
+Every criterion demands a positive witness that the plane did something. A fleet
+that ran nothing reports inconclusive; a run that used no cell of the named pool
+fails. `ran-on-a-fleet-cell` is the one a bypass cannot fake, because capacity
+created outside Eyvan leaves no cell record behind.
+
 ## What a failure means
 
 Every proof above has a CPU-verified counterpart that already passes. A failure

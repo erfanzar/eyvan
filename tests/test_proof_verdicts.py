@@ -24,6 +24,7 @@ from eyvan.sdk.commands.proof import (
     EXIT_CODES,
     Verdict,
     evaluate_catalog_authority,
+    evaluate_control_plane_ran_it,
     evaluate_in_job_submission,
     evaluate_kubernetes_preconditions,
     evaluate_secret_delivery,
@@ -1201,3 +1202,54 @@ def test_an_absent_backend_is_distinguished_from_an_empty_page() -> None:
     assert silent.verdict is Verdict.INCONCLUSIVE
     assert "does not expose structured logs" in absent.checks[0].detail
     assert "does not expose structured logs" not in silent.checks[0].detail
+
+
+# ------------------------------------------------------- P9: the plane, not a person
+
+
+def _succeeded_workload(**overrides):
+    workload = {
+        "id": "wl-1",
+        "state": "succeeded",
+        "worker_count": 2,
+        "required_labels": {"eyvan_pool": "research/v6e-8-us-central2-b"},
+    }
+    workload.update(overrides)
+    return workload
+
+
+def _fleet_cell(pool_id: str = "research/v6e-8-us-central2-b"):
+    return {"id": "cell-1", "pool_id": pool_id}
+
+
+def test_p9_passes_when_the_plane_placed_and_carried_the_run() -> None:
+    result = evaluate_control_plane_ran_it(_succeeded_workload(), [_fleet_cell()])
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_p9_is_unknown_when_nothing_ran() -> None:
+    """The vacuous-pass guard: an empty plane must not report a pass."""
+
+    result = evaluate_control_plane_ran_it(_succeeded_workload(state="pending"), [])
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_p9_fails_a_run_that_used_no_fleet_capacity() -> None:
+    """A job driven by hand leaves no cell of the plane's own behind.
+
+    This is the criterion a bypass cannot satisfy, and the reason the proof
+    exists: a whole day of hand-run accelerator time read like evidence about
+    the control plane while telling us nothing about it.
+    """
+
+    result = evaluate_control_plane_ran_it(_succeeded_workload(), [_fleet_cell(pool_id="someone-elses-pool")])
+
+    assert result.verdict is Verdict.FAIL
+
+
+def test_p9_fails_a_workload_that_was_never_bound_to_a_pool() -> None:
+    result = evaluate_control_plane_ran_it(_succeeded_workload(required_labels={}), [_fleet_cell()])
+
+    assert result.verdict is Verdict.FAIL

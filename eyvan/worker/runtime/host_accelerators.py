@@ -22,6 +22,20 @@ differed, and only the machine could say so.
 Stdlib only, and no subprocess: this runs on the worker path, and shelling out to
 ``nvidia-smi`` would make the answer depend on a binary the failing case is
 precisely the one that cannot run.
+
+**Nothing calls this yet, deliberately.** It is a correct probe with no consumer,
+which is the shape of defect this package has shipped before -- a working
+feature no client can ask for -- so it declares itself here rather than reading
+as protection that is in force. Wiring it belongs in
+``_with_execution_readiness`` in ``eyvan.worker.agent.service``, which already
+downgrades a cell to ``EXECUTION_CONNECTING`` when a readiness probe refuses.
+
+Two things gate that. It cannot be qualified without a GPU cell, and the
+readiness path it would join is the one every TPU cell depends on, so a
+mis-scoped branch would break capacity that works today in order to guard
+capacity nobody is currently running. When a GPU is in scope again, gate
+strictly on a GPU accelerator kind and qualify against both cases above -- the
+P100 is the one that reported success while its driver could not open the GPU.
 """
 
 from __future__ import annotations
