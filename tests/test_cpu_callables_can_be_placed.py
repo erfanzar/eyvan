@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 
+from eyvan.capacity.planning import POOL_ALTERNATES_LABEL
 from eyvan.records import (
     CallableExecution,
     CapacityPoolRecord,
@@ -125,11 +126,31 @@ async def test_a_cpu_callable_still_respects_the_capacity_class_it_asked_for() -
 
 
 @pytest.mark.asyncio
-async def test_two_cpu_pools_are_ambiguous_rather_than_arbitrary() -> None:
-    """Picking one would place work somewhere the caller did not choose."""
+async def test_two_interchangeable_pools_become_alternates_for_one_another() -> None:
+    """Same shape, different zone, is cross-zone capacity rather than ambiguity.
+
+    Refusing kept placement from being *arbitrary*, which was right. Choosing
+    the lowest id and recording the rest as alternates is not arbitrary, and it
+    is what lets a workload leave a zone that keeps reclaiming it -- a fleet is
+    scoped to one zone, so without this a job can only ever wait where it was
+    submitted. A caller who wants one specific pool still names it directly.
+    """
+
+    workload, _replayed = await _submit(_service(), [_cpu_pool(pool_id="cpu-b"), _cpu_pool(pool_id="cpu-a")])
+
+    labels = workload.spec.required_labels
+    assert labels["eyvan_pool"] == "cpu-a", "the primary must be deterministic, not whichever arrived first"
+    assert labels[POOL_ALTERNATES_LABEL] == "cpu-b"
+
+
+@pytest.mark.asyncio
+async def test_pools_that_are_not_interchangeable_are_still_ambiguous() -> None:
+    """Different admission width means placing in either changes the job."""
+
+    wide = _cpu_pool(pool_id="cpu-wide", accelerator=ResourceVector(cpu=32, memory_gib=128))
 
     with pytest.raises(ConflictError, match="ambiguous"):
-        await _submit(_service(), [_cpu_pool(pool_id="cpu-a"), _cpu_pool(pool_id="cpu-b")])
+        await _submit(_service(), [_cpu_pool(pool_id="cpu-a"), wide])
 
 
 @pytest.mark.asyncio

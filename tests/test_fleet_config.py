@@ -932,3 +932,73 @@ def test_an_entirely_unpriced_pool_does_not_warn() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
         EyvanFleetConfig.model_validate(fleet)
+
+
+def _two_zone_fleet() -> JsonObject:
+    """One fleet holding the same TPU shape in two zones."""
+
+    return {
+        "version": 1,
+        "name": "research",
+        "provider": {"type": "gcp", "project": "example-project", "region": "us-east5", "zone": "us-east5-b"},
+        "executor": "eyvan-native",
+        "capacity_class": "spot",
+        "pools": {
+            "v6e-8-us-east5-b": {
+                "accelerator_type": "v6e-8",
+                "capacity_class": "spot",
+                "min_workers": 0,
+                "max_workers": 2,
+                "resources": {"CPU": 32, "TPU": 8},
+                "provider_options": {"bootstrap_egress": "public-internet"},
+            },
+            "v6e-8-us-central2-b": {
+                "accelerator_type": "v6e-8",
+                "zone": "us-central2-b",
+                "capacity_class": "spot",
+                "min_workers": 0,
+                "max_workers": 2,
+                "resources": {"CPU": 32, "TPU": 8},
+                "provider_options": {"bootstrap_egress": "public-internet"},
+            },
+        },
+    }
+
+
+def test_one_fleet_may_hold_the_same_tpu_shape_in_two_zones() -> None:
+    """A pool's name and its accelerator shape are allowed to differ.
+
+    While the mapping key *was* the shape, one fleet could hold a shape once,
+    and a fleet is scoped to a zone -- so a workload could only ever wait on the
+    zone it was submitted against. Racing zones is what actually wins spot
+    capacity: on 2026-08-15 us-east5-b granted and reclaimed twice while
+    us-central2-b held.
+    """
+
+    config = EyvanFleetConfig.model_validate(_two_zone_fleet())
+
+    pools = {pool["node_type"]: pool for pool in config.pool_payloads()}
+    assert set(pools) == {"v6e-8-us-east5-b", "v6e-8-us-central2-b"}
+
+    assert {pool["accelerator_type"] for pool in pools.values()} == {"v6e-8"}, (
+        "both pools must run the real shape, whatever they are named"
+    )
+    assert {pool["zone"] for pool in pools.values()} == {"us-east5-b", "us-central2-b"}, (
+        "and each must keep its own zone, which is the point of naming them apart"
+    )
+
+
+def test_a_pool_without_an_explicit_shape_still_takes_its_name() -> None:
+    """The common spelling keeps working: the key is the shape."""
+
+    fleet = _two_zone_fleet()
+    pools = _json_object(fleet["pools"])
+    pool = _json_object(pools["v6e-8-us-east5-b"])
+    pool.pop("accelerator_type")
+    pools["v6e-8"] = pool
+    del pools["v6e-8-us-east5-b"]
+    del pools["v6e-8-us-central2-b"]
+
+    config = EyvanFleetConfig.model_validate(fleet)
+
+    assert [pool["accelerator_type"] for pool in config.pool_payloads()] == ["v6e-8"]

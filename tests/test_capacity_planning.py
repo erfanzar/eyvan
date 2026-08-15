@@ -8,14 +8,18 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from datetime import timedelta
 
 import pytest
 
 from eyvan.capacity.planning import (
+    POOL_ALTERNATES_LABEL,
     CapacityPlanner,
     CapacitySimulation,
     PoolDemand,
+    _candidate_pool_ids,
+    _preferred_candidate,
     cell_matches_pool,
     cell_requires_replacement,
 )
@@ -883,3 +887,102 @@ async def test_disabling_a_pool_under_a_live_lease_does_not_stop_the_leader_cycl
     await service.disable_fleet(fleet_admin(), "research", idempotency_key="fleet-down")
 
     assert await controller.reconcile_capacity_pools_once() == {"launched": 0, "drained": 0, "deleted": 0}
+
+
+# --------------------------------------------------------------------- cross-zone alternates
+
+
+def _shape_pool(pool_id: str) -> CapacityPoolRecord:
+    """One pool of a shape; several of these differ only by zone."""
+
+    return multislice_tpu_pool(pool_id)
+
+
+def _pending_workload(*, alternates: str = "") -> WorkloadRecord:
+    labels = {"eyvan_pool": "research/zone-a"}
+    if alternates:
+        labels[POOL_ALTERNATES_LABEL] = alternates
+    return WorkloadRecord(
+        id="wl-pending",
+        state=WorkloadState.PENDING,
+        org_id="acme",
+        project_id="research",
+        created_by="operator",
+        spec=WorkloadDefinition(
+            name="pending",
+            execution=CommandExecution(command="python train.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 32, "memory_gib": 0, "tpu": 8}},
+            provider="gcp",
+            required_executor="eyvan-native",
+            required_labels=labels,
+        ),
+    )
+
+
+def test_candidate_pools_keep_the_primary_first_and_drop_duplicates() -> None:
+    workload = _pending_workload(alternates="research/zone-b, research/zone-a ,research/zone-c")
+
+    assert _candidate_pool_ids(workload) == ("research/zone-a", "research/zone-b", "research/zone-c")
+
+
+def test_a_workload_without_alternates_names_exactly_the_pool_it_always_did() -> None:
+    assert _candidate_pool_ids(_pending_workload()) == ("research/zone-a",)
+
+
+def test_placement_leaves_a_cooling_zone_for_a_healthy_one() -> None:
+    """The whole point of alternates.
+
+    Without this a workload keeps asking the zone that has been reclaiming it
+    while a healthy zone sits idle beside it. On 2026-08-15 us-east5-b granted
+    and reclaimed a 2x v6e-8 allocation twice while us-central2-b held one long
+    enough to finish.
+    """
+
+    cold, warm = _shape_pool("research/zone-a"), _shape_pool("research/zone-b")
+    workload = _pending_workload(alternates=warm.id)
+
+    chosen = _preferred_candidate(
+        [cold, warm],
+        workload=workload,
+        free_owned_exact_supply=Counter(),
+        free_shared_exact_supply=Counter(),
+        pool_cooling=Counter({cold.id: 2}),
+        pool_consecutive_failures=Counter({cold.id: 3}),
+    )
+
+    assert chosen.id == warm.id
+
+
+def test_capacity_that_already_exists_beats_a_healthier_but_empty_zone() -> None:
+    """A free cell is certain; a healthy zone is only a better bet."""
+
+    cold, warm = _shape_pool("research/zone-a"), _shape_pool("research/zone-b")
+    workload = _pending_workload(alternates=warm.id)
+
+    chosen = _preferred_candidate(
+        [cold, warm],
+        workload=workload,
+        free_owned_exact_supply=Counter(),
+        free_shared_exact_supply=Counter({(cold.id, workload.spec.worker_count): 1}),
+        pool_cooling=Counter({cold.id: 2}),
+        pool_consecutive_failures=Counter({cold.id: 3}),
+    )
+
+    assert chosen.id == cold.id
+
+
+def test_equally_healthy_empty_zones_keep_the_primary() -> None:
+    """Ties go to the pool the caller was pinned to, so nothing moves at random."""
+
+    first, second = _shape_pool("research/zone-a"), _shape_pool("research/zone-b")
+
+    chosen = _preferred_candidate(
+        [first, second],
+        workload=_pending_workload(alternates=second.id),
+        free_owned_exact_supply=Counter(),
+        free_shared_exact_supply=Counter(),
+        pool_cooling=Counter(),
+        pool_consecutive_failures=Counter(),
+    )
+
+    assert chosen.id == first.id

@@ -1124,9 +1124,13 @@ async def test_pool_callable_submission_rejects_invalid_tpu_pool_selection(
     if case == "disabled":
         pools = [_capacity_pool(enabled=False)]
     elif case == "ambiguous":
+        # Two pools of one shape are cross-zone alternates when they are
+        # interchangeable, so ambiguity now means they are *not*: placing in
+        # either would change the admission width the workload runs on.
+        wider = _capacity_pool(pool_id="v5p-b", node_type="v5p-b")
         pools = [
             _capacity_pool(pool_id="v5p-a", node_type="v5p-a"),
-            _capacity_pool(pool_id="v5p-b", node_type="v5p-b"),
+            wider.model_copy(update={"allocatable": ResourceVector(cpu=1, memory_gib=1, tpu=8)}),
         ]
     elif case == "wrong-kind":
         pools = [

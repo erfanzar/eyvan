@@ -131,12 +131,34 @@ def _pool_kind_from_resources(value: tp.Mapping[str, JsonValue]) -> str | None:
     return "cpu" if "cpu" in resources else None
 
 
+def _pool_accelerator_type(pool: JsonObject, *, name: str) -> str:
+    """Return the accelerator shape a pool runs, which need not be its name.
+
+    A pool is keyed by its accelerator type by default, which reads well and is
+    what almost every fleet wants. It also means one fleet cannot hold two pools
+    of the same shape -- and a fleet is scoped to a single zone, so a workload
+    could only ever wait on the zone it was submitted against. Racing several
+    zones is what actually wins spot capacity; on 2026-08-15 us-east5-b granted
+    and reclaimed twice while us-central2-b held.
+
+    So a pool may state ``accelerator_type`` explicitly and take a free-form
+    name, letting ``v6e-8-us-east5-b`` and ``v6e-8-us-central2-b`` coexist.
+    """
+
+    declared = pool.get("accelerator_type")
+    if declared is None:
+        return name
+    if not isinstance(declared, str) or not declared or declared != declared.strip():
+        raise ValueError(f"pool {name!r} accelerator_type must be a non-empty trimmed string when set")
+    return declared
+
+
 def _apply_catalog_shape(pool: JsonObject, *, accelerator_type: str) -> None:
     """Fill every omitted admission resource for a known accelerator shape.
 
-    A public pool is keyed by its accelerator type, so the shape is already
-    stated. An explicit positive CPU or memory value remains an intentional
-    schedulable override; omitted values inherit the provider-sourced catalog.
+    The shape is the pool's ``accelerator_type`` when it states one, and its
+    mapping key otherwise. An explicit positive CPU or memory value remains an
+    intentional schedulable override; omitted values inherit the catalog.
     TPU count itself is a shape invariant and is checked later by
     ``TpuNodeType.validate_tpu_resources``.
 
@@ -183,7 +205,8 @@ def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
             raise ValueError(f"pool {name!r} cannot set provider_options.node_prefix for a one-worker pool")
         pool["provider_options"] = provider_options
 
-    _apply_catalog_shape(pool, accelerator_type=name)
+    accelerator_type = _pool_accelerator_type(pool, name=name)
+    _apply_catalog_shape(pool, accelerator_type=accelerator_type)
 
     kind = pool.get("kind")
     if isinstance(kind, str):
@@ -195,10 +218,11 @@ def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
             raise ValueError(f"pool {name!r} must declare kind or advertise CPU, GPU, or TPU resources")
         pool["kind"] = kind
     if kind in {"gpu", "tpu"}:
-        accelerator_type = pool.get("accelerator_type")
-        if accelerator_type is not None and accelerator_type != name:
-            raise ValueError(f"pool {name!r} accelerator_type must exactly match its mapping key")
-        pool["accelerator_type"] = name
+        # The shape a pool runs, which defaults to its name but may be stated
+        # explicitly so several pools of one shape can coexist in a fleet --
+        # each pinned to a different zone, so a workload has somewhere else to
+        # go when one zone keeps reclaiming.
+        pool["accelerator_type"] = accelerator_type
     return pool
 
 

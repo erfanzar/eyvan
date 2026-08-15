@@ -42,7 +42,7 @@ from eyvan.artifacts.managed import (
     parse_managed_uri,
 )
 from eyvan.artifacts.managed import result_uri as managed_result_uri
-from eyvan.capacity.planning import cell_matches_template, cell_provides_pool_supply
+from eyvan.capacity.planning import POOL_ALTERNATES_LABEL, cell_matches_template, cell_provides_pool_supply
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.domain import costing
 from eyvan.domain.availability import p95_latency
@@ -1051,12 +1051,26 @@ class ControlPlaneService:
                 raise ConflictError(
                     f"enabled capacity pool for {accelerator_type!r} in fleet {fleet_name!r} is not a {kind_label} pool"
                 )
-            if len(tpu_matches) > 1:
+            # Several pools of one shape is the shape of cross-zone capacity, not
+            # a misconfiguration: a fleet is scoped to a zone, so this is how a
+            # workload gets somewhere else to go when one zone keeps reclaiming
+            # it. They must be genuinely interchangeable to be alternates --
+            # equal admission width and topology -- or the choice would silently
+            # change what the workload runs on.
+            candidates = sorted(tpu_matches, key=lambda candidate: candidate.id)
+            pool = candidates[0]
+            interchangeable = [
+                candidate
+                for candidate in candidates[1:]
+                if candidate.allocatable == pool.allocatable and candidate.topology == pool.topology
+            ]
+            if len(candidates) > 1 and not interchangeable:
                 raise ConflictError(
-                    f"TPU accelerator type {accelerator_type!r} is ambiguous in fleet {fleet_name!r}; "
-                    "configure exactly one enabled pool"
+                    f"TPU accelerator type {accelerator_type!r} is ambiguous in fleet {fleet_name!r}: its enabled "
+                    "pools differ in admission width or topology, so they are not interchangeable. Configure "
+                    "exactly one, or make them match to use them as cross-zone alternates."
                 )
-            pool = tpu_matches[0]
+            alternate_pool_ids = tuple(candidate.id for candidate in interchangeable)
             if pool.max_cells == 0:
                 raise ConflictError(
                     f"TPU accelerator type {accelerator_type!r} in fleet {fleet_name!r} has max_workers set to zero"
@@ -1110,6 +1124,7 @@ class ControlPlaneService:
 
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
+                alternate_pool_ids=alternate_pool_ids,
                 name=name if name is not None else f"{fleet_name}/{accelerator_type}",
                 execution=execution,
                 environment=dict(environment or {}),
@@ -1320,8 +1335,9 @@ class ControlPlaneService:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        alternate_pool_ids: tuple[str, ...] = (),
     ) -> WorkloadDefinition:
-        """Build a workload whose placement contract is pinned to one fleet pool.
+        """Build a workload placed in one fleet pool, or any equivalent of it.
 
         The checkpoint fields are the job's, not the pool's. Everything else here
         is dictated by the pool a caller named -- provider, region, accelerator,
@@ -1336,6 +1352,12 @@ class ControlPlaneService:
             "eyvan_pool": pool.id,
             "eyvan_pool_template": pool.template_fingerprint,
         }
+        if alternate_pool_ids:
+            # Pools of the same shape in other zones. The planner keeps
+            # ``eyvan_pool`` as the first choice and falls to these when it is
+            # cold, which is the difference between a job that waits on one zone
+            # and a job that goes where the capacity is.
+            pool_labels[POOL_ALTERNATES_LABEL] = ",".join(alternate_pool_ids)
         required_labels = {**pool_labels, WORKER_COUNT_LABEL: str(worker_count)}
         return WorkloadDefinition(
             name=name,

@@ -49,6 +49,68 @@ _CELL_ID_LIMIT = 96
 _CELL_EPOCH_CHARS = 6
 
 
+#: Additional pool ids a workload will accept, comma separated. ``eyvan_pool``
+#: stays the first choice, so a spec written before this existed behaves
+#: identically.
+POOL_ALTERNATES_LABEL = "eyvan_pool_alternates"
+
+
+def _candidate_pool_ids(workload: WorkloadRecord) -> tuple[str, ...]:
+    """Return the pools this workload accepts, best-known choice first.
+
+    A workload used to name exactly one pool, and a fleet is scoped to one zone,
+    so a job could only ever wait on the zone it was submitted against. That is
+    the opposite of how spot capacity is actually won: on 2026-08-15 us-east5-b
+    granted a 2x v6e-8 allocation and reclaimed it before boot, twice, while
+    us-central2-b held one long enough to finish.
+    """
+
+    primary = workload.spec.required_labels.get("eyvan_pool") or ""
+    alternates = workload.spec.required_labels.get(POOL_ALTERNATES_LABEL) or ""
+    ordered = [primary, *(name.strip() for name in alternates.split(","))]
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for pool_id in ordered:
+        if pool_id and pool_id not in seen:
+            seen.add(pool_id)
+            candidates.append(pool_id)
+    return tuple(candidates)
+
+
+def _preferred_candidate(
+    candidates: list[CapacityPoolRecord],
+    *,
+    workload: WorkloadRecord,
+    free_owned_exact_supply: Counter[tuple[str, int, str]],
+    free_shared_exact_supply: Counter[tuple[str, int]],
+    pool_cooling: Counter[str],
+    pool_consecutive_failures: Counter[str],
+) -> CapacityPoolRecord:
+    """Choose which acceptable pool to place a workload in.
+
+    Capacity that already exists wins outright: a cell this workload owns, then
+    any free cell of the right width. Only when nothing is free does the choice
+    become a bet on which zone will grant, and then the least-cold pool wins --
+    otherwise a workload would keep asking the zone that has been reclaiming it
+    while a healthy zone sits idle beside it.
+
+    The first candidate wins ties, so a single-pool workload takes exactly the
+    path it always did.
+    """
+
+    def rank(pool: CapacityPoolRecord) -> tuple[int, int, int, int]:
+        owned = free_owned_exact_supply[(pool.id, workload.spec.worker_count, workload.id)]
+        shared = free_shared_exact_supply[(pool.id, workload.spec.worker_count)]
+        return (
+            0 if owned else 1,
+            0 if shared else 1,
+            pool_cooling[pool.id],
+            pool_consecutive_failures[pool.id],
+        )
+
+    return min(candidates, key=lambda pool: (rank(pool), candidates.index(pool)))
+
+
 def pool_cell_prefix(pool: CapacityPoolRecord) -> str:
     """Return the provider-safe prefix for physical cells in ``pool``."""
 
@@ -337,6 +399,8 @@ class CapacitySimulation:
         active_lease_cells = {lease.cell_id for lease in leases if lease.state in ACTIVE_LEASE_STATES}
         free_shared_exact_supply: Counter[tuple[str, int]] = Counter()
         free_owned_exact_supply: Counter[tuple[str, int, str]] = Counter()
+        pool_cooling: Counter[str] = Counter()
+        pool_consecutive_failures: Counter[str] = Counter()
 
         for cell in cells:
             pool = pools_by_id.get(cell.pool_id or "")
@@ -373,16 +437,36 @@ class CapacitySimulation:
                     free_shared_exact_supply[(pool.id, cell.worker_count)] += 1
                 else:
                     free_owned_exact_supply[(pool.id, cell.worker_count, cell.autoscale_request_workload_id)] += 1
+            # How badly this pool is currently failing, for choosing between
+            # pools of the same shape in different zones. Belief is kept per
+            # cell, so a pool is as cold as its coldest cell.
+            belief = cell.availability
+            if belief.cooldown_until is not None and belief.cooldown_until > now:
+                pool_cooling[pool.id] += 1
+            pool_consecutive_failures[pool.id] = max(
+                pool_consecutive_failures[pool.id], int(belief.consecutive_failures)
+            )
 
         generic_workloads: list[WorkloadRecord] = []
         for workload in workloads:
             if workload.state is not WorkloadState.PENDING:
                 continue
-            exact_pool_id = workload.spec.required_labels.get("eyvan_pool")
-            exact_pool = pools_by_id.get(exact_pool_id or "")
-            if exact_pool is None or not exact_pool.enabled:
+            candidates = [
+                candidate
+                for candidate in (pools_by_id.get(pool_id) for pool_id in _candidate_pool_ids(workload))
+                if candidate is not None and candidate.enabled
+            ]
+            if not candidates:
                 generic_workloads.append(workload)
                 continue
+            exact_pool = _preferred_candidate(
+                candidates,
+                workload=workload,
+                free_owned_exact_supply=free_owned_exact_supply,
+                free_shared_exact_supply=free_shared_exact_supply,
+                pool_cooling=pool_cooling,
+                pool_consecutive_failures=pool_consecutive_failures,
+            )
             if workload.spec.worker_count > 1 and not exact_pool.hosts_multi_worker_cells:
                 # The same guard the generic branch below has always had, and for a
                 # stronger reason here: this branch calls ``make_cell`` on a pool the
