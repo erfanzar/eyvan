@@ -31,7 +31,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from eyvan._internal.json_types import JsonObject, JsonValue, model_json
-from eyvan.capacity import READY_CAPACITY_STATUSES, CapacityStatus
+from eyvan.capacity import DEFINITIVE_CAPACITY_LOSS_STATUSES, READY_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import (
     CapacityDriver,
     CellObservation,
@@ -881,6 +881,19 @@ class CellAgentService:
         observation = self.capacity.observe(cell_id)
         endpoint = observation.metadata.get("agent_endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
+            # Retirement fences the predecessor so two generations of one
+            # workload cannot run at once. A host whose capacity is definitively
+            # lost cannot be running anything, so the fence is already satisfied
+            # and there is no agent left to ask -- which is the ordinary way a
+            # reclaimed Spot cell looks, not a fault.
+            #
+            # Raising here instead stopped the *successor* from being placed: the
+            # error escapes the submit request for the healthy replacement cell,
+            # so a preempted workload retried forever against a cell that was
+            # ready for it. Only a host that still exists but cannot be reached
+            # is a genuine failure, because that one may still be running.
+            if observation.state in DEFINITIVE_CAPACITY_LOSS_STATUSES:
+                return
             raise RuntimeError(f"cell {cell_id!r} has no agent endpoint for remote retirement")
         from eyvan.worker.agent.client import CellAgentClient
 
