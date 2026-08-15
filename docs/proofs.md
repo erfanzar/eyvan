@@ -886,6 +886,66 @@ becomes something people re-run until it is green.
 **Shape** v5p-16 spot, run until reclaimed. **1–3 hours, opportunistic** — run it
 alongside another proof rather than waiting on it.
 
+### Run 2026-08-13, exit 1 (fail) — and it found two defects
+
+A v5p-16 spot slice in `us-central1-a`, submitted 16:28 UTC with `--max-retries 0
+--max-preemption-retries 5`. GCP reclaimed it at 17:12. Four of the five criteria
+passed; the run is worth more than a pass, because the two things that went wrong
+are both things an operator would have paid for.
+
+**Defect 1 — a reclamation was recorded as a stockout.** The reclaimed cell
+carried a contradiction in one record: `interruptions: 1.94` (classified right)
+alongside `consecutive_failures: 1`, `failure_evidence: 1.92` and a
+`cooldown_until`. The guard that suppresses failure accounting for an
+interruption asked whether the cell *is* `READY`, but a reclaimed cell is
+draining by the time it runs, so it read as a cell that never delivered.
+`provision_latencies_s` answers what was meant, and the two live cells
+discriminated it before a line was written: the preempted one `[1427.8]`, its
+never-ready replacement `[]`. The consequence is not a mislabel — a cooled-down
+pool stops being asked, so a preempted job can fail to come back *because* its
+own preemption told the scheduler the zone was empty.
+
+**Defect 2 — the replacement capacity could not be used.** With the pool
+replaced and healthy, the workload sat in `leased` while the plane did this
+every 90 seconds for 25 minutes:
+
+```
+POST /api/v1/cells/research-v5p-16-b59987-0002/workloads -> 500
+RuntimeError: cell 'research-v5p-16-b59987-0001' has no agent endpoint
+              for remote retirement
+```
+
+The two cells differ: the submit went to the healthy replacement, and the error
+is about the reclaimed predecessor. Supersession retires the previous placement
+before the next may run, a reclaimed host has no agent left to answer, and the
+raise escaped the *successor's* submit. So the preemption budget was spent, the
+capacity came back, and the job still did not run. Retirement fences the
+predecessor so two generations cannot run at once, so the fix is narrow: a cell
+in `DEFINITIVE_CAPACITY_LOSS_STATUSES` is not running anything and the fence is
+already satisfied; a host that still exists but cannot be reached may be, and
+still fails.
+
+**Verified on hardware.** The fixed build was installed on the head at 17:50 and
+the same call that had returned 500 for 25 minutes returned `200 OK` at 17:53,
+with zero retirement errors from the new process; the workload moved
+`leased -> dispatching -> running` on attempt 2. `workload-survived` then passed.
+
+**Why the run still exits 1, and what would close it.** `no-stockout-cooldown`
+still fails, because cell `…-0001` carries the `cooldown_until` that the
+*pre-fix* build wrote. That is a stale record rather than current behaviour, and
+no amount of re-running settles it: the fix changes what a reclamation writes
+next time, not what was already written. **P5 needs one more real reclamation on
+the fixed build.** Do not clear the record by hand to make it green — a
+criterion satisfied by editing its own evidence proves nothing.
+
+The criterion itself was hardened in the same pass. It read "no cell in this
+run's pools carries a cooldown", which is only evidence while the reclaimed cell
+is still in the report — and a reclaimed cell is deleted and awaiting recreation.
+Once reaped, its departure alone would have turned the check green and qualified
+the very defect above, with no operator action in between. Passing now requires a
+witness: a cell that reports the reclamation and carries no cooldown. Absent one,
+the verdict is inconclusive.
+
 ## P6 — a warm window held and released across its own boundary
 
 **Establishes** that a window configured in fleet YAML holds a cell warm through
@@ -1117,4 +1177,3 @@ here therefore means the CPU test was testing the wrong thing — not that the
 feature is broken in a way the suite could have caught. That is the point of
 running them, and it is why "the tests pass" has never appeared in this
 repository as an argument that something works on hardware.
-
