@@ -59,7 +59,9 @@ async def test_a_wrong_token_is_refused() -> None:
 
     with pytest.raises(Exception) as caught:
         await _authenticator(token).authenticate(_Request(Authorization=f"Bearer {token[:-1]}x"))
-    assert getattr(caught.value, "status_code", None) in (401, 503)
+    # 401, not 503: a rejected credential is not a server fault, and the status
+    # must not tell an unauthenticated caller how the plane is configured.
+    assert getattr(caught.value, "status_code", None) == 401
 
 
 @pytest.mark.asyncio

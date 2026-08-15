@@ -154,8 +154,15 @@ class RequestAuthenticator:
             scheme, _, token = authorization.partition(" ")
             if scheme.lower() != "bearer" or not token:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid Authorization header")
-            if self.bootstrap_token is not None and secrets.compare_digest(token, self.bootstrap_token):
-                return bootstrap_principal()
+            if self.bootstrap_token is not None:
+                if secrets.compare_digest(token, self.bootstrap_token):
+                    return bootstrap_principal()
+                if self.verifier is None:
+                    # A credential was presented and it is wrong. Reporting "no
+                    # identity provider" would call a rejected token a server
+                    # fault and tell an unauthenticated caller how the plane is
+                    # configured.
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token")
             if self.verifier is None:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

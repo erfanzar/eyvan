@@ -785,10 +785,7 @@ def test_the_installer_carries_no_credential_and_does_not_require_uv() -> None:
     assert "python3 -m venv /opt/eyvan/venv" in script
     # The staged wheel, not the name `eyvan`: that name resolves only from an
     # index, and a real bootstrap died on "No matching distribution found".
-    assert (
-        "/opt/eyvan/venv/bin/python -m pip install --disable-pip-version-check --upgrade /opt/eyvan/eyvan-head.whl"
-        in script
-    )
+    assert "--upgrade /opt/eyvan/wheels/*.whl" in script
     assert not any(line.rstrip().endswith(" eyvan") for line in script.splitlines() if "pip install" in line)
 
 

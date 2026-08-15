@@ -89,9 +89,10 @@ DEFAULT_SSH_READY_DELAY_S = 15.0
 #: Where the head keeps the environment the server and migration both read.
 HEAD_ENVIRONMENT_PATH = "/etc/eyvan/head.env"
 HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
-#: Where a staged distribution lands. Owner-only: it is not secret, but a
-#: world-readable wheel is a world-writable install target one bug later.
-HEAD_WHEEL_PATH = "/opt/eyvan/eyvan-head.whl"
+#: Where a staged distribution lands. A wheel must keep its PEP 427 name --
+#: pip refuses "eyvan-head.whl" as not a valid wheel filename -- so the file is
+#: written under its own name in a directory the installer globs.
+HEAD_WHEEL_DIR = "/opt/eyvan/wheels"
 HEAD_VENV_PATH = "/opt/eyvan/venv"
 HEAD_SERVICE_NAME = "eyvan-head.service"
 
@@ -265,6 +266,12 @@ class HeadSpec:
     oidc_audience: str = "eyvan"
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
+
+    @property
+    def installed_description(self) -> str:
+        """Describe what gets installed, without leaking the internal sentinel."""
+
+        return "this Eyvan distribution" if self.stages_wheel else self.package
 
     @property
     def stages_wheel(self) -> bool:
@@ -630,6 +637,21 @@ class _LocalWheel:
 
     data: bytes
     digest: str
+    filename: str
+
+
+def staged_wheel_filename() -> str:
+    """Return the PEP 427 name the staged wheel lands under.
+
+    Derived from the version rather than read from the built file so that the
+    dry-run plan and the executed command name the same path. pip refuses a file
+    that is not named like a wheel, which is how "eyvan-head.whl" failed on a
+    real head after everything else had already been installed.
+    """
+
+    from eyvan import __version__
+
+    return f"eyvan-{__version__}-py3-none-any.whl"
 
 
 def _local_wheel_bytes() -> _LocalWheel:
@@ -645,12 +667,14 @@ def _local_wheel_bytes() -> _LocalWheel:
     builder = native_worker_wheel_builder()
     try:
         path = builder.build()
-        data = Path(path).read_bytes()
+        wheel_path = Path(path)
+        data = wheel_path.read_bytes()
+        filename = wheel_path.name
     finally:
         close = getattr(builder, "close", None)
         if callable(close):
             close()
-    return _LocalWheel(data=data, digest=hashlib.sha256(data).hexdigest())
+    return _LocalWheel(data=data, digest=hashlib.sha256(data).hexdigest(), filename=filename)
 
 
 def render_head_bootstrap_script(spec: HeadSpec) -> str:
@@ -664,8 +688,7 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
     package = spec.package
     if not package.strip():
         raise ValueError("head package specification must be non-empty")
-    if package == STAGED_WHEEL_PACKAGE:
-        package = HEAD_WHEEL_PATH
+    staged = package == STAGED_WHEEL_PACKAGE
     venv_python = f"{HEAD_VENV_PATH}/bin/python"
     after = "network-online.target" if spec.database_url is not None else "network-online.target postgresql.service"
     unit = "\n".join(
@@ -731,7 +754,17 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "  install -d -m 0755 /opt/eyvan",
         f"  python3 -m venv {HEAD_VENV_PATH}",
         "fi",
-        f"{venv_python} -m pip install --disable-pip-version-check --upgrade {shlex.quote(package)}",
+        (
+            # The glob is deliberate and must not be quoted: the wheel keeps
+            # its own PEP 427 filename, which this script does not know at
+            # render time. Installing the file rather than the name `eyvan`
+            # means no index is consulted for Eyvan itself, while its
+            # dependencies still resolve normally -- --no-index blocked those
+            # too and the install died on alembic.
+            f"{venv_python} -m pip install --disable-pip-version-check --upgrade {HEAD_WHEEL_DIR}/*.whl"
+            if staged
+            else f"{venv_python} -m pip install --disable-pip-version-check --upgrade {shlex.quote(package)}"
+        ),
         f"chmod -R a+rX {HEAD_VENV_PATH}",
         "",
     ]
@@ -1374,7 +1407,8 @@ class HeadProvisioner:
             skipped_when_present=True,
         )
 
-    def _stage_wheel_action(self) -> HeadAction:
+    def _stage_wheel_action(self, filename: str | None = None) -> HeadAction:
+        filename = filename or staged_wheel_filename()
         """Build the delivery of this installation's own wheel.
 
         The default package used to be the name ``eyvan``, which pip resolves
@@ -1389,11 +1423,11 @@ class HeadProvisioner:
 
         return self._ssh_action(
             HeadStep.STAGE_WHEEL,
-            f"stage this Eyvan distribution as {HEAD_WHEEL_PATH}",
+            f"stage this Eyvan distribution into {HEAD_WHEEL_DIR}",
             "sudo /bin/sh -ec "
             + shlex.quote(
-                f"umask 077; install -d -m 0755 /opt/eyvan; base64 -d > {HEAD_WHEEL_PATH}.tmp; "
-                f"mv {HEAD_WHEEL_PATH}.tmp {HEAD_WHEEL_PATH}; sha256sum {HEAD_WHEEL_PATH} | cut -d' ' -f1"
+                f"umask 077; rm -rf {HEAD_WHEEL_DIR}; install -d -m 0755 {HEAD_WHEEL_DIR}; "
+                f"base64 -d > {HEAD_WHEEL_DIR}/{filename}; sha256sum {HEAD_WHEEL_DIR}/{filename} | cut -d' ' -f1"
             ),
             mutates=True,
             sends_stdin=True,
@@ -1429,7 +1463,10 @@ class HeadProvisioner:
 
         return self._ssh_action(
             HeadStep.BOOTSTRAP,
-            f"run the installer: virtual environment, {self.spec.package}, PostgreSQL, and the systemd unit",
+            (
+                f"run the installer: virtual environment, {self.spec.installed_description}, "
+                "PostgreSQL, and the systemd unit"
+            ),
             f"sudo {HEAD_BOOTSTRAP_PATH}",
             mutates=True,
         )

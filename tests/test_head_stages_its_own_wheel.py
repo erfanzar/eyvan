@@ -20,7 +20,7 @@ import hashlib
 import pytest
 
 from eyvan.sdk.commands.head import (
-    HEAD_WHEEL_PATH,
+    HEAD_WHEEL_DIR,
     STAGED_WHEEL_PACKAGE,
     HeadSpec,
     HeadStep,
@@ -37,8 +37,10 @@ def test_a_head_installs_a_staged_wheel_by_default() -> None:
 
     assert spec.stages_wheel
     installs = [line for line in render_head_bootstrap_script(spec).splitlines() if "pip install" in line]
-    assert installs and all(HEAD_WHEEL_PATH in line for line in installs)
+    assert installs and all(HEAD_WHEEL_DIR in line for line in installs)
     assert not any(line.rstrip().endswith(" eyvan") for line in installs)
+    assert all("/wheels/" in line for line in installs), "Eyvan comes from the staged file, never from an index"
+    assert all(line.rstrip().endswith(".whl") for line in installs), "pip refuses a non-PEP-427 wheel filename"
 
 
 def test_an_explicit_package_still_wins_and_skips_staging() -> None:
