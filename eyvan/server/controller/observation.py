@@ -59,6 +59,7 @@ from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
+    CellAgentInvalidConfigurationError,
     CellAgentStaleMutationError,
     CellAgentUnavailableError,
 )
@@ -1699,16 +1700,30 @@ class _ControllerObservation:
                 "[eyvan] the capacity this workload ran on has been released, so its logs are no longer "
                 "readable from the cell. Archived output, where a fleet retains it, is the remaining source."
             )
-        if len(members) > 1:
-            coordinator_lease, coordinator_cell = self._ordered_gang_member_pairs(members)[0]
-            return await asyncio.to_thread(
-                self._agent_factory(coordinator_cell).gang_logs,
-                coordinator_lease.cell_id,
-                workload.id,
-                workload.remote_id,
+        # A lease can still name a cell whose execution is gone: the workload
+        # finished, its container was reaped, and the observation no longer
+        # carries a management UID. The agent answers that with an invalid
+        # configuration error, which reached the operator as a bare HTTP 500 --
+        # on exactly the workload they are reading logs for, because it failed.
+        # The empty-members branch above already decided this class of answer is
+        # a sentence rather than a 500; this is the same state one step later.
+        try:
+            if len(members) > 1:
+                coordinator_lease, coordinator_cell = self._ordered_gang_member_pairs(members)[0]
+                return await asyncio.to_thread(
+                    self._agent_factory(coordinator_cell).gang_logs,
+                    coordinator_lease.cell_id,
+                    workload.id,
+                    workload.remote_id,
+                )
+            _lease, cell = members[0]
+            return await asyncio.to_thread(self._agent_factory(cell).logs, cell.id, workload.remote_id)
+        except CellAgentInvalidConfigurationError as exc:
+            return (
+                f"[eyvan] this workload's execution is no longer readable from its cell ({exc}). The run has "
+                "ended and its container was reaped; archived output, where a fleet retains it, is the "
+                "remaining source."
             )
-        _lease, cell = members[0]
-        return await asyncio.to_thread(self._agent_factory(cell).logs, cell.id, workload.remote_id)
 
     async def workload_log_page(
         self,
