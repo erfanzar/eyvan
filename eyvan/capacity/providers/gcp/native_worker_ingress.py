@@ -360,6 +360,176 @@ class GcloudNativeWorkerPublicIngress:
             raise _gcloud_operation_error("update", spec, result)
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedIngressRule:
+    """One firewall rule this runtime created, as found in a project."""
+
+    name: str
+    network: FirewallNetworkReference
+    network_tag: str
+    port: int
+    source_range: str
+
+    @property
+    def description(self) -> str:
+        """Return the ownership marker this rule was matched by."""
+
+        return f"{_INGRESS_DESCRIPTION_PREFIX}:{self.network_tag}"
+
+
+def list_managed_ingress_rules(
+    *,
+    project: str,
+    runner: GcloudCommandRunner = _gcloud_runner,
+) -> tuple[ManagedIngressRule, ...]:
+    """Return every rule in ``project`` carrying this runtime's ownership marker.
+
+    ``ensure`` deliberately never deletes during scale-down -- the rule has to
+    outlive a scale-to-zero so the next scale-up can reach its workers.  The
+    consequence is that nothing ever removed one either, so a rule outlived the
+    project that needed it and accumulated silently.  Finding them is the
+    prerequisite for removing them, and it is read-only.
+    """
+
+    _validate_project_id(project, field_name="project")
+    result = runner(
+        (
+            "compute",
+            "firewall-rules",
+            "list",
+            "--project",
+            project,
+            f"--filter=description~^{_INGRESS_DESCRIPTION_PREFIX}",
+            "--format=json",
+        )
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"gcloud returned exit status {result.returncode}"
+        raise GcloudFirewallRuleError(f"could not list managed native worker firewall rules: {detail}")
+    try:
+        decoded = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise GcloudFirewallRuleError(f"managed firewall rule listing returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(decoded, list):
+        raise GcloudFirewallRuleError("managed firewall rule listing did not return a JSON array")
+
+    # The gcloud filter narrows the transfer; this loop is what decides
+    # ownership. A server-side filter is a convenience and can match loosely --
+    # deleting on the strength of one would eventually delete somebody else's
+    # rule in a shared project.
+    rules: list[ManagedIngressRule] = []
+    for raw in decoded:
+        if not is_json_object(raw):
+            continue
+        parsed = _parse_managed_rule(raw)
+        if parsed is not None:
+            rules.append(parsed)
+    return tuple(sorted(rules, key=lambda rule: rule.name))
+
+
+def release_managed_ingress_rule(
+    *,
+    project: str,
+    rule_name: str,
+    runner: GcloudCommandRunner = _gcloud_runner,
+) -> None:
+    """Delete one rule after confirming this runtime owns it.
+
+    The ownership check is re-read here rather than trusted from a prior list:
+    between listing and deleting, a name can come to mean a different rule, and
+    a firewall rule is exactly the kind of thing where deleting the wrong one is
+    both silent and someone else's outage.
+    """
+
+    _validate_project_id(project, field_name="project")
+    described = runner(
+        (
+            "compute",
+            "firewall-rules",
+            "describe",
+            rule_name,
+            "--project",
+            project,
+            "--format=json",
+        )
+    )
+    if described.returncode != 0:
+        if _is_not_found(described):
+            return
+        detail = (described.stderr or described.stdout).strip() or f"exit status {described.returncode}"
+        raise GcloudFirewallRuleError(f"could not describe firewall rule {rule_name!r}: {detail}")
+    raw = _decode_object(described.stdout, resource=f"firewall rule {rule_name!r}")
+    if _parse_managed_rule(raw) is None:
+        raise FirewallRuleConflictError(
+            f"firewall rule {rule_name!r} is not owned by this Eyvan runtime; refusing to delete it"
+        )
+    deleted = runner(
+        (
+            "compute",
+            "firewall-rules",
+            "delete",
+            rule_name,
+            "--project",
+            project,
+            "--quiet",
+        )
+    )
+    if deleted.returncode != 0:
+        if _is_not_found(deleted):
+            return
+        detail = (deleted.stderr or deleted.stdout).strip() or f"exit status {deleted.returncode}"
+        raise GcloudFirewallRuleError(f"could not delete managed firewall rule {rule_name!r}: {detail}")
+
+
+def _parse_managed_rule(raw: JsonObject) -> ManagedIngressRule | None:
+    """Return the rule when it is unambiguously ours, ``None`` otherwise."""
+
+    description = raw.get("description")
+    if not isinstance(description, str):
+        return None
+    marker = f"{_INGRESS_DESCRIPTION_PREFIX}:"
+    if not description.startswith(marker):
+        return None
+    network_tag = description[len(marker) :]
+    if _TAG_PATTERN.fullmatch(network_tag) is None:
+        return None
+    if raw.get("direction") != "INGRESS":
+        return None
+    name = raw.get("name")
+    network_value = raw.get("network")
+    if not isinstance(name, str) or not name or not isinstance(network_value, str):
+        return None
+    target_tags = raw.get("targetTags")
+    if target_tags != [network_tag]:
+        return None
+    allowed = raw.get("allowed")
+    if not isinstance(allowed, list) or len(allowed) != 1 or not is_json_object(allowed[0]):
+        return None
+    ports = allowed[0].get("ports")
+    if allowed[0].get("IPProtocol") != "tcp" or not isinstance(ports, list) or len(ports) != 1:
+        return None
+    try:
+        port = int(str(ports[0]))
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    source_ranges = raw.get("sourceRanges")
+    if not isinstance(source_ranges, list) or len(source_ranges) != 1 or not isinstance(source_ranges[0], str):
+        return None
+    try:
+        network = FirewallNetworkReference.from_gcloud_value(network_value)
+    except FirewallRuleConflictError:
+        return None
+    return ManagedIngressRule(
+        name=name,
+        network=network,
+        network_tag=network_tag,
+        port=port,
+        source_range=source_ranges[0],
+    )
+
+
 def endpoint_mode_from_metadata(metadata: tp.Mapping[str, JsonValue]) -> NativeWorkerEndpointMode:
     """Parse the persisted native-worker route mode with a private legacy default."""
 
@@ -482,10 +652,13 @@ __all__ = (
     "GcloudFirewallRuleError",
     "GcloudNativeWorkerPublicIngress",
     "HttpPublicIpv4Resolver",
+    "ManagedIngressRule",
     "NativeWorkerEndpointMode",
     "NativeWorkerIngressError",
     "NativeWorkerPublicIngress",
     "PublicIpv4ResolutionError",
     "PublicIpv4Resolver",
     "endpoint_mode_from_metadata",
+    "list_managed_ingress_rules",
+    "release_managed_ingress_rule",
 )

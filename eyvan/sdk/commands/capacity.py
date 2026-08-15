@@ -594,6 +594,82 @@ def get_cell(session: CliSession, cell_id: str, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+@capacity.group("ingress")
+def ingress() -> None:
+    """Inspect and remove firewall rules opened for native GCP workers.
+
+    These rules are created locally by the agent, via gcloud, and never through
+    the control plane -- so they are cleaned up the same way, without a server.
+    Provisioning deliberately never deletes them: a rule must survive a
+    scale-to-zero for the next scale-up to reach its workers. That leaves
+    removal as an operator decision, which is what these two commands are.
+    """
+
+
+@ingress.command("list")
+@click.option("--project", required=True, help="GCP project to search for managed rules.")
+@click.option("--json", "as_json", is_flag=True)
+def list_ingress(project: str, as_json: bool) -> None:
+    """List firewall rules this runtime created in a project."""
+
+    from eyvan.capacity.providers.gcp.native_worker_ingress import list_managed_ingress_rules
+
+    rules = list_managed_ingress_rules(project=project)
+    payload = [
+        {
+            "name": rule.name,
+            "network": rule.network.canonical_name,
+            "network_tag": rule.network_tag,
+            "port": rule.port,
+            "source_range": rule.source_range,
+        }
+        for rule in rules
+    ]
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2))
+        return
+    if not payload:
+        click.echo(f"no Eyvan-managed native worker ingress rules in {project}")
+        return
+    for entry in payload:
+        click.echo(f"{entry['name']}  tcp:{entry['port']}  from {entry['source_range']}  tag {entry['network_tag']}")
+
+
+@ingress.command("release")
+@click.option("--project", required=True, help="GCP project owning the rule.")
+@click.option("--rule", "rule_names", multiple=True, help="Rule name; repeatable. Omit with --all to remove every rule.")
+@click.option("--all", "release_all", is_flag=True, help="Release every managed rule found in the project.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def release_ingress(project: str, rule_names: tuple[str, ...], release_all: bool, yes: bool) -> None:
+    """Delete managed ingress rules, refusing anything this runtime does not own."""
+
+    from eyvan.capacity.providers.gcp.native_worker_ingress import (
+        list_managed_ingress_rules,
+        release_managed_ingress_rule,
+    )
+
+    if release_all == bool(rule_names):
+        raise click.UsageError("pass either --all or one or more --rule values, not both and not neither")
+
+    targets = [rule.name for rule in list_managed_ingress_rules(project=project)] if release_all else list(rule_names)
+    if not targets:
+        click.echo(f"no Eyvan-managed native worker ingress rules in {project}")
+        return
+
+    # Named rules are shown before the prompt too. A firewall rule is removed
+    # from a project that may be shared, so "what exactly is about to go" is
+    # worth one extra line of output.
+    click.echo(f"about to delete {len(targets)} firewall rule(s) in {project}:")
+    for name in targets:
+        click.echo(f"  {name}")
+    if not yes:
+        click.confirm("proceed?", abort=True)
+
+    for name in targets:
+        release_managed_ingress_rule(project=project, rule_name=name)
+        click.echo(f"released {name}")
+
+
 def register_capacity_commands(main: click.Group) -> None:
     """Attach the capacity command group to the CLI root."""
 

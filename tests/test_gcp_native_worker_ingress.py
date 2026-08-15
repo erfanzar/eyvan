@@ -21,6 +21,8 @@ from eyvan.capacity.providers.gcp.native_worker_ingress import (
     FirewallRuleConflictError,
     FirewallRuleSpec,
     GcloudNativeWorkerPublicIngress,
+    list_managed_ingress_rules,
+    release_managed_ingress_rule,
 )
 
 _TAG = "eyvan-nw-0123456789abcdef01234567"
@@ -51,12 +53,23 @@ class FirewallRunner:
     create_race: bool = False
 
     def __call__(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
-        """Handle describe/create/update commands emitted by the manager."""
+        """Handle list/describe/create/update/delete commands emitted by the manager."""
 
         command = tuple(args)
         self.calls.append(command)
         operation = command[2]
+        if operation == "list":
+            # gcloud's own --filter narrows the transfer; it is not the
+            # ownership decision. This fake deliberately ignores it and returns
+            # every rule, so a test cannot pass on the strength of a filter the
+            # production code should not be trusting either.
+            return _result(stdout=json.dumps(list(self.rules.values())))
         rule_name = command[3]
+        if operation == "delete":
+            if rule_name not in self.rules:
+                return _result(1, stderr="NOT_FOUND")
+            del self.rules[rule_name]
+            return _result()
         if operation == "describe":
             rule = self.rules.get(rule_name)
             return _result(stdout=json.dumps(rule)) if rule is not None else _result(1, stderr="NOT_FOUND")
@@ -87,6 +100,9 @@ class FirewallRunner:
         project = cls._value(args, "--project")
         network = cls._value(args, "--network")
         return {
+            # Real gcloud always returns a name on describe and list, and the
+            # release path keys off it, so the fake has to carry one too.
+            "name": args[3],
             "description": cls._value(args, "--description"),
             "direction": "INGRESS",
             "network": f"https://www.googleapis.com/compute/v1/projects/{project}/global/networks/{network}",
@@ -130,6 +146,7 @@ def _manager(runner: FirewallRunner, address: str = "203.0.113.24") -> GcloudNat
 def _existing_rule(*, source_range: str = "198.51.100.8/32") -> JsonObject:
     network = FirewallNetworkReference.from_config(capacity_project="project-a", network="research")
     return {
+        "name": _rule_name(),
         "description": f"eyvan-native-worker-ingress:v1:{_TAG}",
         "direction": "INGRESS",
         "network": f"https://www.googleapis.com/compute/v1/{network.canonical_name}",
@@ -223,3 +240,90 @@ def test_shared_vpc_uses_the_network_host_project_for_the_rule() -> None:
     create = runner.calls[-1]
     assert create[create.index("--project") + 1] == "network-host"
     assert create[create.index("--network") + 1] == "research"
+
+
+def _foreign_rule(name: str = "someone-elses-rule") -> JsonObject:
+    """A rule that looks similar but carries no Eyvan ownership marker."""
+
+    return {
+        "name": name,
+        "description": "allow ssh from the office",
+        "direction": "INGRESS",
+        "network": "https://www.googleapis.com/compute/v1/projects/project-a/global/networks/research",
+        "priority": 1000,
+        "targetTags": ["office"],
+        "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
+        "sourceRanges": ["198.51.100.0/32"],
+        "disabled": False,
+    }
+
+
+def test_listing_returns_only_rules_this_runtime_owns() -> None:
+    runner = FirewallRunner(rules={_rule_name(): _existing_rule(), "someone-elses-rule": _foreign_rule()})
+
+    found = list_managed_ingress_rules(project="project-a", runner=runner)
+
+    assert [rule.name for rule in found] == [_rule_name()]
+    assert found[0].network_tag == _TAG
+    assert found[0].port == 8100
+
+
+def test_release_removes_a_rule_this_runtime_created() -> None:
+    runner = FirewallRunner()
+    _manager(runner).ensure(project="project-a", network="research", port=8100)
+    created = _rule_name()
+    assert created in runner.rules
+
+    release_managed_ingress_rule(project="project-a", rule_name=created, runner=runner)
+
+    assert created not in runner.rules
+
+
+def test_release_refuses_a_rule_this_runtime_does_not_own() -> None:
+    runner = FirewallRunner(rules={"someone-elses-rule": _foreign_rule()})
+
+    with pytest.raises(FirewallRuleConflictError):
+        release_managed_ingress_rule(project="project-a", rule_name="someone-elses-rule", runner=runner)
+
+    # The refusal has to leave the rule in place. A project here is shared with
+    # other researchers, so deleting one on a failed ownership check would be
+    # somebody else's outage.
+    assert "someone-elses-rule" in runner.rules
+    assert "delete" not in [call[2] for call in runner.calls]
+
+
+def test_release_of_an_absent_rule_is_not_an_error() -> None:
+    runner = FirewallRunner()
+
+    release_managed_ingress_rule(project="project-a", rule_name=_rule_name(), runner=runner)
+
+    assert runner.rules == {}
+
+
+def test_ownership_is_rechecked_at_delete_not_taken_from_the_listing() -> None:
+    """A name that changes meaning between list and delete must not be deleted."""
+
+    runner = FirewallRunner(rules={_rule_name(): _existing_rule()})
+    found = list_managed_ingress_rules(project="project-a", runner=runner)
+    assert [rule.name for rule in found] == [_rule_name()]
+
+    # The name now denotes a rule nobody here owns.
+    runner.rules[_rule_name()] = _foreign_rule(name=_rule_name())
+
+    with pytest.raises(FirewallRuleConflictError):
+        release_managed_ingress_rule(project="project-a", rule_name=_rule_name(), runner=runner)
+
+    assert _rule_name() in runner.rules
+
+
+def test_create_then_list_then_release_closes_the_leak() -> None:
+    """The whole point: a rule provisioning made can now be found and removed."""
+
+    runner = FirewallRunner()
+    _manager(runner).ensure(project="project-a", network="research", port=8100)
+
+    found = list_managed_ingress_rules(project="project-a", runner=runner)
+    assert len(found) == 1
+    release_managed_ingress_rule(project="project-a", rule_name=found[0].name, runner=runner)
+
+    assert list_managed_ingress_rules(project="project-a", runner=runner) == ()

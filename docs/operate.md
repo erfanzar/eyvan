@@ -153,12 +153,27 @@ a queued workload", and those look identical in a bucket listing.
 
 ## Native-worker ingress rules outlive their heads
 
-Eyvan has no code path that deletes a native-worker ingress firewall rule. It
-creates one -- `ensure` in
-`eyvan/capacity/providers/gcp/native_worker_ingress.py` -- and reconciles it,
-and nothing in this package removes it. `eyvan head down` deletes the head's
-*own* rules, the control-plane port and SSH, which is why a clean teardown still
-leaves these behind.
+Provisioning never deletes a native-worker ingress firewall rule, and that is
+deliberate: the rule has to survive a scale-to-zero so the next scale-up can
+still reach its workers. `ensure` in
+`eyvan/capacity/providers/gcp/native_worker_ingress.py` creates and reconciles
+it. `eyvan head down` deletes the head's *own* rules, the control-plane port and
+SSH, which is why a clean teardown still leaves these behind.
+
+Removal is therefore an operator decision rather than an automatic one, and
+`eyvan capacity ingress` is where it lives. It runs locally against gcloud, with
+no control plane involved, because that is how the rule was created:
+
+```
+eyvan capacity ingress list --project <p>
+eyvan capacity ingress release --project <p> --rule <name>
+eyvan capacity ingress release --project <p> --all      # prompts unless --yes
+```
+
+`release` re-reads each rule and refuses anything without this runtime's exact
+ownership marker, so it cannot remove a rule someone else made -- nor the
+`eyvan-control-plane-head:v1` rules a live head is using, which carry a
+different marker and are not native-worker ingress at all.
 
 One accumulates per head, because the target tag is
 `HMAC(native_worker_root_secret, project_id)` and each head is given its own
