@@ -489,7 +489,9 @@ def test_restart_refuses_a_live_daemon_owned_by_a_different_runtime_profile(tmp_
         process_terminator=terminator,
     )
 
-    with pytest.raises(LocalDaemonConfigurationError, match="different native GCP runtime profile"):
+    # The refusal now names both profiles and the remedy rather than only the
+    # fact of a mismatch; the behaviour it guards is unchanged.
+    with pytest.raises(LocalDaemonConfigurationError, match="not the selected"):
         supervisor.restart(endpoint, runtime_profile_path=requested_profile)
 
     assert terminator.pids == []
@@ -553,3 +555,56 @@ def test_subprocess_launcher_rejects_a_symlinked_log_path(tmp_path: Path) -> Non
         SubprocessLocalDaemonLauncher().start(
             LocalDaemonCommand(target=target, log_path=log_path, profile=paths.profile(target))
         )
+
+
+def _profile_aware_supervisor(tmp_path: Path, health: HealthResponses) -> LocalDaemonSupervisor:
+    return LocalDaemonSupervisor(
+        paths=LocalDaemonPaths(tmp_path / "eyvan"),
+        launcher=FakeLauncher([]),
+        health_probe=health,
+    )
+
+
+def test_stale_pid_record_is_named_as_stale_not_as_a_profile_mismatch(tmp_path: Path) -> None:
+    """A record naming a dead pid must say so, not blame the runtime profile.
+
+    All three ownership failures reported "not owned by the selected native GCP
+    runtime profile". For a stale record that sentence is simply false, and it
+    sent the operator hunting a profile problem that did not exist -- the only
+    way forward was hand-editing the record's JSON.
+    """
+
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8123")
+    supervisor = _profile_aware_supervisor(tmp_path, HealthResponses([True]))
+    record_path = supervisor.paths.record_path(_target(endpoint.url))
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    # A pid that cannot be running: process 0 is never a live user process, and
+    # os.kill(0, 0) would signal our own process group rather than probe it.
+    write_owner_only_record(
+        record_path,
+        LocalDaemonRecord(endpoint=endpoint, pid=2**31 - 1, runtime_profile_path="/tmp/profile.json"),
+    )
+
+    with pytest.raises(LocalDaemonConfigurationError) as excinfo:
+        supervisor.ensure(endpoint, runtime_profile_path=Path("/tmp/profile.json"))
+
+    message = str(excinfo.value)
+    assert "is not running" in message
+    assert str(record_path) in message
+    assert "stale" in message
+    assert "not owned by the selected native GCP runtime profile" not in message
+
+
+def test_absent_pid_record_names_the_path_it_looked_for(tmp_path: Path) -> None:
+    """With nothing listening on record, the operator needs the path to check."""
+
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8124")
+    supervisor = _profile_aware_supervisor(tmp_path, HealthResponses([True]))
+    record_path = supervisor.paths.record_path(_target(endpoint.url))
+
+    with pytest.raises(LocalDaemonConfigurationError) as excinfo:
+        supervisor.ensure(endpoint, runtime_profile_path=Path("/tmp/profile.json"))
+
+    message = str(excinfo.value)
+    assert "no owner-only PID record exists" in message
+    assert str(record_path) in message

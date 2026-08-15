@@ -53,6 +53,26 @@ _STAGE_TIMEOUTS: dict[CellStageAction, float] = {
 }
 
 
+def _wire(request: tp.Any) -> JsonObject:
+    """Serialize a request for an agent that may be older than this head.
+
+    ``exclude_none`` is the whole point. Agent-side models are ``extra="forbid"``
+    -- deliberately, so a rolled-back replica cannot be handed a field it would
+    persist and then fail to read back -- and every optional field on them
+    defaults to ``None``. Omitting a ``None`` therefore parses to exactly the
+    same object on a matching agent, while an agent that predates the field
+    accepts the payload instead of rejecting the whole configuration.
+
+    Sending them cost a real run: a head one commit ahead sent
+    ``runtime.python: null`` to an agent whose ``NativeRuntimeConfig`` had no
+    such field, every allocation died on ``extra_forbidden``, and the operator
+    was told "provider rejected capacity request" -- about a provider that had
+    never been called.
+    """
+
+    return request.model_dump(mode="json", exclude_none=True)
+
+
 class CellAgentBusyError(RuntimeError):
     """The cell agent cannot acquire its shared mutation lease yet."""
 
@@ -288,7 +308,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/reconcile",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=1800,
         )
         return AgentObservation.model_validate(response.json())
@@ -297,7 +317,7 @@ class CellAgentClient:
         response = self._send(
             "PUT",
             f"/api/v1/cells/{cell_id}/capacity",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=1800,
         )
         return AgentObservation.model_validate(response.json())
@@ -310,7 +330,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=1800,
         )
         return WorkloadObservation.model_validate(response.json())
@@ -321,7 +341,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{coordinator_cell_id}/workload-gangs",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=1800,
         )
         return WorkloadObservation.model_validate(response.json())
@@ -345,7 +365,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/stop",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
         )
         return WorkloadObservation.model_validate(response.json())
 
@@ -361,7 +381,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{coordinator_cell_id}/workload-gangs/{workload_id}/{remote_id}/stop",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
         )
         return WorkloadObservation.model_validate(response.json())
 
@@ -369,7 +389,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/retire",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=600,
         )
         return WorkloadObservation.model_validate(response.json())
@@ -386,7 +406,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{coordinator_cell_id}/workload-gangs/{workload_id}/{remote_id}/retire",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=600,
         )
         return WorkloadObservation.model_validate(response.json())
@@ -395,7 +415,7 @@ class CellAgentClient:
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/checkpoint",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
         )
         return WorkloadObservation.model_validate(response.json())
 
@@ -469,7 +489,7 @@ class CellAgentClient:
             response = self._send(
                 "POST",
                 f"/api/v1/cells/{cell_id}/stage-actions",
-                json=request.model_dump(mode="json"),
+                json=_wire(request),
                 timeout=_STAGE_TIMEOUTS[request.action],
             )
         except CellAgentUnsupportedCapabilityError as exc:
@@ -486,14 +506,14 @@ class CellAgentClient:
         return CellStageActionResult.model_validate_json(response.content)
 
     def drain(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
-        response = self._send("POST", f"/api/v1/cells/{cell_id}/drain", json=request.model_dump(mode="json"))
+        response = self._send("POST", f"/api/v1/cells/{cell_id}/drain", json=_wire(request))
         return AgentObservation.model_validate(response.json())
 
     def release(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
         response = self._send(
             "DELETE",
             f"/api/v1/cells/{cell_id}",
-            json=request.model_dump(mode="json"),
+            json=_wire(request),
             timeout=700,
         )
         return AgentObservation.model_validate(response.json())

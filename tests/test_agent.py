@@ -1123,3 +1123,28 @@ def test_an_unreachable_agent_is_not_a_missing_build() -> None:
 
     with pytest.raises(CellAgentUnavailableError):
         client.build()
+
+
+def test_wire_omits_unset_optionals_so_an_older_agent_still_parses() -> None:
+    """A head one commit ahead must not break every allocation.
+
+    Agent-side models are ``extra="forbid"`` on purpose. Sending an explicit
+    null for an optional the agent has never heard of makes it reject the whole
+    configuration -- which is how ``runtime.python: null`` killed every
+    allocation and surfaced as "provider rejected capacity request" about a
+    provider that was never called.
+    """
+
+    from eyvan.records import NativeRuntimeConfig
+    from eyvan.worker.agent.client import _wire
+
+    config = NativeRuntimeConfig(env={"A": "b"})
+    assert config.python is None
+
+    payload = _wire(config)
+
+    assert "python" not in payload, "an unset optional must not be sent as an explicit null"
+    assert payload["env"] == {"A": "b"}, "set fields must still be sent"
+    # An agent that does know the field parses the trimmed payload identically,
+    # so this costs nothing when both sides match.
+    assert NativeRuntimeConfig.model_validate(payload) == config

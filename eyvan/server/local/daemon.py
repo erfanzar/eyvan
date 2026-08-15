@@ -785,9 +785,17 @@ class LocalDaemonSupervisor:
             record = read_owner_only_record(record_path)
             if record is None:
                 if self.health_probe(configured_endpoint):
+                    # Name the record and the remedy. This refusal is correct --
+                    # stopping an unidentified process is worse than failing --
+                    # but as a bare sentence it is a dead end: the operator
+                    # cannot tell whether the record was never written, was
+                    # removed, or names a server started outside the supervisor,
+                    # and the only way forward was hand-editing JSON.
                     raise LocalDaemonConfigurationError(
                         f"a local Eyvan control plane is already listening at {configured_endpoint.url}, but no "
-                        "owner-only Eyvan PID record identifies it; refusing to stop it"
+                        f"owner-only Eyvan PID record identifies it at {record_path}; refusing to stop a process "
+                        "this supervisor cannot prove it owns. Either it was started outside Eyvan (stop it "
+                        "yourself, then retry), or its record was removed while it kept running."
                     )
             elif record.endpoint != configured_endpoint:
                 raise LocalDaemonConfigurationError(
@@ -797,8 +805,10 @@ class LocalDaemonSupervisor:
             elif self.process_liveness(record.pid):
                 if record.runtime_profile_path not in {None, profile_identifier}:
                     raise LocalDaemonConfigurationError(
-                        f"the local Eyvan control plane at {configured_endpoint.url} belongs to a different native GCP "
-                        "runtime profile; refusing to stop it"
+                        f"the local Eyvan control plane at {configured_endpoint.url} (pid {record.pid}) belongs to "
+                        f"native GCP runtime profile {record.runtime_profile_path}, not the selected "
+                        f"{profile_identifier}; refusing to stop it. Select that profile, or stop that control plane "
+                        "before running a command against this one."
                     )
                 self._stop_recorded_daemon(
                     record,
@@ -924,9 +934,27 @@ class LocalDaemonSupervisor:
         pid = None
         if record is None or record.endpoint != endpoint or not process_is_alive(record.pid):
             if runtime_profile_path is not None:
+                # Say which of the three causes it is. They need different
+                # remedies and only one of them is about the profile, but all
+                # three used to report "not owned by the selected native GCP
+                # runtime profile" -- so a stale record naming a dead pid sent
+                # the operator looking for a profile problem that did not exist,
+                # and the way out was hand-editing the record's JSON.
+                if record is None:
+                    detail = f"no owner-only PID record exists at {record_path}"
+                    remedy = "it was started outside Eyvan, or its record was removed while it kept running"
+                elif record.endpoint != endpoint:
+                    detail = f"the record at {record_path} names endpoint {record.endpoint.url}"
+                    remedy = "that record belongs to a different control plane"
+                else:
+                    detail = f"the record at {record_path} names pid {record.pid}, which is not running"
+                    remedy = (
+                        "the record is stale while something healthy holds the port; stop that listener, or "
+                        "remove the stale record if you are certain it is orphaned"
+                    )
                 raise LocalDaemonConfigurationError(
-                    f"a local Eyvan control plane is already listening at {endpoint.url}, but it is not owned by "
-                    "the selected native GCP runtime profile"
+                    f"a local Eyvan control plane is already listening at {endpoint.url}, but this supervisor "
+                    f"cannot prove it owns it: {detail}. {remedy.capitalize()}."
                 )
         else:
             if record.runtime_profile_path != runtime_profile_path:
