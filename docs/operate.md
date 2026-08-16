@@ -384,6 +384,41 @@ No receipt in this repository claims a provider, TPU, GPU, or P8 qualification
 run has completed; see [proofs.md](proofs.md).
 
 
+## Starting from nothing
+
+```
+eyvan quickstart          # what is missing between here and a first job
+eyvan quickstart --yes    # ...and run that first job
+```
+
+Each step is either already true or printed as the exact command that makes it
+true: a control plane, an applied fleet, capacity to run on. It stops at the
+first missing one rather than reporting all three, because the next thing to
+type is the only thing worth knowing.
+
+It never provisions and never submits on its own. Standing up a head and
+allocating accelerators cost real money, so the first prints the command and
+the second needs `--yes`. Before submitting it prints what the job will cost,
+and says *unknown* rather than `$0.00` when a pool declares no price -- a
+confident zero is the number somebody budgets against.
+
+## Reading anything
+
+```
+eyvan list                       # the vocabulary
+eyvan list workloads --filter state=running
+eyvan list cells
+eyvan get workloads wl_abc123
+```
+
+One grammar over `workloads`, `cells`, `pools`, `leases`, `events`, `fleets`,
+`quotas` and `budgets`, each emitting the same JSON every other command emits.
+A filter a resource does not accept is refused by name rather than forwarded
+and ignored -- a listing that silently returned everything would look filtered.
+
+The per-noun commands stay. `workload explain` and `workload estimate` say
+things no record projection can.
+
 ## Submitting one job
 
 ```
