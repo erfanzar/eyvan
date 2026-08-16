@@ -572,6 +572,10 @@ class CapacityClass(StrEnum):
     RESERVED = "reserved"
     ON_DEMAND = "on_demand"
     SPOT = "spot"
+    #: Queued until available, then held for a bounded window and returned
+    #: whether or not the job has finished. See the domain enum for why the name
+    #: describes the shape rather than any provider's product.
+    FLEX_START = "flex_start"
 
 
 class PriorityBand(StrEnum):
@@ -1623,6 +1627,11 @@ class CellRecord(EyvanModel):
     #: so a pool whose curve is retuned does not retroactively rewrite how the
     #: machines already running were being judged.
     availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
+    #: How long the provider holds *this* machine before taking it back. Copied
+    #: from the pool for the same reason: when a cell goes away is a fact about
+    #: the cell, and asking its pool later would answer for a template that may
+    #: since have been retuned.
+    max_hold_s: int | None = Field(default=None, ge=60)
     generation: int = 1
     idle_since: datetime | None = None
     last_heartbeat_at: datetime | None = None
@@ -1802,6 +1811,16 @@ class CapacityPoolRecord(EyvanModel):
     #: contended spot TPU zone is not the right curve for a rate-limited
     #: account, and there was no way to say so.
     availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
+    #: How long this pool's capacity is held before the provider takes it back,
+    #: whatever the job is doing. The property that makes ``flex_start`` a
+    #: distinct class rather than a discount: a wait, then a window.
+    #:
+    #: Required for a flex-start pool, because the window exists whether or not
+    #: anybody wrote it down -- and a scheduler that does not know it places
+    #: eight-hour jobs on four-hour capacity and finds out at hour four.
+    #: Permitted on other classes for a bounded commitment; absent means the
+    #: capacity is held until Eyvan releases it.
+    max_hold_s: int | None = Field(default=None, ge=60)
     max_replica_resources: CanonicalResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
     quota_group: str | None = Field(default=None, max_length=192)
@@ -1827,6 +1846,12 @@ class CapacityPoolRecord(EyvanModel):
 
     @model_validator(mode="after")
     def validate_pool(self) -> CapacityPoolRecord:
+        if self.capacity_class is CapacityClass.FLEX_START and self.max_hold_s is None:
+            raise ValueError(
+                "a flex_start pool must declare max_hold_s: the provider returns the capacity after a "
+                "bounded window whether or not the job is finished, and a scheduler that does not know "
+                "the window places work that cannot finish on it"
+            )
         for field_name, value in (
             ("capacity pool id", self.id),
             ("fleet name", self.fleet_name),
@@ -1990,6 +2015,7 @@ class CapacityPoolRecord(EyvanModel):
             provider_options=provider_options,
             runtime=self.runtime,
             availability_policy=self.availability_policy,
+            max_hold_s=self.max_hold_s,
             labels={
                 **self.labels,
                 "eyvan_fleet": self.fleet_name,

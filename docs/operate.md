@@ -128,6 +128,39 @@ that is the afternoon this exists for.
 than silently collapsed. `eyvan run --zone` still pins one out of the set, and
 pinning withholds the alternates on purpose.
 
+### Capacity that arrives late and leaves on a timer
+
+```yaml
+pools:
+  v6e-8-flex:
+    kind: tpu
+    capacity_class: flex_start
+    max_hold_s: 14400        # required: the provider takes it back after this
+```
+
+`flex_start` is the fourth thing capacity can be, and it is neither of the other
+three: unlike spot it is not taken back mid-run, and unlike on-demand it neither
+arrives immediately nor stays indefinitely. You wait, then you hold it for a
+window, then it goes. GCP sells this as Dynamic Workload Scheduler flex-start;
+the class is named for the shape rather than the product, because a provider's
+vocabulary inside the scheduler is a leak.
+
+**`max_hold_s` is required for the class.** The window exists whether or not
+anybody writes it down, and a scheduler that does not know it places an
+eight-hour job on four-hour capacity and finds out at hour four -- after the
+queueing wait, having produced nothing. Declared, that becomes a refusal at
+submission naming both numbers. A **checkpointable** job may exceed the window:
+it resumes on the next grant, which is the whole point of checkpointing on
+capacity that is always going to be taken away.
+
+`max_hold_s` is permitted on any class, for a reservation with an end date.
+
+**No backend provisions it yet.** The scheduling semantics are implemented and
+the GCP TPU backend refuses a flex-start pool by name, saying the class is
+modelled and this backend has not built it -- rather than quietly provisioning
+spot instead, which would hand you entirely different interruption semantics
+under a name you chose deliberately.
+
 ### How hard a pool backs off
 
 ```yaml

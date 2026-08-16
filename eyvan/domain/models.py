@@ -194,6 +194,16 @@ class CapacityClass(StrEnum):
     RESERVED = "reserved"
     ON_DEMAND = "on_demand"
     SPOT = "spot"
+    #: Queued until the provider can satisfy it, then held for a bounded time
+    #: and returned whether or not the job is finished.
+    #:
+    #: The fourth thing capacity can be, and neither of the other three: unlike
+    #: spot it is not taken back mid-run, and unlike on-demand it does not
+    #: arrive immediately or stay indefinitely. GCP sells it as Dynamic Workload
+    #: Scheduler flex-start; the name here describes the *shape* -- a wait, then
+    #: a window -- because a provider's product name in the scheduler is the
+    #: leak this project keeps having to remove.
+    FLEX_START = "flex_start"
 
     @classmethod
     def parse(cls, value: CapacityClass | str) -> CapacityClass:

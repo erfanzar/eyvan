@@ -349,6 +349,9 @@ class CellUpsertRequest(ApiModel):
     #: Carried from the pool that created this cell, so an observation about
     #: it needs nothing but the cell itself.
     availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
+    #: How long the provider holds this capacity before taking it back.
+    #: Required for a flex_start pool; the record refuses one without it.
+    max_hold_s: int | None = Field(default=None, ge=60)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None
@@ -394,6 +397,9 @@ class CapacityPoolUpsertRequest(ApiModel):
     #: forgets. Declared in fleet YAML and carried to the record, so a curve
     #: an operator wrote is the curve the planner uses.
     availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
+    #: How long the provider holds this capacity before taking it back.
+    #: Required for a flex_start pool; the record refuses one without it.
+    max_hold_s: int | None = Field(default=None, ge=60)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None

@@ -379,6 +379,9 @@ class NodeTypeBase(FleetConfigModel):
     #: fleet's. Whole-value rather than merged field by field: a backoff curve
     #: is one shape, and half of somebody else's is not a curve anybody chose.
     availability_policy: AvailabilityPolicy | None = None
+    #: How long the provider holds this pool's capacity before taking it back,
+    #: whatever the job is doing. Required for `capacity_class: flex_start`.
+    max_hold_s: int | None = Field(default=None, ge=60)
     unit_prices: dict[str, float] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
@@ -870,6 +873,7 @@ class EyvanFleetConfig(FleetConfigModel):
                     "provider_options": template["provider_options"],
                     "runtime": template["runtime"],
                     "availability_policy": template["availability_policy"],
+                    "max_hold_s": node_type.max_hold_s,
                     "labels": template["labels"],
                     "topology": template["topology"],
                     "max_replica_resources": template["max_replica_resources"],

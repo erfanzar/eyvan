@@ -255,6 +255,27 @@ def _fingerprint(value: BaseModel | tp.Mapping[str, JsonValue]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _flex_start_refusal(pool: CapacityPoolRecord, *, estimated_duration_seconds: int, checkpointable: bool) -> str:
+    """Say why a job cannot run inside this pool's hold window, or nothing.
+
+    Flex-start capacity arrives after a wait and is returned after a bounded
+    window, finished or not. A job longer than the window will be interrupted:
+    if it can checkpoint it resumes on the next grant, and if it cannot it is
+    killed having produced nothing -- at hour four of a four-hour window, after
+    the wait, which is the most expensive possible time to learn this.
+    """
+
+    if pool.max_hold_s is None or estimated_duration_seconds <= pool.max_hold_s:
+        return ""
+    if checkpointable:
+        return ""
+    return (
+        f"this pool holds capacity for {pool.max_hold_s}s and the job estimates {estimated_duration_seconds}s; "
+        "it would be stopped before finishing. Make it checkpointable so it resumes on the next grant, "
+        "shorten the estimate, or use a pool that holds capacity until you release it"
+    )
+
+
 def _multislice_refusal(pool: CapacityPoolRecord) -> str:
     """Say why one pool cannot host several slices at once, or nothing if it can.
 
@@ -1045,6 +1066,12 @@ class ControlPlaneService:
                     f"fleet node type {fleet_name}/{node_type} partitions workers with max_replica_resources; "
                     "use the advanced workload submission API"
                 )
+            if refusal := _flex_start_refusal(
+                pool,
+                estimated_duration_seconds=estimated_duration_seconds,
+                checkpointable=checkpointable,
+            ):
+                raise ConflictError(f"fleet node type {fleet_name}/{node_type} cannot run this job: {refusal}")
             if pods > 1 and (unsupported := _multislice_refusal(pool)):
                 # Refused here, naming the pool, rather than left to the record's
                 # own validator: that one raises while the spec is being built,

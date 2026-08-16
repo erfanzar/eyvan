@@ -49,7 +49,7 @@ from eyvan.capacity.providers.gcp.queued_resources import (
     normalize_tpu_config,
 )
 from eyvan.config import EyvanSettings
-from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
+from eyvan.records import CapacityClass, NativeContainerConfig, NativeRuntimeConfig
 
 
 class CapacityProvider(tp.Protocol):
@@ -692,6 +692,17 @@ class GcpTpuCapacityDriver:
             raise ValueError("capacity field 'capacity_class' must be a string")
         capacity_class = capacity_class_value.replace("_", "-")
         if capacity_class not in self.capacity_classes:
+            # Two different failures, and the difference is what an operator does
+            # next. A class Eyvan does not have is a typo; a class Eyvan models
+            # and this backend has not implemented is a gap, and saying so keeps
+            # somebody from concluding the fleet YAML is wrong when it is not.
+            known = {candidate.value.replace("_", "-") for candidate in CapacityClass}
+            if capacity_class in known:
+                raise ValueError(
+                    f"{self.provider_name} does not yet provision {capacity_class!r} capacity. Eyvan models the "
+                    "class and this backend has not implemented it, so the pool is refused rather than quietly "
+                    f"provisioned as something else. Supported here: {', '.join(sorted(self.capacity_classes))}"
+                )
             raise ValueError(f"unsupported {self.provider_name} capacity class {capacity_class!r}")
         executor_value = document.get("executor")
         if executor_value is not None and not isinstance(executor_value, str):
