@@ -206,6 +206,17 @@ class PoolWorkloadSubmitRequest(ApiModel):
     org_id: str = Field(min_length=1, max_length=128)
     project_id: str = Field(min_length=1, max_length=128)
     command: str = Field(min_length=1)
+    #: How many whole cells this job occupies at once, allocated atomically.
+    #: The multislice knob, and it was pinned to one on this path while the
+    #: callable path exposed it -- so a command could not ask for the shape the
+    #: decorator could, and every multislice run had to be written in Python or
+    #: submitted through the advanced API.
+    pods: int = Field(default=1, ge=1)
+    #: A constraint rather than a preference: with it set only a pool in that
+    #: zone may run this job, and cross-zone alternates are not offered. For
+    #: work pinned to data, to a reservation, or to a peer already running
+    #: there. Without it the fleet chooses, which is what you usually want.
+    zone: str | None = Field(default=None, min_length=1, max_length=128)
     name: str | None = Field(default=None, min_length=1, max_length=200)
     environment: dict[str, str] = Field(default_factory=dict)
     #: Secret *references*, never values. Unlike ``environment``, which is

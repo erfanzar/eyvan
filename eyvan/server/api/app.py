@@ -2235,6 +2235,8 @@ def create_app(
             org_id=request.org_id,
             project_id=request.project_id,
             command=request.command,
+            pods=request.pods,
+            zone=request.zone,
             name=request.name,
             environment=request.environment,
             secret_mounts=request.secret_mounts,

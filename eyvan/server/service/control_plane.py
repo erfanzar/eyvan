@@ -242,6 +242,25 @@ def _fingerprint(value: BaseModel | tp.Mapping[str, JsonValue]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _multislice_refusal(pool: CapacityPoolRecord) -> str:
+    """Say why one pool cannot host several slices at once, or nothing if it can.
+
+    The same conditions ``WorkloadDefinition`` enforces, checked against the pool
+    a caller actually named so the refusal can point at it. Several workers
+    allocated together is a TPU multislice shape and nothing else: it needs the
+    native executor to place ranks across hosts, GCP's queued resources to
+    allocate them atomically, and TPU chips to be worth doing.
+    """
+
+    if pool.executor != "eyvan-native":
+        return "it does not run the eyvan-native executor"
+    if pool.provider != "gcp":
+        return "it is not a GCP pool"
+    if pool.allocatable.tpu <= 0 or pool.allocatable.gpu > 0:
+        return "it provides no TPU resource"
+    return ""
+
+
 def storage_scope(org_id: str, project_id: str) -> str:
     payload = json.dumps((org_id, project_id), ensure_ascii=True, separators=(",", ":")).encode()
     return f"scope_{hashlib.sha256(payload).hexdigest()}"
@@ -823,6 +842,8 @@ class ControlPlaneService:
         org_id: str,
         project_id: str,
         command: str,
+        pods: int = 1,
+        zone: str | None = None,
         name: str | None = None,
         environment: tp.Mapping[str, str] | None = None,
         secret_mounts: tp.Mapping[str, str] | None = None,
@@ -855,6 +876,11 @@ class ControlPlaneService:
                 "org_id": org_id,
                 "project_id": project_id,
                 "command": command,
+                # Both are part of what was asked for, so a replay that ignored
+                # them would return a one-cell job to a caller who asked for
+                # four, or an unpinned job to one who pinned a zone.
+                "pods": pods,
+                "zone": zone,
                 "name": name,
                 "environment": dict(environment or {}),
                 "secret_mounts": dict(secret_mounts or {}),
@@ -889,6 +915,16 @@ class ControlPlaneService:
                 matching_pools = [pool for pool in fleet_pools if pool.accelerator_type == node_type]
                 if not matching_pools:
                     raise NotFoundError(f"fleet node type {fleet_name}/{node_type} was not found")
+            if zone is not None:
+                # A constraint, so it is applied before alternates are chosen
+                # and it removes them: a job pinned to a zone that quietly ran
+                # in another one is the failure this flag exists to prevent.
+                pinned = [pool for pool in matching_pools if pool.zone == zone]
+                if not pinned:
+                    available = sorted({pool.zone for pool in matching_pools if pool.zone is not None})
+                    detail = f"; it has pools in {', '.join(available)}" if available else ""
+                    raise NotFoundError(f"fleet node type {fleet_name}/{node_type} has no pool in zone {zone}{detail}")
+                matching_pools = pinned
             alternate_pool_ids: tuple[str, ...] = ()
             if len(matching_pools) > 1:
                 # Several pools of one shape is cross-zone capacity, not a
@@ -920,6 +956,15 @@ class ControlPlaneService:
                     f"fleet node type {fleet_name}/{node_type} partitions workers with max_replica_resources; "
                     "use the advanced workload submission API"
                 )
+            if pods > 1 and (unsupported := _multislice_refusal(pool)):
+                # Refused here, naming the pool, rather than left to the record's
+                # own validator: that one raises while the spec is being built,
+                # so the caller was told their *request* was malformed when the
+                # truth is that this pool cannot host a multislice job at all.
+                raise ConflictError(
+                    f"fleet node type {fleet_name}/{node_type} cannot run --pods {pods}: {unsupported}. "
+                    "Several slices allocated together are a TPU multislice shape."
+                )
 
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
@@ -932,7 +977,13 @@ class ControlPlaneService:
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
                 max_preemption_retries=max_preemption_retries,
+                # The same mapping the callable path uses, deliberately: `pods`
+                # is the number of native workers allocated together, so
+                # `--pods 2` and ``TpuConfig(pods=2)`` describe one shape. Two
+                # spellings of "two slices" that produced different specs would
+                # be the worst possible outcome of adding this flag.
                 cell_group_count=1,
+                worker_count=pods,
                 workspace=workspace,
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,

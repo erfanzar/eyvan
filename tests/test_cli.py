@@ -348,11 +348,11 @@ def test_active_context_supplies_run_defaults_and_environment_overrides_them(mon
 
     from_context = runner.invoke(
         cli.main,
-        ["--user", "alice", "run", "dev-fleet/cpu-workers", "--", "python", "train.py"],
+        ["--user", "alice", "run", "--no-wait", "dev-fleet/cpu-workers", "--", "python", "train.py"],
     )
     from_environment = runner.invoke(
         cli.main,
-        ["--user", "alice", "run", "dev-fleet/cpu-workers", "--", "python", "eval.py"],
+        ["--user", "alice", "run", "--no-wait", "dev-fleet/cpu-workers", "--", "python", "eval.py"],
         env={
             "EYVAN_URL": "https://override.example.com",
             "EYVAN_ORG": "override-org",
@@ -1992,6 +1992,7 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
             "--project",
             "research",
             "run",
+            "--no-wait",
             "dev-fleet/gpu-workers",
             "--name",
             "train",
@@ -2020,6 +2021,10 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "org_id": "acme",
         "project_id": "research",
         "command": "python -m train --config 'two words.yaml'",
+        # Shape and placement a caller may state, both at their defaults here:
+        # one slice, and no zone pinned, so the fleet still chooses.
+        "pods": 1,
+        "zone": None,
         "name": "train",
         "environment": {"RUN_ID": "experiment-1"},
         "secret_mounts": {},
@@ -2094,6 +2099,7 @@ def test_run_prints_durable_job_controls_without_changing_json_stdout(monkeypatc
             "--project",
             "research",
             "run",
+            "--no-wait",
             "dev-fleet/gpu-workers",
             "--",
             "python",
@@ -2130,7 +2136,7 @@ def test_run_uses_environment_scope_and_preserves_help_as_command_input(monkeypa
 
     result = CliRunner().invoke(
         cli.main,
-        ["--user", "alice", "run", "dev-fleet/cpu-workers", "--", "python", "train.py", "--help"],
+        ["--user", "alice", "run", "--no-wait", "dev-fleet/cpu-workers", "--", "python", "train.py", "--help"],
         env={"EYVAN_ORG": "acme", "EYVAN_PROJECT": "research"},
     )
 
@@ -2145,7 +2151,7 @@ def test_run_rejects_invalid_target_without_calling_api(monkeypatch, target: str
 
     result = CliRunner().invoke(
         cli.main,
-        ["--org", "acme", "--project", "research", "run", target, "--", "python", "train.py"],
+        ["--org", "acme", "--project", "research", "run", "--no-wait", target, "--", "python", "train.py"],
     )
 
     assert result.exit_code != 0
@@ -2159,7 +2165,7 @@ def test_run_uses_documented_scope_defaults(monkeypatch) -> None:
 
     result = CliRunner().invoke(
         cli.main,
-        ["run", "dev-fleet/cpu-workers", "--", "python", "train.py"],
+        ["run", "--no-wait", "dev-fleet/cpu-workers", "--", "python", "train.py"],
     )
 
     assert result.exit_code == 0, result.output
@@ -2173,7 +2179,7 @@ def test_run_requires_a_command_without_calling_api(monkeypatch) -> None:
 
     result = CliRunner().invoke(
         cli.main,
-        ["--org", "acme", "--project", "research", "run", "dev-fleet/cpu-workers"],
+        ["--org", "acme", "--project", "research", "run", "--no-wait", "dev-fleet/cpu-workers"],
     )
 
     assert result.exit_code != 0
@@ -2184,7 +2190,7 @@ def test_run_infers_the_only_submit_capable_fleet(monkeypatch) -> None:
     fake = FakeClient(fleets=("research",))
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
 
-    result = CliRunner().invoke(cli.main, ["run", "v5p-16", "--", "python", "train.py"])
+    result = CliRunner().invoke(cli.main, ["run", "--no-wait", "v5p-16", "--", "python", "train.py"])
 
     assert result.exit_code == 0, result.output
     assert [call[:2] for call in fake.calls] == [
@@ -2197,7 +2203,7 @@ def test_run_requires_an_applied_fleet(monkeypatch) -> None:
     fake = FakeClient(fleets=())
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
 
-    result = CliRunner().invoke(cli.main, ["run", "v5p-16", "--", "python", "train.py"])
+    result = CliRunner().invoke(cli.main, ["run", "--no-wait", "v5p-16", "--", "python", "train.py"])
 
     assert result.exit_code != 0
     assert "run `eyvan up` first" in result.output
@@ -2208,7 +2214,7 @@ def test_run_requires_selection_when_multiple_fleets_are_applied(monkeypatch) ->
     fake = FakeClient(fleets=("research", "serving"))
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
 
-    result = CliRunner().invoke(cli.main, ["run", "v5p-16", "--", "python", "train.py"])
+    result = CliRunner().invoke(cli.main, ["run", "--no-wait", "v5p-16", "--", "python", "train.py"])
 
     assert result.exit_code != 0
     assert "multiple fleets are applied: research, serving" in result.output
@@ -2235,7 +2241,7 @@ def test_run_rejects_a_malformed_fleet_list(monkeypatch) -> None:
     fake = MalformedFleetClient()
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
 
-    result = CliRunner().invoke(cli.main, ["run", "v5p-16", "--", "python", "train.py"])
+    result = CliRunner().invoke(cli.main, ["run", "--no-wait", "v5p-16", "--", "python", "train.py"])
 
     assert result.exit_code != 0
     assert "invalid fleet-name list" in result.output
@@ -2253,7 +2259,7 @@ def test_run_ignores_an_active_fleet_from_another_endpoint(monkeypatch) -> None:
 
     result = runner.invoke(
         cli.main,
-        ["--url", "https://serving.example.com", "run", "v5p-16", "--", "python", "serve.py"],
+        ["--url", "https://serving.example.com", "run", "--no-wait", "v5p-16", "--", "python", "serve.py"],
     )
 
     assert selected.exit_code == 0, selected.output
@@ -2270,7 +2276,7 @@ def test_up_activates_fleet_for_bare_run_target(monkeypatch, tmp_path) -> None:
     runner = CliRunner()
 
     applied = runner.invoke(cli.main, ["up", str(config_path)])
-    submitted = runner.invoke(cli.main, ["run", "gpu-workers", "--", "python", "train.py"])
+    submitted = runner.invoke(cli.main, ["run", "--no-wait", "gpu-workers", "--", "python", "train.py"])
 
     assert applied.exit_code == 0, applied.output
     assert submitted.exit_code == 0, submitted.output

@@ -217,6 +217,64 @@ class JobTerminalOutput:
             style = "bold red" if update.state in {JobLifecycleState.BLOCKED, JobLifecycleState.FAILED} else "yellow"
             console.print(Text(f"  {update.diagnostic}", style=style))
 
+    def note(self, message: str) -> None:
+        """Render one aside about the run that is not a state change."""
+
+        writer = self._writer
+        if writer is not None:
+            self._write_plain(writer, (f"Eyvan: {message}",))
+            return
+        console = self._console
+        assert console is not None
+        if not console.is_terminal:
+            self._write_plain(console.print, (f"Eyvan: {message}",))
+            return
+        heading = Text("Eyvan", style="bold cyan")
+        heading.append("  ")
+        heading.append(message, style="yellow")
+        console.print(heading)
+
+    def detached(self, workload_id: str) -> None:
+        """Say that this client stopped watching, not that the job stopped.
+
+        The distinction is the whole message. A durable job survives its
+        submitter, so a user who pressed Ctrl-C has to be told the run is still
+        going and how to get back to it -- otherwise the safe assumption is that
+        they just killed it, and the usual next action is to submit it again.
+        """
+
+        lines = (
+            f"Eyvan: detached from {workload_id}. The job is still running.",
+            f"  reattach  eyvan workload logs {workload_id} --follow",
+            f"  cancel    eyvan workload cancel {workload_id}",
+        )
+        writer = self._writer
+        if writer is not None:
+            self._write_plain(writer, lines)
+            return
+        console = self._console
+        assert console is not None
+        if not console.is_terminal:
+            self._write_plain(console.print, lines)
+            return
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="dim", no_wrap=True)
+        table.add_column()
+        table.add_row("Job", Text(workload_id, style="bold cyan"))
+        table.add_row("State", Text("still running", style="bold green"))
+        table.add_row("Reattach", Text(f"eyvan workload logs {workload_id} --follow", style="cyan"))
+        table.add_row("Cancel", Text(f"eyvan workload cancel {workload_id}", style="cyan"))
+        console.print(
+            Panel(
+                table,
+                title="[bold yellow]Detached[/]",
+                title_align="left",
+                border_style="yellow",
+                padding=(0, 1),
+                expand=False,
+            )
+        )
+
     @staticmethod
     def _write_plain(writer: tp.Callable[[str], None], lines: tuple[str, ...]) -> None:
         """Write the exact plain fallback lines to a terminal-independent sink."""

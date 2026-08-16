@@ -15,7 +15,6 @@ from pydantic import ValidationError
 from eyvan.artifacts import ArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.records import (
-    AutoscaleBlockReason,
     CallableExecution,
     WorkloadProgress,
     WorkloadProgressPhase,
@@ -37,6 +36,13 @@ from eyvan.sdk.job_receipt import (
     JobLifecycleUpdate,
     JobSubmissionReceipt,
     JobTerminalOutput,
+)
+from eyvan.sdk.lifecycle import (
+    TERMINAL_STATES,
+    running_workload_update,
+    terminal_workload_update,
+    worker_count,
+    worker_request,
 )
 from eyvan.server.api.schemas import NoMatchingCapacityPoolErrorResponse
 from eyvan.worker.runtime.results import load_result
@@ -65,21 +71,6 @@ def _placement_error(error: EyvanHTTPError) -> EyvanPlacementError | None:
     )
 
 
-def _worker_count(count: int) -> str:
-    """Format one worker count without exposing provider resource accounting."""
-
-    return f"{count} worker" if count == 1 else f"{count} workers"
-
-
-def _worker_request(accelerator_type: str | None, workers: int) -> str:
-    """Format a provider-neutral worker request for terminal output."""
-
-    worker_count = _worker_count(workers)
-    if accelerator_type is None:
-        return worker_count
-    return f"{accelerator_type} x {worker_count}"
-
-
 class _CallableProgressRenderer:
     """Render change-only autoscaling progress for one blocking callable result wait."""
 
@@ -98,7 +89,7 @@ class _CallableProgressRenderer:
     def __call__(self, workload: WorkloadRecord) -> None:
         """Render one control-plane observation without repeating unchanged state."""
 
-        terminal = workload.state in {WorkloadState.SUCCEEDED, WorkloadState.FAILED, WorkloadState.CANCELLED}
+        terminal = workload.state in TERMINAL_STATES
         if terminal:
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
@@ -147,10 +138,10 @@ class _CallableProgressRenderer:
 
         pool = progress.pool
         if pool is None:
-            return _worker_request(None, _CallableProgressRenderer._required_workers(progress))
+            return worker_request(None, _CallableProgressRenderer._required_workers(progress))
         accelerator_type = pool.accelerator_type if pool.accelerator_type is not None else pool.node_type
         location = pool.zone if pool.zone is not None else pool.region
-        return f"{_worker_request(accelerator_type, _CallableProgressRenderer._required_workers(progress))} | {location}"
+        return f"{worker_request(accelerator_type, _CallableProgressRenderer._required_workers(progress))} | {location}"
 
     @staticmethod
     def _ready_workers(progress: WorkloadProgress) -> str:
@@ -240,9 +231,9 @@ class _CallableProgressRenderer:
         if phase is WorkloadProgressPhase.PREEMPTED:
             lost = progress.capacity.lost_workers
             if lost == 0:
-                summary = f"Spot capacity lost | re-requesting {_worker_count(required_workers)}"
+                summary = f"Spot capacity lost | re-requesting {worker_count(required_workers)}"
             else:
-                summary = f"Spot capacity lost: {_worker_count(lost)} | re-requesting {_worker_count(required_workers)}"
+                summary = f"Spot capacity lost: {worker_count(lost)} | re-requesting {worker_count(required_workers)}"
             return JobLifecycleUpdate(
                 JobLifecycleState.PREEMPTED,
                 scope,
@@ -265,7 +256,7 @@ class _CallableProgressRenderer:
             )
         if phase is WorkloadProgressPhase.QUEUE_ADMISSION_DENIED:
             target = progress.queue_admission_denial
-            denial_scope = _worker_request(None if target is None else target.accelerator_type, required_workers)
+            denial_scope = worker_request(None if target is None else target.accelerator_type, required_workers)
             if target is not None:
                 denial_scope = f"{denial_scope} | {target.zone}"
             return JobLifecycleUpdate(
@@ -278,35 +269,13 @@ class _CallableProgressRenderer:
             return self._terminal_progress_update(progress)
         raise AssertionError(f"unhandled workload progress phase {phase.value!r}")
 
-    @staticmethod
-    def _terminal_workload_update(workload: WorkloadRecord) -> JobLifecycleUpdate:
-        """Render a terminal record when the progress endpoint is no longer needed."""
-
-        if workload.autoscale_block_reason is AutoscaleBlockReason.QUEUE_ADMISSION_DENIED:
-            target = workload.queue_admission_denial
-            required_workers = workload.spec.cell_group_count * workload.spec.worker_count
-            scope = _worker_request(None if target is None else target.accelerator_type, required_workers)
-            if target is not None:
-                scope = f"{scope} | {target.zone}"
-            return JobLifecycleUpdate(
-                JobLifecycleState.BLOCKED,
-                scope,
-                "GCP denied queue admission; no queued resource was created",
-                workload.failure_reason,
-            )
-        if workload.state is WorkloadState.SUCCEEDED:
-            return JobLifecycleUpdate(JobLifecycleState.SUCCEEDED, None, "job completed")
-        if workload.state is WorkloadState.FAILED:
-            return JobLifecycleUpdate(JobLifecycleState.FAILED, None, "job failed", workload.failure_reason)
-        if workload.state is WorkloadState.CANCELLED:
-            return JobLifecycleUpdate(JobLifecycleState.CANCELLED, None, "job cancelled")
-        raise AssertionError(f"workload {workload.id!r} is not terminal: {workload.state.value!r}")
+    _terminal_workload_update = staticmethod(terminal_workload_update)
 
     @staticmethod
     def _fallback_or_terminal_update(workload: WorkloadRecord) -> JobLifecycleUpdate:
         """Retain terminal output when the optional progress endpoint is unavailable."""
 
-        if workload.state in {WorkloadState.SUCCEEDED, WorkloadState.FAILED, WorkloadState.CANCELLED}:
+        if workload.state in TERMINAL_STATES:
             return _CallableProgressRenderer._terminal_workload_update(workload)
         return _CallableProgressRenderer._fallback_update(workload)
 
@@ -324,29 +293,7 @@ class _CallableProgressRenderer:
             f"workload progress for {progress.workload_id!r} is terminal with {progress.workload_state.value!r}"
         )
 
-    @staticmethod
-    def _fallback_update(workload: WorkloadRecord) -> JobLifecycleUpdate:
-        """Render typed workload state when the progress API is temporarily unavailable."""
-
-        if workload.state is WorkloadState.PENDING:
-            return JobLifecycleUpdate(JobLifecycleState.QUEUED, None, "waiting for matching capacity")
-        if workload.state is WorkloadState.ADMITTED:
-            return JobLifecycleUpdate(JobLifecycleState.QUEUED, None, "admitted | waiting for a capacity lease")
-        if workload.state is WorkloadState.LEASED:
-            return JobLifecycleUpdate(JobLifecycleState.DISPATCHING, None, "capacity leased | waiting for dispatch")
-        if workload.state is WorkloadState.DISPATCHING:
-            return JobLifecycleUpdate(JobLifecycleState.DISPATCHING, None, "starting native workers")
-        if workload.state is WorkloadState.RUNNING:
-            return JobLifecycleUpdate(JobLifecycleState.RUNNING, None, "workload is running")
-        if workload.state is WorkloadState.CHECKPOINTING:
-            return JobLifecycleUpdate(
-                JobLifecycleState.CHECKPOINTING,
-                None,
-                "writing checkpoint before releasing capacity",
-            )
-        if workload.state is WorkloadState.CANCELLING:
-            return JobLifecycleUpdate(JobLifecycleState.CANCELLING, None, "releasing workload capacity")
-        raise AssertionError(f"workload {workload.id!r} has no fallback lifecycle update: {workload.state.value!r}")
+    _fallback_update = staticmethod(running_workload_update)
 
 
 class _SdkJobBackend:
@@ -479,7 +426,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
             JobSubmissionReceipt(
                 workload_id=workload.id,
                 fleet=request.fleet,
-                resource_shape=_worker_request(request.tpu.type, request.tpu.pods),
+                resource_shape=worker_request(request.tpu.type, request.tpu.pods),
                 atomic=True,
             )
         )

@@ -36,6 +36,7 @@ from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.requests import pool_workload_request
 from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
+from eyvan.sdk.follow import WorkloadFollower
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
 from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.server.api.schemas import (
@@ -190,8 +191,16 @@ class WorkloadCommandService:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
-    ) -> None:
-        """Submit one pool-targeted command using context and fleet defaults."""
+        pods: int = 1,
+        zone: str | None = None,
+        wait: bool = True,
+    ) -> int:
+        """Submit one pool-targeted command using context and fleet defaults.
+
+        Returns:
+            What the process should exit with: the followed job's outcome, or
+            zero when ``wait`` is false and the job was merely handed over.
+        """
 
         scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
         workspace_ref = self._upload_workspace(workspace, scope) if workspace is not None else None
@@ -217,6 +226,8 @@ class WorkloadCommandService:
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
+                pods=pods,
+                zone=zone,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -229,8 +240,26 @@ class WorkloadCommandService:
                 "Idempotency-Key": self.keys.create("run", idempotency_key),
             },
         )
-        self.renderer.emit(response)
+        workload_id = self._submission_id(response)
+        if not wait or workload_id is None:
+            # The handover contract, unchanged: the submission document on
+            # stdout is what every script that pipes this command parses, and
+            # it is only correct when stdout carries nothing else.
+            self.renderer.emit(response)
+            self._emit_submission_receipt(response, fleet=target.fleet)
+            return 0
         self._emit_submission_receipt(response, fleet=target.fleet)
+        return self.follow(workload_id)
+
+    def follow(self, workload_id: str) -> int:
+        """Stream one workload's output until it stops, and report its outcome."""
+
+        outcome = WorkloadFollower(
+            client=self.session.client,
+            output=JobTerminalOutput(stream=click.get_text_stream("stderr")),
+            write=lambda line: click.echo(line),
+        ).follow(workload_id)
+        return outcome.exit_code
 
     def submit(
         self,
@@ -378,6 +407,18 @@ class WorkloadCommandService:
 )
 @click.option("--gpu", "gpu_type", metavar="TYPE", help="GPU shape to run on, for example nvidia-tesla-a100.")
 @click.option("--cpu", "cpu_only", is_flag=True, help="Run on CPU capacity.")
+@click.option(
+    "--pods",
+    type=int,
+    default=1,
+    show_default=True,
+    help="How many slices to allocate together, atomically. The same shape TpuConfig(pods=N) asks for.",
+)
+@click.option(
+    "--zone",
+    help="Pin this job to one zone. A constraint, not a preference: without it the fleet places the job wherever "
+    "its pools of this shape have capacity.",
+)
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
 @click.option("--name")
@@ -443,6 +484,14 @@ class WorkloadCommandService:
     multiple=True,
     help="A large input this job pulls, so cells that recently pulled it are preferred. A hint, never a pin.",
 )
+@click.option(
+    "--no-wait",
+    "no_wait",
+    is_flag=True,
+    default=False,
+    help="Print the submission document and return immediately, instead of streaming the job. Use this in scripts: "
+    "stdout is then the JSON record and nothing else.",
+)
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
@@ -451,6 +500,8 @@ def run_workload(
     tpu_type: str | None,
     gpu_type: str | None,
     cpu_only: bool,
+    pods: int,
+    zone: str | None,
     org_id: str | None,
     project_id: str | None,
     name: str | None,
@@ -468,6 +519,7 @@ def run_workload(
     checkpoint_grace_seconds: int,
     estimated_duration_seconds: int,
     named_assets: tuple[str, ...],
+    no_wait: bool,
     command: tuple[str, ...],
 ) -> None:
     """Queue COMMAND on hardware you name, or on TYPE / FLEET/TYPE.
@@ -475,6 +527,12 @@ def run_workload(
     `--tpu v6e-8` asks the fleet which pool provides that shape, so nobody has
     to learn a pool-naming scheme to run anything. Naming TARGET still pins one
     pool exactly, which is what you want when the choice matters.
+
+    The job's output streams to stdout and its progress to stderr, and this
+    command exits 0 when it succeeded, 1 when it failed and 2 when it was
+    cancelled. Ctrl-C detaches; it does not cancel, because the job is durable
+    and outlives whoever submitted it. `--no-wait` prints the submission
+    document and returns instead.
     """
 
     shapes = {"--tpu": tpu_type, "--gpu": gpu_type, "--cpu": "cpu" if cpu_only else None}
@@ -491,7 +549,7 @@ def run_workload(
             command = (target, *command)
         target = next(iter(named.values()))
 
-    WorkloadCommandService(session).run(
+    exit_code = WorkloadCommandService(session).run(
         target_value=target,
         org_id=org_id,
         project_id=project_id,
@@ -511,7 +569,14 @@ def run_workload(
         checkpoint_grace_seconds=checkpoint_grace_seconds,
         estimated_duration_seconds=estimated_duration_seconds,
         named_assets=named_assets,
+        pods=pods,
+        zone=zone,
+        wait=not no_wait,
     )
+    if exit_code:
+        # The job's outcome is this command's outcome, so `eyvan run ... && ...`
+        # means what it looks like it means.
+        raise SystemExit(exit_code)
 
 
 @click.command("exec")
@@ -1113,11 +1178,29 @@ def workload_process_status(session: CliSession, workload_id: str) -> None:
 
 @workload.command("logs")
 @click.argument("workload_id")
+@click.option(
+    "--follow",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Keep printing output until the workload stops, then exit with its outcome.",
+)
 @click.pass_obj
-def workload_logs(session: CliSession, workload_id: str) -> None:
-    """Print driver logs for a workload attempt."""
+def workload_logs(session: CliSession, workload_id: str, follow: bool) -> None:
+    """Print driver logs for a workload attempt.
 
-    click.echo(session.client.request_text("GET", f"/api/v1/workloads/{workload_id}/logs"))
+    Reads the live cell while one exists and this attempt's archive once it
+    does not, so a preempted or finished job is still readable. With --follow
+    this reattaches to a running job: output on stdout, progress on stderr, and
+    an exit status of 0, 1 or 2 for succeeded, failed or cancelled.
+    """
+
+    if not follow:
+        click.echo(session.client.request_text("GET", f"/api/v1/workloads/{workload_id}/logs"))
+        return
+    exit_code = WorkloadCommandService(session).follow(workload_id)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 @click.command("kick")

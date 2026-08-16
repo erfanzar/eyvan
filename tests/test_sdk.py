@@ -67,6 +67,10 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "org_id": "acme",
         "project_id": "research",
         "command": "python train.py",
+        # Shape and placement a caller may state, at their defaults here: one
+        # slice, and no zone pinned, so the fleet still chooses.
+        "pods": 1,
+        "zone": None,
         "name": "daily-train",
         "environment": {"RUN_ID": "42"},
         "secret_mounts": {},

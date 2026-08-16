@@ -384,6 +384,34 @@ No receipt in this repository claims a provider, TPU, GPU, or P8 qualification
 run has completed; see [proofs.md](proofs.md).
 
 
+## Submitting one job
+
+```
+eyvan run --tpu v6e-8 -- python train.py            # shape, not a pool name
+eyvan run --tpu v5p-8 --pods 2 -- python train.py   # two slices, allocated together
+eyvan run --tpu v5p-8 --zone us-east5-b -- python train.py
+eyvan run research/v5p-workers -- python train.py   # pin one pool exactly
+eyvan run --no-wait --tpu v6e-8 -- python train.py  # for scripts: JSON on stdout
+```
+
+`--tpu`, `--gpu` and `--cpu` name hardware; the fleet is asked which pool
+provides it, and interchangeable pools of that shape in other zones become
+alternates the planner can fall to. Naming `FLEET/TYPE` still pins one pool.
+
+`--pods N` is the multislice knob and means exactly what `TpuConfig(pods=N)`
+means to the decorator: N slices allocated atomically, all or nothing. A pool
+that cannot host that shape refuses before anything is provisioned.
+
+`--zone` is a **constraint, not a preference**. With it set only a pool in that
+zone may run the job and no cross-zone alternate is offered, which is the point:
+a job pinned to data or to a reservation that quietly ran elsewhere has lost the
+reason it was pinned.
+
+The job streams to stdout and its progress to stderr; the command exits 0, 1 or
+2 for succeeded, failed or cancelled, so `eyvan run ... && next-step` means what
+it looks like. **Ctrl-C detaches and does not cancel** -- the job is durable and
+outlives whoever submitted it. Reattach with `eyvan workload logs ID --follow`.
+
 ## Debugging one workload
 
 ```

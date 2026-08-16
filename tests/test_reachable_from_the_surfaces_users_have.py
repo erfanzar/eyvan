@@ -253,6 +253,7 @@ def test_the_run_command_can_set_the_failure_budget(monkeypatch: pytest.MonkeyPa
             "--project",
             "research",
             "run",
+            "--no-wait",
             "dev-fleet/gpu-workers",
             "--max-retries",
             "5",
@@ -608,7 +609,7 @@ def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch:
         cli.main,
         [
             *["--user", "alice", "--org", "acme", "--project", "research"],
-            *["run", "dev-fleet/gpu-workers"],
+            *["run", "--no-wait", "dev-fleet/gpu-workers"],
             *["--checkpointable", "--checkpoint-hook", "python -m ckpt"],
             *["--checkpoint-output-uri", "gs://ckpt/run-1", "--checkpoint-grace-seconds", "120"],
             *["--can-submit-children", "--priority-band", "batch", "--intra-band-priority", "7"],

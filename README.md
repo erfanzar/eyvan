@@ -10,11 +10,15 @@ collectives, or your framework. It owns *capacity, admission, placement, and
 lifecycle*, and hands a fenced lease to whatever you actually run.
 
 ```bash
-eyvan head up fleet.yaml     # provision a control plane on GCP
-eyvan up fleet.yaml          # reconcile declared capacity
-eyvan run python train.py --accelerator v5p-8
+eyvan head up fleet.yaml          # provision a control plane on GCP
+eyvan up fleet.yaml               # reconcile declared capacity
+eyvan run --tpu v5p-8 -- python train.py
 eyvan status
 ```
+
+`eyvan run` streams the job's output and exits with its outcome. Ctrl-C
+detaches without cancelling; `--no-wait` prints the submission document and
+returns instead.
 
 ## Status, as of this commit
 
@@ -120,9 +124,10 @@ train()
 From the CLI:
 
 ```bash
-eyvan run python train.py --accelerator v5p-8
+eyvan run --tpu v5p-8 -- python train.py     # streams; exits with the job's outcome
+eyvan run --tpu v5p-8 --pods 2 -- python train.py
 eyvan workload list
-eyvan workload logs WORKLOAD_ID --follow
+eyvan workload logs WORKLOAD_ID --follow     # reattach to a running job
 ```
 
 Batch, arrays, and small DAGs are normal durable workloads with bounded fan-out
