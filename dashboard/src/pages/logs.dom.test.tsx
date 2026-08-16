@@ -71,6 +71,7 @@ function renderPage(detail: WorkloadDetail = workload()) {
       onAction={() => {}}
       canOperate
       loadExplanation={() => new Promise(() => {})}
+      loadCost={() => new Promise(() => {})}
       followLogs={followLogs}
     />,
   );
@@ -140,6 +141,7 @@ describe("following a workload's output", () => {
         onAction={() => {}}
         canOperate
         loadExplanation={() => new Promise(() => {})}
+        loadCost={() => new Promise(() => {})}
         followLogs={(handlers) => {
           state.handlers = handlers;
           return Promise.reject(new Error("log stream returned 503"));
@@ -194,6 +196,7 @@ describe("following a workload's output", () => {
         onAction={() => {}}
         canOperate
         loadExplanation={() => new Promise(() => {})}
+        loadCost={() => new Promise(() => {})}
       />,
     );
     openLogs();

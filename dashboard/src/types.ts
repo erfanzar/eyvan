@@ -120,6 +120,31 @@ export interface LogEntry {
   message: string;
 }
 
+/**
+ * What one run used and was charged, as the control plane totals it.
+ *
+ * `priced` is the field that decides whether `settled` means anything. An
+ * unpriced pool settles to zero, so rendering `$0.00` would present the absence
+ * of a price as the absence of a bill -- and that is the number somebody puts
+ * in a budget.
+ */
+export interface WorkloadSpend {
+  workloadId: string;
+  state: string;
+  /** Measured rather than priced, so known even when the money is not. */
+  acceleratorHours: Record<string, number>;
+  settled: number;
+  priced: boolean;
+  reserved: number;
+  leases: number;
+  shape?: string;
+  capacityClass?: string;
+  /** Absent unless somebody declared a price for the same shape on demand. */
+  onDemandHourly?: number;
+  /** Where that price came from, or why there is none. Always worth showing. */
+  onDemandSource: string;
+}
+
 export interface WorkloadDetail extends WorkloadSummary {
   command: string;
   checkpointUri?: string;

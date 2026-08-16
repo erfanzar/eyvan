@@ -97,6 +97,7 @@ from eyvan.records import (
     WorkloadExplanation,
     WorkloadProgress,
     WorkloadRecord,
+    WorkloadSpendRecord,
     WorkloadState,
     utcnow,
 )
@@ -2362,6 +2363,26 @@ def create_app(
         """
 
         return await service.explain_workload(principal, workload_id)
+
+    @app.get(
+        "/api/v1/workloads/{workload_id}/cost",
+        response_model=WorkloadSpendRecord,
+        tags=["workloads"],
+    )
+    async def workload_cost(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        on_demand_hourly: tp.Annotated[float | None, Query(ge=0)] = None,
+    ) -> WorkloadSpendRecord:
+        """Return what one run used and was charged, with the alternative.
+
+        Authorized as a read of the workload it is about. The client used to
+        assemble this itself, which meant listing capacity pools for their unit
+        prices -- a fleet read -- so the one command that answers "what did this
+        cost me" was refused to everybody who could not administer the fleet.
+        """
+
+        return await service.workload_cost(principal, workload_id, on_demand_hourly=on_demand_hourly)
 
     @app.post(
         "/api/v1/workloads/{workload_id}/progress-reports",

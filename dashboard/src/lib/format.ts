@@ -12,6 +12,24 @@ export function formatMoney(value: number, compact = false): string {
   }).format(value);
 }
 
+/**
+ * Money to the cent, for a figure that is often less than a dollar.
+ *
+ * Not `formatMoney`, which rounds to whole dollars. That is right for a budget
+ * in the thousands and wrong for one run: a forty-cent job would render as
+ * "$0", which reads as free. The two decimals also match what `eyvan workload
+ * cost` prints, so the terminal and the browser cannot disagree about a number
+ * somebody is comparing across them.
+ */
+export function formatSpend(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
 export function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat("en-US", {
     month: "short",

@@ -25,8 +25,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { LogEntry, WorkloadDetail, WorkloadExplanation } from "../types";
+import { formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
+import type { LogEntry, WorkloadDetail, WorkloadExplanation, WorkloadSpend } from "../types";
 
 type DetailTab = "overview" | "timeline" | "logs";
 
@@ -57,8 +57,87 @@ interface WorkloadDetailPageProps {
   onAction: (action: "cancel" | "checkpoint" | "retry" | "kick") => void;
   canOperate: boolean;
   loadExplanation: (id: string, signal: AbortSignal) => Promise<WorkloadExplanation>;
+  loadCost: (id: string, signal: AbortSignal) => Promise<WorkloadSpend>;
   /** Absent when the plane cannot be streamed from, which hides the control. */
   followLogs?: (handlers: LogFollowHandlers, signal: AbortSignal) => Promise<void>;
+}
+
+/** Render one run's spend, saying *unknown* wherever it is unknown. */
+function SpendPanel({ spend, error }: { spend: WorkloadSpend | null; error: string | null }) {
+  if (error) {
+    return (
+      <div className="resource-row-detail">
+        <span>{error}</span>
+      </div>
+    );
+  }
+  if (!spend) {
+    return (
+      <div className="resource-row-detail">
+        <span>Totalling this run…</span>
+      </div>
+    );
+  }
+  if (!spend.leases) {
+    return (
+      <div className="resource-row-detail">
+        <span>This run has never held a lease, so it has not been charged for capacity.</span>
+      </div>
+    );
+  }
+  const measured = Object.entries(spend.acceleratorHours)
+    .filter(([, value]) => value > 0)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const alternative = spend.onDemandHourly === undefined ? undefined : spend.onDemandHourly * (measured[0]?.[1] ?? 0);
+  return (
+    <dl className="definition-grid">
+      <div>
+        <dt>Used</dt>
+        <dd>
+          {measured.length
+            ? measured.map(([name, value]) => `${value.toFixed(1)} ${name.toUpperCase()}-hours`).join(", ")
+            : "no accelerator hours settled"}{" "}
+          across {spend.leases} lease{spend.leases === 1 ? "" : "s"}
+        </dd>
+      </div>
+      <div>
+        <dt>Cost</dt>
+        {/* An unpriced pool settles to zero. `$0.00` here would present the
+            absence of a price as the absence of a bill, and that number ends up
+            in somebody's budget. */}
+        <dd>{spend.priced ? formatSpend(spend.settled) : "Unknown — no pool this run used declares a unit price"}</dd>
+      </div>
+      {spend.reserved > 0 && (
+        <div>
+          <dt>Reserved</dt>
+          <dd>{formatSpend(spend.reserved)} still held by unsettled leases</dd>
+        </div>
+      )}
+      <div>
+        <dt>On demand</dt>
+        <dd>
+          {alternative === undefined
+            ? `Unknown — ${spend.onDemandSource}`
+            : `${formatSpend(alternative)} (${spend.onDemandSource})`}
+        </dd>
+      </div>
+      {alternative !== undefined && spend.priced && (
+        <div>
+          <dt>Saved</dt>
+          <dd>
+            {formatSpend(alternative - spend.settled)}
+            {alternative > 0 ? ` (${Math.round(((alternative - spend.settled) / alternative) * 100)}% less)` : ""}
+          </dd>
+        </div>
+      )}
+      {spend.shape && (
+        <div>
+          <dt>Capacity</dt>
+          <dd>{spend.capacityClass ? `${spend.shape}, ${spend.capacityClass}` : spend.shape}</dd>
+        </div>
+      )}
+    </dl>
+  );
 }
 
 export function WorkloadDetailPage({
@@ -67,6 +146,7 @@ export function WorkloadDetailPage({
   onAction,
   canOperate,
   loadExplanation,
+  loadCost,
   followLogs,
 }: WorkloadDetailPageProps) {
   const [tab, setTab] = useState<DetailTab>("overview");
@@ -95,6 +175,8 @@ export function WorkloadDetailPage({
   // terminal.
   const [explanation, setExplanation] = useState<WorkloadExplanation | null>(null);
   const [explainError, setExplainError] = useState<string | null>(null);
+  const [spend, setSpend] = useState<WorkloadSpend | null>(null);
+  const [spendError, setSpendError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -114,6 +196,24 @@ export function WorkloadDetailPage({
       });
     return () => controller.abort();
   }, [loadExplanation, workload.id]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSpend(null);
+    setSpendError(null);
+    loadCost(workload.id, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setSpend(result);
+      })
+      .catch((error: unknown) => {
+        // Named, never blank. An empty cost panel reads as "nothing is being
+        // spent", which is the most expensive thing it could say incorrectly.
+        if (!controller.signal.aborted) {
+          setSpendError(error instanceof Error ? error.message : "Unable to total this run");
+        }
+      });
+    return () => controller.abort();
+  }, [loadCost, workload.id]);
   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
   const cancellable = !["completed", "failed", "cancelled", "preempting"].includes(workload.status);
@@ -302,6 +402,11 @@ export function WorkloadDetailPage({
             ) : (
               <div className="resource-row-detail"><span>Per-workload spend is not reported by the control plane.</span></div>
             )}
+          </section>
+
+          <section className="panel detail-section">
+            <div className="panel-header"><div><h2>What this run cost</h2><p>Measured hours, and the on-demand alternative</p></div><WalletCards size={18} /></div>
+            <SpendPanel spend={spend} error={spendError} />
           </section>
 
           <section className="panel detail-section">

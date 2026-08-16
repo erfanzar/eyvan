@@ -198,6 +198,7 @@ describe("capability-aware actions", () => {
         onAction={() => {}}
         canOperate={viewer.capabilities.operateWorkloads}
         loadExplanation={(id, signal) => apiClient.explainWorkload(id, viewer.scope, signal)}
+        loadCost={() => new Promise(() => {})}
       />,
     );
 

@@ -25,7 +25,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiClient } from "../api/client";
 import { getMockWorkload, mockWorkloads } from "../api/mockData";
-import type { CapacityLease, Cell, WorkloadDetail } from "../types";
+import type { CapacityLease, Cell, WorkloadDetail, WorkloadSpend } from "../types";
 import { FleetPage } from "./FleetPage";
 import { WorkloadDetailPage } from "./WorkloadDetailPage";
 
@@ -74,6 +74,7 @@ describe("the placement verdict panel", () => {
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
+        loadCost={() => new Promise(() => {})}
       />);
 
     await waitFor(() => expect(screen.getByText("Placement verdict")).toBeDefined());
@@ -94,6 +95,7 @@ describe("the placement verdict panel", () => {
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
+        loadCost={() => new Promise(() => {})}
       />);
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
@@ -116,6 +118,7 @@ describe("why a workload is on the attempt it is on", () => {
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
+        loadCost={() => new Promise(() => {})}
       />);
 
     const runtime = screen.getByText("Reclaimed").closest("dl");
@@ -136,6 +139,7 @@ describe("why a workload is on the attempt it is on", () => {
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
+        loadCost={() => new Promise(() => {})}
       />);
 
     const runtime = screen.getByText("Reclaimed").closest("dl") as HTMLElement;
@@ -288,5 +292,81 @@ describe("the launch latency panel", () => {
     render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
+  });
+});
+
+describe("what this run cost", () => {
+  const spend = (overrides: Partial<WorkloadSpend> = {}): WorkloadSpend => ({
+    workloadId: "wl-1",
+    state: "succeeded",
+    acceleratorHours: { tpu: 8 },
+    settled: 9.6,
+    priced: true,
+    reserved: 0,
+    leases: 1,
+    shape: "v5p-8",
+    capacityClass: "spot",
+    onDemandHourly: 4,
+    onDemandSource: "declared by pool pool-od",
+    ...overrides,
+  });
+
+  const renderCost = (value: WorkloadSpend | Error) =>
+    render(
+      <WorkloadDetailPage
+        workload={workload()}
+        onBack={() => {}}
+        onAction={() => {}}
+        canOperate
+        loadExplanation={() => new Promise(() => {})}
+        loadCost={() => (value instanceof Error ? Promise.reject(value) : Promise.resolve(value))}
+      />,
+    );
+
+  it("prints the sentence a spot-first scheduler exists to say", async () => {
+    renderCost(spend());
+
+    expect(await screen.findByText(/8.0 TPU-hours/)).toBeTruthy();
+    expect(screen.getByText("$9.60")).toBeTruthy();
+    expect(screen.getByText(/\$32.00 \(declared by pool pool-od\)/)).toBeTruthy();
+    expect(screen.getByText(/\$22.40 \(70% less\)/)).toBeTruthy();
+  });
+
+  it("says unknown rather than free when no pool declares a price", async () => {
+    // An unpriced pool settles to zero. Rendering $0.00 presents the absence of
+    // a price as the absence of a bill, and that is the number a team budgets
+    // against.
+    renderCost(spend({ priced: false, settled: 0 }));
+
+    expect(await screen.findByText(/no pool this run used declares a unit price/)).toBeTruthy();
+    expect(screen.queryByText("$0.00")).toBeNull();
+  });
+
+  it("claims no saving against a run whose own cost is unknown", async () => {
+    // Subtracting a real price from an unknown one produces a fictional saving.
+    renderCost(spend({ priced: false, settled: 0 }));
+
+    await screen.findByText(/no pool this run used declares a unit price/);
+    expect(screen.queryByText(/% less/)).toBeNull();
+  });
+
+  it("says why there is no comparison instead of leaving it blank", async () => {
+    renderCost(spend({ onDemandHourly: undefined, onDemandSource: "no on-demand pool for v5p-8 declares a price" }));
+
+    expect(await screen.findByText(/Unknown — no on-demand pool for v5p-8 declares a price/)).toBeTruthy();
+  });
+
+  it("distinguishes a run that never held a lease from one that cost nothing", async () => {
+    renderCost(spend({ leases: 0, acceleratorHours: {}, settled: 0, priced: false }));
+
+    expect(await screen.findByText(/never held a lease/)).toBeTruthy();
+  });
+
+  it("names a failure rather than rendering an empty cost panel", async () => {
+    // An empty cost panel reads as "nothing is being spent", which is the most
+    // expensive thing it could say incorrectly.
+    renderCost(new Error("Eyvan API request failed with 503"));
+
+    expect(await screen.findByText(/503/)).toBeTruthy();
   });
 });

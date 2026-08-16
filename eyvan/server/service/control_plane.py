@@ -54,6 +54,7 @@ from eyvan.domain import costing
 from eyvan.domain.availability import p95_latency
 from eyvan.domain.carbon import CarbonSource, CarbonUnavailable, NoCarbonSource, fresh_reading
 from eyvan.domain.models import SchedulingResult
+from eyvan.domain.spend import spend_of
 from eyvan.records import (
     BILLABLE_CELL_STATES,
     CALLABLE_SIGNING_KEY_ENV,
@@ -131,6 +132,7 @@ from eyvan.records import (
     WorkloadEstimate,
     WorkloadExplanation,
     WorkloadRecord,
+    WorkloadSpendRecord,
     WorkloadState,
     WorkspaceRef,
     artifact_reference_id,
@@ -285,6 +287,49 @@ def _multislice_refusal(pool: CapacityPoolRecord) -> str:
     if pool.allocatable.tpu <= 0 or pool.allocatable.gpu > 0:
         return "it provides no TPU resource"
     return ""
+
+
+#: Label naming the pool a workload was placed against. Written to both the
+#: spec's required labels and its metadata when a job is submitted to a pool.
+_POOL_LABEL = "eyvan_pool"
+
+
+def _declares_a_price(unit_prices: tp.Mapping[str, float]) -> bool:
+    """Return whether a pool actually declares a positive price for anything."""
+
+    return any(value > 0 for value in unit_prices.values())
+
+
+def _on_demand_price(
+    shape: str | None,
+    pools: tp.Sequence[CapacityPoolRecord],
+    supplied: float | None,
+) -> tuple[float | None, str]:
+    """Find an on-demand hourly price for ``shape``, or say why there is none.
+
+    Eyvan carries no price catalogue and no spot-discount constant, so this is
+    either a price an operator declared on an on-demand pool of the same shape
+    or a number the caller passed. Anything else would be invented, and an
+    invented saving is the figure a team puts in a budget.
+
+    The class is compared as the enum. The client-side version of this compared
+    against the string ``"on-demand"`` while the enum's value is ``on_demand``,
+    so it never matched: the comparison this whole feature exists for could not
+    fire, and every run reported the alternative as unknown.
+    """
+
+    if supplied is not None:
+        return supplied, "from --on-demand-price"
+    if shape is None:
+        return None, "this run's shape is not recorded"
+    for pool in pools:
+        if pool.accelerator_type != shape or pool.capacity_class is not CapacityClass.ON_DEMAND:
+            continue
+        for dimension in ("tpu", "gpu"):
+            value = pool.unit_prices.get(dimension)
+            if value is not None and value > 0:
+                return float(value), f"declared by pool {pool.id}"
+    return None, f"no on-demand pool for {shape} declares a price; pass --on-demand-price to compare"
 
 
 def storage_scope(org_id: str, project_id: str) -> str:
@@ -4594,6 +4639,64 @@ class ControlPlaneService:
                 )
             )
             return updated
+
+    async def workload_cost(
+        self,
+        principal: Principal,
+        workload_id: str,
+        *,
+        on_demand_hourly: float | None = None,
+    ) -> WorkloadSpendRecord:
+        """Total one run's capacity spend, and the on-demand alternative.
+
+        Computed here rather than by the caller because the honest answer needs
+        pool unit prices, and pool records are a fleet read. Assembled in the
+        client, `eyvan workload cost` had to list capacity pools -- so the one
+        command that answers "what did this run cost me" was refused to
+        everybody who could not administer the fleet, while its help said
+        nothing about needing that. Authorized exactly like reading the workload
+        it is about, which is the permission the question actually implies.
+
+        No price is invented. The comparison uses a price an operator declared
+        on an on-demand pool of the same shape, or one the caller passed, and
+        says which. An invented saving is the figure a team puts in a budget.
+        """
+
+        workload = await self.get_workload(principal, workload_id)
+        async with self.repository.transaction() as tx:
+            leases = await tx.list_leases(workload_id=workload_id)
+            pools = await tx.list_capacity_pools()
+
+        # The placement contract, not the user-facing copy of it. Both carry the
+        # pool for a pool-submitted job, and a job submitted through the
+        # advanced API carries neither -- which is why an absent pool is
+        # "unknowable" rather than "unpriced".
+        pool_id = workload.spec.required_labels.get(_POOL_LABEL) or workload.spec.metadata.get(_POOL_LABEL)
+        used_pool = next((pool for pool in pools if pool.id == pool_id), None)
+        shape = used_pool.accelerator_type if used_pool is not None else None
+        # `None` means unknowable and is reported as unpriced; an empty set means
+        # known-unpriced. Both render as *unknown*, and neither is zero.
+        priced_cells: set[str] | None = None
+        if used_pool is not None:
+            priced_cells = {lease.cell_id for lease in leases} if _declares_a_price(used_pool.unit_prices) else set()
+        spend = spend_of(
+            [lease.model_dump(mode="json") for lease in leases],
+            priced_cells=priced_cells,
+        )
+        hourly, source = _on_demand_price(shape, pools, on_demand_hourly)
+        return WorkloadSpendRecord(
+            workload_id=workload_id,
+            state=workload.state.value,
+            accelerator_hours=spend.accelerator_hours,
+            settled=spend.settled,
+            priced=spend.priced,
+            reserved=spend.reserved,
+            leases=spend.leases,
+            shape=shape,
+            capacity_class=used_pool.capacity_class.value if used_pool is not None else None,
+            on_demand_hourly=hourly,
+            on_demand_source=source,
+        )
 
     async def list_leases(
         self, principal: Principal, *, org_id: str, project_id: str, workload_id: str | None = None

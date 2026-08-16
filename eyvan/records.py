@@ -2661,6 +2661,40 @@ class CellBillingReport(EyvanModel):
     unpriced_cells: int = Field(ge=0)
 
 
+class WorkloadSpendRecord(EyvanModel):
+    """What one run used and was charged, with the on-demand alternative.
+
+    Computed by the control plane rather than by whoever is asking, because the
+    honest answer needs pool unit prices and those are a fleet read. Assembling
+    it in the client meant `eyvan workload cost` listed capacity pools, so the
+    one command that answers "what did this cost me" was refused to everybody
+    who could not administer the fleet -- while its own help said nothing about
+    that.
+
+    ``priced`` is the field that matters. An unpriced pool settles to zero, so
+    ``settled`` means nothing when this is false, and reporting `$0.00` would
+    present the absence of a price as the absence of a bill.
+    """
+
+    workload_id: str
+    state: str
+    #: Measured, so always known even when nothing here can be priced.
+    accelerator_hours: dict[str, float] = Field(default_factory=dict)
+    settled: float = Field(default=0, ge=0)
+    priced: bool = False
+    reserved: float = Field(default=0, ge=0)
+    leases: int = Field(default=0, ge=0)
+    #: The shape and class this run held, from the pool it was pinned to.
+    shape: str | None = None
+    capacity_class: str | None = None
+    #: An on-demand price for the same shape, and where it came from. Never
+    #: invented: Eyvan carries no price catalogue and no spot-discount constant,
+    #: so this is a price some on-demand pool declares or nothing at all, and
+    #: ``on_demand_source`` says which.
+    on_demand_hourly: float | None = Field(default=None, ge=0)
+    on_demand_source: str = ""
+
+
 class ArtifactCollection(EyvanModel):
     """What one collection pass reclaimed, or would reclaim in a dry run."""
 

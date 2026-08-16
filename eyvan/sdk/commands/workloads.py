@@ -40,8 +40,8 @@ from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_com
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
 from eyvan.sdk.follow import WorkloadFollower, parse_duration
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
+from eyvan.sdk.spend import RunSpend
 from eyvan.sdk.spend import render as spend_render
-from eyvan.sdk.spend import spend_of
 from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.sdk.timeline import render, timeline
 from eyvan.server.api.schemas import (
@@ -55,6 +55,30 @@ from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 
 WorkloadAction = tp.Literal["cancel", "checkpoint", "retry"]
 _WORKLOAD_ACTIONS: tuple[WorkloadAction, ...] = ("cancel", "checkpoint", "retry")
+
+
+def _as_float(value: object) -> float:
+    """Read a number from a JSON document, treating anything else as zero."""
+
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else 0.0
+
+
+def _as_str(value: object) -> str | None:
+    """Read a string from a JSON document, or nothing when it is absent."""
+
+    return value if isinstance(value, str) and value else None
+
+
+def _float_map(value: object) -> dict[str, float]:
+    """Read a map of numbers, dropping entries that are not numbers."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): float(item)
+        for key, item in value.items()
+        if isinstance(item, int | float) and not isinstance(item, bool)
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,96 +430,37 @@ class WorkloadCommandService:
     ) -> None:
         """Print what one run cost, and what it would have cost on demand."""
 
-        scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
-        record = self.session.client.request("GET", f"/api/v1/workloads/{workload_id}")
-        leases = self.session.client.request(
+        del org_id, project_id
+        params = {} if on_demand_hourly is None else {"on_demand_hourly": on_demand_hourly}
+        # Asked of the plane rather than assembled here. Totalling it locally
+        # meant reading capacity pools for their unit prices, which needs
+        # manage_fleet -- so this command 403'd for exactly the people who ask
+        # what their own run cost, and its help never said so.
+        document = self.session.client.request(
             "GET",
-            "/api/v1/leases",
-            params={"org_id": scope.org_id, "project_id": scope.project_id, "workload_id": workload_id},
-            headers=self.session.workload_headers(scope),
+            f"/api/v1/workloads/{workload_id}/cost",
+            params=params,
         )
-        pools = self.session.client.request("GET", "/api/v1/capacity-pools")
-        pool_documents = [pool for pool in pools if is_json_object(pool)] if isinstance(pools, list) else []
-        lease_documents = [lease for lease in leases if is_json_object(lease)] if isinstance(leases, list) else []
-
-        used_pool = self._pool_of(record, pool_documents)
-        shape = str(used_pool["accelerator_type"]) if used_pool and used_pool.get("accelerator_type") else None
-        capacity_class = str(used_pool["capacity_class"]) if used_pool and used_pool.get("capacity_class") else None
-        priced_cells = self._priced_cells(lease_documents, pool_documents, used_pool)
-        hourly, source = self._on_demand_hourly(shape, pool_documents, on_demand_hourly)
-        state = str(record.get("state")) if is_json_object(record) and record.get("state") else "unknown"
+        if not is_json_object(document):
+            raise click.ClickException("control plane returned an invalid cost document")
         for line in spend_render(
-            workload_id,
-            state,
-            spend_of(lease_documents, priced_cells=priced_cells),
-            shape=shape,
-            capacity_class=capacity_class,
-            on_demand_hourly=hourly,
-            on_demand_source=source,
+            str(document.get("workload_id") or workload_id),
+            str(document.get("state") or "unknown"),
+            RunSpend(
+                accelerator_hours=_float_map(document.get("accelerator_hours")),
+                settled=_as_float(document.get("settled")),
+                priced=bool(document.get("priced")),
+                reserved=_as_float(document.get("reserved")),
+                leases=int(_as_float(document.get("leases"))),
+            ),
+            shape=_as_str(document.get("shape")),
+            capacity_class=_as_str(document.get("capacity_class")),
+            on_demand_hourly=None
+            if document.get("on_demand_hourly") is None
+            else _as_float(document.get("on_demand_hourly")),
+            on_demand_source=str(document.get("on_demand_source") or ""),
         ):
             click.echo(line)
-
-    @staticmethod
-    def _pool_of(record: JsonValue, pools: list[dict]) -> dict | None:
-        """Return the pool one workload was pinned to, from its own spec."""
-
-        if not is_json_object(record):
-            return None
-        spec = record.get("spec")
-        metadata = spec.get("metadata") if is_json_object(spec) else None
-        pool_id = metadata.get("eyvan_pool") if is_json_object(metadata) else None
-        if not isinstance(pool_id, str):
-            return None
-        return next((pool for pool in pools if pool.get("id") == pool_id), None)
-
-    @staticmethod
-    def _priced_cells(leases: list[dict], pools: list[dict], used_pool: dict | None) -> set[str] | None:
-        """Return the cells whose pool declares a price, or ``None`` if unknowable.
-
-        A settled cost of zero from an unpriced pool is not a free run, so the
-        renderer needs to know whether every contributing lease came from a pool
-        that actually declares a unit price.
-        """
-
-        if used_pool is None:
-            return None
-        prices = used_pool.get("unit_prices")
-        if not is_json_object(prices) or not any(
-            isinstance(value, int | float) and not isinstance(value, bool) and value > 0 for value in prices.values()
-        ):
-            return set()
-        del pools
-        return {str(lease["cell_id"]) for lease in leases if isinstance(lease.get("cell_id"), str)}
-
-    @staticmethod
-    def _on_demand_hourly(
-        shape: str | None,
-        pools: list[dict],
-        supplied: float | None,
-    ) -> tuple[float | None, str]:
-        """Find an on-demand hourly price for ``shape``, or say why there is none.
-
-        Eyvan carries no price catalogue and no spot-discount constant, so this
-        is either a price an operator declared on an on-demand pool of the same
-        shape, or a number they passed in. Anything else would be invented, and
-        an invented saving is the figure a team puts in a budget.
-        """
-
-        if supplied is not None:
-            return supplied, "from --on-demand-price"
-        if shape is None:
-            return None, "this run's shape is not recorded"
-        for pool in pools:
-            if pool.get("accelerator_type") != shape or str(pool.get("capacity_class")) != "on-demand":
-                continue
-            prices = pool.get("unit_prices")
-            if not is_json_object(prices):
-                continue
-            for dimension in ("tpu", "gpu"):
-                value = prices.get(dimension)
-                if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
-                    return float(value), f"declared by pool {pool.get('id')}"
-        return None, f"no on-demand pool for {shape} declares a price; pass --on-demand-price to compare"
 
     @staticmethod
     def _workload_lease_ids_from(record: JsonValue) -> tuple[str, ...]:

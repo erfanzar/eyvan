@@ -38,6 +38,7 @@ import type {
   WarmthReport,
   WorkloadExplanation,
   WorkloadProcessStatus,
+  WorkloadSpend,
   TimelineEvent,
   WorkloadDetail,
   WorkloadStatus,
@@ -110,6 +111,21 @@ interface RawAvailablePool {
   region: string;
   zone?: string | null;
   enabled: boolean;
+}
+
+/** One run's totalled spend, as the workload cost route reports it. */
+interface RawWorkloadSpend {
+  workload_id: string;
+  state: string;
+  accelerator_hours: Record<string, number>;
+  settled: number;
+  priced: boolean;
+  reserved: number;
+  leases: number;
+  shape?: string | null;
+  capacity_class?: string | null;
+  on_demand_hourly?: number | null;
+  on_demand_source: string;
 }
 
 interface RawLease {
@@ -885,6 +901,36 @@ export class EyvanApiClient {
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<WorkloadExplanation>(`/workloads/${encodeURIComponent(id)}/explain`, { signal });
+  }
+
+  /**
+   * What one run used and was charged, totalled by the control plane.
+   *
+   * Computed there rather than here: the honest answer needs pool unit prices,
+   * which are a fleet read, so a browser assembling it would either be wrong or
+   * be limited to fleet administrators. It is authorized as a read of the
+   * workload, which is the permission the question implies.
+   */
+  async getWorkloadCost(
+    id: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WorkloadSpend> {
+    void this.scopeSnapshot(scope);
+    const raw = await this.request<RawWorkloadSpend>(`/workloads/${encodeURIComponent(id)}/cost`, { signal });
+    return {
+      workloadId: raw.workload_id,
+      state: raw.state,
+      acceleratorHours: raw.accelerator_hours ?? {},
+      settled: raw.settled,
+      priced: raw.priced,
+      reserved: raw.reserved,
+      leases: raw.leases,
+      shape: raw.shape ?? undefined,
+      capacityClass: raw.capacity_class ?? undefined,
+      onDemandHourly: raw.on_demand_hourly ?? undefined,
+      onDemandSource: raw.on_demand_source,
+    };
   }
 
   /**

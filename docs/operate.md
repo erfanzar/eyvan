@@ -604,7 +604,13 @@ provisioning, and failed two minutes in".
 
 `cost` reports accelerator-hours, which are measured and therefore always
 known, and money only where a pool declares a unit price. **An unpriced pool
-settles to zero**, so a run on one reports *unknown* rather than `$0.00`.
+settles to zero**, so a run on one reports *unknown* rather than `$0.00`. The
+same figures are on the workload page in the dashboard.
+
+The plane totals it, not the client. Adding up leases locally meant reading
+capacity pools for their unit prices -- a fleet read -- so until 2026-08-17 the
+one command that answers "what did this run cost me" was refused to everybody
+who could not administer the fleet, and its help said nothing about that.
 
 The on-demand comparison needs an on-demand price, and Eyvan carries no price
 catalogue and no spot-discount constant. It uses one an on-demand pool of the

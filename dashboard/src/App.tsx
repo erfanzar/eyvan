@@ -973,6 +973,10 @@ export default function App({ client = apiClient, identityProvider = currentIden
       withAuthorityRefresh(() => client.explainWorkload(id, explanationScope, signal)),
     [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
   );
+  const loadCost = useCallback(
+    (id: string, signal: AbortSignal) => withAuthorityRefresh(() => client.getWorkloadCost(id, explanationScope, signal)),
+    [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
+  );
   const followedWorkloadId = selectedWorkload?.id;
   const followWorkloadLogs = useCallback(
     (handlers: LogFollowHandlers, signal: AbortSignal) => {
@@ -1036,6 +1040,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
           onAction={(action) => void operateWorkload(action)}
           canOperate={detailCapabilities.operateWorkloads}
           loadExplanation={loadExplanation}
+          loadCost={loadCost}
           followLogs={followWorkloadLogs}
         />
       );
