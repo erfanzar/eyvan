@@ -166,6 +166,16 @@ export interface Cell {
   region: string;
   zone: string;
   status: "healthy" | "starting" | "degraded" | "maintenance";
+  /**
+   * The control plane's own word for what this cell is doing.
+   *
+   * Kept beside `status` rather than folded into it, because the four statuses
+   * are presentation tones and two distinct states share one of them: a cell
+   * being drained and a cell being released both read as `maintenance`, and an
+   * operator deciding what to do about a machine needs to know which. Absent in
+   * demo data, which has no plane to have said anything.
+   */
+  state?: string;
   /** The capacity class the cell was provisioned as; absent on older records. */
   capacityClass?: "reserved" | "on_demand" | "spot";
   utilization: number;

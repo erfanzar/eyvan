@@ -1245,4 +1245,35 @@ describe("provider TPU quota", () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(connected).toBeUndefined();
   });
+  // ------------------------------------------------------------------ taking a cell out of service
+
+  it("sends an idempotency key with a drain so a retried click drains once", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "cell-a", state: "draining" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const result = await new EyvanApiClient("/api/v1", false).drainCell("cell-a");
+
+    expect(result).toEqual({ id: "cell-a", state: "draining" });
+    const [path, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/api/v1/cells/cell-a/drain");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBeTruthy();
+  });
+
+  it("refuses to drain in demo mode rather than miming it", async () => {
+    // A gesture that appears to work against a dataset with no fleet behind it
+    // teaches the action without its consequence.
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(new EyvanApiClient("/api/v1", true).drainCell("cell-a")).rejects.toEqual(
+      expect.objectContaining({ name: "ApiError" }),
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });

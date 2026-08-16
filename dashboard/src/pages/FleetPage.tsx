@@ -10,6 +10,7 @@ import {
   Gauge,
   KeyRound,
   MapPin,
+  MinusCircle,
   Network,
   RefreshCw,
   Server,
@@ -17,6 +18,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -30,6 +32,8 @@ interface FleetPageProps {
   loadWarmth: (signal: AbortSignal) => Promise<WarmthReport>;
   loadBilling: (signal: AbortSignal) => Promise<BillingReport>;
   loadLaunchLatency: (signal: AbortSignal) => Promise<LaunchLatencyReport>;
+  /** Absent unless this principal may manage the fleet, which hides the control. */
+  onDrainCell?: (cellId: string) => Promise<void>;
 }
 
 export function FleetPage({
@@ -39,6 +43,7 @@ export function FleetPage({
   loadWarmth,
   loadBilling,
   loadLaunchLatency,
+  onDrainCell,
 }: FleetPageProps) {
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
@@ -50,12 +55,34 @@ export function FleetPage({
   const [costError, setCostError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshed, setRefreshed] = useState(false);
+  const [draining, setDraining] = useState<Cell | null>(null);
+  const [drainBusy, setDrainBusy] = useState(false);
+  const [drainError, setDrainError] = useState<string | null>(null);
+  const [drained, setDrained] = useState<string | null>(null);
   const regions = useMemo(() => Array.from(new Set(cells.map((cell) => cell.region))), [cells]);
   const visibleCells = region === "all" ? cells : cells.filter((cell) => cell.region === region);
   const activeLeases = leases.filter((lease) => ["active", "activating"].includes(lease.state));
   const totalSpend = activeLeases.reduce((sum, lease) => sum + lease.spendPerHour, 0);
   const healthyCount = cells.filter((cell) => cell.status === "healthy").length;
   const averageUtilization = Math.round(cells.reduce((sum, cell) => sum + cell.utilization, 0) / Math.max(cells.length, 1));
+
+  const drainConfirmed = async () => {
+    if (!draining || !onDrainCell) return;
+    setDrainBusy(true);
+    setDrainError(null);
+    try {
+      await onDrainCell(draining.id);
+      setDraining(null);
+      setDrained(draining.name);
+    } catch (error) {
+      // The dialog stays open holding the reason. Closing it and dropping a
+      // toast puts the failure two seconds away from a fleet that did not
+      // change, which reads as a fleet that did.
+      setDrainError(error instanceof Error ? error.message : "Unable to drain this cell");
+    } finally {
+      setDrainBusy(false);
+    }
+  };
 
   const refreshInventory = async () => {
     setRefreshing(true);
@@ -252,6 +279,31 @@ export function FleetPage({
                   })}
                 </div>
                 <div className="cell-card-footer"><span>Scoped utilization <strong>{cell.utilization}%</strong></span><span>Heartbeat {formatDateTime(cell.lastHeartbeat)}</span></div>
+                {onDrainCell && (
+                  <div className="cell-card-actions">
+                    <button
+                      className="button button-secondary"
+                      type="button"
+                      // Already on its way out, and asking again says nothing
+                      // new. The request is idempotent, so this is not about
+                      // safety -- it is about not offering a gesture whose only
+                      // effect would be to look like it did something.
+                      disabled={cell.status === "maintenance"}
+                      onClick={() => {
+                        setDrainError(null);
+                        setDrained(null);
+                        setDraining(cell);
+                      }}
+                    >
+                      <MinusCircle size={15} aria-hidden="true" />
+                      {cell.status !== "maintenance"
+                        ? "Drain"
+                        : cell.state === "deleting"
+                          ? "Releasing"
+                          : "Draining"}
+                    </button>
+                  </div>
+                )}
               </article>
             ))}
           </div>
@@ -281,6 +333,46 @@ export function FleetPage({
             </table>
           </div>
         </section>
+      )}
+
+      <ConfirmDialog
+        open={draining !== null}
+        title={`Drain ${draining?.name ?? ""}`}
+        confirmLabel="Drain cell"
+        // Typed, not clicked. A drain cannot be undone -- there is no route back
+        // to READY -- and on spot the slice it gives up may not be grantable
+        // again for hours. That is why this stayed off the dashboard until now;
+        // a phrase a reflex cannot type is what makes it safe to offer here.
+        confirmPhrase={draining?.name}
+        busy={drainBusy}
+        error={drainError}
+        consequence={
+          <>
+            <p>
+              The scheduler stops placing new work on <strong>{draining?.name}</strong>. Its agent begins releasing
+              capacity, and the cell is released once every lease has left it.
+            </p>
+            {/* The number that decides whether this is routine or an
+                interruption, and the reason the count is on the card at all.
+                An operator draining a bad host needs to know it is holding
+                someone's gang before they find out from the job's owner. */}
+            <p>
+              {draining?.activeWorkloads
+                ? `${draining.activeWorkloads} workload${draining.activeWorkloads === 1 ? "" : "s"} currently hold capacity here. Their leases end when this cell releases, and each one reschedules elsewhere if its retry budget allows.`
+                : "No workload currently holds capacity here."}
+            </p>
+          </>
+        }
+        onConfirm={() => void drainConfirmed()}
+        onCancel={() => {
+          setDraining(null);
+          setDrainError(null);
+        }}
+      />
+      {drained && (
+        <div className="inline-notice" role="status">
+          {drained} is draining. It stops accepting work now and releases once its leases end.
+        </div>
       )}
     </div>
   );

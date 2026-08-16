@@ -804,6 +804,20 @@ export default function App({ client = apiClient, identityProvider = currentIden
     if (!refreshed) throw new Error("Fleet inventory refresh did not complete");
   };
 
+  const drainCell = async (cellId: string) => {
+    // Re-checked here rather than trusted from the render that hid the button.
+    // Authority is refreshed on every sweep, and a grant can be revoked between
+    // the page being drawn and the button being pressed.
+    if (!capabilitiesForResource(snapshotRef.current.authority, fleetScope.orgId, fleetScope.projectId).manageFleet) {
+      throw new ApiError("This session may not manage fleet capacity", 403);
+    }
+    await client.drainCell(cellId, scopeOperationAbortRef.current.signal);
+    // Inventory rather than the one record: a cell's rendered shape is a join
+    // against its live leases, and reconstructing that here would put a figure
+    // on the page the next refresh disagrees with.
+    await refreshFleet();
+  };
+
   const updatePolicy = async (policy: SchedulingPolicy, enabled: boolean) => {
     const current = snapshotRef.current;
     if (!current.selectedScope) throw new ApiError("No project scope is selected");
@@ -1017,6 +1031,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadWarmth={loadWarmth}
             loadBilling={loadBilling}
             loadLaunchLatency={loadLaunchLatency}
+            onDrainCell={capabilities.manageFleet ? drainCell : undefined}
           />
         );
         break;

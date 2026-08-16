@@ -682,5 +682,17 @@ eyvan preemption-force-finalize <command-id> --reason "..."
 eyvan system-reconcile
 ```
 
-These are CLI-only and deliberately not on the dashboard. Each is irreversible
-in a way a mis-click should not be able to reach.
+Each is irreversible in a way a mis-click should not be able to reach. There is
+no route back to `READY`: a drained cell is on its way out, and on spot the
+slice it gives up may not be grantable again for hours.
+
+`cell-delete`, `preemption-force-finalize` and `system-reconcile` stay
+CLI-only. **`cell-drain` is also on the dashboard's Fleet page**, because "stop
+putting work on that host" is the one of these an operator needs during an
+incident, and needing to leave the page for it is how people end up running
+`gcloud` by hand. The dashboard requires the cell's name to be *typed* rather
+than a button clicked. A confirmation button reduces mis-clicks and nothing
+more -- "are you sure" is answered yes by the same reflex that produced the
+first click -- while typing a cell's name is not something a reflex does. The
+dialog also says how many workloads currently hold capacity there before you
+type it.

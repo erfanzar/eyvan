@@ -984,6 +984,7 @@ export class EyvanApiClient {
           region: cell.region,
           zone: cell.zone ?? "-",
           status: cellStatus(cell.state),
+          state: cell.state,
           utilization,
           activeWorkloads: new Set(activeLeases.map((lease) => lease.workloadId)).size,
           // Topology is the durable placement/failure-domain contract. The
@@ -1204,6 +1205,27 @@ export class EyvanApiClient {
       throw new ApiError("Workload mutation returned a resource outside the immutable requested scope", 409);
     }
     return mapWorkload(raw);
+  }
+
+  /**
+   * Stop new placement on one cell and ask its agent to drain.
+   *
+   * Returns the state the control plane moved it to rather than a remapped
+   * `Cell`: a cell's rendered shape is a join against its active leases, and
+   * rebuilding that from one record would put a figure on the page that the
+   * next refresh disagrees with. The caller refreshes inventory instead.
+   *
+   * Not offered in demo mode. A drain that appears to work against a dataset
+   * with no fleet behind it teaches the gesture without its consequence.
+   */
+  async drainCell(cellId: string, signal?: AbortSignal): Promise<{ id: string; state: string }> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no fleet to drain", 400);
+    const raw = await this.request<RawCell>(`/cells/${encodeURIComponent(cellId)}/drain`, {
+      method: "POST",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      signal,
+    });
+    return { id: raw.id, state: raw.state };
   }
 
   async updatePolicy(

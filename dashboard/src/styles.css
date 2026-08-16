@@ -473,6 +473,15 @@ code,
   color: #303632;
 }
 
+.button-danger {
+  background: #9a332c;
+  color: #ffffff;
+}
+
+.button-danger:hover {
+  background: #7f2a24;
+}
+
 .button-secondary:hover,
 .button-ghost:hover {
   background: #f0f3f1;
@@ -1543,6 +1552,12 @@ code,
 .modal-scrim,
 .drawer-scrim { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(18, 22, 19, 0.56); }
 .modal { position: relative; z-index: 1; width: min(820px, 100%); max-height: calc(100vh - 36px); overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: #fff; box-shadow: 0 24px 70px rgba(20, 27, 23, 0.28); }
+.modal-narrow { width: min(480px, 100%); }
+.confirm-consequence { padding: 16px 0 4px; color: var(--text-muted); font-size: 13px; line-height: 1.55; }
+.confirm-consequence strong { color: var(--text); }
+.confirm-phrase { margin-top: 6px; }
+.confirm-phrase input { font-family: "SFMono-Regular", Consolas, monospace; }
+.cell-card-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 10px; }
 .modal-header { display: flex; min-height: 68px; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 18px; border-bottom: 1px solid var(--border); }
 .modal-header h2 { font-size: 17px; }
 .modal-header p { margin-top: 3px; color: var(--text-muted); font-size: 11px; }

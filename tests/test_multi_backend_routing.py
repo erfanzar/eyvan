@@ -197,8 +197,13 @@ def test_one_fleet_state_uri_per_agent_is_a_documented_requirement() -> None:
 
     from pathlib import Path
 
-    readme = Path("libs/eyvan/README.md")
-    if not readme.exists():  # pragma: no cover - repository layout guard
-        pytest.skip("README not present in this checkout")
+    # Resolved from this file, not from the working directory. The path used to
+    # be `libs/eyvan/README.md`, which is only true when pytest is run from the
+    # monorepo root -- from the eyvan checkout itself the README is right there
+    # and the test skipped anyway. A skip is this check disappearing entirely,
+    # and it is the only thing standing behind an invariant that cannot be
+    # enforced in code. Missing is now a failure, because the README ships with
+    # this package.
+    readme = Path(__file__).resolve().parents[1] / "README.md"
     text = readme.read_text(encoding="utf-8")
     assert "EYVAN_FLEET_STATE_URI" in text
