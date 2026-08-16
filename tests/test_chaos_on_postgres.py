@@ -377,6 +377,13 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
         pytest.skip("the workspace workflow lives in the monorepo, which a standalone eyvan checkout lacks")
 
     document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    if "eyvan-postgres" not in (document.get("jobs") or {}):
+        # A workspace workflow exists, but not one that runs eyvan's lane --
+        # which is what a standalone eyvan clone sitting inside some other
+        # workspace sees. Asserting against it reports the other project's CI
+        # as a violation of this project's policy. Existence of the file is not
+        # the question; ownership of the lane is.
+        pytest.skip("this workspace's CI does not run the Eyvan PostgreSQL lane")
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = document.get("on") or document.get(True) or {}
 

@@ -23,8 +23,15 @@ import pytest
 import yaml
 
 _MONOREPO_ROOT = Path(__file__).resolve().parents[3]
-if not (_MONOREPO_ROOT / "WORKSPACE.md").is_file():
-    pytest.skip("OCI release policy is owned by the EasyDeL workspace", allow_module_level=True)
+# Guarded on the release workflow itself rather than on WORKSPACE.md. The
+# marker file only says "a workspace is above me", which is also true of a
+# standalone eyvan clone that happens to sit inside one -- and then every check
+# below reads a workflow this workspace does not own and fails, reporting a
+# policy violation where there is no policy. The inputs are the honest guard:
+# where they exist the policy is owned here and is checked, and where they do
+# not there is nothing to check.
+if not (_MONOREPO_ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").is_file():
+    pytest.skip("OCI release policy is owned by the workspace that holds its workflow", allow_module_level=True)
 ROOT = _MONOREPO_ROOT
 EYVAN_ROOT = ROOT / "libs" / "eyvan"
 SCRIPT = ROOT / "scripts" / "verify_eyvan_oci_release.py"

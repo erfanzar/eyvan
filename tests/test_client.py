@@ -253,3 +253,52 @@ def test_an_ordinary_validation_error_is_not_called_skew() -> None:
     error = EyvanHTTPError(response, "[{'type': 'missing', 'loc': ['body', 'name']}]")
 
     assert "version skew" not in str(error)
+
+
+# --------------------------------------------------------------------------- an empty success
+
+
+def test_a_204_is_a_success_rather_than_an_unparseable_body() -> None:
+    """DELETE answers 204 with no body, and that is the success case.
+
+    Parsing it as JSON reported every successful deletion as
+    ``Error: 204: ... non-JSON response body: ''`` and exited 1 -- so
+    `eyvan quota delete` removed the quota and then told the operator, and any
+    script wrapping it, that it had failed. A tool that reports success as
+    failure is worse than one that fails: the next step is a retry of something
+    that already happened.
+    """
+
+    import httpx
+
+    from eyvan.sdk.commands.http import EyvanClient
+
+    assert EyvanClient._json(httpx.Response(204)) is None
+
+
+def test_a_body_that_is_genuinely_unparseable_is_still_an_error() -> None:
+    """The 204 exemption must not become "ignore whatever the server sent".
+
+    A 200 carrying HTML is a proxy error page or a login redirect, and reading
+    it as an empty success would turn a broken deployment into a silent no-op.
+    """
+
+    import httpx
+    import pytest as _pytest
+
+    from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
+
+    with _pytest.raises(EyvanApiError, match="non-JSON response body"):
+        EyvanClient._json(httpx.Response(200, text="<html>502 Bad Gateway</html>"))
+
+
+def test_an_empty_body_on_a_status_that_promises_content_is_still_an_error() -> None:
+    """200 with nothing in it is a broken server, not an empty answer."""
+
+    import httpx
+    import pytest as _pytest
+
+    from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
+
+    with _pytest.raises(EyvanApiError, match="non-JSON response body"):
+        EyvanClient._json(httpx.Response(200, text=""))

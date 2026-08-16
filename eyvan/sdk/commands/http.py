@@ -55,6 +55,13 @@ class EyvanClient:
 
     @staticmethod
     def _json(response: httpx.Response) -> JsonValue:
+        if response.status_code == httpx.codes.NO_CONTENT:
+            # 204 is what a successful DELETE returns, and an empty body is the
+            # whole point of it. Parsing it as JSON reported every successful
+            # deletion as `Error: 204: ... non-JSON response body: ''` and
+            # exited 1 -- so `eyvan quota delete` removed the quota and then
+            # told the operator, and any script wrapping it, that it had failed.
+            return None
         try:
             payload = response.json()
         except json.JSONDecodeError as exc:
