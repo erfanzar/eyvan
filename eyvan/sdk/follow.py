@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 import typing as tp
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.records import WorkloadRecord, WorkloadState
@@ -48,7 +49,7 @@ class FollowOutcome:
 class _LogWindow:
     """One page of output as the follower needs it."""
 
-    lines: tuple[tuple[int, str], ...] = ()
+    lines: tuple[tuple[int, str, datetime | None], ...] = ()
     cursor: str = ""
     attempt_changed: bool = False
     expected_ranks: int | None = None
@@ -62,7 +63,7 @@ class _LogWindow:
         if not is_json_object(payload):
             return cls()
         raw = payload.get("records")
-        lines: list[tuple[int, str]] = []
+        lines: list[tuple[int, str, datetime | None]] = []
         for record in raw if isinstance(raw, list) else []:
             if not is_json_object(record):
                 continue
@@ -72,6 +73,7 @@ class _LogWindow:
                 (
                     rank if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0 else 0,
                     message if isinstance(message, str) else "",
+                    _timestamp(record.get("timestamp")),
                 )
             )
         cursor = payload.get("next_cursor")
@@ -85,6 +87,44 @@ class _LogWindow:
             detail=detail if isinstance(detail, str) else "",
             unavailable=bool(payload.get("unavailable")),
         )
+
+
+#: How a duration is spelled on the command line. Iris uses --since-seconds;
+#: a suffix reads better and "10m" is what somebody means when they type it.
+_DURATION_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": 86_400}
+
+
+def parse_duration(value: str) -> timedelta:
+    """Parse ``30s``, ``10m``, ``2h`` or ``1d`` into a duration.
+
+    Raises:
+        ValueError: When the spelling is not one of those. Refused rather than
+            guessed: reading "10" as ten seconds when somebody meant minutes
+            hides most of what they asked to see and looks like a quiet log.
+    """
+
+    text = value.strip().lower()
+    if len(text) < 2 or text[-1] not in _DURATION_UNITS or not text[:-1].isdigit():
+        units = ", ".join(f"10{suffix}" for suffix in _DURATION_UNITS)
+        raise ValueError(f"{value!r} is not a duration; write one of {units}")
+    return timedelta(seconds=int(text[:-1]) * _DURATION_UNITS[text[-1]])
+
+
+def _timestamp(value: object) -> datetime | None:
+    """Read one record's ISO timestamp, or ``None`` when it carries none.
+
+    A record with no readable timestamp cannot be placed in time, and is shown
+    by ``--since`` rather than hidden: dropping it would silently shorten the
+    window a caller asked to see.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 class _Transport(tp.Protocol):
@@ -131,6 +171,11 @@ class WorkloadFollower:
     #: faster than this client reads would otherwise hold the loop forever and
     #: the lifecycle line would stop moving while the fleet changed underneath.
     max_pages_per_poll: int = 64
+    #: Show only output newer than this. A client-side window over the whole
+    #: journal, because a log position is an opaque backend cursor and no
+    #: backend Eyvan reads can seek by time. It bounds what is *printed*, never
+    #: what is fetched -- worth saying, because the difference is the whole cost.
+    since: timedelta | None = None
     _cursor: str = ""
     _last_update: JobLifecycleUpdate | None = None
     _rank_prefixes: bool = False
@@ -197,9 +242,12 @@ class WorkloadFollower:
                 self.output.note("the job restarted; following the new attempt from its first line")
             if window.expected_ranks is not None and window.expected_ranks > 1:
                 self._rank_prefixes = True
-            if not self._rank_prefixes and any(rank for rank, _message in window.lines):
+            if not self._rank_prefixes and any(rank for rank, _message, _at in window.lines):
                 self._rank_prefixes = True
-            for rank, message in window.lines:
+            cutoff = None if self.since is None else datetime.now(timezone.utc) - self.since
+            for rank, message, at in window.lines:
+                if cutoff is not None and at is not None and at < cutoff:
+                    continue
                 self.write(f"[{rank}] {message}" if self._rank_prefixes else message)
             if window.cursor:
                 self._cursor = window.cursor

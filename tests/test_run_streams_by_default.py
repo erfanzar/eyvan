@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import typing as tp
+from datetime import datetime, timedelta, timezone
 
 from click.testing import CliRunner
 
@@ -51,11 +52,15 @@ def _page(
     cursor: str,
     expected_ranks: int | None = None,
     attempt_changed: bool = False,
+    age_s: float = 0.0,
 ) -> dict:
+    stamped = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
     return {
         "attempt": 1,
         "attempt_changed": attempt_changed,
-        "records": [{"message": message, "rank": rank, "stream": "stdout"} for rank, message in lines],
+        "records": [
+            {"message": message, "rank": rank, "stream": "stdout", "timestamp": stamped} for rank, message in lines
+        ],
         "next_cursor": cursor,
         "unavailable": False,
         "detail": "",
@@ -319,6 +324,38 @@ def test_streaming_keeps_stdout_free_of_the_submission_document(monkeypatch) -> 
     result = _invoke(monkeypatch, plane, "dev-fleet/gpu-workers", "--", "python", "train.py")
 
     assert result.stdout.strip() == "the only thing on stdout"
+
+
+def test_since_shows_only_the_recent_window() -> None:
+    """The tail is what a reattaching operator wants, not an hour of history."""
+
+    plane = _Plane(
+        states=[_record(WorkloadState.SUCCEEDED)],
+        pages={"": {**_page([(0, "an hour ago")], cursor="c1", age_s=3600)}},
+    )
+    written: list[str] = []
+    follower = _follower(plane, written)
+    follower.since = timedelta(minutes=10)
+
+    follower.follow("wl-1")
+
+    assert "an hour ago" not in written
+
+
+def test_since_keeps_a_line_it_cannot_place_in_time() -> None:
+    """Dropping an undated line would silently shorten the window asked for."""
+
+    page = _page([(0, "undated")], cursor="c1")
+    for record in page["records"]:
+        record.pop("timestamp")
+    plane = _Plane(states=[_record(WorkloadState.SUCCEEDED)], pages={"": page})
+    written: list[str] = []
+    follower = _follower(plane, written)
+    follower.since = timedelta(minutes=10)
+
+    follower.follow("wl-1")
+
+    assert "undated" in written
 
 
 def test_workload_logs_can_follow_a_running_job(monkeypatch) -> None:

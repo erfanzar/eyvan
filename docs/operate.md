@@ -495,6 +495,29 @@ whatever it is given on a machine holding someone's training job, so it is an
 admission decision an operator makes for a fleet rather than a capability that
 arrives switched on.
 
+## Where the time and the money went
+
+```
+eyvan workload timeline <id>     # submitted, admitted, leased, dispatched, settled
+eyvan workload cost <id>
+eyvan workload cost <id> --on-demand-price 4.00
+```
+
+`timeline` is one column with elapsed times, built from the audit ledger and
+ordered by its sequence rather than by clock -- two events committed together
+share a timestamp, and sorting those by time reorders cause and effect. This is
+what turns "it failed" into "it spent eight minutes queued, thirty
+provisioning, and failed two minutes in".
+
+`cost` reports accelerator-hours, which are measured and therefore always
+known, and money only where a pool declares a unit price. **An unpriced pool
+settles to zero**, so a run on one reports *unknown* rather than `$0.00`.
+
+The on-demand comparison needs an on-demand price, and Eyvan carries no price
+catalogue and no spot-discount constant. It uses one an on-demand pool of the
+same shape declares, or one you pass with `--on-demand-price`; without either
+it says so. An invented saving is the figure a team puts in a budget.
+
 ## Logs after the machine is gone
 
 Both log commands read the live cell while one exists, and fall back to this

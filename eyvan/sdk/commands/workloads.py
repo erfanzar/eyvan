@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import typing as tp
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 import click
@@ -21,6 +22,7 @@ from eyvan.artifacts.managed import workspace_uri as managed_workspace_uri
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.records import (
     DEFAULT_MAX_RETRIES,
+    AuditEvent,
     CapacityClass,
     CommandExecution,
     PriorityBand,
@@ -36,9 +38,12 @@ from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.requests import pool_workload_request
 from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
-from eyvan.sdk.follow import WorkloadFollower
+from eyvan.sdk.follow import WorkloadFollower, parse_duration
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
+from eyvan.sdk.spend import render as spend_render
+from eyvan.sdk.spend import spend_of
 from eyvan.sdk.terminal import stream_is_terminal
+from eyvan.sdk.timeline import render, timeline
 from eyvan.server.api.schemas import (
     BatchSubmitRequest,
     DagNodeRequest,
@@ -251,13 +256,14 @@ class WorkloadCommandService:
         self._emit_submission_receipt(response, fleet=target.fleet)
         return self.follow(workload_id)
 
-    def follow(self, workload_id: str) -> int:
+    def follow(self, workload_id: str, *, since: timedelta | None = None) -> int:
         """Stream one workload's output until it stops, and report its outcome."""
 
         outcome = WorkloadFollower(
             client=self.session.client,
             output=JobTerminalOutput(stream=click.get_text_stream("stderr")),
             write=lambda line: click.echo(line),
+            since=since,
         ).follow(workload_id)
         return outcome.exit_code
 
@@ -345,6 +351,163 @@ class WorkloadCommandService:
         """Emit live process detail for one workload attempt."""
 
         self.renderer.emit(self.session.client.request("GET", f"/api/v1/workloads/{workload_id}/process-status"))
+
+    def _events_about(self, entity_type: str, entity_id: str, *, scope: WorkloadScope, limit: int) -> list[AuditEvent]:
+        """Read one entity's audit events, ignoring rows this client cannot parse."""
+
+        payload = self.session.client.request(
+            "GET",
+            "/api/v1/events",
+            params={
+                "org_id": scope.org_id,
+                "project_id": scope.project_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "limit": limit,
+            },
+            headers=self.session.workload_headers(scope),
+        )
+        events: list[AuditEvent] = []
+        for entry in payload if isinstance(payload, list) else []:
+            if not is_json_object(entry):
+                continue
+            try:
+                events.append(AuditEvent.model_validate(entry))
+            except ValidationError:
+                # A newer plane recording something this client cannot model.
+                # Skipped rather than fatal: an unreadable row must not take the
+                # rest of the narrative with it.
+                continue
+        return events
+
+    def timeline(self, workload_id: str, *, org_id: str | None, project_id: str | None, limit: int) -> None:
+        """Print one ordered narrative of what happened to a workload.
+
+        The workload's own events plus its leases', because "leased capacity"
+        and "capacity released" are recorded against the lease and are two of
+        the moments an operator most wants placed in the sequence.
+        """
+
+        scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
+        record = self.session.client.request("GET", f"/api/v1/workloads/{workload_id}")
+        events = self._events_about("workload", workload_id, scope=scope, limit=limit)
+        for lease_id in self._workload_lease_ids_from(record):
+            events.extend(self._events_about("lease", lease_id, scope=scope, limit=limit))
+        for line in render(timeline(events)):
+            click.echo(line)
+
+    def cost(
+        self,
+        workload_id: str,
+        *,
+        org_id: str | None,
+        project_id: str | None,
+        on_demand_hourly: float | None,
+    ) -> None:
+        """Print what one run cost, and what it would have cost on demand."""
+
+        scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
+        record = self.session.client.request("GET", f"/api/v1/workloads/{workload_id}")
+        leases = self.session.client.request(
+            "GET",
+            "/api/v1/leases",
+            params={"org_id": scope.org_id, "project_id": scope.project_id, "workload_id": workload_id},
+            headers=self.session.workload_headers(scope),
+        )
+        pools = self.session.client.request("GET", "/api/v1/capacity-pools")
+        pool_documents = [pool for pool in pools if is_json_object(pool)] if isinstance(pools, list) else []
+        lease_documents = [lease for lease in leases if is_json_object(lease)] if isinstance(leases, list) else []
+
+        used_pool = self._pool_of(record, pool_documents)
+        shape = str(used_pool["accelerator_type"]) if used_pool and used_pool.get("accelerator_type") else None
+        capacity_class = str(used_pool["capacity_class"]) if used_pool and used_pool.get("capacity_class") else None
+        priced_cells = self._priced_cells(lease_documents, pool_documents, used_pool)
+        hourly, source = self._on_demand_hourly(shape, pool_documents, on_demand_hourly)
+        state = str(record.get("state")) if is_json_object(record) and record.get("state") else "unknown"
+        for line in spend_render(
+            workload_id,
+            state,
+            spend_of(lease_documents, priced_cells=priced_cells),
+            shape=shape,
+            capacity_class=capacity_class,
+            on_demand_hourly=hourly,
+            on_demand_source=source,
+        ):
+            click.echo(line)
+
+    @staticmethod
+    def _pool_of(record: JsonValue, pools: list[dict]) -> dict | None:
+        """Return the pool one workload was pinned to, from its own spec."""
+
+        if not is_json_object(record):
+            return None
+        spec = record.get("spec")
+        metadata = spec.get("metadata") if is_json_object(spec) else None
+        pool_id = metadata.get("eyvan_pool") if is_json_object(metadata) else None
+        if not isinstance(pool_id, str):
+            return None
+        return next((pool for pool in pools if pool.get("id") == pool_id), None)
+
+    @staticmethod
+    def _priced_cells(leases: list[dict], pools: list[dict], used_pool: dict | None) -> set[str] | None:
+        """Return the cells whose pool declares a price, or ``None`` if unknowable.
+
+        A settled cost of zero from an unpriced pool is not a free run, so the
+        renderer needs to know whether every contributing lease came from a pool
+        that actually declares a unit price.
+        """
+
+        if used_pool is None:
+            return None
+        prices = used_pool.get("unit_prices")
+        if not is_json_object(prices) or not any(
+            isinstance(value, int | float) and not isinstance(value, bool) and value > 0 for value in prices.values()
+        ):
+            return set()
+        del pools
+        return {str(lease["cell_id"]) for lease in leases if isinstance(lease.get("cell_id"), str)}
+
+    @staticmethod
+    def _on_demand_hourly(
+        shape: str | None,
+        pools: list[dict],
+        supplied: float | None,
+    ) -> tuple[float | None, str]:
+        """Find an on-demand hourly price for ``shape``, or say why there is none.
+
+        Eyvan carries no price catalogue and no spot-discount constant, so this
+        is either a price an operator declared on an on-demand pool of the same
+        shape, or a number they passed in. Anything else would be invented, and
+        an invented saving is the figure a team puts in a budget.
+        """
+
+        if supplied is not None:
+            return supplied, "from --on-demand-price"
+        if shape is None:
+            return None, "this run's shape is not recorded"
+        for pool in pools:
+            if pool.get("accelerator_type") != shape or str(pool.get("capacity_class")) != "on-demand":
+                continue
+            prices = pool.get("unit_prices")
+            if not is_json_object(prices):
+                continue
+            for dimension in ("tpu", "gpu"):
+                value = prices.get(dimension)
+                if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+                    return float(value), f"declared by pool {pool.get('id')}"
+        return None, f"no on-demand pool for {shape} declares a price; pass --on-demand-price to compare"
+
+    @staticmethod
+    def _workload_lease_ids_from(record: JsonValue) -> tuple[str, ...]:
+        """Return the lease ids one workload document names, current or past."""
+
+        if not is_json_object(record):
+            return ()
+        ids = record.get("lease_ids")
+        if isinstance(ids, list):
+            return tuple(value for value in ids if isinstance(value, str))
+        single = record.get("lease_id")
+        return (single,) if isinstance(single, str) else ()
 
     def explain(self, workload_id: str) -> None:
         """Emit why one workload is or is not currently placeable."""
@@ -1240,6 +1403,66 @@ def workload_status(session: CliSession, workload_id: str) -> None:
     WorkloadCommandService(session).show(workload_id)
 
 
+@workload.command("timeline")
+@click.argument("workload_id")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--limit", type=int, default=200, show_default=True, help="Most events to read per entity.")
+@click.pass_obj
+def workload_timeline(
+    session: CliSession,
+    workload_id: str,
+    org_id: str | None,
+    project_id: str | None,
+    limit: int,
+) -> None:
+    """Show what happened to WORKLOAD_ID, in order, with elapsed times.
+
+    Submitted, admitted, leased, dispatched, preempted, retried, settled -- one
+    column, each line offset from the first. Every fact here was already in the
+    audit ledger; what was missing was reading them together, which is how
+    "eight minutes queued, thirty provisioning, two preemptions" becomes
+    visible at all.
+    """
+
+    WorkloadCommandService(session).timeline(workload_id, org_id=org_id, project_id=project_id, limit=limit)
+
+
+@workload.command("cost")
+@click.argument("workload_id")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option(
+    "--on-demand-price",
+    "on_demand_hourly",
+    type=float,
+    help="On-demand price per accelerator-hour, to compare against. Eyvan carries no price catalogue, so without "
+    "an on-demand pool declaring one this is the only way to see the comparison.",
+)
+@click.pass_obj
+def workload_cost(
+    session: CliSession,
+    workload_id: str,
+    org_id: str | None,
+    project_id: str | None,
+    on_demand_hourly: float | None,
+) -> None:
+    """Show what WORKLOAD_ID cost, and what it would have cost on demand.
+
+    The sentence a spot-first scheduler exists to say. Accelerator-hours are
+    measured and always known; money is reported only where a pool declares a
+    price, and the on-demand comparison only where somebody declared that
+    price too -- an invented saving is the figure a team puts in a budget.
+    """
+
+    WorkloadCommandService(session).cost(
+        workload_id,
+        org_id=org_id,
+        project_id=project_id,
+        on_demand_hourly=on_demand_hourly,
+    )
+
+
 @workload.command("explain")
 @click.argument("workload_id")
 @click.pass_obj
@@ -1272,20 +1495,44 @@ def workload_process_status(session: CliSession, workload_id: str) -> None:
     default=False,
     help="Keep printing output until the workload stops, then exit with its outcome.",
 )
+@click.option(
+    "--since",
+    metavar="DURATION",
+    help="Show only output newer than this, spelled 30s, 10m, 2h or 1d.",
+)
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
 @click.pass_obj
-def workload_logs(session: CliSession, workload_id: str, follow: bool) -> None:
+def workload_logs(
+    session: CliSession,
+    workload_id: str,
+    follow: bool,
+    since: str | None,
+    org_id: str | None,
+    project_id: str | None,
+) -> None:
     """Print driver logs for a workload attempt.
 
     Reads the live cell while one exists and this attempt's archive once it
     does not, so a preempted or finished job is still readable. With --follow
     this reattaches to a running job: output on stdout, progress on stderr, and
     an exit status of 0, 1 or 2 for succeeded, failed or cancelled.
+
+    ``--since`` bounds what is printed, not what is read: a log position is an
+    opaque backend cursor and none of the journals Eyvan reads can seek by
+    time, so the window is applied here rather than pretended at the source.
     """
 
-    if not follow:
-        click.echo(session.client.request_text("GET", f"/api/v1/workloads/{workload_id}/logs"))
+    service = WorkloadCommandService(session)
+    resolved = service.resolve(workload_id, org_id=org_id, project_id=project_id)
+    try:
+        window = None if since is None else parse_duration(since)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if not follow and window is None:
+        click.echo(session.client.request_text("GET", f"/api/v1/workloads/{resolved}/logs"))
         return
-    exit_code = WorkloadCommandService(session).follow(workload_id)
+    exit_code = service.follow(resolved, since=window)
     if exit_code:
         raise SystemExit(exit_code)
 
