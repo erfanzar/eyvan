@@ -57,6 +57,31 @@ WorkloadAction = tp.Literal["cancel", "checkpoint", "retry"]
 _WORKLOAD_ACTIONS: tuple[WorkloadAction, ...] = ("cancel", "checkpoint", "retry")
 
 
+def _requirements(declared: tp.Sequence[str], path: Path | None) -> tuple[str, ...]:
+    """Combine --with packages with a requirements file, read on this machine.
+
+    Read here rather than on the host, and this is the whole reason the flag
+    exists rather than passing `-r requirements.txt` through: that path names a
+    file on *your* machine, and the host has never seen it. Comments and blank
+    lines are dropped; an option line is refused, because `-r` or `--index-url`
+    inside the file would do on the host exactly what passing it directly would.
+    """
+
+    packages = [item.strip() for item in declared if item.strip()]
+    if path is not None:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            entry = line.split("#", 1)[0].strip()
+            if not entry:
+                continue
+            if entry.startswith("-"):
+                raise click.UsageError(
+                    f"{path}: {entry!r} is an installer option, not a package. Eyvan ships the packages "
+                    "themselves, so a file that redirects the install cannot travel with the job."
+                )
+            packages.append(entry)
+    return tuple(dict.fromkeys(packages))
+
+
 def _as_float(value: object) -> float:
     """Read a number from a JSON document, treating anything else as zero."""
 
@@ -222,6 +247,7 @@ class WorkloadCommandService:
         named_assets: tuple[str, ...] = (),
         pods: int = 1,
         zone: str | None = None,
+        dependencies: tuple[str, ...] = (),
         wait: bool = True,
     ) -> int:
         """Submit one pool-targeted command using context and fleet defaults.
@@ -257,6 +283,7 @@ class WorkloadCommandService:
                 named_assets=named_assets,
                 pods=pods,
                 zone=zone,
+                dependencies=dependencies,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -652,6 +679,21 @@ class WorkloadCommandService:
     help="Pin this job to one zone. A constraint, not a preference: without it the fleet places the job wherever "
     "its pools of this shape have capacity.",
 )
+@click.option(
+    "--with",
+    "dependencies",
+    multiple=True,
+    metavar="PACKAGE",
+    help="Install this package on the host before the command runs, over whatever the image provides. "
+    "Repeatable. Use instead of rebuilding an image to add one library.",
+)
+@click.option(
+    "--with-requirements",
+    "requirements_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Read packages from a requirements file and install them like --with. Read here, not on the host: "
+    "the fleet never opens a path from your machine.",
+)
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
 @click.option("--name")
@@ -735,6 +777,8 @@ def run_workload(
     cpu_only: bool,
     pods: int,
     zone: str | None,
+    dependencies: tuple[str, ...],
+    requirements_file: Path | None,
     org_id: str | None,
     project_id: str | None,
     name: str | None,
@@ -782,6 +826,7 @@ def run_workload(
             command = (target, *command)
         target = next(iter(named.values()))
 
+    declared = _requirements(dependencies, requirements_file)
     exit_code = WorkloadCommandService(session).run(
         target_value=target,
         org_id=org_id,
@@ -804,6 +849,7 @@ def run_workload(
         named_assets=named_assets,
         pods=pods,
         zone=zone,
+        dependencies=declared,
         wait=not no_wait,
     )
     if exit_code:

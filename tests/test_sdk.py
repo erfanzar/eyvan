@@ -97,6 +97,9 @@ def test_sync_sdk_runs_on_configured_node_type() -> None:
         "checkpoint_grace_seconds": 0,
         "estimated_duration_seconds": 3600,
         "named_assets": [],
+        # Job intent too: what a job needs installed is a fact about the job,
+        # and empty is what one that asked for nothing sends.
+        "dependencies": [],
     }
     client.close()
 
@@ -190,6 +193,9 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "checkpoint_grace_seconds": 0,
         "estimated_duration_seconds": 3600,
         "named_assets": [],
+        # Job intent too: what a job needs installed is a fact about the job,
+        # and empty is what one that asked for nothing sends.
+        "dependencies": [],
     }
     client.close()
 

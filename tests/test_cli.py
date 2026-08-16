@@ -2050,6 +2050,9 @@ def test_run_sends_only_command_intent_and_logical_pool_target(monkeypatch) -> N
         "checkpoint_grace_seconds": 0,
         "estimated_duration_seconds": 3600,
         "named_assets": [],
+        # Job intent too: what a job needs installed is a fact about the job,
+        # and empty is what one that asked for nothing sends.
+        "dependencies": [],
     }
     assert (
         not {

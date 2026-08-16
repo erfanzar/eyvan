@@ -224,6 +224,11 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: enters a record.
     secret_mounts: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, str] = Field(default_factory=dict)
+    #: Packages installed on the host before the command runs, layered over
+    #: whatever the image provides. The missing half of a per-job runtime
+    #: environment: the working tree and the variables could already travel with
+    #: a job, while adding one library meant rebuilding an image.
+    dependencies: tuple[str, ...] = ()
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
     max_failure_retries: int = Field(default=0, ge=0)
     max_preemption_retries: int = Field(default=10, ge=0)
@@ -275,6 +280,10 @@ class PoolCallableSubmitRequest(ApiModel):
     execution: CallableExecution
     name: str | None = Field(default=None, min_length=1, max_length=200)
     environment: dict[str, str] = Field(default_factory=dict)
+    #: Packages installed on the host before the callable worker starts, layered
+    #: over what the image provides. The wrapper `exec`s into the worker, so the
+    #: pickled callable's imports resolve against them.
+    dependencies: tuple[str, ...] = ()
     #: Secret *references*, never values. Unlike ``environment``, which is
     #: persisted in the spec, these are resolved at dispatch and the value never
     #: enters a record.

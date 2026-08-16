@@ -393,6 +393,29 @@ class _ControllerWorkloadCommands:
             raise StaleOutboxCommand(f"workload {workload.id!r} lease membership changed")
         return tuple(zip(concrete_leases, concrete_cells, strict=True))
 
+    @staticmethod
+    def _dependency_entrypoint(dependencies: tp.Sequence[str], command: str) -> str:
+        """Wrap a command so its declared packages are installed before it runs.
+
+        Returns ``command`` unchanged when nothing is declared, so a job that
+        asks for no packages pays nothing -- no wrapper process, no cache
+        lookup, and the command the executor runs is still the command the user
+        wrote.
+
+        Each requirement is a separate argument rather than one string. They
+        reach the host through a shell, and a version specifier is full of
+        characters a shell reads: ``jax>=0.4`` unquoted is a redirect that
+        truncates a file called ``=0.4``.
+        """
+
+        if not dependencies:
+            return command
+        parts = ["python", "-m", "eyvan.worker.runtime.dependency_entry"]
+        for requirement in dependencies:
+            parts.extend(("--require", requirement))
+        parts.append("--")
+        return " ".join(shlex.quote(part) for part in parts) + " " + command
+
     def _workspace_entrypoint(
         self,
         workload: WorkloadRecord,
@@ -635,9 +658,13 @@ class _ControllerWorkloadCommands:
             # return, which is precisely why `eyvan run` could not ship a
             # working tree and running your own code meant baking an image.
             workspace = workload.spec.resolved_workspace()
-            if workspace is None:
-                return execution.command, environment
-            return self._workspace_entrypoint(workload, workspace, execution.command, environment)
+            command = execution.command
+            if workspace is not None:
+                command, environment = self._workspace_entrypoint(workload, workspace, command, environment)
+            # Outermost, so the packages are in place before anything else runs
+            # -- including the workspace entry, which is itself `python -m`. The
+            # wrapper `exec`s, so PATH survives into the job.
+            return self._dependency_entrypoint(workload.spec.dependencies, command), environment
 
         artifact_uri = execution.artifact_uri
         result_uri = execution.result_uri
@@ -750,7 +777,11 @@ class _ControllerWorkloadCommands:
                     "(defensible only where the plane is unreachable outside a private network)"
                 )
             environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
-        return shlex.join(parts), environment
+        # Wrapped for the same reason the command path is, and it works for the
+        # same reason: the wrapper `exec`s, so the callable worker starts under
+        # the prepared environment and the pickled callable's imports resolve
+        # against the packages the submitter asked for.
+        return self._dependency_entrypoint(workload.spec.dependencies, shlex.join(parts)), environment
 
     @staticmethod
     def _outbox_dispatch_reservation(command: OutboxRecord) -> WorkloadDispatchReservation | None:

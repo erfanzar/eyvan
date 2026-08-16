@@ -69,6 +69,7 @@ class AcceleratorConfig(tp.Protocol):
     checkpoint_hook: str | None
     checkpoint_output_uri: str | None
     can_submit_children: bool
+    dependencies: tp.Sequence[str]
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -145,6 +146,11 @@ class TpuConfig:
     #: under its owner's identity. Off by default: a credential nobody asked
     #: for is one nobody is watching.
     can_submit_children: bool = False
+    #: Packages installed on the cell before this callable is loaded, over what
+    #: the image provides. The wrapper `exec`s into the callable worker, so the
+    #: pickled function's imports resolve against them -- which is the point:
+    #: adding one library should not mean rebuilding an image.
+    dependencies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
@@ -191,6 +197,11 @@ class GpuConfig:
     #: under its owner's identity. Off by default: a credential nobody asked
     #: for is one nobody is watching.
     can_submit_children: bool = False
+    #: Packages installed on the cell before this callable is loaded, over what
+    #: the image provides. The wrapper `exec`s into the callable worker, so the
+    #: pickled function's imports resolve against them -- which is the point:
+    #: adding one library should not mean rebuilding an image.
+    dependencies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
@@ -227,6 +238,11 @@ class CpuConfig:
     #: under its owner's identity. Off by default: a credential nobody asked
     #: for is one nobody is watching.
     can_submit_children: bool = False
+    #: Packages installed on the cell before this callable is loaded, over what
+    #: the image provides. The wrapper `exec`s into the callable worker, so the
+    #: pickled function's imports resolve against them -- which is the point:
+    #: adding one library should not mean rebuilding an image.
+    dependencies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)

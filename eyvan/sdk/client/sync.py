@@ -188,6 +188,7 @@ class EyvanClient:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -214,6 +215,7 @@ class EyvanClient:
             checkpoint_grace_seconds=checkpoint_grace_seconds,
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
+            dependencies=dependencies,
         )
         response = self._mutating_request(
             "POST",
@@ -249,6 +251,7 @@ class EyvanClient:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -276,6 +279,7 @@ class EyvanClient:
             checkpoint_grace_seconds=checkpoint_grace_seconds,
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
+            dependencies=dependencies,
         )
         response = self._mutating_request(
             "POST",

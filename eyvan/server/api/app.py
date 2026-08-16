@@ -2256,6 +2256,7 @@ def create_app(
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
+            dependencies=request.dependencies,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2307,6 +2308,7 @@ def create_app(
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
+            dependencies=request.dependencies,
             idempotency_key=idempotency_key,
         )
         if replayed:

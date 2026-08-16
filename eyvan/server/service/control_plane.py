@@ -943,6 +943,7 @@ class ControlPlaneService:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -973,6 +974,10 @@ class ControlPlaneService:
                 # working tree is a different submission, and a replay that
                 # ignored the tree would silently run yesterday's code.
                 "workspace": workspace.sha256 if workspace is not None else None,
+                # Part of what was asked for: the same command with a different
+                # dependency set is a different job, and a replay that ignored
+                # them would hand back a run built against yesterday's packages.
+                "dependencies": list(dependencies),
             }
         )
         async with self.repository.transaction() as tx:
@@ -1076,6 +1081,7 @@ class ControlPlaneService:
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
+                dependencies=dependencies,
             )
             return await self._store_workload(
                 tx,
@@ -1116,6 +1122,7 @@ class ControlPlaneService:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on an atomic ``pods``-worker TPU cell."""
@@ -1158,6 +1165,10 @@ class ControlPlaneService:
                 "metadata": dict(metadata or {}),
                 "max_retries": max_retries,
                 "max_failure_retries": max_failure_retries,
+                # Part of what was asked for: the same callable against a
+                # different dependency set is a different job, and a replay
+                # ignoring them would return one built on other packages.
+                "dependencies": list(dependencies),
             }
         )
         async with self.repository.transaction() as tx:
@@ -1312,6 +1323,7 @@ class ControlPlaneService:
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
+                dependencies=dependencies,
             )
             return await self._store_workload(
                 tx,
@@ -1503,6 +1515,7 @@ class ControlPlaneService:
         checkpoint_grace_seconds: int = 0,
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
         alternate_pool_ids: tuple[str, ...] = (),
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
@@ -1560,6 +1573,7 @@ class ControlPlaneService:
             checkpoint_grace_seconds=checkpoint_grace_seconds,
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
+            dependencies=dependencies,
         )
 
     async def _replayed_workload(

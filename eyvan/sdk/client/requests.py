@@ -51,6 +51,7 @@ def pool_workload_request(
     checkpoint_grace_seconds: int = 0,
     estimated_duration_seconds: int = 3600,
     named_assets: tuple[str, ...] = (),
+    dependencies: tuple[str, ...] = (),
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -62,6 +63,7 @@ def pool_workload_request(
         environment=dict(environment or {}),
         secret_mounts=dict(secret_mounts or {}),
         metadata=dict(metadata or {}),
+        dependencies=dependencies,
         max_retries=max_retries,
         max_failure_retries=max_failure_retries,
         max_preemption_retries=max_preemption_retries,
@@ -104,6 +106,7 @@ def pool_callable_request(
     checkpoint_grace_seconds: int = 0,
     estimated_duration_seconds: int = 3600,
     named_assets: tuple[str, ...] = (),
+    dependencies: tuple[str, ...] = (),
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -132,6 +135,7 @@ def pool_callable_request(
         checkpoint_grace_seconds=checkpoint_grace_seconds,
         estimated_duration_seconds=estimated_duration_seconds,
         named_assets=named_assets,
+        dependencies=dependencies,
     )
 
 

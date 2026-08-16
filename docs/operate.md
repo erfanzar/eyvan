@@ -521,6 +521,42 @@ The job streams to stdout and its progress to stderr; the command exits 0, 1 or
 it looks like. **Ctrl-C detaches and does not cancel** -- the job is durable and
 outlives whoever submitted it. Reattach with `eyvan workload logs ID --follow`.
 
+### Packages this job needs
+
+```
+eyvan run --tpu v6e-8 --with flax --with 'optax>=0.2' -- python train.py
+eyvan run --tpu v6e-8 --with-requirements requirements.txt -- python train.py
+```
+
+Installed on the host before the command runs, **over** whatever the image
+provides rather than instead of it. That layering is not an optimization: a
+clean virtual environment on a TPU host has no `jax` and no `libtpu`, so a job
+that asked for one small library would install a second, CPU-only JAX over a
+working one and die on its first device call.
+
+One environment per distinct set of packages, per host, content-addressed and
+reused -- eight ranks on one machine declaring the same packages install once,
+under a lock. The completion marker is written last, so an attempt preempted
+mid-install leaves a directory that is rebuilt rather than a half-populated one
+that is trusted. **An install that fails fails the job**, before the command
+starts: running anyway produces an `ImportError` minutes later, on an
+accelerator, blamed on your code.
+
+`--with-requirements` is read on *your* machine and the packages travel with the
+job. Passing `-r requirements.txt` as a package is refused for the same reason,
+here and inside the file: that path names a file the host has never seen, and
+`--index-url` points the install somewhere the submitter chose.
+
+Callables carry them too, through `TpuConfig(dependencies=[...])` and its GPU
+and CPU siblings. The wrapper `exec`s into the callable worker, so the pickled
+function's imports resolve against the packages you asked for -- which is the
+case that needs this most, since a pickle's dependencies are whatever it
+happens to reference.
+
+Cached under `/var/lib/eyvan/runtime-envs`, or `EYVAN_RUNTIME_ENV_DIR` when the
+runtime sets one. A host where neither is writable says so and caches under the
+working directory, where the next attempt will not find it.
+
 ### From the dashboard
 
 **Submit workload** on the Workloads page asks the same four things: shape,

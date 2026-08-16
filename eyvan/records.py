@@ -920,6 +920,23 @@ class WorkloadDefinition(EyvanModel):
 
     gang: ResourceGang = Field(default_factory=ResourceGang)
     environment: dict[str, str] = Field(default_factory=dict)
+    #: Packages installed on the host before this job's command runs, layered
+    #: over whatever the image provides rather than replacing it. The missing
+    #: half of a per-job runtime environment: a workload could already carry its
+    #: working tree and its variables, while adding one library meant rebuilding
+    #: an image and rolling a fleet.
+    #:
+    #: Applies to every execution kind. The wrapper installs and then ``exec``s,
+    #: so a callable's own worker starts under the prepared environment -- the
+    #: interpreter is the host's, with the job's packages layered over it, which
+    #: is what the pickled callable's imports resolve against.
+    #:
+    #: Requirement strings only. An entry starting with ``-`` is refused because
+    #: it is an installer *option*, not a package: ``-r requirements.txt`` names
+    #: a file on the host that nothing shipped, and ``--index-url`` redirects
+    #: the install to somewhere the submitter chose. Both would be honoured by
+    #: pip and neither is what a dependency list means.
+    dependencies: tuple[str, ...] = ()
     backend_options: JsonDocument = Field(default_factory=dict)
     required_executor: CanonicalOptionalExecutor = None
     metadata: dict[str, str] = Field(default_factory=dict)
@@ -1011,6 +1028,18 @@ class WorkloadDefinition(EyvanModel):
             raise ValueError("checkpoint hook and output URI require checkpointable=true")
         if self.checkpointable and not (self.checkpoint_hook and self.checkpoint_output_uri):
             raise ValueError("checkpointable workloads require a checkpoint hook and durable output URI")
+        for requirement in self.dependencies:
+            _validate_string(requirement, field_name="dependency")
+            if requirement.startswith("-"):
+                # An installer option, not a package. `-r requirements.txt`
+                # names a file on the host that nothing shipped, and
+                # `--index-url` points the install somewhere the submitter
+                # chose; pip honours both, and neither is a dependency.
+                raise ValueError(
+                    f"dependency {requirement!r} is an installer option, not a package; list the packages themselves"
+                )
+            if any(character in requirement for character in "\x00\n\r"):
+                raise ValueError("dependencies must not contain newlines or null bytes")
         _validate_string_map(self.required_labels, field_name="required labels")
         _validate_string_map(self.preferred_labels, field_name="preferred labels")
         _validate_string_map(self.metadata, field_name="metadata")
