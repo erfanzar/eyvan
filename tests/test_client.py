@@ -213,3 +213,43 @@ async def test_async_transport_replaces_connection_traceback_with_actionable_eyv
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__ is True
     await transport.aclose()
+
+
+def test_a_rejected_unknown_field_is_named_as_version_skew() -> None:
+    """Eyvan's records are extra="forbid" on purpose.
+
+    So a rejected unknown field means this client sent something the control
+    plane's models do not carry -- a version skew, not a malformed request.
+    Reported as a bare pydantic dump it reads like a payload bug, which is how
+    `eyvan up` failed against a head one commit behind with nothing naming the
+    cause.
+    """
+
+    import httpx
+
+    from eyvan.sdk.client.transport import EyvanHTTPError
+
+    request = httpx.Request("POST", "http://127.0.0.1:8080/api/v1/fleets")
+    response = httpx.Response(422, request=request, json={"detail": "x"})
+    detail = "[{'type': 'extra_forbidden', 'loc': ['body', 'pools', 0, 'runtime', 'python']}]"
+
+    error = EyvanHTTPError(response, detail)
+
+    assert "version skew" in str(error)
+    assert "eyvan capacity builds" in str(error)
+    assert "eyvan runtime deploy" in str(error)
+
+
+def test_an_ordinary_validation_error_is_not_called_skew() -> None:
+    """A genuinely malformed request must not be blamed on the plane's build."""
+
+    import httpx
+
+    from eyvan.sdk.client.transport import EyvanHTTPError
+
+    request = httpx.Request("POST", "http://127.0.0.1:8080/api/v1/fleets")
+    response = httpx.Response(422, request=request, json={"detail": "x"})
+
+    error = EyvanHTTPError(response, "[{'type': 'missing', 'loc': ['body', 'name']}]")
+
+    assert "version skew" not in str(error)

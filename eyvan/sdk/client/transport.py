@@ -31,6 +31,18 @@ class EyvanHTTPError(httpx.HTTPStatusError):
         message = f"Eyvan API returned {response.status_code} {response.reason_phrase}"
         if detail:
             message = f"{message}: {detail}"
+        if response.status_code == 422 and "extra_forbidden" in detail:
+            # Name what this is. Eyvan's records are extra="forbid" deliberately,
+            # so a rejected unknown field means this client sent something the
+            # control plane's models do not carry -- a version skew, not a
+            # malformed request. Reported as a bare pydantic dump it reads like a
+            # bug in the payload: `eyvan up` failed exactly this way against a
+            # head one commit behind, with nothing naming the cause.
+            message = (
+                f"{message}\n\nThis is a version skew: the control plane rejected a field this client sent. "
+                "Compare builds with 'eyvan capacity builds', then bring the plane up to this source with "
+                "'eyvan runtime deploy'."
+            )
         super().__init__(message, request=response.request, response=response)
 
 

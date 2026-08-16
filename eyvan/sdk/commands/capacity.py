@@ -72,6 +72,21 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
     click.echo(
         f"control plane  {plane.get('version')}  {plane_digest or 'no digest: ' + str(plane.get('digest_detail'))}"
     )
+
+    # This client's own build, beside the plane's. The comparison used to start
+    # at the control plane, so the one skew an operator meets first -- a CLI
+    # newer than the head it is talking to -- was the one this command could not
+    # show. That skew surfaces instead as a raw pydantic 422 from `eyvan up`.
+    from eyvan._internal.build_identity import build_identity
+
+    client = build_identity()
+    client_digest = client.source_digest
+    click.echo(f"this client   {client.version}  {client_digest or 'no digest: ' + str(client.digest_detail)}")
+    if client_digest and plane_digest and client_digest != plane_digest:
+        click.echo(
+            "  this client and the control plane are different builds; "
+            "run 'eyvan runtime deploy' to bring the plane up to this source"
+        )
     silent = 0
     for entry in agents if isinstance(agents, list) else []:
         if not isinstance(entry, dict):
