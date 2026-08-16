@@ -367,6 +367,44 @@ function parseLogLine(line: string): Pick<LogEntry, "timestamp" | "level" | "sou
   return { timestamp, level, source, message: rest || line };
 }
 
+/** One structured log record as the follow stream frames it. */
+interface RawLogRecord {
+  message: string;
+  stream?: string;
+  timestamp?: string | null;
+  rank?: number;
+  pid?: number | null;
+}
+
+/**
+ * Project one streamed record onto the entry the log view renders.
+ *
+ * The rank leads the source column because in a gang it is the identity that
+ * matters: sixteen hosts printing the same line is normal, and one of them
+ * printing something different is the entire diagnosis. A bracketed tag inside
+ * the line is kept alongside it rather than instead of it -- the program's own
+ * idea of where the line came from does not replace which process said it.
+ *
+ * The record's capture time is a fallback, not the preference. A line that
+ * stamps itself dates the event; the record dates the read, and on a host that
+ * has been buffering those differ by however long the buffer held.
+ */
+function mapLogRecord(record: RawLogRecord, id: string): LogEntry {
+  const parsed = parseLogLine(record.message);
+  const rank = typeof record.rank === "number" ? `rank ${record.rank}` : undefined;
+  const source = [rank, parsed.source].filter(Boolean).join(" · ") || undefined;
+  const stream =
+    record.stream === "stdout" || record.stream === "stderr" ? record.stream : ("unknown" as const);
+  return {
+    id,
+    timestamp: parsed.timestamp ?? record.timestamp ?? undefined,
+    level: parsed.level,
+    source,
+    stream,
+    message: parsed.message,
+  };
+}
+
 /** Derive a capacity-acquisition percentage from the workload progress contract. */
 function mapProgressPercent(progress: RawWorkloadProgress): number | undefined {
   if (progress.phase === "terminal") {
@@ -615,6 +653,67 @@ export class EyvanApiClient {
         signal,
         onEvent,
         onConnectionChange,
+      });
+    } catch (streamError) {
+      if (streamError instanceof EventStreamHttpError) {
+        if (streamError.status === 401) rejectSession();
+        throw new ApiError(streamError.message, streamError.status);
+      }
+      throw streamError;
+    }
+  }
+
+  /**
+   * Follow one workload's output as it is produced, record by record.
+   *
+   * A data channel, unlike `followEvents`: these frames carry the lines
+   * themselves, so nothing is refetched and no page read can substitute. That
+   * is why it is a separate stream -- the audit stream is keyed on a global
+   * sequence for one (org, project), while log records are per
+   * (workload, attempt, rank) and have no global order at all.
+   *
+   * `onAttemptChanged` is not a notification the caller may ignore. A retry
+   * replaces the remote execution, so the lines that follow belong to a
+   * different process; appending them to what is already on screen would show
+   * a job that resumed where it left off, which is the one story the reader
+   * must not be told.
+   *
+   * Resolves only when `signal` aborts. In demo mode it resolves immediately:
+   * there is no process to follow, and replaying canned lines under a "live"
+   * indicator is a lie the reader cannot detect.
+   */
+  async followWorkloadLogs(
+    id: string,
+    handlers: {
+      onRecord: (entry: LogEntry) => void;
+      onAttemptChanged: (attempt: number) => void;
+      onConnectionChange?: (connected: boolean) => void;
+    },
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.forceDemo) return;
+    // Only ever incremented, and never derived from the record's own content:
+    // two ranks emit identical lines at the same millisecond routinely, and a
+    // key collision makes React reuse one row for both.
+    let delivered = 0;
+    try {
+      await followEventStream({
+        url: `${this.baseUrl}/workloads/${encodeURIComponent(id)}/logs/stream`,
+        headers: apiAuthHeaders(),
+        signal,
+        onConnectionChange: handlers.onConnectionChange,
+        onEvent: (event) => {
+          if (event.event === "log.attempt_changed") {
+            const attempt = (event.data as { attempt?: number } | null)?.attempt;
+            if (typeof attempt === "number") handlers.onAttemptChanged(attempt);
+            return;
+          }
+          if (event.event !== "log.record") return;
+          const record = event.data as RawLogRecord | null;
+          if (!record || typeof record.message !== "string") return;
+          delivered += 1;
+          handlers.onRecord(mapLogRecord(record, `${id}-stream-${delivered}`));
+        },
       });
     } catch (streamError) {
       if (streamError instanceof EventStreamHttpError) {

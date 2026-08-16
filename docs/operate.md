@@ -546,6 +546,8 @@ eyvan workload status <id>
 eyvan workload explain <id>
 eyvan workload process-status <id>     # live process detail
 eyvan workload logs <id>               # concatenated text
+eyvan workload logs <id> --follow      # reattach to a running job
+eyvan workload logs <id> --since 10m   # only output newer than that
 eyvan workload log-page <id>           # structured, per-rank, resumable
 eyvan workload children <id>           # the job tree
 eyvan workload exec <id> -- py-spy dump --pid ...   # a diagnostic beside it
@@ -623,6 +625,30 @@ that admits a hole.
 Archived logs are kept for `EYVAN_LOG_RETENTION_S` (30 days by default),
 separately from the general artifact window: a callable can be rebuilt from its
 source, and a log cannot.
+
+### Watching one in the browser
+
+The workload page's **Logs** tab has a *Follow* button. It reads the same
+per-rank stream `--follow` does, so each line is labelled with the rank that
+printed it -- in a gang that is usually the diagnosis, because sixteen hosts
+printing the same line is normal and one printing something else is not.
+
+Three things it does that a plain tail does not:
+
+* **A retry clears the view** and says which attempt started. The lines after a
+  retry come from a different process, and showing them under the previous
+  attempt's tail is how a reader concludes a job resumed when it started over.
+* **A dropped connection is named**, because a stream that stopped and a job
+  that stopped printing look identical and call for opposite reactions. It
+  reconnects on its own, resuming from the last line it was given rather than
+  replaying the attempt.
+* **It keeps the newest 2,000 lines** and reports how many it dropped. A
+  followed job is unbounded; a tab holding a week-long run's output stops
+  responding long before it runs out of memory.
+
+Scrolling up stops the view following the tail, and returning to the bottom
+resumes it. Use `--follow` when you want the run's exit status: the button
+follows output, and the CLI exits 0, 1 or 2 with the job.
 
 ## Reading a managed service
 

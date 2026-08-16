@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { cellStatus, computeOverview, EyvanApiClient, workloadStatus } from "./client";
+import type { LogEntry } from "../types";
 import { consumeSessionNotice } from "../auth/oidc";
 
 describe("EyvanApiClient", () => {
@@ -1136,5 +1137,112 @@ describe("provider TPU quota", () => {
     await expect(new EyvanApiClient("/api/v1", false).getTpuQuota()).rejects.toEqual(
       expect.objectContaining({ name: "ApiError", status: 403 }),
     );
+  });  // ------------------------------------------------------------------ following one workload's output
+
+  /** A response whose body streams the given SSE text, then ends. */
+  function streamingResponse(text: string): Response {
+    const encoder = new TextEncoder();
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(text));
+          controller.close();
+        },
+      }),
+      { status: 200 },
+    );
+  }
+
+  /**
+   * Follow a scripted stream until `expected` callbacks have landed, then stop.
+   *
+   * The abort is the test's, not the client's: a follow resolves only when its
+   * caller aborts, because a stream that ended is a connection that dropped and
+   * the right response to that is to reconnect. Waiting for it to finish on its
+   * own would be waiting for the bug.
+   */
+  async function follow(text: string, expected: number) {
+    const controller = new AbortController();
+    const entries: LogEntry[] = [];
+    const attempts: number[] = [];
+    const stop = () => {
+      if (entries.length + attempts.length >= expected) controller.abort();
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamingResponse(text)));
+    await new EyvanApiClient("/api/v1", false).followWorkloadLogs(
+      "wl-1",
+      {
+        onRecord: (entry) => {
+          entries.push(entry);
+          stop();
+        },
+        onAttemptChanged: (attempt) => {
+          attempts.push(attempt);
+          stop();
+        },
+      },
+      controller.signal,
+    );
+    return { entries, attempts };
+  }
+
+  it("names the rank that produced each followed line", async () => {
+    // The identity that matters in a gang. Sixteen hosts printing the same line
+    // is normal; one printing something different is the whole diagnosis, and a
+    // merged view cannot express it.
+    const { entries } = await follow(
+      'event: log.record\ndata: {"message":"step 1","stream":"stdout","rank":0,"timestamp":"2026-08-16T10:00:00Z"}\n\n' +
+        'event: log.record\ndata: {"message":"step 1","stream":"stderr","rank":3,"timestamp":"2026-08-16T10:00:01Z"}\n\n',
+      2,
+    );
+
+    expect(entries.map((entry) => entry.source)).toEqual(["rank 0", "rank 3"]);
+    expect(entries.map((entry) => entry.stream)).toEqual(["stdout", "stderr"]);
+    // Two ranks, the same text: distinct keys, or React renders one row twice.
+    expect(new Set(entries.map((entry) => entry.id)).size).toBe(2);
+  });
+
+  it("prefers the timestamp the line carries over the time it was read", async () => {
+    // On a host that has been buffering, those differ by however long the
+    // buffer held -- and the reader is trying to date the event, not the read.
+    const { entries } = await follow(
+      'event: log.record\ndata: {"message":"2026-08-16T09:00:00Z INFO [trainer] loss=1.2","rank":1,"timestamp":"2026-08-16T11:30:00Z"}\n\n',
+      1,
+    );
+
+    expect(entries[0].timestamp).toBe("2026-08-16T09:00:00Z");
+    expect(entries[0].level).toBe("INFO");
+    // The program's own tag is kept beside the rank, not instead of it.
+    expect(entries[0].source).toBe("rank 1 · trainer");
+    expect(entries[0].message).toBe("loss=1.2");
+  });
+
+  it("hands an attempt change to the caller rather than folding it into the output", async () => {
+    // The lines after it come from a different process. Delivered as ordinary
+    // records they read as the same run continuing, which is the one conclusion
+    // a follower must not reach.
+    const { entries, attempts } = await follow(
+      'event: log.attempt_changed\ndata: {"attempt":2}\n\n' +
+        'event: log.record\ndata: {"message":"restarted","rank":0}\n\n',
+      2,
+    );
+
+    expect(attempts).toEqual([2]);
+    expect(entries.map((entry) => entry.message)).toEqual(["restarted"]);
+  });
+
+  it("does not stream canned lines under a live indicator in demo mode", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    let connected: boolean | undefined;
+
+    await new EyvanApiClient("/api/v1", true).followWorkloadLogs(
+      "wl-1",
+      { onRecord: () => {}, onAttemptChanged: () => {}, onConnectionChange: (value) => (connected = value) },
+      new AbortController().signal,
+    );
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(connected).toBeUndefined();
   });
 });

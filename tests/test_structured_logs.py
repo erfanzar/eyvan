@@ -2124,6 +2124,14 @@ def test_the_stream_response_disables_proxy_buffering() -> None:
     assert response.headers["x-accel-buffering"] == "no"
 
 
+_AUTH = {
+    "X-Eyvan-User": "alice",
+    "X-Eyvan-Roles": "operator",
+    "X-Eyvan-Org": "acme",
+    "X-Eyvan-Project": "research",
+}
+
+
 def _stream_client(controller_pages: list[dict]):
     """A control plane whose log pages are scripted, so following is deterministic."""
 
@@ -2297,14 +2305,89 @@ def test_a_reconnecting_browser_resumes_from_last_event_id() -> None:
     assert seen == ["2:0=c9|1=c8"], "the reconnect replayed from the tail instead of resuming"
 
 
+def test_a_follower_is_told_the_position_it_should_reconnect_from() -> None:
+    """The other half of the resume, and the half that was missing.
+
+    The route reads ``Last-Event-ID`` and resumes from it, but emitted no ``id``
+    on any frame -- so a browser had nothing to send back, and every dropped
+    connection replayed the attempt from the beginning. Honouring a header you
+    never write is not a resume protocol; it is a read of something no reader
+    can produce.
+    """
+
+    client, app = _stream_client(
+        [
+            {
+                "attempt": 1,
+                "attempt_changed": False,
+                "records": [
+                    {"message": "step 1", "stream": "stdout", "rank": 0, "cursor": "rank-0-private"},
+                    {"message": "step 2", "stream": "stdout", "rank": 1, "cursor": "rank-1-private"},
+                ],
+                "next_cursor": "1:0=c1|1=c2",
+            }
+        ]
+    )
+    _seed_workload(app)
+
+    response = client.get("/api/v1/workloads/wl-1/logs/stream", params={"follow": "false"}, headers=_AUTH)
+
+    identifiers = [line.removeprefix("id: ") for line in response.text.splitlines() if line.startswith("id: ")]
+    assert identifiers == ["1:0=c1|1=c2"], "the page's joined cursor is the only resumable position"
+    # A rank's own cursor addresses that rank's journal in its backend's private
+    # encoding. Handed back as a stream position it is not resumable, and the
+    # route's own preflight would refuse it.
+    assert "id: rank-0-private" not in response.text
+
+
+def test_the_resume_position_arrives_only_after_the_page_it_covers() -> None:
+    """An id on the first frame claims delivery of records not yet sent.
+
+    A reader that drops between them reconnects past output it never saw, and
+    the loss is silent: the stream resumes cleanly from a position that lied.
+    """
+
+    client, app = _stream_client(
+        [
+            {
+                "attempt": 1,
+                "attempt_changed": False,
+                "records": [
+                    {"message": "first", "stream": "stdout", "rank": 0},
+                    {"message": "last", "stream": "stdout", "rank": 0},
+                ],
+                "next_cursor": "1:0=c2",
+            }
+        ]
+    )
+    _seed_workload(app)
+
+    response = client.get("/api/v1/workloads/wl-1/logs/stream", params={"follow": "false"}, headers=_AUTH)
+
+    assert response.text.index("first") < response.text.index("id: 1:0=c2"), "the id preceded a record it covers"
+
+
+def test_an_attempt_change_carries_the_new_attempts_position() -> None:
+    """A reconnect after a retry must not resume from the dead attempt.
+
+    The announcement is the last frame of its page when the new attempt has
+    printed nothing yet, so it is what carries the reset position -- and a
+    reader that reconnects immediately after being told the attempt changed
+    would otherwise send back the previous attempt's cursor.
+    """
+
+    client, app = _stream_client([{"attempt": 2, "attempt_changed": True, "records": [], "next_cursor": "2:"}])
+    _seed_workload(app)
+
+    response = client.get("/api/v1/workloads/wl-1/logs/stream", params={"follow": "false"}, headers=_AUTH)
+
+    frames = [frame for frame in response.text.split("\n\n") if "event: log.attempt_changed" in frame]
+    assert len(frames) == 1
+    assert "id: 2:" in frames[0]
+
+
 # --------------------------------------------------------------------------- a broken cursor is refused on the wire
 
-_AUTH = {
-    "X-Eyvan-User": "alice",
-    "X-Eyvan-Roles": "operator",
-    "X-Eyvan-Org": "acme",
-    "X-Eyvan-Project": "research",
-}
 _UNREADABLE_CURSOR = "eyvan-log-v2.!!!not-base64!!!"
 
 

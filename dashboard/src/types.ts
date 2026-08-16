@@ -106,6 +106,17 @@ export interface LogEntry {
   level?: "DEBUG" | "INFO" | "WARN" | "ERROR";
   /** Present only when the log line carries a bracketed source tag. */
   source?: string;
+  /**
+   * Which of the process's two streams produced the line.
+   *
+   * Populated only by the structured follow, because only it knows: the
+   * one-shot text endpoint returns lines already merged, and inferring the
+   * stream from the text would invent an attribution. Deliberately not folded
+   * into `level` -- plenty of healthy programs write progress to stderr, and
+   * rendering every one of those lines as an error is how a working job comes
+   * to look like a failing one.
+   */
+  stream?: "stdout" | "stderr" | "unknown";
   message: string;
 }
 

@@ -3537,16 +3537,37 @@ def create_app(
             while True:
                 page = await controller.workload_log_page(workload_id, after=position, limit=limit)
                 records = page.get("records")
+                advanced = page.get("next_cursor")
+                frames: list[tuple[object, str]] = []
                 if page.get("attempt_changed"):
                     # Exactly one typed event, then the cursor resets. Silently
                     # continuing would show the new attempt's first lines
                     # appended to the old attempt's tail, and the reader would
                     # conclude the job resumed where it left off.
-                    yield sse_frame(data={"attempt": page.get("attempt")}, event="log.attempt_changed")
+                    frames.append(({"attempt": page.get("attempt")}, "log.attempt_changed"))
                 if isinstance(records, list) and records:
-                    for record in records:
-                        yield sse_frame(data=record, event="log.record")
-                advanced = page.get("next_cursor")
+                    frames.extend((record, "log.record") for record in records)
+                # The id a reconnecting reader hands back as ``Last-Event-ID``.
+                # This route reads that header and resumes from it, so without
+                # writing it the resume was half a protocol: every drop replayed
+                # the attempt from the beginning and duplicated what the reader
+                # already had.
+                #
+                # It rides the page's *last* frame, and it is the page cursor
+                # rather than a record's own. A record's cursor addresses one
+                # rank's journal in one backend's private encoding; the position
+                # that can be resumed from is the joined one, and it is only
+                # true once every record on the page has been delivered. A drop
+                # mid-page therefore resumes at the page boundary before it and
+                # redelivers that page -- at-least-once, which is the honest
+                # guarantee for a stream that cannot acknowledge.
+                resume = advanced if isinstance(advanced, str) and advanced else None
+                for index, (data, event) in enumerate(frames):
+                    yield sse_frame(
+                        data=data,
+                        event=event,
+                        identifier=resume if index == len(frames) - 1 else None,
+                    )
                 if isinstance(advanced, str) and advanced:
                     position = advanced
                 if not follow or await raw_request.is_disconnected():

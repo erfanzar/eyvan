@@ -27,7 +27,7 @@ import { BudgetsPage } from "./pages/BudgetsPage";
 import { CapacityPage } from "./pages/CapacityPage";
 import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
-import { WorkloadDetailPage } from "./pages/WorkloadDetailPage";
+import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
 import {
   accessibleRoute,
@@ -929,6 +929,18 @@ export default function App({ client = apiClient, identityProvider = currentIden
       withAuthorityRefresh(() => client.explainWorkload(id, explanationScope, signal)),
     [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
   );
+  const followedWorkloadId = selectedWorkload?.id;
+  const followWorkloadLogs = useCallback(
+    (handlers: LogFollowHandlers, signal: AbortSignal) => {
+      if (!followedWorkloadId) return Promise.resolve();
+      // Bound to the id captured when the callback was made, so a stream that
+      // outlives a navigation cannot deliver one workload's output under
+      // another's name. Changing the id changes the callback, which restarts
+      // the follow rather than repointing a live one.
+      return withAuthorityRefresh(() => client.followWorkloadLogs(followedWorkloadId, handlers, signal));
+    },
+    [client, followedWorkloadId, withAuthorityRefresh],
+  );
 
   const browserIdentity = identityProvider();
   const identity: AuthIdentity | undefined = browserIdentity
@@ -980,6 +992,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
           onAction={(action) => void operateWorkload(action)}
           canOperate={detailCapabilities.operateWorkloads}
           loadExplanation={loadExplanation}
+          followLogs={followWorkloadLogs}
         />
       );
     }

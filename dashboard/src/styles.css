@@ -1412,6 +1412,17 @@ code,
 .log-source { color: #a7b3ab; }
 .log-line code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-empty { display: grid; min-height: 250px; place-items: center; color: #929e96; }
+.log-follow-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #7d8a82; }
+.log-follow-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #99a49d; }
+.log-follow-live { color: #2f8f5b; }
+.log-follow-live::before { background: #2f8f5b; }
+.log-notice { padding: 9px 13px; font-size: 12px; color: #55605a; background: #f1f4f2; border-bottom: 1px solid #e2e7e4; }
+.log-notice-error { color: #9a332c; background: #fbeceb; }
+/* stderr is marked, not recolored as an error: plenty of healthy programs
+   write progress there, and painting all of it red makes a working job read as
+   a failing one. */
+.log-stderr { border-left: 2px solid #c4746c; }
+.log-stderr .log-source { color: #d0928b; }
 
 .topology-panel { min-height: 220px; }
 .topology-regions { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 0; border-top: 1px solid var(--border); }

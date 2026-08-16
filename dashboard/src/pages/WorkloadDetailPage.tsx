@@ -12,6 +12,8 @@ import {
   Code2,
   Database,
   HardDrive,
+  Pause,
+  Play,
   RefreshCw,
   Search,
   Server,
@@ -19,7 +21,7 @@ import {
   WalletCards,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -28,12 +30,35 @@ import type { LogEntry, WorkloadDetail, WorkloadExplanation } from "../types";
 
 type DetailTab = "overview" | "timeline" | "logs";
 
+/** Handlers the follow stream drives. Mirrors the client's contract. */
+export interface LogFollowHandlers {
+  onRecord: (entry: LogEntry) => void;
+  onAttemptChanged: (attempt: number) => void;
+  onConnectionChange?: (connected: boolean) => void;
+}
+
+/**
+ * How many followed lines the page keeps.
+ *
+ * A followed job is unbounded by definition, and a browser tab holding every
+ * line of a week-long training run stops responding long before it runs out of
+ * memory. The oldest lines go, because the tail is what a follower is watching
+ * -- and the count of what went is shown, because a log that silently forgets
+ * its beginning is worse than one that admits to a window.
+ */
+const FOLLOW_BUFFER_LINES = 2_000;
+
+/** Distance from the bottom, in pixels, within which the view keeps itself pinned. */
+const PIN_TO_BOTTOM_PX = 48;
+
 interface WorkloadDetailPageProps {
   workload: WorkloadDetail;
   onBack: () => void;
   onAction: (action: "cancel" | "checkpoint" | "retry" | "kick") => void;
   canOperate: boolean;
   loadExplanation: (id: string, signal: AbortSignal) => Promise<WorkloadExplanation>;
+  /** Absent when the plane cannot be streamed from, which hides the control. */
+  followLogs?: (handlers: LogFollowHandlers, signal: AbortSignal) => Promise<void>;
 }
 
 export function WorkloadDetailPage({
@@ -42,11 +67,28 @@ export function WorkloadDetailPage({
   onAction,
   canOperate,
   loadExplanation,
+  followLogs,
 }: WorkloadDetailPageProps) {
   const [tab, setTab] = useState<DetailTab>("overview");
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState("all");
   const [copied, setCopied] = useState(false);
+  const [following, setFollowing] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [followError, setFollowError] = useState<string | null>(null);
+  const [attemptNotice, setAttemptNotice] = useState<string | null>(null);
+  // One piece of state rather than a list and a counter: every record commits
+  // both, and two setters is two renders per line at the exact moment lines
+  // arrive fastest.
+  const [followed, setFollowed] = useState<{ entries: LogEntry[]; dropped: number }>({
+    entries: [],
+    dropped: 0,
+  });
+  const streamRef = useRef<HTMLDivElement | null>(null);
+  // Whether the reader is at the bottom. Scrolling up is how somebody reads
+  // what just went past, and yanking them back to the tail on the next line
+  // makes a busy log unreadable.
+  const pinnedRef = useRef(true);
   // The scheduler's per-cell verdict. The page has always shown the flat
   // `scheduling_reason`, one sentence, while the detail behind it existed and
   // no page requested it -- so "why is this queued" was answerable only from a
@@ -81,14 +123,74 @@ export function WorkloadDetailPage({
   // queued job there is nothing to move, and on a finished one nothing to save.
   const kickable = ["running", "provisioning", "checkpointing"].includes(workload.status);
 
+  const appendRecord = useCallback((entry: LogEntry) => {
+    setFollowed((current) => {
+      const entries = [...current.entries, entry];
+      if (entries.length <= FOLLOW_BUFFER_LINES) return { entries, dropped: current.dropped };
+      const overflow = entries.length - FOLLOW_BUFFER_LINES;
+      return { entries: entries.slice(overflow), dropped: current.dropped + overflow };
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!following || !followLogs) return;
+    const controller = new AbortController();
+    setFollowed({ entries: [], dropped: 0 });
+    setFollowError(null);
+    setAttemptNotice(null);
+    followLogs(
+      {
+        onRecord: appendRecord,
+        // The buffer is cleared, not appended to. The lines that follow come
+        // from a different process; showing them under the old attempt's tail
+        // is how a reader concludes a job resumed when it in fact restarted.
+        onAttemptChanged: (attempt) => {
+          setFollowed({ entries: [], dropped: 0 });
+          setAttemptNotice(`Attempt ${attempt} started. Output above belonged to the previous attempt.`);
+        },
+        onConnectionChange: setConnected,
+      },
+      controller.signal,
+    ).catch((error: unknown) => {
+      // Named, never swallowed. A follow that quietly stopped looks exactly
+      // like a job that stopped printing, and the two call for opposite
+      // reactions.
+      if (!controller.signal.aborted) {
+        setFollowError(error instanceof Error ? error.message : "The log stream stopped");
+      }
+    });
+    return () => {
+      controller.abort();
+      setConnected(false);
+    };
+  }, [appendRecord, following, followLogs, workload.id]);
+
+  // Following is per attempt of one workload. Navigating to another job must
+  // not leave the previous one's lines on screen under the new one's name.
+  useEffect(() => {
+    setFollowing(false);
+    setFollowed({ entries: [], dropped: 0 });
+    setAttemptNotice(null);
+    setFollowError(null);
+  }, [workload.id]);
+
+  const shownLogs = following ? followed.entries : workload.logs;
   const filteredLogs = useMemo(() => {
     const query = logQuery.trim().toLowerCase();
-    return workload.logs.filter(
+    return shownLogs.filter(
       (log) =>
         (logLevel === "all" || log.level === logLevel) &&
         (!query || log.message.toLowerCase().includes(query) || (log.source?.toLowerCase().includes(query) ?? false)),
     );
-  }, [logLevel, logQuery, workload.logs]);
+  }, [logLevel, logQuery, shownLogs]);
+
+  useEffect(() => {
+    const element = streamRef.current;
+    if (!following || !element || !pinnedRef.current) return;
+    // Assigned rather than `scrollTo`, which is a no-op or absent depending on
+    // the environment; this is the property both a browser and jsdom honour.
+    element.scrollTop = element.scrollHeight;
+  }, [filteredLogs.length, following]);
 
   const copyCommand = async () => {
     await navigator.clipboard.writeText(workload.command);
@@ -295,17 +397,73 @@ export function WorkloadDetailPage({
                 <option value="ERROR">Error</option>
               </select>
             </label>
+            {followLogs && (
+              <button
+                className={following ? "button button-secondary" : "button button-primary"}
+                type="button"
+                aria-pressed={following}
+                onClick={() => setFollowing((current) => !current)}
+                title={
+                  following
+                    ? "Stop following and show the snapshot fetched with this page"
+                    : "Stream this workload's output as it is produced"
+                }
+              >
+                {following ? <Pause size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+                {following ? "Stop following" : "Follow"}
+              </button>
+            )}
+            {following && (
+              <span className={connected ? "log-follow-state log-follow-live" : "log-follow-state"}>
+                {/* Distinguished because they mean opposite things: a live
+                    stream with no lines is a quiet job, and a dropped one is a
+                    reader who is no longer being told anything. */}
+                {connected ? "Live" : "Reconnecting…"}
+              </span>
+            )}
           </div>
-          <div className="log-stream" role="log" aria-label="Workload logs">
+          {followError && <div className="log-notice log-notice-error">{followError}</div>}
+          {attemptNotice && <div className="log-notice">{attemptNotice}</div>}
+          {following && followed.dropped > 0 && (
+            <div className="log-notice">
+              Showing the last {FOLLOW_BUFFER_LINES.toLocaleString()} lines · {followed.dropped.toLocaleString()} earlier
+              lines dropped from this view
+            </div>
+          )}
+          <div
+            className="log-stream"
+            role="log"
+            aria-label="Workload logs"
+            ref={streamRef}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              pinnedRef.current =
+                element.scrollHeight - element.scrollTop - element.clientHeight < PIN_TO_BOTTOM_PX;
+            }}
+          >
             {filteredLogs.map((log: LogEntry) => (
-              <div className={`log-line${log.level ? ` log-${log.level.toLowerCase()}` : ""}`} key={log.id}>
+              <div
+                className={`log-line${log.level ? ` log-${log.level.toLowerCase()}` : ""}${log.stream === "stderr" ? " log-stderr" : ""}`}
+                key={log.id}
+              >
                 <time>{log.timestamp ? log.timestamp.slice(11, 23) : "—"}</time>
                 <span className="log-level">{log.level ?? "—"}</span>
                 <span className="log-source">{log.source ?? "—"}</span>
                 <code>{log.message}</code>
               </div>
             ))}
-            {filteredLogs.length === 0 && <div className="log-empty">No log entries match this filter.</div>}
+            {filteredLogs.length === 0 && (
+              <div className="log-empty">
+                {/* Three different facts, and only one of them is "the filter
+                    matched nothing". Reporting a filtered-out buffer as a
+                    silent job sends the reader to look at the wrong thing. */}
+                {!following || followed.entries.length > 0
+                  ? "No log entries match this filter."
+                  : connected
+                    ? "Following. This attempt has not printed anything yet."
+                    : "Connecting to the log stream…"}
+              </div>
+            )}
           </div>
         </section>
       )}
