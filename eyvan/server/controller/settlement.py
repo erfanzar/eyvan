@@ -243,8 +243,19 @@ class _ControllerSettlement:
             # output: exact streaming redaction cannot be reconstructed after a
             # worker restart without persisting the plaintext values themselves.
             return
+        # Resume where the incremental archive stopped, never from the start of
+        # the journal. The chunks already hold everything up to that cursor, and
+        # re-reading it here would store a second copy of every line and make
+        # replay show each of them twice. With no chunks the cursor is empty and
+        # this is the read it has always been.
+        chunk_cursor = await self._last_log_chunk_cursor(workload)
         try:
-            page = await self.workload_log_page(workload.id, limit=_LOG_ARCHIVE_LINE_LIMIT + 1)
+            page = await self.workload_log_page(
+                workload.id,
+                after=chunk_cursor,
+                limit=_LOG_ARCHIVE_LINE_LIMIT + 1,
+                live_only=True,
+            )
         except Exception:
             logger.warning("could not read logs for %s before release", workload.id, exc_info=True)
             return

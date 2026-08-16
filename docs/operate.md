@@ -414,6 +414,38 @@ whatever it is given on a machine holding someone's training job, so it is an
 admission decision an operator makes for a fleet rather than a capability that
 arrives switched on.
 
+## Logs after the machine is gone
+
+Both log commands read the live cell while one exists, and fall back to this
+attempt's archive once it does not. That is deliberate: the read an operator
+actually needs is usually the one *after* the capacity disappeared.
+
+Two writers fill that archive.
+
+* **While the workload runs**, the `archive-live-logs` phase copies new output
+  into immutable per-attempt chunks every `EYVAN_LOG_ARCHIVE_INTERVAL_S` seconds
+  (60 by default; `0` switches it off). This is what makes a **preempted** run
+  readable at all -- a reclaimed slice is gone before the control plane learns
+  anything about it, so nothing on the release path can save its journal. What a
+  preemption costs is bounded by that interval, not by the length of the run.
+* **On the release path**, settlement archives what is left, resuming from where
+  the last chunk stopped so no line is stored or replayed twice.
+
+Both refuse to archive a workload that mounts secrets, for the reason
+`artifact-safety.md` gives: streaming redaction cannot be reconstructed after
+the fact without persisting the plaintext values.
+
+A replay says what it is. `rank N archived (incomplete)` means that rank's
+output is known to be partial -- the tail between the last chunk and the
+reclamation, a rank whose host was unreachable, or an object that would not
+open. A chunk that could not be read is named in the page's `detail` rather
+than skipped, because a shortened log that reads as complete is worse than one
+that admits a hole.
+
+Archived logs are kept for `EYVAN_LOG_RETENTION_S` (30 days by default),
+separately from the general artifact window: a callable can be rebuilt from its
+source, and a log cannot.
+
 ## Reading a managed service
 
 ```

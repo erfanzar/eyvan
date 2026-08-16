@@ -24,6 +24,7 @@ from eyvan.server.controller.capacity_commands import _ControllerCapacityCommand
 from eyvan.server.controller.expansion import _ControllerExpansion
 from eyvan.server.controller.fleets import _ControllerFleets
 from eyvan.server.controller.lifecycle import _ControllerLifecycle
+from eyvan.server.controller.log_archival import _ControllerLogArchival
 from eyvan.server.controller.loops import _ControllerLoops
 from eyvan.server.controller.observation import _ControllerObservation
 from eyvan.server.controller.outbox import _ControllerOutbox
@@ -46,6 +47,7 @@ class EyvanController(
     _ControllerSettlement,
     _ControllerServices,
     _ControllerObservation,
+    _ControllerLogArchival,
     _ControllerStaging,
     _ControllerExpansion,
     _ControllerLoops,

@@ -34,6 +34,7 @@ from eyvan.server.controller._support import (
     _system_principal,
     logger,
 )
+from eyvan.server.controller.log_archival import _LogChunkProgress
 from eyvan.server.persistence.base import Repository
 from eyvan.server.service.control_plane import ControlPlaneService
 from eyvan.server.service.stage import CellStageExecutor
@@ -89,6 +90,11 @@ class _ControllerLifecycle:
         # grace period, which delays an escalation rather than triggering one
         # early -- the safe direction for something that ends in draining a host.
         self._indeterminate_since: dict[tuple[str, int], datetime] = {}
+        # Where each (workload, attempt) incremental log archive has reached.
+        # In memory for the same reason: every position is also stored in the
+        # chunk it was captured with, so losing this map costs one listing per
+        # attempt rather than a replayed archive.
+        self._log_chunk_progress: dict[tuple[str, int], _LogChunkProgress] = {}
         self._owns_agent_clients = agent_factory is None
         self._agent_factory = agent_factory or self._default_agent
         self._leader_cycle_lock = asyncio.Lock()

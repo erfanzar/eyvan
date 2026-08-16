@@ -62,6 +62,15 @@ LOG_ARCHIVE_MANIFEST_VERSION = 1
 #: Writers may place compatibility gap objects only inside this fixed window.
 LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT = 64
 
+#: Marker stored as the first JSON line of an incremental log chunk. Chunks hold
+#: every rank together rather than one object per rank, because they are written
+#: while the workload runs: a per-rank split would multiply the object count by
+#: the attempt's width on every interval, and the records already name their own
+#: rank. Its own key and its own version, distinct from the terminal manifest's,
+#: so neither reader can be handed the other's document.
+LOG_CHUNK_HEADER_KEY = "_eyvan_log_chunk"
+LOG_CHUNK_VERSION = 1
+
 #: Rank recorded when a payload declared a ``rank`` that is not a non-negative
 #: integer. Coercing such a rank to ``0`` is worse than useless: two malformed
 #: ranks collide onto rank zero and the page then looks complete to the

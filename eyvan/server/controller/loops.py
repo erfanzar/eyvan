@@ -141,6 +141,20 @@ class _ControllerLoops:
                 interval_s=self.settings.cell_billing_interval_s,
                 zero_interval_disables=True,
             ),
+            # After observation and after settlement, so a workload that ended
+            # this cycle has already had its terminal archive written and is no
+            # longer RUNNING when this phase looks. Before retention, because
+            # retention is what eventually removes what this phase writes.
+            #
+            # Its failures are isolated for the same reason settlement swallows
+            # its own: a cell that will not answer about its journal is not a
+            # reason to stop scheduling work.
+            LeaderPhase(
+                "archive-live-logs",
+                self.archive_running_logs_once,
+                interval_s=self.settings.log_archive_interval_s,
+                zero_interval_disables=True,
+            ),
             # Retention is housekeeping and must never delay placement, so it runs
             # last, on its own slow interval, and its failures are isolated.
             LeaderPhase(

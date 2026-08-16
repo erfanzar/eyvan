@@ -199,8 +199,8 @@ def _attach(controller, access) -> None:
 
 
 def _scripted_page(**page):
-    async def read(_workload_id, *, after="", limit=200):
-        del after, limit
+    async def read(_workload_id, *, after="", limit=200, live_only=False):
+        del after, limit, live_only
         return {"records": [], "truncated_ranks": [], "unavailable": False, **page}
 
     return read
@@ -791,8 +791,8 @@ async def test_capacity_is_settled_when_the_archive_raises_outright(tmp_path: Pa
     controller = await _controller(tmp_path, width=2)
     _attach(controller, _artifact_access(tmp_path / "artifacts"))
 
-    async def broken(_workload_id, *, after="", limit=200):
-        del after, limit
+    async def broken(_workload_id, *, after="", limit=200, live_only=False):
+        del after, limit, live_only
         return ["this is not a page document"]
 
     controller.workload_log_page = broken

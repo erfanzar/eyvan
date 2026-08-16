@@ -78,6 +78,7 @@ from eyvan.worker.runtime.log_records import (
     LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
     LOG_ARCHIVE_MANIFEST_KEY,
     LOG_ARCHIVE_MANIFEST_VERSION,
+    LOG_CHUNK_HEADER_KEY,
     ArchiveGap,
     CursorContext,
     CursorFresh,
@@ -127,6 +128,10 @@ _ARCHIVE_STATUS_UNREACHED = frozenset({"unreachable", "failed"})
 
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+#: Answer to a ``live_only`` read of an attempt whose capacity is gone. Said
+#: rather than answered from the archive, so an archive writer cannot be handed
+#: its own output back and store a second copy of it.
+_LIVE_READ_HAS_NO_CELL = "no cell holds this attempt's journal any more"
 
 #: Newest node-health audit events one replacement-budget decision reads. Small
 #: on purpose: the entity type carries nothing but these decisions, so a fleet
@@ -417,6 +422,57 @@ class _ArchiveReplay:
     truncated: frozenset[int] = frozenset()
     detail: str = ""
     unavailable: bool = False
+
+
+def _chunk_header(payload: bytes) -> JsonObject:
+    """Return one chunk's header, or an empty mapping if it carries none."""
+
+    for entry in _archived_entries(payload):
+        if (
+            isinstance(entry, list)
+            and len(entry) == 2
+            and entry[0] == LOG_CHUNK_HEADER_KEY
+            and isinstance(entry[1], dict)
+        ):
+            return entry[1]
+    return {}
+
+
+def _chunk_truncated_ranks(header: JsonObject) -> set[int]:
+    """Return the ranks one chunk recorded as incomplete when it was written."""
+
+    raw = header.get("truncated_ranks")
+    return {
+        rank
+        for rank in (raw if isinstance(raw, list) else [])
+        if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0
+    }
+
+
+def _joined_archive_replays(earlier: _ArchiveReplay, later: _ArchiveReplay) -> _ArchiveReplay:
+    """Join the incremental stream to the terminal archive, in that order.
+
+    Concatenation rather than a merge, and it is only correct because the two
+    do not overlap: settlement resumes its read from the last chunk's cursor, so
+    the terminal objects hold exactly the lines written after the final chunk.
+    Interleaving them by timestamp instead would reorder a rank's own output
+    whenever its clock and the controller's disagreed, and the offsets a
+    resumable read hands back address file order, not time.
+    """
+
+    ranks = {rank: tuple(lines) for rank, lines in earlier.ranks.items()}
+    for rank, lines in later.ranks.items():
+        ranks[rank] = ranks.get(rank, ()) + tuple(lines)
+    details = [detail for detail in (earlier.detail, later.detail) if detail]
+    return _ArchiveReplay(
+        ranks=ranks,
+        truncated=earlier.truncated | later.truncated,
+        detail="; ".join(details),
+        # Unavailable only when neither half could produce a line. One half
+        # having nothing to say is ordinary: an attempt that was reclaimed has
+        # no terminal archive, and one that predates chunking has no chunks.
+        unavailable=earlier.unavailable and later.unavailable and not any(ranks.values()),
+    )
 
 
 def _dag_release_order(node: WorkloadRecord) -> tuple[str, str]:
@@ -1696,9 +1752,10 @@ class _ControllerObservation:
             # -- on precisely the records an operator reads logs for, because
             # something went wrong with them. `/log-page` handled the same state
             # cleanly, so the two surfaces disagreed about one workload.
-            return (
-                "[eyvan] the capacity this workload ran on has been released, so its logs are no longer "
-                "readable from the cell. Archived output, where a fleet retains it, is the remaining source."
+            return await self._archived_driver_logs(
+                workload,
+                reason="the capacity this workload ran on has been released, so its logs are no longer readable "
+                "from the cell",
             )
         # A lease can still name a cell whose execution is gone: the workload
         # finished, its container was reaped, and the observation no longer
@@ -1719,11 +1776,54 @@ class _ControllerObservation:
             _lease, cell = members[0]
             return await asyncio.to_thread(self._agent_factory(cell).logs, cell.id, workload.remote_id)
         except CellAgentInvalidConfigurationError as exc:
-            return (
-                f"[eyvan] this workload's execution is no longer readable from its cell ({exc}). The run has "
-                "ended and its container was reaped; archived output, where a fleet retains it, is the "
-                "remaining source."
+            return await self._archived_driver_logs(
+                workload,
+                reason=f"this workload's execution is no longer readable from its cell ({exc}) because the run "
+                "ended and its container was reaped",
             )
+
+    async def _archived_driver_logs(self, workload: WorkloadRecord, *, reason: str) -> str:
+        """Render this attempt's archived output when no cell can serve it.
+
+        The whole point of archiving. A live read is only possible while the
+        capacity exists, and the read an operator actually needs is the one after
+        it is gone -- the workload was preempted, the slice was released, the
+        container was reaped. Both of those states used to end at a sentence
+        explaining that archived output was "the remaining source" without ever
+        going and getting it, so the archive settlement writes was reachable
+        through ``/log-page`` and unreachable through ``logs``.
+
+        Ranks are rendered in the live gang's own section format rather than as
+        one merged stream, because that is the shape an operator comparing two
+        ranks of a hung collective already knows how to read. A rank the archive
+        could not replay keeps its section and says so: dropping it would turn a
+        partial archive into a complete-looking log, which is the failure the
+        per-rank discipline exists to prevent.
+
+        Args:
+            workload: The attempt whose archive is being read.
+            reason: Why the live cell could not serve it, in the voice of the
+                sentence this returns. Carried into both answers so the operator
+                is told what happened to the capacity, not only what was found.
+
+        Returns:
+            The archived output, or a sentence naming why none was recoverable.
+        """
+
+        page = await self._archived_log_page(workload)
+        by_rank: dict[int, list[LogRecord]] = {}
+        for record in page.records:
+            by_rank.setdefault(record.rank, []).append(record)
+        if not by_rank:
+            detail = page.detail or "this attempt has no archived logs"
+            return f"[eyvan] {reason}, and no archived output was recoverable ({detail})."
+        sections = [f"[eyvan] {reason}. Replaying archived output ({page.detail})."]
+        for rank in sorted(set(by_rank) | set(page.truncated_ranks)):
+            lines = by_rank.get(rank, ())
+            marker = " (incomplete)" if rank in page.truncated_ranks else ""
+            body = "\n".join(record.message for record in lines) or "[eyvan] no archived lines for this rank"
+            sections.append(f"===== rank {rank} archived{marker} =====\n{body}")
+        return "\n".join(sections)
 
     async def workload_log_page(
         self,
@@ -1731,6 +1831,7 @@ class _ControllerObservation:
         *,
         after: str = "",
         limit: int = 200,
+        live_only: bool = False,
     ) -> JsonObject:
         """Return one resumable page of structured logs for a workload attempt.
 
@@ -1750,6 +1851,12 @@ class _ControllerObservation:
         cells report now. An attempt with no frozen topology is served with its
         rank identity reported as unknown rather than reconstructed: today's
         cells cannot prove which host was rank N while that attempt started.
+
+        ``live_only`` refuses the archive fallback and reports the cell's
+        absence instead. Readers want the fallback; the two *writers* of the
+        archive must not have it, because a read that quietly returns archived
+        lines would make them archive their own output a second time -- growing
+        without bound and duplicating every line on replay.
         """
 
         async with self.repository.transaction() as transaction:
@@ -1785,6 +1892,14 @@ class _ControllerObservation:
             # immutable objects, so there is no live journal to consult and no
             # cell whose absence has to be discovered first.
             archive_attempt_changed, archive_positions = self._decoded_archive_cursor(after, workload)
+            if not archive_attempt_changed and live_only:
+                return _log_page_document(
+                    LogPage(unavailable=True, detail=_LIVE_READ_HAS_NO_CELL),
+                    attempt=workload.attempt,
+                    topology_state=frozen_state,
+                    topology_digest=frozen_digest,
+                    expected_ranks=frozen_ranks,
+                )
             if not archive_attempt_changed:
                 archived = await self._archived_log_page(workload, positions=archive_positions, limit=limit)
                 return _log_page_document(
@@ -1811,6 +1926,18 @@ class _ControllerObservation:
             # error -- and falling back to the archive is the entire reason the
             # archive exists.
             members = ()
+        if not members and live_only:
+            # An archive writer asking for live lines. There are none, and
+            # saying so is the whole point of the flag: the fallback below would
+            # hand it this attempt's own archive to archive again.
+            return _log_page_document(
+                LogPage(unavailable=True, detail=_LIVE_READ_HAS_NO_CELL),
+                attempt=workload.attempt,
+                attempt_changed=attempt_changed,
+                topology_state=frozen_state,
+                topology_digest=frozen_digest,
+                expected_ranks=frozen_ranks,
+            )
         if not members:
             # The handover. The follower is holding live positions and the
             # journals they name are gone, so they are translated into the
@@ -2418,6 +2545,64 @@ class _ControllerObservation:
             unavailable=bool(document.get("unavailable")),
         )
 
+    async def _chunked_archive_replay(self, workload: WorkloadRecord) -> _ArchiveReplay | None:
+        """Read one attempt's incremental chunks back, in the order written.
+
+        These are the lines that were saved *while* the workload ran, so they
+        are the only ones that exist at all when a machine is reclaimed rather
+        than released. ``None`` means this attempt has no chunks -- either it
+        predates incremental archival or the phase is switched off -- and the
+        terminal archive is then served exactly as it was before.
+
+        A chunk that cannot be read is a hole in the middle of a stream, not the
+        end of one: the ranks it held are reported truncated and the remaining
+        chunks are still served, because stopping at the first unreadable object
+        would hide every line after it behind one lost write.
+        """
+
+        chunks = await self._list_log_chunks(workload)
+        if not chunks:
+            return None
+        ranks: dict[int, list[LogRecord]] = {}
+        missing: list[int] = []
+        malformed = 0
+        truncated: set[int] = set()
+        for sequence, uri in chunks:
+            try:
+                payload = await self.service.read_managed_artifact(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    uri=uri,
+                )
+            except Exception:
+                missing.append(sequence)
+                continue
+            entries = [entry for entry in _archived_entries(payload) if isinstance(entry, dict)]
+            header = _chunk_header(payload)
+            truncated.update(_chunk_truncated_ranks(header))
+            for record in log_page_from_json({"records": entries}).records:
+                if record.rank < 0:
+                    # A rank the writer could not place. Counted rather than
+                    # filed under rank zero: two malformed ranks collide there
+                    # and the page then looks complete to whoever reads it.
+                    malformed += 1
+                    continue
+                ranks.setdefault(record.rank, []).append(record)
+        detail = f"replayed from {len(chunks)} archived chunk(s)"
+        if missing:
+            detail += "; chunk(s) could not be read: " + ", ".join(str(sequence) for sequence in sorted(missing))
+            # Which ranks lost lines is unknowable from an object that will not
+            # open, so every rank the stream carries is marked incomplete.
+            truncated.update(ranks)
+        if malformed:
+            detail += f"; {malformed} archived line(s) named no valid rank"
+        return _ArchiveReplay(
+            ranks={rank: tuple(lines) for rank, lines in sorted(ranks.items())},
+            truncated=frozenset(truncated),
+            detail=detail,
+            unavailable=bool(missing) and not any(ranks.values()),
+        )
+
     async def _indexed_archive_replay(self, workload: WorkloadRecord) -> _ArchiveReplay:
         """Read an archive that carries its index inside rank zero's own object.
 
@@ -2549,9 +2734,12 @@ class _ControllerObservation:
 
         if self.artifact_access is None:
             return LogPage(unavailable=True, detail="managed artifacts are not configured on this replica")
+        chunked = await self._chunked_archive_replay(workload)
         replay = await self._manifest_archive_replay(workload)
         if replay is None:
             replay = await self._indexed_archive_replay(workload)
+        if chunked is not None:
+            replay = _joined_archive_replays(chunked, replay)
         return self._archive_window(
             workload,
             replay,

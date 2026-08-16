@@ -153,6 +153,23 @@ class EyvanSettings:
     """
 
     artifact_retention_s: int = 7 * 24 * 3600
+    #: How often a running workload's new output is copied into an immutable
+    #: chunk, and how much of it is taken per pass. This is the bound on what a
+    #: preemption can destroy: everything older than one interval is already in
+    #: storage when the machine goes away. Zero disables it, which is the former
+    #: behaviour -- logs existed only on the cell until the release path.
+    #:
+    #: On by default, unlike the other housekeeping phases. Off by default is
+    #: right for a phase that changes what a fleet *does*; this one only reads a
+    #: journal that is already being read on demand, and the state it prevents
+    #: (a preempted attempt with no logs at all) is the one operators hit most.
+    log_archive_interval_s: float = 60.0
+    log_archive_chunk_lines: int = 2000
+    #: How many workloads are captured at once. Bounded because each capture
+    #: fans out to every cell of its attempt, and a fleet with a thousand
+    #: running workloads would otherwise open a thousand reads from the leader
+    #: on every interval.
+    log_archive_concurrency: int = 8
     #: How long an attempt's archived logs are kept. Longer than the general
     #: artifact window on purpose: a callable can be rebuilt from its source,
     #: while logs are the only record of what a run did, and the question they
@@ -416,6 +433,12 @@ class EyvanSettings:
         for name in ("artifact_retention_s", "log_retention_s"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative; use 0 to disable collection")
+        if not math.isfinite(self.log_archive_interval_s) or self.log_archive_interval_s < 0:
+            raise ValueError("log_archive_interval_s must be finite and non-negative; use 0 to disable it")
+        if self.log_archive_chunk_lines <= 0:
+            raise ValueError("log_archive_chunk_lines must be positive")
+        if self.log_archive_concurrency <= 0:
+            raise ValueError("log_archive_concurrency must be positive")
         self._validate_cell_stage_settings()
         validate_minimum_client_version(self.min_client_version)
 
@@ -580,6 +603,9 @@ class EyvanSettings:
             ),
             artifact_retention_s=int(os.getenv("EYVAN_ARTIFACT_RETENTION_S", defaults.artifact_retention_s)),
             log_retention_s=int(os.getenv("EYVAN_LOG_RETENTION_S", defaults.log_retention_s)),
+            log_archive_interval_s=float(os.getenv("EYVAN_LOG_ARCHIVE_INTERVAL_S", defaults.log_archive_interval_s)),
+            log_archive_chunk_lines=int(os.getenv("EYVAN_LOG_ARCHIVE_CHUNK_LINES", defaults.log_archive_chunk_lines)),
+            log_archive_concurrency=int(os.getenv("EYVAN_LOG_ARCHIVE_CONCURRENCY", defaults.log_archive_concurrency)),
             service_reconcile_interval_s=float(
                 os.getenv("EYVAN_SERVICE_RECONCILE_INTERVAL_S", defaults.service_reconcile_interval_s)
             ),

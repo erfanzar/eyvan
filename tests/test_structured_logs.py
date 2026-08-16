@@ -853,7 +853,7 @@ async def test_sparse_high_rank_archive_writes_are_bounded_and_direct(tmp_path) 
     _attach_artifact_access(controller, access)
     high_rank = 1_000_000
 
-    async def sparse_page(_workload_id, *, after="", limit=200):
+    async def sparse_page(_workload_id, *, after="", limit=200, live_only=False):
         assert after == ""
         assert limit == 1001
         return {
@@ -912,7 +912,7 @@ async def test_new_manifest_archive_retains_the_old_contiguous_jsonl_shape(tmp_p
     controller = await _controller_with(_PagingAgent())
     _attach_artifact_access(controller, _artifact_access(tmp_path))
 
-    async def sparse_page(_workload_id, *, after="", limit=200):
+    async def sparse_page(_workload_id, *, after="", limit=200, live_only=False):
         del after
         assert limit == 1001
         return {

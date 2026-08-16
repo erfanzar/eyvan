@@ -36,6 +36,15 @@ from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_clai
 
 _CALLABLE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+#: Width of a log chunk's zero-padded sequence, and the ceiling that width
+#: implies. Fixed width is what makes lexicographic URI order numeric order, so
+#: a writer can find its last chunk by listing rather than by probing. Six
+#: digits is a million chunks for one attempt -- at any sane archive interval,
+#: longer than any run and longer than any retention window.
+LOG_CHUNK_SEQUENCE_DIGITS = 6
+LOG_CHUNK_MAX_SEQUENCE = 10**LOG_CHUNK_SEQUENCE_DIGITS - 1
+_LOG_CHUNK_SEQUENCE = re.compile(rf"^[0-9]{{{LOG_CHUNK_SEQUENCE_DIGITS}}}$")
 _TOKEN_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
 _TOKEN_VERSION = "v1"
 
@@ -578,6 +587,60 @@ def log_manifest_uri(workload_id: str, attempt: int) -> str:
         raise InvalidManagedArtifactURI("log archive manifests require a positive attempt")
     object_id = f"{workload_id}-a{attempt}-manifest"
     return ManagedArtifactRef(ManagedArtifactKind.LOGS, _validate_object_id(ManagedArtifactKind.LOGS, object_id)).uri
+
+
+def log_chunk_uri(workload_id: str, attempt: int, sequence: int) -> str:
+    """Build a canonical managed URI for one incremental log chunk.
+
+    Chunks are how an attempt's output survives losing its host. The terminal
+    archive can only ever be written on the release path, so an attempt whose
+    machine is reclaimed rather than released -- every preemption, which is the
+    common case on spot -- reaches settlement with no journal left to read. A
+    chunk is written while the cell is alive and is immutable once written, so
+    what it holds is already safe when the host disappears.
+
+    The sequence is zero-padded so that lexicographic URI order is numeric
+    order. That is what lets the writer recover its position after a leadership
+    change by listing the prefix and taking the last entry, rather than by
+    probing every sequence from zero.
+
+    ``-c{sequence}`` cannot collide with ``-r{rank}`` or ``-manifest``.
+    """
+
+    if attempt < 1 or sequence < 0:
+        raise InvalidManagedArtifactURI("log chunks require a positive attempt and a non-negative sequence")
+    if sequence > LOG_CHUNK_MAX_SEQUENCE:
+        raise InvalidManagedArtifactURI(f"log chunk sequence must not exceed {LOG_CHUNK_MAX_SEQUENCE}")
+    object_id = f"{log_chunk_object_prefix(workload_id, attempt)}{sequence:0{LOG_CHUNK_SEQUENCE_DIGITS}d}"
+    return ManagedArtifactRef(ManagedArtifactKind.LOGS, _validate_object_id(ManagedArtifactKind.LOGS, object_id)).uri
+
+
+def log_chunk_object_prefix(workload_id: str, attempt: int) -> str:
+    """Return the object-ID prefix every chunk of one attempt shares."""
+
+    if attempt < 1:
+        raise InvalidManagedArtifactURI("log chunks require a positive attempt")
+    return f"{workload_id}-a{attempt}-c"
+
+
+def log_chunk_uri_prefix(workload_id: str, attempt: int) -> str:
+    """Return the URI prefix every chunk of one attempt shares."""
+
+    return f"eyvan://{ManagedArtifactKind.LOGS.value}/{log_chunk_object_prefix(workload_id, attempt)}"
+
+
+def log_chunk_sequence(uri: str, workload_id: str, attempt: int) -> int | None:
+    """Return the sequence a chunk URI names, or ``None`` if it names no chunk."""
+
+    prefix = log_chunk_uri_prefix(workload_id, attempt)
+    if not uri.startswith(prefix):
+        return None
+    suffix = uri[len(prefix) :]
+    # ``str.isdigit`` is true of superscripts and other unicode digits that
+    # ``int`` then parses into a sequence no writer ever minted.
+    if not _LOG_CHUNK_SEQUENCE.fullmatch(suffix):
+        return None
+    return int(suffix)
 
 
 def result_uri(result_id: str) -> str:
