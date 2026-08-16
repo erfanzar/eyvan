@@ -46,6 +46,12 @@ from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import ConflictError, NotFoundError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
+#: States in which a workload has capacity requested for it and no lease yet.
+#: The same pair ``server/invariants.py`` means by "not yet running", and the
+#: window in which a reservation on a freshly requested cell is the only thing
+#: stopping another workload from taking it.
+_WAITING_FOR_CAPACITY = frozenset({WorkloadState.PENDING, WorkloadState.ADMITTED})
+
 
 class _ControllerFleets:
     """Operator-driven fleet, pool, and cell administration.
@@ -246,9 +252,18 @@ class _ControllerFleets:
         """Return source-attributed capacity to shared supply after its owner stops waiting.
 
         A fresh autoscaled cell is reserved only while the workload that caused
-        it to be requested remains pending. Lease creation clears the
-        reservation atomically. This recovery path handles cancellation,
+        it to be requested is still waiting for capacity. Lease creation clears
+        the reservation atomically. This recovery path handles cancellation,
         terminal failure, and deleted legacy workloads before a lease exists.
+
+        Waiting is ``PENDING`` *or* ``ADMITTED``, matching what
+        ``server/invariants.py`` already means by "not yet running". Both are
+        states in which a workload has capacity requested for it and no lease,
+        so releasing an admitted one would hand its slice to somebody else while
+        it is still queued for it. Every path today admits and leases in one
+        transaction, so this changes nothing that currently happens -- it is the
+        precondition for requesting several zones at once, where waiting with
+        capacity already granted is the normal case rather than a race window.
         """
 
         candidates = tuple(cell for cell in cells if cell.autoscale_request_workload_id is not None)
@@ -268,7 +283,7 @@ class _ControllerFleets:
                 owner_id = current.autoscale_request_workload_id
                 assert owner_id is not None
                 owner = await transaction.get_workload(owner_id)
-                if owner is not None and owner.state is WorkloadState.PENDING:
+                if owner is not None and owner.state in _WAITING_FOR_CAPACITY:
                     continue
                 released = current.model_copy(
                     update={
