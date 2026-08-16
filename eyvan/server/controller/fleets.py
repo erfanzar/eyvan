@@ -388,7 +388,14 @@ class _ControllerFleets:
             quotas=quotas,
             policies=policies,
         )
-        demand_by_pool = simulation.demand(pool_records, tuple(leases), simulated, tuple(workloads), now)
+        demand_by_pool = simulation.demand(
+            pool_records,
+            tuple(leases),
+            simulated,
+            tuple(workloads),
+            now,
+            race_width=max(int(self.settings.capacity_race_width), 1),
+        )
         planner = CapacityPlanner(pool_records, cells_by_pool, now)
         plans = planner.plan(demand_by_pool)
         await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)

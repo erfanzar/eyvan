@@ -529,6 +529,7 @@ class CapacitySimulation:
         result: SchedulingResult,
         workloads: tuple[WorkloadRecord, ...] = (),
         now: datetime | None = None,
+        race_width: int = 1,
     ) -> dict[str, PoolDemand]:
         """Resolve scheduler placements to physical cell shapes per pool.
 
@@ -536,6 +537,13 @@ class CapacitySimulation:
         pool may reclaim another's capacity. Both are optional so a caller that
         does not defragment is unchanged; omitting them yields a demand that is
         never eligible to take capacity from a peer.
+
+        ``race_width`` is how many of a workload's candidate pools may be asked
+        for capacity at once. One -- the default -- is the sequential behaviour:
+        ask the best zone, and try the next one on the following tick if it is
+        cold. Higher spends money in more than one zone to find out which will
+        actually grant, which is how spot capacity is won and is a decision an
+        operator makes rather than a default anyone inherits.
         """
 
         real_ids: dict[str, set[str]] = {pool.id: set() for pool in pools}
@@ -565,6 +573,13 @@ class CapacitySimulation:
                 else:
                     virtual_counts[pool_id].append(worker_count)
                     virtual_workload_ids[pool_id].append(lease.workload_id)
+        if race_width > 1:
+            self._race_alternates(
+                virtual_counts,
+                virtual_workload_ids,
+                by_workload_id=by_workload_id,
+                race_width=race_width,
+            )
         return {
             pool.id: PoolDemand(
                 real_cell_ids=frozenset(real_ids[pool.id]),
@@ -586,6 +601,58 @@ class CapacitySimulation:
             )
             for pool in pools
         }
+
+    @staticmethod
+    def _race_alternates(
+        virtual_counts: dict[str, list[int]],
+        virtual_workload_ids: dict[str, list[str]],
+        *,
+        by_workload_id: dict[str, WorkloadRecord],
+        race_width: int,
+    ) -> None:
+        """Ask a workload's other candidate zones for capacity too.
+
+        The scheduler places a workload into exactly one pool, so demand built
+        from placements alone asks one zone and waits. That is the wrong shape
+        for spot: a zone that will not grant costs a whole reconcile interval to
+        discover, and the next one costs another. Asking several at once turns
+        a serial search into a race, and the first zone to actually produce a
+        machine wins.
+
+        Every extra request is real money, so it is bounded twice: by
+        ``race_width``, and by the workload's own declared alternates -- pools
+        of the same shape that the submission path already proved
+        interchangeable. Nothing here invents a candidate.
+
+        The losers are not this function's problem, and that is deliberate: a
+        cell requested here carries its workload's reservation, the reservation
+        survives exactly as long as the workload is still waiting, and the
+        recovery sweep returns it to shared supply the moment the workload is
+        leased somewhere. Racing without that ordering strands paid capacity,
+        which is why this is the last piece added rather than the first.
+        """
+
+        for pool_id in list(virtual_counts):
+            for index, workload_id in enumerate(list(virtual_workload_ids[pool_id])):
+                workload = by_workload_id.get(workload_id)
+                if workload is None:
+                    continue
+                worker_count = virtual_counts[pool_id][index]
+                alternates = [
+                    candidate
+                    for candidate in _candidate_pool_ids(workload)
+                    if candidate != pool_id and candidate in virtual_counts
+                ]
+                for alternate in alternates[: max(race_width - 1, 0)]:
+                    already = sum(1 for existing in virtual_workload_ids[alternate] if existing == workload_id)
+                    # One request per member per pool. Without this a workload
+                    # already asking an alternate -- because a previous tick
+                    # raced it, or because it is a multislice group -- would
+                    # accumulate another request on every reconcile.
+                    if already >= workload.spec.cell_group_count:
+                        continue
+                    virtual_counts[alternate].append(worker_count)
+                    virtual_workload_ids[alternate].append(workload_id)
 
 
 @dataclass(frozen=True, slots=True)

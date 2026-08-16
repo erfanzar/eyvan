@@ -121,6 +121,27 @@ that is the afternoon this exists for.
 than silently collapsed. `eyvan run --zone` still pins one out of the set, and
 pinning withholds the alternates on purpose.
 
+### Racing them
+
+By default a workload's zones are tried one per reconcile interval: ask the
+best one, and if it will not grant, ask the next. `EYVAN_CAPACITY_RACE_WIDTH`
+asks that many at once instead.
+
+**It is off by default (`1`) because every extra request is a machine somebody
+is billed for until the race resolves.** It is bounded twice -- by the width
+and by the workload's own declared alternates -- so it can never widen a search
+beyond pools already proven interchangeable, and one request per slice per zone
+however many reconcile ticks pass.
+
+The losing zones are returned to shared supply as soon as the winner is leased:
+a requested cell carries its workload's reservation, the reservation lasts
+exactly as long as the workload is waiting, and the recovery sweep clears it on
+the next cycle. That ordering is the whole safety argument -- without it a
+loser is granted, billed, and drainable by nothing.
+
+**Not yet qualified on hardware.** The mechanism and its bounds are tested; no
+run has yet raced real zones and been observed releasing a loser.
+
 ## Cost
 
 ```

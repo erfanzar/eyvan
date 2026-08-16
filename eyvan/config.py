@@ -170,6 +170,19 @@ class EyvanSettings:
     #: running workloads would otherwise open a thousand reads from the leader
     #: on every interval.
     log_archive_concurrency: int = 8
+    #: How many of a workload's candidate zones may be asked for capacity at
+    #: once. One is a serial search: ask the best zone, and if it will not grant
+    #: try the next one a reconcile interval later. Higher races them, which is
+    #: how spot capacity is actually won -- on 2026-08-15 us-east5-b granted and
+    #: reclaimed a 2x v6e-8 twice while us-central2-b held one long enough to
+    #: finish, and a serial search would have spent both of those attempts
+    #: before reaching the zone that worked.
+    #:
+    #: One by default, because every extra request is a machine somebody is
+    #: billed for until the race resolves. Bounded by the workload's own
+    #: declared alternates as well, so this can never widen a search beyond
+    #: pools the submission path already proved interchangeable.
+    capacity_race_width: int = 1
     #: How long an attempt's archived logs are kept. Longer than the general
     #: artifact window on purpose: a callable can be rebuilt from its source,
     #: while logs are the only record of what a run did, and the question they
@@ -439,6 +452,8 @@ class EyvanSettings:
             raise ValueError("log_archive_chunk_lines must be positive")
         if self.log_archive_concurrency <= 0:
             raise ValueError("log_archive_concurrency must be positive")
+        if self.capacity_race_width < 1:
+            raise ValueError("capacity_race_width must be at least 1; 1 asks one zone at a time")
         self._validate_cell_stage_settings()
         validate_minimum_client_version(self.min_client_version)
 
@@ -606,6 +621,7 @@ class EyvanSettings:
             log_archive_interval_s=float(os.getenv("EYVAN_LOG_ARCHIVE_INTERVAL_S", defaults.log_archive_interval_s)),
             log_archive_chunk_lines=int(os.getenv("EYVAN_LOG_ARCHIVE_CHUNK_LINES", defaults.log_archive_chunk_lines)),
             log_archive_concurrency=int(os.getenv("EYVAN_LOG_ARCHIVE_CONCURRENCY", defaults.log_archive_concurrency)),
+            capacity_race_width=int(os.getenv("EYVAN_CAPACITY_RACE_WIDTH", defaults.capacity_race_width)),
             service_reconcile_interval_s=float(
                 os.getenv("EYVAN_SERVICE_RECONCILE_INTERVAL_S", defaults.service_reconcile_interval_s)
             ),
