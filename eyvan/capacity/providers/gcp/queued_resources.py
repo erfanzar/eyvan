@@ -108,6 +108,19 @@ TERMINAL_NODE_STATES = frozenset(
         GcpTpuNodeState.HIDDEN,
     }
 )
+#: Terminal node states that GCP moves a *reclaimed spot* TPU through.
+#:
+#: ``PREEMPTED`` is the honest signal, but it is transient: GCP deletes the node
+#: it reclaimed, so whether Eyvan ever sees ``PREEMPTED`` is a race between the
+#: reclamation and the reconcile interval. Both cells of the 2026-08-13 P5 run
+#: were reclaimed the same way and only the first was observed in ``PREEMPTED``;
+#: the second was already ``DELETING``, and the workload was killed for it.
+SPOT_RECLAMATION_NODE_STATES = frozenset(
+    {
+        GcpTpuNodeState.PREEMPTED,
+        GcpTpuNodeState.DELETING,
+    }
+)
 _TPU_OPTION_KEYS = frozenset(
     {
         "bootstrap_egress",
@@ -908,6 +921,21 @@ class GcloudTpuProvider:
                 # pool is out of capacity -- which is what it did while every
                 # non-ready observation collapsed to one belief.
                 preempted = any(state is GcpTpuNodeState.PREEMPTED for state in node_states)
+                if not preempted and spec.capacity_class == "spot":
+                    # Reaching here means ``desired_state`` is still "up": Eyvan
+                    # wants this cell and did not ask for it to go away. On spot
+                    # that is a reclamation, and reading it as a generic capacity
+                    # loss charges it to ``max_retries`` -- which a spot job sets
+                    # to 0 precisely because it expects to be reclaimed -- and so
+                    # kills the workload instead of resuming it on the preemption
+                    # budget it still has.
+                    #
+                    # Narrow on purpose: STOPPED, TERMINATED and the HIDDEN pair
+                    # are left generic, because those say something happened to
+                    # the host rather than to the purchase, and calling them
+                    # reclamations would suppress the failure evidence that lets
+                    # a genuinely bad zone accumulate a cooldown.
+                    preempted = any(state in SPOT_RECLAMATION_NODE_STATES for state in node_states)
                 return ProviderObservation(
                     CapacityStatus.NEEDS_RECREATE,
                     f"TPU VM is terminal ({terminal})",

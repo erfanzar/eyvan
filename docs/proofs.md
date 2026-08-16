@@ -925,10 +925,38 @@ in `DEFINITIVE_CAPACITY_LOSS_STATUSES` is not running anything and the fence is
 already satisfied; a host that still exists but cannot be reached may be, and
 still fails.
 
-**Verified on hardware.** The fixed build was installed on the head at 17:50 and
+**What the fixed build did on the live fleet.** Installed on the head at 17:50;
 the same call that had returned 500 for 25 minutes returned `200 OK` at 17:53,
-with zero retirement errors from the new process; the workload moved
-`leased -> dispatching -> running` on attempt 2. `workload-survived` then passed.
+with zero retirement errors from the new process, and the workload moved
+`leased -> dispatching -> running` on attempt 2. `workload-survived` passed on
+the next evaluation. That is an observation of this run, not a receipt: P5 still
+exits 1 below, and nothing here qualifies a build on its own.
+
+**Defect 3 — the second reclamation was not charged to anything.** GCP took the
+replacement slice at 18:04 as well, and this time the workload was killed:
+
+```
+event=lost previous_cell_state=ready previous_provider_state=HEALTHY
+           capacity_class=spot reason="TPU VM is terminal (DELETING)"
+workload -> failed: "execution cell capacity is NEEDS_RECREATE"
+           failure_count=0  preemption_count=1 (unchanged)  capacity_loss_count=0
+```
+
+Both cells were reclaimed the same way; only the first was observed in
+`PREEMPTED`. That state is transient -- GCP deletes the node it reclaimed -- and
+reconciles ran ~48s apart, so the second was already `DELETING` when Eyvan
+looked. Untyped, `_recover_lost_workload` reads a generic capacity loss and
+charges `max_retries`, which a spot job sets to 0 *because* it expects to be
+reclaimed. So the job died with its preemption budget unspent and neither
+counter recording why.
+
+Which budget a spot reclamation lands in must not depend on winning a race with
+the poll interval. Reaching that classification means `desired_state` is still
+"up" -- Eyvan wants the cell and did not ask for it to go away -- so on spot a
+node dying anyway is a reclamation, whether it is seen as `PREEMPTED` or
+`DELETING`. `STOPPED`, `TERMINATED` and the `HIDDEN` pair stay generic: they say
+something happened to the host rather than to the purchase, and relabelling them
+would suppress the failure evidence that lets a bad zone earn a cooldown.
 
 **Why the run still exits 1, and what would close it.** `no-stockout-cooldown`
 still fails, because cell `…-0001` carries the `cooldown_until` that the
