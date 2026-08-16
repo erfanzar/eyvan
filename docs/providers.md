@@ -1,10 +1,17 @@
 # Writing an Eyvan capacity provider
 
-Eyvan ships four capacity backends (`gcp`, `kubernetes`, `manual`, `onprem-ssh`)
-and a development one (`local`). This document is for the fifth one, which
-somebody else writes: CoreWeave, AWS, Slurm, a lab scheduler, a hardware vendor's
-API. You publish a distribution, Eyvan loads it through an entry point, and your
-provider serves a `capacity_backend` name the same way the in-tree ones do.
+Eyvan ships five capacity backends (`gcp`, `aws-ec2`, `kubernetes`, `manual`,
+`onprem-ssh`) and a development one (`local`). This document is for the next one,
+which somebody else writes: CoreWeave, Slurm, a lab scheduler, a hardware
+vendor's API. You publish a distribution, Eyvan loads it through an entry point,
+and your provider serves a `capacity_backend` name the same way the in-tree ones
+do.
+
+`aws-ec2` is worth reading as the worked example, because it was written after
+this contract existed rather than before: it is one driver, one capability entry
+and a transport, with no edit to the scheduler, the planner or the durable model.
+It also shows what the conformance suite is for -- two real ownership bugs in it
+were found by the suite and not by its own tests.
 
 Nothing here is a private API. If you need to reach into `eyvan.server` or copy a
 driver to make your provider work, that is a bug in this contract -- open an

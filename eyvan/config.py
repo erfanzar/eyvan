@@ -245,6 +245,17 @@ class EyvanSettings:
     #: both, which is the default and today's behaviour: locality stays the soft
     #: preference it has always been until an operator sizes a cache.
     cell_stage_interval_s: float = 0.0
+    #: AWS region the EC2 capacity backend provisions in. Required for that
+    #: backend and unused by every other: a fleet with no AWS pools never reads
+    #: it, and one with them cannot be built without it.
+    aws_region: str = ""
+    #: Static AWS credentials, for a control plane that is not running with an
+    #: instance role. Empty is the ordinary case and the better one -- a plane on
+    #: EC2 or EKS gets rotating credentials from its role, and a long-lived key
+    #: in a settings file is a key in a backup.
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_session_token: str = ""
     #: How often the leader pushes committed audit events to project webhooks.
     #: Thirty seconds because a notification is not a control loop: the events
     #: are already durable, and a receiver's chat provider rate-limits long
@@ -658,6 +669,10 @@ class EyvanSettings:
             grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             cell_stage_interval_s=float(os.getenv("EYVAN_CELL_STAGE_INTERVAL_S", defaults.cell_stage_interval_s)),
+            aws_region=os.getenv("EYVAN_AWS_REGION", defaults.aws_region),
+            aws_access_key_id=os.getenv("EYVAN_AWS_ACCESS_KEY_ID", defaults.aws_access_key_id),
+            aws_secret_access_key=os.getenv("EYVAN_AWS_SECRET_ACCESS_KEY", defaults.aws_secret_access_key),
+            aws_session_token=os.getenv("EYVAN_AWS_SESSION_TOKEN", defaults.aws_session_token),
             webhook_delivery_interval_s=float(
                 os.getenv("EYVAN_WEBHOOK_DELIVERY_INTERVAL_S", defaults.webhook_delivery_interval_s)
             ),

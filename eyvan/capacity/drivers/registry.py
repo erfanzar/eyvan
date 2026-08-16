@@ -265,6 +265,40 @@ def _kubernetes_factory(name: str, *, state: FleetStateStore, settings: EyvanSet
     )
 
 
+def _aws_factory(name: str, *, state: FleetStateStore, settings: EyvanSettings) -> CapacityDriver:
+    """Build the EC2 driver, refusing to guess at a region or a credential.
+
+    Refused loudly rather than defaulted: a driver that quietly picked
+    ``us-east-1`` would provision real machines in a region nobody chose, and one
+    that fell back to an anonymous client would fail every call with an
+    authentication error that says nothing about the missing setting.
+    """
+
+    del name
+    from eyvan.capacity.drivers.aws import AwsEc2CapacityDriver
+    from eyvan.capacity.providers.aws.api import HttpEc2Api
+    from eyvan.capacity.providers.aws.signing import AwsCredentials
+
+    if not settings.aws_region:
+        raise ValueError("the aws-ec2 capacity backend requires EYVAN_AWS_REGION")
+    if not (settings.aws_access_key_id and settings.aws_secret_access_key):
+        raise ValueError(
+            "the aws-ec2 capacity backend requires EYVAN_AWS_ACCESS_KEY_ID and EYVAN_AWS_SECRET_ACCESS_KEY. "
+            "Instance-role credentials are not read yet, so a plane relying on one must supply them explicitly"
+        )
+    return AwsEc2CapacityDriver(
+        state,
+        api=HttpEc2Api(
+            region=settings.aws_region,
+            credentials=AwsCredentials(
+                access_key_id=settings.aws_access_key_id,
+                secret_access_key=settings.aws_secret_access_key,
+                session_token=settings.aws_session_token or None,
+            ),
+        ),
+    )
+
+
 def _gcp_factory(name: str, *, state: FleetStateStore, settings: EyvanSettings) -> CapacityDriver:
     from eyvan.capacity.drivers.gcp import GcpCapacityDriver
     from eyvan.capacity.providers.gcp.native_worker_ingress import GcloudNativeWorkerPublicIngress
@@ -648,6 +682,8 @@ DEFAULT_CAPACITY_BACKENDS.register("gcp-compute", _gcp_factory)
 DEFAULT_CAPACITY_BACKENDS.register("kubernetes", _kubernetes_factory)
 DEFAULT_CAPACITY_BACKENDS.register("k8s", _kubernetes_factory)
 DEFAULT_CAPACITY_BACKENDS.register("onprem-ssh", _onprem_ssh_factory)
+DEFAULT_CAPACITY_BACKENDS.register("aws-ec2", _aws_factory)
+DEFAULT_CAPACITY_BACKENDS.register("aws", _aws_factory)
 
 
 __all__ = (

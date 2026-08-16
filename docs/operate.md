@@ -810,6 +810,51 @@ decisions, each carrying the observation it was taken from rather than a pointer
 to state that has since moved on. That is what makes "why did it scale in at
 04:12" answerable the next morning.
 
+## Running on AWS
+
+```yaml
+provider:
+  type: aws
+  region: us-east-1
+pools:
+  cpu-16:
+    kind: cpu
+    capacity_backend: aws-ec2
+    capacity_class: spot
+    provider_options:
+      image_id: ami-0123456789abcdef0
+      instance_type: m6i.large
+      subnet_id: subnet-abc
+      security_group_ids: [sg-abc]
+```
+
+The plane needs `EYVAN_AWS_REGION` plus `EYVAN_AWS_ACCESS_KEY_ID` and
+`EYVAN_AWS_SECRET_ACCESS_KEY` (and `EYVAN_AWS_SESSION_TOKEN` for temporary
+credentials). Instance-role credentials are not read yet, so a plane relying on
+one must supply them explicitly; the backend refuses to start rather than
+defaulting a region and provisioning real machines somewhere nobody chose.
+
+One instance per cell. Ownership lives in three tags -- `eyvan:cell`,
+`eyvan:generation`, `eyvan:fence` -- because EC2 offers nowhere else to put it,
+and an instance failing to match all three is a leak to terminate rather than
+capacity to adopt. A cell that finds such an instance reports
+`NEEDS_RECREATE` rather than scheduling onto hardware whose generation nobody is
+tracking.
+
+Spot cells ask for a **one-time** request, never a persistent one: a persistent
+request re-launches the instance itself after a reclamation, behind Eyvan's back,
+leaving the fleet paying for a machine no cell owns. A reclamation is reported as
+a preemption, so the preemption budget and the retry accounting work exactly as
+they do on GCP.
+
+**Not run against a real AWS account.** The signing is checked against AWS's own
+published test vectors and the driver passes the twelve-property conformance
+suite against a fake EC2, which establishes that its fencing and idempotency are
+right and says nothing about whether AWS accepts the bytes. `flex_start` is not
+offered here: AWS sells a bounded window as a Capacity Block, bought in advance
+rather than queued, and mapping it onto that class would misdescribe what you
+get.
+
 ## Getting told, instead of asking
 
 ```

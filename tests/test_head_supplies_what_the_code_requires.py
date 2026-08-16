@@ -45,6 +45,15 @@ _NOT_A_HEAD_CONCERN: dict[str, str] = {
         "a workload-side opt-in that weakens artifact transport; a head that set it for every "
         "workload would remove a protection nobody asked to remove"
     ),
+    "EYVAN_AWS_REGION": (
+        "required only by the aws-ec2 capacity backend, which a GCP head never selects. A head "
+        "that wrote a region for a backend it does not run would be stating a fact about somebody "
+        "else's fleet"
+    ),
+    "EYVAN_AWS_ACCESS_KEY_ID": (
+        "same: the aws-ec2 backend's credential. It is also the kind of value a head must not "
+        "invent -- a long-lived key written into every head's environment is a key in every backup"
+    ),
     "EYVAN_NATIVE_WORKER_WHEELHOUSE": (
         "required only for private-google-access egress, where workers cannot reach PyPI and need "
         "their dependencies staged too; heads on cloud-nat or public-internet install normally. "

@@ -64,6 +64,9 @@ def capacity_backend_agent_family(name: str) -> str:
         "compute": "gcp",
         "kubernetes": "kubernetes",
         "k8s": "kubernetes",
+        "aws": "aws",
+        "aws-ec2": "aws",
+        "ec2": "aws",
     }
     return families.get(normalized, normalized)
 

@@ -137,6 +137,8 @@ def test_capabilities_declare_real_backend_enforcement(tmp_path) -> None:
 
 def test_registry_exposes_every_backend_including_manual() -> None:
     assert DEFAULT_CAPACITY_BACKENDS.names() == (
+        "aws",
+        "aws-ec2",
         "gcp",
         "gcp-compute",
         "gcp-tpu",

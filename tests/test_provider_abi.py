@@ -328,6 +328,8 @@ def test_discovery_is_off_by_default_and_imports_nothing(plugin_site, tmp_path, 
 
     assert not sentinel.exists(), "a disabled plugin must not be imported"
     assert DEFAULT_CAPACITY_BACKENDS.names() == (
+        "aws",
+        "aws-ec2",
         "gcp",
         "gcp-compute",
         "gcp-tpu",
