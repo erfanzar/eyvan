@@ -395,6 +395,93 @@ class WorkloadCommandService:
         )
         self.renderer.emit(response)
 
+    def _scoped_workloads(self, scope: WorkloadScope) -> tuple[WorkloadRecord, ...]:
+        """Read every workload this scope can see."""
+
+        return self._workload_records(
+            self.session.client.request(
+                "GET",
+                "/api/v1/workloads",
+                params={"org_id": scope.org_id, "project_id": scope.project_id},
+                headers=self.session.workload_headers(scope),
+            )
+        )
+
+    def matching(self, prefix: str, *, scope: WorkloadScope) -> tuple[WorkloadRecord, ...]:
+        """Return every workload whose id or name starts with ``prefix``.
+
+        Name as well as id, because the id is a uuid and the name is the thing
+        a person chose. A sweep like ``--prefix sweep-lr-`` is exactly the shape
+        a batch of experiments has, and matching only ids would make it useless
+        for the case it exists for.
+        """
+
+        if not prefix.strip():
+            # Everything starts with the empty string, and this is the argument
+            # to a cancel. Refused rather than treated as "all".
+            raise click.UsageError("--prefix must not be empty")
+        return tuple(
+            workload
+            for workload in self._scoped_workloads(scope)
+            if workload.id.startswith(prefix) or workload.spec.name.startswith(prefix)
+        )
+
+    def resolve(self, reference: str, *, org_id: str | None, project_id: str | None) -> str:
+        """Return the workload id ``reference`` names, whatever form it took.
+
+        Exact ids are answered without a lookup, so nothing changes for the
+        normal path or for a scope this client cannot list. A prefix or a name
+        is resolved against the scope and must identify exactly one workload:
+        an ambiguous reference names the candidates instead of picking one,
+        because the caller is usually about to cancel something.
+        """
+
+        if reference.startswith("wl_") and len(reference) > 3:
+            return reference
+        scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
+        try:
+            candidates = self.matching(reference, scope=scope)
+        except Exception:
+            # A scope this client cannot list is not a reason to refuse an id it
+            # was given. The route decides whether it exists.
+            return reference
+        if not candidates:
+            return reference
+        if len(candidates) == 1:
+            return candidates[0].id
+        shown = ", ".join(f"{workload.id} ({workload.spec.name})" for workload in candidates[:5])
+        more = "" if len(candidates) <= 5 else f", and {len(candidates) - 5} more"
+        raise click.ClickException(f"{reference!r} matches {len(candidates)} workloads: {shown}{more}")
+
+    def mutate_prefix(
+        self,
+        prefix: str,
+        action: WorkloadAction,
+        *,
+        scope: WorkloadScope,
+        confirmed: bool,
+    ) -> None:
+        """Apply one lifecycle mutation to every workload matching ``prefix``.
+
+        Confirmation is required for more than one, and the matches are listed
+        first. A batch cancel is the single most expensive mistake this CLI can
+        make -- a mistyped prefix ends other people's training runs -- and the
+        cost of showing what is about to happen is one line each.
+        """
+
+        matches = self.matching(prefix, scope=scope)
+        if not matches:
+            raise click.ClickException(f"no workload in {scope.org_id}/{scope.project_id} starts with {prefix!r}")
+        if len(matches) > 1 and not confirmed:
+            for workload in matches:
+                click.echo(f"  {workload.id}  {workload.state.value:<12}{workload.spec.name}", err=True)
+            raise click.ClickException(f"{action} would apply to {len(matches)} workloads; pass --yes to confirm")
+        for workload in matches:
+            # One key per workload, derived from the action and the id, so a
+            # retried sweep re-sends the same key per job rather than a fresh
+            # one that would be a second request for the same intent.
+            self.mutate(workload.id, action, f"{action}-{workload.id}")
+
 
 @click.command("run")
 @click.argument("target", required=False)
@@ -1204,9 +1291,27 @@ def workload_logs(session: CliSession, workload_id: str, follow: bool) -> None:
 
 
 @click.command("kick")
-@click.argument("workload_id")
+@click.argument("workload_id", required=False)
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--prefix", help="Apply to every workload in this scope whose id or name starts with PREFIX.")
+@click.option(
+    "--yes",
+    "-y",
+    "confirmed",
+    is_flag=True,
+    default=False,
+    help="Do not ask before kicking more than one workload.",
+)
 @click.pass_obj
-def kick_workload(session: CliSession, workload_id: str) -> None:
+def kick_workload(
+    session: CliSession,
+    workload_id: str | None,
+    org_id: str | None,
+    project_id: str | None,
+    prefix: str | None,
+    confirmed: bool,
+) -> None:
     """Interrupt this attempt and let WORKLOAD_ID reschedule elsewhere.
 
     For an attempt wedged on a host that is not coming back while the job itself
@@ -1216,21 +1321,76 @@ def kick_workload(session: CliSession, workload_id: str) -> None:
     Charged to the preemption budget rather than the failure budget: a spot job
     sets ``--max-retries 0`` because it expects to be interrupted, so charging a
     kick there would end the job you were trying to move.
+
+    WORKLOAD_ID may be a full id, a unique id prefix or a name; ``--prefix``
+    kicks every match, which is what a zone going bad under a sweep looks like.
     """
 
-    WorkloadCommandService(session).renderer.emit(
-        session.client.request("POST", f"/api/v1/workloads/{workload_id}/kick")
-    )
+    service = WorkloadCommandService(session)
+    if prefix is not None:
+        if workload_id is not None:
+            raise click.UsageError("pass a workload id or --prefix, not both")
+        scope = session.workload_scope(org_id=org_id, project_id=project_id)
+        matches = service.matching(prefix, scope=scope)
+        if not matches:
+            raise click.ClickException(f"no workload in {scope.org_id}/{scope.project_id} starts with {prefix!r}")
+        if len(matches) > 1 and not confirmed:
+            for match in matches:
+                click.echo(f"  {match.id}  {match.state.value:<12}{match.spec.name}", err=True)
+            raise click.ClickException(f"kick would apply to {len(matches)} workloads; pass --yes to confirm")
+        for match in matches:
+            service.renderer.emit(session.client.request("POST", f"/api/v1/workloads/{match.id}/kick"))
+        return
+    if workload_id is None:
+        raise click.UsageError("give a workload id, or --prefix to match several")
+    resolved = service.resolve(workload_id, org_id=org_id, project_id=project_id)
+    service.renderer.emit(session.client.request("POST", f"/api/v1/workloads/{resolved}/kick"))
 
 
 def _workload_action_command(action: WorkloadAction) -> click.Command:
     @click.command(action)
-    @click.argument("workload_id")
+    @click.argument("workload_id", required=False)
     @click.option("--idempotency-key")
+    @click.option("--org", "org_id")
+    @click.option("--project", "project_id")
+    @click.option(
+        "--prefix",
+        help="Apply to every workload in this scope whose id or name starts with PREFIX.",
+    )
+    @click.option(
+        "--yes",
+        "-y",
+        "confirmed",
+        is_flag=True,
+        default=False,
+        help="Do not ask before applying this to more than one workload.",
+    )
     @click.pass_obj
-    def command(session: CliSession, workload_id: str, idempotency_key: str | None) -> None:
-        WorkloadCommandService(session).mutate(workload_id, action, idempotency_key)
+    def command(
+        session: CliSession,
+        workload_id: str | None,
+        idempotency_key: str | None,
+        org_id: str | None,
+        project_id: str | None,
+        prefix: str | None,
+        confirmed: bool,
+    ) -> None:
+        service = WorkloadCommandService(session)
+        if prefix is not None:
+            if workload_id is not None:
+                raise click.UsageError("pass a workload id or --prefix, not both")
+            scope = session.workload_scope(org_id=org_id, project_id=project_id)
+            service.mutate_prefix(prefix, action, scope=scope, confirmed=confirmed)
+            return
+        if workload_id is None:
+            raise click.UsageError("give a workload id, or --prefix to match several")
+        service.mutate(service.resolve(workload_id, org_id=org_id, project_id=project_id), action, idempotency_key)
 
+    command.help = (
+        f"{action.capitalize()} one workload, or every workload matching --prefix.\n\n"
+        "WORKLOAD_ID may be a full id, a unique id prefix, or a workload's name when only one carries it. "
+        "Nobody types a uuid from memory, and the id in a log line is usually the only copy anyone has."
+    )
     return command
 
 

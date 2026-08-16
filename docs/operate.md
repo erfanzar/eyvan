@@ -447,6 +447,24 @@ The job streams to stdout and its progress to stderr; the command exits 0, 1 or
 it looks like. **Ctrl-C detaches and does not cancel** -- the job is durable and
 outlives whoever submitted it. Reattach with `eyvan workload logs ID --follow`.
 
+## Naming a job, and naming a batch
+
+```
+eyvan workload cancel wl_9f2c...              # a full id
+eyvan workload cancel baseline-run            # its name, when only one carries it
+eyvan workload cancel --prefix sweep-lr- --yes
+eyvan workload kick --prefix sweep-lr- --yes  # move a whole sweep off a bad zone
+```
+
+`cancel`, `retry`, `checkpoint` and `kick` accept a full id, a unique id prefix
+or a name. An ambiguous reference lists the candidates rather than picking one:
+the command that follows is usually a cancel, and picking wrong ends somebody
+else's run.
+
+`--prefix` applies to every match. More than one match is listed and refused
+until `--yes`, and an empty prefix is refused outright -- everything starts
+with the empty string.
+
 ## Debugging one workload
 
 ```
