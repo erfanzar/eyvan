@@ -77,6 +77,100 @@ def _candidate_pool_ids(workload: WorkloadRecord) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+def candidate_zone_report(
+    workload: WorkloadRecord,
+    pools: tp.Sequence[CapacityPoolRecord],
+    cells: tp.Sequence[CellRecord],
+    leases: tp.Sequence[LeaseRecord],
+    *,
+    now: datetime,
+) -> tuple[dict[str, object], ...]:
+    """Describe every pool this workload accepts, best choice first.
+
+    The same signals :func:`_preferred_candidate` ranks on, computed the same
+    way and returned instead of consumed. Sharing the ranking rather than the
+    numbers would be a second implementation of the decision; sharing the
+    numbers and re-ranking here would be a second implementation of the order.
+    So this calls the ranking function and reports the inputs beside its answer.
+
+    Empty for a workload that accepts one pool: there is nothing to choose
+    between, and a one-entry list reads as a decision that was never made.
+
+    Args:
+        workload: The workload whose candidates are being described.
+        pools: Every pool in the fleet.
+        cells: Every cell, for the free-supply and belief counts.
+        now: When cooldowns are judged against.
+
+    Returns:
+        One mapping per candidate pool, ordered best first.
+    """
+
+    candidate_ids = _candidate_pool_ids(workload)
+    if len(candidate_ids) < 2:
+        return ()
+    pools_by_id = {pool.id: pool for pool in pools}
+    candidates = [pools_by_id[pool_id] for pool_id in candidate_ids if pool_id in pools_by_id]
+    if len(candidates) < 2:
+        return ()
+
+    free_owned: Counter[tuple[str, int, str]] = Counter()
+    free_shared: Counter[tuple[str, int]] = Counter()
+    cooling: Counter[str] = Counter()
+    failures: Counter[str] = Counter()
+    # A cell is free when nothing holds an active lease on it. The same rule the
+    # planner uses; a state-based test would count a busy cell as available the
+    # moment its state stopped being the one this code happened to check.
+    leased = {lease.cell_id for lease in leases if lease.state in ACTIVE_LEASE_STATES}
+    for cell in cells:
+        pool_id = cell.pool_id or ""
+        if pool_id not in pools_by_id:
+            continue
+        belief = cell.availability
+        if belief.cooldown_until is not None and belief.cooldown_until > now:
+            cooling[pool_id] += 1
+        failures[pool_id] = max(failures[pool_id], int(belief.consecutive_failures))
+        if cell.id in leased:
+            continue
+        if cell.autoscale_request_workload_id is None:
+            free_shared[(pool_id, cell.worker_count)] += 1
+        else:
+            free_owned[(pool_id, cell.worker_count, cell.autoscale_request_workload_id)] += 1
+
+    preferred = _preferred_candidate(
+        candidates,
+        workload=workload,
+        free_owned_exact_supply=free_owned,
+        free_shared_exact_supply=free_shared,
+        pool_cooling=cooling,
+        pool_consecutive_failures=failures,
+    )
+    width = workload.spec.worker_count
+    ordered = sorted(
+        candidates,
+        key=lambda pool: (
+            pool.id != preferred.id,
+            -free_owned[(pool.id, width, workload.id)],
+            -free_shared[(pool.id, width)],
+            cooling[pool.id],
+            failures[pool.id],
+            candidate_ids.index(pool.id),
+        ),
+    )
+    return tuple(
+        {
+            "pool_id": pool.id,
+            "zone": pool.zone,
+            "preferred": pool.id == preferred.id,
+            "free_owned_cells": free_owned[(pool.id, width, workload.id)],
+            "free_shared_cells": free_shared[(pool.id, width)],
+            "cooling_cells": cooling[pool.id],
+            "consecutive_failures": failures[pool.id],
+        }
+        for pool in ordered
+    )
+
+
 def _preferred_candidate(
     candidates: list[CapacityPoolRecord],
     *,

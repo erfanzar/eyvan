@@ -1102,6 +1102,36 @@ class CellRejection(EyvanModel):
     message: str = Field(max_length=512)
 
 
+class CandidateZone(EyvanModel):
+    """One pool this workload accepts, and what is known about it.
+
+    The belief state -- cooldowns and consecutive provider failures -- has
+    decided which pool a cross-zone workload asks next since alternates
+    existed, and said so nowhere. "Why is it waiting on us-east5-b when
+    us-central2-b is idle" had no answer short of reading cell records by hand,
+    and on a spot-first fleet it is the question asked most often.
+
+    Attributes:
+        pool_id: The pool, which for a cross-zone shape is effectively the zone.
+        zone: Where it is, when the pool records one.
+        preferred: Whether this is the pool the planner would ask next.
+        free_owned_cells: Cells this workload already owns here, which it could
+            take immediately. The strongest reason to prefer a pool.
+        free_shared_cells: Unreserved cells of the right width here.
+        cooling_cells: Cells in a provider-failure cooldown. A pool is as cold
+            as its coldest cell, which is why one is enough to rank it lower.
+        consecutive_failures: The worst consecutive-failure count here.
+    """
+
+    pool_id: str = Field(max_length=128)
+    zone: str | None = Field(default=None, max_length=128)
+    preferred: bool = False
+    free_owned_cells: int = Field(default=0, ge=0)
+    free_shared_cells: int = Field(default=0, ge=0)
+    cooling_cells: int = Field(default=0, ge=0)
+    consecutive_failures: int = Field(default=0, ge=0)
+
+
 class WorkloadExplanation(EyvanModel):
     """Why one workload is or is not currently placeable.
 
@@ -1142,6 +1172,10 @@ class WorkloadExplanation(EyvanModel):
     delivery_state: str | None = None
     delivery_attempts: int = Field(default=0, ge=0)
     delivery_error: str | None = Field(default=None, max_length=2000)
+    #: Every pool this workload accepts, best choice first, with what the belief
+    #: state knows about each. Empty for a workload that names one pool, which
+    #: is most of them and for which there is nothing to choose between.
+    candidate_zones: tuple[CandidateZone, ...] = ()
     observed_at: datetime = Field(default_factory=utcnow)
 
     @property

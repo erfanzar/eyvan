@@ -42,7 +42,12 @@ from eyvan.artifacts.managed import (
     parse_managed_uri,
 )
 from eyvan.artifacts.managed import result_uri as managed_result_uri
-from eyvan.capacity.planning import POOL_ALTERNATES_LABEL, cell_matches_template, cell_provides_pool_supply
+from eyvan.capacity.planning import (
+    POOL_ALTERNATES_LABEL,
+    candidate_zone_report,
+    cell_matches_template,
+    cell_provides_pool_supply,
+)
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.domain import costing
 from eyvan.domain.availability import p95_latency
@@ -68,6 +73,7 @@ from eyvan.records import (
     BudgetRecord,
     BudgetStatus,
     CallableExecution,
+    CandidateZone,
     CapacityClass,
     CapacityPoolRecord,
     CarbonReport,
@@ -658,6 +664,7 @@ class ControlPlaneService:
             # workload may run -- so a grant was recorded and licensed nothing.
             grants = await tx.list_budget_grants() if self.plane_id else []
             quota_grants = await tx.list_quota_grants() if self.plane_id else []
+            pools_for_explain = await tx.list_capacity_pools()
         result = self.scheduler.schedule(
             workloads,
             cells,
@@ -670,6 +677,16 @@ class ControlPlaneService:
             plane_id=self.plane_id,
         )
         explanation = _explain_from_scheduling_result(workload, result)
+        zones = candidate_zone_report(workload, pools_for_explain, cells, leases, now=utcnow())
+        if zones:
+            # Which zone this workload will ask next, and on what evidence. The
+            # belief state has been deciding it since alternates existed and
+            # saying so nowhere, so "why is it waiting on a zone that keeps
+            # reclaiming while another sits idle" had no answer short of reading
+            # cell records by hand.
+            explanation = explanation.model_copy(
+                update={"candidate_zones": tuple(CandidateZone.model_validate(zone) for zone in zones)}
+            )
         if explanation.placeable:
             return explanation
         provisioning = tuple(

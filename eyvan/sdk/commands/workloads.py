@@ -542,6 +542,24 @@ class WorkloadCommandService:
                 summary = f"{summary} (showing {shown}, {omitted} not shown)"
             lines.append(f"  cells       {summary}")
             lines.extend(f"    {cell.cell_id}  {cell.code.value}  {cell.message}" for cell in explanation.cells)
+        if explanation.candidate_zones:
+            # Why this zone and not that one. The belief state has decided it
+            # for every cross-zone workload since alternates existed; printing
+            # the evidence beside the choice is what makes it reviewable.
+            lines.append("  zones")
+            for zone in explanation.candidate_zones:
+                marker = "->" if zone.preferred else "  "
+                where = zone.zone or zone.pool_id
+                evidence = []
+                if zone.free_owned_cells:
+                    evidence.append(f"{zone.free_owned_cells} already yours")
+                if zone.free_shared_cells:
+                    evidence.append(f"{zone.free_shared_cells} free")
+                if zone.cooling_cells:
+                    evidence.append(f"{zone.cooling_cells} cooling")
+                if zone.consecutive_failures:
+                    evidence.append(f"{zone.consecutive_failures} consecutive failures")
+                lines.append(f"    {marker} {where}  {', '.join(evidence) or 'nothing free, nothing failing'}")
         if explanation.autoscale_block_reason is not None:
             lines.append(f"  autoscale   {explanation.autoscale_block_reason.value}")
         if explanation.queue_admission_denial is not None:

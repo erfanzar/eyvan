@@ -40,7 +40,7 @@ _CANDIDATE = re.compile(r"""[`"'](/[a-z][^`"'\s]*)""")
 #: naming its members here is what keeps them checked -- a fourth action added
 #: to that union without a route fails the test that follows this map.
 _DYNAMIC_SEGMENTS: dict[str, tuple[str, ...]] = {
-    "/workloads/{}/{}": ("cancel", "checkpoint", "retry"),
+    "/workloads/{}/{}": ("cancel", "checkpoint", "kick", "retry"),
 }
 
 
