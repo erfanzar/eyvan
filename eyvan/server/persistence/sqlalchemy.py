@@ -66,6 +66,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
@@ -79,7 +80,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0018_service_operations"
+SCHEMA_REVISION = "0019_webhooks"
 
 
 @tp.runtime_checkable
@@ -166,6 +167,16 @@ class QuotaRow(Base):
     org_id: Mapped[str | None] = mapped_column(String(128), index=True)
     project_id: Mapped[str | None] = mapped_column(String(128), index=True)
     principal_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class WebhookRow(Base):
+    __tablename__ = "webhooks"
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    #: Real columns, because delivery lists every enabled subscription for a
+    #: scope on every cycle and that read must not become a scan over JSON.
+    org_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -865,6 +876,37 @@ class SqlAlchemySession:
                 data=_dump(budget),
             )
         )
+
+    async def get_webhook(self, webhook_id: str) -> WebhookRecord | None:
+        row = await self._get_locked(WebhookRow, webhook_id)
+        return None if row is None else WebhookRecord.model_validate(row.data)
+
+    async def list_webhooks(self, *, org_id: str | None = None, project_id: str | None = None) -> list[WebhookRecord]:
+        statement = select(WebhookRow)
+        if org_id is not None:
+            statement = statement.where(WebhookRow.org_id == org_id)
+        if project_id is not None:
+            statement = statement.where(WebhookRow.project_id == project_id)
+        rows = (await self.session.scalars(statement)).all()
+        return sorted(_decode_rows(WebhookRecord, rows, table="webhooks"), key=lambda item: item.id)
+
+    async def put_webhook(self, webhook: WebhookRecord) -> None:
+        await self.session.merge(
+            WebhookRow(
+                id=webhook.id,
+                org_id=webhook.org_id,
+                project_id=webhook.project_id,
+                data=_dump(webhook),
+            )
+        )
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        # Loaded first, like every other delete here: `_get_locked` takes the
+        # row lock, so a delete racing a delivery cursor update serializes
+        # rather than leaving the loser writing a row that no longer exists.
+        row = await self._get_locked(WebhookRow, webhook_id)
+        if row is not None:
+            await self.session.delete(row)
 
     async def put_progress_report(self, workload_id: str, report: UserProgressReport) -> None:
         await self.session.merge(ProgressReportRow(workload_id=workload_id, rank=report.rank, data=_dump(report)))

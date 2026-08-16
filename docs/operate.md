@@ -770,6 +770,44 @@ decisions, each carrying the observation it was taken from rather than a pointer
 to state that has since moved on. That is what makes "why did it scale in at
 04:12" answerable the next morning.
 
+## Getting told, instead of asking
+
+```
+eyvan webhook add https://hooks.example.com/eyvan --secret "$WEBHOOK_SECRET"
+eyvan webhook add https://hooks.example.com/eyvan --secret ... --action workload.settled
+eyvan webhook list
+eyvan webhook remove wh_...
+```
+
+The audit trail was always readable, over SSE, by a client willing to hold a
+connection open. That is the wrong shape for the things people want notified --
+a Slack workspace, a pager, a script on a laptop -- so "tell me when my job
+finishes" meant writing a poller.
+
+Each delivery is a batch of audit events, signed with your secret as
+`X-Eyvan-Signature: sha256=...` over the exact body, and carries
+`X-Eyvan-Sequence` so a receiver can tell a gap from a quiet fleet. Verify the
+signature: the URL is all anybody needs to send you a convincing forgery.
+
+**Delivery is at-least-once.** The cursor advances only after a receiver
+accepts, so a receiver that saw nothing gets it again and one that saw it twice
+can dedupe on the event id. A subscription starts from *now*, not from the
+beginning of the ledger, because a new integration replaying a month into an
+incident channel is a bad first impression. Ten consecutive failures disable a
+subscription, and the reason is recorded -- an integration that silently went
+quiet cannot be told apart from a fleet with nothing happening in it.
+
+`--entity-type` and `--action` narrow what is sent; the default is everything.
+Filtered-out events still advance the cursor, so a narrow subscription does not
+re-read the ledger every cycle.
+
+**A subscription is a request the control plane makes.** So the URL is checked
+against the plane's own network -- loopback, private ranges, and the cloud
+metadata service on `169.254.169.254` are refused, at creation and again at
+delivery, because a name that resolved publicly yesterday can resolve to
+loopback today. Set `EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` where the receiver
+genuinely shares the plane's network. Signing keys are never readable back.
+
 ## Break glass
 
 ```

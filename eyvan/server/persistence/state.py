@@ -38,6 +38,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
@@ -62,6 +63,7 @@ class ControlPlaneState:
     policies: dict[tuple[str, str], PolicyRecord] = field(default_factory=dict)
     quotas: dict[tuple[str, str, str], QuotaRecord] = field(default_factory=dict)
     budgets: dict[tuple[str, str], BudgetRecord] = field(default_factory=dict)
+    webhooks: dict[str, WebhookRecord] = field(default_factory=dict)
     #: Keyed by (subject, role, org, project) so re-issuing one overwrites it.
     role_grants: dict[tuple[str, str, str, str], RoleGrantRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
@@ -280,6 +282,23 @@ class StateSession(RepositorySession):
 
     async def put_budget(self, budget: BudgetRecord) -> None:
         self._state.budgets[(budget.org_id, budget.project_id)] = budget
+
+    async def get_webhook(self, webhook_id: str) -> WebhookRecord | None:
+        return self._state.webhooks.get(webhook_id)
+
+    async def list_webhooks(self, *, org_id: str | None = None, project_id: str | None = None) -> list[WebhookRecord]:
+        items = [
+            item
+            for item in self._state.webhooks.values()
+            if (org_id is None or item.org_id == org_id) and (project_id is None or item.project_id == project_id)
+        ]
+        return sorted(items, key=lambda item: item.id)
+
+    async def put_webhook(self, webhook: WebhookRecord) -> None:
+        self._state.webhooks[webhook.id] = webhook
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        self._state.webhooks.pop(webhook_id, None)
 
     async def put_progress_report(self, workload_id: str, report: UserProgressReport) -> None:
         self._state.progress_reports.setdefault(workload_id, {})[report.rank] = report

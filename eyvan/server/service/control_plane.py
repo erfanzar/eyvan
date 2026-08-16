@@ -126,6 +126,7 @@ from eyvan.records import (
     ServiceReplicaHealthState,
     UserProgressReport,
     WarmthReport,
+    WebhookRecord,
     WorkerResourceScope,
     WorkloadDefinition,
     WorkloadDispatchReservation,
@@ -210,6 +211,7 @@ from eyvan.server.service.subjobs import (
     parent_depth,
     validate_parent,
 )
+from eyvan.server.service.webhooks import validate_target as validate_webhook_target
 from eyvan.worker.runtime.node_health import HostFaultProof, parse_host_fault_marker
 
 #: How much of a statement the audit ledger keeps. Enough to recognise the
@@ -4653,6 +4655,96 @@ class ControlPlaneService:
                 )
             )
             return updated
+
+    async def create_webhook(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        url: str,
+        secret: str,
+        entity_types: tuple[str, ...] = (),
+        actions: tuple[str, ...] = (),
+        allow_private_targets: bool = False,
+    ) -> WebhookRecord:
+        """Register where this project wants its lifecycle events pushed.
+
+        Authorized as managing the project, not as reading it: a subscription
+        sends this project's audit trail somewhere, and anybody who can create
+        one decides where its history goes.
+
+        The subscription is created starting from *now*, not from the beginning
+        of the ledger. A new integration replaying a month of history into
+        somebody's incident channel is the first impression this feature would
+        otherwise make.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
+        validate_webhook_target(url, allow_private=allow_private_targets)
+        async with self.repository.transaction() as tx:
+            latest = await tx.list_events(org_id=org_id, project_id=project_id, newest_first=True, limit=1)
+            webhook = WebhookRecord(
+                id=_new_id("wh"),
+                org_id=org_id,
+                project_id=project_id,
+                url=url,
+                secret=secret,
+                entity_types=entity_types,
+                actions=actions,
+                delivered_sequence=latest[0].sequence if latest else 0,
+                created_by=principal.subject,
+            )
+            await tx.put_webhook(webhook)
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=principal.subject,
+                    entity_type="webhook",
+                    entity_id=webhook.id,
+                    action="webhook.created",
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+            )
+        return webhook
+
+    async def list_webhooks(self, principal: Principal, *, org_id: str, project_id: str) -> list[WebhookRecord]:
+        """Return this project's subscriptions, with their signing keys removed."""
+
+        self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
+        async with self.repository.transaction() as tx:
+            webhooks = await tx.list_webhooks(org_id=org_id, project_id=project_id)
+        # Redacted on the way out rather than on the way in: the plane needs the
+        # key to sign, and a signature anybody can forge proves nothing.
+        return [webhook.redacted() for webhook in webhooks]
+
+    async def delete_webhook(self, principal: Principal, webhook_id: str) -> WebhookRecord:
+        """Stop delivering to one subscription and forget it."""
+
+        async with self.repository.transaction() as tx:
+            webhook = await tx.get_webhook(webhook_id)
+            if webhook is None:
+                raise NotFoundError(f"webhook {webhook_id!r} was not found")
+            self.authorizer.require(
+                principal,
+                Permission.MANAGE_PROJECT,
+                org_id=webhook.org_id,
+                project_id=webhook.project_id,
+            )
+            await tx.delete_webhook(webhook_id)
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=principal.subject,
+                    entity_type="webhook",
+                    entity_id=webhook_id,
+                    action="webhook.deleted",
+                    org_id=webhook.org_id,
+                    project_id=webhook.project_id,
+                )
+            )
+        return webhook.redacted()
 
     async def workload_cost(
         self,

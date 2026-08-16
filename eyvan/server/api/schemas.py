@@ -443,6 +443,22 @@ class CapacityPoolUpsertRequest(ApiModel):
         return CapacityPoolRecord(**self.model_dump(exclude={"agent_endpoint"}), agent_endpoint=agent_endpoint)
 
 
+class WebhookCreateRequest(ApiModel):
+    """Where a project wants its lifecycle events pushed."""
+
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    url: str = Field(min_length=1, max_length=2048)
+    #: The key deliveries are signed with. Supplied rather than generated so the
+    #: receiver can be configured with it first: a secret this plane invents has
+    #: to be read back out of a record that deliberately never returns it.
+    secret: str = Field(min_length=16, max_length=256)
+    #: Empty means every event, which is the useful default. A filter that has to
+    #: be right before anything arrives is one most people get wrong once.
+    entity_types: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+
+
 class FleetApplyRequest(ApiModel):
     pools: tuple[CapacityPoolUpsertRequest, ...] = Field(min_length=1)
 

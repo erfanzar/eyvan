@@ -34,6 +34,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
     WorkloadState,
@@ -163,6 +164,16 @@ class RepositorySession(tp.Protocol):
     async def list_budgets(self, *, org_id: str | None = None) -> list[BudgetRecord]: ...
 
     async def put_budget(self, budget: BudgetRecord) -> None: ...
+
+    async def get_webhook(self, webhook_id: str) -> WebhookRecord | None: ...
+
+    async def list_webhooks(
+        self, *, org_id: str | None = None, project_id: str | None = None
+    ) -> list[WebhookRecord]: ...
+
+    async def put_webhook(self, webhook: WebhookRecord) -> None: ...
+
+    async def delete_webhook(self, webhook_id: str) -> None: ...
 
     async def get_managed_artifact(self, org_id: str, project_id: str, uri: str) -> ManagedArtifactRecord | None: ...
 

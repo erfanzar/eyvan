@@ -245,6 +245,17 @@ class EyvanSettings:
     #: both, which is the default and today's behaviour: locality stays the soft
     #: preference it has always been until an operator sizes a cache.
     cell_stage_interval_s: float = 0.0
+    #: How often the leader pushes committed audit events to project webhooks.
+    #: Thirty seconds because a notification is not a control loop: the events
+    #: are already durable, and a receiver's chat provider rate-limits long
+    #: before this does. Zero disables delivery entirely, which is also what a
+    #: fleet with no subscriptions costs.
+    webhook_delivery_interval_s: float = 30.0
+    #: Whether a webhook may point at loopback or a private range. Off, because
+    #: a subscription is a request *this plane* makes: an internal address turns
+    #: one into a way to reach what the submitter cannot. On for a development
+    #: plane, and for a fleet whose receiver genuinely shares its network.
+    webhook_allow_private_targets: bool = False
     #: Hard ceiling on the bytes Eyvan may own on one cell's disk. Zero is the
     #: off switch, and it is off by construction: nothing is staged, so nothing
     #: has to be reclaimed and no budget can be exceeded.
@@ -647,6 +658,13 @@ class EyvanSettings:
             grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             cell_stage_interval_s=float(os.getenv("EYVAN_CELL_STAGE_INTERVAL_S", defaults.cell_stage_interval_s)),
+            webhook_delivery_interval_s=float(
+                os.getenv("EYVAN_WEBHOOK_DELIVERY_INTERVAL_S", defaults.webhook_delivery_interval_s)
+            ),
+            webhook_allow_private_targets=truthy(
+                "EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS",
+                defaults.webhook_allow_private_targets,
+            ),
             cell_stage_budget_bytes=int(os.getenv("EYVAN_CELL_STAGE_BUDGET_BYTES", defaults.cell_stage_budget_bytes)),
             cell_stage_max_bytes=int(os.getenv("EYVAN_CELL_STAGE_MAX_BYTES", defaults.cell_stage_max_bytes)),
             cell_stage_eviction_policy=os.getenv(

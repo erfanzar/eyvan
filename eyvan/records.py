@@ -2782,6 +2782,61 @@ class WorkloadSpendRecord(EyvanModel):
     on_demand_source: str = ""
 
 
+class WebhookRecord(EyvanModel):
+    """Where one project wants its lifecycle events pushed.
+
+    The audit stream has always been readable, over SSE, by a client willing to
+    hold a connection open. That is the wrong shape for the things people
+    actually want notified -- a Slack workspace, a pager, somebody's small
+    script -- so "tell me when my job finishes" meant writing a poller, and a
+    poller is how a control plane acquires a hundred clients asking the same
+    question every five seconds.
+
+    The secret is write-only. It is the key the receiver verifies the signature
+    with; anything that reads a subscription back reads it redacted, because a
+    signature anybody can forge proves nothing about who sent the request.
+    """
+
+    id: str = Field(max_length=96)
+    org_id: str = Field(max_length=128)
+    project_id: str = Field(max_length=128)
+    url: str = Field(min_length=1, max_length=2048)
+    #: Key for the HMAC every delivery carries. Never returned by a read.
+    secret: str = Field(min_length=16, max_length=256)
+    #: Entity types and actions this subscription wants. Empty means every one,
+    #: which is the useful default: a filter that must be written before
+    #: anything arrives is a filter most people get wrong once and never fix.
+    entity_types: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+    enabled: bool = True
+    #: The audit sequence this subscription has been delivered through. Durable
+    #: so a restarted plane resumes rather than replaying a week of history into
+    #: somebody's incident channel.
+    delivered_sequence: int = Field(default=0, ge=0)
+    consecutive_failures: int = Field(default=0, ge=0)
+    #: Why delivery stopped, when it did. A subscription that silently went
+    #: quiet is indistinguishable from a fleet with nothing happening in it.
+    disabled_reason: str | None = Field(default=None, max_length=512)
+    created_by: str = Field(max_length=256)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_webhook(self) -> WebhookRecord:
+        _validate_string(self.id, field_name="webhook id")
+        _validate_string(self.url, field_name="webhook url")
+        for name in (*self.entity_types, *self.actions):
+            _validate_string(name, field_name="webhook filter")
+        if self.enabled and self.disabled_reason is not None:
+            raise ValueError("an enabled webhook has no disabled reason")
+        return self
+
+    def redacted(self) -> WebhookRecord:
+        """Return this subscription with its signing key removed."""
+
+        return self.model_copy(update={"secret": "*" * 16})
+
+
 class ArtifactCollection(EyvanModel):
     """What one collection pass reclaimed, or would reclaim in a dry run."""
 

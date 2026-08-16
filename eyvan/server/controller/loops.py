@@ -219,6 +219,15 @@ class _ControllerLoops:
                 interval_s=self.settings.cell_stage_interval_s,
                 zero_interval_disables=True,
             ),
+            # Last, and on its own interval. A delivery is an HTTP request to
+            # somebody else's server: it must never sit between a workload
+            # becoming placeable and the scheduler noticing.
+            LeaderPhase(
+                "deliver-webhooks",
+                self.deliver_webhooks_once,
+                interval_s=self.settings.webhook_delivery_interval_s,
+                zero_interval_disables=True,
+            ),
         )
 
     async def _run_leader_phases(self, *, now: float, due: dict[str, float]) -> dict[str, float]:

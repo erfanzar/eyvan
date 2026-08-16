@@ -93,6 +93,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     UserProgressReport,
     WarmthReport,
+    WebhookRecord,
     WorkloadEstimate,
     WorkloadExplanation,
     WorkloadProgress,
@@ -149,6 +150,7 @@ from eyvan.server.api.schemas import (
     TpuQuotaFailure,
     TpuQuotaSnapshot,
     TpuQuotaStatus,
+    WebhookCreateRequest,
     WorkloadEstimateRequest,
     WorkloadExecRequest,
     WorkloadSubmitRequest,
@@ -2994,6 +2996,53 @@ def create_app(
         if replayed:
             response.headers["Idempotent-Replay"] = "true"
         return cell
+
+    @app.post(
+        "/api/v1/webhooks",
+        response_model=WebhookRecord,
+        status_code=status.HTTP_201_CREATED,
+        tags=["governance"],
+    )
+    async def create_webhook(
+        request: WebhookCreateRequest,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> WebhookRecord:
+        """Register where this project's lifecycle events should be pushed.
+
+        The response is the only time the signing key is visible, and it is the
+        one the caller supplied: reads redact it, because a signature anybody
+        can forge proves nothing about who sent a delivery.
+        """
+
+        return await service.create_webhook(
+            principal,
+            org_id=request.org_id,
+            project_id=request.project_id,
+            url=request.url,
+            secret=request.secret,
+            entity_types=request.entity_types,
+            actions=request.actions,
+            allow_private_targets=settings.webhook_allow_private_targets,
+        )
+
+    @app.get("/api/v1/webhooks", response_model=list[WebhookRecord], tags=["governance"])
+    async def list_webhooks(
+        org_id: tp.Annotated[str, Query(min_length=1, max_length=128)],
+        project_id: tp.Annotated[str, Query(min_length=1, max_length=128)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[WebhookRecord]:
+        """List this project's subscriptions, with their signing keys removed."""
+
+        return await service.list_webhooks(principal, org_id=org_id, project_id=project_id)
+
+    @app.delete("/api/v1/webhooks/{webhook_id}", response_model=WebhookRecord, tags=["governance"])
+    async def delete_webhook(
+        webhook_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> WebhookRecord:
+        """Stop delivering to one subscription and forget it."""
+
+        return await service.delete_webhook(principal, webhook_id)
 
     @app.get("/api/v1/leases", response_model=list[LeaseRecord], tags=["leases"])
     async def list_leases(

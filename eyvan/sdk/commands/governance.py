@@ -437,11 +437,99 @@ def system_reconcile(session: CliSession) -> None:
     click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
 
 
+@click.group("webhook")
+def webhook() -> None:
+    """Push this project's lifecycle events somewhere, instead of polling for them."""
+
+
+@webhook.command("list")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.pass_obj
+def list_webhooks(session: CliSession, org_id: str | None, project_id: str | None) -> None:
+    """List this project's subscriptions.
+
+    Signing keys are not returned. They are what a receiver verifies a delivery
+    with, and one anybody can read back proves nothing about who sent it.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    _service(session).read(
+        "/api/v1/webhooks",
+        params={"org_id": scope.org_id, "project_id": scope.project_id},
+    )
+
+
+@webhook.command("add")
+@click.argument("url")
+@click.option(
+    "--secret",
+    required=True,
+    help="Key deliveries are signed with, as X-Eyvan-Signature: sha256=... over the body. "
+    "Configure your receiver with it first; it is never readable back.",
+)
+@click.option(
+    "--entity-type",
+    "entity_types",
+    multiple=True,
+    help="Only deliver events about these, for example workload or cell. Repeatable; default is everything.",
+)
+@click.option(
+    "--action",
+    "actions",
+    multiple=True,
+    help="Only deliver these actions, for example workload.settled. Repeatable; default is everything.",
+)
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.pass_obj
+def add_webhook(
+    session: CliSession,
+    url: str,
+    secret: str,
+    entity_types: tuple[str, ...],
+    actions: tuple[str, ...],
+    org_id: str | None,
+    project_id: str | None,
+) -> None:
+    """Subscribe URL to this project's events.
+
+    Delivery starts from now rather than from the beginning of the ledger: a new
+    integration replaying a month of history into an incident channel is the
+    first impression this would otherwise make.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    JsonRenderer().emit(
+        session.client.request(
+            "POST",
+            "/api/v1/webhooks",
+            json={
+                "org_id": scope.org_id,
+                "project_id": scope.project_id,
+                "url": url,
+                "secret": secret,
+                "entity_types": list(entity_types),
+                "actions": list(actions),
+            },
+        )
+    )
+
+
+@webhook.command("remove")
+@click.argument("webhook_id")
+@click.pass_obj
+def remove_webhook(session: CliSession, webhook_id: str) -> None:
+    """Stop delivering to one subscription and forget it."""
+
+    JsonRenderer().emit(session.client.request("DELETE", f"/api/v1/webhooks/{webhook_id}"))
+
+
 def register_governance_commands(main: click.Group) -> None:
     """Attach the governance command groups to the CLI root."""
 
-    for command in (quota, budget, policy, system_reconcile):
+    for command in (quota, budget, policy, webhook, system_reconcile):
         main.add_command(command)
 
 
-__all__ = ("budget", "policy", "quota", "register_governance_commands", "system_reconcile")
+__all__ = ("budget", "policy", "quota", "register_governance_commands", "system_reconcile", "webhook")

@@ -1,0 +1,207 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Pushing lifecycle events out, so nobody has to poll for them.
+
+The audit trail has always been readable -- over SSE, by a client willing to
+hold a connection open. That is the wrong shape for the things people actually
+want notified: a Slack workspace, a pager, a small script on somebody's laptop.
+So "tell me when my job finishes" meant writing a poller, and pollers are how a
+control plane acquires a hundred clients asking the same question every five
+seconds.
+
+Three properties this delivery has to have, and each one is a way it could
+quietly go wrong:
+
+**A dead receiver must not stall the plane.** Deliveries run last, on their own
+interval, with a bounded timeout, and each subscription's failure is isolated
+from the others. An endpoint that accepts a connection and never answers is the
+ordinary failure here, not the exotic one.
+
+**The cursor advances only on success**, which makes delivery at-least-once
+rather than at-most-once. A receiver that sees a duplicate can dedupe on the
+event id; one that never sees an event has no way to know.
+
+**A filtered-out event still advances the cursor.** Otherwise a subscription
+narrowed to one action re-reads everything before its filter forever, and gets
+slower every day the fleet is used.
+"""
+
+from __future__ import annotations
+
+import json
+import typing as tp
+
+import httpx
+
+from eyvan._internal.json_types import JsonObject
+from eyvan.records import AuditEvent, WebhookRecord, utcnow
+from eyvan.server.controller._support import logger
+from eyvan.server.service.webhooks import (
+    SEQUENCE_HEADER,
+    SIGNATURE_HEADER,
+    WebhookTargetRefused,
+    matches,
+    sign,
+    validate_target,
+)
+
+#: Events read per subscription per cycle. Bounded so one subscription that has
+#: been down for a day cannot hold the phase open while it catches up -- it
+#: catches up over several cycles instead, and every other subscription keeps
+#: being delivered meanwhile.
+_DELIVERY_BATCH = 50
+
+#: Consecutive failures before a subscription is disabled. A receiver that has
+#: been refusing for this long is not coming back on its own, and retrying it
+#: forever spends the plane's time and fills its logs. Disabling *records why*,
+#: because a subscription that silently went quiet cannot be told apart from a
+#: fleet with nothing happening in it.
+_FAILURE_LIMIT = 10
+
+#: How long one delivery may take. Short: this runs on the leader, and a
+#: receiver that needs longer than this to accept a POST is one that will be
+#: retried rather than waited for.
+_DELIVERY_TIMEOUT_S = 10.0
+
+
+def delivery_body(webhook: WebhookRecord, events: tp.Sequence[AuditEvent]) -> JsonObject:
+    """Return the document one delivery carries.
+
+    A batch rather than one event per request. A busy fleet emits events far
+    faster than a receiver's rate limit, and a delivery per event is how an
+    integration gets itself throttled by its own chat provider.
+    """
+
+    return {
+        "webhook_id": webhook.id,
+        "org_id": webhook.org_id,
+        "project_id": webhook.project_id,
+        "delivered_at": utcnow().isoformat(),
+        "events": [event.model_dump(mode="json") for event in events],
+    }
+
+
+class _ControllerWebhookDelivery:
+    """Deliver committed audit events to each project's subscriptions."""
+
+    async def deliver_webhooks_once(self) -> int:
+        """Send one batch to every subscription with something to send.
+
+        Returns:
+            How many subscriptions were delivered to, so a caller can tell a
+            quiet cycle from a cycle that did nothing because it was broken.
+        """
+
+        async with self.repository.transaction() as transaction:
+            webhooks = [item for item in await transaction.list_webhooks() if item.enabled]
+        if not webhooks:
+            return 0
+
+        delivered = 0
+        for webhook in webhooks:
+            try:
+                if await self._deliver_one(webhook):
+                    delivered += 1
+            except Exception as error:
+                # Isolated deliberately. A subscription pointing at something
+                # that raises in a way nothing here anticipated is one broken
+                # integration, not a reason to stop notifying everybody else.
+                logger.warning("webhook %s delivery failed unexpectedly: %s", webhook.id, error)
+        return delivered
+
+    async def _deliver_one(self, webhook: WebhookRecord) -> bool:
+        """Send this subscription's next batch, returning whether anything went."""
+
+        async with self.repository.transaction() as transaction:
+            events = await transaction.list_events(
+                org_id=webhook.org_id,
+                project_id=webhook.project_id,
+                after_sequence=webhook.delivered_sequence,
+                limit=_DELIVERY_BATCH,
+            )
+        if not events:
+            return False
+
+        # The cursor covers everything read, not everything sent. A subscription
+        # filtered to one action would otherwise re-read the whole ledger before
+        # its filter on every cycle, forever, getting slower as the fleet is used.
+        highest = max(event.sequence for event in events)
+        wanted = [
+            event for event in events if matches(event.entity_type, event.action, webhook.entity_types, webhook.actions)
+        ]
+        if not wanted:
+            await self._advance(webhook, highest)
+            return False
+
+        body = json.dumps(delivery_body(webhook, wanted), separators=(",", ":")).encode()
+        try:
+            # Re-checked at delivery, not only at creation: a name that resolved
+            # publicly when the subscription was written can resolve to loopback
+            # now, and that gap is the whole point of a rebinding attack.
+            validate_target(webhook.url, allow_private=self.settings.webhook_allow_private_targets)
+            async with httpx.AsyncClient(timeout=_DELIVERY_TIMEOUT_S) as client:
+                response = await client.post(
+                    webhook.url,
+                    content=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        SIGNATURE_HEADER: sign(webhook.secret, body),
+                        SEQUENCE_HEADER: str(highest),
+                    },
+                )
+            response.raise_for_status()
+        except (httpx.HTTPError, WebhookTargetRefused) as error:
+            await self._record_failure(webhook, str(error))
+            return False
+
+        await self._advance(webhook, highest)
+        return True
+
+    async def _advance(self, webhook: WebhookRecord, sequence: int) -> None:
+        """Record that this subscription has been delivered through ``sequence``."""
+
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_webhook(webhook.id)
+            if current is None:
+                return
+            await transaction.put_webhook(
+                current.model_copy(
+                    update={
+                        # Never moved backwards: this cycle's read and the write
+                        # are separate transactions, so a concurrent delivery may
+                        # already have gone further.
+                        "delivered_sequence": max(current.delivered_sequence, sequence),
+                        "consecutive_failures": 0,
+                        "updated_at": utcnow(),
+                    }
+                )
+            )
+
+    async def _record_failure(self, webhook: WebhookRecord, detail: str) -> None:
+        """Count one failure, and disable the subscription once it is hopeless."""
+
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_webhook(webhook.id)
+            if current is None:
+                return
+            failures = current.consecutive_failures + 1
+            disabled = failures >= _FAILURE_LIMIT
+            await transaction.put_webhook(
+                current.model_copy(
+                    update={
+                        "consecutive_failures": failures,
+                        "enabled": not disabled,
+                        # Recorded whether or not it disabled anything: the first
+                        # question about a quiet integration is what the receiver
+                        # last said, and nowhere else keeps it.
+                        "disabled_reason": (
+                            f"disabled after {failures} consecutive failures; last: {detail}"[:512] if disabled else None
+                        ),
+                        "updated_at": utcnow(),
+                    }
+                )
+            )
+        logger.warning("webhook %s delivery failed (%d consecutive): %s", webhook.id, failures, detail)
