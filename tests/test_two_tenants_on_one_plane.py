@@ -465,10 +465,18 @@ def test_governance_resolves_per_tenant_rather_than_globally(plane: TestClient) 
     rival_budget = plane.get("/api/v1/budgets/rival/research", headers=RIVAL)
 
     assert acme_quota.status_code == 200
-    assert acme_quota.json()["limits"]["cpu"] == 4.0
+    acme_scopes = {entry["scope"]: entry["quota"] for entry in acme_quota.json()["scopes"]}
+    assert acme_scopes["project"]["limits"]["cpu"] == 4.0
     # The neighbouring tenant inherits neither. A global resolution would hand
     # rival acme's ceiling, which reads as a working limit and is the wrong one.
-    assert rival_quota.status_code == 404
+    #
+    # Asserted as "declares nothing" rather than as a 404: the read now answers
+    # an unconfigured scope instead of refusing it, so the isolation property
+    # has to be stated directly. It is also the stronger assertion -- a 404
+    # would still pass if the route leaked another tenant's limit and then
+    # failed for an unrelated reason.
+    assert rival_quota.status_code == 200
+    assert all(entry["quota"] is None for entry in rival_quota.json()["scopes"])
     assert rival_budget.status_code == 404
 
 

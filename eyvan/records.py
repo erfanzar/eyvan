@@ -2062,6 +2062,60 @@ class PolicyRecord(EyvanModel):
         return self
 
 
+class ScopeQuota(EyvanModel):
+    """One scope of the quota hierarchy, and whether anything is declared there.
+
+    Attributes:
+        scope: ``org``, ``project`` or ``principal``.
+        org_id / project_id / principal_id: the scope's identity.
+        quota: the record declared at this scope, or ``None`` when nothing is.
+            Absence means this scope imposes no limit -- which is what admission
+            does with it -- and is a different answer from a limit of zero.
+    """
+
+    scope: tp.Literal["org", "project", "principal"]
+    org_id: str = Field(max_length=128)
+    project_id: str | None = Field(default=None, max_length=128)
+    principal_id: str | None = Field(default=None, max_length=128)
+    quota: QuotaRecord | None = None
+
+
+class EffectiveQuota(EyvanModel):
+    """Every quota that applies to one scope, and whether any of them bind.
+
+    Admission walks the whole chain and enforces *every* quota it finds, so
+    "the quota that applies" is not one row. Reporting the narrowest stored row
+    would answer a question nobody asked, and reporting a 404 when nothing is
+    stored -- which is what this used to do -- calls the ordinary state of a
+    fresh fleet an error.
+
+    ``unlimited`` is the honest reading of an empty hierarchy: no scope declares
+    a limit, so nothing here constrains the workload. It is stated rather than
+    left to be inferred from an empty list, because an empty list is exactly
+    what a caller would also see if the read had silently failed.
+    """
+
+    org_id: str = Field(max_length=128)
+    project_id: str | None = Field(default=None, max_length=128)
+    principal_id: str | None = Field(default=None, max_length=128)
+    scopes: tuple[ScopeQuota, ...] = ()
+
+    @property
+    def unlimited(self) -> bool:
+        """Return whether no scope in the chain declares a limit."""
+
+        return all(entry.quota is None for entry in self.scopes)
+
+    @model_validator(mode="after")
+    def validate_chain(self) -> EffectiveQuota:
+        """Keep the reported chain in the order admission walks it."""
+
+        order = [entry.scope for entry in self.scopes]
+        if order != sorted(order, key=("org", "project", "principal").index):
+            raise ValueError("effective quota scopes must be ordered org, project, principal")
+        return self
+
+
 class QuotaRecord(EyvanModel):
     """Hierarchical resource quota and DRF weight."""
 

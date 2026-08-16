@@ -77,6 +77,7 @@ from eyvan.records import (
     CellBillingReport,
     CellRecord,
     CoordinationKind,
+    EffectiveQuota,
     LaunchLatencyReport,
     LeaseRecord,
     ManagedArtifactRecord,
@@ -3350,13 +3351,20 @@ def create_app(
     ) -> list[QuotaRecord]:
         return await service.list_quotas(principal, org_id=org_id, project_id=project_id, principal_id=principal_id)
 
-    @app.get("/api/v1/quotas/current", response_model=QuotaRecord, tags=["governance"])
+    @app.get("/api/v1/quotas/current", response_model=EffectiveQuota, tags=["governance"])
     async def get_quota(
         org_id: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
         project_id: str | None = None,
         principal_id: str | None = None,
-    ) -> QuotaRecord:
+    ) -> EffectiveQuota:
+        """Return every quota that applies here, rather than one stored row.
+
+        A scope with nothing declared is reported as declaring nothing, which
+        is what admission does with it. This route used to 404 when no exact
+        row existed, which called an unconfigured fleet an error.
+        """
+
         return await service.get_quota(principal, org_id=org_id, project_id=project_id, principal_id=principal_id)
 
     @app.delete("/api/v1/quotas", status_code=status.HTTP_204_NO_CONTENT, tags=["governance"])

@@ -25,11 +25,12 @@ import typing as tp
 import click
 from pydantic import ValidationError
 
-from eyvan._internal.json_types import model_json
-from eyvan.records import CapacityClass, ResourceLimits
+from eyvan._internal.json_types import JsonValue, is_json_object, model_json
+from eyvan.records import CapacityClass, EffectiveQuota, ResourceLimits
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.server.api.schemas import BudgetPutRequest, PolicyPutRequest, QuotaPutRequest
 
 
@@ -89,10 +90,62 @@ def get_quota(session: CliSession, org_id: str | None, project_id: str | None) -
     """
 
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
-    _service(session).read(
+    payload = session.client.request(
+        "GET",
         "/api/v1/quotas/current",
         params={"org_id": scope.org_id, "project_id": scope.project_id},
     )
+    _emit_effective_quota(payload)
+    JsonRenderer().emit(payload)
+
+
+def _announce_quota_scope(org_id: str, project_id: str | None, principal_id: str | None) -> None:
+    """Say which scope a quota is about to be written at.
+
+    A quota widens what it is written to, so the failure that matters is
+    setting one broader than intended -- and that is exactly what omitting
+    ``--project`` on this subcommand does, whether or not the session has one.
+    """
+
+    stream = click.get_text_stream("stderr")
+    if not stream_is_terminal(stream):
+        return
+    if principal_id is not None:
+        where = f"principal {principal_id} in {org_id}/{project_id}"
+    elif project_id is not None:
+        where = f"project {org_id}/{project_id}"
+    else:
+        where = f"the whole {org_id} organization; pass --project to narrow it"
+    click.echo(f"Eyvan: setting the quota for {where}.", file=stream)
+
+
+def _emit_effective_quota(payload: JsonValue) -> None:
+    """Write a one-line human reading to stderr, leaving JSON stdout unchanged.
+
+    "No quota is set" is the ordinary state of a fresh fleet and the most likely
+    answer to this question, and it is invisible in a document whose every
+    ``quota`` field is ``null``. An empty answer that is never spelled out reads
+    as a broken command.
+    """
+
+    stream = click.get_text_stream("stderr")
+    if not stream_is_terminal(stream) or not is_json_object(payload):
+        return
+    try:
+        effective = EffectiveQuota.model_validate(payload)
+    except ValidationError:
+        return
+    if effective.unlimited:
+        where = effective.project_id or effective.org_id
+        click.echo(f"Eyvan: no quota is set for {where}; nothing here limits what it may run.", file=stream)
+        return
+    click.echo("Eyvan: every scope below applies; the tightest one binds first.", file=stream)
+    for entry in effective.scopes:
+        if entry.quota is None:
+            click.echo(f"  {entry.scope:<10} no limit declared", file=stream)
+            continue
+        limits = ", ".join(f"{name}={value:g}" for name, value in sorted(entry.quota.limits.as_dict().items()) if value)
+        click.echo(f"  {entry.scope:<10} {limits or 'zero on every resource'}", file=stream)
 
 
 @quota.command("set")
@@ -122,7 +175,15 @@ def set_quota(
 ) -> None:
     """Set the quota for one scope."""
 
+    # The org is resolved from the session; the project is *not*, and must not
+    # be -- omitting --project is how an org-wide quota is written, so filling
+    # it in from the session would make that unwritable from any normal
+    # session. The asymmetry is deliberate and invisible, which is the danger:
+    # `eyvan --project research quota set --cpu 64` writes an org quota, wider
+    # than the person almost certainly meant. So the scope is stated before it
+    # is written.
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    _announce_quota_scope(scope.org_id, project_id, principal_id)
     try:
         request = QuotaPutRequest(
             org_id=scope.org_id,

@@ -84,6 +84,7 @@ from eyvan.records import (
     CellState,
     CommandExecution,
     CoordinationKind,
+    EffectiveQuota,
     ExpansionAdmissionRecord,
     ExpansionAdmissionState,
     ExpansionMode,
@@ -116,6 +117,7 @@ from eyvan.records import (
     Role,
     RoleGrant,
     RoleGrantRecord,
+    ScopeQuota,
     ServiceDecisionKind,
     ServiceDecisionRecord,
     ServiceObservation,
@@ -4745,13 +4747,49 @@ class ControlPlaneService:
 
     async def get_quota(
         self, principal: Principal, *, org_id: str, project_id: str | None, principal_id: str | None
-    ) -> QuotaRecord:
+    ) -> EffectiveQuota:
+        """Return every quota that applies to one scope, and whether any binds.
+
+        Admission walks org, project and principal and enforces *every* quota it
+        finds, treating a missing one as "no limit from that scope". This
+        answers the same question the same way.
+
+        It used to be an exact-row lookup that raised ``NotFoundError`` when the
+        row was absent -- so asking a fresh fleet what its quota was returned a
+        404, calling the ordinary unconfigured state an error, while the command
+        that called it advertised hierarchy resolution it never did.
+        """
+
         self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
         async with self.repository.transaction() as tx:
-            quota = await tx.get_quota(org_id, project_id, principal_id)
-            if quota is None:
-                raise NotFoundError("quota was not found")
-            return quota
+            scopes: list[ScopeQuota] = [
+                ScopeQuota(scope="org", org_id=org_id, quota=await tx.get_quota(org_id, None, None))
+            ]
+            if project_id is not None:
+                scopes.append(
+                    ScopeQuota(
+                        scope="project",
+                        org_id=org_id,
+                        project_id=project_id,
+                        quota=await tx.get_quota(org_id, project_id, None),
+                    )
+                )
+            if project_id is not None and principal_id is not None:
+                scopes.append(
+                    ScopeQuota(
+                        scope="principal",
+                        org_id=org_id,
+                        project_id=project_id,
+                        principal_id=principal_id,
+                        quota=await tx.get_quota(org_id, project_id, principal_id),
+                    )
+                )
+        return EffectiveQuota(
+            org_id=org_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            scopes=tuple(scopes),
+        )
 
     async def run_readonly_query(
         self,
