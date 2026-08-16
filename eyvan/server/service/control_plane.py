@@ -878,11 +878,38 @@ class ControlPlaneService:
             if replayed is not None:
                 return replayed, True
 
-            matching_pools = [pool for pool in await self._fleet_pools(tx, fleet_name) if pool.node_type == node_type]
+            fleet_pools = await self._fleet_pools(tx, fleet_name)
+            matching_pools = [pool for pool in fleet_pools if pool.node_type == node_type]
             if not matching_pools:
-                raise NotFoundError(f"fleet node type {fleet_name}/{node_type} was not found")
+                # Fall back to the hardware the caller asked for. A pool is
+                # named by its shape unless an operator named it otherwise, so
+                # requiring the pool name meant a user had to learn a naming
+                # scheme to run anything -- while `ray job submit` and
+                # `iris job run --tpu v5litepod-16` ask only for hardware.
+                matching_pools = [pool for pool in fleet_pools if pool.accelerator_type == node_type]
+                if not matching_pools:
+                    raise NotFoundError(f"fleet node type {fleet_name}/{node_type} was not found")
+            alternate_pool_ids: tuple[str, ...] = ()
             if len(matching_pools) > 1:
-                raise ConflictError(f"fleet node type {fleet_name}/{node_type} is ambiguous")
+                # Several pools of one shape is cross-zone capacity, not a
+                # misconfiguration, exactly as on the callable path: they are
+                # alternates when interchangeable, and ambiguous when placing in
+                # either would change the admission width the workload runs on.
+                candidates = sorted(matching_pools, key=lambda candidate: candidate.id)
+                primary = candidates[0]
+                interchangeable = [
+                    candidate
+                    for candidate in candidates[1:]
+                    if candidate.allocatable == primary.allocatable and candidate.topology == primary.topology
+                ]
+                if not interchangeable:
+                    raise ConflictError(
+                        f"fleet node type {fleet_name}/{node_type} is ambiguous: its pools differ in admission "
+                        "width or topology, so they are not interchangeable. Name one pool directly, or make "
+                        "them match to use them as cross-zone alternates."
+                    )
+                matching_pools = [primary]
+                alternate_pool_ids = tuple(candidate.id for candidate in interchangeable)
             pool = matching_pools[0]
             if not pool.enabled:
                 raise ConflictError(f"fleet node type {fleet_name}/{node_type} is disabled")
@@ -896,6 +923,7 @@ class ControlPlaneService:
 
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
+                alternate_pool_ids=alternate_pool_ids,
                 name=name if name is not None else f"{fleet_name}/{node_type}",
                 execution=CommandExecution(command=command),
                 environment=dict(environment or {}),

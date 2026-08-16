@@ -368,7 +368,16 @@ class WorkloadCommandService:
 
 
 @click.command("run")
-@click.argument("target")
+@click.argument("target", required=False)
+@click.option(
+    "--tpu",
+    "tpu_type",
+    metavar="TYPE",
+    help="TPU shape to run on, for example v6e-8. Use this instead of naming a pool: the fleet is asked which "
+    "pool provides it, and pools of that shape in other zones become alternates.",
+)
+@click.option("--gpu", "gpu_type", metavar="TYPE", help="GPU shape to run on, for example nvidia-tesla-a100.")
+@click.option("--cpu", "cpu_only", is_flag=True, help="Run on CPU capacity.")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
 @click.option("--name")
@@ -438,7 +447,10 @@ class WorkloadCommandService:
 @click.pass_obj
 def run_workload(
     session: CliSession,
-    target: str,
+    target: str | None,
+    tpu_type: str | None,
+    gpu_type: str | None,
+    cpu_only: bool,
     org_id: str | None,
     project_id: str | None,
     name: str | None,
@@ -458,7 +470,26 @@ def run_workload(
     named_assets: tuple[str, ...],
     command: tuple[str, ...],
 ) -> None:
-    """Queue COMMAND on TYPE or FLEET/TYPE using applied fleet defaults."""
+    """Queue COMMAND on hardware you name, or on TYPE / FLEET/TYPE.
+
+    `--tpu v6e-8` asks the fleet which pool provides that shape, so nobody has
+    to learn a pool-naming scheme to run anything. Naming TARGET still pins one
+    pool exactly, which is what you want when the choice matters.
+    """
+
+    shapes = {"--tpu": tpu_type, "--gpu": gpu_type, "--cpu": "cpu" if cpu_only else None}
+    named = {flag: value for flag, value in shapes.items() if value is not None}
+    if len(named) > 1:
+        raise click.UsageError(f"pass exactly one of {', '.join(sorted(named))}; a job runs on one kind of hardware")
+    if named:
+        # TARGET is a positional in front of a variadic COMMAND, so click hands
+        # us the command's first word as the target. When the hardware is named
+        # by flag there is no pool argument, and that word belongs to the
+        # command -- otherwise `--tpu v6e-8 python train.py` would try to place
+        # work on a pool called "python".
+        if target is not None:
+            command = (target, *command)
+        target = next(iter(named.values()))
 
     WorkloadCommandService(session).run(
         target_value=target,

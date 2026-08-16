@@ -1605,3 +1605,64 @@ async def test_a_trusted_project_still_reaches_every_submission_route() -> None:
     )
 
     assert batch is not None
+
+
+@pytest.mark.asyncio
+async def test_a_command_may_name_the_hardware_instead_of_the_pool() -> None:
+    """`eyvan run --tpu v6e-8` should not require learning a pool-naming scheme.
+
+    Ray asks for resources and Iris asks for `--tpu v5litepod-16`; requiring the
+    pool name was the single largest ergonomic gap. A pool is named by its shape
+    unless an operator named it otherwise, so the shape is looked up when no
+    pool carries that name.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    operator = _principal(Role.PROJECT_OPERATOR)
+    pool = _capacity_pool(pool_id="research/east", node_type="east").model_copy(update={"accelerator_type": "v6e-8"})
+    await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key="pool-east")
+
+    workload, _ = await service.submit_pool_workload(
+        operator,
+        fleet_name="research-fleet",
+        node_type="v6e-8",
+        org_id="acme",
+        project_id="research",
+        command="python train.py",
+        idempotency_key="shape-1",
+    )
+
+    assert workload.spec.required_labels["eyvan_pool"] == "research/east", (
+        "the shape must resolve to the pool that provides it, whatever that pool is called"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_shape_served_by_two_zones_carries_them_as_alternates() -> None:
+    """A command workload gets the same cross-zone failover a callable does."""
+
+    from eyvan.capacity.planning import POOL_ALTERNATES_LABEL
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    operator = _principal(Role.PROJECT_OPERATOR)
+    for pool_id, node_type in (("research/west", "west"), ("research/east", "east")):
+        pool = _capacity_pool(pool_id=pool_id, node_type=node_type).model_copy(update={"accelerator_type": "v6e-8"})
+        await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key=f"pool-{node_type}")
+
+    workload, _ = await service.submit_pool_workload(
+        operator,
+        fleet_name="research-fleet",
+        node_type="v6e-8",
+        org_id="acme",
+        project_id="research",
+        command="python train.py",
+        idempotency_key="shape-2",
+    )
+
+    labels = workload.spec.required_labels
+    assert labels["eyvan_pool"] == "research/east", "the primary must be deterministic"
+    assert labels[POOL_ALTERNATES_LABEL] == "research/west"

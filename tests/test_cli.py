@@ -12,6 +12,7 @@ import subprocess
 import sys
 import typing as tp
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import pytest
@@ -41,6 +42,7 @@ from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.config import EyvanSettings
 from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.commands import workloads as workload_commands
 from eyvan.sdk.contexts import get_active_context
 from eyvan.server.api.app import create_app
 from eyvan.server.api.schemas import (
@@ -2340,3 +2342,54 @@ def test_a_malformed_pipeline_file_never_reaches_the_control_plane(monkeypatch, 
     assert result.exit_code != 0
     assert "command" in result.output
     assert fake.calls == [], "nothing may reach the control plane"
+
+
+# ------------------------------------------------- naming hardware instead of a pool
+
+
+def _run_args(*args: str) -> list[str]:
+    return ["--user", "alice", "--role", "project_operator", "run", *args]
+
+
+def test_naming_a_shape_leaves_every_positional_to_the_command() -> None:
+    """`--tpu v6e-8 python train.py` must not place work on a pool named "python".
+
+    TARGET is a positional in front of a variadic COMMAND, so click hands the
+    command's first word to the target. When the hardware is named by flag there
+    is no pool argument and that word belongs to the command.
+    """
+
+    seen: dict[str, object] = {}
+
+    def capture(self, **kwargs):
+        seen.update(kwargs)
+
+    with mock.patch.object(workload_commands.WorkloadCommandService, "run", capture):
+        result = CliRunner().invoke(cli.main, _run_args("--tpu", "v6e-8", "python", "train.py"))
+
+    assert result.exit_code == 0, result.output
+    assert seen["target_value"] == "v6e-8"
+    assert seen["command"] == ("python", "train.py")
+
+
+def test_naming_a_pool_still_pins_that_pool() -> None:
+    """The original form keeps working, so no existing script breaks."""
+
+    seen: dict[str, object] = {}
+
+    def capture(self, **kwargs):
+        seen.update(kwargs)
+
+    with mock.patch.object(workload_commands.WorkloadCommandService, "run", capture):
+        result = CliRunner().invoke(cli.main, _run_args("research/v6e-8", "python", "train.py"))
+
+    assert result.exit_code == 0, result.output
+    assert seen["target_value"] == "research/v6e-8"
+    assert seen["command"] == ("python", "train.py")
+
+
+def test_run_refuses_two_kinds_of_hardware() -> None:
+    result = CliRunner().invoke(cli.main, _run_args("--tpu", "v6e-8", "--gpu", "nvidia-tesla-a100", "echo", "hi"))
+
+    assert result.exit_code != 0
+    assert "one kind of hardware" in result.output
