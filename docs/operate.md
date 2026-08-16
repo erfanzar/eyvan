@@ -121,6 +121,44 @@ that is the afternoon this exists for.
 than silently collapsed. `eyvan run --zone` still pins one out of the set, and
 pinning withholds the alternates on purpose.
 
+### How hard a pool backs off
+
+```yaml
+availability_policy:            # fleet-wide default
+  backoff_base_s:
+    stockout: 60                # the zone had none; ask again in a minute
+    host_fault: 300             # it gave us a broken machine; that repeats
+  default_backoff_s: 15
+  max_backoff_s: 3600
+  evidence_decay: 0.98
+pools:
+  v6e-8:
+    availability_policy:        # this pool's own, replacing the fleet's whole
+      backoff_base_s: {stockout: 120}
+```
+
+Each base doubles per consecutive failure and is capped by `max_backoff_s`.
+`evidence_decay` is how much of the previous evidence one observation keeps:
+below 1 the model forgets, which is the point, since a zone that was empty this
+morning says little about this afternoon.
+
+These were constants until 2026-08-17, and constants are somebody else's
+answer. A stockout is answered by asking again later; a host fault is answered
+by provisioning a *replacement*, which costs a full allocation and a destroy
+before anything is learned -- so they are not one number. Which numbers are
+right depends on the zone and the purchase class, and an operator watching the
+wrong behaviour had no lever except deleting the pool.
+
+Declaring nothing keeps the previous behaviour exactly. A pool's policy
+**replaces** the fleet's rather than merging field by field: a backoff curve is
+one shape, and half of somebody else's is not a curve anybody chose. A base
+above `max_backoff_s` is refused rather than silently clamped, because a number
+the ceiling discards is a number that means nothing.
+
+A cell carries the curve of the pool that created it, so retuning a pool
+applies to machines built after the change rather than rewriting how the ones
+already running were being judged.
+
 ### Racing them
 
 By default a workload's zones are tried one per reconcile interval: ask the

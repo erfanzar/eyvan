@@ -49,9 +49,12 @@ class ProvisionOutcome(StrEnum):
 #: window doubles per consecutive failure and is capped by ``max_backoff_s``.
 #: Anything not named here backs off from 15s, which is the historical default
 #: for a provider error.
-_FAILURE_BACKOFF_BASE_S: dict[ProvisionOutcome, int] = {
-    ProvisionOutcome.STOCKOUT: 60,
-    ProvisionOutcome.HOST_FAULT: 300,
+#: Keyed by outcome *value* so a declared policy and this default are the same
+#: shape: an operator writes `stockout: 120` in YAML, and nothing has to
+#: translate between a string and an enum on the way in.
+_FAILURE_BACKOFF_BASE_S: dict[str, int] = {
+    ProvisionOutcome.STOCKOUT.value: 60,
+    ProvisionOutcome.HOST_FAULT.value: 300,
 }
 
 
@@ -107,8 +110,17 @@ class CapacityBelief:
         successful_hours: float = 0.0,
         evidence_decay: float = 0.98,
         max_backoff_s: int = 3600,
+        backoff_base_s: tp.Mapping[str, int] | None = None,
+        default_backoff_s: int = 15,
     ) -> CapacityBelief:
-        """Return a new belief after one provider observation."""
+        """Return a new belief after one provider observation.
+
+        The three tuning arguments used to be module constants. They are how a
+        pool reacts to being told no, and the right answer differs by zone and
+        by purchase class -- a contended spot region is worth asking again in a
+        minute, an account being rate-limited is not. Their defaults reproduce
+        the constants exactly, so a caller that passes nothing is unchanged.
+        """
 
         now = now or datetime.now(UTC)
         if now.tzinfo is None:
@@ -141,7 +153,8 @@ class CapacityBelief:
             # allocation and a destroy before anything can be learned. Paying
             # that every fifteen seconds against a zone handing out broken
             # machines is the loop this backoff exists to stop.
-            base = _FAILURE_BACKOFF_BASE_S.get(outcome, 15)
+            curve = _FAILURE_BACKOFF_BASE_S if backoff_base_s is None else backoff_base_s
+            base = curve.get(outcome.value, default_backoff_s)
             cooldown = now + timedelta(seconds=min(max_backoff_s, base * (2 ** (failures - 1))))
 
         return replace(

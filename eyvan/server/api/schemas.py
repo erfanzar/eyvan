@@ -20,6 +20,7 @@ from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.records import (
     DEFAULT_MAX_RETRIES,
+    AvailabilityPolicy,
     BudgetRecord,
     CallableExecution,
     CanonicalCapacityClass,
@@ -345,6 +346,9 @@ class CellUpsertRequest(ApiModel):
     pool_id: str | None = None
     provider_options: JsonDocument = Field(default_factory=dict)
     runtime: NativeRuntimeConfig = Field(default_factory=NativeRuntimeConfig)
+    #: Carried from the pool that created this cell, so an observation about
+    #: it needs nothing but the cell itself.
+    availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None
@@ -386,6 +390,10 @@ class CapacityPoolUpsertRequest(ApiModel):
     agent_endpoint: str | None = Field(default=None, min_length=1)
     provider_options: JsonDocument = Field(default_factory=dict)
     runtime: NativeRuntimeConfig = Field(default_factory=NativeRuntimeConfig)
+    #: How this pool backs off when the provider refuses it, and how fast it
+    #: forgets. Declared in fleet YAML and carried to the record, so a curve
+    #: an operator wrote is the curve the planner uses.
+    availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None

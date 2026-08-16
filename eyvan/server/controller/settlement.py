@@ -647,7 +647,17 @@ class _ControllerSettlement:
             consecutive_failures=current.consecutive_failures,
             cooldown_until=current.cooldown_until,
             last_observed_at=current.last_observed_at,
-        ).observe(outcome, latency_s=latency_s)
+        ).observe(
+            outcome,
+            latency_s=latency_s,
+            # The cell's own copy, taken from its pool when it was created. A
+            # curve retuned since then applies to the machines created after
+            # it, not retroactively to how these were already being judged.
+            evidence_decay=cell.availability_policy.evidence_decay,
+            max_backoff_s=cell.availability_policy.max_backoff_s,
+            backoff_base_s=cell.availability_policy.backoff_base_s,
+            default_backoff_s=cell.availability_policy.default_backoff_s,
+        )
         return CapacityBeliefState(
             success_evidence=belief.success_evidence,
             failure_evidence=belief.failure_evidence,

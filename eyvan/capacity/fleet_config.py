@@ -21,6 +21,7 @@ from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_ba
 from eyvan.capacity.hardware_catalog import shape_for, validate_accelerator_write_boundary
 from eyvan.capacity.providers.gcp.queued_resources import bootstrap_egress_choices
 from eyvan.records import (
+    AvailabilityPolicy,
     CanonicalCapacityClass,
     CapacityClass,
     CapacityPoolRecord,
@@ -374,6 +375,10 @@ class NodeTypeBase(FleetConfigModel):
     agent_endpoint: str | None = Field(default=None, min_length=1)
     provider_options: JsonDocument = Field(default_factory=dict)
     runtime: NativeRuntimeConfig | None = None
+    #: How this pool backs off when the provider refuses it, overriding the
+    #: fleet's. Whole-value rather than merged field by field: a backoff curve
+    #: is one shape, and half of somebody else's is not a curve anybody chose.
+    availability_policy: AvailabilityPolicy | None = None
     unit_prices: dict[str, float] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
@@ -681,6 +686,7 @@ class EyvanFleetConfig(FleetConfigModel):
     capacity_class: CanonicalCapacityClass = CapacityClass.ON_DEMAND
     autoscaling: AutoscalingDefaults = Field(default_factory=AutoscalingDefaults)
     runtime: NativeRuntimeConfig = Field(default_factory=NativeRuntimeConfig)
+    availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
     labels: dict[str, str] = Field(default_factory=dict)
     pools: dict[str, NodeType] = Field(min_length=1)
 
@@ -863,6 +869,7 @@ class EyvanFleetConfig(FleetConfigModel):
                     "agent_endpoint": template["endpoint"],
                     "provider_options": template["provider_options"],
                     "runtime": template["runtime"],
+                    "availability_policy": template["availability_policy"],
                     "labels": template["labels"],
                     "topology": template["topology"],
                     "max_replica_resources": template["max_replica_resources"],
@@ -932,6 +939,7 @@ class EyvanFleetConfig(FleetConfigModel):
             "pool_id": f"{self.name}-{node_type_name}",
             "provider_options": self._compiled_provider_options(node_type, runtime),
             "runtime": model_json(runtime),
+            "availability_policy": model_json(self._resolved_availability_policy(node_type)),
             "labels": _json_object(labels),
             "topology": _json_object(node_type.topology),
             "max_replica_resources": (
@@ -939,6 +947,11 @@ class EyvanFleetConfig(FleetConfigModel):
             ),
             "max_gang_replicas": max_gang_replicas,
         }
+
+    def _resolved_availability_policy(self, node_type: NodeType) -> AvailabilityPolicy:
+        """Return the pool's own curve, or the fleet's when it declares none."""
+
+        return node_type.availability_policy or self.availability_policy
 
     def _resolved_runtime(self, node_type: NodeType) -> NativeRuntimeConfig:
         """Return fleet defaults overlaid by one node-type runtime."""

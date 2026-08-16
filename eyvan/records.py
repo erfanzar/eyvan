@@ -1501,6 +1501,53 @@ class WorkloadRecord(EyvanModel):
         return self
 
 
+class AvailabilityPolicy(EyvanModel):
+    """How hard a pool backs off, and how fast it forgets.
+
+    These were constants, and the wrong ones for somebody. How long to wait
+    after a zone says no is a property of *that* zone and that purchase class:
+    a spot TPU pool in a contended region is worth asking again in a minute,
+    while a pool whose provider is rate-limiting the account is not. A single
+    curve compiled into the planner meant an operator watching the wrong
+    behaviour had no way to say so, and the only lever left was to delete the
+    pool.
+
+    Defaults reproduce the constants exactly, so a fleet that declares nothing
+    behaves as it always did.
+    """
+
+    #: What one observation retains of the previous evidence. Below 1 the model
+    #: forgets, which is the point: a zone that was empty this morning is not
+    #: evidence about this afternoon. Nearer 1 remembers longer.
+    evidence_decay: float = Field(default=0.98, gt=0, le=1)
+    #: The ceiling on the doubling. Without one a pool that failed a dozen times
+    #: overnight is still in cooldown when somebody arrives to use it.
+    max_backoff_s: int = Field(default=3600, ge=1, le=86_400)
+    #: First cooldown per outcome, doubling per consecutive failure. Keyed by
+    #: `ProvisionOutcome` value; anything unnamed uses `default_backoff_s`.
+    #: A stockout is answered by asking again later, while a host fault is
+    #: answered by provisioning a replacement -- a full allocation and a destroy
+    #: before anything is learned -- which is why they are not one number.
+    backoff_base_s: dict[str, int] = Field(default_factory=lambda: {"stockout": 60, "host_fault": 300})
+    default_backoff_s: int = Field(default=15, ge=1, le=86_400)
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> AvailabilityPolicy:
+        for outcome, seconds in self.backoff_base_s.items():
+            if not outcome or outcome != outcome.strip():
+                raise ValueError("availability policy outcome names must be non-empty and trimmed")
+            if seconds < 1 or seconds > self.max_backoff_s:
+                # A base above the ceiling is not a longer cooldown, it is a
+                # cooldown the ceiling silently discards -- so the number an
+                # operator wrote would mean nothing.
+                raise ValueError(
+                    f"backoff base for {outcome!r} must be between 1 and max_backoff_s ({self.max_backoff_s})"
+                )
+        if self.default_backoff_s > self.max_backoff_s:
+            raise ValueError("default backoff must not exceed max_backoff_s")
+        return self
+
+
 class CapacityBeliefState(EyvanModel):
     """Persisted empirical availability evidence for one execution cell."""
 
@@ -1571,6 +1618,11 @@ class CellRecord(EyvanModel):
     #: has to reconstruct the cause from an agent's storage document by hand.
     unavailable_detail: str | None = Field(default=None, max_length=2048)
     availability: CapacityBeliefState = Field(default_factory=CapacityBeliefState)
+    #: Copied from the pool at creation, like the runtime and the labels. Held on
+    #: the cell so an observation needs nothing but the cell it is about -- and
+    #: so a pool whose curve is retuned does not retroactively rewrite how the
+    #: machines already running were being judged.
+    availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
     generation: int = 1
     idle_since: datetime | None = None
     last_heartbeat_at: datetime | None = None
@@ -1745,6 +1797,11 @@ class CapacityPoolRecord(EyvanModel):
     runtime: NativeRuntimeConfig = Field(default_factory=NativeRuntimeConfig)
     labels: dict[str, str] = Field(default_factory=dict)
     topology: dict[str, str] = Field(default_factory=dict)
+    #: How this pool backs off when the provider says no, and how fast it
+    #: forgets. Declared rather than compiled in: the right curve for a
+    #: contended spot TPU zone is not the right curve for a rate-limited
+    #: account, and there was no way to say so.
+    availability_policy: AvailabilityPolicy = Field(default_factory=AvailabilityPolicy)
     max_replica_resources: CanonicalResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
     quota_group: str | None = Field(default=None, max_length=192)
@@ -1932,6 +1989,7 @@ class CapacityPoolRecord(EyvanModel):
             autoscale_request_workload_id=autoscale_request_workload_id,
             provider_options=provider_options,
             runtime=self.runtime,
+            availability_policy=self.availability_policy,
             labels={
                 **self.labels,
                 "eyvan_fleet": self.fleet_name,
