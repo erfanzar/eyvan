@@ -179,6 +179,63 @@ def _apply_catalog_shape(pool: JsonObject, *, accelerator_type: str) -> None:
     resources.setdefault("tpu", shape.schedulable_tpu)
 
 
+def _expand_pool_zones(name: str, value: JsonValue) -> list[tuple[str, JsonValue]]:
+    """Split one pool declaring several zones into one pool per zone.
+
+    Racing zones is what actually wins spot capacity -- on 2026-08-15 us-east5-b
+    granted and reclaimed twice while us-central2-b held -- and the scheduler
+    already knows how to treat interchangeable pools of one shape as cross-zone
+    alternates. What was missing was a way to *say* it: declaring the same eight
+    lines three times, once per zone, with three different names and an explicit
+    ``accelerator_type`` on each, is a transcription exercise nobody should do.
+
+    The expansion is mechanical and visible: ``v6e-8`` with three zones becomes
+    ``v6e-8-us-east5-a`` and its siblings, each pinned to one zone and each
+    naming ``v6e-8`` as its shape. They are therefore identical in admission
+    width and topology, which is exactly the condition the submission path
+    requires before it will offer them as alternates for each other.
+
+    Args:
+        name: The pool's mapping key.
+        value: Its declaration.
+
+    Returns:
+        One ``(name, declaration)`` pair per zone, or the original pair
+        unchanged when the pool names no zone list.
+
+    Raises:
+        ValueError: When ``zones`` is not a list of distinct non-empty strings,
+            or is combined with a single ``zone``. Two ways of saying where a
+            pool runs is one way too many.
+    """
+
+    if not is_json_object(value) or "zones" not in value:
+        return [(name, value)]
+    declared = value["zones"]
+    if not isinstance(declared, list) or not declared:
+        raise ValueError(f"pool {name!r} zones must be a non-empty list of zone names")
+    zones = []
+    for zone in declared:
+        if not isinstance(zone, str) or not zone or zone != zone.strip():
+            raise ValueError(f"pool {name!r} zones must contain non-empty trimmed zone names")
+        zones.append(zone)
+    if len(set(zones)) != len(zones):
+        raise ValueError(f"pool {name!r} lists a zone twice")
+    if value.get("zone") is not None:
+        raise ValueError(f"pool {name!r} sets both zone and zones; use one")
+    shape = value.get("accelerator_type")
+    expanded: list[tuple[str, JsonValue]] = []
+    for zone in zones:
+        pool = dict(value)
+        pool.pop("zones")
+        pool["zone"] = zone
+        # Each sibling keeps the shared shape, so the fleet holds one kind of
+        # hardware in several places rather than several kinds of hardware.
+        pool["accelerator_type"] = shape if isinstance(shape, str) and shape else name
+        expanded.append((f"{name}-{zone}", pool))
+    return expanded
+
+
 def _normalize_public_pool(name: str, value: JsonValue) -> JsonValue:
     """Compile one concise ``pools`` entry into the internal node-type shape."""
 
@@ -642,7 +699,13 @@ class EyvanFleetConfig(FleetConfigModel):
         if has_pools:
             pools = normalized["pools"]
             if is_json_object(pools):
-                normalized["pools"] = {name: _normalize_public_pool(name, pool) for name, pool in pools.items()}
+                expanded: JsonObject = {}
+                for name, pool in pools.items():
+                    for zoned_name, zoned in _expand_pool_zones(name, pool):
+                        if zoned_name in expanded:
+                            raise ValueError(f"pool {zoned_name!r} is declared twice after expanding zones")
+                        expanded[zoned_name] = _normalize_public_pool(zoned_name, zoned)
+                normalized["pools"] = expanded
         elif has_node_types:
             node_types = normalized.pop("node_types")
             if is_json_object(node_types):

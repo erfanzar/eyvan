@@ -99,6 +99,28 @@ gauge lags by minutes at best, so a balance without its timestamp is a guess
 wearing a number. The same view is on the dashboard's **Quota & capacity** page,
 which reads the same route.
 
+## One pool, several zones
+
+```yaml
+pools:
+  v6e-8:
+    kind: tpu
+    capacity_class: spot
+    zones: [us-east5-a, us-east5-b, us-central2-b]
+    max_workers: 4
+```
+
+Expands into `v6e-8-us-east5-a` and its two siblings: same shape, same
+admission width, one zone each. A job asking for `--tpu v6e-8` is placed in one
+and carries the other two as alternates, so it goes where the capacity is
+instead of waiting on the zone it happened to be submitted against. On
+2026-08-15 us-east5-b granted and reclaimed twice while us-central2-b held --
+that is the afternoon this exists for.
+
+`zones` and `zone` are mutually exclusive; a repeated zone is refused rather
+than silently collapsed. `eyvan run --zone` still pins one out of the set, and
+pinning withholds the alternates on purpose.
+
 ## Cost
 
 ```
