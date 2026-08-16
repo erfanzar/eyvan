@@ -748,6 +748,23 @@ describe("App scope and authority race guards", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Submit workload" })).toBeNull());
   });
 
+  it("kicks a running attempt without ending the job", async () => {
+    // The action a wedged host needs and the dashboard did not have: cancel
+    // ends the job, waiting for a timeout keeps the accelerator busy doing
+    // nothing. Only the CLI could do this, which is the wrong place for a
+    // decision somebody makes while looking at a stuck run.
+    window.location.hash = "#/workloads/wl-1";
+    const operator = authority("project_operator");
+    const { client, calls } = fakeClient(operator);
+    renderApp(client);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Kick" })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "Kick" }));
+
+    await waitFor(() => expect(calls.workloadAction).toHaveBeenCalledTimes(1));
+    expect(calls.workloadAction.mock.calls[0]?.[1]).toBe("kick");
+  });
+
   it("drops stale workload actions when a mutation 403 refreshes durable authority", async () => {
     window.location.hash = "#/workloads/wl-revoked";
     const operator = authority("project_operator");

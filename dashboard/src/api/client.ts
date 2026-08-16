@@ -1080,7 +1080,7 @@ export class EyvanApiClient {
 
   async workloadAction(
     id: string,
-    action: "cancel" | "checkpoint" | "retry",
+    action: "cancel" | "checkpoint" | "retry" | "kick",
     scope: AuthScope = this.activeScope,
     signal?: AbortSignal,
   ): Promise<WorkloadDetail> {
@@ -1090,6 +1090,9 @@ export class EyvanApiClient {
       if (!mock) throw new ApiError(`Workload ${id} was not found`, 404);
       return {
         ...cloneMock(mock),
+        // A kick ends this attempt and requeues the job, so it reads as queued
+        // exactly like a retry -- the difference is which budget pays for it,
+        // and that is the control plane's to record rather than the mock's.
         status: action === "cancel" ? "preempting" : action === "checkpoint" ? "checkpointing" : "queued",
       };
     }

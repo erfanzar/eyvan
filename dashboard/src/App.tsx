@@ -845,7 +845,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     }
   };
 
-  const operateWorkload = async (action: "cancel" | "checkpoint" | "retry") => {
+  const operateWorkload = async (action: "cancel" | "checkpoint" | "retry" | "kick") => {
     const workload = selectedWorkload;
     const resourceAuthority = detailAuthority;
     if (!workload) return;

@@ -17,6 +17,7 @@ import {
   Server,
   ShieldCheck,
   WalletCards,
+  Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -30,7 +31,7 @@ type DetailTab = "overview" | "timeline" | "logs";
 interface WorkloadDetailPageProps {
   workload: WorkloadDetail;
   onBack: () => void;
-  onAction: (action: "cancel" | "checkpoint" | "retry") => void;
+  onAction: (action: "cancel" | "checkpoint" | "retry" | "kick") => void;
   canOperate: boolean;
   loadExplanation: (id: string, signal: AbortSignal) => Promise<WorkloadExplanation>;
 }
@@ -75,6 +76,10 @@ export function WorkloadDetailPage({
   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
   const cancellable = !["completed", "failed", "cancelled", "preempting"].includes(workload.status);
   const checkpointable = ["running", "provisioning", "checkpointing"].includes(workload.status);
+  // Kick moves an attempt off a host that is not coming back while the job
+  // itself is fine. Only offered while an attempt exists to interrupt: on a
+  // queued job there is nothing to move, and on a finished one nothing to save.
+  const kickable = ["running", "provisioning", "checkpointing"].includes(workload.status);
 
   const filteredLogs = useMemo(() => {
     const query = logQuery.trim().toLowerCase();
@@ -118,6 +123,17 @@ export function WorkloadDetailPage({
               <button className="button button-primary" type="button" onClick={() => onAction("checkpoint")}>
                 <HardDrive size={16} aria-hidden="true" />
                 Checkpoint
+              </button>
+            )}
+            {kickable && (
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => onAction("kick")}
+                title="Interrupt this attempt and let the job reschedule elsewhere"
+              >
+                <Zap size={16} aria-hidden="true" />
+                Kick
               </button>
             )}
             {cancellable && (
