@@ -430,9 +430,21 @@ run has completed; see [proofs.md](proofs.md).
 ## Starting from nothing
 
 ```
-eyvan quickstart          # what is missing between here and a first job
-eyvan quickstart --yes    # ...and run that first job
+eyvan up examples/laptop.yaml   # a control plane and one CPU pool, on this machine
+eyvan quickstart                # what is still missing between here and a first job
+eyvan quickstart --yes          # ...and run that first job
 ```
+
+`eyvan up` against a loopback URL **starts and supervises the control plane
+itself**. Do not run `eyvan-server` first and apply second: `up` refuses a
+plane it cannot prove it owns, because adopting a process it did not supervise
+is how two control planes come to share one database.
+
+`examples/laptop.yaml` is the smallest fleet that runs. Its capacity backend
+claims no CPU, memory, container or accelerator isolation -- it exists so the
+control plane, scheduler, leases and execution path can be exercised without a
+cloud account, and it is not a way to run training work. For that, write a
+fleet against a real provider or use `eyvan head up`.
 
 Each step is either already true or printed as the exact command that makes it
 true: a control plane, an applied fleet, capacity to run on. It stops at the

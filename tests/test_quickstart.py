@@ -113,7 +113,7 @@ def test_no_control_plane_prints_the_command_that_makes_one(monkeypatch) -> None
 
     assert result.exit_code == 0, result.output
     assert "eyvan head up" in result.output
-    assert "eyvan-server" in result.output, "a laptop should not be told to provision a VM"
+    assert "eyvan up fleet.yaml" in result.output, "the local route must come first; a laptop needs no VM"
 
 
 def test_no_fleet_prints_the_command_that_applies_one(monkeypatch) -> None:
@@ -217,3 +217,57 @@ def test_an_explicit_shape_must_exist_in_the_fleet(monkeypatch) -> None:
 
     assert result.exit_code != 0
     assert "v5p-8" in result.output, "say what the fleet does provide"
+
+
+# --------------------------------------------------------------------------- roles
+
+
+def test_a_role_that_cannot_read_pools_still_gets_guided(monkeypatch) -> None:
+    """Listing pools needs manage_fleet, which a new user does not have.
+
+    They were given an operator role and told to run a job. Answering "you
+    cannot see the pools" to somebody who asked "how do I start" is the wrong
+    failure, and it is the one this command shipped with.
+    """
+
+    class _Restricted(_Plane):
+        def request(self, method, path, *, params=None, json=None, headers=None):
+            if path == "/api/v1/capacity-pools":
+                raise PermissionError("403: 'alice' lacks manage_fleet permission")
+            return super().request(method, path, params=params, json=json, headers=headers)
+
+    result = _invoke(monkeypatch, _Restricted())
+
+    assert result.exit_code == 0, result.output
+    assert "eyvan run" in result.output, "an operator can still submit; say so"
+    assert "not visible to this role" in result.output
+
+
+def test_no_cost_is_quoted_without_a_pool_to_quote_from(monkeypatch) -> None:
+    """A figure derived from a guessed shape is worse than admitting ignorance."""
+
+    class _Restricted(_Plane):
+        def request(self, method, path, *, params=None, json=None, headers=None):
+            if path == "/api/v1/capacity-pools":
+                raise PermissionError("403")
+            return super().request(method, path, params=params, json=json, headers=headers)
+
+    result = _invoke(monkeypatch, _Restricted())
+
+    assert "cost       unknown" in result.output
+    assert "$" not in result.output
+
+
+def test_a_cpu_pool_is_offered_with_the_cpu_flag(monkeypatch) -> None:
+    """`--tpu cpu` is nonsense to read and wrong to run.
+
+    "cpu" is what a CPU pool calls its own accelerator type; the flag names the
+    kind of hardware, not the pool's word for it.
+    """
+
+    plane = _Plane(pools=[{**POOL, "accelerator_type": "cpu"}])
+
+    result = _invoke(monkeypatch, plane)
+
+    assert "eyvan run --cpu --" in result.output
+    assert "--tpu cpu" not in result.output

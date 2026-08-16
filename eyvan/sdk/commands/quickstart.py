@@ -63,11 +63,15 @@ def _reachable(session: CliSession) -> Step:
             done=False,
             headline="a control plane",
             detail=f"nothing is answering at {session.base_url} ({type(exc).__name__})",
-            # Two honest options rather than one: a laptop does not need a VM,
-            # and telling someone to provision GCP to try a CPU job is how a
-            # first impression gets thrown away.
-            command="eyvan head up fleet.yaml        # a control plane on GCP\n"
-            "  eyvan-server --log-level info  # or one on this machine",
+            # `eyvan up` starts and *owns* a loopback control plane, and
+            # refuses one started by hand -- it cannot prove it owns a process
+            # it did not supervise. So the local answer is to apply a fleet and
+            # let it bring the plane up, not to run the server first and apply
+            # second, which is what this used to print and which does not work.
+            # Telling someone to provision GCP to try a CPU job is how a first
+            # impression gets thrown away, so both routes are offered.
+            command="eyvan up fleet.yaml      # a plane on this machine, started for you\n"
+            "  eyvan head up fleet.yaml  # or one on GCP",
         )
     return Step(done=True, headline="a control plane", detail=f"answering at {session.base_url}")
 
@@ -105,7 +109,22 @@ def _shapes(session: CliSession) -> tuple[Step, tuple[dict, ...]]:
     request built from a shape name alone matches nothing.
     """
 
-    payload = session.client.request("GET", "/api/v1/capacity-pools")
+    try:
+        payload = session.client.request("GET", "/api/v1/capacity-pools")
+    except Exception:
+        # Reading pools needs manage_fleet, which the person running a
+        # quickstart usually does not have -- they were given an operator role
+        # and told to run a job. Refusing here answered "you cannot see the
+        # pools" to somebody who asked "how do I start", so the guide continues
+        # on what an operator can see: a fleet exists, so submit to it.
+        return (
+            Step(
+                done=True,
+                headline="capacity to run on",
+                detail="not visible to this role; the fleet will choose",
+            ),
+            (),
+        )
     pools = [pool for pool in payload if is_json_object(pool)] if isinstance(payload, list) else []
     usable = tuple(pool for pool in pools if pool.get("enabled") is not False)
     if not pools:
@@ -276,17 +295,30 @@ def quickstart(
         return
 
     chosen = _choose(pools, shape)
-    if chosen is None:
+    if chosen is None and pools:
         available = ", ".join(
             sorted({str(pool["accelerator_type"]) for pool in pools if isinstance(pool.get("accelerator_type"), str)})
         )
         raise click.ClickException(f"no enabled pool provides {shape!r}; this fleet provides: {available or 'CPU only'}")
-    selected = chosen.get("accelerator_type") if isinstance(chosen.get("accelerator_type"), str) else None
+    selected = shape
+    if chosen is not None and isinstance(chosen.get("accelerator_type"), str):
+        selected = str(chosen["accelerator_type"])
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
-    target = f"--tpu {selected}" if selected is not None else "--cpu"
+    # "cpu" is what a CPU pool calls its accelerator type, and `--tpu cpu` is
+    # nonsense to read and wrong to run. The flag is the kind of hardware, not
+    # the pool's own word for it.
+    target = "--cpu" if selected in (None, "cpu") else f"--tpu {selected}"
     write("")
     write(f"  first job  eyvan run {target} -- {HELLO_COMMAND}")
-    write(f"  cost       {_estimate(session, scope=scope, pool=chosen)}")
+    # No pool document means no honest estimate: the request would have to
+    # guess a shape and a capacity class, and a cost quoted from a guess is
+    # worse than none.
+    cost = (
+        _estimate(session, scope=scope, pool=chosen)
+        if chosen is not None
+        else "unknown; this role cannot read pool prices"
+    )
+    write(f"  cost       {cost}")
     if not confirmed:
         write("")
         write("  Run it with --yes. It allocates real hardware and is billed for it.")
