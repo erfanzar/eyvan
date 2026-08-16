@@ -212,8 +212,12 @@ def test_tpu_capacity_pool_materializes_one_atomic_multi_worker_cell() -> None:
     [
         ({"worker_count": 2}, "must match provider_options.node_count"),
         (
+            # The cell declares no capacity backend, so nothing has said it can
+            # build a cell spanning several machines. Refused on that capability
+            # rather than on a provider's name, so a second cloud that declares
+            # the capability is not blocked by this validator.
             {"worker_count": 2, "provider_options": {"node_count": 2, "node_prefix": "two-workers"}},
-            "GCP TPU capacity backend",
+            "does not build cells spanning several machines",
         ),
     ],
 )

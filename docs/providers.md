@@ -10,6 +10,15 @@ Nothing here is a private API. If you need to reach into `eyvan.server` or copy 
 driver to make your provider work, that is a bug in this contract -- open an
 issue rather than forking.
 
+Nothing that *decides* -- the scheduler, the capacity planner, the durable model
+-- may name a provider, and `tests/test_provider_boundary.py` enforces it. If
+your provider needs a decision made differently, that is a capability to
+declare rather than a branch to add: `BackendCapabilities` in
+`capacity/drivers/base.py` is how a backend says it can allocate one cell
+spanning several machines. Declaring it is what makes multislice-shaped work
+reachable on your cloud; without it every cell you build is one machine, which
+is the safe reading of a driver that has not said otherwise.
+
 ---
 
 ## 1. The shape

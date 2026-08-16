@@ -21,7 +21,13 @@ from pydantic import JsonValue as PydanticJsonValue
 from eyvan._internal.compat import UTC, StrEnum
 from eyvan._internal.json_types import is_json_object
 from eyvan.capacity import CapacityStatus
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode, canonical_execution_backend
+from eyvan.capacity.drivers.base import (
+    CapacityProviderFailureCode,
+    backend_capabilities,
+    canonical_execution_backend,
+    max_multi_worker_cell_width,
+    providers_hosting_multi_worker_cells,
+)
 from eyvan.domain import costing
 from eyvan.domain.models import InfeasibilityCode, WorkerResourceScope
 from eyvan.identity.rotation import CredentialRotationState
@@ -38,7 +44,11 @@ JsonDocument: tp.TypeAlias = dict[str, PydanticJsonValue]
 _SAFE_FLEET_COMPONENT = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_RETRIES = 3
-MAX_GCP_TPU_MULTISLICE_WORKERS = 256
+#: Widest multi-machine cell any known backend builds. Derived from the backend
+#: capability table rather than written here, so the durable model stops being
+#: the place a provider's ceiling is recorded. Kept under its original name
+#: because it is imported across the package and by tests.
+MAX_GCP_TPU_MULTISLICE_WORKERS = max_multi_worker_cell_width()
 WORKER_COUNT_LABEL = "eyvan_worker_count"
 CALLABLE_SIGNING_KEY_ENV = "EYVAN_CALLABLE_SIGNING_KEY"
 REMOTE_CALLABLE_SIGNATURE_ERROR = (
@@ -1046,8 +1056,13 @@ class WorkloadDefinition(EyvanModel):
         if self.worker_count > 1:
             if self.cell_group_count != 1:
                 raise ValueError("multi-worker capacity must use exactly one physical cell")
-            if self.provider != "gcp":
-                raise ValueError("multi-worker capacity requires the GCP provider")
+            if self.provider not in providers_hosting_multi_worker_cells():
+                # Asked of the capability table, not of a provider name: a cell
+                # spanning several machines is a thing a backend can or cannot
+                # build, and a second cloud that can build one must not be
+                # refused by a validator in the durable model.
+                supported = ", ".join(sorted(providers_hosting_multi_worker_cells())) or "no known provider"
+                raise ValueError(f"multi-worker capacity requires a provider that builds it: {supported}")
             if self.required_executor != "eyvan-native":
                 raise ValueError("multi-worker capacity requires the eyvan-native executor")
             if self.gang.per_replica.tpu <= 0 or self.gang.per_replica.gpu > 0:
@@ -1599,8 +1614,10 @@ class CellRecord(EyvanModel):
         if self.worker_count == 1 and node_prefix is not None:
             raise ValueError("provider_options.node_prefix requires worker_count greater than one")
         if self.worker_count > 1:
-            if self.provider != "gcp" or self.capacity_backend != "gcp-tpu":
-                raise ValueError("multi-worker cells require the GCP TPU capacity backend")
+            if not backend_capabilities(self.capacity_backend).multi_worker_cells:
+                raise ValueError(
+                    f"capacity backend {self.capacity_backend!r} does not build cells spanning several machines"
+                )
             if self.executor != "eyvan-native":
                 raise ValueError("multi-worker cells require the eyvan-native executor")
             if self.worker_count > MAX_GCP_TPU_MULTISLICE_WORKERS:
@@ -1809,7 +1826,7 @@ class CapacityPoolRecord(EyvanModel):
         inside a leader phase where a raise stops the control plane.
         """
 
-        return self.provider == "gcp" and self.capacity_backend == "gcp-tpu" and self.executor == "eyvan-native"
+        return backend_capabilities(self.capacity_backend).multi_worker_cells and self.executor == "eyvan-native"
 
     def make_cell(
         self,

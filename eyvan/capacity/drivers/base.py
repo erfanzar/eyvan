@@ -68,6 +68,73 @@ def capacity_backend_agent_family(name: str) -> str:
     return families.get(normalized, normalized)
 
 
+@dataclass(frozen=True, slots=True)
+class BackendCapabilities:
+    """What one capacity backend can actually provide, as data rather than a name.
+
+    The durable model has to refuse shapes no backend can build -- a cell
+    spanning several machines, allocated together or not at all, is the only one
+    so far -- and it did that by asking whether the provider was GCP. That reads
+    as a validation and behaves as a moat: a second cloud could implement
+    multislice perfectly and still be refused by a record validator in a file
+    that has nothing to do with any provider.
+
+    Stated here, keyed by backend, a new provider declares what it can do and
+    the durable model stops being the thing that decides.
+
+    Attributes:
+        multi_worker_cells: Whether one cell may span more than one machine.
+        max_workers_per_cell: The widest such cell this backend will build.
+    """
+
+    multi_worker_cells: bool = False
+    max_workers_per_cell: int = 1
+
+
+#: Every backend's capabilities. A backend absent from this table hosts only
+#: single-machine cells, which is the safe reading: a driver that has not said
+#: it can allocate a gang atomically almost certainly cannot.
+_BACKEND_CAPABILITIES: dict[str, BackendCapabilities] = {
+    # One Cloud TPU multislice queued resource. 256 is the provider's own
+    # ceiling on workers in a single request, not a number Eyvan chose.
+    "gcp-tpu": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=256),
+}
+
+
+def backend_capabilities(name: str | None) -> BackendCapabilities:
+    """Return what ``name`` can build, defaulting to a single-machine backend."""
+
+    if not name:
+        return BackendCapabilities()
+    return _BACKEND_CAPABILITIES.get(name.strip().lower().replace("_", "-"), BackendCapabilities())
+
+
+def providers_hosting_multi_worker_cells() -> frozenset[str]:
+    """Return every provider some backend of which can build a multi-machine cell.
+
+    Derived from the capability table rather than listed, so a second cloud that
+    declares a multislice backend is accepted by the durable model without
+    anyone editing it. A workload spec names a provider and not a backend --
+    which backend hosts it is a placement decision -- so this is the widest
+    honest question the spec-level check can ask.
+    """
+
+    return frozenset(
+        capacity_backend_agent_family(name)
+        for name, capabilities in _BACKEND_CAPABILITIES.items()
+        if capabilities.multi_worker_cells
+    )
+
+
+def max_multi_worker_cell_width() -> int:
+    """Return the widest multi-machine cell any known backend will build."""
+
+    return max(
+        (capabilities.max_workers_per_cell for capabilities in _BACKEND_CAPABILITIES.values()),
+        default=1,
+    )
+
+
 class StaleMutationError(RuntimeError):
     """Reject a mutation that does not own the persisted generation fence."""
 

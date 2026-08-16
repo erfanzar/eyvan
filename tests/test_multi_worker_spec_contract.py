@@ -59,12 +59,15 @@ def test_a_valid_multi_worker_spec_is_accepted() -> None:
     ("overrides", "message"),
     [
         ({"cell_group_count": 2}, "exactly one physical cell"),
-        ({"provider": "aws"}, "requires the GCP provider"),
+        # Refused because no backend of that provider has declared it can build
+        # a cell spanning several machines -- not because of its name. A cloud
+        # that declares one becomes eligible without editing this contract.
+        ({"provider": "aws"}, "requires a provider that builds it"),
         ({"required_executor": "ray-jobs"}, "requires the eyvan-native executor"),
         ({"gang": {"replicas": 1, "per_replica": {"cpu": 1, "gpu": 2}}}, "requires a TPU resource request"),
         ({"worker_count": MAX_GCP_TPU_MULTISLICE_WORKERS + 1}, "must not exceed"),
     ],
-    ids=["multi-cell-group", "non-gcp-provider", "wrong-executor", "gpu-gang", "over-ceiling"],
+    ids=["multi-cell-group", "provider-without-the-capability", "wrong-executor", "gpu-gang", "over-ceiling"],
 )
 def test_each_invalid_multi_worker_shape_is_refused(overrides: dict, message: str) -> None:
     """Every clause of the contract, one test case each.
