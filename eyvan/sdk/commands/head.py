@@ -869,8 +869,9 @@ class HeadUpResult:
             return None
         return (
             "This head has no EYVAN_OIDC_ISSUER, so it authenticates with a generated bootstrap token instead. "
-            "Read it from the head with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env -- then export it as "
-            "EYVAN_API_TOKEN locally. Register an identity provider and re-run with --oidc-issuer to retire it."
+            "Read it with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env, then pass it as "
+            "`eyvan --token <token> --url <address>`. Register an identity provider and re-run with "
+            "--oidc-issuer to retire it."
         )
 
     def as_document(self) -> JsonObject:
