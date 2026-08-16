@@ -855,6 +855,44 @@ offered here: AWS sells a bounded window as a Capacity Block, bought in advance
 rather than queued, and mapping it onto that class would misdescribe what you
 get.
 
+## Running on Azure
+
+```yaml
+pools:
+  cpu-16:
+    kind: cpu
+    capacity_backend: azure-vm
+    capacity_class: spot
+    provider_options:
+      vm_size: Standard_D4s_v5
+      network_interface_id: /subscriptions/.../networkInterfaces/nic
+```
+
+Needs `EYVAN_AZURE_SUBSCRIPTION_ID`, `EYVAN_AZURE_RESOURCE_GROUP`,
+`EYVAN_AZURE_LOCATION` and `EYVAN_AZURE_ACCESS_TOKEN`. The token is supplied
+rather than acquired: a managed identity, a client credential and a federated
+token are three different auth stories, and a transport that picked one would
+pick it for every operator.
+
+One VM per cell, ownership in `eyvan-cell` / `eyvan-generation` / `eyvan-fence`
+tags, exactly as on EC2. Two things are Azure-specific:
+
+**The VM name is the idempotency key.** A `PUT` to the same resource path is the
+same machine, so there is no client token to derive and no window in which a
+retry builds a second one. A cell id longer than Azure's limit is hashed into
+the name rather than truncated -- truncating makes two distinct cells collide on
+one machine.
+
+**Spot VMs are created with `evictionPolicy: Delete`.** The default is
+`Deallocate`, which is the worst of both: the VM stops and keeps its disks, its
+NIC and its name, so the fleet stops paying for compute and keeps paying for
+storage while holding a machine no scheduler can place work on. An eviction is
+read from the power state and reported as a preemption; a deallocated
+*on-demand* VM is not, because somebody stopped that one.
+
+**Not run against a real subscription.** It passes the twelve-property
+conformance suite against a fake ARM.
+
 ## Getting told, instead of asking
 
 ```

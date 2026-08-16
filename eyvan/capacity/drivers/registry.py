@@ -299,6 +299,45 @@ def _aws_factory(name: str, *, state: FleetStateStore, settings: EyvanSettings) 
     )
 
 
+def _azure_factory(name: str, *, state: FleetStateStore, settings: EyvanSettings) -> CapacityDriver:
+    """Build the Azure VM driver, refusing to guess at a subscription.
+
+    Refused loudly rather than defaulted, for the reason the AWS factory gives:
+    a driver that picked a subscription would create real machines somewhere
+    nobody chose.
+    """
+
+    del name
+    from eyvan.capacity.drivers.azure import AzureVmCapacityDriver
+    from eyvan.capacity.providers.azure.api import HttpAzureApi
+
+    missing = [
+        variable
+        for variable, value in (
+            ("EYVAN_AZURE_SUBSCRIPTION_ID", settings.azure_subscription_id),
+            ("EYVAN_AZURE_RESOURCE_GROUP", settings.azure_resource_group),
+            ("EYVAN_AZURE_LOCATION", settings.azure_location),
+            ("EYVAN_AZURE_ACCESS_TOKEN", settings.azure_access_token),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"the azure-vm capacity backend requires {', '.join(missing)}")
+    return AzureVmCapacityDriver(
+        state,
+        api=HttpAzureApi(
+            subscription_id=settings.azure_subscription_id,
+            resource_group=settings.azure_resource_group,
+            location=settings.azure_location,
+            # A callable rather than a value, so a rotating credential is read
+            # at call time. A token captured at construction works for exactly
+            # one lifetime and then fails as an unrelated permissions problem.
+            token=lambda: settings.azure_access_token,
+        ),
+        location=settings.azure_location,
+    )
+
+
 def _gcp_factory(name: str, *, state: FleetStateStore, settings: EyvanSettings) -> CapacityDriver:
     from eyvan.capacity.drivers.gcp import GcpCapacityDriver
     from eyvan.capacity.providers.gcp.native_worker_ingress import GcloudNativeWorkerPublicIngress
@@ -684,6 +723,8 @@ DEFAULT_CAPACITY_BACKENDS.register("k8s", _kubernetes_factory)
 DEFAULT_CAPACITY_BACKENDS.register("onprem-ssh", _onprem_ssh_factory)
 DEFAULT_CAPACITY_BACKENDS.register("aws-ec2", _aws_factory)
 DEFAULT_CAPACITY_BACKENDS.register("aws", _aws_factory)
+DEFAULT_CAPACITY_BACKENDS.register("azure-vm", _azure_factory)
+DEFAULT_CAPACITY_BACKENDS.register("azure", _azure_factory)
 
 
 __all__ = (

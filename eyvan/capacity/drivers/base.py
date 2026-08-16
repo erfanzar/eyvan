@@ -67,6 +67,8 @@ def capacity_backend_agent_family(name: str) -> str:
         "aws": "aws",
         "aws-ec2": "aws",
         "ec2": "aws",
+        "azure": "azure",
+        "azure-vm": "azure",
     }
     return families.get(normalized, normalized)
 

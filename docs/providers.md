@@ -1,7 +1,7 @@
 # Writing an Eyvan capacity provider
 
-Eyvan ships five capacity backends (`gcp`, `aws-ec2`, `kubernetes`, `manual`,
-`onprem-ssh`) and a development one (`local`). This document is for the next one,
+Eyvan ships six capacity backends (`gcp`, `aws-ec2`, `azure-vm`, `kubernetes`,
+`manual`, `onprem-ssh`) and a development one (`local`). This document is for the next one,
 which somebody else writes: CoreWeave, Slurm, a lab scheduler, a hardware
 vendor's API. You publish a distribution, Eyvan loads it through an entry point,
 and your provider serves a `capacity_backend` name the same way the in-tree ones

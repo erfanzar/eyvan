@@ -256,6 +256,15 @@ class EyvanSettings:
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_session_token: str = ""
+    #: Azure subscription, resource group and region the azure-vm backend
+    #: provisions in. Required for that backend and unused by every other.
+    azure_subscription_id: str = ""
+    azure_resource_group: str = ""
+    azure_location: str = ""
+    #: Bearer token for ARM. Supplied rather than acquired: a managed identity, a
+    #: client credential and a federated token are three different auth stories,
+    #: and a transport that picked one would pick it for every operator.
+    azure_access_token: str = ""
     #: How often the leader pushes committed audit events to project webhooks.
     #: Thirty seconds because a notification is not a control loop: the events
     #: are already durable, and a receiver's chat provider rate-limits long
@@ -669,6 +678,10 @@ class EyvanSettings:
             grant_expiry_interval_s=float(os.getenv("EYVAN_GRANT_EXPIRY_INTERVAL_S", defaults.grant_expiry_interval_s)),
             cell_billing_interval_s=float(os.getenv("EYVAN_CELL_BILLING_INTERVAL_S", defaults.cell_billing_interval_s)),
             cell_stage_interval_s=float(os.getenv("EYVAN_CELL_STAGE_INTERVAL_S", defaults.cell_stage_interval_s)),
+            azure_subscription_id=os.getenv("EYVAN_AZURE_SUBSCRIPTION_ID", defaults.azure_subscription_id),
+            azure_resource_group=os.getenv("EYVAN_AZURE_RESOURCE_GROUP", defaults.azure_resource_group),
+            azure_location=os.getenv("EYVAN_AZURE_LOCATION", defaults.azure_location),
+            azure_access_token=os.getenv("EYVAN_AZURE_ACCESS_TOKEN", defaults.azure_access_token),
             aws_region=os.getenv("EYVAN_AWS_REGION", defaults.aws_region),
             aws_access_key_id=os.getenv("EYVAN_AWS_ACCESS_KEY_ID", defaults.aws_access_key_id),
             aws_secret_access_key=os.getenv("EYVAN_AWS_SECRET_ACCESS_KEY", defaults.aws_secret_access_key),

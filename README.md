@@ -62,6 +62,7 @@ difference costs money:
 | `gcp`, `gcp-compute`, `gcp-tpu` | Compute Engine VMs and Cloud TPU, provisioned and reclaimed by Eyvan | one live TPU fleet; see [docs/proofs.md](docs/proofs.md) |
 | `k8s`, `kubernetes` | any conformant cluster, via Jobs and optionally Kueue | one GKE run; not re-qualified for the current candidate |
 | `aws`, `aws-ec2` | EC2 instances, on-demand or spot, fenced by instance tags | passes the conformance suite against a fake EC2; **no run against a real AWS account** |
+| `azure`, `azure-vm` | Azure virtual machines, on-demand or Spot, fenced by resource tags | passes the conformance suite against a fake ARM; **no run against a real subscription** |
 | `onprem-ssh` | hosts you already own, reached over SSH | code-complete, **no run against a real SSH host** |
 | your own | the `eyvan.capacity_providers` entry point, with a conformance suite | ABI published; no external provider written yet |
 

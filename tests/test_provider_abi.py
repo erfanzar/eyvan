@@ -330,6 +330,8 @@ def test_discovery_is_off_by_default_and_imports_nothing(plugin_site, tmp_path, 
     assert DEFAULT_CAPACITY_BACKENDS.names() == (
         "aws",
         "aws-ec2",
+        "azure",
+        "azure-vm",
         "gcp",
         "gcp-compute",
         "gcp-tpu",

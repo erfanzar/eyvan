@@ -139,6 +139,8 @@ def test_registry_exposes_every_backend_including_manual() -> None:
     assert DEFAULT_CAPACITY_BACKENDS.names() == (
         "aws",
         "aws-ec2",
+        "azure",
+        "azure-vm",
         "gcp",
         "gcp-compute",
         "gcp-tpu",
