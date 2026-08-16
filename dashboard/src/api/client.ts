@@ -9,6 +9,7 @@ import {
   getMockWorkload,
   mockAuditEvents,
   mockBudgets,
+  mockAvailableShapes,
   mockCells,
   mockLeases,
   mockPolicies,
@@ -18,6 +19,7 @@ import { apiAuthHeaders, configuredScope, isDemoMode, rejectSession, type AuthSc
 import { EventStreamHttpError, followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
   AuditEvent,
+  AvailableShape,
   BillingReport,
   Budget,
   CapacityLease,
@@ -97,6 +99,17 @@ interface RawCell {
   labels: Record<string, string>;
   topology?: Record<string, string>;
   last_heartbeat_at?: string;
+}
+
+/** One advertised pool from `/capacity`, readable with `submit` alone. */
+interface RawAvailablePool {
+  fleet: string;
+  pool: string;
+  accelerator_type: string;
+  capacity_class: string;
+  region: string;
+  zone?: string | null;
+  enabled: boolean;
 }
 
 interface RawLease {
@@ -1134,6 +1147,50 @@ export class EyvanApiClient {
     }));
   }
 
+  /**
+   * Every shape this scope may submit to, across applied fleets.
+   *
+   * Readable with `submit` alone, unlike the pool records behind it, and that
+   * is the point: choosing what to run on should not require permission to
+   * manage the fleet. It is also the only honest source for the form's
+   * choices -- a hard-coded list of accelerator types is a list of shapes some
+   * other fleet had.
+   */
+  async listAvailableShapes(
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<AvailableShape[]> {
+    if (this.forceDemo) return cloneMock(mockAvailableShapes);
+    const requestScope = this.scopeSnapshot(scope);
+    const payload = await this.request<{ pools: RawAvailablePool[] }>(
+      this.scope("/capacity", requestScope),
+      { signal },
+    );
+    return payload.pools
+      .filter((pool) => pool.enabled)
+      .map((pool) => ({
+        fleet: pool.fleet,
+        pool: pool.pool,
+        shape: pool.accelerator_type,
+        capacityClass: pool.capacity_class as AvailableShape["capacityClass"],
+        region: pool.region,
+        zone: pool.zone ?? undefined,
+      }));
+  }
+
+  /**
+   * Submit one command against a fleet shape, the way `eyvan run` does.
+   *
+   * The pool supplies the infrastructure contract: CPU, memory, accelerator
+   * count, topology and provider all come from the node type this lands on.
+   * This used to build a spec by hand against the advanced `/workloads` route,
+   * which meant the browser inventing every one of those -- it sent
+   * `provider: "gcp"` on every submission, which is a hard constraint that
+   * makes the job unplaceable on any other cloud, and a `required_topology` of
+   * `slice: "single-slice"` whose values no pool declares, so the default
+   * submission was refused with TOPOLOGY_MISMATCH against a value the user
+   * never typed.
+   */
   async submitWorkload(
     input: SubmitWorkloadInput,
     scope: AuthScope = this.activeScope,
@@ -1141,40 +1198,30 @@ export class EyvanApiClient {
   ): Promise<WorkloadDetail> {
     if (this.forceDemo) return createMockWorkload(input);
     const requestScope = this.scopeSnapshot(scope);
-    const accelerator = input.resources.accelerator;
     const payload = {
       org_id: requestScope.orgId,
       project_id: requestScope.projectId,
-      spec: {
-        name: input.name,
-        execution: { kind: "command", command: input.command },
-        gang: {
-          replicas: input.resources.replicas,
-          per_replica: {
-            cpu: input.resources.cpu,
-            memory_gib: input.resources.memoryGb,
-            gpu: 0,
-            tpu: input.resources.acceleratorCount ?? 0,
-          },
-          required_topology: input.resources.topology ? { slice: input.resources.topology } : {},
-        },
-        provider: "gcp",
-        accelerator_type: accelerator,
-        capacity_class: input.capacityClass,
-        priority_band: input.priority,
-        estimated_duration_seconds: input.estimatedDurationSeconds,
-        checkpointable: input.preemptible,
-        checkpoint_hook: input.checkpointHook,
-        checkpoint_output_uri: input.checkpointUri,
-        metadata: input.labels,
-      },
+      command: input.command,
+      pods: input.pods,
+      zone: input.zone,
+      name: input.name,
+      environment: input.environment,
+      metadata: input.labels,
+      priority_band: input.priority,
+      estimated_duration_seconds: input.estimatedDurationSeconds,
+      checkpointable: input.checkpointable,
+      checkpoint_hook: input.checkpointHook,
+      checkpoint_output_uri: input.checkpointUri,
     };
-    const raw = await this.request<RawWorkload>("/workloads", {
-      method: "POST",
-      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
-      body: JSON.stringify(payload),
-      signal,
-    });
+    const raw = await this.request<RawWorkload>(
+      `/fleets/${encodeURIComponent(input.fleet)}/node-types/${encodeURIComponent(input.shape)}/workloads`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+        body: JSON.stringify(payload),
+        signal,
+      },
+    );
     return mapWorkload(raw);
   }
 

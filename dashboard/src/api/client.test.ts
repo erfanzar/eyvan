@@ -514,14 +514,15 @@ describe("EyvanApiClient", () => {
     const client = new EyvanApiClient("/api/v1", true);
 
     const workload = await client.submitWorkload({
+      fleet: "research",
+      shape: "v6e-8",
+      pods: 1,
       name: "demo-run",
-      project: "research",
       priority: "batch",
-      capacityClass: "spot",
       command: "python demo.py",
-      resources: { cpu: 2, memoryGb: 4, replicas: 1 },
       estimatedDurationSeconds: 3600,
-      preemptible: false,
+      checkpointable: false,
+      environment: {},
       labels: {},
     });
 

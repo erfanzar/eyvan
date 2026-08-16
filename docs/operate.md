@@ -521,6 +521,23 @@ The job streams to stdout and its progress to stderr; the command exits 0, 1 or
 it looks like. **Ctrl-C detaches and does not cancel** -- the job is durable and
 outlives whoever submitted it. Reattach with `eyvan workload logs ID --follow`.
 
+### From the dashboard
+
+**Submit workload** on the Workloads page asks the same four things: shape,
+pods, zone, command. It offers the shapes this scope may actually run on, read
+from `/capacity` -- the same route `eyvan capacity` uses, readable with `submit`
+alone, so choosing what to run on does not require permission to manage the
+fleet. A shape present in several zones is one entry, because those pools are
+alternates; picking a zone pins it and withholds them.
+
+It asks for nothing a pool declares. CPU, memory, accelerator count, topology
+and provider all come from the node type the job lands on, so a form that asked
+for them would be guessing -- and until 2026-08-17 it was: it sent
+`provider: "gcp"` on every submission, which makes a job unplaceable on any
+other cloud, and a topology of `slice: "single-slice"`, a value no pool
+declares, so the default submission was refused with `TOPOLOGY_MISMATCH`
+against a string nobody typed.
+
 ## Naming a job, and naming a batch
 
 ```

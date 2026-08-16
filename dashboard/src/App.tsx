@@ -38,6 +38,7 @@ import {
   type SectionAvailability,
 } from "./routing";
 import type {
+  AvailableShape,
   DashboardData,
   EffectiveProjectScope,
   SchedulingPolicy,
@@ -244,6 +245,14 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const [error, setError] = useState<string | null>(null);
   const [detailFailure, setDetailFailure] = useState<DetailFailure | null>(null);
   const [submitInteraction, setSubmitInteraction] = useState<SubmitInteraction | null>(null);
+  // Read when the form opens rather than with the dashboard sweep: it is only
+  // ever used by the form, and a submit-only principal has no dashboard sweep
+  // to carry it.
+  const [availableShapes, setAvailableShapes] = useState<{
+    shapes: AvailableShape[];
+    loading: boolean;
+    error: string | null;
+  }>({ shapes: [], loading: false, error: null });
   const [submissionAcknowledgement, setSubmissionAcknowledgement] =
     useState<SubmissionAcknowledgement | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
@@ -698,6 +707,27 @@ export default function App({ client = apiClient, identityProvider = currentIden
     };
     submitInteractionRef.current = interaction;
     setSubmitInteraction(interaction);
+    setAvailableShapes({ shapes: [], loading: true, error: null });
+    client
+      .listAvailableShapes(immutableScope, scopeOperationAbortRef.current.signal)
+      .then((shapes) => {
+        // Discarded when the scope moved under it. Offering another project's
+        // hardware would submit against a fleet this scope may not use, and the
+        // refusal would arrive after the form was filled in.
+        if (submitInteractionRef.current?.id !== interaction.id) return;
+        setAvailableShapes({ shapes, loading: false, error: null });
+      })
+      .catch((shapesError: unknown) => {
+        if (submitInteractionRef.current?.id !== interaction.id) return;
+        // Named rather than left empty. An empty list means "no fleet is
+        // applied", which sends somebody to run `eyvan up` when the truth is
+        // that the read failed.
+        setAvailableShapes({
+          shapes: [],
+          loading: false,
+          error: shapesError instanceof Error ? shapesError.message : "Unable to read what this scope can run on",
+        });
+      });
   };
 
   const selectScope = (scope: EffectiveProjectScope) => {
@@ -1119,6 +1149,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
             key={`${scopeKey(submitInteraction.scope)}:${submitInteraction.id}`}
             open
             project={submitInteraction.scope.projectId}
+            shapes={availableShapes.shapes}
+            loadingShapes={availableShapes.loading}
+            shapesError={availableShapes.error}
             onClose={() => closeSubmitInteraction(submitInteraction.id)}
             onSubmit={(input) => submitWorkload(input, submitInteraction)}
           />

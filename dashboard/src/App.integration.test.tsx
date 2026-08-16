@@ -160,6 +160,7 @@ type FakeOverrides = Partial<{
   listWorkloads: EyvanApiClient["listWorkloads"];
   listPolicies: EyvanApiClient["listPolicies"];
   submitWorkload: EyvanApiClient["submitWorkload"];
+  listAvailableShapes: EyvanApiClient["listAvailableShapes"];
   updatePolicy: EyvanApiClient["updatePolicy"];
   getWorkload: EyvanApiClient["getWorkload"];
   workloadAction: EyvanApiClient["workloadAction"];
@@ -223,9 +224,23 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     getBilling: vi.fn(async () => ({ observed_at: "2026-01-01T00:00:00Z", accrued_cost: 0, idle_cost: 0 })),
     getLaunchLatency: vi.fn(async () => ({ observed_at: "2026-01-01T00:00:00Z", pools: [] })),
     getTpuQuota: vi.fn(async () => quotaSnapshot()),
+    listAvailableShapes: vi.fn(
+      overrides.listAvailableShapes ??
+        (async () => [
+          {
+            fleet: "research",
+            pool: "research-v6e-8-us-east5-a",
+            shape: "v6e-8",
+            capacityClass: "spot" as const,
+            region: "us-east5",
+            zone: "us-east5-a",
+          },
+        ]),
+    ),
     submitWorkload: vi.fn(
       overrides.submitWorkload ??
-        (async (input, scope) => scopedWorkload(scope ?? { orgId: "acme", projectId: input.project }, input.name)),
+        (async (input, scope) =>
+          scopedWorkload(scope ?? { orgId: "acme", projectId: "research" }, input.name ?? input.shape)),
     ),
     workloadAction: vi.fn(
       overrides.workloadAction ??
@@ -491,8 +506,8 @@ describe("App scope and authority race guards", () => {
     await waitFor(() => expect(screen.getByText("acme-research-workload")).toBeDefined());
 
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    const aDialog = screen.getByRole("dialog", { name: "Submit workload" });
-    fireEvent.change(within(aDialog).getByLabelText("Workload name"), { target: { value: "A draft" } });
+    const aDialog = screen.getByRole("dialog", { name: "Run a job" });
+    fireEvent.change(within(aDialog).getByLabelText("Name"), { target: { value: "A draft" } });
     expect((within(aDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(a.projectId);
 
     act(() => document.dispatchEvent(new Event("visibilitychange")));
@@ -501,15 +516,22 @@ describe("App scope and authority race guards", () => {
         JSON.stringify([b.orgId, b.projectId]),
       ),
     );
-    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Run a job" })).toBeNull();
     expect(calls.submitWorkload).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    const bDialog = screen.getByRole("dialog", { name: "Submit workload" });
-    expect((within(bDialog).getByLabelText("Workload name") as HTMLInputElement).value).toBe("");
+    const bDialog = screen.getByRole("dialog", { name: "Run a job" });
+    expect((within(bDialog).getByLabelText("Name") as HTMLInputElement).value).toBe("");
     expect((within(bDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(b.projectId);
-    fireEvent.change(within(bDialog).getByLabelText("Workload name"), { target: { value: "B submission" } });
-    fireEvent.click(within(bDialog).getByRole("button", { name: "Submit workload" }));
+    fireEvent.change(within(bDialog).getByLabelText("Name"), { target: { value: "B submission" } });
+    // The command is required, and the shape preselects once the fleet read
+    // lands -- which is a real wait, not a test artefact: the form cannot offer
+    // hardware it has not been told about.
+    fireEvent.change(within(bDialog).getByLabelText("Command"), { target: { value: "python train.py" } });
+    await waitFor(() =>
+      expect((within(bDialog).getByLabelText("Shape") as HTMLSelectElement).value).toBe("research/v6e-8"),
+    );
+    fireEvent.click(within(bDialog).getByRole("button", { name: "Run" }));
 
     await waitFor(() => expect(calls.submitWorkload).toHaveBeenCalledTimes(1));
     expect(calls.submitWorkload.mock.calls[0][0]).toEqual(expect.objectContaining({ name: "B submission" }));
@@ -536,9 +558,13 @@ describe("App scope and authority race guards", () => {
     await waitFor(() => expect(screen.getByText("acme-research-workload")).toBeDefined());
 
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    const aDialog = screen.getByRole("dialog", { name: "Submit workload" });
-    fireEvent.change(within(aDialog).getByLabelText("Workload name"), { target: { value: "A pending" } });
-    fireEvent.click(within(aDialog).getByRole("button", { name: "Submit workload" }));
+    const aDialog = screen.getByRole("dialog", { name: "Run a job" });
+    fireEvent.change(within(aDialog).getByLabelText("Name"), { target: { value: "A pending" } });
+    fireEvent.change(within(aDialog).getByLabelText("Command"), { target: { value: "python train.py" } });
+    await waitFor(() =>
+      expect((within(aDialog).getByLabelText("Shape") as HTMLSelectElement).value).toBe("research/v6e-8"),
+    );
+    fireEvent.click(within(aDialog).getByRole("button", { name: "Run" }));
     await waitFor(() => expect(calls.submitWorkload).toHaveBeenCalledTimes(1));
     expect(calls.submitWorkload.mock.calls[0][1]).toEqual(a);
 
@@ -548,15 +574,15 @@ describe("App scope and authority race guards", () => {
         JSON.stringify([b.orgId, b.projectId]),
       ),
     );
-    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Run a job" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    const bDialog = screen.getByRole("dialog", { name: "Submit workload" });
-    fireEvent.change(within(bDialog).getByLabelText("Workload name"), { target: { value: "B draft" } });
+    const bDialog = screen.getByRole("dialog", { name: "Run a job" });
+    fireEvent.change(within(bDialog).getByLabelText("Name"), { target: { value: "B draft" } });
 
     await act(async () => pending.resolve(scopedWorkload(a, "A pending")));
-    const currentDialog = screen.getByRole("dialog", { name: "Submit workload" });
-    expect((within(currentDialog).getByLabelText("Workload name") as HTMLInputElement).value).toBe("B draft");
+    const currentDialog = screen.getByRole("dialog", { name: "Run a job" });
+    expect((within(currentDialog).getByLabelText("Name") as HTMLInputElement).value).toBe("B draft");
     expect((within(currentDialog).getByLabelText("Project") as HTMLInputElement).value).toBe(b.projectId);
     expect(screen.queryByText(/A pending submitted to/)).toBeNull();
   });
@@ -844,14 +870,14 @@ describe("App scope and authority race guards", () => {
     renderApp(client);
     await waitFor(() => expect(screen.getByRole("button", { name: "Submit workload" })).toBeDefined());
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    expect(screen.getByRole("dialog", { name: "Submit workload" })).toBeDefined();
+    expect(screen.getByRole("dialog", { name: "Run a job" })).toBeDefined();
 
     act(() => document.dispatchEvent(new Event("visibilitychange")));
     await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(3));
 
     // /session is still pending: the first typed denial, not its eventual
     // reconciliation result, must remove every stale mutation affordance.
-    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Run a job" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Submit workload" })).toBeNull();
 
     await act(async () => reconciliation.reject(new ApiError("session unavailable", 503)));
@@ -881,12 +907,12 @@ describe("App scope and authority race guards", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDefined());
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    expect(screen.getByRole("dialog", { name: "Submit workload" })).toBeDefined();
+    expect(screen.getByRole("dialog", { name: "Run a job" })).toBeDefined();
 
     await act(async () => streamDenied.resolve());
     await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(3));
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
-    expect(screen.queryByRole("dialog", { name: "Submit workload" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Run a job" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Submit workload" })).toBeNull();
 
     await act(async () => reconciliation.reject(new ApiError("session reconciliation failed", 503)));
@@ -922,9 +948,13 @@ describe("submit-only and wildcard deep links", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Submit workload" })).toBeDefined());
 
     fireEvent.click(screen.getByRole("button", { name: "Submit workload" }));
-    const dialog = screen.getByRole("dialog", { name: "Submit workload" });
-    fireEvent.change(within(dialog).getByLabelText("Workload name"), { target: { value: "submit-only-job" } });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Submit workload" }));
+    const dialog = screen.getByRole("dialog", { name: "Run a job" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "submit-only-job" } });
+    fireEvent.change(within(dialog).getByLabelText("Command"), { target: { value: "python train.py" } });
+    await waitFor(() =>
+      expect((within(dialog).getByLabelText("Shape") as HTMLSelectElement).value).toBe("research/v6e-8"),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run" }));
 
     await waitFor(() => expect(screen.getByText("Workload submitted")).toBeDefined());
     expect(screen.getByText(/submit-only-job.*cannot read workload detail/)).toBeDefined();

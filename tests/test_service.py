@@ -1085,7 +1085,7 @@ async def test_pool_callable_submission_enforces_the_gcp_multislice_worker_limit
     assert accepted.spec.worker_count == 256
     assert accepted.spec.gang.per_replica.tpu == pool.allocatable.tpu
     assert accepted.spec.resources_per_cell.tpu == pool.allocatable.tpu * 256
-    with pytest.raises(InputError, match="must not exceed the GCP TPU multislice limit of 256"):
+    with pytest.raises(InputError, match="must not exceed 256, the widest gang any capacity backend"):
         await service.submit_pool_callable(
             _principal(Role.PROJECT_OPERATOR),
             fleet_name=pool.fleet_name,

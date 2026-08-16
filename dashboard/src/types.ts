@@ -265,17 +265,44 @@ export interface ControlPlaneHealth {
   service: string;
 }
 
+/**
+ * One shape this scope may submit to, as the control plane advertises it.
+ *
+ * `shape` is the name a submission uses -- the accelerator type for a pool that
+ * declares one, the pool's own node type otherwise -- which is exactly what
+ * `eyvan run --tpu v6e-8` passes. The rest is what the pool declares, not
+ * anything the submitter chooses: a pool supplies its own CPU, memory,
+ * accelerator count and topology, which is why none of those are asked for.
+ */
+export interface AvailableShape {
+  fleet: string;
+  pool: string;
+  shape: string;
+  capacityClass: "spot" | "on_demand" | "reserved";
+  region: string;
+  zone?: string;
+}
+
 export interface SubmitWorkloadInput {
-  name: string;
-  project: string;
+  /** Which applied fleet to run in. Chosen for you when there is only one. */
+  fleet: string;
+  /** The hardware to run on, as `eyvan run --tpu` spells it. */
+  shape: string;
+  /** Whole cells allocated together and atomically. The multislice knob. */
+  pods: number;
+  /**
+   * A constraint, not a preference: with it set only a pool in that zone may
+   * run this job, and cross-zone alternates are withheld.
+   */
+  zone?: string;
+  name?: string;
   priority: PriorityBand;
-  capacityClass: "spot" | "on_demand";
   command: string;
-  resources: ResourceRequest;
   estimatedDurationSeconds: number;
-  preemptible: boolean;
+  checkpointable: boolean;
   checkpointHook?: string;
   checkpointUri?: string;
+  environment: Record<string, string>;
   labels: Record<string, string>;
 }
 

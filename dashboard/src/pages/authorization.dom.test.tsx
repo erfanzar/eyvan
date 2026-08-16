@@ -212,6 +212,7 @@ describe("capability-aware actions", () => {
       <SubmitWorkloadModal
         open
         project="platform"
+        shapes={[]}
         onClose={() => {}}
         onSubmit={async () => {
           throw new Error("not submitted in this test");

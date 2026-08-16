@@ -5,6 +5,7 @@
 
 import type {
   AuditEvent,
+  AvailableShape,
   Budget,
   CapacityLease,
   Cell,
@@ -697,17 +698,54 @@ export function getMockWorkload(id: string): WorkloadDetail | undefined {
   return workload ? detailFor(workload) : undefined;
 }
 
+/**
+ * Shapes the demo fleet advertises.
+ *
+ * Two zones of one shape, because that is the case the submit form has to get
+ * right: they are alternates, so the zone field offers both and neither is
+ * required.
+ */
+export const mockAvailableShapes: AvailableShape[] = [
+  {
+    fleet: "research",
+    pool: "research-v6e-8-us-east5-a",
+    shape: "v6e-8",
+    capacityClass: "spot",
+    region: "us-east5",
+    zone: "us-east5-a",
+  },
+  {
+    fleet: "research",
+    pool: "research-v6e-8-us-east5-b",
+    shape: "v6e-8",
+    capacityClass: "spot",
+    region: "us-east5",
+    zone: "us-east5-b",
+  },
+  {
+    fleet: "research",
+    pool: "research-cpu-16",
+    shape: "cpu-16",
+    capacityClass: "on_demand",
+    region: "us-east5",
+    zone: "us-east5-a",
+  },
+];
+
 export function createMockWorkload(input: SubmitWorkloadInput): WorkloadDetail {
   const id = `wrk-${Math.random().toString(16).slice(2, 6)}`;
+  // The pool supplies the infrastructure contract, so the demo cannot know the
+  // per-replica shape a real submission would land on. Stated as what was
+  // asked for -- the shape name and the pod count -- rather than invented.
   const workload: WorkloadSummary = {
     id,
-    name: input.name,
+    name: input.name ?? `${input.fleet}/${input.shape}`,
     org: "demo",
-    project: input.project,
+    project: "demo",
     user: "dashboard",
     status: "planning",
     priority: input.priority,
-    resources: input.resources,
+    resources: { cpu: 0, memoryGb: 0, replicas: input.pods, accelerator: input.shape },
     submittedAt: new Date().toISOString(),
     progress: 2,
     budgetSpent: 0,

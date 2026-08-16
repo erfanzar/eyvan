@@ -42,6 +42,7 @@ from eyvan.artifacts.managed import (
     parse_managed_uri,
 )
 from eyvan.artifacts.managed import result_uri as managed_result_uri
+from eyvan.capacity.drivers.base import backend_capabilities, providers_hosting_multi_worker_cells
 from eyvan.capacity.planning import (
     POOL_ALTERNATES_LABEL,
     candidate_zone_report,
@@ -255,15 +256,32 @@ def _multislice_refusal(pool: CapacityPoolRecord) -> str:
 
     The same conditions ``WorkloadDefinition`` enforces, checked against the pool
     a caller actually named so the refusal can point at it. Several workers
-    allocated together is a TPU multislice shape and nothing else: it needs the
-    native executor to place ranks across hosts, GCP's queued resources to
-    allocate them atomically, and TPU chips to be worth doing.
+    allocated together needs a backend that allocates a gang of machines
+    atomically, the native executor to place ranks across them, and accelerator
+    chips to be worth doing.
+
+    Asked of the capability table rather than of a provider's name. This used to
+    read ``pool.provider != "gcp"``, which is the leak the durable model had
+    already been cured of one layer down: a second cloud implementing atomic
+    gang allocation would have passed the record validator and been refused
+    here, by the submission path, for being the wrong brand.
+
+    A pool naming a backend is judged on that backend, which is the precise
+    question. One that names none falls back to the provider-level answer the
+    spec validator uses, so pools predating ``capacity_backend`` keep working
+    rather than losing multislice to a field they never set.
     """
 
     if pool.executor != "eyvan-native":
         return "it does not run the eyvan-native executor"
-    if pool.provider != "gcp":
-        return "it is not a GCP pool"
+    builds_gangs = (
+        backend_capabilities(pool.capacity_backend).multi_worker_cells
+        if pool.capacity_backend
+        else pool.provider in providers_hosting_multi_worker_cells()
+    )
+    if not builds_gangs:
+        named = pool.capacity_backend or pool.provider
+        return f"its {named} capacity backend allocates one machine per cell"
     if pool.allocatable.tpu <= 0 or pool.allocatable.gpu > 0:
         return "it provides no TPU resource"
     return ""
@@ -1066,7 +1084,14 @@ class ControlPlaneService:
         if isinstance(pods, bool) or not isinstance(pods, int) or pods < 1:
             raise InputError("pods must be a positive integer")
         if pods > MAX_GCP_TPU_MULTISLICE_WORKERS:
-            raise InputError(f"pods must not exceed the GCP TPU multislice limit of {MAX_GCP_TPU_MULTISLICE_WORKERS}")
+            # Named for what the number is rather than for who set it. It is the
+            # widest gang any *known* backend allocates, taken from the
+            # capability table -- so calling it GCP's limit stops being true the
+            # moment a second backend declares a different one.
+            raise InputError(
+                f"pods must not exceed {MAX_GCP_TPU_MULTISLICE_WORKERS}, "
+                "the widest gang any capacity backend allocates atomically"
+            )
         if not accelerator_type or accelerator_type != accelerator_type.strip():
             raise InputError("accelerator_type must be non-empty and trimmed")
 

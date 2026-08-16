@@ -1570,6 +1570,9 @@ code,
 .form-grid-three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: #434b46; font-size: 11px; font-weight: 650; }
 .field-wide { grid-column: 1 / -1; }
+.field > label { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.field-hint { color: var(--text-muted); font-weight: 450; line-height: 1.35; }
+.form-note { margin-top: 8px; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
 .field input,
 .field select,
 .field textarea { width: 100%; min-width: 0; border: 1px solid var(--border-strong); border-radius: 5px; outline: 0; background: #fff; font-size: 12px; font-weight: 450; }

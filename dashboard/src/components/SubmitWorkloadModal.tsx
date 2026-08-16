@@ -3,55 +3,128 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertCircle, LoaderCircle, Plus, X } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+/**
+ * Submitting a job from the browser, asking only what the fleet cannot supply.
+ *
+ * This form used to build a workload spec by hand: CPU and memory per replica,
+ * accelerator count, a gang topology, and a provider. All four are properties
+ * of the pool a job lands on, so the browser was inventing them -- and getting
+ * two of them wrong in ways nobody could see. It sent `provider: "gcp"` on
+ * every submission, a hard constraint that makes a job unplaceable on any other
+ * cloud, and a topology of `slice: "single-slice"`, a value no pool declares,
+ * so the *default* submission was refused for a mismatch against a string the
+ * user never typed.
+ *
+ * It now asks what `eyvan run` asks: which shape, how many, and what command.
+ * The pool supplies the rest, and the shapes on offer are the ones this scope
+ * may actually submit to rather than a list of hardware some other fleet had.
+ */
 
-import type { PriorityBand, SubmitWorkloadInput, WorkloadDetail } from "../types";
+import { AlertCircle, LoaderCircle, Plus, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+
+import type { AvailableShape, PriorityBand, SubmitWorkloadInput, WorkloadDetail } from "../types";
 
 interface SubmitWorkloadModalProps {
   open: boolean;
   project: string;
+  /** Every shape this scope may run on. Empty means no fleet is applied. */
+  shapes: AvailableShape[];
+  /** Set while the shapes are still being read, which is not the same as none. */
+  loadingShapes?: boolean;
+  /** Why the shape list could not be read, if it could not. */
+  shapesError?: string | null;
   onClose: () => void;
   onSubmit: (input: SubmitWorkloadInput) => Promise<WorkloadDetail>;
 }
 
+const ANY_ZONE = "";
+
 const initialForm = {
   name: "",
   priority: "interactive" as PriorityBand,
-  capacityClass: "spot" as "spot" | "on_demand",
-  command: "python -m easydel.scripts.elarge --config configs/train.yaml",
-  replicas: 1,
-  cpu: 64,
-  memoryGb: 512,
-  accelerator: "v5p-8",
-  acceleratorCount: 4,
-  topology: "single-slice",
+  command: "",
+  pods: 1,
+  zone: ANY_ZONE,
   estimatedDurationHours: 8,
-  preemptible: true,
-  checkpointHook: "python scripts/checkpoint.py",
-  checkpointUri: "gs://eyvan-checkpoints/research/run",
-  labels: "environment=production,team=research",
+  // Off, as `eyvan run` has it. On is the better answer for a spot job and the
+  // wrong default for a form: it makes two more fields required before anything
+  // can be submitted at all, which is a long first run in exchange for a
+  // property most first runs do not need.
+  checkpointable: false,
+  checkpointHook: "",
+  checkpointUri: "",
+  environment: "",
+  labels: "",
 };
 
-export function SubmitWorkloadModal({ open, project, onClose, onSubmit }: SubmitWorkloadModalProps) {
+/** Split `A=1,B=2` into a map, dropping anything that is not a pair. */
+function parsePairs(value: string): Record<string, string> {
+  return Object.fromEntries(
+    value
+      .split(",")
+      .map((entry) => entry.trim().split("=", 2))
+      .filter((entry): entry is [string, string] => entry.length === 2 && Boolean(entry[0]) && Boolean(entry[1])),
+  );
+}
+
+export function SubmitWorkloadModal({
+  open,
+  project,
+  shapes,
+  loadingShapes = false,
+  shapesError = null,
+  onClose,
+  onSubmit,
+}: SubmitWorkloadModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const [form, setForm] = useState(initialForm);
+  const [selected, setSelected] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // Keyed `fleet/shape`, because two fleets may both offer v6e-8 and they are
+  // different capacity. The pools behind one key are its zones.
+  const offers = useMemo(() => {
+    const grouped = new Map<string, AvailableShape[]>();
+    for (const pool of shapes) {
+      const key = `${pool.fleet}/${pool.shape}`;
+      grouped.set(key, [...(grouped.get(key) ?? []), pool]);
+    }
+    return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right));
+  }, [shapes]);
+
+  const chosen = offers.find(([key]) => key === selected)?.[1] ?? [];
+  const zones = [...new Set(chosen.map((pool) => pool.zone).filter((zone): zone is string => Boolean(zone)))].sort();
+  const classes = [...new Set(chosen.map((pool) => pool.capacityClass))].sort();
+
+  // Split from the effect below, and the split is load-bearing. `onClose` is a
+  // closure the parent rebuilds every render, so an effect that depends on it
+  // re-runs whenever anything above this form changes -- an arriving event, the
+  // thirty-second sweep. Resetting the form there wipes what somebody is typing
+  // while they type it, and moving focus there drags the caret back to the
+  // first field. Both belong to the transition into `open`, which is what this
+  // effect watches.
   useEffect(() => {
     if (!open) return;
+    setForm(initialForm);
+    setError(null);
+    setSelected("");
     previousFocus.current = document.activeElement as HTMLElement;
+    globalThis.setTimeout(() => dialogRef.current?.querySelector<HTMLElement>("select, input")?.focus(), 0);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
     document.body.classList.add("modal-open");
-    globalThis.setTimeout(() => dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus(), 0);
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
       if (event.key !== "Tab" || !dialogRef.current) return;
       const focusable = Array.from(
         dialogRef.current.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
+          "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])",
         ),
       );
       if (!focusable.length) return;
@@ -73,6 +146,17 @@ export function SubmitWorkloadModal({ open, project, onClose, onSubmit }: Submit
     };
   }, [onClose, open]);
 
+  useEffect(() => {
+    if (!open) return;
+    // Preselect the only thing on offer -- one fewer decision on a first
+    // submission, and the common case for a single-fleet plane. Written as
+    // "fill an empty selection" rather than "set the selection" because the
+    // shapes arrive after the form opens: a plain assignment here would also
+    // fire on every later refresh and move the choice out from under someone
+    // who had already made one.
+    setSelected((current) => (current === "" && offers.length === 1 ? offers[0][0] : current));
+  }, [offers, open]);
+
   if (!open) return null;
 
   const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => {
@@ -82,51 +166,40 @@ export function SubmitWorkloadModal({ open, project, onClose, onSubmit }: Submit
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
-    if (!form.name.trim() || !project.trim() || !form.command.trim()) {
-      setError("Name, project, and command are required.");
+    const [fleet, shape] = selected.split("/", 2);
+    if (!fleet || !shape) {
+      setError("Choose the hardware to run on.");
       return;
     }
-    if (form.replicas < 1 || form.cpu < 1 || form.memoryGb < 1 || form.estimatedDurationHours <= 0) {
-      setError("Resource counts and estimated duration must be greater than zero.");
+    if (!form.command.trim()) {
+      setError("A command is required.");
       return;
     }
-    if (form.accelerator !== "none" && form.acceleratorCount < 1) {
-      setError("Accelerator-backed workloads require at least one accelerator per replica.");
+    if (form.pods < 1 || form.estimatedDurationHours <= 0) {
+      setError("Pod count and estimated duration must be greater than zero.");
       return;
     }
-    if (form.preemptible && (!form.checkpointHook.trim() || !form.checkpointUri.trim())) {
-      setError("Preemptible workloads require a checkpoint hook and durable output URI.");
+    if (form.checkpointable && (!form.checkpointHook.trim() || !form.checkpointUri.trim())) {
+      setError("A checkpointable job needs a hook and somewhere durable to write.");
       return;
     }
-
-    const labels = Object.fromEntries(
-      form.labels
-        .split(",")
-        .map((entry) => entry.trim().split("=", 2))
-        .filter((entry): entry is [string, string] => entry.length === 2 && Boolean(entry[0]) && Boolean(entry[1])),
-    );
 
     setSubmitting(true);
     try {
       await onSubmit({
-        name: form.name.trim(),
-        project: project.trim(),
+        fleet,
+        shape,
+        pods: form.pods,
+        zone: form.zone || undefined,
+        name: form.name.trim() || undefined,
         priority: form.priority,
-        capacityClass: form.capacityClass,
         command: form.command.trim(),
-        resources: {
-          replicas: form.replicas,
-          cpu: form.cpu,
-          memoryGb: form.memoryGb,
-          accelerator: form.accelerator === "none" ? undefined : form.accelerator,
-          acceleratorCount: form.accelerator === "none" ? undefined : form.acceleratorCount,
-          topology: form.topology === "none" ? undefined : form.topology,
-        },
         estimatedDurationSeconds: Math.round(form.estimatedDurationHours * 3600),
-        preemptible: form.preemptible,
-        checkpointHook: form.preemptible ? form.checkpointHook.trim() : undefined,
-        checkpointUri: form.preemptible ? form.checkpointUri.trim() : undefined,
-        labels,
+        checkpointable: form.checkpointable,
+        checkpointHook: form.checkpointable ? form.checkpointHook.trim() : undefined,
+        checkpointUri: form.checkpointable ? form.checkpointUri.trim() : undefined,
+        environment: parsePairs(form.environment),
+        labels: parsePairs(form.labels),
       });
       setForm(initialForm);
       onClose();
@@ -142,51 +215,226 @@ export function SubmitWorkloadModal({ open, project, onClose, onSubmit }: Submit
       <button className="modal-scrim" type="button" onClick={onClose} aria-label="Close submit workload dialog" />
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="submit-workload-title" ref={dialogRef}>
         <div className="modal-header">
-          <div><h2 id="submit-workload-title">Submit workload</h2><p>Create an admitted workload request for the global scheduler.</p></div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog" title="Close dialog"><X size={19} /></button>
+          <div>
+            <h2 id="submit-workload-title">Run a job</h2>
+            <p>The pool supplies CPU, memory, accelerators and topology. Name the hardware and the command.</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog" title="Close dialog">
+            <X size={19} />
+          </button>
         </div>
         <form onSubmit={submit}>
           <div className="modal-body">
-            {error && <div className="form-error" role="alert"><AlertCircle size={16} />{error}</div>}
+            {error && (
+              <div className="form-error" role="alert">
+                <AlertCircle size={16} />
+                {error}
+              </div>
+            )}
+            {shapesError && (
+              <div className="form-error" role="alert">
+                <AlertCircle size={16} />
+                {shapesError}
+              </div>
+            )}
+            {/* Three different facts. "No fleet is applied" sends somebody to
+                `eyvan up`; "still reading" sends them nowhere; and a failed
+                read must never render as an empty fleet. */}
+            {!shapesError && !loadingShapes && offers.length === 0 && (
+              <div className="form-error" role="alert">
+                <AlertCircle size={16} />
+                No fleet is applied, so there is nothing to run on yet. Run <code>eyvan up</code> first.
+              </div>
+            )}
 
             <fieldset>
-              <legend>Identity and admission</legend>
+              <legend>Hardware</legend>
               <div className="form-grid form-grid-two">
-                <label className="field field-wide"><span>Workload name</span><input value={form.name} onChange={(event) => set("name", event.target.value)} placeholder="llama-70b-sft-v5" required /></label>
-                <label className="field"><span>Project</span><input value={project} readOnly aria-readonly="true" /></label>
-                <label className="field"><span>Priority band</span><select value={form.priority} onChange={(event) => set("priority", event.target.value as PriorityBand)}><option value="production">Production</option><option value="interactive">Interactive</option><option value="batch">Batch</option></select></label>
-                <label className="field"><span>Capacity class</span><select value={form.capacityClass} onChange={(event) => set("capacityClass", event.target.value as "spot" | "on_demand")}><option value="spot">Spot</option><option value="on_demand">On-demand</option></select></label>
+                <label className="field field-wide">
+                  <span>Shape</span>
+                  <select
+                    value={selected}
+                    onChange={(event) => {
+                      setSelected(event.target.value);
+                      // A zone from the previous shape is a constraint nothing
+                      // can satisfy, and the refusal would name a zone the
+                      // submitter did not knowingly choose.
+                      set("zone", ANY_ZONE);
+                    }}
+                    disabled={loadingShapes}
+                    required
+                  >
+                    <option value="">{loadingShapes ? "Reading the fleet…" : "Choose hardware"}</option>
+                    {offers.map(([key, pools]) => (
+                      <option key={key} value={key}>
+                        {key} · {pools.length} pool{pools.length === 1 ? "" : "s"}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="field">
+                  <label>
+                    <span>Pods</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={form.pods}
+                      onChange={(event) => set("pods", Number(event.target.value))}
+                    />
+                  </label>
+                  {/* Outside the label on purpose: a field's accessible name is
+                      its label's whole text, so a hint inside renames it. */}
+                  <small className="field-hint">Whole cells allocated together, atomically.</small>
+                </div>
+                <label className="field">
+                  <span>Zone</span>
+                  <select value={form.zone} onChange={(event) => set("zone", event.target.value)}>
+                    {/* Default is unpinned on purpose: pinning withholds the
+                        cross-zone alternates, which is the whole reason a shape
+                        exists in several zones. */}
+                    <option value={ANY_ZONE}>Wherever there is capacity</option>
+                    {zones.map((zone) => (
+                      <option key={zone} value={zone}>
+                        Pin to {zone}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {chosen.length > 0 && (
+                <p className="form-note">
+                  {chosen.length === 1
+                    ? `One pool, in ${chosen[0].zone ?? chosen[0].region}.`
+                    : `${chosen.length} pools across ${zones.join(", ")}; the fleet places this where capacity is and carries the rest as alternates.`}{" "}
+                  Capacity class: {classes.join(", ")}.
+                </p>
+              )}
+            </fieldset>
+
+            <fieldset>
+              <legend>Job</legend>
+              <div className="form-grid form-grid-two">
+                <label className="field field-wide">
+                  <span>Command</span>
+                  <textarea
+                    rows={3}
+                    value={form.command}
+                    onChange={(event) => set("command", event.target.value)}
+                    placeholder="python train.py --config configs/run.yaml"
+                    required
+                  />
+                </label>
+                <div className="field">
+                  <label>
+                    <span>Name</span>
+                    <input
+                      value={form.name}
+                      onChange={(event) => set("name", event.target.value)}
+                      placeholder={selected || "fleet/shape"}
+                    />
+                  </label>
+                  <small className="field-hint">Optional. Defaults to the fleet and shape.</small>
+                </div>
+                <label className="field">
+                  <span>Project</span>
+                  <input value={project} readOnly aria-readonly="true" />
+                </label>
+                <label className="field">
+                  <span>Priority band</span>
+                  <select
+                    value={form.priority}
+                    onChange={(event) => set("priority", event.target.value as PriorityBand)}
+                  >
+                    <option value="production">Production</option>
+                    <option value="interactive">Interactive</option>
+                    <option value="batch">Batch</option>
+                  </select>
+                </label>
+                <div className="field">
+                  <label>
+                    <span>Estimated duration (hours)</span>
+                    <input
+                      type="number"
+                      min="0.25"
+                      step="0.25"
+                      value={form.estimatedDurationHours}
+                      onChange={(event) => set("estimatedDurationHours", Number(event.target.value))}
+                    />
+                  </label>
+                  <small className="field-hint">Every cost estimate is taken over this.</small>
+                </div>
+                <label className="field">
+                  <span>Environment</span>
+                  <input
+                    value={form.environment}
+                    onChange={(event) => set("environment", event.target.value)}
+                    placeholder="WANDB_PROJECT=runs,JAX_PLATFORMS=tpu"
+                  />
+                </label>
+                <label className="field">
+                  <span>Labels</span>
+                  <input
+                    value={form.labels}
+                    onChange={(event) => set("labels", event.target.value)}
+                    placeholder="team=research,env=prod"
+                  />
+                </label>
               </div>
             </fieldset>
 
             <fieldset>
-              <legend>Gang resources</legend>
-              <div className="form-grid form-grid-three">
-                <label className="field"><span>Replicas</span><input type="number" min="1" value={form.replicas} onChange={(event) => set("replicas", Number(event.target.value))} /></label>
-                <label className="field"><span>CPU per replica</span><input type="number" min="1" value={form.cpu} onChange={(event) => set("cpu", Number(event.target.value))} /></label>
-                <label className="field"><span>Memory per replica (GB)</span><input type="number" min="1" value={form.memoryGb} onChange={(event) => set("memoryGb", Number(event.target.value))} /></label>
-                <label className="field"><span>Accelerator type</span><select value={form.accelerator} onChange={(event) => set("accelerator", event.target.value)}><option value="v6e-8">Trillium v6e-8</option><option value="v5p-8">TPU v5p-8</option><option value="v5p-16">TPU v5p-16</option><option value="v5e-8">TPU v5e-8</option><option value="v4-8">TPU v4-8</option><option value="none">CPU only (no accelerator)</option></select></label>
-                <label className="field"><span>Accelerator count</span><input type="number" min="0" disabled={form.accelerator === "none"} value={form.acceleratorCount} onChange={(event) => set("acceleratorCount", Number(event.target.value))} /></label>
-                <label className="field"><span>Gang topology</span><select value={form.topology} onChange={(event) => set("topology", event.target.value)}><option value="single-slice">Single TPU slice</option><option value="same-zone">Same zone</option><option value="multi-slice">Multi-slice pod</option><option value="none">No strict constraint</option></select></label>
-              </div>
-            </fieldset>
-
-            <fieldset>
-              <legend>Runtime and controls</legend>
+              <legend>Surviving a reclamation</legend>
               <div className="form-grid form-grid-two">
-                <label className="field field-wide"><span>Command</span><textarea rows={3} value={form.command} onChange={(event) => set("command", event.target.value)} required /></label>
-                <label className="field"><span>Estimated duration (hours)</span><input type="number" min="0.25" step="0.25" value={form.estimatedDurationHours} onChange={(event) => set("estimatedDurationHours", Number(event.target.value))} /></label>
-                <label className="field"><span>Labels</span><input value={form.labels} onChange={(event) => set("labels", event.target.value)} placeholder="team=research,env=prod" /></label>
-                <label className="checkbox-field field-wide"><input type="checkbox" checked={form.preemptible} onChange={(event) => set("preemptible", event.target.checked)} /><span><strong>Checkpointable and preemptible</strong><small>Allow whole-gang preemption after the configured checkpoint grace.</small></span></label>
-                {form.preemptible && <><label className="field field-wide"><span>Checkpoint hook</span><input value={form.checkpointHook} onChange={(event) => set("checkpointHook", event.target.value)} required /></label><label className="field field-wide"><span>Checkpoint output URI</span><input value={form.checkpointUri} onChange={(event) => set("checkpointUri", event.target.value)} required /></label></>}
+                <label className="checkbox-field field-wide">
+                  <input
+                    type="checkbox"
+                    checked={form.checkpointable}
+                    onChange={(event) => set("checkpointable", event.target.checked)}
+                  />
+                  <span>
+                    <strong>Checkpointable</strong>
+                    {/* Both, or neither has any effect: the scheduler only
+                        checkpoints on preemption when the job says it can and
+                        says how. Without them a spot job restarts from zero on
+                        every reclamation, however many retries it is allowed. */}
+                    <small>
+                      On spot this is the difference between resuming and starting over. The hook runs on the cell
+                      before the job is stopped.
+                    </small>
+                  </span>
+                </label>
+                {form.checkpointable && (
+                  <>
+                    <label className="field field-wide">
+                      <span>Checkpoint hook</span>
+                      <input
+                        value={form.checkpointHook}
+                        onChange={(event) => set("checkpointHook", event.target.value)}
+                        placeholder="python scripts/checkpoint.py"
+                        required
+                      />
+                    </label>
+                    <label className="field field-wide">
+                      <span>Checkpoint output</span>
+                      <input
+                        value={form.checkpointUri}
+                        onChange={(event) => set("checkpointUri", event.target.value)}
+                        placeholder="a durable URI the hook writes to"
+                        required
+                      />
+                    </label>
+                  </>
+                )}
               </div>
             </fieldset>
           </div>
           <div className="modal-footer">
-            <button className="button button-secondary" type="button" onClick={onClose}>Cancel</button>
-            <button className="button button-primary" type="submit" disabled={submitting}>
+            <button className="button button-secondary" type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="button button-primary" type="submit" disabled={submitting || offers.length === 0}>
               {submitting ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}
-              {submitting ? "Submitting" : "Submit workload"}
+              {submitting ? "Submitting" : "Run"}
             </button>
           </div>
         </form>

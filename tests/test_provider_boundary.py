@@ -165,3 +165,90 @@ def test_a_provider_becomes_eligible_by_declaring_a_capable_backend() -> None:
 
     assert after - before == {capacity_backend_agent_family("acme-gang")}
     assert providers_hosting_multi_worker_cells() == before, "the table is the only source"
+
+
+def test_the_submission_path_gates_multislice_on_capability_too() -> None:
+    """The same leak, one layer up, where it survived the durable model's cure.
+
+    ``WorkloadDefinition`` was taught to ask the capability table, but the
+    submission path in front of it still asked whether the pool was GCP -- so a
+    second cloud that allocated a gang atomically would have satisfied the
+    record and been refused by the thing that builds it. A moat is no less a
+    moat for being one function earlier.
+    """
+
+    from eyvan.capacity.drivers.base import _BACKEND_CAPABILITIES, BackendCapabilities
+    from eyvan.records import CapacityPoolRecord, ResourceLimits
+    from eyvan.server.service.control_plane import _multislice_refusal
+
+    def pool(**overrides) -> CapacityPoolRecord:
+        fields = {
+            "capacity": ResourceLimits(tpu=4),
+            "allocatable": ResourceLimits(tpu=4),
+            "executor": "eyvan-native",
+            **overrides,
+        }
+        return CapacityPoolRecord(
+            id="pool-1",
+            fleet_name="research",
+            node_type="gang-16",
+            provider="acme",
+            region="acme-east",
+            agent_endpoint="http://agent.invalid",
+            **fields,
+        )
+
+    assert _multislice_refusal(pool(capacity_backend="acme-gang")), "an undeclared backend allocates one machine"
+
+    _BACKEND_CAPABILITIES["acme-gang"] = BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=8)
+    try:
+        assert _multislice_refusal(pool(capacity_backend="acme-gang")) == "", (
+            "a backend that declares atomic gang allocation is refused for being the wrong brand"
+        )
+        # The other two conditions are about the shape, not the cloud, and must
+        # survive: ranks are placed across hosts by the native executor, and a
+        # gang of machines with no accelerator in them is not worth allocating
+        # atomically.
+        assert _multislice_refusal(pool(capacity_backend="acme-gang", executor="container"))
+        assert _multislice_refusal(
+            pool(
+                capacity_backend="acme-gang",
+                capacity=ResourceLimits(cpu=8),
+                allocatable=ResourceLimits(cpu=8),
+            )
+        )
+    finally:
+        del _BACKEND_CAPABILITIES["acme-gang"]
+
+
+def test_a_pool_that_names_no_backend_keeps_the_answer_it_had() -> None:
+    """Backward compatibility, and the reason the fallback exists.
+
+    ``capacity_backend`` is optional and arrived after multislice did. Judging a
+    pool that never set it as "one machine per cell" would take multislice away
+    from every fleet applied before the field, on an upgrade, with no config
+    change to point at.
+    """
+
+    from eyvan.capacity.drivers.base import providers_hosting_multi_worker_cells
+    from eyvan.records import CapacityPoolRecord, ResourceLimits
+    from eyvan.server.service.control_plane import _multislice_refusal
+
+    provider = sorted(providers_hosting_multi_worker_cells())[0]
+    legacy = CapacityPoolRecord(
+        id="pool-legacy",
+        fleet_name="research",
+        node_type="v5p-8",
+        provider=provider,
+        # Required of this provider's pools by the record itself, and unrelated
+        # to what is under test.
+        provider_project="a-project",
+        region="us-east5",
+        zone="us-east5-a",
+        capacity=ResourceLimits(tpu=4),
+        allocatable=ResourceLimits(tpu=4),
+        executor="eyvan-native",
+        agent_endpoint="http://agent.invalid",
+    )
+
+    assert _multislice_refusal(legacy) == ""
