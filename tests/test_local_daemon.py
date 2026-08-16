@@ -258,7 +258,16 @@ def test_supervisor_starts_literal_loopback_server_and_persists_owner_only_pid_r
         pid=9876,
         log_path=paths.log_path(target),
     )
-    assert launcher.commands == [LocalDaemonCommand(target=target, log_path=paths.log_path(target), profile=profile)]
+    # record_path is passed so the server can claim ownership as the process
+    # that actually binds; the supervisor's own pre-write is only a first guess.
+    assert launcher.commands == [
+        LocalDaemonCommand(
+            target=target,
+            log_path=paths.log_path(target),
+            profile=profile,
+            record_path=record_path,
+        )
+    ]
     assert launcher.commands[0].argv == (
         sys.executable,
         "-m",
@@ -276,6 +285,8 @@ def test_supervisor_starts_literal_loopback_server_and_persists_owner_only_pid_r
         str(profile.artifact_token_key_path),
         "--artifact-store-uri",
         profile.artifact_store_uri,
+        "--local-daemon-record-path",
+        str(record_path),
         "--log-level",
         "info",
     )
@@ -346,6 +357,7 @@ def test_restart_replaces_a_verified_legacy_owned_daemon_with_the_runtime_profil
             log_path=paths.log_path(target),
             profile=paths.profile(target),
             runtime_profile_path=profile_path,
+            record_path=paths.record_path(target),
         )
     ]
     assert json.loads(paths.record_path(target).read_text(encoding="utf-8")) == {
@@ -553,7 +565,12 @@ def test_subprocess_launcher_rejects_a_symlinked_log_path(tmp_path: Path) -> Non
 
     with pytest.raises(LocalDaemonStateError, match="daemon log"):
         SubprocessLocalDaemonLauncher().start(
-            LocalDaemonCommand(target=target, log_path=log_path, profile=paths.profile(target))
+            LocalDaemonCommand(
+                target=target,
+                log_path=log_path,
+                profile=paths.profile(target),
+                record_path=paths.record_path(target),
+            )
         )
 
 
@@ -608,3 +625,29 @@ def test_absent_pid_record_names_the_path_it_looked_for(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "no owner-only PID record exists" in message
     assert str(record_path) in message
+
+
+def test_the_server_is_told_where_to_claim_ownership(tmp_path: Path) -> None:
+    """Only the serving process knows which PID ends up holding the port.
+
+    The supervisor writes the record first, from the PID it launched, so a
+    process that dies before binding is still cleaned up. But a record naming
+    any other process makes every later native command refuse with "not owned by
+    the selected native GCP runtime profile", and the only way out was editing
+    the record's JSON by hand.
+    """
+
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:19099")
+    launcher = FakeLauncher(FakeProcess(pid=5150))
+    # Two probes before launch: ensure() checks for an existing daemon once
+    # before taking the startup lock and once inside it.
+    supervisor = _supervisor(tmp_path, launcher, HealthResponses([False, False, True]))
+    target = _target(endpoint.url)
+
+    supervisor.ensure(endpoint)
+
+    argv = launcher.commands[0].argv
+    assert "--local-daemon-record-path" in argv
+    assert argv[argv.index("--local-daemon-record-path") + 1] == str(
+        LocalDaemonPaths(tmp_path / "eyvan").record_path(target)
+    )

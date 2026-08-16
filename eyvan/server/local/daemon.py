@@ -253,6 +253,13 @@ class LocalDaemonCommand:
     log_path: Path
     profile: LocalDaemonProfile
     runtime_profile_path: Path | None = None
+    #: Where the server rewrites the owner record once it is actually serving.
+    #: The supervisor writes this file first, from the PID it launched, so a
+    #: process that dies before binding is still cleaned up. But only the server
+    #: knows which PID ended up holding the port, and a record naming any other
+    #: process makes every later command refuse with "not owned by the selected
+    #: native GCP runtime profile" until it is edited by hand.
+    record_path: Path | None = None
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -275,6 +282,7 @@ class LocalDaemonCommand:
             str(self.profile.artifact_token_key_path),
             "--artifact-store-uri",
             self.profile.artifact_store_uri,
+            *(() if self.record_path is None else ("--local-daemon-record-path", str(self.record_path))),
             "--log-level",
             "info",
         )
@@ -737,6 +745,7 @@ class LocalDaemonSupervisor:
                 log_path=log_path,
                 profile=self.paths.profile(target),
                 runtime_profile_path=expanded_runtime_profile_path,
+                record_path=record_path,
             )
             try:
                 process = self.launcher.start(command)

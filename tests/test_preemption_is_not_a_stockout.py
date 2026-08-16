@@ -635,3 +635,64 @@ def test_a_suspended_spot_vm_is_not_called_a_preemption() -> None:
     )
 
     assert provider.ensure(record()).failure_code is None
+
+
+async def test_a_capacity_failure_records_what_actually_happened() -> None:
+    """The reason is a code; the detail is the sentence an operator needs.
+
+    A cell that died on a cell-agent config rejection reported "provider
+    rejected capacity request" -- about a provider that had never been called --
+    while the real pydantic error existed only in a log file on whichever
+    machine ran the head. Diagnosing it took SSH and grep.
+    """
+
+    from test_controller import FakeAgent, principal
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CellRecord, CellState, OutboxRecord, ResourceVector, Role
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.persistence.memory import InMemoryRepository
+    from eyvan.server.service.control_plane import ControlPlaneService
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    controller = EyvanController(repository, service, settings=EyvanSettings(), agent_factory=lambda _cell: FakeAgent())
+    await service.upsert_cell(
+        principal(Role.FLEET_ADMIN),
+        CellRecord(
+            id="cell-bad-config",
+            provider="local",
+            region="local",
+            state=CellState.REGISTERING,
+            capacity=ResourceVector(cpu=8, memory_gib=64),
+            allocatable=ResourceVector(cpu=8, memory_gib=64),
+        ),
+        idempotency_key="cell-bad-config",
+    )
+    async with repository.transaction() as tx:
+        cell = await tx.get_cell("cell-bad-config")
+    assert cell is not None
+    diagnostic = (
+        "invalid configuration: 1 validation error for NativeRuntimeConfig\npython\n  Extra inputs are not permitted"
+    )
+
+    await controller._record_capacity_failure(
+        OutboxRecord(
+            id="cmd-1",
+            topic="capacity.apply",
+            aggregate_type="cell",
+            aggregate_id=cell.id,
+            idempotency_key="cmd-1",
+            generation=cell.generation,
+        ),
+        diagnostic,
+        failure_code=None,
+    )
+
+    async with repository.transaction() as tx:
+        updated = await tx.get_cell("cell-bad-config")
+    assert updated is not None
+    assert updated.unavailable_detail is not None
+    assert "Extra inputs are not permitted" in updated.unavailable_detail, (
+        "the operator must be able to read the real failure without SSHing the head"
+    )

@@ -163,7 +163,12 @@ from eyvan.server.controller import EyvanController
 from eyvan.server.introspection import allocations_as_json, thread_stacks_as_json
 from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
-from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
+from eyvan.server.local.daemon import (
+    DEFAULT_LOCAL_CELL_AGENT_URL,
+    LocalDaemonRecord,
+    runtime_profile_identifier,
+    write_owner_only_record,
+)
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
 from eyvan.server.persistence.base import ReadOnlyQueryUnsupported, Repository, TransientRepositoryError
 from eyvan.server.persistence.leader import PostgresAdvisoryLeader
@@ -3662,6 +3667,7 @@ def main() -> None:
     parser.add_argument("--local-artifact-token-key-path", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--artifact-store-uri", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-profile", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--local-daemon-record-path", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--log-level",
         type=ServerLogLevel,
@@ -3709,6 +3715,24 @@ def main() -> None:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.local_daemon_record_path is not None:
+        # Claim ownership as the process that is about to serve. The supervisor
+        # writes this file first, from the PID it launched, so a process that
+        # dies before this point is still cleaned up -- but only this process
+        # knows which PID ends up holding the port. A record naming any other
+        # process makes every later native command refuse with "not owned by the
+        # selected native GCP runtime profile", and the only way out was editing
+        # the record's JSON by hand.
+        write_owner_only_record(
+            args.local_daemon_record_path,
+            LocalDaemonRecord(
+                endpoint=ControlPlaneEndpoint.parse(args.public_url),
+                pid=os.getpid(),
+                runtime_profile_path=runtime_profile_identifier(
+                    args.runtime_profile.expanduser().resolve() if args.runtime_profile is not None else None
+                ),
+            ),
+        )
     uvicorn.run(
         application,
         host=server_bind.host,

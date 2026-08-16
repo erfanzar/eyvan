@@ -680,6 +680,13 @@ class _ControllerSettlement:
                         observed_at,
                     ),
                     "unavailable_reason": unavailable_reason,
+                    # The reason is a code; this is what actually happened. It
+                    # was dropped here, so a cell that died on a cell-agent
+                    # config rejection showed the operator "provider rejected
+                    # capacity request" -- about a provider that had never been
+                    # called -- while the real pydantic error existed only in a
+                    # log file on whichever machine ran the head.
+                    "unavailable_detail": error[:2048] or None,
                     "availability": self._observe_capacity_belief(cell, outcome),
                     "updated_at": observed_at,
                 }
