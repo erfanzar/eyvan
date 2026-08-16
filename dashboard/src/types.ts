@@ -207,6 +207,20 @@ export interface Cell {
   activeWorkloads: number;
   /** The control plane does not report a per-cell queue depth; only demo data sets this. */
   queuedWorkloads?: number;
+  /**
+   * What the planner believes about this machine's zone, and why it may not be
+   * asking for more there.
+   *
+   * A cell in cooldown is one the planner is deliberately not asking, which is
+   * indistinguishable on every other view from a zone that simply has no
+   * capacity. That difference is the whole content of a bad spot afternoon.
+   */
+  availability?: {
+    cooldownUntil?: string;
+    consecutiveFailures: number;
+    /** Decayed count, so a reclamation an hour ago weighs less than one now. */
+    interruptions: number;
+  };
   topology: string;
   resources: Array<{
     name: string;

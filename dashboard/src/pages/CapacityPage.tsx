@@ -9,11 +9,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { MetricCard } from "../components/MetricCard";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatAgeSeconds } from "../lib/format";
-import type { TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
+import { formatAgeSeconds, formatDateTime } from "../lib/format";
+import type { AuditEvent, Cell, TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
 
 interface CapacityPageProps {
   loadQuota: (signal: AbortSignal, options?: { refresh?: boolean }) => Promise<TpuQuotaSnapshot>;
+  /** Cells the fleet currently holds. Empty for a session that may not read them. */
+  cells?: Cell[];
+  /** Fleet capacity history. Absent when this session may not manage the fleet. */
+  loadCapacityEvents?: (signal: AbortSignal) => Promise<AuditEvent[]>;
 }
 
 type SortKey = "free" | "limit" | "zone";
@@ -42,7 +46,7 @@ function reasonForNoBalance(entry: TpuQuotaEntry): string {
     : "usage unavailable -- the limit is known and how much of it is in use is not";
 }
 
-export function CapacityPage({ loadQuota }: CapacityPageProps) {
+export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: CapacityPageProps) {
   const [snapshot, setSnapshot] = useState<TpuQuotaSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -88,6 +92,52 @@ export function CapacityPage({ loadQuota }: CapacityPageProps) {
       setRefreshing(false);
     }
   };
+
+  const [capacityEvents, setCapacityEvents] = useState<AuditEvent[] | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!loadCapacityEvents) return;
+    const controller = new AbortController();
+    loadCapacityEvents(controller.signal)
+      .then((events) => {
+        if (!controller.signal.aborted) setCapacityEvents(events);
+      })
+      .catch((error: unknown) => {
+        // Named. An empty history reads as "this fleet has been quiet", which
+        // is the opposite of what a failed read means on the afternoon somebody
+        // is looking at this page.
+        if (!controller.signal.aborted) {
+          setHistoryError(error instanceof Error ? error.message : "Unable to read capacity history");
+        }
+      });
+    return () => controller.abort();
+  }, [loadCapacityEvents]);
+
+  /**
+   * One row per zone: what is held there, and what the planner believes.
+   *
+   * The cooldown is the field this panel exists for. A zone the planner is
+   * deliberately not asking looks, on every other view, exactly like a zone
+   * with no capacity -- and the two call for opposite reactions.
+   */
+  const zones = useMemo(() => {
+    const now = Date.now();
+    const grouped = new Map<string, { held: number; cooling: number; interruptions: number; until?: string }>();
+    for (const cell of cells) {
+      const zone = cell.zone || cell.region;
+      const row = grouped.get(zone) ?? { held: 0, cooling: 0, interruptions: 0 };
+      row.held += 1;
+      const cooldown = cell.availability?.cooldownUntil;
+      if (cooldown && Date.parse(cooldown) > now) {
+        row.cooling += 1;
+        if (!row.until || Date.parse(cooldown) > Date.parse(row.until)) row.until = cooldown;
+      }
+      row.interruptions += cell.availability?.interruptions ?? 0;
+      grouped.set(zone, row);
+    }
+    return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right));
+  }, [cells]);
 
   const entries = useMemo(() => snapshot?.entries ?? [], [snapshot]);
   const generations = useMemo(
@@ -448,6 +498,75 @@ export function CapacityPage({ loadQuota }: CapacityPageProps) {
             </section>
           )}
         </>
+      )}
+
+      {(zones.length > 0 || historyError || capacityEvents) && (
+        <section className="panel data-panel" aria-label="Zone capacity history">
+          <div className="panel-header">
+            <div>
+              <h2>What each zone has been doing</h2>
+              <p>What the fleet holds, what the planner is not asking, and why</p>
+            </div>
+            <MapPin size={18} />
+          </div>
+          {historyError && (
+            <div className="resource-row-detail">
+              <span>{historyError}</span>
+            </div>
+          )}
+          {zones.length > 0 && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Zone</th>
+                    <th>Cells held</th>
+                    <th>Not being asked</th>
+                    <th>Reclamations</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {zones.map(([zone, row]) => (
+                    <tr key={zone}>
+                      <td className="monospace">{zone}</td>
+                      <td>{row.held}</td>
+                      <td>
+                        {/* A cooldown is a decision, not an absence. Rendering
+                            it as "0 free" would send an operator looking for
+                            capacity that is being withheld on purpose. */}
+                        {row.cooling
+                          ? `${row.cooling} cooling until ${formatDateTime(row.until as string)}`
+                          : "none"}
+                      </td>
+                      <td>{row.interruptions ? row.interruptions.toFixed(1) : "none"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {capacityEvents !== null && capacityEvents.length > 0 && (
+            <ol className="timeline-list">
+              {capacityEvents.slice(0, 12).map((event) => (
+                <li key={event.id} className={`timeline-${event.severity}`}>
+                  <span className="timeline-marker" aria-hidden="true" />
+                  <div>
+                    <span className="timeline-heading">
+                      <strong>{event.action}</strong>
+                      <time>{formatDateTime(event.timestamp)}</time>
+                    </span>
+                    <p className="monospace">{event.target}</p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+          {capacityEvents !== null && capacityEvents.length === 0 && !historyError && (
+            <div className="resource-row-detail">
+              <span>No capacity has been granted or released recently.</span>
+            </div>
+          )}
+        </section>
       )}
     </div>
   );

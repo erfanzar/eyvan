@@ -27,7 +27,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiClient } from "../api/client";
 import { formatAgeSeconds } from "../lib/format";
-import type { TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
+import type { AuditEvent, Cell, TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
 import { CapacityPage } from "./CapacityPage";
 
 afterEach(() => {
@@ -429,5 +429,77 @@ describe("the page and the client method agree", () => {
 
     await waitFor(() => expect(spy.mock.calls).toHaveLength(2));
     expect(spy.mock.calls[1][2]).toEqual({ refresh: true });
+  });
+});
+
+describe("what each zone has been doing", () => {
+  const cell = (overrides: Partial<Cell> = {}): Cell => ({
+    id: "cell-a",
+    name: "cell-a",
+    backend: "gcp-tpu",
+    region: "us-east5",
+    zone: "us-east5-b",
+    status: "healthy",
+    utilization: 50,
+    activeWorkloads: 1,
+    topology: "v6e-8",
+    resources: [],
+    lastHeartbeat: "2026-08-17T09:00:00Z",
+    ...overrides,
+  });
+
+  const renderZones = (cells: Cell[], events: AuditEvent[] | Error = []) =>
+    render(
+      <CapacityPage
+        loadQuota={async () => snapshot({ status: "unconfigured", entries: [] })}
+        cells={cells}
+        loadCapacityEvents={async () =>
+          events instanceof Error ? Promise.reject(events) : events
+        }
+      />,
+    );
+
+  it("names a zone the planner is deliberately not asking", async () => {
+    // A cooldown is a decision, and on every other view it is indistinguishable
+    // from a zone with no capacity. The two call for opposite reactions: wait,
+    // or go somewhere else.
+    const future = new Date(Date.now() + 600_000).toISOString();
+    renderZones([cell({ availability: { cooldownUntil: future, consecutiveFailures: 3, interruptions: 2 } })]);
+
+    expect(await screen.findByText(/cooling until/)).toBeTruthy();
+  });
+
+  it("does not report an expired cooldown as one still in force", async () => {
+    const past = new Date(Date.now() - 600_000).toISOString();
+    renderZones([cell({ availability: { cooldownUntil: past, consecutiveFailures: 0, interruptions: 0 } })]);
+
+    // The row exists and reports nothing withheld, which is the distinction:
+    // an expired cooldown is not a cooldown.
+    const rows = await screen.findAllByRole("row");
+    const zone = rows.find((row) => row.textContent?.includes("us-east5-b"));
+    expect(zone?.textContent).toContain("none");
+    expect(screen.queryByText(/cooling until/)).toBeNull();
+  });
+
+  it("sums what a zone holds rather than listing every machine", async () => {
+    renderZones([cell(), cell({ id: "cell-b", name: "cell-b" }), cell({ id: "cell-c", zone: "us-east5-a" })]);
+
+    const rows = await screen.findAllByRole("row");
+    const east5b = rows.find((row) => row.textContent?.includes("us-east5-b"));
+    expect(east5b?.textContent).toContain("2");
+  });
+
+  it("names a failed history read rather than showing a quiet fleet", async () => {
+    // An empty history reads as "nothing has happened here", which is the
+    // opposite of what a failed read means on the afternoon somebody looks.
+    renderZones([cell()], new Error("Eyvan API request failed with 403"));
+
+    expect(await screen.findByText(/403/)).toBeTruthy();
+  });
+
+  it("says a fleet has been quiet only when the read succeeded", async () => {
+    renderZones([cell()], []);
+
+    expect(await screen.findByText(/No capacity has been granted or released recently/)).toBeTruthy();
   });
 });

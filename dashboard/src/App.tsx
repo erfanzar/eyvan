@@ -977,6 +977,10 @@ export default function App({ client = apiClient, identityProvider = currentIden
     (id: string, signal: AbortSignal) => withAuthorityRefresh(() => client.getWorkloadCost(id, explanationScope, signal)),
     [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
   );
+  const loadCapacityEvents = useCallback(
+    (signal: AbortSignal) => withAuthorityRefresh(() => client.listCapacityEvents(200, signal)),
+    [client, withAuthorityRefresh],
+  );
   const followedWorkloadId = selectedWorkload?.id;
   const followWorkloadLogs = useCallback(
     (handlers: LogFollowHandlers, signal: AbortSignal) => {
@@ -1071,7 +1075,16 @@ export default function App({ client = apiClient, identityProvider = currentIden
         );
         break;
       case "capacity":
-        content = <CapacityPage loadQuota={loadQuota} />;
+        content = (
+          <CapacityPage
+            loadQuota={loadQuota}
+            cells={data.cells}
+            // Absent for a session that may not manage the fleet: cell history
+            // is fleet-wide and answering it to a project reader would be a
+            // cross-tenant read wearing a chart.
+            loadCapacityEvents={capabilities.manageFleet ? loadCapacityEvents : undefined}
+          />
+        );
         break;
       case "budgets":
         content = (

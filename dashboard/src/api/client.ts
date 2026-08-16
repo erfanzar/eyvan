@@ -100,6 +100,11 @@ interface RawCell {
   labels: Record<string, string>;
   topology?: Record<string, string>;
   last_heartbeat_at?: string;
+  availability?: {
+    cooldown_until?: string | null;
+    consecutive_failures?: number;
+    interruptions?: number;
+  };
 }
 
 /** One advertised pool from `/capacity`, readable with `submit` alone. */
@@ -1044,6 +1049,13 @@ export class EyvanApiClient {
           zone: cell.zone ?? "-",
           status: cellStatus(cell.state),
           state: cell.state,
+          availability: cell.availability
+            ? {
+                cooldownUntil: cell.availability.cooldown_until ?? undefined,
+                consecutiveFailures: cell.availability.consecutive_failures ?? 0,
+                interruptions: cell.availability.interruptions ?? 0,
+              }
+            : undefined,
           utilization,
           activeWorkloads: new Set(activeLeases.map((lease) => lease.workloadId)).size,
           // Topology is the durable placement/failure-domain contract. The
@@ -1098,6 +1110,32 @@ export class EyvanApiClient {
       ),
       class: cellClasses.get(lease.cell_id),
     }));
+  }
+
+  /**
+   * Recent fleet-wide capacity history, newest first.
+   *
+   * The fleet ledger rather than the project one: a cell's events carry no
+   * org or project, because capacity belongs to the fleet and not to whoever
+   * happens to be running on it. A project-scoped read returns none of them,
+   * which is why this page was previously unable to show what a zone did.
+   */
+  async listCapacityEvents(limit = 200, signal?: AbortSignal): Promise<AuditEvent[]> {
+    if (this.forceDemo) return cloneMock(mockAuditEvents).filter((event) => event.category === "capacity");
+    const raw = await this.request<RawEvent[]>(`/fleet/events?entity_type=cell&limit=${limit}`, { signal });
+    return raw
+      .map((event) => ({
+        id: event.id,
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        action: event.action,
+        actor: event.actor,
+        target: event.entity_id,
+        category: "capacity" as const,
+        severity: event.action.includes("failed") ? ("critical" as const) : ("info" as const),
+        detail: `${event.previous_state ?? "new"} -> ${event.new_state ?? "recorded"}`,
+      }))
+      .sort((left, right) => (right.sequence ?? 0) - (left.sequence ?? 0));
   }
 
   async listBudgets(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<Budget[]> {

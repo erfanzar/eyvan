@@ -99,6 +99,13 @@ gauge lags by minutes at best, so a balance without its timestamp is a guess
 wearing a number. The same view is on the dashboard's **Quota & capacity** page,
 which reads the same route.
 
+That page also shows, per zone, what the fleet holds and **what the planner is
+deliberately not asking for**. A zone in cooldown looks identical on every other
+view to a zone with no capacity, and the two call for opposite reactions -- wait,
+or go somewhere else. Beside it is the fleet's recent capacity history, so an
+afternoon of grants and reclamations reads as a sequence rather than as a
+snapshot that keeps changing.
+
 ## One pool, several zones
 
 ```yaml
