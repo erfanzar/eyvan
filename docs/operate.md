@@ -429,11 +429,30 @@ run has completed; see [proofs.md](proofs.md).
 
 ## Starting from nothing
 
+On this machine, with no cloud account:
+
 ```
-eyvan up examples/laptop.yaml   # a control plane and one CPU pool, on this machine
-eyvan quickstart                # what is still missing between here and a first job
-eyvan quickstart --yes          # ...and run that first job
+eyvan up examples/laptop.yaml   # a control plane and one CPU pool, started for you
+eyvan doctor                    # leads with the one thing still missing, if any
+eyvan run --cpu -- python -c "print('hello')"
 ```
+
+On GCP, where the pools come from real quota rather than from you:
+
+```
+eyvan autoscale init            # once: project, fleet prefix, egress
+eyvan up --region us-east5      # discover spot quota per zone, generate, apply one
+eyvan run --tpu v6e-8 --pods 2 -- python train.py
+```
+
+`eyvan up --region` is the path to use. It reads the provider's actual spot TPU
+quota, writes one fleet per zone that has any, and applies one -- which is
+where a hand-written fleet gets the zone, the shape or the quota group wrong.
+`eyvan up FLEET.yaml` remains for a fleet you mean to control exactly.
+
+`eyvan doctor` is the "what now" command at every step: its checks run in
+dependency order, so the first non-passing one is the cause rather than a
+symptom, and it is printed first with the command that fixes it.
 
 `eyvan up` against a loopback URL **starts and supervises the control plane
 itself**. Do not run `eyvan-server` first and apply second: `up` refuses a

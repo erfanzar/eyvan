@@ -145,12 +145,33 @@ class DoctorReport:
 
         return not any(check.status in {CheckStatus.FAIL, CheckStatus.SKIP} for check in self.checks)
 
+    @property
+    def next_step(self) -> CheckResult | None:
+        """Return the one check to act on, or ``None`` when nothing needs acting on.
+
+        The checks already run in dependency order, so the first non-passing one
+        carrying a remedy is the cause rather than a symptom of it. Naming it is
+        the difference between a report and an instruction: somebody standing a
+        fleet up for the first time gets a wall of a dozen lines, and the only
+        one that matters is buried in it.
+        """
+
+        for check in self.checks:
+            if check.status is not CheckStatus.PASS and check.remedy:
+                return check
+        return None
+
     def as_json(self) -> dict[str, JsonValue]:
         payload: dict[str, JsonValue] = {
             "ok": self.ok,
             "client_version": client_version(),
             "checks": [check.as_json() for check in self.checks],
         }
+        step = self.next_step
+        # Machine-readable too: a script bringing a fleet up wants the same one
+        # answer a person does, and re-deriving it from the check list means
+        # re-implementing the ordering rule.
+        payload["next_step"] = step.as_json() if step is not None else None
         return payload
 
 
@@ -395,7 +416,14 @@ class DoctorCommandService:
                 "submittable-fleet",
                 CheckStatus.FAIL,
                 "no fleet is applied on this control plane",
-                "apply one with `eyvan up FLEET.yaml`",
+                # The generated path first: it discovers which zones actually
+                # hold spot quota and writes the pools from it, which is where
+                # a hand-written fleet gets the zone, shape and quota group
+                # wrong. `autoscale init` is named because `up --region`
+                # refuses without a project in the profile.
+                "eyvan autoscale init      # once: project, fleet prefix, egress\n"
+                "eyvan up --region REGION  # discover spot quota, generate, apply\n"
+                "eyvan up FLEET.yaml       # or apply a fleet you wrote",
             )
         active = self.session.active_context
         if active is not None and active.fleet in names:
@@ -770,6 +798,12 @@ class DoctorCommandService:
         report = self.report()
         stream = click.get_text_stream("stderr")
         if stream_is_terminal(stream):
+            step = report.next_step
+            if step is not None:
+                click.echo(f"  next: {step.detail}", file=stream)
+                for line in step.remedy.splitlines():
+                    click.echo(f"        {line}", file=stream)
+                click.echo("", file=stream)
             for check in report.checks:
                 click.echo(f"  {check.status.value.upper():5} {check.name}  {check.detail}", file=stream)
                 # A remedy that lists several settings is several lines; printing

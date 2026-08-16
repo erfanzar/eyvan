@@ -481,3 +481,91 @@ def test_an_unpriced_accelerator_is_reported_even_when_cpu_has_a_price() -> None
 
     assert _unpriced_pool_names([partly_priced]) == {"research/v5p-16"}
     assert _unpriced_pool_names([fully_priced]) == set()
+
+
+# --------------------------------------------------------------------------- the one next thing
+
+
+def test_the_report_names_one_thing_to_act_on() -> None:
+    """A dozen lines with the important one buried is a report, not an answer.
+
+    The checks already run in dependency order, so the first non-passing one
+    carrying a remedy is the cause. Naming it is what makes `doctor` the
+    command somebody standing a fleet up for the first time can follow.
+    """
+
+    from eyvan.sdk.commands.doctor import CheckResult, CheckStatus, DoctorReport
+
+    report = DoctorReport(
+        checks=[
+            CheckResult("server-startup-settings", CheckStatus.PASS, "nothing needed"),
+            CheckResult("submittable-fleet", CheckStatus.FAIL, "no fleet is applied", "eyvan up --region REGION"),
+            CheckResult("price-drift", CheckStatus.WARN, "not authorized", "ask an admin"),
+        ]
+    )
+
+    step = report.next_step
+    assert step is not None
+    assert step.name == "submittable-fleet", "the cause, not the symptom that follows it"
+
+
+def test_a_healthy_fleet_is_told_to_do_nothing() -> None:
+    """An instruction invented for a fleet with no problem is noise."""
+
+    from eyvan.sdk.commands.doctor import CheckResult, CheckStatus, DoctorReport
+
+    report = DoctorReport(checks=[CheckResult("submittable-fleet", CheckStatus.PASS, "active fleet 'research'")])
+
+    assert report.next_step is None
+    assert report.as_json()["next_step"] is None
+
+
+def test_a_failure_with_no_remedy_never_becomes_the_next_step() -> None:
+    """ "Something is wrong" is not an instruction; the next actionable one is."""
+
+    from eyvan.sdk.commands.doctor import CheckResult, CheckStatus, DoctorReport
+
+    report = DoctorReport(
+        checks=[
+            CheckResult("mystery", CheckStatus.FAIL, "it broke"),
+            CheckResult("submittable-fleet", CheckStatus.FAIL, "no fleet", "eyvan up --region REGION"),
+        ]
+    )
+
+    step = report.next_step
+    assert step is not None and step.name == "submittable-fleet"
+
+
+def test_the_next_step_is_readable_by_a_script() -> None:
+    """A script bringing a fleet up wants the same answer a person gets.
+
+    Re-deriving it from the check list means re-implementing the ordering rule,
+    which is how a wrapper and the tool it wraps come to disagree.
+    """
+
+    from eyvan.sdk.commands.doctor import CheckResult, CheckStatus, DoctorReport
+
+    report = DoctorReport(checks=[CheckResult("submittable-fleet", CheckStatus.FAIL, "no fleet", "eyvan up")])
+
+    assert report.as_json()["next_step"] == {
+        "name": "submittable-fleet",
+        "status": "fail",
+        "detail": "no fleet",
+        "remedy": "eyvan up",
+    }
+
+
+def test_a_fleetless_plane_is_pointed_at_the_generated_path() -> None:
+    """`up --region` reads real spot quota; a hand-written fleet guesses it.
+
+    And it names `autoscale init`, because `up --region` refuses without a
+    project in the profile -- advice that stops one step short is the reason
+    somebody follows it and hits a wall.
+    """
+
+    report = DoctorCommandService(_session(_healthy(fleets=[]))).report()
+
+    step = report.next_step
+    assert step is not None and step.name == "submittable-fleet"
+    assert "eyvan autoscale init" in step.remedy
+    assert "eyvan up --region" in step.remedy
