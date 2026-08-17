@@ -29,6 +29,37 @@ class EyvanApiError(click.ClickException):
         super().__init__(f"{status_code}: {detail}")
 
 
+def _name_a_version_skew(status_code: int, detail: object) -> str | None:
+    """Say "your CLI is newer than your plane" when that is what happened.
+
+    FastAPI answers a field it does not know with 422 and
+    ``extra_forbidden``, which is exactly right and completely unhelpful: the
+    operator reads that ``dependencies`` are not permitted, goes looking for the
+    flag they used, and finds it documented and working. The cause is never in
+    the request -- it is that the plane predates the field.
+
+    Only for that one shape. A 422 naming a field the caller really did get
+    wrong must keep saying so, because most of them are.
+    """
+
+    if status_code != 422 or not isinstance(detail, list):
+        return None
+    unknown = [
+        ".".join(str(part) for part in item.get("loc", [])[1:])
+        for item in detail
+        if isinstance(item, dict) and item.get("type") == "extra_forbidden"
+    ]
+    if not unknown:
+        return None
+    fields = ", ".join(name for name in unknown if name) or "a field"
+    return (
+        f"the control plane does not know {fields}, which this client sends. That is a version "
+        "skew rather than a bad request: the plane is older than this CLI. Upgrade it -- "
+        "`eyvan runtime deploy --yes` for a local plane, or redeploy the head's wheel -- "
+        "or use a client matching the plane"
+    )
+
+
 class EyvanClient:
     """JSON CLI adapter that delegates HTTP behavior to ``SyncApiTransport``."""
 
@@ -50,7 +81,7 @@ class EyvanClient:
         if is_json_object(payload):
             api_detail = payload.get("detail")
             if api_detail is not None:
-                return str(api_detail)
+                return _name_a_version_skew(response.status_code, api_detail) or str(api_detail)
         return detail
 
     @staticmethod

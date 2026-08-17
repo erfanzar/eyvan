@@ -2402,3 +2402,34 @@ def test_run_refuses_two_kinds_of_hardware() -> None:
 
     assert result.exit_code != 0
     assert "one kind of hardware" in result.output
+
+
+def test_a_field_the_plane_does_not_know_is_named_as_a_version_skew() -> None:
+    """FastAPI's answer is right and completely unhelpful on its own.
+
+    The operator reads that `dependencies` are not permitted, goes looking for
+    the flag they used, and finds it documented and working. The cause is never
+    in the request: the plane is older than the client that sent it.
+    """
+
+    from eyvan.sdk.commands.http import _name_a_version_skew
+
+    detail = [{"type": "extra_forbidden", "loc": ["body", "dependencies"], "msg": "Extra inputs are not permitted"}]
+
+    named = _name_a_version_skew(422, detail)
+
+    assert named is not None
+    assert "dependencies" in named
+    assert "older than this CLI" in named
+
+
+def test_an_ordinary_validation_failure_still_says_what_was_wrong() -> None:
+    """Most 422s are the caller's fault, and blaming the plane for those would
+    send somebody to upgrade a server over a typo."""
+
+    from eyvan.sdk.commands.http import _name_a_version_skew
+
+    detail = [{"type": "missing", "loc": ["body", "command"], "msg": "Field required"}]
+
+    assert _name_a_version_skew(422, detail) is None
+    assert _name_a_version_skew(404, [{"type": "extra_forbidden", "loc": ["body", "x"]}]) is None
