@@ -95,6 +95,13 @@ HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
 HEAD_WHEEL_DIR = "/opt/eyvan/wheels"
 HEAD_VENV_PATH = "/opt/eyvan/venv"
 HEAD_SERVICE_NAME = "eyvan-head.service"
+#: A cell agent on the head. Every capacity pool needs an agent endpoint, and a
+#: loopback development plane quietly supplies one -- so a fleet that applied on
+#: a laptop was refused on a real head with "no default cell agent is
+#: configured". The head runs one and points the platform default at it.
+HEAD_AGENT_SERVICE_NAME = "eyvan-head-agent.service"
+HEAD_AGENT_PORT = 8090
+PLATFORM_CONFIG_PATH = "/etc/eyvan/platform.yaml"
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _RESOURCE_NAME_PATTERN = re.compile(r"^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -819,13 +826,44 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
                 "",
             )
         )
+    agent_unit = "\n".join(
+        (
+            "[Unit]",
+            "Description=Eyvan cell agent on the control-plane head",
+            f"After=network-online.target {HEAD_SERVICE_NAME}",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            "User=eyvan-head",
+            "EnvironmentFile=/etc/eyvan/head.env",
+            f"ExecStart={HEAD_VENV_PATH}/bin/eyvan-agent --host 0.0.0.0 --port {HEAD_AGENT_PORT}",
+            "Restart=on-failure",
+            "RestartSec=3",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        )
+    )
     lines.extend(
         (
             f"cat >/etc/systemd/system/{HEAD_SERVICE_NAME} <<'EYVAN_HEAD_UNIT'",
             unit,
             "EYVAN_HEAD_UNIT",
             f"chmod 0644 /etc/systemd/system/{HEAD_SERVICE_NAME}",
+            f"cat >/etc/systemd/system/{HEAD_AGENT_SERVICE_NAME} <<'EYVAN_AGENT_UNIT'",
+            agent_unit,
+            "EYVAN_AGENT_UNIT",
+            f"chmod 0644 /etc/systemd/system/{HEAD_AGENT_SERVICE_NAME}",
+            f"cat >{PLATFORM_CONFIG_PATH} <<'EYVAN_PLATFORM'",
+            "version: 1",
+            "agents:",
+            "  default:",
+            f"    endpoint: http://127.0.0.1:{HEAD_AGENT_PORT}",
+            "EYVAN_PLATFORM",
+            f"chmod 0644 {PLATFORM_CONFIG_PATH}",
             "systemctl daemon-reload",
+            f"systemctl enable --now {HEAD_AGENT_SERVICE_NAME}",
             "",
         )
     )
