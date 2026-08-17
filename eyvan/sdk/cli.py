@@ -44,7 +44,7 @@ from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
 from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
-from eyvan.sdk.terminal import stream_is_terminal
+from eyvan.sdk.terminal import stream_is_terminal, terminal_console
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
 
@@ -91,9 +91,17 @@ def main(
     ):
         role = "fleet_admin"
         if stream_is_terminal(sys.stderr):
-            click.echo(
-                "Using role 'fleet_admin' for the loopback development endpoint; pass --role to override it.",
-                err=True,
+            # This prints above *every* command run against a local plane, so it
+            # is built to recede: one dim line, phrased as where you are rather
+            # than as a warning about what was done to you. Only the role is
+            # left undimmed, because it is the single word worth catching.
+            #
+            # Naming the endpoint is not decoration. Two development planes on
+            # one machine differ only by port, and "which one did that command
+            # hit" is the question this line then answers for free.
+            terminal_console(sys.stderr).print(
+                f"[dim]development plane[/dim] {endpoint.url} "
+                f"[dim]· acting as[/dim] fleet_admin [dim](--role to change)[/dim]"
             )
     identity = resolve_control_plane_identity(
         endpoint,

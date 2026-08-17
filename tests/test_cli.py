@@ -395,6 +395,48 @@ def test_loopback_control_plane_uses_local_development_identity_by_default(monke
     ]
 
 
+def test_the_development_identity_notice_names_the_plane_the_role_and_the_way_out(monkeypatch) -> None:
+    """It prints above every local command, so it has to earn its line.
+
+    Three things make it worth keeping: which plane answered (two development
+    planes on one machine differ only by port), what rights the command ran
+    with, and the flag that changes them. An earlier version named none of the
+    first and buried the third behind "override it".
+    """
+
+    fake = FakeClient()
+    monkeypatch.delenv("EYVAN_TOKEN", raising=False)
+    monkeypatch.delenv("EYVAN_DEV_USER", raising=False)
+    monkeypatch.setattr(cli, "EyvanClient", lambda base_url, *, headers: fake)
+    monkeypatch.setattr(cli, "stream_is_terminal", lambda _stream: True)
+
+    result = CliRunner().invoke(cli.main, ["--url", "http://127.0.0.1:8081", "status", "dev-fleet"])
+
+    assert result.exit_code == 0, result.output
+    assert "http://127.0.0.1:8081" in result.output
+    assert "fleet_admin" in result.output
+    assert "--role" in result.output
+    # One line, not a paragraph. It is chrome above real output, and a notice
+    # that wraps is one people stop reading.
+    notice = next(line for line in result.output.splitlines() if "fleet_admin" in line)
+    assert len(notice) <= 100
+
+
+def test_the_development_identity_notice_stays_off_a_pipe(monkeypatch) -> None:
+    """Redirected output is somebody's script reading it, not somebody reading it."""
+
+    fake = FakeClient()
+    monkeypatch.delenv("EYVAN_TOKEN", raising=False)
+    monkeypatch.delenv("EYVAN_DEV_USER", raising=False)
+    monkeypatch.setattr(cli, "EyvanClient", lambda base_url, *, headers: fake)
+    monkeypatch.setattr(cli, "stream_is_terminal", lambda _stream: False)
+
+    result = CliRunner().invoke(cli.main, ["status", "dev-fleet"])
+
+    assert result.exit_code == 0, result.output
+    assert "fleet_admin" not in result.output
+
+
 def test_remote_control_plane_never_receives_synthesized_development_identity(monkeypatch) -> None:
     fake = FakeClient()
     constructed: list[tuple[str, dict[str, str]]] = []
