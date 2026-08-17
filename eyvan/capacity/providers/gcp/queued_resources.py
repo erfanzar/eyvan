@@ -935,6 +935,11 @@ class GcloudTpuProvider:
                     # the host rather than to the purchase, and calling them
                     # reclamations would suppress the failure evidence that lets
                     # a genuinely bad zone accumulate a cooldown.
+                    #
+                    # This is the rule ``compute_instances`` already applies to a
+                    # Spot VM that reached TERMINATED without Eyvan stopping it,
+                    # limited the same way. TPU was the sibling still requiring
+                    # the provider to spell the reclamation out.
                     preempted = any(state in SPOT_RECLAMATION_NODE_STATES for state in node_states)
                 return ProviderObservation(
                     CapacityStatus.NEEDS_RECREATE,
