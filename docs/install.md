@@ -62,11 +62,14 @@ credentials the server refuses to start without, points the server at
 PostgreSQL, runs the migration, and starts the control plane under systemd so it
 survives both ssh exit and reboot.
 
-**This command has not been run against real GCP.** It is covered against an
-injected command boundary -- the sequence, the ownership refusals, the
-idempotent re-run, the ingress scope, and the mid-sequence failure path are all
-tested -- but no run against a real project has been performed, so provider
-acceptance of the exact gcloud invocations is unverified. Read the plan first:
+**The create path has run against real GCP** -- see P0 in
+[proofs.md](proofs.md): a head was provisioned, adopted on a re-run, and used to
+dispatch a multislice workload that returned its device count. What that receipt
+does not cover is every option this command accepts. A flag no live run has
+passed -- another egress mode, an external database, an OIDC issuer -- is tested
+only against the injected command boundary, where the sequence, the ownership
+refusals, the idempotent re-run, the ingress scope and the mid-sequence failure
+path all are. Read the plan first:
 
 ```bash
 eyvan head up fleet.yaml --dry-run
