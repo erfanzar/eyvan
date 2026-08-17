@@ -445,3 +445,64 @@ def test_gcs_store_uploads_each_digest_once_and_can_read_results() -> None:
     assert sum(command[2] == "cp" for command in runner.calls) == 1
     assert "--no-clobber" in next(command for command in runner.calls if command[2] == "cp")
     assert store.allocate_result_uri("call-one") == "gs://artifacts/eyvan/results/call-one.result"
+
+
+# --------------------------------------------------------------------------- connecting, explicitly
+
+
+def test_init_takes_the_address_positionally(monkeypatch) -> None:
+    """`ray.init("...")` is the shape people arrive with.
+
+    Keyword-only meant the one argument anybody passes was also the one that
+    read least like the tool it replaces.
+    """
+
+    monkeypatch.delenv("EYVAN_URL", raising=False)
+    submitter = FakeSubmitter("done")
+
+    context = init("http://10.0.0.5:8080", submitter=submitter, artifact_uri="gs://bucket/root")
+
+    assert context.base_url == "http://10.0.0.5:8080"
+
+
+def test_init_reports_which_plane_it_resolved(monkeypatch) -> None:
+    """It picks from argument, EYVAN_URL, saved context, this node, then the
+    default -- and the caller could not previously tell which one won."""
+
+    monkeypatch.setenv("EYVAN_URL", "http://10.0.0.9:8080")
+    submitter = FakeSubmitter("done")
+
+    context = init(submitter=submitter, artifact_uri="gs://bucket/root")
+
+    assert context.base_url == "http://10.0.0.9:8080"
+
+
+def test_the_address_and_the_keyword_may_not_disagree(monkeypatch) -> None:
+    """One of them would silently win, and the loser is somebody's production
+    plane."""
+
+    monkeypatch.delenv("EYVAN_URL", raising=False)
+
+    with pytest.raises(ValueError, match="address or base_url"):
+        init(
+            "http://10.0.0.5:8080",
+            base_url="http://10.0.0.6:8080",
+            submitter=FakeSubmitter("done"),
+            artifact_uri="gs://bucket/root",
+        )
+
+
+def test_the_same_address_twice_is_not_a_conflict(monkeypatch) -> None:
+    """Passing the same value both ways is redundant, not contradictory, and
+    refusing it would fail code that is merely repetitive."""
+
+    monkeypatch.delenv("EYVAN_URL", raising=False)
+
+    context = init(
+        "http://10.0.0.5:8080",
+        base_url="http://10.0.0.5:8080",
+        submitter=FakeSubmitter("done"),
+        artifact_uri="gs://bucket/root",
+    )
+
+    assert context.base_url == "http://10.0.0.5:8080"

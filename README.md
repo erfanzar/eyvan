@@ -123,6 +123,26 @@ def train():
 train()
 ```
 
+No connect call, because there is nothing to say yet: a bare `@execute` resolves
+a plane the first time it submits, and on a laptop or on a head that resolution
+is already right. Name one when it is not, or when you want to know which one
+you got:
+
+```python
+import eyvan
+
+eyvan.init()                                       # the default: this machine's plane
+eyvan.init("http://10.0.0.5:8080")                 # a head, positionally
+eyvan.init(fleet="research-us-east5-a")            # pin the fleet, keep the plane
+
+print(eyvan.init().base_url)                       # which plane would a bare @execute use
+```
+
+Resolution order is the argument, then `EYVAN_URL`, then the context saved by
+`eyvan use`, then this node's own plane if it serves one, then loopback. The
+returned context carries the `base_url` that won, so a machine with both a
+laptop plane and a head never has to guess which it is submitting to.
+
 From the CLI:
 
 ```bash

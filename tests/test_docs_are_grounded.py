@@ -21,6 +21,7 @@ part that can be checked, which is exactly the part that silently drifts.
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import re
 
@@ -480,3 +481,38 @@ def test_every_documented_console_script_invocation_parses(page: pathlib.Path) -
                     unparsed.append(f"{script} {tail.strip()}")
 
     assert not unparsed, f"{page.name} documents invocations the parser rejects: {'; '.join(sorted(set(unparsed)))}"
+
+
+def test_the_readme_connect_call_matches_the_signature_it_documents() -> None:
+    """The README shows `eyvan.init` in three forms and names what it returns.
+
+    All three were true when written and none is checked by running the snippet,
+    so the signature is checked instead: a positional address, a `fleet`
+    keyword, and a `base_url` on the result.
+    """
+
+    import inspect
+
+    from eyvan.sdk.execution import ExecutionContext, init
+
+    readme = (DOCS.parent / "README.md").read_text(encoding="utf-8")
+    parameters = inspect.signature(init).parameters
+
+    assert 'eyvan.init("http://10.0.0.5:8080")' in readme
+    positional = next(iter(parameters.values()))
+    assert positional.kind is inspect.Parameter.POSITIONAL_ONLY, "the README passes the address positionally"
+
+    assert "eyvan.init(fleet=" in readme
+    assert parameters["fleet"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    assert ".base_url" in readme
+    assert "base_url" in {field.name for field in dataclasses.fields(ExecutionContext)}
+
+
+def test_the_readme_does_not_teach_setting_the_url_it_already_defaults_to() -> None:
+    """`os.environ["EYVAN_URL"] = "http://127.0.0.1:8080"` is what the start
+    console used to print: an assignment of the value that wins anyway."""
+
+    readme = (DOCS.parent / "README.md").read_text(encoding="utf-8")
+
+    assert 'os.environ["EYVAN_URL"]' not in readme

@@ -173,13 +173,20 @@ def python_snippet(url: str, fleet: str | None, accelerator: str = "v5p-8") -> s
     Written out rather than described. The gap between "you can submit from
     Python" and a file somebody can run is where a first session usually ends,
     and it is four lines wide.
+
+    ``init`` rather than ``os.environ["EYVAN_URL"]``: setting the environment
+    from inside the process that reads it is a detour, and the earlier version
+    of this snippet taught it even when the URL it set was already the default.
+    A local plane therefore gets a bare ``eyvan.init()``, and only a real head
+    is named -- so the argument in the snippet is always one that matters.
     """
 
-    fleet_note = f"  # fleet: {fleet}" if fleet else ""
+    address = "" if url == LOCAL_URL else f'"{url}"'
+    arguments = ", ".join(part for part in (address, f'fleet="{fleet}"' if fleet else "") if part)
     return (
-        f"import os\n"
-        f'os.environ["EYVAN_URL"] = "{url}"{fleet_note}\n\n'
-        f"from eyvan import TpuConfig, execute\n\n\n"
+        f"import eyvan\n"
+        f"from eyvan import TpuConfig, execute\n\n"
+        f"eyvan.init({arguments})\n\n\n"
         f'@execute(TpuConfig(type="{accelerator}"))\n'
         f"def train():\n"
         f"    import jax\n\n"

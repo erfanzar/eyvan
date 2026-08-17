@@ -33,7 +33,14 @@ from eyvan.sdk.commands.head_discovery import (
     discovery_action,
     parse_heads,
 )
-from eyvan.sdk.commands.start import discover, plan_targets, python_snippet, render_outcome, start_flow
+from eyvan.sdk.commands.start import (
+    LOCAL_URL,
+    discover,
+    plan_targets,
+    python_snippet,
+    render_outcome,
+    start_flow,
+)
 from eyvan.sdk.terminal import terminal_console
 
 RUNNING = """[
@@ -243,5 +250,18 @@ def test_connecting_to_a_head_ends_with_runnable_python() -> None:
 def test_the_snippet_points_at_the_plane_that_was_chosen() -> None:
     snippet = python_snippet("http://10.0.0.5:8080", "research")
 
-    assert 'os.environ["EYVAN_URL"] = "http://10.0.0.5:8080"' in snippet
-    assert "# fleet: research" in snippet
+    assert 'eyvan.init("http://10.0.0.5:8080", fleet="research")' in snippet
+    assert "os.environ" not in snippet, "setting the environment from the process that reads it is a detour"
+
+
+def test_the_snippet_names_no_address_for_the_plane_that_is_already_the_default() -> None:
+    """An argument that changes nothing teaches that it is required.
+
+    The loopback URL is what init resolves to with no argument at all, so
+    printing it turns the one-line form into a two-line one for no reason.
+    """
+
+    snippet = python_snippet(LOCAL_URL, None)
+
+    assert "eyvan.init()" in snippet
+    assert LOCAL_URL not in snippet

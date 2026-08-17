@@ -68,7 +68,16 @@ R_co = tp.TypeVar("R_co", covariant=True)
 
 @dataclass(frozen=True, slots=True)
 class ExecutionContext(tp.Generic[R_co]):
-    """Process-wide defaults used by decorated Eyvan callables."""
+    """Process-wide defaults used by decorated Eyvan callables.
+
+    Attributes:
+        base_url: The control plane this process resolved. Carried because
+            ``init`` picks it from six places -- argument, ``EYVAN_URL``, the
+            saved context, this node's own plane, then the loopback default --
+            and the returned context was previously unable to say which one won.
+            Somebody with a laptop plane and a head has two, and "which am I
+            submitting to" is the first question they ask.
+    """
 
     fleet: str | None
     org_id: str
@@ -76,6 +85,7 @@ class ExecutionContext(tp.Generic[R_co]):
     artifact_store: ArtifactStore
     submitter: CallableSubmitter[R_co] | None = None
     signing_key: bytes | None = field(default=None, repr=False)
+    base_url: str | None = None
 
 
 _context: ExecutionContext[tp.NoReturn] | None = None
@@ -139,6 +149,8 @@ def _validate_native_gcp_artifact_override(
 
 
 def init(
+    address: str | None = None,
+    /,
     *,
     fleet: str | None = None,
     org_id: str | None = None,
@@ -152,8 +164,50 @@ def init(
     dev_user: str | None = None,
     environ: tp.Mapping[str, str] | None = None,
 ) -> ExecutionContext[tp.NoReturn]:
-    """Configure callable execution, using ``EYVAN_*`` environment fallbacks."""
+    """Connect this process to a control plane, and return what it connected to.
 
+    Called for you the first time a decorated callable is submitted, so a script
+    that is happy with the defaults never has to name it. Call it explicitly to
+    choose a plane, to pin a fleet, or simply to find out which plane a bare
+    ``@execute`` would have used -- the returned context carries the resolved
+    ``base_url``.
+
+    Args:
+        address: The control plane to use, positionally, so the common case
+            reads as one call: ``eyvan.init("http://10.0.0.5:8080")``. Same
+            meaning as ``base_url``; passing both is an error rather than a
+            silent winner. Omit it and the resolution order is ``EYVAN_URL``,
+            the saved CLI context, this node's own plane if it serves one, and
+            finally the loopback default -- which is why a laptop needs no
+            argument at all.
+        fleet: Fleet to submit to, when the saved context does not already name
+            one.
+        org_id: Owning organization; defaults to the saved context, then Eyvan's
+            default org.
+        project_id: Owning project, resolved the same way.
+        artifact_uri: Where callables and workspaces are staged. Mutually
+            exclusive with ``artifact_store``.
+        artifact_store: A constructed store, for callers that already have one.
+        submitter: Injected submission boundary. Supplying one keeps ``init``
+            from building a client, which is what makes it testable offline.
+        signing_key: Key for signed callables; remote planes refuse it.
+        base_url: Keyword form of ``address``.
+        token: Bearer credential, when this plane is not one this node owns.
+        dev_user: Development identity for a loopback plane.
+        environ: Environment to read, so a caller can resolve against something
+            other than the process environment.
+
+    Returns:
+        The process-wide context, including the ``base_url`` that won.
+
+    Raises:
+        ValueError: If ``address`` and ``base_url`` disagree, or if both
+            ``artifact_uri`` and ``artifact_store`` are given.
+    """
+
+    if address is not None and base_url is not None and address != base_url:
+        raise ValueError("Eyvan init accepts address or base_url, not both")
+    base_url = base_url if base_url is not None else address
     environment = os.environ if environ is None else environ
     active_context = get_active_context(context_config_path(environment))
     # What control plane is this *machine* part of. Consulted after the caller's
@@ -282,6 +336,7 @@ def init(
         artifact_store=artifact_store,
         submitter=submitter,
         signing_key=configured_key or None,
+        base_url=endpoint.url,
     )
     global _context
     with _context_lock:
