@@ -114,11 +114,19 @@ class AutoscaleGenerationRenderer:
     def emit(self) -> None:
         """Display cached zone configs and bounded omitted-candidate diagnostics."""
 
-        if self.generation.has_entries:
-            self._configs()
-        self._skipped()
+        configs = self._configs() if self.generation.has_entries else None
+        tables = [table for table in (configs, self._skipped()) if table is not None]
+        # One width for both. Each table sized to its own content otherwise, and
+        # the two disagreed by ten columns -- which looks careless side by side,
+        # and is worse than that on a narrow terminal: the wider table folds
+        # while the narrower one does not, so the pair reflows into each other
+        # when somebody selects and copies them.
+        widest = max((self.console.measure(table).maximum for table in tables), default=0)
+        for table in tables:
+            table.min_width = min(widest, self.console.width)
+            print_block(self.console, table)
 
-    def _configs(self) -> None:
+    def _configs(self) -> Table:
         """Render one row per generated zone instead of every TPU pool."""
 
         table = Table(
@@ -140,7 +148,7 @@ class AutoscaleGenerationRenderer:
                 self._family_summary(entry),
                 entry.path.name,
             )
-        print_block(self.console, table)
+        return table
 
     @staticmethod
     def _family_summary(entry: CachedAutoscaleConfig) -> str:
@@ -160,12 +168,12 @@ class AutoscaleGenerationRenderer:
             summaries.append(summary)
         return "\n".join(summaries) or "-"
 
-    def _skipped(self) -> None:
+    def _skipped(self) -> Table | None:
         """Render grouped public skip diagnostics without relying on model internals."""
 
         summaries = self._skipped_reason_summaries()
         if not summaries:
-            return
+            return None
         table = Table(
             title="[bold yellow]Skipped candidates[/]",
             box=box.SIMPLE_HEAD,
@@ -183,7 +191,7 @@ class AutoscaleGenerationRenderer:
             type_label = "type" if summary.type_count == 1 else "types"
             zone_label = "zone" if zone_count == 1 else "zones"
             table.add_row(reason, f"{summary.type_count} {type_label} across {zone_count} {zone_label}")
-        print_block(self.console, table)
+        return table
 
     def _skipped_reason_summaries(self) -> dict[str, _SkippedReasonSummary]:
         """Read only stable JSON diagnostics so catalog grouping can evolve independently."""
@@ -258,7 +266,7 @@ def _prompt_bootstrap_egress(console: Console, default: str) -> str:
         if value == default:
             default_choice = choice
         table.add_row(choice, value, description)
-    console.print(table)
+    print_block(console, table)
     selected = Prompt.ask(
         "Bootstrap network",
         choices=[choice for choice, _value, _description in _EGRESS_CHOICES],
@@ -286,7 +294,7 @@ def _render_autoscale_defaults_review(console: Console, defaults: AutoscaleDefau
     table.add_row("Warm workers", str(defaults.min_workers))
     maximum = "unbounded" if defaults.max_workers == 0 else str(defaults.max_workers)
     table.add_row("Worker ceiling", maximum)
-    console.print(Panel(table, title="[bold cyan]Review autoscale defaults[/]", border_style="cyan"))
+    print_block(console, Panel(table, title="[bold cyan]Review autoscale defaults[/]", border_style="cyan"))
 
 
 def _render_autoscale_defaults_saved(console: Console, path: Path) -> None:
@@ -449,7 +457,7 @@ def choose_cached_config(
             "\n".join(summaries),
             entry.config.name,
         )
-    console.print(table)
+    print_block(console, table)
     selected_index = click.prompt("Select config", type=click.IntRange(1, len(entries)))
     return entries[selected_index - 1]
 
@@ -499,7 +507,7 @@ def render_fleet_applied(
         )
         table.add_row("Live quota", quota_summary)
     table.add_row("Config", selected.path.name if selected is not None else "provided YAML")
-    console.print(Panel(table, title="[bold green]Fleet applied[/]", border_style="green"))
+    print_block(console, Panel(table, title="[bold green]Fleet applied[/]", border_style="green"))
 
 
 def require_preemptible_tpus(config: EyvanFleetConfig) -> None:

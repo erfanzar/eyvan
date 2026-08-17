@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from pydantic import ValidationError
@@ -249,6 +249,60 @@ TPU_QUOTA_CACHE_TTL_S = 120.0
 #: with a stated failure, while the read continues in the background and lands
 #: in the cache for the next caller.
 TPU_QUOTA_READ_DEADLINE_S = 25.0
+
+#: Served at "/" by a plane that hosts no dashboard, in place of the framework's
+#: bare 404. Deliberately one self-contained document with no linked asset: the
+#: plane that cannot serve a UI bundle cannot serve a stylesheet either.
+NO_DASHBOARD_PAGE = """<!doctype html>
+<meta charset="utf-8"><title>Eyvan control plane</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;min-height:100vh;display:grid;place-items:center;
+      font:16px/1.6 ui-sans-serif,system-ui,-apple-system,sans-serif}
+ main{max-width:34rem;padding:2rem}
+ h1{font-size:1.1rem;font-weight:600;margin:0 0 .25rem;letter-spacing:.01em}
+ p{margin:0 0 1rem;opacity:.75}
+ code{font:0.875rem ui-monospace,SFMono-Regular,Menlo,monospace;
+      padding:.1rem .35rem;border-radius:.25rem;background:color-mix(in srgb,currentColor 8%,transparent)}
+ ul{margin:0;padding:0;list-style:none;display:grid;gap:.6rem}
+ li{display:grid;gap:.15rem}
+ span{font-size:.875rem;opacity:.6}
+</style>
+<main>
+  <h1>Eyvan control plane</h1>
+  <p>This plane serves the API. It is not hosting the dashboard bundle.</p>
+  <ul>
+    <li><code>eyvan dashboard-dev</code><span>run the UI against this plane from a source checkout</span></li>
+    <li><code>/healthz</code><span>whether this plane is up</span></li>
+    <li><code>/docs</code><span>the API this plane does serve</span></li>
+  </ul>
+</main>
+"""
+
+
+def dashboard_bundle() -> Path | None:
+    """Return the dashboard bundle this plane should serve, if it has one.
+
+    A head and the container image both point ``EYVAN_DASHBOARD_DIR`` at a
+    built bundle, and that stays authoritative. What it adds is the fallback
+    that makes a *development* plane behave like the head it stands in for: a
+    source checkout keeps ``dashboard/dist`` beside the package, and serving it
+    is the difference between the URL every command prints being the UI and
+    being a 404.
+
+    An installed wheel has no such sibling -- the dashboard is a Node build tree
+    that cannot travel inside a Python distribution -- so it returns ``None``
+    and the plane says so at "/" rather than pretending.
+    """
+
+    configured = os.environ.get("EYVAN_DASHBOARD_DIR")
+    if configured:
+        directory = Path(configured)
+        return directory if directory.is_dir() else None
+    # .../eyvan/server/api/app.py -> the checkout root that holds dashboard/.
+    bundled = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
+    return bundled if (bundled / "index.html").is_file() else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3654,10 +3708,21 @@ def create_app(
 
         return sse_response(log_source())
 
-    dashboard_path = os.environ.get("EYVAN_DASHBOARD_DIR")
-    dashboard_dir = Path(dashboard_path) if dashboard_path else None
-    if dashboard_dir is not None and dashboard_dir.is_dir():
+    dashboard_dir = dashboard_bundle()
+    if dashboard_dir is not None:
         app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
+    else:
+        # Registered only when nothing is mounted, because a route at "/" would
+        # otherwise shadow the dashboard's own index. Every Eyvan command prints
+        # this plane's URL, so somebody follows it eventually, and a bare
+        # `{"detail":"Not Found"}` reads as a broken plane rather than as one
+        # that serves an API and no UI.
+        @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+        async def dashboard_absent() -> str:
+            """Say what this plane is, and where its UI went."""
+
+            return NO_DASHBOARD_PAGE
+
     return app
 
 

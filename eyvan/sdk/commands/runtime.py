@@ -777,7 +777,7 @@ def _render_runtime_restarted(console: Console, result: RuntimeRestartResult) ->
     print_block(console, Panel(table, title="[bold green]Native GCP runtime restarted[/]", border_style="green"))
     warning = result.callable_trust_warning
     if warning is not None:
-        console.print(Panel(warning, title="[bold yellow]Callable trust narrowed[/]", border_style="yellow"))
+        print_block(console, Panel(warning, title="[bold yellow]Callable trust narrowed[/]", border_style="yellow"))
 
 
 def _initialize_native_runtime(
