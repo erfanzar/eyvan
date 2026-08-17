@@ -266,3 +266,60 @@ def test_a_callable_dispatch_installs_before_the_worker_starts() -> None:
     )
 
     assert wrapped.index("dependency_entry") < wrapped.index("callable_worker")
+
+
+# --------------------------------------------------------------------------- where the packages land
+
+
+def test_an_unwritable_host_path_falls_back_to_the_working_directory(tmp_path, monkeypatch, capsys) -> None:
+    """A laptop's cell agent cannot write /var/lib, and the job still has to run.
+
+    Failing here would mean `--with` worked only on a root-owned cell, which is
+    every fleet except the one somebody tries first.
+    """
+
+    monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.setattr(dependency_entry, "DEFAULT_CACHE_ROOT", Path("/proc/eyvan-cannot-write-here"))
+    monkeypatch.chdir(tmp_path)
+
+    assert dependency_entry.cache_root() == tmp_path / dependency_entry.FALLBACK_CACHE_DIR
+
+
+def test_the_fallback_says_which_later_runs_reuse_the_install(tmp_path, monkeypatch, capsys) -> None:
+    """The consequence, not just the fact.
+
+    A silent fallback turns into minutes of reinstall on every attempt with no
+    stated cause -- and the earlier wording claimed the install was never reused,
+    which is wrong for the ordinary case of running twice from one directory.
+    """
+
+    monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.setattr(dependency_entry, "DEFAULT_CACHE_ROOT", Path("/proc/eyvan-cannot-write-here"))
+    monkeypatch.chdir(tmp_path)
+
+    dependency_entry.cache_root()
+    reported = capsys.readouterr().err
+
+    assert "is not writable" in reported
+    assert dependency_entry.FALLBACK_CACHE_DIR in reported
+    assert "same" in reported and "directory" in reported
+
+
+def test_the_fallback_directory_is_ignored_by_the_repository() -> None:
+    """It is written into whatever directory a job was submitted from.
+
+    For anybody submitting out of a checkout -- which is how the examples read
+    -- an un-ignored cache dirties `git status` with an installed virtualenv.
+    """
+
+    ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
+
+    assert f"{dependency_entry.FALLBACK_CACHE_DIR}/" in ignored
+
+
+def test_an_explicit_runtime_env_dir_wins_over_both(tmp_path, monkeypatch) -> None:
+    """The declared path is the one a fleet points at a fast shared disk."""
+
+    monkeypatch.setenv("EYVAN_RUNTIME_ENV_DIR", str(tmp_path / "declared"))
+
+    assert dependency_entry.cache_root() == tmp_path / "declared"

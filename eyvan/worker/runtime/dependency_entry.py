@@ -48,6 +48,12 @@ from pathlib import Path
 #: work; the per-attempt working directory would defeat exactly that.
 DEFAULT_CACHE_ROOT = Path("/var/lib/eyvan/runtime-envs")
 
+#: Where environments go when the host path is not writable -- a laptop, or any
+#: cell whose agent does not run as root. Named rather than inlined because it
+#: appears in a working tree somebody is version-controlling, and the .gitignore
+#: that keeps it out of their commits has to spell the same thing.
+FALLBACK_CACHE_DIR = ".eyvan-runtime-envs"
+
 #: Written only after an install succeeds. Its absence is what makes a partial
 #: environment rebuild instead of being trusted.
 COMPLETE_MARKER = ".eyvan-complete"
@@ -70,9 +76,10 @@ def cache_root() -> Path:
 
     Falls back to the working directory when the host path is not writable,
     which is the ordinary case for a developer running a local cell. The
-    fallback is reported rather than silent: it changes whether a second run
-    reuses the first one's install, and a slow job whose cause is an unwritable
-    cache should say so.
+    fallback is reported rather than silent: it changes *which* later runs reuse
+    this install -- only ones starting from the same directory, so a retry that
+    materialises a fresh workspace installs again -- and a job whose minutes go
+    to a reinstall should say where they went.
     """
 
     configured = os.environ.get("EYVAN_RUNTIME_ENV_DIR")
@@ -87,10 +94,11 @@ def cache_root() -> Path:
     except OSError as error:
         print(
             f"eyvan: {DEFAULT_CACHE_ROOT} is not writable ({error}); caching this job's packages "
-            "under the working directory instead, so they will not be reused by the next attempt",
+            f"in ./{FALLBACK_CACHE_DIR} instead, so only a later run from this same "
+            "directory reuses them",
             file=sys.stderr,
         )
-        return Path.cwd() / ".eyvan-runtime-envs"
+        return Path.cwd() / FALLBACK_CACHE_DIR
 
 
 def _install_commands(environment: Path, requirements: tp.Sequence[str]) -> list[list[str]]:
