@@ -48,6 +48,7 @@ from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEnd
 from eyvan.sdk.commands.autoscale import autoscale_console, gcloud_default_project, is_interactive
 from eyvan.sdk.commands.deployment import stale_components
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.terminal import print_block
 from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, LocalDaemonSupervisor
 
 _DEFAULT_BUILD_TIMEOUT_S = 300.0
@@ -730,7 +731,7 @@ def _render_runtime_review(
     table.add_row("GCP project", project_id)
     table.add_row("GCS artifact root", artifact_root_uri)
     table.add_row("Private profile", str(profile_path))
-    console.print(Panel(table, title="[bold cyan]Review native GCP runtime[/]", border_style="cyan"))
+    print_block(console, Panel(table, title="[bold cyan]Review native GCP runtime[/]", border_style="cyan"))
 
 
 def _render_runtime_ready(console: Console, result: RuntimeInitializationResult) -> None:
@@ -744,7 +745,7 @@ def _render_runtime_ready(console: Console, result: RuntimeInitializationResult)
     table.add_row("GCS artifact root", result.profile.artifact_root_uri)
     table.add_row("Native worker package", str(payload["native_worker_wheel_uri"]))
     table.add_row("Private profile", str(result.profile_path))
-    console.print(Panel(table, title="[bold green]Native GCP runtime ready[/]", border_style="green"))
+    print_block(console, Panel(table, title="[bold green]Native GCP runtime ready[/]", border_style="green"))
 
 
 def _render_runtime_restart_review(
@@ -760,7 +761,7 @@ def _render_runtime_restart_review(
     table.add_column("Value", style="white", overflow="fold")
     table.add_row("Control plane", endpoint.url)
     table.add_row("Private profile", str(profile_path))
-    console.print(Panel(table, title="[bold yellow]Restart native GCP runtime[/]", border_style="yellow"))
+    print_block(console, Panel(table, title="[bold yellow]Restart native GCP runtime[/]", border_style="yellow"))
 
 
 def _render_runtime_restarted(console: Console, result: RuntimeRestartResult) -> None:
@@ -773,7 +774,7 @@ def _render_runtime_restarted(console: Console, result: RuntimeRestartResult) ->
     table.add_row("Cell agent", result.agent_state.value)
     if result.trusted_callable_projects:
         table.add_row("Trusted callables", ", ".join(result.trusted_callable_projects))
-    console.print(Panel(table, title="[bold green]Native GCP runtime restarted[/]", border_style="green"))
+    print_block(console, Panel(table, title="[bold green]Native GCP runtime restarted[/]", border_style="green"))
     warning = result.callable_trust_warning
     if warning is not None:
         console.print(Panel(warning, title="[bold yellow]Callable trust narrowed[/]", border_style="yellow"))

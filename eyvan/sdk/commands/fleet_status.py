@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState, ResourceLimits
-from eyvan.sdk.terminal import stream_is_terminal, terminal_console
+from eyvan.sdk.terminal import print_block, stream_is_terminal, terminal_console
 from eyvan.server.api.schemas import FleetStatusResponse
 
 _ATTENTION_CELL_LIMIT = 12
@@ -294,7 +294,7 @@ class FleetStatusRenderer:
         table.add_row("Pools", Text(f"{enabled_pools} enabled / {len(pools)} total"))
         table.add_row("Workers", Text(f"{ready_workers} ready / {active_workers} active"))
         table.add_row("State", Text(state, style=state_style))
-        self.console.print(Panel(table, title="[bold cyan]Eyvan fleet[/]", border_style="cyan"))
+        print_block(self.console, Panel(table, title="[bold cyan]Eyvan fleet[/]", border_style="cyan"))
 
     def _pools(self, view: FleetStatusView) -> None:
         table = Table(
@@ -321,7 +321,7 @@ class FleetStatusRenderer:
                 cells.label(target),
                 Text(state, style=state_style),
             )
-        self.console.print(table)
+        print_block(self.console, table)
 
     def _quotas(self, view: FleetStatusView) -> None:
         quotas = view.shared_quotas
@@ -332,7 +332,7 @@ class FleetStatusRenderer:
         table.add_column("Value", overflow="fold")
         for index, quota in enumerate(quotas):
             table.add_row("Shared quota" if index == 0 else "", quota.label())
-        self.console.print(table)
+        print_block(self.console, table)
 
     def _attention_cells(self, view: FleetStatusView) -> None:
         attention = view.attention_cells
@@ -359,7 +359,7 @@ class FleetStatusRenderer:
                 Text(cell.state.value, style=_cell_state_style(cell.state)),
                 Text(cell.unavailable_reason or "-"),
             )
-        self.console.print(table)
+        print_block(self.console, table)
         remaining = len(attention) - _ATTENTION_CELL_LIMIT
         if remaining > 0:
             self.console.print(

@@ -38,7 +38,10 @@ _WORKER_SCALING_ALIASES = {
     "max_workers": "max_cells",
     "initial_workers": "initial_cells",
 }
-_MAX_POOL_WORKERS = 10_000
+#: Largest pool any fleet may declare. Also what `max_workers: 0` resolves
+#: to, so "unbounded" has one spelling the whole package agrees on.
+MAX_POOL_WORKERS = 10_000
+_MAX_POOL_WORKERS = MAX_POOL_WORKERS
 _RESOURCE_KEY_ALIASES = {
     "cpu": "cpu",
     "gpu": "gpu",
@@ -978,6 +981,25 @@ class EyvanFleetConfig(FleetConfigModel):
             options.pop(key, None)
         options["image"] = runtime.vm_image
         return options
+
+
+def validate_generated_fleet(document: JsonObject) -> EyvanFleetConfig:
+    """Validate a fleet document Eyvan wrote, without the advice for hand-written ones.
+
+    ``max_workers: 0`` earns a warning above, and that warning is good: it tells
+    somebody writing YAML by hand that they have asked for an unbounded pool and
+    how to say so deliberately. It has no audience when Eyvan generated the
+    document itself -- from the operator's own autoscale profile -- and it
+    arrives as a pydantic stack line printed through the middle of a rendered
+    table, advice about a file the reader never opened.
+
+    Scoped to documents this package produced. A file a person wrote still gets
+    the warning on the path that reads it, which is the only place it was for.
+    """
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="max_workers: 0 means unbounded", category=UserWarning)
+        return EyvanFleetConfig.model_validate(document)
 
 
 __all__ = (

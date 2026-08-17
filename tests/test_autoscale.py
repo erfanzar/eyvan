@@ -611,3 +611,53 @@ def test_long_fleet_prefix_uses_a_stable_collision_resistant_name() -> None:
     digest = generated.fleet_name.rsplit("-", 1)[-1]
     assert len(digest) == 8
     assert set(digest) <= set("0123456789abcdef")
+
+
+def test_generating_a_fleet_does_not_lecture_the_operator_about_its_own_output() -> None:
+    """`max_workers: 0` earns a warning, and that warning has no audience here.
+
+    It exists to tell somebody hand-writing YAML that they asked for an
+    unbounded pool. Eyvan wrote this 0 itself, from the operator's own autoscale
+    profile -- so the advice arrives as a pydantic stack line printed through
+    the middle of a rendered table, about a file the reader never opened. Worse,
+    quota lookups run on a thread pool, so a warning emitted while Rich is
+    writing a table interleaves with it and breaks the box-drawing mid-glyph.
+    """
+
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", UserWarning)
+        generated = generate_autoscale_config(_request(max_workers=0))
+
+    # Still unbounded. The warning is suppressed, not the meaning.
+    assert {pool.max_cells for pool in generated.config.pools.values()} == {10_000}
+
+
+def test_a_hand_written_zero_is_still_warned_about(tmp_path) -> None:
+    """The suppression is scoped to documents this package produced.
+
+    A person who writes `max_workers: 0` in their own YAML still needs telling.
+    """
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    document = {
+        "version": 1,
+        "name": "hand-written",
+        "provider": {"type": "local", "region": "local"},
+        "executor": "native-local",
+        "pools": {
+            "cpu": {
+                "kind": "cpu",
+                "capacity_backend": "local",
+                "machine_type": "laptop",
+                "resources": {"cpu": 2, "memory_gib": 4},
+                "max_workers": 0,
+                "agent_endpoint": "http://127.0.0.1:8095",
+            }
+        },
+    }
+
+    with pytest.warns(UserWarning, match="max_workers: 0 means unbounded"):
+        EyvanFleetConfig.model_validate(document)

@@ -72,6 +72,24 @@ class TerminalRendering:
         return cls(is_terminal=is_terminal, color_enabled=is_terminal and not no_color)
 
 
+def print_block(console: Console, renderable: object) -> None:
+    """Print a table or panel with soft wrapping switched off for this call.
+
+    The console is built with ``soft_wrap=True`` because that is right for
+    prose: Rich emits the line and the terminal decides where it breaks. It is
+    wrong for anything with a border. A table rendered wider than the real
+    terminal is wrapped by the terminal at a byte boundary, which lands halfway
+    through a multi-byte box-drawing character -- so the rule turns into a
+    replacement glyph and the next row's text is written over what is left of
+    it. That is what `eyvan autoscale generate` looked like on a narrow window.
+
+    With soft wrapping off for the call, Rich crops and wraps to the width it
+    measured, and every border stays whole.
+    """
+
+    console.print(renderable, soft_wrap=False)
+
+
 def terminal_console(
     stream: tp.TextIO,
     *,
@@ -97,4 +115,4 @@ def terminal_console(
     )
 
 
-__all__ = ("TerminalRendering", "stream_is_terminal", "terminal_console")
+__all__ = ("TerminalRendering", "print_block", "stream_is_terminal", "terminal_console")

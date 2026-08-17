@@ -73,6 +73,29 @@ reporting no samples is unmeasured rather than instant. A pool with cells in
 cooldown is not being asked, so its latency figure is frozen at whatever it was
 before the failures started -- which is why that count is on the same line.
 
+## Starting from a project you have not seen
+
+```
+eyvan start                 # what control planes already exist, and how to use one
+eyvan start --json          # the same, as data
+```
+
+The first screen. It searches the configured GCP project for instances carrying
+the `eyvan-managed=control-plane-head` label -- the same label `head up` refuses
+to adopt an instance without -- lists any plane already answering on this
+machine, and offers creating either. Then it prints the commands that follow
+your choice, including the Python that submits against the plane you picked.
+
+**It reads and prints; it creates nothing.** A first-run tool that provisions
+cloud resources while somebody is still working out the vocabulary is the one
+thing it must not be, so `head up` is shown rather than run.
+
+A head that exists but is stopped is listed and marked, not hidden: the useful
+move there is starting the head you have, and hiding it is how a project ends up
+with two. A discovery that *failed* is named rather than folded into "no heads
+found" -- on screen the two look identical, and only one of them makes it safe
+to create another.
+
 ## Where can I run this?
 
 ```

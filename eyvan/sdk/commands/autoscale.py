@@ -35,7 +35,7 @@ from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
 from eyvan.records import CapacityClass
 from eyvan.sdk.commands.fleet_status import is_interactive_output
-from eyvan.sdk.terminal import terminal_console
+from eyvan.sdk.terminal import print_block, terminal_console
 
 _EGRESS_CHOICES: tuple[tuple[str, str, str], ...] = (
     ("1", "private-google-access", "Private Google APIs only"),
@@ -126,7 +126,10 @@ class AutoscaleGenerationRenderer:
             box=box.SIMPLE_HEAD,
             header_style="bold cyan",
             pad_edge=False,
-            expand=True,
+            # Sized to its content rather than stretched to the console. An
+            # expanded table is exactly as wide as Rich *believes* the terminal
+            # is, so every row overflows when that belief is wrong -- and the
+            # overflow arrives as wrapped fragments interleaved with the rules.
         )
         table.add_column("Zone", style="bold white", no_wrap=True)
         table.add_column("TPU families", overflow="fold")
@@ -137,7 +140,7 @@ class AutoscaleGenerationRenderer:
                 self._family_summary(entry),
                 entry.path.name,
             )
-        self.console.print(table)
+        print_block(self.console, table)
 
     @staticmethod
     def _family_summary(entry: CachedAutoscaleConfig) -> str:
@@ -168,7 +171,10 @@ class AutoscaleGenerationRenderer:
             box=box.SIMPLE_HEAD,
             header_style="bold yellow",
             pad_edge=False,
-            expand=True,
+            # Sized to its content rather than stretched to the console. An
+            # expanded table is exactly as wide as Rich *believes* the terminal
+            # is, so every row overflows when that belief is wrong -- and the
+            # overflow arrives as wrapped fragments interleaved with the rules.
         )
         table.add_column("Reason", overflow="fold")
         table.add_column("Summary", no_wrap=True)
@@ -177,7 +183,7 @@ class AutoscaleGenerationRenderer:
             type_label = "type" if summary.type_count == 1 else "types"
             zone_label = "zone" if zone_count == 1 else "zones"
             table.add_row(reason, f"{summary.type_count} {type_label} across {zone_count} {zone_label}")
-        self.console.print(table)
+        print_block(self.console, table)
 
     def _skipped_reason_summaries(self) -> dict[str, _SkippedReasonSummary]:
         """Read only stable JSON diagnostics so catalog grouping can evolve independently."""

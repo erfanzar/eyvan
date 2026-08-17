@@ -34,7 +34,7 @@ from eyvan.capacity.autoscale.models import (
     QueueAdmissionDenialKey,
     QuotaSnapshot,
 )
-from eyvan.capacity.fleet_config import EyvanFleetConfig, NodeType, TpuNodeType
+from eyvan.capacity.fleet_config import EyvanFleetConfig, NodeType, TpuNodeType, validate_generated_fleet
 from eyvan.records import CapacityClass
 
 GeneratedAutoscale = GeneratedAutoscaleConfig | GeneratedZoneAutoscaleConfig
@@ -575,7 +575,7 @@ def _load_fleet_config_document(path: Path) -> tuple[EyvanFleetConfig | None, Js
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not is_json_object(raw):
             return None, None
-        return EyvanFleetConfig.model_validate(raw), raw
+        return validate_generated_fleet(raw), raw
     except (OSError, ValueError, yaml.YAMLError):
         return None, None
 

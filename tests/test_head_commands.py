@@ -1358,18 +1358,27 @@ def test_status_and_down_do_not_demand_an_egress_mode_to_read_or_delete_a_head(m
     ]
 
 
-def test_the_install_page_states_the_command_its_scope_and_that_it_is_unqualified() -> None:
+def test_the_install_page_states_the_command_its_scope_and_what_the_receipt_covers() -> None:
     """The doc gap is half the failure being fixed here.
 
     The egress value that stopped the live attempt was rejected by a message
     naming no legal set, and the set appeared in no page. It appears in this one
-    now, and the page must keep saying the command is unproven against GCP.
+    now.
+
+    This used to assert the page said the command "has not been run against real
+    GCP", which was true when it was written and stopped being true when P0 ran
+    -- so the test went on enforcing a claim the project had already disproved.
+    What the page must keep doing is *bound* the claim: name the receipt, and say
+    that the options no live run has passed are tested only against the injected
+    command boundary. Understating what is proven and overstating it both end
+    with somebody building a head by hand.
     """
 
     page = (Path(__file__).resolve().parent.parent / "docs" / "install.md").read_text(encoding="utf-8")
 
     assert "eyvan head up" in page
-    assert "has not been run against real GCP" in page
+    assert "has run against real GCP" in page
+    assert "injected command boundary" in page, "the page must still bound what the receipt covers"
     for mode in head_commands.BOOTSTRAP_EGRESS_MODES:
         assert mode in page
     assert "0.0.0.0/0" in page

@@ -21,7 +21,7 @@ from eyvan.capacity.autoscale.models import (
     QuotaSnapshot,
     TpuProfile,
 )
-from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.capacity.fleet_config import validate_generated_fleet
 
 
 def _zone_region(zone: str) -> str:
@@ -129,7 +129,7 @@ def generate_autoscale_config(
         pools=pools,
     )
     return GeneratedAutoscaleConfig(
-        config=EyvanFleetConfig.model_validate(document),
+        config=validate_generated_fleet(document),
         document=document,
         profile=request.profile,
         quota=quota,
@@ -265,7 +265,7 @@ def generate_zone_autoscale_config(
         pools=pools,
     )
     return GeneratedZoneAutoscaleConfig(
-        config=EyvanFleetConfig.model_validate(document),
+        config=validate_generated_fleet(document),
         document=document,
         profiles=request.profiles,
         generation_quotas=tuple(generation_quotas),

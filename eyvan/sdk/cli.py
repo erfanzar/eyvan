@@ -38,6 +38,7 @@ from eyvan.sdk.commands.runtime import register_runtime_commands
 from eyvan.sdk.commands.services import register_service_commands
 from eyvan.sdk.commands.soak import register_soak_commands
 from eyvan.sdk.commands.soak_monitor import register_soak_monitor_commands
+from eyvan.sdk.commands.start import register_start_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
@@ -119,6 +120,7 @@ def main(
 
 
 for register_commands in (
+    register_start_commands,
     register_context_commands,
     register_doctor_commands,
     register_fleet_commands,
