@@ -28,6 +28,7 @@ from eyvan.capacity.autoscale.profiles import DEFAULT_TPU_PROFILES, tpu_profile_
 from eyvan.capacity.hardware_catalog import (
     CATALOG_PATH,
     SUPPORTED_CATALOG_VERSION,
+    GenerationRule,
     HardwareCatalogError,
     hardware_catalog,
     load_hardware_catalog,
@@ -278,7 +279,7 @@ def test_an_unsupported_schema_version_is_refused_rather_than_partly_read(tmp_pa
     document = _catalog_document()
     document["catalog_version"] = 99
 
-    with pytest.raises(HardwareCatalogError, match="this build understands 2"):
+    with pytest.raises(HardwareCatalogError, match=f"this build understands {SUPPORTED_CATALOG_VERSION}"):
         load_hardware_catalog(_write(tmp_path, document))
 
 
@@ -338,7 +339,7 @@ def test_malformed_yaml_names_the_file(tmp_path) -> None:
     path = tmp_path / "catalog.yaml"
     path.write_text(
         textwrap.dedent("""\
-        catalog_version: 2
+        catalog_version: 3
         shapes: [
         """),
         encoding="utf-8",
@@ -348,14 +349,30 @@ def test_malformed_yaml_names_the_file(tmp_path) -> None:
         load_hardware_catalog(path)
 
 
+#: A real GCP accelerator type this catalog deliberately describes no shape for.
+#:
+#: It has to be real -- a made-up name would exercise the parser's rejection path
+#: rather than the "known provider type, unknown host resources" path these tests
+#: are about. v4 has no explicit row and no generation rule, so nothing here
+#: establishes its host CPU or memory. If a v4 rule is ever added, every test
+#: using this fails loudly and asks for a new one, which is the intent.
+UNCATALOGUED_TYPE = "v4-32"
+
+
+def test_the_uncatalogued_fixture_is_still_uncatalogued() -> None:
+    """Guards the three tests below, whose whole subject is an unknown type."""
+
+    assert shape_for(UNCATALOGUED_TYPE) is None
+
+
 def test_an_unknown_type_is_refused_with_the_alternatives(tmp_path) -> None:
     """An error an operator can act on names what the catalog does know."""
 
     with pytest.raises(HardwareCatalogError) as raised:
-        hardware_catalog().require("v5p-64")
+        hardware_catalog().require(UNCATALOGUED_TYPE)
 
     message = str(raised.value)
-    assert "v5p-64" in message
+    assert UNCATALOGUED_TYPE in message
     assert "v5p-16" in message, "the refusal must list the types that are available"
 
 
@@ -688,7 +705,7 @@ def test_direct_unknown_gcp_shape_requires_and_accepts_the_complete_manual_vecto
     from eyvan.server.api.schemas import CapacityPoolUpsertRequest
 
     incomplete = _direct_accelerator_write_payload("pool")
-    incomplete["accelerator_type"] = "v5p-64"
+    incomplete["accelerator_type"] = UNCATALOGUED_TYPE
     incomplete["capacity"] = {"cpu": 64, "memory_gib": 256, "tpu": 32}
     incomplete["allocatable"] = {"cpu": 64, "memory_gib": 256}
 
@@ -730,7 +747,7 @@ def test_an_unknown_pool_without_explicit_memory_is_refused() -> None:
 
     with pytest.raises(ValidationError, match=r"unknown TPU shape.*explicit positive CPU and memory_gib"):
         EyvanFleetConfig.model_validate(
-            _fleet({"min_workers": 0, "max_workers": 1, "resources": {"CPU": 64, "TPU": 32}}, name="v5p-64")
+            _fleet({"min_workers": 0, "max_workers": 1, "resources": {"CPU": 64, "TPU": 32}}, name=UNCATALOGUED_TYPE)
         )
 
 
@@ -880,3 +897,99 @@ def test_an_uncatalogued_discovered_type_is_skipped_instead_of_getting_zero_memo
 
     assert resolution.profile is None
     assert resolution.skip_reason is profiles.AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE
+
+
+# --------------------------------------------------------------- multi-host slice rules
+
+
+def test_a_generation_rule_answers_for_slice_sizes_no_row_names() -> None:
+    """GCP lists 94 v5p types in one zone and this file named two of them.
+
+    The other 92 were refused as types Eyvan "cannot derive a worker shape"
+    for, which reads like a provider limitation and was a table-maintenance
+    one. A multi-host slice is N of one VM, so the generation states that VM
+    once.
+    """
+
+    derived = shape_for("v5p-512")
+
+    assert derived is not None
+    assert derived.chips == 256, "v5p bills two quota units per chip"
+    assert derived.quota_units == 512
+    assert (derived.host_cpu, derived.host_memory_gib) == (208, 448)
+    assert derived.hosts == 64, "256 chips at four per ct5p-hightpu-4t"
+
+
+def test_no_derived_number_is_new() -> None:
+    """The rule widens where sourced numbers apply; it does not add any.
+
+    If these ever disagree, one of the two was edited alone -- which is the
+    three-sources-for-one-fact problem this catalog exists to end.
+    """
+
+    row = shape_for("v5p-32")
+    derived = shape_for("v5p-1024")
+
+    assert row is not None and derived is not None
+    assert (derived.host_cpu, derived.host_memory_gib) == (row.host_cpu, row.host_memory_gib)
+    assert derived.chips_per_host == row.chips_per_host
+
+
+def test_an_explicit_row_still_wins_over_its_generation_rule() -> None:
+    """v5p-8 is compiled as an integrated Compute Engine TPU VM. A rule that
+    could overwrite that would silently undo a deliberate decision."""
+
+    single = shape_for("v5p-8")
+
+    assert single is not None
+    assert single.capacity_backend == "gcp-compute"
+    assert single.multislice_capable is False
+    assert single.machine_type == "ct5p-hightpu-4t"
+
+
+def test_a_generation_that_declines_to_state_hosts_derives_none() -> None:
+    """The v6e-16 row omits `hosts` on purpose: Eyvan checks that number against
+    the provider's endpoints, and no receipt here establishes v6e's. A rule that
+    invented one would make Eyvan refuse a correctly provisioned slice."""
+
+    derived = shape_for("v6e-64")
+
+    assert derived is not None
+    assert (derived.host_cpu, derived.host_memory_gib) == (180, 720)
+    assert derived.hosts is None
+    assert derived.chips_per_host is None
+
+
+def test_a_slice_smaller_than_one_host_is_never_derived() -> None:
+    """Below the floor a host is subdivided rather than replicated, and the
+    resources of a fraction of a VM do not follow from the whole one."""
+
+    assert shape_for("v6e-4") is None
+    assert shape_for("v5p-12") is None, "six chips is not whole four-chip hosts"
+
+
+def test_a_rule_may_not_claim_a_slice_smaller_than_its_own_host() -> None:
+    with pytest.raises(HardwareCatalogError, match="below one host"):
+        GenerationRule(
+            generation="v5p",
+            kind="tpu",
+            quota_units_per_chip=2,
+            min_chips=2,
+            chips_per_host=4,
+            host_cpu=208,
+            host_memory_gib=448,
+            capacity_backend="gcp-tpu",
+            source_url="https://cloud.google.com/tpu/docs/v5p",
+            source_version="Last updated 2026-08-04 UTC",
+        )
+
+
+def test_every_shipped_rule_names_its_source() -> None:
+    """Same bar the rows carry: an unsourced number is a guess with a comment."""
+
+    rules = hardware_catalog().generation_rules
+
+    assert rules, "the shipped catalog declares multi-host rules"
+    for rule in rules:
+        assert rule.source_url.startswith("https://")
+        assert rule.source_version.strip()

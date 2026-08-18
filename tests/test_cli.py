@@ -799,37 +799,42 @@ def test_autoscale_generate_discovers_dynamic_types_and_caches_one_zone_fleet(mo
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert [entry["fleet"] for entry in payload["generated"]] == ["research-us-central1-a"]
-    assert [pool["accelerator_type"] for pool in payload["generated"][0]["pools"]] == ["v5p-16"]
+    # Every discovered type, not the two the catalog once had rows for.
+    assert sorted(pool["accelerator_type"] for pool in payload["generated"][0]["pools"]) == [
+        "v5p-16",
+        "v5p-512",
+        "v6e-64",
+    ]
+    # `shared` is now true for v5p: two pools draw on the one generation quota,
+    # which is exactly what it reports and what it could not report while only
+    # one v5p type per zone was ever generated.
     assert payload["generated"][0]["generation_quotas"] == [
         {
             "available_tpus": 1024,
             "generation": "v5p",
             "preemptible": True,
             "quota_tpus": 1024,
-            "shared": False,
+            "shared": True,
             "source_metric": "tpu.googleapis.com/tpu-v5p-preemptible",
+            "zone": "us-central1-a",
+        },
+        {
+            "available_tpus": 512,
+            "generation": "v6e",
+            "preemptible": True,
+            "quota_tpus": 512,
+            "shared": False,
+            "source_metric": "tpu.googleapis.com/tpu-v6e-preemptible",
             "zone": "us-central1-a",
         },
     ]
     assert "quota" not in payload["generated"][0]
+    # Only the deliberate exclusion remains. v5p-512 and v6e-64 used to be here
+    # too, refused for having no catalog row of their own.
     assert payload["skipped"] == [
         {
             "generation": "v5p",
             "reason": "compute-backed TPU VM is excluded from queued-resource autoscale",
-            "scope": "generation",
-            "type_count": 1,
-            "zone": "us-central1-a",
-        },
-        {
-            "generation": "v5p",
-            "reason": "Eyvan cannot derive a typed queued-resource worker shape",
-            "scope": "generation",
-            "type_count": 1,
-            "zone": "us-central1-a",
-        },
-        {
-            "generation": "v6e",
-            "reason": "Eyvan cannot derive a typed queued-resource worker shape",
             "scope": "generation",
             "type_count": 1,
             "zone": "us-central1-a",

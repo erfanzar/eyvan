@@ -654,30 +654,63 @@ def test_provider_formats_valid_ipv6_worker_endpoints_as_urls() -> None:
     assert observation.worker_endpoints == ("http://[2001:db8::1]:8123",)
 
 
-def test_provider_observes_arbitrary_ready_tpu_shape_from_provider_endpoints() -> None:
-    value = record()
-    value.accelerator_type = "v5p-512"
-    value.metadata.update({"execution_backend": "eyvan-native", "native_worker_port": 8123})
-    worker_ips = tuple(f"10.2.0.{index}" for index in range(4, 12))
+def _ready_slice(accelerator_type: str, worker_ips: tuple[str, ...]):
+    """A runner whose queued resource is ACTIVE and whose node reports ``worker_ips``."""
 
     def runner(args):
         if "queued-resources" in args:
-            return result(stdout=json.dumps(qr_payload(state="ACTIVE", accelerator_type="v5p-512")))
+            return result(stdout=json.dumps(qr_payload(state="ACTIVE", accelerator_type=accelerator_type)))
         return result(
             stdout=json.dumps(
                 {
                     "state": "READY",
-                    "acceleratorType": "v5p-512",
+                    "acceleratorType": accelerator_type,
                     "metadata": {"eyvan-uid": UID},
                     "networkEndpoints": [{"ipAddress": ip} for ip in worker_ips],
                 }
             )
         )
 
-    observation = GcloudTpuProvider(runner=runner).ensure(value)
+    return runner
+
+
+def test_provider_observes_a_ready_shape_whose_host_count_eyvan_does_not_know() -> None:
+    """v6e states its per-VM resources and deliberately not its endpoint count.
+
+    Google's table distinguishes physical hosts from VMs there and nothing in
+    this repository establishes which one the provider reports, so Eyvan takes
+    the provider's endpoints as given rather than holding a slice to a number
+    it would be guessing.
+    """
+
+    value = record()
+    value.accelerator_type = "v6e-64"
+    value.metadata.update({"execution_backend": "eyvan-native", "native_worker_port": 8123})
+    worker_ips = tuple(f"10.2.0.{index}" for index in range(4, 12))
+
+    observation = GcloudTpuProvider(runner=_ready_slice("v6e-64", worker_ips)).ensure(value)
 
     assert observation.state is CapacityStatus.HEALTHY
     assert observation.worker_endpoints == tuple(f"http://{ip}:8123" for ip in worker_ips)
+
+
+def test_a_slice_short_of_its_known_host_count_is_still_provisioning() -> None:
+    """v5p does state its endpoint count, so a partial slice is not ready.
+
+    A real v5p-512 is 256 chips across sixty-four ct5p-hightpu-4t VMs. Calling
+    it healthy at eight would start a workload on an eighth of the hardware it
+    asked for, which fails later and blames the job.
+    """
+
+    value = record()
+    value.accelerator_type = "v5p-512"
+    value.metadata.update({"execution_backend": "eyvan-native", "native_worker_port": 8123})
+    worker_ips = tuple(f"10.2.0.{index}" for index in range(4, 12))
+
+    observation = GcloudTpuProvider(runner=_ready_slice("v5p-512", worker_ips)).ensure(value)
+
+    assert observation.state is CapacityStatus.PROVISIONING
+    assert "8" in observation.detail and "v5p-512" in observation.detail
 
 
 @pytest.mark.parametrize(

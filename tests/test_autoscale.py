@@ -432,11 +432,45 @@ def test_profile_selection_accepts_generation_filters_and_rejects_unknown_profil
 
 
 def test_dynamic_profile_factory_skips_types_without_authoritative_host_resources() -> None:
-    assert tpu_profile_from_accelerator_type("v5p-512") is None
-    assert tpu_profile_from_accelerator_type("v6e-64") is None
+    """Still refused, and each for its own reason.
+
+    v5litepod and v7 have no generation rule and no row, so nothing establishes
+    a host. v6e-4 is below its rule's floor, where a slice is a *subdivided*
+    host rather than whole VMs. v5p-8 is known and deliberately excluded: it is
+    compiled as an integrated Compute Engine TPU VM, not a queued resource.
+    """
+
     assert tpu_profile_from_accelerator_type("v5litepod-8") is None
-    assert tpu_profile_from_accelerator_type("v5p-8") is None
     assert tpu_profile_from_accelerator_type("v7-64") is None
+    assert tpu_profile_from_accelerator_type("v6e-4") is None
+    assert tpu_profile_from_accelerator_type("v5p-8") is None
+
+
+def test_a_slice_size_with_no_row_is_derived_from_its_generation() -> None:
+    """The ceiling this removed: GCP offers 93 v5p types in us-east5-a and the
+    catalog named two, so 91 slice sizes an operator had quota for were refused
+    with a message that read like a provider limitation.
+
+    Nothing is guessed. A multi-host slice is N of one VM, and the VM's numbers
+    are the ones the explicit v5p rows already source.
+    """
+
+    big = tpu_profile_from_accelerator_type("v5p-512")
+
+    assert big is not None
+    assert big.tpu == 256, "v5p bills two quota units per chip"
+    assert (big.cpu, big.memory_gib) == (208, 448), "the per-VM shape, not a slice total"
+
+    trillium = tpu_profile_from_accelerator_type("v6e-64")
+    assert trillium is not None
+    assert trillium.tpu == 64, "v6e bills one quota unit per chip"
+
+
+def test_a_slice_that_is_not_whole_hosts_is_still_refused() -> None:
+    """Dividing unevenly would mean describing the slice's hosts wrongly, and a
+    wrong host count makes Eyvan refuse capacity the provider built correctly."""
+
+    assert tpu_profile_from_accelerator_type("v5p-12") is None
 
 
 def test_an_explicit_unknown_profile_with_memory_can_still_be_compiled() -> None:

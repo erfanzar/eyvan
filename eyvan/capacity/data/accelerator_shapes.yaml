@@ -48,8 +48,70 @@
 # the other GCP machine profiles in this repository. Every entry records the
 # exact provider page/version reviewed so future edits do not become guesses.
 
-catalog_version: 2
-revision: "2026-08-07.1"
+catalog_version: 3
+revision: "2026-08-18.1"
+
+# Multi-host slice rules, and why they are not more hand-written rows.
+#
+# GCP offers 93 v5p types in us-east5-a. This file named two of them, so Eyvan
+# refused 91 slice sizes an operator had quota for -- and the refusal read
+# "Eyvan cannot derive a typed queued-resource worker shape", which sounds like
+# a provider limitation and is not one. A table of individually transcribed
+# rows can only ever end that way: every size Google adds is a size Eyvan
+# rejects until somebody notices.
+#
+# A multi-host slice is not new hardware. It is N of one VM wired together, and
+# that VM is the thing whose CPU and memory admission needs. So a generation
+# states its per-VM shape once and every multi-host size follows by division.
+# NO NUMBER BELOW IS NEW: each is the value already transcribed in the explicit
+# row for that generation, from the same page and version.
+#
+# `min_chips` is where the rule starts, and it is never 1. Small slices are the
+# case where a host is *subdivided* -- a fraction of a VM, with resources this
+# repository has no source for -- so they stay explicit rows or stay refused.
+# Deriving them would be inventing numbers, which is the failure this whole
+# file exists to prevent.
+#
+# An explicit row always wins. It carries what a rule cannot: image families,
+# machine types, and the deliberate exclusions (v5p-8 is compiled as an
+# integrated Compute Engine TPU VM, not a queued resource).
+
+generation_rules:
+  - generation: v5p
+    kind: tpu
+    quota_units_per_chip: 2
+    # Every multi-host v5p slice is built from ct5p-hightpu-4t, the machine type
+    # already encoded in fleet_config and in the v5p-16/v5p-32 rows below.
+    min_chips: 8
+    chips_per_host: 4
+    host_cpu: 208
+    host_memory_gib: 448
+    capacity_backend: gcp-tpu
+    machine_type: ct5p-hightpu-4t
+    # The v5p-16 and v5p-32 rows below state `hosts` outright, so the division
+    # is the endpoint count Eyvan may check and not just a resource claim.
+    establishes_hosts: true
+    source_url: https://cloud.google.com/tpu/docs/v5p
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - generation: v6e
+    kind: tpu
+    quota_units_per_chip: 1
+    # From the v6e-16 row: multi-host v6e "is composed of documented four-chip
+    # VMs; these are per-VM resources". v6e-8 and smaller are single-VM shapes
+    # with a different host, so the rule starts above them.
+    min_chips: 16
+    chips_per_host: 4
+    host_cpu: 180
+    host_memory_gib: 720
+    capacity_backend: gcp-tpu
+    # Left off deliberately, exactly as the v6e-16 row leaves `hosts` off:
+    # Google's table distinguishes physical hosts from VMs and no receipt here
+    # establishes v6e's endpoint count. The four-chip figure sizes the VM's
+    # resources; it is not a count Eyvan may hold a provisioned slice to.
+    establishes_hosts: false
+    source_url: https://cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-08-04 UTC"
 
 shapes:
   - accelerator_type: v5p-8

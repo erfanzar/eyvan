@@ -62,7 +62,7 @@ import yaml
 #: Schema version this build understands. A catalog declaring anything else is
 #: refused rather than partially read: a build silently ignoring fields it does
 #: not know would size pools from half a description.
-SUPPORTED_CATALOG_VERSION = 2
+SUPPORTED_CATALOG_VERSION = 3
 
 CATALOG_PATH = Path(__file__).resolve().parent / "data" / "accelerator_shapes.yaml"
 
@@ -276,18 +276,135 @@ class AcceleratorShape:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationRule:
+    """How one TPU generation builds a multi-host slice out of one VM.
+
+    A multi-host slice is not new hardware, it is ``N`` of one machine type
+    wired together -- so the per-VM resources admission needs are a property of
+    the generation, not of each size. Stating them once is what lets Eyvan
+    accept a slice size Google added yesterday instead of refusing it until
+    somebody transcribes a row.
+
+    ``min_chips`` is never 1. Below it a host is *subdivided* rather than
+    replicated, and the resources of a fraction of a VM do not follow from the
+    whole one; those sizes stay explicit rows or stay unknown. Deriving them
+    would be inventing numbers.
+
+    Attributes:
+        quota_units_per_chip: What the provider bills per chip -- two for v4
+            and v5p, one for v5e and v6e. The accelerator suffix counts these,
+            not chips, and conflating them requests twice the hardware.
+        chips_per_host: Chips on one VM of this generation's multi-host shape.
+        establishes_hosts: Whether dividing by ``chips_per_host`` yields the
+            endpoint count Eyvan may *check*, and not merely the number of VMs
+            the resources describe. Off by default, and it must stay off for a
+            generation whose explicit rows decline to state ``hosts``: Eyvan
+            compares that number against the provider's endpoints, so a derived
+            one that is wrong makes it refuse a slice that was built correctly
+            -- the failure the explicit rows avoid by staying silent.
+    """
+
+    generation: str
+    kind: str
+    quota_units_per_chip: int
+    min_chips: int
+    chips_per_host: int
+    host_cpu: int
+    host_memory_gib: float
+    capacity_backend: str
+    source_url: str
+    source_version: str
+    machine_type: str | None = None
+    establishes_hosts: bool = False
+
+    def __post_init__(self) -> None:
+        if self.kind != "tpu":
+            raise HardwareCatalogError(f"{self.generation}: generation rules describe TPU slices only")
+        for name in ("quota_units_per_chip", "min_chips", "chips_per_host", "host_cpu"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise HardwareCatalogError(f"{self.generation}: {name} must be a positive integer")
+        if not isinstance(self.host_memory_gib, (int, float)) or self.host_memory_gib <= 0:
+            raise HardwareCatalogError(f"{self.generation}: host_memory_gib must be positive")
+        if self.min_chips < self.chips_per_host:
+            # A slice smaller than one VM is a subdivided host, which is exactly
+            # what this rule may not describe.
+            raise HardwareCatalogError(
+                f"{self.generation}: min_chips {self.min_chips} is below one host's {self.chips_per_host} chips"
+            )
+        if self.min_chips % self.chips_per_host:
+            raise HardwareCatalogError(f"{self.generation}: min_chips must be whole hosts")
+        for name in ("source_url", "source_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise HardwareCatalogError(f"{self.generation}: a generation rule must name a {name}")
+
+    def derive(self, accelerator_type: str, quota_units: int) -> AcceleratorShape | None:
+        """Return the shape for one slice of this generation, if the rule covers it.
+
+        ``None`` rather than a guess whenever the size is not whole VMs of this
+        generation: a slice Eyvan cannot divide evenly is one whose hosts it
+        would be describing wrongly, and a wrong host count makes Eyvan refuse
+        capacity that was provisioned correctly.
+        """
+
+        if quota_units % self.quota_units_per_chip:
+            return None
+        chips = quota_units // self.quota_units_per_chip
+        if chips < self.min_chips or chips % self.chips_per_host:
+            return None
+        return AcceleratorShape(
+            accelerator_type=accelerator_type,
+            kind=self.kind,
+            generation=self.generation,
+            chips=chips,
+            quota_units=quota_units,
+            hosts=chips // self.chips_per_host if self.establishes_hosts else None,
+            chips_per_host=self.chips_per_host if self.establishes_hosts else None,
+            host_cpu=self.host_cpu,
+            host_memory_gib=self.host_memory_gib,
+            capacity_backend=self.capacity_backend,
+            multislice_capable=True,
+            machine_type=self.machine_type,
+            source_url=self.source_url,
+            source_version=self.source_version,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class HardwareCatalog:
     """Every shape this build knows, and the revision they came from."""
 
     catalog_version: int
     revision: str
     shapes: tuple[AcceleratorShape, ...]
+    generation_rules: tuple[GenerationRule, ...] = ()
 
     def get(self, accelerator_type: str) -> AcceleratorShape | None:
-        """Return one shape, or ``None`` for a type this catalog does not describe."""
+        """Return one shape, or ``None`` for a type this catalog does not describe.
+
+        An explicit row wins over a generation rule, always. The row carries
+        what a rule cannot -- image families, machine types, and the deliberate
+        exclusions -- and a rule that could override one would silently undo a
+        decision somebody made on purpose.
+        """
 
         normalized = accelerator_type.strip().lower()
-        return next((shape for shape in self.shapes if shape.accelerator_type == normalized), None)
+        explicit = next((shape for shape in self.shapes if shape.accelerator_type == normalized), None)
+        if explicit is not None:
+            return explicit
+        return self._derived(normalized)
+
+    def _derived(self, normalized: str) -> AcceleratorShape | None:
+        """Build a shape from this generation's multi-host rule, if one covers it."""
+
+        from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
+
+        parsed = parse_tpu_accelerator_type(normalized)
+        if parsed is None:
+            return None
+        rule = next((item for item in self.generation_rules if item.generation == parsed.generation), None)
+        return None if rule is None else rule.derive(normalized, parsed.size)
 
     def require(self, accelerator_type: str) -> AcceleratorShape:
         """Return one shape or refuse, naming what the catalog does know.
@@ -348,7 +465,28 @@ def _load(path: Path) -> HardwareCatalog:
             raise HardwareCatalogError(f"hardware catalog declares {shape.accelerator_type!r} more than once")
         seen.add(shape.accelerator_type)
         shapes.append(shape)
-    return HardwareCatalog(catalog_version=version, revision=revision.strip(), shapes=tuple(shapes))
+
+    rules: list[GenerationRule] = []
+    declared = document.get("generation_rules", [])
+    if not isinstance(declared, list):
+        raise HardwareCatalogError("hardware catalog generation_rules must be a list")
+    for entry in declared:
+        if not isinstance(entry, dict):
+            raise HardwareCatalogError("every hardware catalog generation rule must be a mapping")
+        try:
+            rule = GenerationRule(**entry)
+        except TypeError as exc:
+            raise HardwareCatalogError(f"hardware catalog rule {entry.get('generation')!r}: {exc}") from exc
+        if any(item.generation == rule.generation for item in rules):
+            raise HardwareCatalogError(f"hardware catalog declares a rule for {rule.generation!r} more than once")
+        rules.append(rule)
+
+    return HardwareCatalog(
+        catalog_version=version,
+        revision=revision.strip(),
+        shapes=tuple(shapes),
+        generation_rules=tuple(rules),
+    )
 
 
 @lru_cache(maxsize=1)

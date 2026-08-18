@@ -100,12 +100,11 @@ def test_generation_service_groups_zone_profiles_and_persists_typed_result(tmp_p
     )
 
     assert [entry.config.name for entry in result.entries] == ["research-us-east5-a"]
-    assert sorted(result.entries[0].config.pools) == ["v5p-16"]
+    # All three, and one zone fleet. v5p-512 and v6e-64 have no catalog row and
+    # need none: their generations state how a multi-host slice is built.
+    assert sorted(result.entries[0].config.pools) == ["v5p-16", "v5p-512", "v6e-64"]
     assert result.entries[0].config.pools["v5p-16"].quota_group == "gcp-tpu-spot:project-a:us-east5-a:v5p"
-    assert [(item.reason, item.generation, item.type_count) for item in result.skipped] == [
-        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v5p", 1),
-        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v6e", 1),
-    ]
+    assert result.skipped == ()
     assert result.cached is True
     assert [entry.config.name for entry in cache.list()] == ["research-us-east5-a"]
     rendered_quotas = _json_array(result.as_dict()["quota"])
@@ -201,23 +200,34 @@ def test_generation_service_omits_only_the_exact_cached_queue_admission_denial(t
         persist=False,
     )
 
-    assert result.entries == ()
+    # The denied type is omitted and its sibling is not, which is the whole
+    # subject: a denial is recorded against one exact worker, never a generation.
+    assert [sorted(entry.config.pools) for entry in result.entries] == [["v6e-32"]]
     assert [
         (candidate.reason, candidate.generation, candidate.zone, candidate.type_count) for candidate in result.skipped
-    ] == [
-        (AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL, "v6e", "us-east5-a", 1),
-        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v6e", "us-east5-a", 1),
-    ]
+    ] == [(AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL, "v6e", "us-east5-a", 1)]
 
 
-def test_generation_service_groups_oversized_catalog_types_and_hides_them_from_json(tmp_path) -> None:
-    oversized = tuple(_row(f"v5p-{size}", quota_tpus=4096) for size in range(4224, 9985, 128))
+def test_generation_service_groups_undescribed_types_and_hides_them_from_json(tmp_path) -> None:
+    """Diagnostics stay bounded however many types a zone refuses.
+
+    This used to be about "oversized" slices, a category that no longer exists:
+    v5p-3968 and v5p-12288 are ordinary types now that a generation states how
+    it builds a multi-host slice. What remains is the property that outlived it
+    -- one grouped row per reason rather than one per type, and no accelerator
+    name in the JSON, so a zone with sixty refusals does not print sixty lines.
+
+    v4 is the subject because nothing here describes its host: no row, and no
+    generation rule. It is refused for the reason the message states.
+    """
+
+    undescribed = tuple(_row(f"v4-{size}", generation="v4", quota_tpus=4096) for size in range(16, 2065, 16))
     discovery = FakeDiscovery(
         (
             _row("v5p-8", quota_tpus=4096),
             _row("v5p-16", quota_tpus=4096),
             _row("v5p-3968", quota_tpus=4096),
-            *oversized,
+            *undescribed,
         )
     )
 
@@ -227,17 +237,24 @@ def test_generation_service_groups_oversized_catalog_types_and_hides_them_from_j
         persist=False,
     )
 
-    assert sorted(result.entries[0].config.pools) == ["v5p-16"]
-    assert [(candidate.reason, candidate.generation, candidate.type_count) for candidate in result.skipped] == [
-        (AutoscaleSkipReason.COMPUTE_BACKED_TPU_VM, "v5p", 1),
-        (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE, "v5p", len(oversized) + 1),
-    ]
+    assert sorted(result.entries[0].config.pools) == ["v5p-16", "v5p-3968"]
+    assert sorted(
+        (candidate.reason.value, candidate.generation, candidate.type_count) for candidate in result.skipped
+    ) == sorted(
+        [
+            (AutoscaleSkipReason.COMPUTE_BACKED_TPU_VM.value, "v5p", 1),
+            (AutoscaleSkipReason.UNSUPPORTED_ACCELERATOR_TYPE.value, "v4", len(undescribed)),
+        ]
+    )
     payload = result.as_dict()
-    assert [_json_object(entry)["accelerator_type"] for entry in _json_array(payload["quota"])] == ["v5p-16"]
+    assert sorted(_json_object(entry)["accelerator_type"] for entry in _json_array(payload["quota"])) == [
+        "v5p-16",
+        "v5p-3968",
+    ]
     skipped = _json_array(payload["skipped"])
     assert len(skipped) == 2
     assert all("accelerator_type" not in _json_object(entry) for entry in skipped)
-    assert "v5p-4224" not in str(payload)
+    assert "v4-2064" not in str(payload)
 
 
 def test_generation_service_returns_bounded_diagnostics_when_no_complete_worker_is_eligible(tmp_path) -> None:

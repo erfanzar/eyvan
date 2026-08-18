@@ -64,7 +64,11 @@ class QueuedTpuProfileCatalog:
         # They say nothing authoritative about host CPU or memory. Emitting the
         # old ``cpu=32, memory_gib=0`` fallback made an unknown discovered type
         # look schedulable while every normal workload was guaranteed not to fit.
-        # Unknown hardware remains available through an explicit fleet resource
+        #
+        # The catalog answers for a slice size it has no row for when the
+        # generation states how it builds one, which is what stopped this
+        # refusing 91 of the 93 v5p types GCP offers in a single zone. Unknown
+        # hardware still remains available through an explicit fleet resource
         # vector or a directly constructed ``TpuProfile`` with positive memory.
         shape = shape_for(normalized)
         if shape is None or shape.kind != "tpu":
