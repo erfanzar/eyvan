@@ -47,6 +47,15 @@ function reasonForNoBalance(entry: TpuQuotaEntry): string {
     : "usage unavailable -- the limit is known and how much of it is in use is not";
 }
 
+/** One granted quota, and what the sizes drawing on it add up to. */
+interface QuotaRow {
+  entry: TpuQuotaEntry;
+  sliceCount: number;
+  largestSlice: number;
+  smallestSlice: number;
+  bestFit: TpuQuotaEntry;
+}
+
 export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: CapacityPageProps) {
   const [snapshot, setSnapshot] = useState<TpuQuotaSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -165,10 +174,44 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     const rows = selected.filter(
       (entry) => isMeasured(entry) && (fitsType === "any" || (entry.free_slices ?? 0) >= fitsCount),
     );
-    return [...rows].sort((left, right) => {
-      if (sortKey === "zone") return left.zone.localeCompare(right.zone) || left.accelerator_type.localeCompare(right.accelerator_type);
-      if (sortKey === "limit") return (right.limit_chips ?? 0) - (left.limit_chips ?? 0);
-      return (right.free_chips ?? 0) - (left.free_chips ?? 0);
+    // One row per quota, not per slice size.
+    //
+    // Cloud TPU quota is granted against a generation -- one metric, one limit,
+    // one usage reading. The provider then offers ninety-odd slice sizes that
+    // all draw on it, and the table printed every one of them: fifty-two rows
+    // for us-central2-b v4, identical in limit, in use and free, differing only
+    // in a slice size the Fits column already derives. A zone read as a wall of
+    // repetition, and the one fact each row carried -- 80000 free -- had to be
+    // read fifty-two times to learn once.
+    //
+    // The sizes are not lost. They are what the Fits column answers about, and
+    // the shape filter above still selects one.
+    const byQuota = new Map<string, QuotaRow>();
+    for (const entry of rows) {
+      const key = `${entry.zone}:${entry.generation}:${entry.capacity_class}`;
+      const existing = byQuota.get(key);
+      if (existing) {
+        existing.sliceCount += 1;
+        existing.largestSlice = Math.max(existing.largestSlice, entry.chips_per_slice ?? 0);
+        existing.smallestSlice = Math.min(existing.smallestSlice, entry.chips_per_slice ?? 0);
+        // The best fit across the sizes this quota covers, so the column keeps
+        // meaning what it meant when every size had its own row.
+        if ((entry.free_slices ?? 0) > (existing.bestFit?.free_slices ?? -1)) existing.bestFit = entry;
+        continue;
+      }
+      byQuota.set(key, {
+        entry,
+        sliceCount: 1,
+        largestSlice: entry.chips_per_slice ?? 0,
+        smallestSlice: entry.chips_per_slice ?? 0,
+        bestFit: entry,
+      });
+    }
+    return [...byQuota.values()].sort((left, right) => {
+      if (sortKey === "zone")
+        return left.entry.zone.localeCompare(right.entry.zone) || left.entry.generation.localeCompare(right.entry.generation);
+      if (sortKey === "limit") return (right.entry.limit_chips ?? 0) - (left.entry.limit_chips ?? 0);
+      return (right.entry.free_chips ?? 0) - (left.entry.free_chips ?? 0);
     });
   }, [fitsCount, fitsType, selected, sortKey]);
 
@@ -186,8 +229,13 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     setFitsCount(1);
   };
 
-  const freeChips = measured.reduce((total, entry) => total + (entry.free_chips ?? 0), 0);
-  const measuredZones = new Set(measured.filter((entry) => (entry.free_chips ?? 0) > 0).map((entry) => entry.zone));
+  // Summed over quotas now rather than over slice sizes. The old sum counted
+  // one zone's 80000 free chips once per size the provider offered, so a single
+  // v4 zone reported four million.
+  const freeChips = measured.reduce((total, row) => total + (row.entry.free_chips ?? 0), 0);
+  const measuredZones = new Set(
+    measured.filter((row) => (row.entry.free_chips ?? 0) > 0).map((row) => row.entry.zone),
+  );
   const unmeasuredZones = new Set(unmeasured.map((entry) => entry.zone));
   const age = snapshot?.age_s ?? null;
   const stale = snapshot !== null && snapshot.cached && age !== null && age > snapshot.ttl_s;
@@ -418,7 +466,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                   <thead>
                     <tr>
                       <th>Zone</th>
-                      <th>Type</th>
+                      <th>Generation</th>
                       <th>Class</th>
                       <th>Limit</th>
                       <th>In use</th>
@@ -428,15 +476,25 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                     </tr>
                   </thead>
                   <tbody>
-                    {measured.map((entry) => (
-                      <tr key={`${entry.zone}:${entry.accelerator_type}:${entry.capacity_class}`}>
+                    {measured.map(({ entry, sliceCount, smallestSlice, largestSlice, bestFit }) => (
+                      <tr key={`${entry.zone}:${entry.generation}:${entry.capacity_class}`}>
                         <td>
                           <span className="resource-cell">
                             <strong className="monospace">{entry.zone}</strong>
                             <small>{entry.region}</small>
                           </span>
                         </td>
-                        <td>{entry.accelerator_type}</td>
+                        <td>
+                          <span className="resource-cell">
+                            {/* One size is its own name; several are a
+                                generation, and the sizes become what that
+                                generation buys rather than facts of their own. */}
+                            <strong>{sliceCount === 1 ? entry.accelerator_type : entry.generation}</strong>
+                            {sliceCount > 1 && (
+                              <small>{`${sliceCount} slice sizes · ${smallestSlice}-${largestSlice} chips`}</small>
+                            )}
+                          </span>
+                        </td>
                         <td>
                           <StatusBadge value={entry.capacity_class} tone={entry.capacity_class} dot={false} />
                         </td>
@@ -445,7 +503,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         <td>
                           <strong>{chips(entry.free_chips)}</strong>
                         </td>
-                        <td>{entry.free_slices === null ? UNKNOWN : `${entry.free_slices} x ${entry.accelerator_type}`}</td>
+                        <td>{bestFit.free_slices === null ? UNKNOWN : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}</td>
                         {/* The balance was measured at a point in time by a gauge
                             that lags by minutes. Presenting it without that is
                             how a stale number becomes a placement decision. */}
@@ -472,7 +530,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                   <thead>
                     <tr>
                       <th>Zone</th>
-                      <th>Type</th>
+                      <th>Generation</th>
                       <th>Class</th>
                       <th>Limit</th>
                       <th>Free</th>

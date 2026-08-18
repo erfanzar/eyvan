@@ -49,7 +49,7 @@
 # exact provider page/version reviewed so future edits do not become guesses.
 
 catalog_version: 3
-revision: "2026-08-18.1"
+revision: "2026-08-18.2"
 
 # Multi-host slice rules, and why they are not more hand-written rows.
 #
@@ -112,6 +112,24 @@ generation_rules:
     establishes_hosts: false
     source_url: https://cloud.google.com/tpu/docs/v6e
     source_version: "Last updated 2026-08-04 UTC"
+
+  - generation: tpu7x
+    kind: tpu
+    # The suffix counts chips, not TensorCores. v4 and v5p are the exception,
+    # not the rule, and the seventh generation went back to counting chips.
+    quota_units_per_chip: 1
+    # "All TPU7x slices use full-host, 4-chip VMs", so the rule starts at one
+    # whole VM and the published topology table divides exactly: 2x2x1 is 4
+    # chips on 1 host, 8x8x16 is 1024 chips on 256.
+    min_chips: 4
+    chips_per_host: 4
+    host_cpu: 224
+    host_memory_gib: 960
+    capacity_backend: gcp-tpu
+    machine_type: tpu7x-standard-4t
+    establishes_hosts: true
+    source_url: https://docs.cloud.google.com/tpu/docs/tpu7x
+    source_version: "Retrieved 2026-08-18"
 
 shapes:
   - accelerator_type: v5p-8

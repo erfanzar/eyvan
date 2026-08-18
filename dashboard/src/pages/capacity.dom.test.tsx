@@ -503,3 +503,89 @@ describe("what each zone has been doing", () => {
     expect(await screen.findByText(/No capacity has been granted or released recently/)).toBeTruthy();
   });
 });
+
+describe("one row per quota, not per slice size", () => {
+  it("collapses the sizes that draw on a single granted quota", async () => {
+    // Cloud TPU quota is granted against a generation: one metric, one limit,
+    // one usage reading. The provider then offers ninety-odd slice sizes that
+    // all draw on it, and every one got a row -- fifty-two for a single v4
+    // zone, identical but for a size the Fits column already derives.
+    const sizes = [16, 128, 1024, 2048];
+    render(
+      <CapacityPage
+        loadQuota={async () =>
+          snapshot({
+            entries: sizes.map((chips) =>
+              entry({
+                generation: "v4",
+                accelerator_type: `v4-${chips}`,
+                chips_per_slice: chips,
+                metric: "tpu.googleapis.com/tpu-v4s-pod-preemptible",
+                limit_chips: 80000,
+                in_use_chips: 0,
+                free_chips: 80000,
+                free_slices: Math.floor(80000 / chips),
+              }),
+            ),
+          })
+        }
+      />,
+    );
+
+    await waitFor(() => expect(within(measuredTable()).getAllByRole("row").length).toBeGreaterThan(1));
+    const rows = within(measuredTable()).getAllByRole("row").slice(1);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain("v4");
+    // The sizes are not lost, they are described.
+    expect(rows[0].textContent).toContain("4 slice sizes");
+  });
+
+  it("keeps quotas apart when they really are different grants", async () => {
+    render(
+      <CapacityPage
+        loadQuota={async () =>
+          snapshot({
+            entries: [
+              entry({ generation: "v4", accelerator_type: "v4-16", chips_per_slice: 16 }),
+              entry({ generation: "v6e", accelerator_type: "v6e-8", chips_per_slice: 8 }),
+              entry({ generation: "v6e", accelerator_type: "v6e-8", chips_per_slice: 8, capacity_class: "on_demand" }),
+            ],
+          })
+        }
+      />,
+    );
+
+    await waitFor(() => expect(within(measuredTable()).getAllByRole("row").length).toBeGreaterThan(1));
+
+    expect(within(measuredTable()).getAllByRole("row").slice(1)).toHaveLength(3);
+  });
+
+  it("counts a zone's free chips once rather than once per size", async () => {
+    // The summary summed over slice sizes, so one v4 zone with 80000 free
+    // reported four million.
+    render(
+      <CapacityPage
+        loadQuota={async () =>
+          snapshot({
+            entries: [16, 128, 1024].map((chips) =>
+              entry({
+                generation: "v4",
+                accelerator_type: `v4-${chips}`,
+                chips_per_slice: chips,
+                limit_chips: 80000,
+                in_use_chips: 0,
+                free_chips: 80000,
+                free_slices: Math.floor(80000 / chips),
+              }),
+            ),
+          })
+        }
+      />,
+    );
+
+    await waitFor(() => expect(within(measuredTable()).getAllByRole("row").length).toBeGreaterThan(1));
+
+    expect(document.body.textContent).not.toContain("240000");
+  });
+});

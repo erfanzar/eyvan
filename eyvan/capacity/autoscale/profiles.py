@@ -14,7 +14,8 @@ from eyvan.capacity.autoscale.models import AutoscaleSkipReason, TpuProfile
 from eyvan.capacity.hardware_catalog import hardware_catalog, shape_for
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 
-_NATIVE_TPU_GENERATIONS = frozenset({"v4", "v5e", "v5litepod", "v5p", "v6e"})
+#: Google ships the seventh generation as ``tpu7x`` rather than ``v7``.
+_NATIVE_TPU_GENERATIONS = frozenset({"v4", "v5e", "v5litepod", "v5p", "v6e", "tpu7x"})
 _TPU_QUOTA_UNITS_PER_RESOURCE = {"v4": 2, "v5p": 2}
 # This type is deliberately compiled by the fleet schema as an integrated
 # Compute Engine TPU VM. The dynamic Cloud TPU quota catalog must not emit it

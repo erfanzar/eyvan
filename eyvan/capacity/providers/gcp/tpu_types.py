@@ -10,7 +10,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-_ACCELERATOR_TYPE = re.compile(r"^(?P<generation>v[0-9][a-z0-9]*?)-(?P<size>[1-9][0-9]*)$")
+#: Every generation before the seventh is named ``v<n>`` with an optional
+#: variant letter -- v4, v5p, v5litepod, v6e. The seventh broke the pattern:
+#: Google ships it as ``tpu7x``, so a regex anchored on a leading ``v`` refused
+#: the whole generation before any policy could look at it.
+_ACCELERATOR_TYPE = re.compile(r"^(?P<generation>(?:v[0-9]|tpu[0-9])[a-z0-9]*?)-(?P<size>[1-9][0-9]*)$")
 
 
 @dataclass(frozen=True, slots=True)

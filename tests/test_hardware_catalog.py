@@ -993,3 +993,53 @@ def test_every_shipped_rule_names_its_source() -> None:
     for rule in rules:
         assert rule.source_url.startswith("https://")
         assert rule.source_version.strip()
+
+
+def test_the_seventh_generation_is_named_tpu7x_not_v7() -> None:
+    """Every generation before it is ``v<n>``; Google shipped this one as
+    ``tpu7x``, and a parser anchored on a leading ``v`` refused the whole
+    generation before any policy could look at it."""
+
+    from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
+
+    parsed = parse_tpu_accelerator_type("tpu7x-256")
+
+    assert parsed is not None
+    assert parsed.generation == "tpu7x"
+    assert parsed.size == 256
+
+
+def test_tpu7x_slices_resolve_from_the_published_vm(monkeypatch) -> None:
+    """224 vCPU and 960 GB per VM, four chips, from Google's own page.
+
+    The suffix counts chips here: v4 and v5p count TensorCores and are the
+    exception, so reading 256 as 128 chips would ask for half the hardware.
+    """
+
+    shape = shape_for("tpu7x-256")
+
+    assert shape is not None
+    assert shape.chips == 256
+    assert shape.quota_units == 256
+    assert (shape.host_cpu, shape.host_memory_gib) == (224, 960)
+    assert shape.hosts == 64, "the published table pairs 4x8x8 with 64 hosts"
+    assert shape.machine_type == "tpu7x-standard-4t"
+
+
+def test_a_tpu7x_slice_smaller_than_one_vm_is_refused() -> None:
+    """"All TPU7x slices use full-host, 4-chip VMs", so a smaller one is not a
+    slice this repository can describe."""
+
+    assert shape_for("tpu7x-2") is None
+
+
+def test_the_autoscaler_will_generate_tpu7x_pools() -> None:
+    """A shape the catalog knows is useless if the planner still refuses it."""
+
+    from eyvan.capacity.autoscale.profiles import resolve_queued_tpu_profile
+
+    resolution = resolve_queued_tpu_profile("tpu7x-64")
+
+    assert resolution.skip_reason is None
+    assert resolution.profile is not None
+    assert resolution.profile.tpu == 64
