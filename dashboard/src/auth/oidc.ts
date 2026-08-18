@@ -92,6 +92,24 @@ export function isDevelopmentAuthEnabled(): boolean {
   return import.meta.env.VITE_EYVAN_DEV_AUTH === "true";
 }
 
+/**
+ * Whether the control plane itself accepts development identity headers.
+ *
+ * Distinct from {@link isDevelopmentAuthEnabled}, which asks whether *this
+ * bundle* was built to send them. A plane can accept them while the bundle
+ * serving its dashboard was never built to send any -- which is exactly the
+ * bundle a laptop plane serves -- and the difference is what turns the sign-in
+ * screen from a recital of build variables into the one command that works.
+ */
+export function planeDevelopmentAuthMode(): string | undefined {
+  return runtimeConfig?.development_auth ?? undefined;
+}
+
+/** Whether the plane requires a credential the browser is unable to read. */
+export function planeRequiresLocalCredential(): boolean {
+  return planeDevelopmentAuthMode() === "loopback_default";
+}
+
 function storage(): Storage | undefined {
   try {
     return globalThis.sessionStorage;
@@ -129,12 +147,17 @@ function redirectUri(): string {
  * Build-time values still win when present, so every existing image behaves
  * identically. This only fills the gap they leave.
  */
-let runtimeConfig: { issuer?: string | null; client_id?: string | null; audience?: string | null } | undefined;
+let runtimeConfig:
+  | { issuer?: string | null; client_id?: string | null; audience?: string | null; development_auth?: string | null }
+  | undefined;
 
 export async function loadRuntimeOidcConfig(fetchImpl: typeof fetch = fetch): Promise<void> {
   if (runtimeConfig !== undefined) return;
   if (bakedIssuer() && bakedClientId() && bakedAudience()) {
-    // Every runtime value is deliberately overridden by this build.
+    // Every runtime value is deliberately overridden by this build, and a
+    // bundle that carries its own OIDC never reaches the local-plane screen
+    // that is the plane's posture's only reader. So the round trip stays
+    // skipped: it is on the critical path of every page load.
     runtimeConfig = {};
     return;
   }

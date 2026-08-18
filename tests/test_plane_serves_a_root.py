@@ -99,3 +99,58 @@ def test_the_root_page_is_registered_only_when_no_bundle_is_mounted() -> None:
 
     assert mount < fallback, "the fallback belongs in the else branch of the mount"
     assert source.count("async def dashboard_absent") == 1
+
+
+def _isolated_loopback_app(tmp_path: Path):
+    """Build a loopback app that owns its own state, not the caller's."""
+
+    from eyvan.config import EyvanSettings, RepositoryBackend
+    from eyvan.server.api.app import create_app
+
+    return create_app(
+        settings=EyvanSettings(
+            dev_auth_enabled=True,
+            repository_backend=RepositoryBackend.LOCAL,
+            local_state_path=tmp_path / "control-plane.json",
+            local_artifact_token_key_path=tmp_path / "artifact-token.key",
+            artifact_store_uri=str(tmp_path / "managed-artifacts"),
+            controller_enabled=False,
+        )
+    )
+
+
+def test_the_dashboard_config_names_the_planes_own_auth_posture(monkeypatch, tmp_path) -> None:
+    """The browser could see "no OIDC" and not "and none is expected here".
+
+    Those two render identically and only one of them means something is wrong,
+    so a laptop plane -- which has no OIDC by design -- was greeted as broken.
+    """
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with TestClient(_isolated_loopback_app(tmp_path)) as client:
+        payload = client.get("/api/v1/dashboard/config").json()
+
+    # Compared against the enum rather than a literal: the browser branches on
+    # this string, so a renamed member has to fail here and not in a browser.
+    from eyvan.server.api.server_startup import DevelopmentAuthMode
+
+    assert payload["development_auth"] in {mode.value for mode in DevelopmentAuthMode}
+    assert payload["development_auth"] != DevelopmentAuthMode.DISABLED.value
+    assert payload["issuer"] is None
+
+
+def test_the_dashboard_config_stays_readable_without_a_credential(monkeypatch, tmp_path) -> None:
+    """Requiring a token to learn how to obtain one is a loop, and this route is
+    the first thing the page loads."""
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with TestClient(_isolated_loopback_app(tmp_path)) as client:
+        response = client.get("/api/v1/dashboard/config")
+
+    assert response.status_code == 200

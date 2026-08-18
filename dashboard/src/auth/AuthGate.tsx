@@ -16,6 +16,7 @@ import {
   isDemoMode,
   isOidcConfigured,
   loadRuntimeOidcConfig,
+  planeRequiresLocalCredential,
 } from "./oidc";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -59,17 +60,32 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (identity || isDemoMode() || isDevelopmentAuthEnabled()) return children;
 
   const configured = isOidcConfigured();
+  // A local plane is not a misconfigured one. It has no OIDC by design, and it
+  // holds a credential no browser can read -- so the honest screen names the
+  // command that supplies it rather than two build variables belonging to a
+  // bundle whoever is reading this never built.
+  const local = !configured && planeRequiresLocalCredential();
   return (
     <AuthState
-      icon={error || !configured ? <AlertTriangle size={22} /> : <Boxes size={22} />}
-      title={error ? "Sign-in failed" : configured ? "Sign in to Eyvan" : "Authentication is not configured"}
+      icon={error || (!configured && !local) ? <AlertTriangle size={22} /> : <Boxes size={22} />}
+      title={
+        error
+          ? "Sign-in failed"
+          : configured
+            ? "Sign in to Eyvan"
+            : local
+              ? "This is a local development plane"
+              : "Authentication is not configured"
+      }
       detail={
         error ??
         (configured
           ? "Use your organization identity to access the fleet control plane."
-          : "Configure VITE_EYVAN_OIDC_ISSUER and VITE_EYVAN_OIDC_CLIENT_ID, enable explicit development auth, or open ?demo=1.")
+          : local
+            ? "It holds an owner-only credential this page cannot read. Run `eyvan dashboard-dev` to open the same dashboard with that credential supplied, or append ?demo=1 to look around sample data."
+            : "Configure VITE_EYVAN_OIDC_ISSUER and VITE_EYVAN_OIDC_CLIENT_ID, enable explicit development auth, or open ?demo=1.")
       }
-      isError={Boolean(error) || !configured}
+      isError={Boolean(error) || (!configured && !local)}
       action={
         configured ? (
           <button

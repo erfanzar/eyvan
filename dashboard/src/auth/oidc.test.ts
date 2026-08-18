@@ -16,6 +16,8 @@ import {
   getAccessToken,
   isOidcConfigured,
   loadRuntimeOidcConfig,
+  planeDevelopmentAuthMode,
+  planeRequiresLocalCredential,
 } from "./oidc";
 
 function memoryStorage(initial: Record<string, string> = {}): Storage {
@@ -305,5 +307,56 @@ describe("runtime OIDC configuration", () => {
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
 
     expect(isOidcConfigured()).toBe(false);
+  });
+});
+
+describe("what the plane says about its own auth", () => {
+  afterEach(() => {
+    __resetRuntimeOidcConfigForTests();
+    vi.unstubAllEnvs();
+  });
+
+  it("reports a loopback plane as needing a credential the browser cannot read", async () => {
+    // The screen this drives: a laptop plane has no OIDC by design, and used to
+    // be greeted as misconfigured -- with two build variables named at somebody
+    // who never built the bundle.
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "loopback_default" }), {
+        status: 200,
+      }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(planeDevelopmentAuthMode()).toBe("loopback_default");
+    expect(planeRequiresLocalCredential()).toBe(true);
+    expect(isOidcConfigured()).toBe(false);
+  });
+
+  it("does not call a plane with development auth disabled a local one", async () => {
+    // That plane really is misconfigured, and the local screen would send its
+    // operator to run a development command against production.
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "disabled" }), { status: 200 }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(planeRequiresLocalCredential()).toBe(false);
+  });
+
+  it("treats a plane too old to answer as not local", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }));
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(planeDevelopmentAuthMode()).toBeUndefined();
+    expect(planeRequiresLocalCredential()).toBe(false);
   });
 });

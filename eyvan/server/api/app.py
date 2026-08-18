@@ -1874,12 +1874,21 @@ def create_app(
         Null when unconfigured rather than absent, so a caller can tell "this
         control plane runs without OIDC" from "this control plane is too old to
         answer".
+
+        ``development_auth`` names the third state, which the browser could not
+        previously see. A plane with no OIDC is not necessarily misconfigured:
+        the loopback development plane every laptop runs has none by design, and
+        the dashboard used to greet it by naming two build-time ``VITE_``
+        variables of a bundle the reader never built. Reported as the mode's own
+        name so the page can say what is true of *this* plane rather than
+        recite the general case.
         """
 
         return {
             "issuer": settings.oidc_issuer,
             "client_id": settings.oidc_dashboard_client_id,
             "audience": settings.oidc_audience,
+            "development_auth": startup.development_auth_mode.value,
         }
 
     @app.get("/api/v1/system/invariants", tags=["system"])
