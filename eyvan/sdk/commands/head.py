@@ -537,6 +537,11 @@ class HeadSecrets:
         else:
             # Startup refuses both at once, so this only ever fills the gap.
             environment["EYVAN_BOOTSTRAP_TOKEN"] = self.bootstrap_token
+            # A loopback development plane trusts its own default project for
+            # callable workloads; a real head trusts nothing, so the decorator
+            # API was refused with 403 after authenticating. In bootstrap mode
+            # there is exactly one principal, and this is its own project.
+            environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] = "default/default"
         return environment
 
     def environment_file(self, spec: HeadSpec, *, address: str) -> str:
@@ -907,9 +912,9 @@ class HeadUpResult:
             return None
         return (
             "This head has no EYVAN_OIDC_ISSUER, so it authenticates with a generated bootstrap token instead. "
-            "Read it with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env, then pass it as "
-            "`eyvan --token <token> --url <address>`. Register an identity provider and re-run with "
-            "--oidc-issuer to retire it."
+            "Read it with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env. Pass it to the CLI as "
+            "`eyvan --token <token> --url <address>`, or export EYVAN_TOKEN for the Python SDK. "
+            "Register an identity provider and re-run with --oidc-issuer to retire it."
         )
 
     def as_document(self) -> JsonObject:
