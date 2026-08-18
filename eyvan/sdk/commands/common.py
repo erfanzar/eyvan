@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import warnings
 from pathlib import Path
 
 import click
@@ -32,12 +33,27 @@ class FleetConfigLoader:
     """Load and validate public fleet YAML documents."""
 
     def load(self, path: Path) -> EyvanFleetConfig:
-        """Return a validated config or a Click-facing actionable error."""
+        """Return a validated config or a Click-facing actionable error.
+
+        Any warning the schema raises is re-rendered rather than left to
+        Python's default handler, which prints the line inside pydantic that
+        happened to call ``warn`` -- a path under ``site-packages`` that says
+        nothing about which file the reader should edit. The advice is worth
+        keeping; the frame it arrived in is not.
+        """
 
         try:
-            return EyvanFleetConfig.from_yaml(path)
+            with warnings.catch_warnings(record=True) as raised:
+                warnings.simplefilter("always")
+                config = EyvanFleetConfig.from_yaml(path)
         except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
             raise click.ClickException(f"invalid fleet configuration {path}: {exc}") from exc
+        # One line per distinct message, not per pool. The schema warns as it
+        # validates, so a twenty-pool fleet raised the same sentence twenty
+        # times -- which buries the file name the line exists to supply.
+        for message in dict.fromkeys(str(warning.message) for warning in raised):
+            click.echo(f"{path}: {message}", err=True)
+        return config
 
 
 def parse_environment(values: tuple[str, ...], *, option: str = "--env") -> dict[str, str]:

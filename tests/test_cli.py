@@ -16,6 +16,7 @@ from unittest import mock
 
 import httpx
 import pytest
+import yaml
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
@@ -2480,3 +2481,47 @@ def test_an_ordinary_validation_failure_still_says_what_was_wrong() -> None:
 
     assert _name_a_version_skew(422, detail) is None
     assert _name_a_version_skew(404, [{"type": "extra_forbidden", "loc": ["body", "x"]}]) is None
+
+
+def test_a_schema_warning_names_the_file_rather_than_pydantics_internals(tmp_path) -> None:
+    """The advice is worth keeping; the frame it arrived in is not.
+
+    Python's default handler prints the line inside pydantic that called
+    `warn` -- a path under site-packages that tells the reader nothing about
+    which file to edit.
+    """
+
+    config = tmp_path / "fleet.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "name": "warned",
+                "provider": {"type": "local", "region": "local"},
+                "executor": "native-local",
+                "capacity_class": "on_demand",
+                "pools": {
+                    f"cpu-{index}": {
+                        "kind": "cpu",
+                        "capacity_backend": "local",
+                        "machine_type": "laptop",
+                        "min_workers": 0,
+                        "max_workers": 0,
+                        "resources": {"cpu": 1, "memory_gib": 1},
+                        "agent_endpoint": "http://127.0.0.1:8095",
+                    }
+                    for index in range(3)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli.main, ["config", "validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "site-packages" not in result.output
+    assert str(config) in result.output
+    # Once, not once per pool: the schema warns as it validates each one, and
+    # three copies of one sentence bury the file name the line exists to add.
+    assert result.output.count("max_workers: 0 means unbounded") == 1
