@@ -218,7 +218,32 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   // Never merged into the sorted table and never dropped by the fit filter.
   // "Nobody could measure it" is a different answer from "it does not fit", and
   // only one of them should stop an operator trying.
-  const unmeasured = useMemo(() => selected.filter((entry) => !isMeasured(entry)), [selected]);
+  const unmeasured = useMemo(() => {
+    const rows = selected.filter((entry) => !isMeasured(entry));
+    // Same collapse as the measured table above, for the same reason: one
+    // granted quota, however many sizes the provider offers against it. This
+    // table was the larger of the two -- 232 rows for the zones nobody could
+    // measure, which is a lot of screen for one sentence repeated.
+    const byQuota = new Map<string, QuotaRow>();
+    for (const entry of rows) {
+      const key = `${entry.zone}:${entry.generation}:${entry.capacity_class}`;
+      const existing = byQuota.get(key);
+      if (existing) {
+        existing.sliceCount += 1;
+        existing.largestSlice = Math.max(existing.largestSlice, entry.chips_per_slice ?? 0);
+        existing.smallestSlice = Math.min(existing.smallestSlice, entry.chips_per_slice ?? 0);
+        continue;
+      }
+      byQuota.set(key, {
+        entry,
+        sliceCount: 1,
+        largestSlice: entry.chips_per_slice ?? 0,
+        smallestSlice: entry.chips_per_slice ?? 0,
+        bestFit: entry,
+      });
+    }
+    return [...byQuota.values()];
+  }, [selected]);
 
   const filtered = Boolean(zoneQuery || capacityClass !== "all" || generation !== "all" || fitsType !== "any");
   const clearFilters = () => {
@@ -236,7 +261,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   const measuredZones = new Set(
     measured.filter((row) => (row.entry.free_chips ?? 0) > 0).map((row) => row.entry.zone),
   );
-  const unmeasuredZones = new Set(unmeasured.map((entry) => entry.zone));
+  const unmeasuredZones = new Set(unmeasured.map((row) => row.entry.zone));
   const age = snapshot?.age_s ?? null;
   const stale = snapshot !== null && snapshot.cached && age !== null && age > snapshot.ttl_s;
 
@@ -538,15 +563,22 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                     </tr>
                   </thead>
                   <tbody>
-                    {unmeasured.map((entry) => (
-                      <tr key={`${entry.zone}:${entry.accelerator_type}:${entry.capacity_class}`}>
+                    {unmeasured.map(({ entry, sliceCount, smallestSlice, largestSlice }) => (
+                      <tr key={`${entry.zone}:${entry.generation}:${entry.capacity_class}`}>
                         <td>
                           <span className="resource-cell">
                             <strong className="monospace">{entry.zone}</strong>
                             <small>{entry.region}</small>
                           </span>
                         </td>
-                        <td>{entry.accelerator_type}</td>
+                        <td>
+                          <span className="resource-cell">
+                            <strong>{sliceCount === 1 ? entry.accelerator_type : entry.generation}</strong>
+                            {sliceCount > 1 && (
+                              <small>{`${sliceCount} slice sizes · ${smallestSlice}-${largestSlice} chips`}</small>
+                            )}
+                          </span>
+                        </td>
                         <td>
                           <StatusBadge value={entry.capacity_class} tone={entry.capacity_class} dot={false} />
                         </td>
