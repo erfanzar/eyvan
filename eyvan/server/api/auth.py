@@ -133,6 +133,70 @@ def bootstrap_principal() -> Principal:
     )
 
 
+#: Host header values that can only mean this machine. Literals, deliberately:
+#: a name would be resolved by DNS, and an attacker who controls a name can
+#: point it at 127.0.0.1 and make their own page same-origin with this plane.
+#: ``localhost`` is included because browsers and the resolver treat it as a
+#: reserved loopback name rather than a lookup.
+_LOOPBACK_HOSTS: tp.Final = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+#: The org and project a loopback plane's own dashboard acts in when it names
+#: none. The same value ``eyvan runtime deploy`` initializes, so the first page
+#: load shows the fleet that is there rather than an empty scope.
+DEFAULT_DEVELOPMENT_SCOPE: tp.Final = "default"
+
+
+def _local_owner() -> str:
+    """Return the account running this plane, as the dashboard's default subject.
+
+    Correct precisely because this only applies to a loopback plane answering
+    its own page: the browser, the plane and the operator are one machine and
+    one person, so the account the server runs as *is* the caller.
+    """
+
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "eyvan-dashboard"
+
+
+def is_own_dashboard_request(request: Request) -> bool:
+    """Return whether this is the browser asking on behalf of the page we served.
+
+    A loopback plane holds an owner-only credential, and a browser cannot read a
+    0600 file -- so the dashboard the plane serves at "/" could not authenticate
+    to the plane serving it. The workaround was to tell people to run a second
+    web server, which is a strange thing to need on the machine already running
+    the first one.
+
+    Three conditions, and each closes a specific hole:
+
+    ``Sec-Fetch-Site: same-origin`` is set by the browser and is on the
+    forbidden-header list, so page script cannot forge it. Another site's page
+    fetching this plane gets ``cross-site`` and is refused. A non-browser client
+    -- curl, or another local user's script -- sends nothing at all and still
+    needs the credential, which is what keeps this from being "loopback means
+    trusted".
+
+    The ``Host`` header must be a loopback literal. Same-origin is computed
+    against the origin the page was loaded from, so DNS rebinding -- resolving
+    an attacker's name to 127.0.0.1 -- would otherwise produce a genuinely
+    same-origin request. That request carries the attacker's name in ``Host``.
+
+    ``Sec-Fetch-Mode`` excludes ``navigate``: a top-level navigation to an API
+    URL is same-origin too, and there is no reason for one to authenticate.
+    """
+
+    if request.headers.get("Sec-Fetch-Site") != "same-origin":
+        return False
+    if request.headers.get("Sec-Fetch-Mode") == "navigate":
+        return False
+    host = request.headers.get("Host", "").strip().lower()
+    return host.rsplit(":", 1)[0] in _LOOPBACK_HOSTS if host else False
+
+
 class RequestAuthenticator:
     """Authenticate bearer tokens, or explicit headers when dev auth is enabled."""
 
@@ -186,20 +250,32 @@ class RequestAuthenticator:
         credential = self.local_development_credential
         if credential is None:
             return
-        if not credential.matches(request.headers.get(LOCAL_DEVELOPMENT_CREDENTIAL_HEADER)):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="local Eyvan development credential is required",
-            )
+        if credential.matches(request.headers.get(LOCAL_DEVELOPMENT_CREDENTIAL_HEADER)):
+            return
+        if is_own_dashboard_request(request):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="local Eyvan development credential is required",
+        )
 
     @staticmethod
     def _dev_principal(request: Request) -> Principal:
-        subject = request.headers.get("X-Eyvan-User")
+        # A browser cannot be asked to set identity headers on a page it was
+        # served without a build that knows to. So for this plane's own
+        # dashboard the defaults come from here, and they are the ones the CLI
+        # already elects on loopback: this machine's owner, holding fleet_admin
+        # over the default scope. Any header the caller does send still wins,
+        # which is what leaves the dashboard's scope picker working.
+        own_dashboard = is_own_dashboard_request(request)
+        subject = request.headers.get("X-Eyvan-User") or (_local_owner() if own_dashboard else None)
         if not subject:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-Eyvan-User is required")
-        org_id = request.headers.get("X-Eyvan-Org")
-        project_id = request.headers.get("X-Eyvan-Project")
-        role_names = [part.strip().lower() for part in request.headers.get("X-Eyvan-Roles", "viewer").split(",")]
+        default_scope = DEFAULT_DEVELOPMENT_SCOPE if own_dashboard else None
+        org_id = request.headers.get("X-Eyvan-Org") or default_scope
+        project_id = request.headers.get("X-Eyvan-Project") or default_scope
+        default_roles = "fleet_admin" if own_dashboard else "viewer"
+        role_names = [part.strip().lower() for part in request.headers.get("X-Eyvan-Roles", default_roles).split(",")]
         grants: list[RoleGrant] = []
         try:
             for name in role_names:

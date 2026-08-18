@@ -169,3 +169,118 @@ def test_explicit_development_auth_keeps_header_only_behavior() -> None:
 def test_local_development_credential_rejects_a_noncanonical_value() -> None:
     with pytest.raises(LocalDevelopmentCredentialError, match="malformed"):
         LocalDevelopmentCredential("not-a-secret")
+
+
+# --------------------------------------------------------- the plane's own dashboard
+
+
+def _dashboard_headers(**overrides: str) -> dict[str, str]:
+    """What a browser sends when the page it loaded asks its own origin."""
+
+    headers = {"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors", "Host": "127.0.0.1:8080"}
+    headers.update(overrides)
+    return headers
+
+
+def _credential_app(tmp_path: Path) -> FastAPI:
+    """An app whose loopback auth demands the owner-only credential."""
+
+    store = LocalDevelopmentCredentialStore(tmp_path / "credential")
+    return _identity_app(
+        RequestAuthenticator(
+            EyvanSettings(dev_auth_enabled=True),
+            local_development_credential=store.load_or_create(),
+        )
+    )
+
+
+def test_the_dashboard_this_plane_served_is_authenticated_without_the_credential(tmp_path: Path) -> None:
+    """A browser cannot read a 0600 file.
+
+    So the dashboard a loopback plane serves at "/" could not authenticate to
+    the plane serving it, and the answer was to run a second web server on the
+    machine already running the first one.
+    """
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get("/identity", headers=_dashboard_headers())
+
+    assert response.status_code == 200
+    assert "fleet_admin" in response.json()["roles"]
+
+
+def test_another_sites_page_reaching_this_plane_is_refused(tmp_path: Path) -> None:
+    """The attack the credential exists for: any page a browser visits can send
+    requests to 127.0.0.1. The browser labels those cross-site, and page script
+    cannot forge that header -- Sec-Fetch-Site is on the forbidden list."""
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get("/identity", headers=_dashboard_headers(**{"Sec-Fetch-Site": "cross-site"}))
+
+    assert response.status_code == 401
+
+
+def test_a_non_browser_client_on_loopback_still_needs_the_credential(tmp_path: Path) -> None:
+    """The property that keeps this from meaning "loopback is trusted".
+
+    Another account's script on this host reaches the same port and sends no
+    fetch metadata at all. It is refused exactly as before.
+    """
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get("/identity")
+
+    assert response.status_code == 401
+
+
+def test_a_rebound_dns_name_is_refused_though_the_browser_calls_it_same_origin(tmp_path: Path) -> None:
+    """Same-origin is computed against the origin the page came from, so an
+    attacker resolving their own name to 127.0.0.1 produces a genuinely
+    same-origin request. It carries their name in Host, which is why Host must
+    be a loopback literal and never a name."""
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get("/identity", headers=_dashboard_headers(Host="evil.example.com"))
+
+    assert response.status_code == 401
+
+
+def test_a_top_level_navigation_to_an_api_url_is_not_the_dashboard(tmp_path: Path) -> None:
+    """Typing an API URL into the address bar is same-origin too, and there is
+    no reason for a navigation to authenticate."""
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get("/identity", headers=_dashboard_headers(**{"Sec-Fetch-Mode": "navigate"}))
+
+    assert response.status_code == 401
+
+
+def test_the_credential_still_authenticates_a_caller_that_has_it(tmp_path: Path) -> None:
+    """The CLI's path is unchanged; the waiver is additional, not a replacement."""
+
+    store = LocalDevelopmentCredentialStore(tmp_path / "credential")
+    credential = store.load_or_create()
+    app = _identity_app(
+        RequestAuthenticator(EyvanSettings(dev_auth_enabled=True), local_development_credential=credential)
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/identity", headers=_development_headers(credential=credential.value))
+
+    assert response.status_code == 200
+
+
+def test_a_header_the_dashboard_sends_still_wins_over_the_default(tmp_path: Path) -> None:
+    """Otherwise the scope picker would be inert: every request would act in the
+    default project however the operator set it."""
+
+    with TestClient(_credential_app(tmp_path)) as client:
+        response = client.get(
+            "/identity",
+            headers=_dashboard_headers(
+                **{"X-Eyvan-User": "someone", "X-Eyvan-Roles": "viewer"},
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"subject": "someone", "roles": ["project_viewer"]}

@@ -57,35 +57,35 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (checking) {
     return <AuthState icon={<LoaderCircle className="spin" size={22} />} title="Completing secure sign-in" />;
   }
-  if (identity || isDemoMode() || isDevelopmentAuthEnabled()) return children;
+  // `planeRequiresLocalCredential` is the plane saying it runs loopback
+  // development auth. This bundle was served *by* that plane, so its API calls
+  // are same-origin and the plane authenticates them as its own page -- the
+  // browser cannot read the owner-only credential and no longer has to.
+  //
+  // Behind OIDC, though, and deliberately: a plane that names an identity
+  // provider wants a real identity, and the plane's own authenticator agrees --
+  // a presented token is resolved before the development path is reached.
+  const ownPlane = planeRequiresLocalCredential() && !isOidcConfigured();
+  if (identity || isDemoMode() || isDevelopmentAuthEnabled() || ownPlane) return children;
 
+  // No local-plane screen below. There was one, explaining that the page could
+  // not read the plane's owner-only credential and naming the command that
+  // supplies it -- and then the plane learned to authenticate the page it
+  // serves, so the wall it described stopped existing. A screen for a state
+  // that can no longer happen is worse than no screen: it is the first thing
+  // somebody debugs when the real fault is elsewhere.
   const configured = isOidcConfigured();
-  // A local plane is not a misconfigured one. It has no OIDC by design, and it
-  // holds a credential no browser can read -- so the honest screen names the
-  // command that supplies it rather than two build variables belonging to a
-  // bundle whoever is reading this never built.
-  const local = !configured && planeRequiresLocalCredential();
   return (
     <AuthState
-      icon={error || (!configured && !local) ? <AlertTriangle size={22} /> : <Boxes size={22} />}
-      title={
-        error
-          ? "Sign-in failed"
-          : configured
-            ? "Sign in to Eyvan"
-            : local
-              ? "This is a local development plane"
-              : "Authentication is not configured"
-      }
+      icon={error || !configured ? <AlertTriangle size={22} /> : <Boxes size={22} />}
+      title={error ? "Sign-in failed" : configured ? "Sign in to Eyvan" : "Authentication is not configured"}
       detail={
         error ??
         (configured
           ? "Use your organization identity to access the fleet control plane."
-          : local
-            ? "It holds an owner-only credential this page cannot read. Run `eyvan dashboard-dev` to open the same dashboard with that credential supplied, or append ?demo=1 to look around sample data."
-            : "Configure VITE_EYVAN_OIDC_ISSUER and VITE_EYVAN_OIDC_CLIENT_ID, enable explicit development auth, or open ?demo=1.")
+          : "Configure VITE_EYVAN_OIDC_ISSUER and VITE_EYVAN_OIDC_CLIENT_ID, enable explicit development auth, or open ?demo=1.")
       }
-      isError={Boolean(error) || (!configured && !local)}
+      isError={Boolean(error) || !configured}
       action={
         configured ? (
           <button

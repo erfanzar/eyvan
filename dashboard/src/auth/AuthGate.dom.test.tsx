@@ -34,7 +34,10 @@ describe("the sign-in screen", () => {
     vi.unstubAllGlobals();
   });
 
-  it("names the command that supplies the credential a local plane needs", async () => {
+  it("renders the fleet on a plane that authenticates its own page", async () => {
+    // The bundle is served by the plane, so its calls are same-origin and the
+    // plane recognises them. A sign-in screen here would be asking somebody to
+    // authenticate to their own laptop.
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
     planeAnswering({ issuer: null, client_id: null, development_auth: "loopback_default" });
@@ -45,12 +48,7 @@ describe("the sign-in screen", () => {
       </AuthGate>,
     );
 
-    await waitFor(() => expect(screen.getByText("This is a local development plane")).toBeTruthy());
-    expect(screen.getByText(/eyvan dashboard-dev/)).toBeTruthy();
-    expect(screen.queryByText(/VITE_EYVAN_OIDC_ISSUER/)).toBeNull();
-    // Not an error. The plane is working exactly as designed, and an alert
-    // sends people to debug something that is not broken.
-    expect(screen.queryByRole("alert")).toBeNull();
+    await waitFor(() => expect(screen.getByText("fleet")).toBeTruthy());
   });
 
   it("still calls a plane with no OIDC and no development auth misconfigured", async () => {
