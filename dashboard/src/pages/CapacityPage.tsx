@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { MetricCard } from "../components/MetricCard";
+import { LoadingState } from "../components/PageState";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatAgeSeconds, formatDateTime } from "../lib/format";
 import type { AuditEvent, Cell, TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
@@ -215,13 +216,17 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   }
 
   if (!snapshot) {
+    // Not a spinner with a word next to it. This read lists accelerator types
+    // in every quota zone the project can see and takes the better part of a
+    // minute on a cold cache -- long enough that an unexplained wait reads as a
+    // hung page, which is how somebody ends up reloading it and starting the
+    // read again.
     return (
       <div className="page-stack">
-        <section className="panel data-panel" aria-label="Provider quota">
-          <div className="resource-row-detail">
-            <span>Reading provider quota…</span>
-          </div>
-        </section>
+        <LoadingState
+          label="Reading provider quota"
+          detail="Listing accelerator types in every quota zone this project can see. The first read takes up to a minute; later ones are served from a two-minute cache."
+        />
       </div>
     );
   }

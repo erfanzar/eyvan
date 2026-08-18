@@ -7,7 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { cellStatus, computeOverview, EyvanApiClient, workloadStatus } from "./client";
 import type { LogEntry } from "../types";
-import { consumeSessionNotice } from "../auth/oidc";
+import { configuredScope, consumeSessionNotice } from "../auth/oidc";
+
+/** The scope every unqualified request carries. Read, not restated: the
+ *  literal here used to be "acme"/"research" while the CLI defaulted to
+ *  "default"/"default", and the dashboard queried a project nobody used. */
+const SCOPE = configuredScope();
 
 describe("EyvanApiClient", () => {
   afterEach(() => {
@@ -69,7 +74,7 @@ describe("EyvanApiClient", () => {
     const workloads = await client.listWorkloads();
 
     expect(workloads[0]).toMatchObject({ id: "wl-1", status: "running", priority: "production" });
-    expect(fetch.mock.calls[0][0]).toContain("org_id=acme");
+    expect(fetch.mock.calls[0][0]).toContain(`org_id=${SCOPE.orgId}`);
     expect(fetch.mock.calls[0][1].headers).not.toHaveProperty("X-Eyvan-User");
     expect(fetch.mock.calls[0][1].headers).not.toHaveProperty("Authorization");
   });
@@ -127,7 +132,7 @@ describe("EyvanApiClient", () => {
       roles: ["project_submitter"],
       permissions: ["submit"],
     });
-    expect(fetch.mock.calls[0][0]).toContain("org_id=acme");
+    expect(fetch.mock.calls[0][0]).toContain(`org_id=${SCOPE.orgId}`);
     expect(fetch.mock.calls[1][0]).toContain("org_id=other&project_id=training");
   });
 
@@ -293,7 +298,7 @@ describe("EyvanApiClient", () => {
 
     await expect(client.updatePolicy(policy, false)).resolves.toMatchObject({ preemptionEnabled: false });
 
-    expect(fetch.mock.calls[0][0]).toBe("/api/v1/policies/acme/research");
+    expect(fetch.mock.calls[0][0]).toBe(`/api/v1/policies/${SCOPE.orgId}/${SCOPE.projectId}`);
     expect(fetch.mock.calls[0][1].method).toBe("PUT");
     expect(JSON.parse(fetch.mock.calls[0][1].body)).toMatchObject({
       allowed_regions: ["us-central2"],
@@ -304,7 +309,10 @@ describe("EyvanApiClient", () => {
 
   it("uses both components of the immutable selected scope for a same-project cross-org update", async () => {
     const fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ...rawPolicy, org_id: "other" }), {
+      // Echoes BOTH components of the requested scope. The client refuses a
+      // mutation answered for a different one, which is the guard this test
+      // drives the request through.
+      new Response(JSON.stringify({ ...rawPolicy, org_id: "other", project_id: "research" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -346,7 +354,7 @@ describe("EyvanApiClient", () => {
     const policies = await client.listPolicies();
 
     expect(policies[0]).toMatchObject({
-      id: "acme/research",
+      id: `${SCOPE.orgId}/${SCOPE.projectId}`,
       type: "placement",
       preemptionEnabled: true,
       summary: expect.stringContaining("us-central2"),
@@ -358,11 +366,11 @@ describe("EyvanApiClient", () => {
     const fetch = vi.fn().mockImplementation((url: string) => {
       const response = (body: unknown) =>
         new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
-      if (url === "/api/v1/budgets/acme/research") return Promise.resolve(response(rawBudget));
-      if (url === "/api/v1/budgets/acme/research/status") {
-        return Promise.resolve(response({ org_id: "acme", project_id: "research", limit: 1000, spent: 100, forecast: 250 }));
+      if (url === `/api/v1/budgets/${SCOPE.orgId}/${SCOPE.projectId}`) return Promise.resolve(response(rawBudget));
+      if (url === `/api/v1/budgets/${SCOPE.orgId}/${SCOPE.projectId}/status`) {
+        return Promise.resolve(response({ org_id: SCOPE.orgId, project_id: SCOPE.projectId, limit: 1000, spent: 100, forecast: 250 }));
       }
-      if (url === "/api/v1/policies/acme/research") return Promise.resolve(response(rawPolicy));
+      if (url === `/api/v1/policies/${SCOPE.orgId}/${SCOPE.projectId}`) return Promise.resolve(response(rawPolicy));
       return Promise.resolve(new Response("not found", { status: 404 }));
     });
     vi.stubGlobal("fetch", fetch);
@@ -370,10 +378,11 @@ describe("EyvanApiClient", () => {
 
     const [budgets, policies] = await Promise.all([client.listBudgets(), client.listPolicies()]);
 
-    expect(budgets[0]).toMatchObject({ owner: "research", forecast: 250 });
-    expect(policies[0]).toMatchObject({ scope: "research" });
-    expect(fetch.mock.calls.map(([url]) => url)).not.toContain("/api/v1/budgets?org_id=acme");
-    expect(fetch.mock.calls.map(([url]) => url)).not.toContain("/api/v1/policies?org_id=acme");
+    expect(budgets[0]).toMatchObject({ owner: SCOPE.projectId, forecast: 250 });
+    expect(policies[0]).toMatchObject({ scope: SCOPE.projectId });
+    // The point of the test: scoped routes, never a query-string list.
+    expect(fetch.mock.calls.map(([url]) => url)).not.toContain(`/api/v1/budgets?org_id=${SCOPE.orgId}`);
+    expect(fetch.mock.calls.map(([url]) => url)).not.toContain(`/api/v1/policies?org_id=${SCOPE.orgId}`);
   });
 
   it("fetches each resource once when computing the overview from shared data", async () => {
@@ -382,8 +391,9 @@ describe("EyvanApiClient", () => {
         new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
       if (url === "/api/v1/workloads") return Promise.resolve(response([rawWorkload]));
       if (url === "/api/v1/cells") return Promise.resolve(response([rawCell]));
-      if (url === "/api/v1/budgets/acme/research") return Promise.resolve(response(rawBudget));
-      if (url === "/api/v1/leases?org_id=acme&project_id=research") return Promise.resolve(response([rawLease]));
+      if (url === `/api/v1/budgets/${SCOPE.orgId}/${SCOPE.projectId}`) return Promise.resolve(response(rawBudget));
+      if (url === `/api/v1/leases?org_id=${SCOPE.orgId}&project_id=${SCOPE.projectId}`)
+        return Promise.resolve(response([rawLease]));
       return Promise.resolve(response([]));
     });
     vi.stubGlobal("fetch", fetch);
@@ -591,8 +601,8 @@ const rawWorkload = {
 };
 
 const rawPolicy = {
-  org_id: "acme",
-  project_id: "research",
+  org_id: SCOPE.orgId,
+  project_id: SCOPE.projectId,
   allowed_providers: ["gcp"],
   allowed_regions: ["us-central2"],
   allowed_capacity_classes: ["spot"],
@@ -617,8 +627,8 @@ const rawCell = {
 };
 
 const rawBudget = {
-  org_id: "acme",
-  project_id: "research",
+  org_id: SCOPE.orgId,
+  project_id: SCOPE.projectId,
   spent: 100,
   limit: 1000,
   period: "monthly",

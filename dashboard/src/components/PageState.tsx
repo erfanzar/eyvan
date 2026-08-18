@@ -5,11 +5,23 @@
 
 import { AlertTriangle, LoaderCircle, RefreshCw } from "lucide-react";
 
-export function LoadingState() {
+interface LoadingStateProps {
+  /** What is being waited on. Defaults to the control plane's own state. */
+  label?: string;
+  /**
+   * Why it is slow, for a wait long enough that a bare spinner reads as a hang.
+   * Omitted for the ordinary sub-second load, where explaining the wait would
+   * be noise.
+   */
+  detail?: string;
+}
+
+export function LoadingState({ label = "Loading control-plane state", detail }: LoadingStateProps = {}) {
   return (
     <div className="page-state" role="status">
       <LoaderCircle className="spin" size={22} aria-hidden="true" />
-      <span>Loading control-plane state</span>
+      <span>{label}</span>
+      {detail && <small>{detail}</small>}
     </div>
   );
 }

@@ -105,7 +105,13 @@ from eyvan.records import (
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.secrets import MAX_SECRET_BYTES, SecretUnavailable, read_secret
-from eyvan.server.api.auth import OIDCTokenVerifier, RequestAuthenticator, TokenVerifier, authenticated_principal
+from eyvan.server.api.auth import (
+    DEFAULT_DEVELOPMENT_SCOPE,
+    OIDCTokenVerifier,
+    RequestAuthenticator,
+    TokenVerifier,
+    authenticated_principal,
+)
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
     ArtifactInventoryReindexRequest,
@@ -1889,6 +1895,14 @@ def create_app(
             "client_id": settings.oidc_dashboard_client_id,
             "audience": settings.oidc_audience,
             "development_auth": startup.development_auth_mode.value,
+            # The scope this plane puts a dashboard session in. Reported because
+            # the dashboard used to compile in "acme"/"research" as its fallback
+            # while the CLI defaults to "default"/"default", so a job submitted
+            # with `eyvan run` was invisible on the page: both are unregistered
+            # free-form scopes and the plane answers for either, so nothing
+            # failed -- the dashboard simply asked about a different project.
+            "default_org": DEFAULT_DEVELOPMENT_SCOPE,
+            "default_project": DEFAULT_DEVELOPMENT_SCOPE,
         }
 
     @app.get("/api/v1/system/invariants", tags=["system"])

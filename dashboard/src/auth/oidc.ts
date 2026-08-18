@@ -74,10 +74,23 @@ export function capabilitiesForPermissions(
   };
 }
 
+/**
+ * The org and project every scoped request is made in.
+ *
+ * The build-time values win, then what the control plane reports, and only then
+ * a literal. That order matters: the literal used to be `acme`/`research` while
+ * the CLI defaults to `default`/`default`, so a job submitted with `eyvan run`
+ * never appeared on this page. Nothing errored, because both are free-form
+ * scopes a plane answers for -- the dashboard was simply asking about a
+ * different project than the one the operator was using.
+ *
+ * The remaining literal is reached only by a build with no configured scope
+ * talking to a plane too old to report one, and it now matches the CLI.
+ */
 export function configuredScope(): AuthScope {
   return {
-    orgId: import.meta.env.VITE_EYVAN_ORG ?? "acme",
-    projectId: import.meta.env.VITE_EYVAN_PROJECT ?? "research",
+    orgId: import.meta.env.VITE_EYVAN_ORG || runtimeConfig?.default_org || "default",
+    projectId: import.meta.env.VITE_EYVAN_PROJECT || runtimeConfig?.default_project || "default",
   };
 }
 
@@ -148,7 +161,14 @@ function redirectUri(): string {
  * identically. This only fills the gap they leave.
  */
 let runtimeConfig:
-  | { issuer?: string | null; client_id?: string | null; audience?: string | null; development_auth?: string | null }
+  | {
+      issuer?: string | null;
+      client_id?: string | null;
+      audience?: string | null;
+      development_auth?: string | null;
+      default_org?: string | null;
+      default_project?: string | null;
+    }
   | undefined;
 
 export async function loadRuntimeOidcConfig(fetchImpl: typeof fetch = fetch): Promise<void> {

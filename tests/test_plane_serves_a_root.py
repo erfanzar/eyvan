@@ -154,3 +154,32 @@ def test_the_dashboard_config_stays_readable_without_a_credential(monkeypatch, t
         response = client.get("/api/v1/dashboard/config")
 
     assert response.status_code == 200
+
+
+def test_the_dashboard_config_reports_the_scope_the_plane_puts_a_session_in(monkeypatch, tmp_path) -> None:
+    """The dashboard compiled in "acme"/"research" while the CLI defaults to
+    "default"/"default", so a job submitted with `eyvan run` never appeared on
+    the page -- both are free-form scopes a plane answers for, so nothing
+    failed and the page simply asked about a different project."""
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with TestClient(_isolated_loopback_app(tmp_path)) as client:
+        payload = client.get("/api/v1/dashboard/config").json()
+
+    assert payload["default_org"] == payload["default_project"]
+    assert payload["default_org"]
+
+
+def test_the_reported_scope_is_the_one_the_cli_submits_into() -> None:
+    """Two constants for one fact is how they drift apart. Checked here because
+    the SDK and the server hold their own, and a page that trusts the server's
+    answer has to land where `eyvan run` put the work.
+    """
+
+    from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
+    from eyvan.server.api.auth import DEFAULT_DEVELOPMENT_SCOPE
+
+    assert DEFAULT_DEVELOPMENT_SCOPE == DEFAULT_ORG_ID == DEFAULT_PROJECT_ID

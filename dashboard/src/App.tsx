@@ -995,16 +995,37 @@ export default function App({ client = apiClient, identityProvider = currentIden
   );
 
   const browserIdentity = identityProvider();
-  const identity: AuthIdentity | undefined = browserIdentity
+  // A plane that authenticates its own page issues this browser no token, so
+  // `currentIdentity()` is empty while the server has in fact resolved a
+  // principal. Rendering that as no identity put "Authenticated user / OIDC
+  // session" in the sidebar -- a name nobody has, a protocol this plane does
+  // not run -- above a Sign out button for a session there is nothing to sign
+  // out of. The authority response already carries the subject; use it.
+  //
+  // `development` is the honest mode: this is the loopback development path,
+  // and it is also the mode that suppresses the sign-out control.
+  const serverIdentity: AuthIdentity | undefined =
+    !browserIdentity && authority?.subject
+      ? {
+          displayName: authority.displayName ?? authority.subject,
+          detail: "",
+          mode: "development",
+          roles: [],
+          scope: configuredScope(),
+          capabilities,
+        }
+      : undefined;
+  const resolvedIdentity = browserIdentity ?? serverIdentity;
+  const identity: AuthIdentity | undefined = resolvedIdentity
     ? {
-        ...browserIdentity,
+        ...resolvedIdentity,
         displayName:
-          authority?.displayName ?? browserIdentity.displayName ?? authority?.subject ?? "Authenticated user",
+          authority?.displayName ?? resolvedIdentity.displayName ?? authority?.subject ?? "Authenticated user",
         detail: selectedScope
           ? `${selectedScope.orgId}/${selectedScope.projectId}${selectedScope.roles.length ? ` · ${selectedScope.roles.join(", ")}` : ""}`
           : "Authority pending server verification",
         roles: selectedScope?.roles ?? [],
-        scope: selectedScope ?? browserIdentity.scope,
+        scope: selectedScope ?? resolvedIdentity.scope,
         capabilities,
       }
     : undefined;

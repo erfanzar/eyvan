@@ -15,6 +15,7 @@ import {
   currentIdentity,
   getAccessToken,
   isOidcConfigured,
+  configuredScope,
   loadRuntimeOidcConfig,
   planeDevelopmentAuthMode,
   planeRequiresLocalCredential,
@@ -358,5 +359,53 @@ describe("what the plane says about its own auth", () => {
 
     expect(planeDevelopmentAuthMode()).toBeUndefined();
     expect(planeRequiresLocalCredential()).toBe(false);
+  });
+});
+
+describe("which project the dashboard asks about", () => {
+  afterEach(() => {
+    __resetRuntimeOidcConfigForTests();
+    vi.unstubAllEnvs();
+  });
+
+  it("uses the scope the control plane reports rather than a compiled-in guess", async () => {
+    // The defect this closes: the literal was "acme"/"research" while the CLI
+    // defaults to "default"/"default". Both are free-form scopes a plane
+    // answers for, so nothing errored -- a job submitted with `eyvan run`
+    // simply never appeared on the page.
+    vi.stubEnv("VITE_EYVAN_ORG", "");
+    vi.stubEnv("VITE_EYVAN_PROJECT", "");
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ default_org: "default", default_project: "default" }), { status: 200 }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(configuredScope()).toEqual({ orgId: "default", projectId: "default" });
+  });
+
+  it("lets a build pin its own scope over the plane's default", async () => {
+    // A hosted deployment builds one bundle per environment; the plane's
+    // default must not silently move it to another project.
+    vi.stubEnv("VITE_EYVAN_ORG", "acme");
+    vi.stubEnv("VITE_EYVAN_PROJECT", "research");
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ default_org: "default", default_project: "default" }), { status: 200 }),
+    );
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(configuredScope()).toEqual({ orgId: "acme", projectId: "research" });
+  });
+
+  it("falls back to the CLI's default against a plane too old to report one", async () => {
+    vi.stubEnv("VITE_EYVAN_ORG", "");
+    vi.stubEnv("VITE_EYVAN_PROJECT", "");
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ issuer: null }), { status: 200 }));
+
+    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+
+    expect(configuredScope()).toEqual({ orgId: "default", projectId: "default" });
   });
 });

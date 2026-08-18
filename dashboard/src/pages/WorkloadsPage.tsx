@@ -131,12 +131,25 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
                   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
                   return (
-                    <tr key={workload.id}>
+                    // The row opens the workload, not just the name in it. Rows
+                    // already lit up on hover, so the whole width read as
+                    // clickable and only 250px of it was -- a click anywhere
+                    // else did nothing at all. The button stays for keyboard
+                    // and screen-reader users, and stops the event so one click
+                    // is one navigation.
+                    <tr
+                      key={workload.id}
+                      className="row-clickable"
+                      onClick={() => onOpenWorkload(workload.id)}
+                    >
                       <td>
                         <button
                           className="table-primary-link"
                           type="button"
-                          onClick={() => onOpenWorkload(workload.id)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onOpenWorkload(workload.id);
+                          }}
                         >
                           <strong>{workload.name}</strong>
                           <span>{workload.id} · {workload.project} · {workload.user}</span>

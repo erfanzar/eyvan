@@ -1147,6 +1147,9 @@ code,
 }
 
 .data-table tbody tr:hover { background: #fbfcfb; }
+/* Only rows that actually navigate get the pointer. A row that lights up on
+   hover but does nothing on click is the affordance lying about itself. */
+.data-table tbody tr.row-clickable { cursor: pointer; }
 .data-table tbody tr:last-child td { border-bottom: 0; }
 
 .workloads-table { min-width: 1260px; }
