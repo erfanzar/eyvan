@@ -18,7 +18,7 @@ import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkloadsPage } from "./WorkloadsPage";
-import type { Workload } from "../types";
+import type { WorkloadSummary } from "../types";
 
 const WORKLOAD = {
   id: "wl_1",
@@ -29,15 +29,15 @@ const WORKLOAD = {
   user: "erfan",
   submittedAt: "2026-08-18T00:00:00Z",
   resources: { cpu: 2, memoryGib: 4, replicas: 1, acceleratorCount: 0 },
-} as unknown as Workload;
+} as unknown as WorkloadSummary;
 
 function renderPage(onOpenWorkload: (id: string) => void) {
   return render(
     <WorkloadsPage
       workloads={[WORKLOAD]}
       onOpenWorkload={onOpenWorkload}
-      capabilities={{ canSubmit: false, canOperate: false, canManageFleet: false, canManageProject: false }}
-      onSubmitWorkload={() => {}}
+      onSubmit={() => {}}
+      canSubmit={false}
     />,
   );
 }
