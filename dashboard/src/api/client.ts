@@ -21,6 +21,7 @@ import type {
   AuditEvent,
   AvailableShape,
   BillingReport,
+  CapacityPoolSummary,
   Budget,
   CapacityLease,
   Cell,
@@ -1372,6 +1373,61 @@ export class EyvanApiClient {
       signal,
     });
     return { id: raw.id, state: raw.state };
+  }
+
+  /**
+   * The pools this project may submit to, as registered rather than as running.
+   *
+   * The fleet page could only ever show cells -- what is provisioned right now
+   * -- so a fleet with twenty pools and nothing running looked like an empty
+   * fleet, and there was no way to see what had been applied at all.
+   */
+  async listCapacityPools(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<CapacityPoolSummary[]> {
+    if (this.forceDemo) return [];
+    const raw = await this.request<Record<string, unknown>[]>(
+      `/capacity-pools?org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`,
+      { signal },
+    );
+    return (Array.isArray(raw) ? raw : []).map((pool) => ({
+      id: String(pool.id ?? ""),
+      fleetName: String(pool.fleet_name ?? ""),
+      acceleratorType: (pool.accelerator_type as string | null) ?? null,
+      capacityClass: String(pool.capacity_class ?? ""),
+      zone: (pool.zone as string | null) ?? null,
+      region: (pool.region as string | null) ?? null,
+      maxCells: Number(pool.max_cells ?? 0),
+      minCells: Number(pool.min_cells ?? 0),
+      enabled: pool.enabled !== false,
+    }));
+  }
+
+  /**
+   * Drain a whole fleet to zero.
+   *
+   * The route is DELETE and its name is "disable": it turns every pool off and
+   * sets its ceiling to zero so the autoscaler releases what is running. The
+   * fleet's definition survives, which is why the UI offers this as stopping a
+   * fleet rather than deleting one -- re-applying the same config brings it
+   * back without re-generating anything.
+   */
+  async disableFleet(fleetName: string, signal?: AbortSignal): Promise<number> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no fleet to stop", 400);
+    const pools = await this.request<unknown[]>(`/fleets/${encodeURIComponent(fleetName)}`, {
+      method: "DELETE",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      signal,
+    });
+    return Array.isArray(pools) ? pools.length : 0;
+  }
+
+  /** Remove one pool, leaving the rest of its fleet alone. */
+  async removeCapacityPool(poolId: string, signal?: AbortSignal): Promise<void> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no pool to remove", 400);
+    await this.request<unknown>(`/capacity-pools/${encodeURIComponent(poolId)}`, {
+      method: "DELETE",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      signal,
+    });
   }
 
   async updatePolicy(

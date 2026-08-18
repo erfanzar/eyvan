@@ -1027,7 +1027,7 @@ def test_tpu7x_slices_resolve_from_the_published_vm(monkeypatch) -> None:
 
 
 def test_a_tpu7x_slice_smaller_than_one_vm_is_refused() -> None:
-    """"All TPU7x slices use full-host, 4-chip VMs", so a smaller one is not a
+    """ "All TPU7x slices use full-host, 4-chip VMs", so a smaller one is not a
     slice this repository can describe."""
 
     assert shape_for("tpu7x-2") is None

@@ -22,6 +22,7 @@ from eyvan.sdk.client.identity import resolve_control_plane_identity
 from eyvan.sdk.commands.artifacts import register_artifact_commands
 from eyvan.sdk.commands.autoscale import register_autoscale_commands
 from eyvan.sdk.commands.capacity import register_capacity_commands
+from eyvan.sdk.commands.connect import register_connect_commands
 from eyvan.sdk.commands.contexts import register_context_commands
 from eyvan.sdk.commands.dashboard import register_dashboard_commands
 from eyvan.sdk.commands.doctor import register_doctor_commands
@@ -129,6 +130,7 @@ def main(
 
 for register_commands in (
     register_start_commands,
+    register_connect_commands,
     register_context_commands,
     register_doctor_commands,
     register_fleet_commands,

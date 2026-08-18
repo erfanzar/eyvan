@@ -848,6 +848,17 @@ export default function App({ client = apiClient, identityProvider = currentIden
     await refreshFleet();
   };
 
+  const stopFleet = async (fleetName: string) => {
+    // Same re-check as drainCell, for the same reason: authority is refreshed
+    // on every sweep, and this one turns off a whole fleet rather than a cell.
+    if (!capabilitiesForResource(snapshotRef.current.authority, fleetScope.orgId, fleetScope.projectId).manageFleet) {
+      throw new ApiError("This session may not manage fleet capacity", 403);
+    }
+    await client.disableFleet(fleetName, scopeOperationAbortRef.current.signal);
+    await refreshFleet();
+    await refreshDashboard(desiredScopeRef.current);
+  };
+
   const updatePolicy = async (policy: SchedulingPolicy, enabled: boolean) => {
     const current = snapshotRef.current;
     if (!current.selectedScope) throw new ApiError("No project scope is selected");
@@ -948,6 +959,12 @@ export default function App({ client = apiClient, identityProvider = currentIden
   };
 
   const fleetScope = selectedScope ? scopeSnapshot(selectedScope) : configuredScope();
+
+  const loadPools = useCallback(
+    (signal: AbortSignal) => client.listCapacityPools(fleetScope, signal),
+    [client, fleetScope],
+  );
+
   const loadWarmth = useCallback(
     (signal: AbortSignal) => withAuthorityRefresh(() => client.getWarmth(fleetScope, signal)),
     [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
@@ -1092,6 +1109,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadBilling={loadBilling}
             loadLaunchLatency={loadLaunchLatency}
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
+            onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
+            loadPools={loadPools}
           />
         );
         break;

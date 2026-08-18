@@ -9,6 +9,7 @@ import {
   Cpu,
   Gauge,
   KeyRound,
+  Layers,
   MapPin,
   MinusCircle,
   Network,
@@ -23,7 +24,14 @@ import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { BillingReport, CapacityLease, Cell, LaunchLatencyReport, WarmthReport } from "../types";
+import type {
+  BillingReport,
+  CapacityLease,
+  CapacityPoolSummary,
+  Cell,
+  LaunchLatencyReport,
+  WarmthReport,
+} from "../types";
 
 interface FleetPageProps {
   cells: Cell[];
@@ -34,12 +42,25 @@ interface FleetPageProps {
   loadLaunchLatency: (signal: AbortSignal) => Promise<LaunchLatencyReport>;
   /** Absent unless this principal may manage the fleet, which hides the control. */
   onDrainCell?: (cellId: string) => Promise<void>;
+  /**
+   * Stop a whole fleet: every pool off, ceiling zero, autoscaler releases what
+   * is running. Absent for a principal who may not manage the fleet.
+   *
+   * The route this calls has existed since fleets did; nothing in the dashboard
+   * called it, so applying and tearing down were the two steps a team had to
+   * leave the browser for.
+   */
+  onStopFleet?: (fleetName: string) => Promise<void>;
+  /** The pools registered for this scope, running or not. */
+  loadPools?: (signal: AbortSignal) => Promise<CapacityPoolSummary[]>;
 }
 
 export function FleetPage({
   cells,
   leases,
   onRefresh,
+  onStopFleet,
+  loadPools,
   loadWarmth,
   loadBilling,
   loadLaunchLatency,
@@ -54,6 +75,10 @@ export function FleetPage({
   const [billing, setBilling] = useState<BillingReport | null>(null);
   const [costError, setCostError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [pools, setPools] = useState<CapacityPoolSummary[]>([]);
+  const [poolsError, setPoolsError] = useState<string | null>(null);
+  const [confirmStop, setConfirmStop] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<string | null>(null);
   const [refreshed, setRefreshed] = useState(false);
   const [draining, setDraining] = useState<Cell | null>(null);
   const [drainBusy, setDrainBusy] = useState(false);
@@ -128,6 +153,40 @@ export function FleetPage({
       });
     return () => controller.abort();
   }, [loadBilling, loadLaunchLatency, loadWarmth]);
+
+  useEffect(() => {
+    if (!loadPools) return;
+    const controller = new AbortController();
+    loadPools(controller.signal)
+      .then((value) => setPools(value))
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        setPoolsError(error instanceof Error ? error.message : "Could not read capacity pools");
+      });
+    return () => controller.abort();
+  }, [loadPools, stopping]);
+
+  const fleets = useMemo(() => {
+    const grouped = new Map<
+      string,
+      { name: string; pools: CapacityPoolSummary[]; shapes: string[]; zones: string[]; disabled: number }
+    >();
+    for (const pool of pools) {
+      const existing = grouped.get(pool.fleetName) ?? {
+        name: pool.fleetName,
+        pools: [],
+        shapes: [],
+        zones: [],
+        disabled: 0,
+      };
+      existing.pools.push(pool);
+      if (pool.acceleratorType && !existing.shapes.includes(pool.acceleratorType)) existing.shapes.push(pool.acceleratorType);
+      if (pool.zone && !existing.zones.includes(pool.zone)) existing.zones.push(pool.zone);
+      if (!pool.enabled) existing.disabled += 1;
+      grouped.set(pool.fleetName, existing);
+    }
+    return [...grouped.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }, [pools]);
 
   const warmHourlyCost = (warmth?.pools ?? []).reduce((total, pool) => total + pool.hourly_cost, 0);
 
@@ -207,6 +266,94 @@ export function FleetPage({
           </dl>
         )}
       </section>
+
+      {fleets.length > 0 && (
+        <section className="panel data-panel" aria-label="Applied fleets">
+          <div className="panel-header">
+            <div>
+              <h2>Applied fleets</h2>
+              <p>What this project may submit to, whether or not anything is running on it</p>
+            </div>
+            <Layers size={18} aria-hidden="true" />
+          </div>
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Fleet</th>
+                  <th>Pools</th>
+                  <th>Shapes</th>
+                  <th>Zone</th>
+                  {onStopFleet && <th aria-label="Actions" />}
+                </tr>
+              </thead>
+              <tbody>
+                {fleets.map((fleet) => (
+                  <tr key={fleet.name}>
+                    <td>
+                      <span className="resource-cell">
+                        <strong>{fleet.name}</strong>
+                        {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
+                      </span>
+                    </td>
+                    <td>{fleet.pools.length}</td>
+                    <td>
+                      <span className="resource-cell">
+                        <strong>{fleet.shapes.slice(0, 3).join(", ")}</strong>
+                        {fleet.shapes.length > 3 && <small>+{fleet.shapes.length - 3} more</small>}
+                      </span>
+                    </td>
+                    <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
+                    {onStopFleet && (
+                      <td>
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          disabled={stopping === fleet.name}
+                          onClick={() => setConfirmStop(fleet.name)}
+                        >
+                          {stopping === fleet.name ? "Stopping" : "Stop"}
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {poolsError && (
+            <div className="inline-error" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {poolsError}
+            </div>
+          )}
+        </section>
+      )}
+
+      {confirmStop && onStopFleet && (
+        <ConfirmDialog
+          open
+          title={`Stop ${confirmStop}?`}
+          consequence={
+            "Every pool in this fleet is disabled and its ceiling set to zero, so the autoscaler releases what is " +
+            "running. The fleet definition survives -- re-applying the same config brings it back."
+          }
+          confirmLabel="Stop fleet"
+          destructive
+          busy={stopping === confirmStop}
+          error={poolsError}
+          onCancel={() => setConfirmStop(null)}
+          onConfirm={() => {
+            const name = confirmStop;
+            setConfirmStop(null);
+            setStopping(name);
+            setPoolsError(null);
+            void onStopFleet(name)
+              .catch((error) => setPoolsError(error instanceof Error ? error.message : "Could not stop the fleet"))
+              .finally(() => setStopping(null));
+          }}
+        />
+      )}
 
       <section className="panel topology-panel">
         <div className="panel-header">

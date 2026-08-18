@@ -404,6 +404,19 @@ export interface PoolWarmth {
   hourly_cost: number;
 }
 
+/** One registered capacity pool, as the control plane holds it. */
+export interface CapacityPoolSummary {
+  id: string;
+  fleetName: string;
+  acceleratorType: string | null;
+  capacityClass: string;
+  zone: string | null;
+  region: string | null;
+  maxCells: number;
+  minCells: number;
+  enabled: boolean;
+}
+
 export interface WarmthReport {
   observed_at: string;
   pools: PoolWarmth[];

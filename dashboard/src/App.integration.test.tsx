@@ -184,6 +184,10 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     ),
     getQueueTrend: vi.fn(async () => [{ label: "10:00", submitted: 1, admitted: 1 }]),
     listCells: vi.fn(async () => mockCells.slice(0, 1)),
+    // The fleet page reads registered pools, which is a different question
+    // from which cells exist: a fleet with twenty pools and nothing running
+    // is the ordinary case and used to be indistinguishable from no fleet.
+    listCapacityPools: vi.fn(async () => []),
     listAuditEvents: vi.fn(async () => mockAuditEvents.slice(0, 1)),
     followEvents: vi.fn(
       overrides.followEvents ??
