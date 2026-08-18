@@ -1288,3 +1288,66 @@ describe("provider TPU quota", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+describe("how long a read is given", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("gives provider quota longer than a control-plane read", async () => {
+    // The defect: quota discovery lists accelerator types in every zone a
+    // project can see and takes tens of seconds cold, but ran on the 3.5s
+    // budget meant for a database read. The page showed "Eyvan API request
+    // timed out" on every first visit while the read itself was fine.
+    vi.useFakeTimers();
+    let settle: (value: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((resolve, reject) => {
+            settle = resolve;
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      ),
+    );
+    const client = new EyvanApiClient("/api/v1", false);
+    const pending = client.getTpuQuota();
+
+    // Well past the control-plane budget, and the request is still alive.
+    await vi.advanceTimersByTimeAsync(20_000);
+    settle(new Response(JSON.stringify({ entries: [], status: "ok" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+
+    await expect(pending).resolves.toMatchObject({ status: "ok" });
+  });
+
+  it("still bounds it rather than waiting forever", async () => {
+    // A budget that never fires is a hung tab. The server answers with the
+    // previous reading or a stated failure at its own deadline; this outlasts
+    // that answer, it does not replace it.
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      ),
+    );
+    const client = new EyvanApiClient("/api/v1", false);
+    const pending = client.getTpuQuota();
+    const settled = pending.then(
+      () => "resolved",
+      (error) => (error as Error).message,
+    );
+
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    await expect(settled).resolves.toContain("timed out");
+  });
+});

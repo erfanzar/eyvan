@@ -521,6 +521,21 @@ const CONTROL_PLANE_TIMEOUT_MS = 3_500;
  */
 const WORKER_FORWARDED_TIMEOUT_MS = 30_000;
 
+/**
+ * Budget for a read the control plane answers by calling the cloud provider.
+ *
+ * Provider quota discovery lists accelerator types in every quota zone a
+ * project can see: `gcloud` calls, not a database read, and the better part of
+ * a minute on a cold cache. On the control-plane budget the quota page timed
+ * out on every first visit and showed "Eyvan API request timed out" -- the read
+ * itself was fine and finishing, and nothing was ever waiting for it.
+ *
+ * Comfortably above the server's own deadline, which answers with the previous
+ * reading or a stated failure rather than hanging. This budget exists to
+ * outlast that answer, not to replace it.
+ */
+const PROVIDER_READ_TIMEOUT_MS = 45_000;
+
 export class EyvanApiClient {
   private activeScope: AuthScope;
 
@@ -1007,7 +1022,7 @@ export class EyvanApiClient {
     if (options.project) query.set("project", options.project);
     if (options.refresh) query.set("refresh", "true");
     const suffix = query.size ? `?${query.toString()}` : "";
-    return this.request<TpuQuotaSnapshot>(`/capacity/quota${suffix}`, { signal });
+    return this.request<TpuQuotaSnapshot>(`/capacity/quota${suffix}`, { signal }, PROVIDER_READ_TIMEOUT_MS);
   }
 
   async listCells(

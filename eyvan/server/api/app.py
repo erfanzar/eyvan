@@ -1371,16 +1371,25 @@ def create_app(
                 ttl_s=TPU_QUOTA_CACHE_TTL_S,
             )
         zones = tuple(sorted({value.strip() for value in (zone or []) if value.strip()}))
-        readings = [
-            await quota_cache.read(
-                discovery=resolve_quota_discovery(),
-                project=selected,
-                zones=zones,
-                capacity_class=capacity_class,
-                refresh=refresh,
+        # Concurrently, so the deadline the cache states is the deadline this
+        # endpoint honours. Awaited in sequence, two independent provider reads
+        # each bounded at 25s made the worst case 50s -- and a bound a caller
+        # can exceed twice over is not a bound: the dashboard budgeted for the
+        # stated one and timed out on every cold read.
+        readings = list(
+            await asyncio.gather(
+                *(
+                    quota_cache.read(
+                        discovery=resolve_quota_discovery(),
+                        project=selected,
+                        zones=zones,
+                        capacity_class=capacity_class,
+                        refresh=refresh,
+                    )
+                    for capacity_class in (CapacityClass.SPOT, CapacityClass.ON_DEMAND)
+                )
             )
-            for capacity_class in (CapacityClass.SPOT, CapacityClass.ON_DEMAND)
-        ]
+        )
         observed_at = utcnow()
         entries = [
             TpuQuotaEntry.from_availability(row, capacity_class=reading.capacity_class, observed_at=observed_at)
