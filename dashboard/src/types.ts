@@ -71,6 +71,22 @@ export interface WorkloadSummary {
   budgetSpent?: number;
   budgetLimit?: number;
   queueReason?: string;
+  /**
+   * Which attempt is running, and what the earlier ones were charged to.
+   *
+   * The timeline carries the events, but counting them by hand is not the
+   * question an operator has in front of a spot job: it is whether this job is
+   * about to run out of retries, and whether what keeps killing it is the cloud
+   * taking the capacity back or the pool failing to give any. Those are
+   * separate budgets, and only one of them is the expected ending of a spot job.
+   *
+   * Optional throughout, because a plane that predates the split reports
+   * neither, and absent must render as unknown rather than as zero.
+   */
+  attempt?: number;
+  preemptionCount?: number;
+  capacityLossCount?: number;
+  failureReason?: string;
 }
 
 export interface TimelineEvent {

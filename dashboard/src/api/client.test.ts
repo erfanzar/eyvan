@@ -207,6 +207,43 @@ describe("EyvanApiClient", () => {
     expect(workloads[0].progress).toBeUndefined();
   });
 
+  it("keeps a reclaimed attempt distinct from a capacity failure", async () => {
+    // The two counts are the plane's answer to "why is this on attempt 3", and
+    // they mean opposite things: a spot job reclaimed twice is behaving as
+    // designed, while one that lost capacity twice is running out of pool. The
+    // client used to declare `attempt` on the wire and then drop it along with
+    // both counts, so the operations UI could show neither.
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([{ ...rawWorkload, attempt: 3, preemption_count: 2, capacity_loss_count: 0 }]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const workloads = await new EyvanApiClient("/api/v1", false).listWorkloads();
+
+    expect(workloads[0]).toMatchObject({ attempt: 3, preemptionCount: 2, capacityLossCount: 0 });
+  });
+
+  it("reports an older plane's missing counts as unknown rather than as zero", async () => {
+    // A plane that predates the budget split sends neither field. Defaulting
+    // them to 0 would render "reclaimed 0 times" for a job that may have been
+    // reclaimed repeatedly -- a confident wrong answer in place of no answer.
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([rawWorkload]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const workloads = await new EyvanApiClient("/api/v1", false).listWorkloads();
+
+    expect(workloads[0].preemptionCount).toBeUndefined();
+    expect(workloads[0].capacityLossCount).toBeUndefined();
+  });
+
   it("sends development identity headers only when explicitly enabled", async () => {
     vi.stubEnv("VITE_EYVAN_DEV_AUTH", "true");
     vi.stubEnv("VITE_EYVAN_DEV_USER", "local-operator");

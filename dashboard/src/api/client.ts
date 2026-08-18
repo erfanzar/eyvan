@@ -56,6 +56,17 @@ interface RawWorkload {
   project_id: string;
   state: string;
   attempt: number;
+  /**
+   * How the plane accounted for every attempt after the first. A spot
+   * reclamation and a capacity loss are charged to different budgets because
+   * they mean opposite things about whether running again can work, and only
+   * one of them is the expected ending of a spot job. Optional: a plane that
+   * predates the split reports neither, and absent must read as unknown rather
+   * than as zero preemptions.
+   */
+  preemption_count?: number;
+  capacity_loss_count?: number;
+  failure_reason?: string | null;
   lease_id?: string;
   checkpoint_uri?: string;
   scheduling_reason?: string;
@@ -234,6 +245,10 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
     startedAt: raw.state === "running" ? raw.updated_at : undefined,
     queueReason: raw.scheduling_reason,
     command: raw.spec.execution.kind === "command" ? raw.spec.execution.command : raw.spec.execution.artifact_uri,
+    attempt: raw.attempt,
+    preemptionCount: raw.preemption_count,
+    capacityLossCount: raw.capacity_loss_count,
+    failureReason: raw.failure_reason ?? undefined,
     checkpointUri: raw.checkpoint_uri,
     leaseId: raw.lease_id,
     // Populated by getWorkload from this workload's leases; the list view has no

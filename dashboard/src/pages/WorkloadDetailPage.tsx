@@ -229,6 +229,14 @@ export function WorkloadDetailPage({
             </div>
             <dl className="runtime-list">
               <div><dt>Checkpoint</dt><dd className="monospace">{workload.checkpointUri ?? "No checkpoint"}</dd></div>
+              <div><dt>Attempt</dt><dd>{workload.attempt ?? "Unknown"}</dd></div>
+              {/* Named for what was charged, not "retries". A job on its third
+                  attempt because the cloud took the slice back twice is healthy
+                  and expected; one on its third because the pool could not give
+                  capacity is not, and the two look identical under one count. */}
+              <div><dt>Reclaimed</dt><dd>{workload.preemptionCount ?? "Unknown"}</dd></div>
+              <div><dt>Capacity lost</dt><dd>{workload.capacityLossCount ?? "Unknown"}</dd></div>
+              {workload.failureReason ? <div><dt>Failure</dt><dd>{workload.failureReason}</dd></div> : null}
               <div><dt>Labels</dt><dd>{Object.entries(workload.labels).map(([key, value]) => <span className="label-chip" key={key}>{key}={value}</span>)}</dd></div>
             </dl>
           </section>

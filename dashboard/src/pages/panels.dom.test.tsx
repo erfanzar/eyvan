@@ -20,7 +20,7 @@
  * Both are asserted here against a real DOM.
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiClient } from "../api/client";
@@ -97,6 +97,50 @@ describe("the placement verdict panel", () => {
       />);
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
+  });
+});
+
+describe("why a workload is on the attempt it is on", () => {
+  it("separates capacity the cloud took back from capacity the pool could not give", async () => {
+    // Both send a job round again, and an operator reads them opposite ways: a
+    // spot job reclaimed twice is behaving exactly as bought, while one that
+    // lost capacity twice is running out of pool. The plane has kept these in
+    // separate budgets since Phase 8 and the page showed neither, so the only
+    // way to answer "why is this on attempt 3" was to count timeline entries
+    // by eye -- which cannot distinguish them at all.
+    const reclaimed = { ...workload(), attempt: 3, preemptionCount: 2, capacityLossCount: 0 };
+
+    render(<WorkloadDetailPage
+        workload={reclaimed}
+        onBack={() => {}}
+        onAction={async () => {}}
+        canOperate
+        loadExplanation={loadExplanation}
+      />);
+
+    const runtime = screen.getByText("Reclaimed").closest("dl");
+    expect(runtime).not.toBeNull();
+    expect(within(runtime as HTMLElement).getByText("Attempt").nextElementSibling?.textContent).toBe("3");
+    expect(within(runtime as HTMLElement).getByText("Reclaimed").nextElementSibling?.textContent).toBe("2");
+    expect(within(runtime as HTMLElement).getByText("Capacity lost").nextElementSibling?.textContent).toBe("0");
+  });
+
+  it("says unknown for a plane that does not report the counts", async () => {
+    // Rendering 0 here would tell an operator a repeatedly-reclaimed job had
+    // never been touched. No answer is the honest one.
+    const older = { ...workload(), attempt: undefined, preemptionCount: undefined, capacityLossCount: undefined };
+
+    render(<WorkloadDetailPage
+        workload={older}
+        onBack={() => {}}
+        onAction={async () => {}}
+        canOperate
+        loadExplanation={loadExplanation}
+      />);
+
+    const runtime = screen.getByText("Reclaimed").closest("dl") as HTMLElement;
+    expect(within(runtime).getByText("Reclaimed").nextElementSibling?.textContent).toBe("Unknown");
+    expect(within(runtime).getByText("Capacity lost").nextElementSibling?.textContent).toBe("Unknown");
   });
 });
 
