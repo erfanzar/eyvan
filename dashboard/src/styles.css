@@ -1,5 +1,13 @@
 :root {
-  color-scheme: light dark;
+  /* Dark, and not because the operating system said so.
+     This is an operations console: it sits open on a second monitor beside a
+     terminal for hours, and the bright surface was the thing lighting up the
+     room at 3am next to a job that had not finished. So dark is the product's
+     look rather than a mode it can be put into, and light is the opt-out --
+     `data-theme="light"` on the root element -- rather than the other way
+     round. Nothing here reads prefers-color-scheme: a viewer whose OS is set
+     light still gets the console the way it is designed. */
+  color-scheme: dark;
 
   /* Type scale.
      Eleven ad-hoc sizes became seven steps with roles. The old base was 12px
@@ -24,74 +32,9 @@
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 
-  /* Light palette. The neutrals keep a slight green bias rather than a pure
-     grey, so they read as chosen beside the deep green this product is named
-     in rather than as whatever the browser had. */
-  --bg: #f4f6f4;
-  --surface: #ffffff;
-  --surface-muted: #f8f9f8;
-  --border: #dfe4e0;
-  --border-strong: #cbd3cd;
-  --text: #202421;
-  --text-muted: #69716b;
-  --text-soft: #8a928c;
-  --sidebar: #171a18;
-  --sidebar-soft: #222724;
-  --sidebar-text: #f4f7f5;
-  --green: #176c55;
-  --green-soft: #e8f4ef;
-  --on-green: #ffffff;
-  --blue: #2d62c7;
-  --blue-soft: #eaf0fb;
-  --amber: #a65d0a;
-  --amber-soft: #fbf0dd;
-  --red: #b23830;
-  --red-soft: #fbeceb;
-  --violet: #7250ad;
-  --violet-soft: #f0ebf8;
-  --shadow: 0 1px 2px rgba(20, 30, 23, 0.04), 0 6px 18px rgba(20, 30, 23, 0.035);
-
-  color: var(--text);
-  background: var(--bg);
-}
-
-/* Dark, for a viewer whose OS says so and who has expressed no preference of
-   their own -- guarded so an explicit light choice still wins on a dark OS.
-   Tokens only, never component names: a colour whose single definition sits
-   behind a media query renders one theme's text on the other theme's ground. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #101311;
-    --surface: #171b19;
-    --surface-muted: #1c211e;
-    --border: #2a302c;
-    --border-strong: #3a423d;
-    --text: #e7ebe8;
-    --text-muted: #9aa39d;
-    --text-soft: #7c857f;
-    --sidebar: #0b0d0c;
-    --sidebar-soft: #171b19;
-    --sidebar-text: #e7ebe8;
-    /* Lifted off the light values: #176c55 on a near-black ground is closer to
-       unreadable than to subtle, and each soft pair becomes a tint of the
-       ground rather than of white. */
-    --green: #4bbd97;
-    --green-soft: #16302a;
-    --on-green: #08120f;
-    --blue: #7ba5f0;
-    --blue-soft: #16233b;
-    --amber: #d99a4e;
-    --amber-soft: #33260f;
-    --red: #e8837a;
-    --red-soft: #37201e;
-    --violet: #a992e0;
-    --violet-soft: #241d38;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.3);
-  }
-}
-
-/* Again for an explicit choice, so the toggle wins in both directions. */
-:root[data-theme="dark"] {
+  /* The accent is lifted off its light-mode value: #176c55 on a near-black
+     ground is closer to unreadable than to subtle, and each soft pair is a
+     tint of the ground rather than of white. */
   --bg: #101311;
   --surface: #171b19;
   --surface-muted: #1c211e;
@@ -115,8 +58,40 @@
   --violet: #a992e0;
   --violet-soft: #241d38;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.3);
+
+  color: var(--text);
+  background: var(--bg);
 }
-/* --- end tokens --- */
+
+/* The opt-out. A complete palette rather than a patch, so no component can end
+   up holding one theme's colour against the other theme's ground. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6f4;
+  --surface: #ffffff;
+  --surface-muted: #f8f9f8;
+  --border: #dfe4e0;
+  --border-strong: #cbd3cd;
+  --text: #202421;
+  --text-muted: #69716b;
+  --text-soft: #8a928c;
+  --sidebar: #171a18;
+  --sidebar-soft: #222724;
+  --sidebar-text: #f4f7f5;
+  --green: #176c55;
+  --green-soft: #e8f4ef;
+  --on-green: #ffffff;
+  --blue: #2d62c7;
+  --blue-soft: #eaf0fb;
+  --amber: #a65d0a;
+  --amber-soft: #fbf0dd;
+  --red: #b23830;
+  --red-soft: #fbeceb;
+  --violet: #7250ad;
+  --violet-soft: #f0ebf8;
+  --shadow: 0 1px 2px rgba(20, 30, 23, 0.04), 0 6px 18px rgba(20, 30, 23, 0.035);
+}
+/* --- end tokens --- *//* --- end tokens --- */
 
 * {
   box-sizing: border-box;
