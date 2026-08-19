@@ -694,7 +694,13 @@ class LocalDaemonSupervisor:
     paths: LocalDaemonPaths = field(default_factory=LocalDaemonPaths)
     launcher: LocalDaemonLauncher = field(default_factory=SubprocessLocalDaemonLauncher)
     health_probe: HealthProbe = field(default_factory=HttpLocalDaemonHealthProbe)
-    startup_timeout_s: float = 20.0
+    #: How long a freshly started server is given to answer.
+    #:
+    #: Twenty seconds was the budget of a plane holding one local pool. Startup
+    #: reconciles every cell the fleet has, so a project with a dozen applied
+    #: fleets and cells mid-provision needs longer -- and the old failure was
+    #: not "wait more", it was killing the server and leaving nothing running.
+    startup_timeout_s: float = 90.0
     poll_interval_s: float = 0.1
     clock: Clock = field(default_factory=_default_clock)
     sleeper: Sleeper = field(default_factory=_default_sleeper)
@@ -997,9 +1003,20 @@ class LocalDaemonSupervisor:
                 raise LocalDaemonStartupError(endpoint, log_path, f"server process exited with status {exit_code}")
             remaining = deadline - self.clock()
             if remaining <= 0:
-                stop_owned_process(process)
-                clear_owner_only_record(record_path, pid=process.pid)
-                raise LocalDaemonStartupError(endpoint, log_path, "server did not become healthy before timeout")
+                # The process is alive and simply slower than the budget, which
+                # on a real fleet is the ordinary case: startup reconciles every
+                # cell, and each one that is provisioning or draining costs a
+                # provider round trip. Killing it here destroyed a reconcile in
+                # progress and left the operator with no control plane at all --
+                # observed with TPU capacity ACTIVE and nothing left to release
+                # it. The record stays written, so the next `ensure` adopts this
+                # process once it answers rather than starting a second one.
+                raise LocalDaemonStartupError(
+                    endpoint,
+                    log_path,
+                    f"server did not answer within {self.startup_timeout_s:.0f}s and is still starting; "
+                    "it was left running -- re-run this command to adopt it once it is healthy",
+                )
             self.sleeper(min(self.poll_interval_s, remaining))
 
 

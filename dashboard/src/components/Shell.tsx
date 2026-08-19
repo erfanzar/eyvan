@@ -14,6 +14,7 @@ import {
   LogOut,
   Menu,
   Plus,
+  Receipt,
   ServerCog,
   X,
 } from "lucide-react";
@@ -49,6 +50,7 @@ const navigation: Array<{
   { section: "workloads", label: "Workloads", icon: ClipboardList },
   { section: "fleet", label: "Fleet", icon: ServerCog },
   { section: "capacity", label: "Quota & capacity", icon: Gauge },
+  { section: "billing", label: "Billing", icon: Receipt },
   { section: "budgets", label: "Budgets & policies", icon: CircleDollarSign },
   { section: "audit", label: "Audit events", icon: Activity },
 ];
@@ -61,6 +63,7 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
     title: "Quota & capacity",
     description: "Where provider TPU quota is free right now, and where nobody could tell",
   },
+  billing: { title: "Billing", description: "What the fleet has run, and what anybody can say it cost" },
   budgets: { title: "Budgets & policies", description: "Spend controls and scheduling governance" },
   audit: { title: "Audit events", description: "Durable control-plane decision history" },
 };

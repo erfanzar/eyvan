@@ -22,6 +22,7 @@ import type {
   AvailableShape,
   BillingReport,
   CapacityPoolSummary,
+  ProjectUsage,
   Budget,
   CapacityLease,
   Cell,
@@ -1399,6 +1400,35 @@ export class EyvanApiClient {
       minCells: Number(pool.min_cells ?? 0),
       enabled: pool.enabled !== false,
     }));
+  }
+
+  /**
+   * Who in this project used what, and what anybody can say it cost.
+   *
+   * The cost is zero wherever a pool declares no unit price, and the caller has
+   * to be able to tell that from free -- hence `unpricedLeases` travelling
+   * beside it rather than being folded in.
+   */
+  async getProjectUsage(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<ProjectUsage> {
+    const raw = await this.request<Record<string, unknown>>(
+      `/usage?org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`,
+      { signal },
+    );
+    const subjects = Array.isArray(raw.subjects) ? (raw.subjects as Record<string, unknown>[]) : [];
+    return {
+      orgId: String(raw.org_id ?? scope.orgId),
+      projectId: String(raw.project_id ?? scope.projectId),
+      subjects: subjects.map((entry) => ({
+        subject: String(entry.subject ?? "unknown"),
+        workloads: Number(entry.workloads ?? 0),
+        settledWorkloads: Number(entry.settled_workloads ?? 0),
+        leases: Number(entry.leases ?? 0),
+        acceleratorHours: Number(entry.accelerator_hours ?? 0),
+        runningSeconds: Number(entry.running_seconds ?? 0),
+        settledCost: Number(entry.settled_cost ?? 0),
+        unpricedLeases: Number(entry.unpriced_leases ?? 0),
+      })),
+    };
   }
 
   /**

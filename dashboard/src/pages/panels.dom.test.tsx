@@ -161,6 +161,10 @@ describe("the warm capacity and cost panel", () => {
     });
     vi.spyOn(apiClient, "getBilling").mockResolvedValue({
       observed_at: "2026-07-29T12:00:00Z",
+      cells: 1,
+      billed_seconds: 3600,
+      idle_seconds: 0,
+      unpriced_cells: 0,
       accrued_cost: 120.5,
       idle_cost: 30.25,
     });
@@ -189,6 +193,10 @@ describe("the warm capacity and cost panel", () => {
     vi.spyOn(apiClient, "getWarmth").mockResolvedValue({ observed_at: "2026-07-29T12:00:00Z", pools: [] });
     vi.spyOn(apiClient, "getBilling").mockResolvedValue({
       observed_at: "2026-07-29T12:00:00Z",
+      cells: 1,
+      billed_seconds: 3600,
+      idle_seconds: 0,
+      unpriced_cells: 0,
       accrued_cost: 0,
       idle_cost: 0,
     });
@@ -207,6 +215,10 @@ describe("the launch latency panel", () => {
     vi.spyOn(apiClient, "getWarmth").mockResolvedValue({ observed_at: "2026-07-29T12:00:00Z", pools: [] });
     vi.spyOn(apiClient, "getBilling").mockResolvedValue({
       observed_at: "2026-07-29T12:00:00Z",
+      cells: 1,
+      billed_seconds: 3600,
+      idle_seconds: 0,
+      unpriced_cells: 0,
       accrued_cost: 0,
       idle_cost: 0,
     });

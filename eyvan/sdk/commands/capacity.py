@@ -558,6 +558,12 @@ def billing(session: CliSession, pool_id: str | None, as_json: bool) -> None:
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 
+def _entry(row: JsonValue) -> dict[str, tp.Any]:
+    """Read one built fleet row, which this module constructed itself."""
+
+    return tp.cast("dict[str, tp.Any]", row)
+
+
 @capacity.command("fleets")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
@@ -610,9 +616,19 @@ def fleets(session: CliSession, as_json: bool) -> None:
     if not rows:
         click.echo("No fleets are applied. Generate one with `eyvan autoscale generate --zone ZONE`.")
         return
-    click.echo("Fleets you can submit to:")
-    for row in rows:
-        entry = tp.cast("dict[str, tp.Any]", row)
+    # A fleet whose pools are all disabled is one `eyvan down` drained. It is
+    # still applied, and nothing can be submitted to it -- so it is listed under
+    # its own heading rather than under a promise the plane will not keep.
+    live = [row for row in rows if _entry(row)["pools"] != _entry(row)["disabled_pools"]]
+    drained = [row for row in rows if _entry(row)["pools"] == _entry(row)["disabled_pools"]]
+    if not live:
+        click.echo("No fleet can accept work; every applied fleet is drained.")
+    else:
+        click.echo("Fleets you can submit to:")
+    for row in live + drained:
+        if drained and row is drained[0]:
+            click.echo("\nDrained (apply a config to bring one back):")
+        entry = _entry(row)
         shapes = tp.cast("list[str]", entry["shapes"])
         zones = tp.cast("list[str]", entry["zones"])
         # The first three shapes and a count. A twenty-pool fleet listed in full

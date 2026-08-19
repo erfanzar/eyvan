@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-export type Section = "overview" | "workloads" | "fleet" | "capacity" | "budgets" | "audit";
+export type Section = "overview" | "workloads" | "fleet" | "capacity" | "billing" | "budgets" | "audit";
 
 export type Route =
   | { section: Section }

@@ -417,6 +417,25 @@ export interface CapacityPoolSummary {
   enabled: boolean;
 }
 
+/** One person's settled usage in a project. */
+export interface SubjectUsage {
+  subject: string;
+  workloads: number;
+  settledWorkloads: number;
+  leases: number;
+  acceleratorHours: number;
+  runningSeconds: number;
+  settledCost: number;
+  /** Leases on pools declaring no unit price. Their cost reads zero and is not. */
+  unpricedLeases: number;
+}
+
+export interface ProjectUsage {
+  orgId: string;
+  projectId: string;
+  subjects: SubjectUsage[];
+}
+
 export interface WarmthReport {
   observed_at: string;
   pools: PoolWarmth[];
@@ -442,6 +461,12 @@ export interface BillingReport {
   observed_at: string;
   accrued_cost: number;
   idle_cost: number;
+  /** Named rather than left to the index signature: the billing page reads
+   *  them, and `unpriced_cells` is what separates "free" from "not costed". */
+  cells: number;
+  billed_seconds: number;
+  idle_seconds: number;
+  unpriced_cells: number;
   [key: string]: unknown;
 }
 

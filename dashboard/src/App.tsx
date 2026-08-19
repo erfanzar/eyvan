@@ -23,6 +23,7 @@ import { SubmitWorkloadModal } from "./components/SubmitWorkloadModal";
 import { useLiveRefresh } from "./lib/useLiveRefresh";
 import { useVisibilityPolling } from "./lib/useVisibilityPolling";
 import { AuditPage } from "./pages/AuditPage";
+import { BillingPage } from "./pages/BillingPage";
 import { BudgetsPage } from "./pages/BudgetsPage";
 import { CapacityPage } from "./pages/CapacityPage";
 import { FleetPage } from "./pages/FleetPage";
@@ -960,6 +961,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
 
   const fleetScope = selectedScope ? scopeSnapshot(selectedScope) : configuredScope();
 
+  const loadUsage = useCallback(
+    (signal: AbortSignal) => client.getProjectUsage(fleetScope, signal),
+    [client, fleetScope],
+  );
+
   const loadPools = useCallback(
     (signal: AbortSignal) => client.listCapacityPools(fleetScope, signal),
     [client, fleetScope],
@@ -1125,6 +1131,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadCapacityEvents={capabilities.manageFleet ? loadCapacityEvents : undefined}
           />
         );
+        break;
+      case "billing":
+        content = <BillingPage loadBilling={loadBilling} loadUsage={loadUsage} />;
         break;
       case "budgets":
         content = (
