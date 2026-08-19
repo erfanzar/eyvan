@@ -86,6 +86,7 @@ from eyvan.records import (
     PolicyRecord,
     Principal,
     ProjectRecord,
+    ProjectUsageReport,
     QueueTrend,
     QuotaRecord,
     Role,
@@ -1311,6 +1312,26 @@ def create_app(
         """
 
         return await service.warmth_report(principal)
+
+    @app.get("/api/v1/usage", response_model=ProjectUsageReport, tags=["capacity"])
+    async def project_usage(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        org_id: str,
+        project_id: str,
+        since: datetime | None = None,
+    ) -> ProjectUsageReport:
+        """Report what each person in a project used, and what it cost.
+
+        The fleet's spending was answerable per pool and never per person, so a
+        shared project could see its bill and not its breakdown. Nothing new is
+        measured: a lease carries its settled cost and accelerator hours, and
+        its workload carries who submitted it.
+
+        Read permission, not project administration. The people sharing a
+        budget are exactly who should be able to see how it is being spent.
+        """
+
+        return await service.project_usage(principal, org_id=org_id, project_id=project_id, since=since)
 
     @app.get("/api/v1/capacity/billing", response_model=CellBillingReport, tags=["capacity"])
     async def cell_billing_report(

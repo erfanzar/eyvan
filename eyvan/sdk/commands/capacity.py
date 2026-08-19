@@ -25,6 +25,7 @@ import click
 
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 
 
 def _emit(payload: object, *, as_json: bool, renderer: JsonRenderer) -> None:
@@ -551,6 +552,31 @@ def billing(session: CliSession, pool_id: str | None, as_json: bool) -> None:
         "/api/v1/capacity/billing",
         params={} if pool_id is None else {"pool_id": pool_id},
     )
+    _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
+@capacity.command("usage")
+@click.option("--since", help="Only count runs submitted after this ISO-8601 instant, e.g. 2026-08-01.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def usage(session: CliSession, since: str | None, as_json: bool) -> None:
+    """Report what each person in this project used, and what it cost.
+
+    Cost settles per lease and was only ever reported per pool, so a shared
+    project could read its bill and never learn whose runs produced it.
+
+    A zero cost beside non-zero hours means the pool declares no unit price --
+    the count of such leases is reported rather than folded in, because a heavy
+    user of unpriced capacity otherwise reads as an idle one.
+    """
+
+    params: dict[str, str] = {
+        "org_id": session.org_id or DEFAULT_ORG_ID,
+        "project_id": session.project_id or DEFAULT_PROJECT_ID,
+    }
+    if since:
+        params["since"] = since
+    payload = session.client.request("GET", "/api/v1/usage", params=params)
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
 
 

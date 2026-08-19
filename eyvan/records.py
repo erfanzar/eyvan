@@ -2774,6 +2774,54 @@ class CellBillingReport(EyvanModel):
     unpriced_cells: int = Field(ge=0)
 
 
+class SubjectUsageRecord(EyvanModel):
+    """What one person used, and what it cost.
+
+    Eyvan settled cost per lease and reported it per pool, so the fleet's
+    spending was answerable and "who spent it" was not -- a shared project could
+    see its bill and not its breakdown. Every input already existed: a lease
+    carries settled cost and accelerator hours, and the workload it belongs to
+    carries who submitted it.
+
+    ``unpriced_leases`` is reported rather than folded into zero. A pool with no
+    declared unit price contributes nothing to ``settled_cost``, and without
+    this a heavy user of unpriced capacity is indistinguishable from an idle
+    one -- which is the reading that gets somebody's quota cut.
+    """
+
+    subject: str
+    org_id: str
+    project_id: str
+    workloads: int = Field(ge=0)
+    #: Terminal workloads only. A run still going has not settled, and counting
+    #: it would make the total move backwards when it finishes cheaper than its
+    #: reservation.
+    settled_workloads: int = Field(ge=0)
+    leases: int = Field(ge=0)
+    accelerator_hours: float = Field(ge=0)
+    running_seconds: float = Field(ge=0)
+    queued_seconds: float = Field(ge=0)
+    settled_cost: float = Field(ge=0)
+    unpriced_leases: int = Field(ge=0)
+    first_submitted_at: datetime | None = None
+    last_submitted_at: datetime | None = None
+
+
+class ProjectUsageReport(EyvanModel):
+    """Per-subject usage across one project, newest activity first."""
+
+    org_id: str
+    project_id: str
+    observed_at: datetime
+    subjects: tuple[SubjectUsageRecord, ...] = ()
+
+    @property
+    def total_cost(self) -> float:
+        """Return what the whole project settled over the same window."""
+
+        return sum(subject.settled_cost for subject in self.subjects)
+
+
 class WorkloadSpendRecord(EyvanModel):
     """What one run used and was charged, with the on-demand alternative.
 

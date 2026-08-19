@@ -109,6 +109,7 @@ from eyvan.records import (
     Principal,
     PriorityBand,
     ProjectRecord,
+    ProjectUsageReport,
     QueueTrend,
     QueueTrendPoint,
     QuotaRecord,
@@ -124,6 +125,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceObservation,
     ServiceReplicaHealthState,
+    SubjectUsageRecord,
     UserProgressReport,
     WarmthReport,
     WebhookRecord,
@@ -7413,6 +7415,121 @@ class ControlPlaneService:
                 )
             )
         return CarbonReport(observed_at=moment, regions=tuple(regions))
+
+    async def project_usage(
+        self,
+        principal: Principal,
+        *,
+        org_id: str,
+        project_id: str,
+        since: datetime | None = None,
+    ) -> ProjectUsageReport:
+        """Report what each person in a project used, and what it cost.
+
+        Cost was settled per lease and reported per pool, so a shared project
+        could see its bill and never its breakdown -- and "who is using the
+        v5p" is the first question anybody sharing a fleet asks.
+
+        Nothing new is measured. A lease already carries its settled cost and
+        accelerator hours; the workload it belongs to already carries who
+        submitted it. This is the join.
+
+        Read permission on the project, deliberately, and not MANAGE_PROJECT:
+        this answers how a shared budget is being spent, and the people sharing
+        it are exactly who should be able to see that without being made
+        administrators first.
+        """
+
+        self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
+        async with self.repository.transaction() as tx:
+            workloads = await tx.list_workloads(org_id=org_id, project_id=project_id)
+            leases = await tx.list_leases(org_id=org_id, project_id=project_id)
+
+        submitted_by = {workload.id: workload for workload in workloads}
+        totals: dict[str, dict[str, float]] = {}
+        seen: dict[str, dict[str, datetime]] = {}
+
+        def bucket(subject: str) -> dict[str, float]:
+            return totals.setdefault(
+                subject,
+                {
+                    "workloads": 0.0,
+                    "settled_workloads": 0.0,
+                    "leases": 0.0,
+                    "accelerator_hours": 0.0,
+                    "running_seconds": 0.0,
+                    "queued_seconds": 0.0,
+                    "settled_cost": 0.0,
+                    "unpriced_leases": 0.0,
+                },
+            )
+
+        for workload in workloads:
+            if since is not None and workload.created_at < since:
+                continue
+            row = bucket(workload.created_by)
+            row["workloads"] += 1
+            if workload.state in TERMINAL_WORKLOAD_STATES:
+                row["settled_workloads"] += 1
+            stamps = seen.setdefault(workload.created_by, {})
+            first = stamps.get("first")
+            last = stamps.get("last")
+            stamps["first"] = workload.created_at if first is None else min(first, workload.created_at)
+            stamps["last"] = workload.created_at if last is None else max(last, workload.created_at)
+
+        for lease in leases:
+            workload = submitted_by.get(lease.workload_id)
+            if workload is None:
+                # A lease whose workload has been collected. Charging it to
+                # nobody loses the cost; charging it to a guess is worse.
+                continue
+            if since is not None and workload.created_at < since:
+                continue
+            row = bucket(workload.created_by)
+            row["leases"] += 1
+            # A mapping of resource -> hours, not a scalar. Summed across
+            # resources: a gang holding TPU and CPU settles both, and taking
+            # only one would under-report the person who used the accelerator.
+            row["accelerator_hours"] += sum((lease.accelerator_hours_settled or {}).values())
+            row["running_seconds"] += lease.running_seconds or 0.0
+            row["queued_seconds"] += lease.queued_seconds or 0.0
+            settled = lease.settled_cost
+            if settled is None or (settled == 0 and (lease.hourly_cost or 0) == 0):
+                # Zero because the pool declares no unit price, not because the
+                # lease was free. Counted separately so a heavy user of unpriced
+                # capacity does not read as an idle one.
+                row["unpriced_leases"] += 1
+            row["settled_cost"] += settled or 0.0
+
+        subjects = tuple(
+            sorted(
+                (
+                    SubjectUsageRecord(
+                        subject=subject,
+                        org_id=org_id,
+                        project_id=project_id,
+                        workloads=int(row["workloads"]),
+                        settled_workloads=int(row["settled_workloads"]),
+                        leases=int(row["leases"]),
+                        accelerator_hours=row["accelerator_hours"],
+                        running_seconds=row["running_seconds"],
+                        queued_seconds=row["queued_seconds"],
+                        settled_cost=row["settled_cost"],
+                        unpriced_leases=int(row["unpriced_leases"]),
+                        first_submitted_at=seen.get(subject, {}).get("first"),
+                        last_submitted_at=seen.get(subject, {}).get("last"),
+                    )
+                    for subject, row in totals.items()
+                ),
+                key=lambda record: (-record.settled_cost, -record.accelerator_hours, record.subject),
+            )
+        )
+        return ProjectUsageReport(
+            org_id=org_id,
+            project_id=project_id,
+            observed_at=utcnow(),
+            subjects=subjects,
+        )
 
     async def warmth_report(self, principal: Principal, *, now: datetime | None = None) -> WarmthReport:
         """Report every pool's warm floor and whether it is currently held.

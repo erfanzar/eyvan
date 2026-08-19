@@ -40,6 +40,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "GET /api/v1/workloads/{workload_id}": "read another org's workload",
     "GET /api/v1/workloads/{workload_id}/explain": "read another org's scheduling verdict",
     "GET /api/v1/workloads/{workload_id}/cost": "read what another org's run cost them",
+    "GET /api/v1/usage": "read who in another org spent what, and on which accelerators",
     "GET /api/v1/webhooks": "read where another org sends its events",
     "POST /api/v1/webhooks": "send another org's audit trail somewhere of your choosing",
     "DELETE /api/v1/webhooks/{webhook_id}": "silence another org's notifications",

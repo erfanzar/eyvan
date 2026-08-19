@@ -103,7 +103,7 @@ def test_a_plane_with_no_fleet_says_what_to_do_next() -> None:
 
 
 def test_an_unreachable_plane_names_the_address_and_the_cause() -> None:
-    """"Connection refused" and "refused this identity" are different fixes."""
+    """ "Connection refused" and "refused this identity" are different fixes."""
 
     rendered = render(ConnectOutcome(target=ConnectTarget("http://head:8080", False, "Connection refused")))
 
