@@ -986,6 +986,72 @@ async def test_pool_callable_submission_requests_one_atomic_multi_worker_cell() 
 
 
 @pytest.mark.asyncio
+async def test_a_pods_request_is_refused_where_no_multislice_queued_resource_can_exist() -> None:
+    """Admission checked the executor and never the backend, and it cost the plane.
+
+    A multi-worker request is one Cloud TPU *multislice* queued resource. Only the
+    ``gcp-tpu`` backend can create one, but this gate asked only whether the
+    executor was ``eyvan-native`` -- which a compute-backed TPU pool legitimately
+    is. So the submission was accepted and stored, and the failure surfaced later
+    inside the ``capacity-pools`` leader phase, which has no ``isolate_failures``:
+    it aborted every later phase on every tick and stopped the whole control
+    plane. Refusing at submit keeps the cost with the caller who can act on it.
+    """
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    operator = _principal(Role.PROJECT_OPERATOR)
+    execution = CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12")
+    resources = ResourceVector(cpu=0, memory_gib=0, tpu=8)
+    # v5p-8 is catalogued `capacity_backend: gcp-compute, multislice_capable: false`,
+    # and eyvan-native is a supported executor for it -- so every other gate passes.
+    # The `eyvan_resource_kind` label is what `_is_complete_tpu_pool` actually reads,
+    # and `fleet_config` stamps it from `kind:` on every pool declared in YAML, so
+    # this is the pool an ordinary fleet file produces -- not a contrived one.
+    compute_backed = _capacity_pool().model_copy(
+        update={
+            "accelerator_type": "v5p-8",
+            "capacity": resources,
+            "allocatable": resources,
+            "provider_options": {},
+            "executor": "eyvan-native",
+            "capacity_backend": "gcp-compute",
+            "labels": {"eyvan_resource_kind": "tpu"},
+        }
+    )
+    await service.upsert_capacity_pool(fleet_admin, compute_backed, idempotency_key="v5p-8-pool")
+
+    with pytest.raises(ConflictError, match="gcp-tpu capacity backend"):
+        await service.submit_pool_callable(
+            operator,
+            fleet_name="research-fleet",
+            org_id="acme",
+            project_id="research",
+            accelerator_type="v5p-8",
+            pods=2,
+            execution=execution,
+            idempotency_key="v5p-8-two-pods",
+        )
+
+    # pods=1 on the same pool stays legal: the refusal is about multislice, not
+    # about the backend being unusable.
+    workload, _ = await service.submit_pool_callable(
+        operator,
+        fleet_name="research-fleet",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-8",
+        pods=1,
+        execution=execution,
+        idempotency_key="v5p-8-one-pod",
+    )
+    assert workload.spec.worker_count == 1
+
+
+@pytest.mark.asyncio
 async def test_pool_callable_submission_enforces_the_gcp_multislice_worker_limit() -> None:
     repository = InMemoryRepository()
     service = ControlPlaneService(

@@ -285,6 +285,60 @@ async def test_generic_multislice_workload_scales_tpu_pool_end_to_end() -> None:
     assert cells[0].provider_options["node_count"] == 2
 
 
+@pytest.mark.asyncio
+async def test_a_multi_worker_workload_pinned_to_a_non_tpu_pool_cannot_stop_the_leader() -> None:
+    """One unplaceable workload used to halt scheduling for the whole plane.
+
+    ``capacity-pools`` is the second leader phase and carries no
+    ``isolate_failures``, so anything it raises aborts every later phase of the
+    cycle -- observation, scheduling, settlement, billing -- and the scheduler
+    loop retries the identical failure on every tick. The pinned branch of
+    ``CapacitySimulation.build`` called ``make_cell(worker_count=2)`` with no
+    backend guard, and ``make_cell`` refuses a multi-worker cell on a non-TPU
+    backend by raising. So a workload pinned to such a pool was a durable poison
+    pill: it stayed PENDING, so nothing cleared it, and the plane never scheduled
+    anything again.
+
+    A workload that can never be placed is skipped and left pending. That is what
+    an unplaceable workload is; it must not also be an outage.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    # A TPU pool on the compute backend -- what the catalog says a v5p-8 is, and
+    # a shape `eyvan-native` legitimately supports at one worker.
+    pool = multislice_tpu_pool(pool_id="research/v5p-8").model_copy(
+        update={"capacity_backend": "gcp-compute", "accelerator_type": "v5p-8"}
+    )
+    await service.apply_fleet(fleet_admin(), "research", (pool,), idempotency_key="fleet-v1")
+    await service.submit_workload(
+        operator(),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="pinned-multislice-on-compute",
+            execution=CommandExecution(command="python train.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 32, "memory_gib": 0, "tpu": 8}},
+            provider="gcp",
+            required_executor="eyvan-native",
+            required_labels={"eyvan_pool": pool.id},
+            worker_count=2,
+            worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        ),
+        idempotency_key="pinned-multislice-1",
+    )
+
+    # The phase completes rather than raising, and mints nothing for a shape that
+    # cannot exist.
+    assert await controller.reconcile_capacity_pools_once() == {"launched": 0, "drained": 0, "deleted": 0}
+    # Still true on the next tick: the workload is durable, so a fix that merely
+    # survived once would still stop the plane forever.
+    assert await controller.reconcile_capacity_pools_once() == {"launched": 0, "drained": 0, "deleted": 0}
+    async with repository.transaction() as transaction:
+        assert await transaction.list_cells() == []
+
+
 def test_cell_ids_do_not_repeat_across_control_plane_incarnations() -> None:
     """Found live 2026-08-01: a fresh control plane collided with old tombstones.
 

@@ -269,6 +269,18 @@ class CapacitySimulation:
             if exact_pool is None or not exact_pool.enabled:
                 generic_workloads.append(workload)
                 continue
+            if workload.spec.worker_count > 1 and not exact_pool.hosts_multi_worker_cells:
+                # The same guard the generic branch below has always had, and for a
+                # stronger reason here: this branch calls ``make_cell`` on a pool the
+                # *workload* named, so a spec that is already durable decides whether
+                # this planner raises. ``make_cell`` refuses a multi-worker cell on
+                # any non-TPU backend by raising, and ``capacity-pools`` is a leader
+                # phase without ``isolate_failures`` -- so the raise would abort every
+                # later phase of the cycle, including scheduling, settlement and
+                # billing, on every tick, for the whole control plane. A workload that
+                # can never be placed is skipped and left PENDING, which is what an
+                # unplaceable workload is; it must not be able to stop the plane.
+                continue
             for member in range(workload.spec.cell_group_count):
                 supply_key = (exact_pool.id, workload.spec.worker_count)
                 owned_supply_key = (*supply_key, workload.id)
@@ -292,11 +304,11 @@ class CapacitySimulation:
                 continue
             for workload in generic_workloads:
                 worker_count = workload.spec.worker_count
-                if worker_count > 1 and (
-                    pool.provider != "gcp" or pool.capacity_backend != "gcp-tpu" or pool.executor != "eyvan-native"
-                ):
+                if worker_count > 1 and not pool.hosts_multi_worker_cells:
                     # Multi-worker cells only exist on the GCP TPU backend with the
-                    # native executor; other pools can never host this shape.
+                    # native executor; other pools can never host this shape. Asked
+                    # through the pool record so this test and the refusal inside
+                    # ``make_cell`` cannot drift apart.
                     continue
                 for member in range(workload.spec.cell_group_count):
                     cell_id = stable_id("virtual_cell", pool.id, "generic", workload.id, member)

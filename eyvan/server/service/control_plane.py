@@ -977,10 +977,29 @@ class ControlPlaneService:
                 raise ConflictError(
                     f"TPU accelerator type {accelerator_type!r} in fleet {fleet_name!r} has max_workers set to zero"
                 )
-            if pods > 1 and pool.executor != "eyvan-native":
+            if pods > 1 and not pool.hosts_multi_worker_cells:
+                # Both halves matter, and only the executor half was ever checked.
+                # A pods>1 request against a ``gcp-compute`` TPU pool -- which is
+                # what the catalog says a ``v5p-8`` is -- passed this gate, was
+                # stored, and then reached ``make_cell`` inside the
+                # ``capacity-pools`` leader phase, which carries no
+                # ``isolate_failures``. The ValueError raised there aborted every
+                # later phase of that cycle -- scheduling, settlement, billing --
+                # on every tick, so one ordinary submission stopped the whole
+                # control plane, and the workload stayed PENDING so nothing ever
+                # cleared it.
                 raise ConflictError(
-                    "multi-worker TPU callables require an eyvan-native pool so Eyvan can fence the physical cell"
+                    f"TPU accelerator type {accelerator_type!r} in fleet {fleet_name!r} cannot host a pods={pods} "
+                    "callable: a multi-worker request is one Cloud TPU multislice queued resource, which requires a "
+                    "gcp-tpu capacity backend and the eyvan-native executor so Eyvan can create and fence it"
                 )
+            # Deliberately not also gated on the catalog's ``multislice_capable``.
+            # That field records the shape's *default* provisioning backend -- a
+            # v5p-8 is catalogued ``gcp-compute`` and therefore single-slice by
+            # default -- but an operator who declares a ``gcp-tpu`` pool for one
+            # has overridden exactly that, and a queued resource is then genuinely
+            # creatable. Refusing here would override the operator using a field
+            # that answers a different question.
             if pool.max_replica_resources is not None and pool.max_replica_resources != pool.allocatable:
                 raise ConflictError(
                     f"TPU accelerator type {accelerator_type!r} in fleet {fleet_name!r} partitions workers with "

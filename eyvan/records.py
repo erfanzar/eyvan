@@ -1762,6 +1762,24 @@ class CapacityPoolRecord(EyvanModel):
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
         return hashlib.sha256(encoded).hexdigest()
 
+    @property
+    def hosts_multi_worker_cells(self) -> bool:
+        """Return whether this pool can mint a cell wider than one worker.
+
+        The readable form of the refusals :meth:`make_cell` raises, and the one
+        every caller that must *decide* rather than *attempt* should ask. A
+        multi-worker cell is one Cloud TPU multislice queued resource, which the
+        GCP TPU backend is the only thing that can create and the native executor
+        the only thing that can fence -- so a pool failing this can never host the
+        shape, whatever else is true of it.
+
+        It exists as a predicate because the alternative is calling ``make_cell``
+        to find out: that answers by raising, and the planner asks this question
+        inside a leader phase where a raise stops the control plane.
+        """
+
+        return self.provider == "gcp" and self.capacity_backend == "gcp-tpu" and self.executor == "eyvan-native"
+
     def make_cell(
         self,
         cell_id: str,
