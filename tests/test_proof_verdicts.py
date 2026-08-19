@@ -349,6 +349,48 @@ def test_a_reclaimed_cell_that_is_gone_cannot_vouch_for_the_absence_of_a_cooldow
     assert result.verdict is not Verdict.PASS
 
 
+def test_a_recreated_cell_still_witnesses_the_reclamation_it_recorded() -> None:
+    """The run that goes best must not be the one that settles least.
+
+    A pool that recreates the cell under its own id clears
+    ``provider_failure_code`` as soon as the replacement is healthy -- which is
+    the same moment the workload finishes resuming and ``workload-survived``
+    becomes settleable. Keyed on that field alone the criterion would go
+    inconclusive exactly on the clean runs.
+
+    ``availability.interruptions`` outlives the recreation and is the belief
+    this criterion is about, so it witnesses too. It is a time-decayed float,
+    which is why the check is not an integer one.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {
+                "id": "cell-a",
+                "pool_id": "research/v5p",
+                "provider_failure_code": None,
+                "availability": {"interruptions": 1.9604, "cooldown_until": None},
+            }
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+
+
+def test_a_cell_that_was_never_interrupted_does_not_witness() -> None:
+    """Otherwise a fresh replacement would vouch for an event it never saw."""
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [{"id": "replacement", "pool_id": "research/v5p", "availability": {"interruptions": 0.0}}],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.INCONCLUSIVE
+
+
 def test_a_surviving_reclaimed_cell_without_a_cooldown_is_a_real_pass() -> None:
     """The witness distinguishes this from the case above, and nothing else does.
 

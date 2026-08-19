@@ -226,6 +226,17 @@ def _is_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _is_positive_number(value: object) -> bool:
+    """Return whether ``value`` is a positive count that may have decayed.
+
+    Separate from :func:`_is_positive_int` because the availability counters are
+    time-decayed floats -- one interruption reads as 1.9604, not 1 -- so an
+    int-only check would treat every one of them as absent.
+    """
+
+    return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+
+
 # --------------------------------------------------------------------------- P5
 
 
@@ -297,10 +308,23 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     # still sets the cooldown -- qualifying the defect by garbage collection.
     # Passing therefore requires a witness: the reclaimed cell, present and not
     # cooling. Without one this is inconclusive, not proven.
+    #
+    # ``provider_failure_code`` alone is too thin a witness. It reports what the
+    # provider says *now*, so a pool that recreates the cell under its own id
+    # clears it the moment the replacement is healthy -- which is exactly when
+    # the workload finishes resuming and the rest of the proof becomes settleable.
+    # The criterion would then go inconclusive precisely on the runs that went
+    # best. ``availability.interruptions`` is the durable record of the same
+    # event and is the belief this criterion is actually about, so either will do.
     pool_ids = {pool["id"] for pool in pools}
     mine = [cell for cell in cells if cell.get("pool_id") in pool_ids]
     cooling = [cell["id"] for cell in mine if (cell.get("availability") or {}).get("cooldown_until")]
-    witnesses = [cell["id"] for cell in mine if cell.get("provider_failure_code") == "preempted"]
+    witnesses = [
+        cell["id"]
+        for cell in mine
+        if cell.get("provider_failure_code") == "preempted"
+        or _is_positive_number((cell.get("availability") or {}).get("interruptions"))
+    ]
     if cooling:
         checks.append(
             _failed(
