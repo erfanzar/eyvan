@@ -1833,7 +1833,16 @@ class CapacityPoolRecord(EyvanModel):
     warm_windows: tuple[WarmWindow, ...] = ()
     initial_cells: int | None = Field(default=None, ge=0)
     max_cells: int = Field(default=1, ge=0, le=10_000)
-    idle_timeout_s: float = Field(default=300, ge=0)
+    #: Seconds a cell holds capacity after its last lease leaves, so the next job
+    #: reuses the slice instead of re-queuing for one. Sized against what
+    #: reacquisition actually costs rather than against tidiness: a real TPU cell
+    #: recorded 1427.8s to reach READY, and a contended zone can leave a request
+    #: in WAITING_FOR_RESOURCES for days. Releasing a slice to save a few idle
+    #: minutes and then paying twenty-four to get it back is a bad trade, and on
+    #: granted spot capacity the idle minutes are the cheaper half. Set zero to
+    #: release on the first sweep where holding a scarce slice costs someone else
+    #: more than re-queuing costs you.
+    idle_timeout_s: float = Field(default=1800, ge=0)
     queue_timeout_s: float | None = Field(default=None, gt=0)
     provisioning_timeout_s: float = Field(default=1800, gt=0)
     upscaling_speed: float = Field(default=1.0, gt=0)

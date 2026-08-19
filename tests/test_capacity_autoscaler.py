@@ -1555,3 +1555,56 @@ async def test_a_cell_reclaimed_after_it_served_records_no_stockout() -> None:
 
     assert reclaimed.availability.failure_evidence == before.failure_evidence
     assert reclaimed.availability.cooldown_until is None
+
+
+@pytest.mark.asyncio
+async def test_an_idle_cell_is_kept_for_reuse_until_its_window_expires() -> None:
+    """A freed cell stays usable, so the next job reuses it instead of re-queuing.
+
+    This is the reason ``idle_timeout_s`` defaults high rather than to zero. A
+    real TPU cell recorded 1427.8 seconds to reach READY and a contended zone can
+    hold a request in WAITING_FOR_RESOURCES indefinitely, so a sweep that
+    reclaims capacity the moment a lease ends trades a twenty-four minute
+    reacquisition for a few idle minutes of already-granted capacity.
+
+    Both halves are asserted together because only the pair is the contract:
+    holding forever is a leak, and releasing immediately is the trade above.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    await service.apply_fleet(
+        fleet_admin(),
+        "research",
+        (cpu_pool(initial_cells=1).model_copy(update={"idle_timeout_s": 1800, "min_cells": 0}),),
+        idempotency_key="fleet-v1",
+    )
+    await controller.reconcile_capacity_pools_once()
+
+    async def set_idle_for(seconds: float) -> None:
+        async with repository.transaction() as transaction:
+            cell = (await transaction.list_cells())[0]
+            await transaction.put_cell(
+                cell.model_copy(
+                    update={
+                        "state": CellState.READY,
+                        "provider_phase": CapacityStatus.HEALTHY,
+                        "idle_since": cell.created_at - timedelta(seconds=seconds),
+                    }
+                )
+            )
+
+    # Inside the window: the slice is held for whatever lands next.
+    await set_idle_for(1500)
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        held = (await transaction.list_cells())[0]
+    assert held.state is CellState.READY
+
+    # Past it: nobody came, and holding a granted slice indefinitely is a leak.
+    await set_idle_for(1900)
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        released = (await transaction.list_cells())[0]
+    assert released.state is CellState.DRAINING

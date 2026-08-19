@@ -415,7 +415,7 @@ class CapacityPoolUpsertRequest(ApiModel):
     warm_windows: tuple[WarmWindow, ...] = ()
     initial_cells: int | None = Field(default=None, ge=0)
     max_cells: int = Field(default=1, ge=0, le=10_000)
-    idle_timeout_s: float = Field(default=300, ge=0)
+    idle_timeout_s: float = Field(default=1800, ge=0)
     queue_timeout_s: float | None = Field(default=None, gt=0)
     provisioning_timeout_s: float = Field(default=1800, gt=0)
     upscaling_speed: float = Field(default=1.0, gt=0)

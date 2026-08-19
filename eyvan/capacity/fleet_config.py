@@ -337,7 +337,7 @@ class ProviderConfig(FleetConfigModel):
 class AutoscalingDefaults(FleetConfigModel):
     """Fleet-wide defaults for server-side capacity pool reconciliation."""
 
-    idle_timeout_s: int = Field(default=300, ge=0)
+    idle_timeout_s: int = Field(default=1800, ge=0)
     queue_timeout_s: float | None = Field(default=None, gt=0)
     provisioning_timeout_s: int = Field(default=1800, gt=0)
     upscaling_speed: float = Field(default=1.0, gt=0)
