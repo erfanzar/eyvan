@@ -105,7 +105,7 @@ def test_callable_project_trust_policy_supports_scoped_and_project_entries() -> 
     assert not policy.allows("acme", "other")
     with pytest.raises(
         AuthorizationError,
-        match="callable workloads are not trusted for project acme/other",
+        match=r"callable workloads are not trusted for project acme/other; this plane trusts ",
     ):
         policy.require("acme", "other")
 

@@ -851,7 +851,11 @@ def test_loopback_development_trusts_only_the_default_callable_scope(tmp_path) -
 
     assert uploaded.status_code == 200
     assert denied_non_default.status_code == 403
-    assert denied_non_default.json() == {"detail": "callable workloads are not trusted for project acme/research"}
+    detail = denied_non_default.json()["detail"]
+    assert detail.startswith("callable workloads are not trusted for project acme/research")
+    # The refusal must say what *is* trusted; without it the submitter sees a
+    # project they never typed and cannot tell which half of their config is wrong.
+    assert "this plane trusts default/default" in detail
 
 
 def test_network_bind_never_infers_callable_trust_from_loopback_public_url() -> None:
@@ -873,7 +877,9 @@ def test_network_bind_never_infers_callable_trust_from_loopback_public_url() -> 
     )
 
     assert response.status_code == 403
-    assert response.json() == {"detail": "callable workloads are not trusted for project default/default"}
+    detail = response.json()["detail"]
+    assert detail.startswith("callable workloads are not trusted for project default/default")
+    assert "trusts no project for callables" in detail
 
 
 def test_server_bind_policy_trusts_only_literal_loopback_addresses() -> None:
@@ -1112,7 +1118,9 @@ def test_pool_callable_api_rejects_untrusted_project_before_pool_lookup() -> Non
     )
 
     assert response.status_code == 403
-    assert response.json() == {"detail": "callable workloads are not trusted for project acme/research"}
+    detail = response.json()["detail"]
+    assert detail.startswith("callable workloads are not trusted for project acme/research")
+    assert "this plane trusts default/default" in detail
 
 
 def test_rbac_and_quota_crud() -> None:

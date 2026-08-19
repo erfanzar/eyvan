@@ -39,10 +39,32 @@ class CallableProjectTrustPolicy:
         return project_id in self.trusted_projects or f"{org_id}/{project_id}" in self.trusted_projects
 
     def require(self, org_id: str, project_id: str) -> None:
-        """Reject callable submission for a project outside this policy."""
+        """Reject callable submission for a project outside this policy.
 
-        if not self.allows(org_id, project_id):
-            raise AuthorizationError(f"callable workloads are not trusted for project {org_id}/{project_id}")
+        The refusal names what *is* trusted. The identity in a submission comes
+        from the caller's active context, not from the fleet they named, so the
+        common way to arrive here is to pass ``init(fleet=...)`` while a context
+        selecting some other org and project is active -- the fleet is
+        overridden and the identity is inherited. Reporting only the rejected
+        project leaves that invisible: the submitter sees a project they never
+        typed and no way to tell which of the two halves is wrong.
+        """
+
+        if self.allows(org_id, project_id):
+            return
+        if self.trusted_projects:
+            trusted = ", ".join(sorted(self.trusted_projects))
+            remedy = f"this plane trusts {trusted}"
+        else:
+            remedy = (
+                "this plane trusts no project for callables; set EYVAN_TRUSTED_CALLABLE_PROJECTS "
+                "or run it as a loopback development plane"
+            )
+        raise AuthorizationError(
+            f"callable workloads are not trusted for project {org_id}/{project_id}; {remedy}. "
+            "Submissions take their org and project from the active Eyvan context, which "
+            "'eyvan context' will show and 'eyvan use' will change"
+        )
 
 
 __all__ = ("CallableProjectTrustPolicy",)
