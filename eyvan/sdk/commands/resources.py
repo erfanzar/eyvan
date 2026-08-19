@@ -24,6 +24,8 @@ import click
 
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.tables import Column, render
+from eyvan.sdk.tables import field as at
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +126,58 @@ RESOURCES: tuple[Resource, ...] = (
     ),
 )
 
+#: What each kind shows when it is listed for a person.
+#:
+#: One row per record and the few fields that answer "what is this and what is
+#: it doing" -- the durable record answers far more and is what `--json` is for.
+#: A kind with no entry here falls back to `--json`, so adding a resource can
+#: never produce a blank table.
+LISTING_COLUMNS: dict[str, tuple[Column, ...]] = {
+    "workloads": (
+        Column("id", at("id")),
+        Column("name", at("spec", "name")),
+        Column("state", at("state")),
+        Column("shape", at("spec", "accelerator_type")),
+        Column("class", at("spec", "capacity_class")),
+        Column("submitted by", at("created_by")),
+    ),
+    "cells": (
+        Column("id", at("id")),
+        Column("state", at("state")),
+        Column("backend", at("capacity_backend")),
+        Column("zone", at("zone")),
+        Column("pool", at("pool_id")),
+    ),
+    "pools": (
+        Column("id", at("id")),
+        Column("fleet", at("fleet_name")),
+        Column("shape", at("accelerator_type")),
+        Column("class", at("capacity_class")),
+        Column("zone", at("zone")),
+        Column("max", at("max_cells"), align=">"),
+        Column("enabled", at("enabled")),
+    ),
+    "leases": (
+        Column("id", at("id")),
+        Column("workload", at("workload_id")),
+        Column("cell", at("cell_id")),
+        Column("state", at("state")),
+        Column("cost", at("settled_cost"), align=">"),
+    ),
+    "events": (
+        Column("sequence", at("sequence"), align=">"),
+        Column("action", at("action")),
+        Column("actor", at("actor")),
+        Column("target", at("entity_id")),
+        Column("at", at("recorded_at")),
+    ),
+    "fleets": (
+        Column("name", at("name")),
+        Column("zone", at("zone")),
+    ),
+}
+
+
 _BY_NAME: dict[str, Resource] = {
     spelling: resource for resource in RESOURCES for spelling in (resource.name, *resource.aliases)
 }
@@ -190,6 +244,7 @@ def _filters(values: tuple[str, ...]) -> dict[str, str]:
     metavar="KEY=VALUE",
     help="Narrow the listing. Each resource accepts its own keys; an unaccepted one is refused by name.",
 )
+@click.option("--json", "as_json", is_flag=True, help="Emit the durable records instead of a table.")
 @click.pass_obj
 def list_resource(
     session: CliSession,
@@ -197,6 +252,7 @@ def list_resource(
     org_id: str | None,
     project_id: str | None,
     filters: tuple[str, ...],
+    as_json: bool,
 ) -> None:
     """List every record of KIND.
 
@@ -209,13 +265,17 @@ def list_resource(
             click.echo(f"{resource.name:<12}{resource.summary}")
         return
     resource = resolve(kind)
-    JsonRenderer().emit(
-        session.client.request(
-            "GET",
-            resource.list_path,
-            params=_params(session, resource, org_id=org_id, project_id=project_id, filters=_filters(filters)),
-        )
+    payload = session.client.request(
+        "GET",
+        resource.list_path,
+        params=_params(session, resource, org_id=org_id, project_id=project_id, filters=_filters(filters)),
     )
+    columns = LISTING_COLUMNS.get(resource.name)
+    if as_json or columns is None or not isinstance(payload, list):
+        JsonRenderer().emit(payload)
+        return
+    for line in render(payload, columns, empty=f"No {resource.name} match." if filters else f"No {resource.name}."):
+        click.echo(line)
 
 
 @click.command("get")
@@ -245,6 +305,8 @@ def get_resource(
             params=_params(session, resource, org_id=org_id, project_id=project_id, filters={}),
         )
     )
+    # `get` stays the record. It is the accessor -- `eyvan list` is the view,
+    # and something is piping this one.
 
 
 def register_resource_commands(group: click.Group) -> None:

@@ -604,7 +604,24 @@ def fleets(session: CliSession, as_json: bool) -> None:
         }
         for name, row in sorted(grouped.items())
     ]
-    _emit(rows, as_json=as_json, renderer=JsonRenderer())
+    if as_json:
+        JsonRenderer().emit(rows)
+        return
+    if not rows:
+        click.echo("No fleets are applied. Generate one with `eyvan autoscale generate --zone ZONE`.")
+        return
+    click.echo("Fleets you can submit to:")
+    for row in rows:
+        entry = tp.cast("dict[str, tp.Any]", row)
+        shapes = tp.cast("list[str]", entry["shapes"])
+        zones = tp.cast("list[str]", entry["zones"])
+        # The first three shapes and a count. A twenty-pool fleet listed in full
+        # is the wall of repetition this command exists to replace, and the
+        # question it answers is "which fleet", not "which shape".
+        listed = ", ".join(shapes[:3]) + (f" +{len(shapes) - 3} more" if len(shapes) > 3 else "")
+        disabled = f"  ({entry['disabled_pools']} disabled)" if entry["disabled_pools"] else ""
+        where = ", ".join(zones) or "local"
+        click.echo(f"  {entry['fleet']:26} {where:16} {entry['pools']:>3} pools  {listed}{disabled}")
 
 
 @capacity.command("usage")
@@ -629,7 +646,28 @@ def usage(session: CliSession, since: str | None, as_json: bool) -> None:
     if since:
         params["since"] = since
     payload = session.client.request("GET", "/api/v1/usage", params=params)
-    _emit(payload, as_json=as_json, renderer=JsonRenderer())
+    if as_json:
+        JsonRenderer().emit(payload)
+        return
+    subjects = payload.get("subjects") if is_json_object(payload) else None
+    if not isinstance(subjects, list) or not subjects:
+        click.echo("Nobody has submitted work in this project yet.")
+        return
+    click.echo(f"{'subject':16} {'runs':>5} {'hours':>8} {'cost':>10}")
+    for entry in subjects:
+        if not is_json_object(entry):
+            continue
+        hours = entry.get("accelerator_hours")
+        cost = entry.get("settled_cost")
+        unpriced = entry.get("unpriced_leases")
+        # A zero cost beside real hours means the pool declares no price. Said
+        # here rather than folded into the number, because the heaviest user of
+        # unpriced capacity otherwise reads exactly like an idle one.
+        note = "  (no unit price on the pools used)" if unpriced else ""
+        click.echo(
+            f"{entry.get('subject', '?')!s:16} {int(entry.get('workloads') or 0):>5} "
+            f"{float(hours or 0):>8.2f} {float(cost or 0):>10.2f}{note}"
+        )
 
 
 @capacity.group("pool")

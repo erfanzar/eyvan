@@ -123,11 +123,25 @@ def test_cells_lists_registered_cells_as_json(tmp_path: Path) -> None:
     ]
     client = FakeOperationsClient(responses=[cells])
 
-    result = CliRunner().invoke(list_cells, [], obj=_session(tmp_path, client))
+    result = CliRunner().invoke(list_cells, ["--json"], obj=_session(tmp_path, client))
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == cells
     assert _only_request(client) == RecordedRequest("GET", "/api/v1/cells", None, None, None)
+
+
+def test_cells_renders_a_table_for_a_person(tmp_path: Path) -> None:
+    """The same fetch, read rather than parsed. A cell record is thirty keys and
+    a fleet of them is a screenful per machine."""
+
+    client = FakeOperationsClient(responses=[[{"id": "cell-a", "state": "ready", "zone": "us-east5-a"}]])
+
+    result = CliRunner().invoke(list_cells, [], obj=_session(tmp_path, client))
+
+    assert result.exit_code == 0, result.output
+    assert "cell-a" in result.output
+    assert "us-east5-a" in result.output
+    assert '"id"' not in result.output, "the record is what --json is for"
 
 
 def test_cell_drain_posts_with_a_generated_operation_scoped_idempotency_key(tmp_path: Path) -> None:

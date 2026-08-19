@@ -195,10 +195,24 @@ def test_a_resource_with_no_single_record_says_so(monkeypatch) -> None:
 
 
 def test_output_is_the_same_json_every_other_command_emits(monkeypatch) -> None:
-    """The point of a uniform surface is that one parser reads all of it."""
+    """The point of a uniform surface is that one parser reads all of it.
+
+    `--json` because the listing renders a table for a person by default. Both
+    spellings are one fetch; only this one is meant to be parsed.
+    """
 
     plane = _Plane()
 
-    result = _invoke(monkeypatch, plane, "list", "cells")
+    result = _invoke(monkeypatch, plane, "list", "cells", "--json")
 
     assert json.loads(result.stdout) == []
+
+
+def test_an_empty_listing_says_so_rather_than_printing_an_empty_table(monkeypatch) -> None:
+    """`[]` is a correct answer and an unreadable one. A blank table reads as a
+    rendering bug; a sentence reads as the fleet holding nothing."""
+
+    result = _invoke(monkeypatch, _Plane(), "list", "cells")
+
+    assert "No cells." in result.stdout
+    assert "[]" not in result.stdout

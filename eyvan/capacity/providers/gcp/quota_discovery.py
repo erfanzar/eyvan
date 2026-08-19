@@ -19,6 +19,10 @@ from typing import Protocol
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_value
+from eyvan.capacity.providers.gcp.accelerator_catalog import (
+    AcceleratorCatalogError,
+    ApiAcceleratorCatalog,
+)
 from eyvan.capacity.providers.gcp.quota_usage import GcpQuotaUsageError, GcpTpuQuotaUsageDiscovery, TpuQuotaUsage
 from eyvan.capacity.providers.gcp.tpu_types import accelerator_generation
 
@@ -283,11 +287,21 @@ class GcpTpuQuotaDiscovery:
         runner: Runner = _runner,
         lookup_concurrency: int = 8,
         usage_discovery: TpuQuotaUsageDiscovery | None = None,
+        catalog: ApiAcceleratorCatalog | None = None,
     ):
         if isinstance(lookup_concurrency, bool) or not isinstance(lookup_concurrency, int) or lookup_concurrency < 1:
             raise ValueError("lookup_concurrency must be a positive integer")
         self._runner = runner
         self.lookup_concurrency = lookup_concurrency
+        # The fast path. One subprocess per zone was 1.4s of Python startup
+        # before any network work, so a project seeing 122 zones spent its
+        # whole deadline spawning gcloud. Set to ``False`` to force the
+        # subprocess path; ``None`` means build the default reader.
+        self._catalog = ApiAcceleratorCatalog() if catalog is None else catalog
+        #: One provider response per project, reused across capacity classes
+        #: within a single discovery. Not a TTL cache: the caller above already
+        #: owns freshness, and holding it longer here would hide a re-read.
+        self._quota_response_cache: dict[str, JsonValue] = {}
         self._usage_discovery: TpuQuotaUsageDiscovery = (
             usage_discovery if usage_discovery is not None else GcpTpuQuotaUsageDiscovery()
         )
@@ -379,7 +393,14 @@ class GcpTpuQuotaDiscovery:
             "--format=json",
             "--quiet",
         )
-        raw = self._run_json(command)
+        # The command does not depend on `preemptible` -- that only selects
+        # which rows of the same response are read afterwards. Discovery asks
+        # for spot and on-demand in turn, so this ran the identical four-second
+        # gcloud call twice per read for one response.
+        raw = self._quota_response_cache.get(project)
+        if raw is None:
+            raw = self._run_json(command)
+            self._quota_response_cache[project] = raw
         if not isinstance(raw, list):
             raise GcloudQuotaError("gcloud quota response was not a list")
         regions: dict[tuple[str, str], _QuotaLimit] = {}
@@ -457,6 +478,17 @@ class GcpTpuQuotaDiscovery:
             except GcloudQuotaError as exc:
                 return zone, None, exc
             return found_zone, types, None
+
+        # Ask the API first, and fall back per-run rather than per-zone: a
+        # token that cannot be minted or an endpoint that cannot be reached
+        # fails the whole attempt at once, and the subprocess path then answers
+        # for every zone. Falling back one zone at a time would pay the startup
+        # cost that made this slow in the first place.
+        if self._catalog:
+            try:
+                return self._catalog.types_for_zones(project, zones)
+            except AcceleratorCatalogError:
+                pass
 
         results: dict[str, tuple[str, ...]] = {}
         failures: list[tuple[str, GcloudQuotaError]] = []

@@ -15,6 +15,8 @@ from eyvan._internal.json_types import model_json
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
+from eyvan.sdk.tables import Column, render
+from eyvan.sdk.tables import field as at
 from eyvan.server.api.schemas import PreemptionForceFinalizeRequest
 
 
@@ -52,12 +54,29 @@ class OperationsCommandService:
         )
 
 
-@click.command("cells")
-@click.pass_obj
-def list_cells(session: CliSession) -> None:
-    """List registered execution cells."""
+#: Shared with `eyvan list cells`, so the two spellings cannot disagree about
+#: what a cell is worth showing.
+CELL_COLUMNS = (
+    Column("id", at("id")),
+    Column("state", at("state")),
+    Column("backend", at("capacity_backend")),
+    Column("zone", at("zone")),
+    Column("pool", at("pool_id")),
+)
 
-    OperationsCommandService(session).read("/api/v1/cells")
+
+@click.command("cells")
+@click.option("--json", "as_json", is_flag=True, help="Emit the durable records instead of a table.")
+@click.pass_obj
+def list_cells(session: CliSession, as_json: bool) -> None:
+    """List the machines this fleet currently holds."""
+
+    payload = session.client.request("GET", "/api/v1/cells")
+    if as_json or not isinstance(payload, list):
+        JsonRenderer().emit(payload)
+        return
+    for line in render(payload, CELL_COLUMNS, empty="This fleet holds no cells."):
+        click.echo(line)
 
 
 @click.command("cell-drain")

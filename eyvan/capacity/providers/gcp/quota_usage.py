@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -71,6 +72,11 @@ class TpuQuotaUsage:
         object.__setattr__(self, "observed_at", self.observed_at.astimezone(UTC))
 
 
+#: Metric reads run at once. One per generation per purchase class, so this is
+#: the whole set for any real project rather than a sample of it.
+_DEFAULT_CONCURRENCY = 16
+
+
 class GcpTpuQuotaUsageDiscovery:
     """Read current TPU quota usage from the Cloud Monitoring REST API.
 
@@ -86,13 +92,17 @@ class GcpTpuQuotaUsageDiscovery:
         client: httpx.Client | None = None,
         clock: Clock = _utc_now,
         lookback: timedelta = _DEFAULT_LOOKBACK,
+        concurrency: int = _DEFAULT_CONCURRENCY,
     ) -> None:
         if lookback <= timedelta(0):
             raise ValueError("lookback must be positive")
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
         self._token_runner = token_runner
         self._client = client
         self._clock = clock
         self._lookback = lookback
+        self._concurrency = concurrency
 
     def discover(self, *, project: str, metrics: Iterable[str]) -> tuple[TpuQuotaUsage, ...]:
         """Return the latest valid allocation usage by metric and location.
@@ -116,19 +126,31 @@ class GcpTpuQuotaUsageDiscovery:
         owns_client = self._client is None
         try:
             records: dict[tuple[str, str], TpuQuotaUsage] = {}
-            for metric in requested_metrics:
-                for usage in self._metric_usage(
-                    client=client,
-                    project=normalized_project,
-                    metric=metric,
-                    token=token,
-                    start=now - self._lookback,
-                    end=now,
-                ):
-                    key = (usage.metric, usage.location)
-                    existing = records.get(key)
-                    if existing is None or usage.observed_at > existing.observed_at:
-                        records[key] = usage
+
+            # One round trip per metric, run together. Sequentially this was the
+            # largest remaining cost of a quota read: eight generations across
+            # two purchase classes is sixteen serial round trips to Cloud
+            # Monitoring, each a few seconds, for readings that do not depend on
+            # each other. The merge below already tolerates any arrival order.
+            def read(metric: str) -> tuple[TpuQuotaUsage, ...]:
+                return tuple(
+                    self._metric_usage(
+                        client=client,
+                        project=normalized_project,
+                        metric=metric,
+                        token=token,
+                        start=now - self._lookback,
+                        end=now,
+                    )
+                )
+
+            with ThreadPoolExecutor(max_workers=min(self._concurrency, len(requested_metrics))) as pool:
+                for batch in pool.map(read, requested_metrics):
+                    for usage in batch:
+                        key = (usage.metric, usage.location)
+                        existing = records.get(key)
+                        if existing is None or usage.observed_at > existing.observed_at:
+                            records[key] = usage
             return tuple(sorted(records.values(), key=lambda usage: (usage.metric, usage.location)))
         finally:
             if owns_client:
