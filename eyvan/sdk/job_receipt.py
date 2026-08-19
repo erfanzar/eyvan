@@ -17,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from eyvan._internal.compat import StrEnum
-from eyvan.sdk.terminal import terminal_console
+from eyvan.sdk.terminal import print_block, terminal_console
 
 
 class JobLifecycleState(StrEnum):
@@ -180,7 +180,8 @@ class JobTerminalOutput:
         table.add_row("Check", Text(f"eyvan workload status {receipt.workload_id}", style="cyan"))
         table.add_row("Logs", Text(f"eyvan workload logs {receipt.workload_id}", style="cyan"))
         table.add_row("Cancel", Text(f"eyvan workload cancel {receipt.workload_id}", style="cyan"))
-        console.print(
+        print_block(
+            console,
             Panel(
                 table,
                 title="[bold cyan]Eyvan job submitted[/]",
@@ -188,7 +189,7 @@ class JobTerminalOutput:
                 border_style="cyan",
                 padding=(0, 1),
                 expand=False,
-            )
+            ),
         )
 
     def lifecycle(self, update: JobLifecycleUpdate) -> None:
@@ -264,7 +265,8 @@ class JobTerminalOutput:
         table.add_row("State", Text("still running", style="bold green"))
         table.add_row("Reattach", Text(f"eyvan workload logs {workload_id} --follow", style="cyan"))
         table.add_row("Cancel", Text(f"eyvan workload cancel {workload_id}", style="cyan"))
-        console.print(
+        print_block(
+            console,
             Panel(
                 table,
                 title="[bold yellow]Detached[/]",
@@ -272,7 +274,7 @@ class JobTerminalOutput:
                 border_style="yellow",
                 padding=(0, 1),
                 expand=False,
-            )
+            ),
         )
 
     @staticmethod

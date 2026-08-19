@@ -2174,10 +2174,28 @@ def test_workload_status_reads_the_durable_workload_record(monkeypatch) -> None:
     fake = FakeClient()
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
 
-    result = CliRunner().invoke(cli.main, ["--user", "alice", "workload", "status", "wl-cli-status"])
+    # `--json` for the record. Without it the command summarises for a person,
+    # which is the same fetch rendered differently -- and the route is what this
+    # test is about.
+    result = CliRunner().invoke(cli.main, ["--user", "alice", "workload", "status", "wl-cli-status", "--json"])
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"id": "wl-cli-status", "state": "pending"}
+    assert fake.calls == [("GET", "/api/v1/workloads/wl-cli-status", {})]
+
+
+def test_workload_status_summarises_the_same_record_without_json(monkeypatch) -> None:
+    """One fetch, two renderings. A status that dumps the durable record makes
+    somebody read sixty keys to learn a state."""
+
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+
+    result = CliRunner().invoke(cli.main, ["--user", "alice", "workload", "status", "wl-cli-status"])
+
+    assert result.exit_code == 0, result.output
+    assert "wl-cli-status" in result.stdout
+    assert "pending" in result.stdout
     assert fake.calls == [("GET", "/api/v1/workloads/wl-cli-status", {})]
 
 

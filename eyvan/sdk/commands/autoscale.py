@@ -300,12 +300,13 @@ def _render_autoscale_defaults_review(console: Console, defaults: AutoscaleDefau
 def _render_autoscale_defaults_saved(console: Console, path: Path) -> None:
     """Show a concise successful completion state for the setup wizard."""
 
-    console.print(
+    print_block(
+        console,
         Panel(
             "[bold green]Autoscale defaults saved[/]",
             title="[bold cyan]Eyvan[/]",
             border_style="green",
-        )
+        ),
     )
     console.print(f"[dim]Profile:[/] {path}")
 
@@ -319,12 +320,13 @@ def _prompt_autoscale_defaults(
     """Run the terminal setup wizard for user-owned autoscale YAML fields."""
 
     console = autoscale_console(err=err)
-    console.print(
+    print_block(
+        console,
         Panel(
             "Set reusable TPU autoscale defaults. Platform routing stays hidden.",
             title="[bold cyan]Eyvan TPU Autoscale[/]",
             border_style="cyan",
-        )
+        ),
     )
     valid_project = _valid_default(current.project, validate_gcp_project_id)
 

@@ -37,7 +37,11 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1] / "eyvan"
 
 #: A bordered renderable handed straight to `console.print`. Matches the two
 #: forms that have actually shipped broken.
-UNGUARDED_PRINT = re.compile(r"\.print\(\s*(Panel\(|Table\(|table\b|panel\b)")
+UNGUARDED_PRINT = re.compile(
+    # `print_block(console, Panel(...))` is the guarded form and must not match,
+    # so the pattern requires the call to be `.print(` on a console.
+    r"(?<!_block)\.print\(\s*(?:Panel\(|Table\(|table\b|panel\b)"
+)
 
 
 def _rendered(renderable: object, width: int) -> list[str]:
@@ -84,11 +88,15 @@ def test_no_bordered_renderable_is_printed_on_the_soft_wrapping_path() -> None:
     source rather than on any one command's output.
     """
 
-    offenders = [
-        f"{path.relative_to(SOURCE_ROOT.parent)}:{number}: {line.strip()}"
-        for path in SOURCE_ROOT.rglob("*.py")
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
-        if UNGUARDED_PRINT.search(line) and "print_block" not in line
-    ]
+    # Searched over whole files rather than line by line. The line-wise version
+    # missed every call formatted as `console.print(` with its `Panel(` on the
+    # next line -- which is how a formatter writes any call long enough to need
+    # wrapping, and therefore how the clipped submission panel got in.
+    offenders: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for match in UNGUARDED_PRINT.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            offenders.append(f"{path.relative_to(SOURCE_ROOT.parent)}:{line}")
 
     assert offenders == [], "print these through eyvan.sdk.terminal.print_block:\n" + "\n".join(offenders)

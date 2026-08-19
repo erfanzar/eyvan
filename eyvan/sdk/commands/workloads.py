@@ -44,6 +44,7 @@ from eyvan.sdk.spend import RunSpend
 from eyvan.sdk.spend import render as spend_render
 from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.sdk.timeline import render, timeline
+from eyvan.sdk.workload_summary import render as summarize_workload
 from eyvan.server.api.schemas import (
     BatchSubmitRequest,
     DagNodeRequest,
@@ -393,10 +394,30 @@ class WorkloadCommandService:
         )
         self._emit_workload_response(response)
 
-    def show(self, workload_id: str) -> None:
-        """Display one workload record and retain any durable queue-admission denial."""
+    def show(self, workload_id: str, *, as_json: bool = False) -> None:
+        """Display one workload, and retain any durable queue-admission denial.
 
-        self._emit_workload_response(self.session.client.request("GET", f"/api/v1/workloads/{workload_id}"))
+        Summarised by default. The durable record is sixty-odd keys, most of
+        them null, and the three facts somebody wants from a status -- what
+        state it is in, what it runs, and why it is not running -- were
+        scattered between ``autoscale_block_reason`` and
+        ``worker_resource_scope``. ``--json`` still returns it verbatim, because
+        anything parsing this needs the record and not the prose.
+        """
+
+        response = self.session.client.request("GET", f"/api/v1/workloads/{workload_id}")
+        self._record_queue_admission_denials(response)
+        if as_json:
+            self.renderer.emit(response)
+            return
+        lines = summarize_workload(response)
+        if not lines:
+            # Unreadable to the summariser is not unreadable to the operator:
+            # falling back to the record beats printing nothing at all.
+            self.renderer.emit(response)
+            return
+        for line in lines:
+            click.echo(line)
 
     def process_status(self, workload_id: str) -> None:
         """Emit live process detail for one workload attempt."""
@@ -1418,18 +1439,23 @@ def list_workloads(
 @click.argument("workload_id")
 @click.pass_obj
 def get_workload(session: CliSession, workload_id: str) -> None:
-    """Get one workload record."""
+    """Get one workload record.
 
-    WorkloadCommandService(session).show(workload_id)
+    The record, verbatim. `status` is the same fetch rendered for a person;
+    this is the accessor, and something is piping it.
+    """
+
+    WorkloadCommandService(session).show(workload_id, as_json=True)
 
 
 @workload.command("status")
 @click.argument("workload_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the durable record instead of a summary.")
 @click.pass_obj
-def workload_status(session: CliSession, workload_id: str) -> None:
-    """Get the durable lifecycle state of one workload."""
+def workload_status(session: CliSession, workload_id: str, as_json: bool) -> None:
+    """Show what one workload is, what it runs, and why it is or is not running."""
 
-    WorkloadCommandService(session).show(workload_id)
+    WorkloadCommandService(session).show(workload_id, as_json=as_json)
 
 
 @workload.command("timeline")

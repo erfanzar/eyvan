@@ -144,7 +144,10 @@ def _session(tmp_path: Path, client: WorkloadResponseClient, cache_dir: Path) ->
 @pytest.mark.parametrize(
     ("arguments", "expects_list"),
     (
-        (("status", "wl-cli-queue-denied"), False),
+        # `status` renders for a person and takes `--json` for the record;
+        # `get` is the accessor and always emits it. The assertion below is
+        # about what they cached, not how either renders.
+        (("status", "wl-cli-queue-denied", "--json"), False),
         (("get", "wl-cli-queue-denied"), False),
         (("list",), True),
     ),
@@ -206,10 +209,31 @@ def test_workload_status_keeps_the_api_response_when_local_denial_cache_fails(
 
     result = CliRunner().invoke(
         workload,
-        ["status", record.id],
+        ["status", record.id, "--json"],
         obj=_session(tmp_path, client, tmp_path / "selected-autoscale"),
     )
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == document
     assert FailingAutoscaleConfigCache.calls == 1
+
+
+def test_a_failed_status_leads_with_the_provider_sentence_not_eyvans_category(tmp_path: Path) -> None:
+    """The record answers "why is this stuck" in four different fields, and a
+    person reading a status does not know which to look at. The provider's own
+    words are the only ones that say what to go and fix."""
+
+    record = _queue_admission_denied_workload()
+    client = WorkloadResponseClient(records=(record.model_dump(mode="json"),))
+
+    result = CliRunner().invoke(
+        workload,
+        ["status", record.id],
+        obj=_session(tmp_path, client, tmp_path / "selected-autoscale"),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "v6e-16" in result.output
+    # The durable record is not what a status prints any more.
+    assert "worker_resource_scope" not in result.output
+    assert result.output.count("\n") < 20, "a status is a summary, not a record dump"

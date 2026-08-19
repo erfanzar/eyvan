@@ -885,12 +885,13 @@ def initialize_runtime(
     console = autoscale_console(err=as_json)
     interactive = is_interactive()
     if interactive:
-        console.print(
+        print_block(
+            console,
             Panel(
                 "Choose the GCP project and GCS root once. Eyvan creates local private credentials automatically.",
                 title="[bold cyan]Eyvan Native GCP Runtime[/]",
                 border_style="cyan",
-            )
+            ),
         )
     if project_id is None:
         project_id = suggested_runtime_project(defaults_path=defaults_path, cache_dir=cache_dir)
