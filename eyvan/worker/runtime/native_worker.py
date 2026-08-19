@@ -531,6 +531,16 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
             args.secret_file.unlink()
         except OSError as exc:
             logger.warning("could not remove native worker secret file %s: %s", args.secret_file, exc)
+    if not isinstance(secret, str) or not secret.strip():
+        # Named here rather than left to the application factory, which raises a
+        # ValueError and reaches an operator as a traceback out of a systemd unit
+        # that failed to start. Every other missing input on this path is a
+        # parser.error naming the flag that supplies it; the credential is the
+        # one an operator is most likely to omit, so it says the same thing.
+        parser.error(
+            "a native worker requires a bearer credential: pass --secret, --secret-file, "
+            "or set EYVAN_NATIVE_WORKER_SECRET"
+        )
 
     import uvicorn
 

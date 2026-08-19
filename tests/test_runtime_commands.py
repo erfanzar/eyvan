@@ -34,7 +34,7 @@ def _profile(*, wheel_uri: str | None = None) -> GcpNativeRuntimeProfile:
     """Build one profile with recognizable secret values for output-safety tests."""
 
     return GcpNativeRuntimeProfile(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
         agent_shared_secret="agent-secret-" + "a" * 32,
         native_worker_root_secret="worker-secret-" + "b" * 32,
@@ -76,7 +76,7 @@ def test_initializer_persists_only_the_staged_profile_and_returns_nonsecret_summ
     bootstrap = FakeBootstrap()
 
     result = runtime_commands.GcpRuntimeInitializer(store, bootstrap).initialize(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan/",
     )
 
@@ -115,7 +115,7 @@ def test_initializer_rejects_a_bootstrapper_that_does_not_return_a_pinned_wheel(
 
     with pytest.raises(runtime_commands.GcpRuntimeInitializationError, match="without a worker wheel URI"):
         runtime_commands.GcpRuntimeInitializer(store, MissingWheelBootstrap()).initialize(
-            project_id="example-project",
+            project_id="example-project-1",
             artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
         )
 
@@ -203,7 +203,7 @@ def test_runtime_init_json_uses_explicit_public_inputs_and_never_emits_profile_s
         [
             "init",
             "--project",
-            "example-project",
+            "example-project-1",
             "--artifact-root",
             "gs://eyvan-runtime-artifacts/eyvan/",
             "--profile",
@@ -214,7 +214,7 @@ def test_runtime_init_json_uses_explicit_public_inputs_and_never_emits_profile_s
     )
 
     assert invoked.exit_code == 0, invoked.output
-    assert calls == [("example-project", "gs://eyvan-runtime-artifacts/eyvan", profile_path)]
+    assert calls == [("example-project-1", "gs://eyvan-runtime-artifacts/eyvan", profile_path)]
     payload = json.loads(invoked.output)
     assert payload["profile_path"] == str(profile_path)
     assert payload["native_worker_wheel_uri"].endswith(f"{'d' * 64}/eyvan-0.1.0-py3-none-any.whl")
@@ -225,7 +225,7 @@ def test_runtime_init_json_uses_explicit_public_inputs_and_never_emits_profile_s
 def test_runtime_init_requires_a_gcs_root_in_noninteractive_mode() -> None:
     invoked = CliRunner().invoke(
         runtime_commands.runtime_group,
-        ["init", "--project", "example-project", "--yes"],
+        ["init", "--project", "example-project-1", "--yes"],
     )
 
     assert invoked.exit_code != 0
@@ -250,7 +250,7 @@ def test_runtime_project_suggestion_prefers_the_autoscale_yaml_project(monkeypat
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
     cache.save_defaults(
         AutoscaleDefaults(
-            project="example-project",
+            project="example-project-1",
             fleet_prefix="research",
             bootstrap_egress="public-internet",
         )
@@ -259,7 +259,7 @@ def test_runtime_project_suggestion_prefers_the_autoscale_yaml_project(monkeypat
 
     suggested = runtime_commands.suggested_runtime_project(defaults_path=None, cache_dir=tmp_path / "autoscale")
 
-    assert suggested == "example-project"
+    assert suggested == "example-project-1"
 
 
 def test_runtime_init_translates_typed_gcp_preflight_failures(monkeypatch, tmp_path: Path) -> None:
@@ -281,7 +281,7 @@ def test_runtime_init_translates_typed_gcp_preflight_failures(monkeypatch, tmp_p
         [
             "init",
             "--project",
-            "example-project",
+            "example-project-1",
             "--artifact-root",
             "gs://eyvan-runtime-artifacts/eyvan",
             "--profile",
@@ -383,7 +383,7 @@ def test_restart_service_replaces_the_profile_owned_cell_agent(monkeypatch, tmp_
     profile_path = tmp_path / "private" / "runtime.json"
     store = GcpNativeRuntimeProfileStore(profile_path)
     profile = store.create(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
         native_worker_wheel_uri=(
             f"gs://eyvan-runtime-artifacts/eyvan/runtime/wheels/{'e' * 64}/eyvan-0.1.0-py3-none-any.whl"

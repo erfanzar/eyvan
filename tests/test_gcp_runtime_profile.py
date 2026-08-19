@@ -37,7 +37,7 @@ def _profile(*, artifact_root_uri: str = "gs://eyvan-runtime-artifacts/eyvan") -
     """Build one explicit profile for replacement-write coverage."""
 
     return GcpNativeRuntimeProfile(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri=artifact_root_uri,
         agent_shared_secret="a" * 32,
         native_worker_root_secret="b" * 32,
@@ -50,7 +50,7 @@ def test_runtime_profile_round_trips_with_private_generated_secrets(tmp_path: Pa
     store = GcpNativeRuntimeProfileStore(path)
 
     created = store.create(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan/",
         native_worker_wheel_uri=_WHEEL_URI,
     )
@@ -88,7 +88,7 @@ def test_runtime_profile_derives_a_stable_opaque_public_worker_ingress_tag() -> 
 def test_runtime_profile_save_replaces_only_after_validating_the_document(tmp_path: Path) -> None:
     path = tmp_path / "profile" / "gcp-native-runtime.json"
     store = GcpNativeRuntimeProfileStore(path)
-    store.create(project_id="example-project", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
+    store.create(project_id="example-project-1", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
     replacement = _profile(artifact_root_uri="gs://eyvan-runtime-artifacts/next")
 
     saved_path = store.save(replacement)
@@ -100,7 +100,7 @@ def test_runtime_profile_save_replaces_only_after_validating_the_document(tmp_pa
 
 def test_runtime_profile_load_or_create_rejects_a_different_requested_runtime(tmp_path: Path) -> None:
     store = GcpNativeRuntimeProfileStore(tmp_path / "profile" / "gcp-native-runtime.json")
-    store.load_or_create(project_id="example-project", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
+    store.load_or_create(project_id="example-project-1", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
 
     with pytest.raises(GcpNativeRuntimeProfileError, match="does not match"):
         store.load_or_create(project_id="another-gcp-project", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
@@ -110,7 +110,7 @@ def test_runtime_profile_store_uses_owner_only_file_and_directory_permissions(tm
     path = tmp_path / "profile" / "gcp-native-runtime.json"
     store = GcpNativeRuntimeProfileStore(path)
 
-    store.create(project_id="example-project", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
+    store.create(project_id="example-project-1", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
@@ -122,11 +122,11 @@ def test_runtime_profile_store_uses_owner_only_file_and_directory_permissions(tm
         ("gs://eyvan-runtime-artifacts", "gs://eyvan-runtime-artifacts/eyvan"),
         ("EXAMPLE-RESEARCH-PROJECT", "gs://eyvan-runtime-artifacts/eyvan"),
         ("short", "gs://eyvan-runtime-artifacts/eyvan"),
-        ("example-project", "https://eyvan-runtime-artifacts/eyvan"),
-        ("example-project", "gs://Invalid_Bucket/eyvan"),
-        ("example-project", "gs://ab/eyvan"),
-        ("example-project", "gs://eyvan-runtime-artifacts/eyvan?credential=secret"),
-        ("example-project", "gs://eyvan-runtime-artifacts//eyvan"),
+        ("example-project-1", "https://eyvan-runtime-artifacts/eyvan"),
+        ("example-project-1", "gs://Invalid_Bucket/eyvan"),
+        ("example-project-1", "gs://ab/eyvan"),
+        ("example-project-1", "gs://eyvan-runtime-artifacts/eyvan?credential=secret"),
+        ("example-project-1", "gs://eyvan-runtime-artifacts//eyvan"),
     ),
 )
 def test_runtime_profile_rejects_invalid_gcp_project_ids_and_artifact_roots(
@@ -158,7 +158,7 @@ def test_runtime_profile_rejects_invalid_gcp_project_ids_and_artifact_roots(
 def test_runtime_profile_rejects_nonconcrete_native_worker_wheels(native_worker_wheel_uri: str) -> None:
     with pytest.raises(GcpNativeRuntimeProfileError):
         GcpNativeRuntimeProfile(
-            project_id="example-project",
+            project_id="example-project-1",
             artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
             agent_shared_secret="a" * 32,
             native_worker_root_secret="b" * 32,
@@ -168,7 +168,7 @@ def test_runtime_profile_rejects_nonconcrete_native_worker_wheels(native_worker_
 
 def test_runtime_profile_accepts_a_content_addressed_directory_with_a_valid_pip_wheel_filename() -> None:
     profile = GcpNativeRuntimeProfile(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
         agent_shared_secret="a" * 32,
         native_worker_root_secret="b" * 32,
@@ -196,7 +196,7 @@ def test_runtime_profile_store_rejects_a_symlinked_profile_file(tmp_path: Path) 
 def test_runtime_profile_store_rejects_a_group_readable_profile_file(tmp_path: Path) -> None:
     path = tmp_path / "profile" / "gcp-native-runtime.json"
     store = GcpNativeRuntimeProfileStore(path)
-    store.create(project_id="example-project", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
+    store.create(project_id="example-project-1", artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan")
     os.chmod(path, 0o640)
 
     with pytest.raises(GcpNativeRuntimeProfileError, match="must not be group- or world-readable"):
@@ -222,7 +222,7 @@ def test_runtime_profile_document_rejects_unknown_or_secretless_schema_fields() 
 def test_runtime_profile_rejects_a_noninteger_version_before_persistence() -> None:
     with pytest.raises(GcpNativeRuntimeProfileError, match="version"):
         GcpNativeRuntimeProfile(
-            project_id="example-project",
+            project_id="example-project-1",
             artifact_root_uri="gs://eyvan-runtime-artifacts/eyvan",
             agent_shared_secret="a" * 32,
             native_worker_root_secret="b" * 32,

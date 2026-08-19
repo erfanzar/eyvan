@@ -39,7 +39,7 @@ STAGED_WHEEL = f"gs://bucket/eyvan/runtime/wheels/{'a' * 64}/eyvan-0.1.0-py3-non
 
 def _profile(wheel_uri: str | None = None) -> GcpNativeRuntimeProfile:
     return GcpNativeRuntimeProfile(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://bucket/eyvan",
         agent_shared_secret="agent-secret-" + "a" * 32,
         native_worker_root_secret="worker-secret-" + "b" * 32,
@@ -63,7 +63,7 @@ def deployed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     store = GcpNativeRuntimeProfileStore(tmp_path / "runtime.json")
     store.create(
-        project_id="example-project",
+        project_id="example-project-1",
         artifact_root_uri="gs://bucket/eyvan",
         native_worker_wheel_uri=None,
     )

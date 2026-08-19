@@ -67,7 +67,7 @@ def _pool() -> CapacityPoolRecord:
         node_type="v6e-16",
         provider="gcp",
         capacity_backend="gcp-tpu",
-        provider_project="example-project",
+        provider_project="example-project-1",
         region="us-central1",
         zone="us-central1-c",
         capacity=resources,
@@ -383,7 +383,7 @@ async def test_terminal_queue_admission_denial_keeps_its_immutable_target() -> N
     service = ControlPlaneService(repository)
     pool = _pool()
     denied_target = GcpQueueAdmissionDenialTarget(
-        provider_project="example-project",
+        provider_project="example-project-1",
         zone="us-east5-a",
         accelerator_type="v5p-16",
         capacity_class=CapacityClass.SPOT,

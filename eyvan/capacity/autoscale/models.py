@@ -100,7 +100,7 @@ def validate_gcp_project_id(value: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValueError("GCP project must be a non-empty trimmed project ID")
     if value.startswith("gs://"):
-        raise ValueError(f"GCP project must be a project ID such as 'example-project', not bucket URI {value!r}")
+        raise ValueError(f"GCP project must be a project ID such as 'example-project-1', not bucket URI {value!r}")
     if _GCP_PROJECT_ID.fullmatch(value) is None:
         raise ValueError("GCP project must be a 6-30 character lowercase project ID")
     return value

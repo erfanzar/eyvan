@@ -55,7 +55,7 @@ from eyvan.sdk.commands.runtime import (
 )
 
 EYVAN_ROOT = Path(__file__).resolve().parents[1]
-PROJECT = "example-project"
+PROJECT = "example-project-1"
 ARTIFACT_ROOT = "gs://eyvan-runtime-artifacts/eyvan"
 MODULE_SOURCE = b"VERSION = '1.2.3'\n"
 EDITABLE_PTH = b"/src\n"
