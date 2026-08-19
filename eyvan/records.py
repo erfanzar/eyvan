@@ -1839,10 +1839,13 @@ class CapacityPoolRecord(EyvanModel):
     #: recorded 1427.8s to reach READY, and a contended zone can leave a request
     #: in WAITING_FOR_RESOURCES for days. Releasing a slice to save a few idle
     #: minutes and then paying twenty-four to get it back is a bad trade, and on
-    #: granted spot capacity the idle minutes are the cheaper half. Set zero to
-    #: release on the first sweep where holding a scarce slice costs someone else
-    #: more than re-queuing costs you.
-    idle_timeout_s: float = Field(default=1800, ge=0)
+    #: granted spot capacity the idle minutes are the cheaper half. An hour is
+    #: deliberately well past that break-even: it spans the gap between one job
+    #: and the next attempt in an interactive session, which is the case the
+    #: window exists for, and holding longer costs nothing where the capacity is
+    #: granted rather than billed. Set zero to release on the first sweep where
+    #: holding a scarce slice costs someone else more than re-queuing costs you.
+    idle_timeout_s: float = Field(default=3600, ge=0)
     queue_timeout_s: float | None = Field(default=None, gt=0)
     provisioning_timeout_s: float = Field(default=1800, gt=0)
     upscaling_speed: float = Field(default=1.0, gt=0)

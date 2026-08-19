@@ -1,4 +1,4 @@
-def test_a_slow_start_leaves_the_server_running_instead_of_killing_it() -> None:
+def test_a_slow_start_leaves_the_server_running_instead_of_killing_it(tmp_path) -> None:
     """The failure that left a fleet with no control plane.
 
     Startup reconciles every cell, and each one provisioning or draining costs
@@ -11,7 +11,7 @@ def test_a_slow_start_leaves_the_server_running_instead_of_killing_it() -> None:
     import pytest
 
     from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
-    from eyvan.server.local.daemon import LocalDaemonStartupError, LocalDaemonSupervisor
+    from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonStartupError, LocalDaemonSupervisor
 
     killed: list[object] = []
 
@@ -24,6 +24,12 @@ def test_a_slow_start_leaves_the_server_running_instead_of_killing_it() -> None:
             return None
 
     supervisor = LocalDaemonSupervisor(
+        # Scoped to tmp_path because `ensure` *writes* a PID record for the
+        # endpoint it is given, and the default paths resolve to the operator's
+        # real ~/.eyvan. Without this the test stamps pid 4242 over the record of
+        # whatever control plane is genuinely listening on 8080, and the next
+        # native command refuses to run against its own live plane.
+        paths=LocalDaemonPaths(tmp_path / "eyvan"),
         launcher=type("L", (), {"start": lambda self, command: _StillStarting()})(),
         health_probe=lambda _endpoint: False,
         startup_timeout_s=0.01,
