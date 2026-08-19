@@ -1077,6 +1077,11 @@ def test_pool_callable_api_selects_an_atomic_tpu_worker_cell_and_preserves_idemp
             "fleet": "research-fleet",
             "requested_accelerator_type": "v6e-8",
             "available_enabled_accelerator_types": ["v5p-8"],
+            # Empty because no fleet on this plane provides v6e-8, which is the
+            # answer a caller needs: "you named the wrong fleet" and "nothing
+            # here has this shape" are different problems with different fixes.
+            "fleets_providing_requested_type": [],
+            "available_fleets": ["research-fleet"],
         },
     }
     callable_operation = client.get("/openapi.json").json()["paths"]["/api/v1/fleets/{fleet_name}/callables"]["post"]

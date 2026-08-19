@@ -471,9 +471,9 @@ def test_decorator_reports_actionable_error_when_selected_fleet_has_no_matching_
     assert raised.value.available_accelerator_types == ("v6e-8", "v6e-16")
     assert str(raised.value) == (
         "Eyvan cannot run TPU 'v5p-16' in selected fleet 'research-us-central1-c'. "
-        "Compatible TPU types for this request: v6e-8, v6e-16. Change TpuConfig(type=...) to one of those, or "
-        "select/apply a fleet "
-        "containing the requested type with `eyvan use FLEET` or `eyvan up CONFIG`."
+        "Compatible TPU types for this request: v6e-8, v6e-16. Change TpuConfig(type=...) to one of those. "
+        "Select a fleet with `eyvan use FLEET`, list them with `eyvan capacity fleets`, "
+        "or apply one with `eyvan up CONFIG`."
     )
     assert raised.value.__cause__ is None
     raw.close()
@@ -594,7 +594,8 @@ def test_auto_resolve_without_a_matching_pool_raises_placement_error_not_type_er
         "Eyvan cannot run TPU 'v5p-16' in any enabled fleet for acme/research "
         "with capacity class 'spot'. "
         "No enabled fleet exposes a compatible TPU pool for this request. "
-        "Select another fleet with `eyvan use FLEET`, or apply one with `eyvan up CONFIG`."
+        "Select a fleet with `eyvan use FLEET`, list them with `eyvan capacity fleets`, "
+        "or apply one with `eyvan up CONFIG`."
     )
     assert [request.url.path for request in requests] == ["/api/v1/capacity"]
     raw.close()

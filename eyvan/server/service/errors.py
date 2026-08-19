@@ -115,10 +115,19 @@ class NoMatchingCapacityPoolError(NotFoundError):
         fleet: str,
         requested_accelerator_type: str,
         available_enabled_accelerator_types: tp.Iterable[str],
+        fleets_providing_requested_type: tp.Iterable[str] = (),
+        available_fleets: tp.Iterable[str] = (),
     ) -> None:
         self.fleet = fleet
         self.requested_accelerator_type = requested_accelerator_type
         self.available_enabled_accelerator_types = sort_accelerator_types(available_enabled_accelerator_types)
+        # Which fleets *do* provide the shape, and failing that, which exist at
+        # all. The commonest way to reach this error is naming a zone where a
+        # fleet name belongs -- `asia-east1-c` instead of
+        # `research-asia-east1-c` -- and the answer is one word the caller
+        # cannot guess and the plane already knows.
+        self.fleets_providing_requested_type = tuple(sorted(set(fleets_providing_requested_type)))
+        self.available_fleets = tuple(sorted(set(available_fleets)))
         super().__init__(
             f"no enabled capacity pool in fleet {fleet!r} matches accelerator type {requested_accelerator_type!r}"
         )

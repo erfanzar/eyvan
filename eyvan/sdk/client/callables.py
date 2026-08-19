@@ -68,6 +68,8 @@ def _placement_error(error: EyvanHTTPError) -> EyvanPlacementError | None:
         fleet=response.context.fleet,
         requested_accelerator_type=response.context.requested_accelerator_type,
         available_accelerator_types=response.context.available_enabled_accelerator_types,
+        fleets_providing_requested_type=response.context.fleets_providing_requested_type,
+        available_fleets=response.context.available_fleets,
     )
 
 

@@ -1035,6 +1035,10 @@ class NoMatchingCapacityPoolErrorContext(ApiModel):
     fleet: str
     requested_accelerator_type: str
     available_enabled_accelerator_types: tuple[str, ...]
+    #: Fleets that do provide the requested shape, and every fleet in scope.
+    #: Defaulted so a client reading an older plane's response still validates.
+    fleets_providing_requested_type: tuple[str, ...] = ()
+    available_fleets: tuple[str, ...] = ()
 
 
 class NoMatchingCapacityPoolErrorResponse(ErrorResponse):

@@ -390,8 +390,42 @@ def test_empty_placement_inventory_does_not_claim_the_fleet_has_no_tpu_pools() -
     assert str(error) == (
         "Eyvan cannot run TPU 'v5p-16' in selected fleet 'research'. "
         "That fleet has no compatible enabled TPU pools for this request. "
-        "Select another fleet with `eyvan use FLEET`, or apply one with `eyvan up CONFIG`."
+        "Select a fleet with `eyvan use FLEET`, list them with `eyvan capacity fleets`, "
+        "or apply one with `eyvan up CONFIG`."
     )
+
+
+def test_the_refusal_names_the_fleets_that_do_provide_the_shape() -> None:
+    """The commonest way to reach this error is typing a zone where a fleet
+    name belongs -- `asia-east1-c` for `research-asia-east1-c`. Telling somebody
+    to "select another fleet" without saying which leaves them exactly as stuck,
+    holding a name they already believe is a fleet."""
+
+    error = EyvanPlacementError(
+        fleet="asia-east1-c",
+        requested_accelerator_type="v6e-16",
+        available_accelerator_types=(),
+        fleets_providing_requested_type=("research-asia-east1-c",),
+        available_fleets=("laptop", "research-asia-east1-c", "research-us-east5-a"),
+    )
+
+    assert "Fleets providing 'v6e-16': research-asia-east1-c." in str(error)
+
+
+def test_when_no_fleet_provides_the_shape_it_says_so_and_lists_what_exists() -> None:
+    """ "No fleet has this" and "you named the wrong one" are different problems;
+    only one of them is fixed by picking from a list."""
+
+    error = EyvanPlacementError(
+        fleet="research",
+        requested_accelerator_type="v7-4096",
+        available_accelerator_types=(),
+        available_fleets=("laptop", "research"),
+    )
+
+    message = str(error)
+    assert "No fleet provides it." in message
+    assert "Fleets in this project: laptop, research." in message
 
 
 def test_local_store_is_content_addressed_and_idempotent(tmp_path) -> None:

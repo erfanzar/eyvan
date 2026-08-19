@@ -1216,10 +1216,25 @@ class ControlPlaneService:
             fleet_pools = await self._fleet_pools(tx, fleet_name)
             exact_matches = [pool for pool in fleet_pools if pool.enabled and pool.accelerator_type == accelerator_type]
             if not exact_matches:
+                # Read the rest of the project only on the failure path. The
+                # commonest way to arrive here is naming a zone where a fleet
+                # name belongs -- `asia-east1-c` for `research-asia-east1-c` --
+                # and the fix is one word the caller cannot guess and the plane
+                # already holds. Paying for that listing on every successful
+                # submission to produce it would be the wrong trade.
+                # Every enabled pool, which is the same set `list_capacity`
+                # offers a submitter: a pool belongs to a fleet, not to a
+                # project, and the scope is enforced when the workload is
+                # placed rather than by filtering the inventory here.
+                in_scope = [pool for pool in await tx.list_capacity_pools() if pool.enabled]
                 raise NoMatchingCapacityPoolError(
                     fleet=fleet_name,
                     requested_accelerator_type=accelerator_type,
                     available_enabled_accelerator_types=self._callable_accelerator_types(fleet_pools, pods=pods),
+                    fleets_providing_requested_type=[
+                        pool.fleet_name for pool in in_scope if pool.accelerator_type == accelerator_type
+                    ],
+                    available_fleets=[pool.fleet_name for pool in in_scope],
                 )
             # The requested kind is derived from what the caller asked for, never
             # from what a pool declares itself to be. A pool mislabelled

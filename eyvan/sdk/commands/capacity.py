@@ -20,9 +20,12 @@ The help text says so, which turns an inconsistency into a stated policy.
 from __future__ import annotations
 
 import json
+import typing as tp
 
 import click
 
+from eyvan._internal.json_types import JsonValue, is_json_object
+from eyvan.domain.accelerators import sort_accelerator_types
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
@@ -553,6 +556,55 @@ def billing(session: CliSession, pool_id: str | None, as_json: bool) -> None:
         params={} if pool_id is None else {"pool_id": pool_id},
     )
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
+@capacity.command("fleets")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def fleets(session: CliSession, as_json: bool) -> None:
+    """List the fleets this project can submit to, and what each provides.
+
+    `capacity list` answers per pool, which is the right grain for choosing a
+    shape and the wrong one for choosing a fleet: twenty rows of one fleet's
+    pools do not tell you the fleet's name is the thing `eyvan use` wants. The
+    commonest placement failure is a zone typed where a fleet name belongs.
+    """
+
+    pools = session.client.request(
+        "GET",
+        "/api/v1/capacity-pools",
+        params={
+            "org_id": session.org_id or DEFAULT_ORG_ID,
+            "project_id": session.project_id or DEFAULT_PROJECT_ID,
+        },
+    )
+    grouped: dict[str, dict[str, object]] = {}
+    for pool in pools if isinstance(pools, list) else []:
+        if not is_json_object(pool):
+            continue
+        name = str(pool.get("fleet_name") or "")
+        row = grouped.setdefault(name, {"fleet": name, "pools": 0, "shapes": set(), "zones": set(), "disabled": 0})
+        row["pools"] = int(row["pools"]) + 1  # type: ignore[call-overload]
+        shape = pool.get("accelerator_type")
+        if isinstance(shape, str) and shape:
+            tp.cast("set[str]", row["shapes"]).add(shape)
+        zone = pool.get("zone")
+        if isinstance(zone, str) and zone:
+            tp.cast("set[str]", row["zones"]).add(zone)
+        if pool.get("enabled") is False:
+            row["disabled"] = int(row["disabled"]) + 1  # type: ignore[call-overload]
+
+    rows: JsonValue = [
+        {
+            "fleet": name,
+            "pools": row["pools"],
+            "disabled_pools": row["disabled"],
+            "zones": sorted(tp.cast("set[str]", row["zones"])),
+            "shapes": sort_accelerator_types(tp.cast("set[str]", row["shapes"])),
+        }
+        for name, row in sorted(grouped.items())
+    ]
+    _emit(rows, as_json=as_json, renderer=JsonRenderer())
 
 
 @capacity.command("usage")

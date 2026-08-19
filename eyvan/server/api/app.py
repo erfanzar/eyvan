@@ -782,6 +782,8 @@ def create_app(
                     fleet=exc.fleet,
                     requested_accelerator_type=exc.requested_accelerator_type,
                     available_enabled_accelerator_types=exc.available_enabled_accelerator_types,
+                    fleets_providing_requested_type=exc.fleets_providing_requested_type,
+                    available_fleets=exc.available_fleets,
                 ),
             )
             return JSONResponse(status_code=status_code, content=model_json(response))

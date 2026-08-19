@@ -334,31 +334,46 @@ class EyvanPlacementError(RuntimeError):
         available_accelerator_types: tp.Iterable[str],
         fleet: str | None = None,
         scope: str | None = None,
+        fleets_providing_requested_type: tp.Iterable[str] = (),
+        available_fleets: tp.Iterable[str] = (),
     ) -> None:
         self.fleet = fleet
         self.scope = scope
         self.requested_accelerator_type = requested_accelerator_type
         self.available_accelerator_types = sort_accelerator_types(available_accelerator_types)
+        self.fleets_providing_requested_type = tuple(sorted(set(fleets_providing_requested_type)))
+        self.available_fleets = tuple(sorted(set(available_fleets)))
         if fleet is not None:
             location = f"in selected fleet {fleet!r}"
             empty_detail = "That fleet has no compatible enabled TPU pools for this request."
         else:
             location = "in any enabled fleet" if scope is None else f"in any enabled fleet for {scope}"
             empty_detail = "No enabled fleet exposes a compatible TPU pool for this request."
-        message = f"Eyvan cannot run TPU {requested_accelerator_type!r} {location}."
+        parts = [f"Eyvan cannot run TPU {requested_accelerator_type!r} {location}."]
         if self.available_accelerator_types:
             available = ", ".join(self.available_accelerator_types)
-            message = (
-                f"{message} Compatible TPU types for this request: {available}. "
-                "Change TpuConfig(type=...) to one of those, or select/apply a fleet containing the requested type "
-                "with `eyvan use FLEET` or `eyvan up CONFIG`."
-            )
+            parts.append(f"Compatible TPU types for this request: {available}.")
+            parts.append("Change TpuConfig(type=...) to one of those.")
         else:
-            message = (
-                f"{message} {empty_detail} "
-                "Select another fleet with `eyvan use FLEET`, or apply one with `eyvan up CONFIG`."
-            )
-        super().__init__(message)
+            parts.append(empty_detail)
+        # Name the fleets that would work. The commonest cause of this error is
+        # a zone typed where a fleet name belongs -- `asia-east1-c` for
+        # `research-asia-east1-c` -- and telling somebody to "select another
+        # fleet" without saying which leaves them exactly as stuck, holding a
+        # name they already believe is a fleet.
+        if self.fleets_providing_requested_type:
+            named = ", ".join(self.fleets_providing_requested_type)
+            parts.append(f"Fleets providing {requested_accelerator_type!r}: {named}.")
+        elif self.available_fleets:
+            named = ", ".join(self.available_fleets)
+            parts.append(f"No fleet provides it. Fleets in this project: {named}.")
+        # One closing instruction, whichever branch ran, so the guidance is not
+        # repeated in different words within a single sentence.
+        parts.append(
+            "Select a fleet with `eyvan use FLEET`, list them with `eyvan capacity fleets`, "
+            "or apply one with `eyvan up CONFIG`."
+        )
+        super().__init__(" ".join(parts))
 
 
 @dataclass(frozen=True, slots=True)
