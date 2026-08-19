@@ -37,13 +37,21 @@ from eyvan.sdk.client.requests import (
     pool_workload_request,
     workload_list_params,
 )
-from eyvan.sdk.client.transport import SyncApiTransport
+from eyvan.sdk.client.transport import EyvanUnavailableError, SyncApiTransport
 from eyvan.sdk.client.types import HeaderMap, QueryParams
 from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadEstimateRequest, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.callables import CallableArtifact
 
 WorkloadObserver: tp.TypeAlias = tp.Callable[[WorkloadRecord], None]
+
+
+#: How long a wait keeps polling a control plane it cannot reach.
+#:
+#: Long enough to cover a restart or a rolling deploy, short enough that a plane
+#: which is genuinely gone is still reported rather than waited on forever. The
+#: workload is durable across the gap; the only thing at risk is the watching.
+UNREACHABLE_GRACE_S = 90.0
 
 
 class EyvanClient:
@@ -357,8 +365,32 @@ class EyvanClient:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         deadline = None if timeout is None else time.monotonic() + timeout
+        # A wait outlives the plane it is watching. A TPU sits in a provider
+        # queue for many minutes, and over that window an operator restarts the
+        # control plane, a proxy drops a connection, or a rolling deploy moves
+        # it -- and the workload is durable through every one of those. Killing
+        # the caller's script on the first failed poll ends the *watching*, not
+        # the job: the run continues on hardware with nobody reading it, which
+        # is the worst of both outcomes.
+        #
+        # Bounded, because a plane that is genuinely gone should still be
+        # reported rather than waited on forever. Only transport failures are
+        # forgiven; a 404 or a 403 is an answer and is raised at once.
+        unreachable_since: float | None = None
         while True:
-            workload = self.get_workload(workload_id)
+            try:
+                workload = self.get_workload(workload_id)
+            except EyvanUnavailableError:
+                now = time.monotonic()
+                if unreachable_since is None:
+                    unreachable_since = now
+                elif now - unreachable_since >= UNREACHABLE_GRACE_S:
+                    raise
+                if deadline is not None and now >= deadline:
+                    raise
+                time.sleep(min(poll_interval, max((deadline - now) if deadline is not None else poll_interval, 0)))
+                continue
+            unreachable_since = None
             if on_update is not None:
                 on_update(workload)
             if workload.state in TERMINAL_WORKLOAD_STATES:

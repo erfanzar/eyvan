@@ -25,7 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
+import { formatAcceleratorRequest, formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
 import type { LogEntry, WorkloadDetail, WorkloadExplanation, WorkloadSpend } from "../types";
 
 type DetailTab = "overview" | "timeline" | "logs";
@@ -382,7 +382,13 @@ export function WorkloadDetailPage({
               <div><dt>Replicas</dt><dd>{workload.resources.replicas}</dd></div>
               <div><dt>CPU</dt><dd>{workload.resources.cpu} cores</dd></div>
               <div><dt>Memory</dt><dd>{workload.resources.memoryGb} GB</dd></div>
-              <div><dt>Accelerators</dt><dd>{workload.resources.accelerator ? `${workload.resources.acceleratorCount}x ${workload.resources.accelerator}` : "None"}</dd></div>
+              <div><dt>Accelerators</dt><dd>
+                {formatAcceleratorRequest(
+                  workload.resources.accelerator,
+                  workload.resources.acceleratorCount,
+                  workload.resources.replicas,
+                )}
+              </dd></div>
               <div><dt>Topology</dt><dd>{workload.resources.topology ?? "No strict constraint"}</dd></div>
               <div><dt>Lease</dt><dd className="monospace">{workload.leaseId ?? "Not active"}</dd></div>
             </dl>

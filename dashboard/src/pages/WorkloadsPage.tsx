@@ -9,7 +9,7 @@ import { useMemo, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatDateTime, formatMoney, percent } from "../lib/format";
+import { formatAcceleratorRequest, formatDateTime, formatMoney, percent } from "../lib/format";
 import type { WorkloadSummary } from "../types";
 
 interface WorkloadsPageProps {
@@ -164,7 +164,11 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                         <span className="resource-cell">
                           <strong>
                             {workload.resources.accelerator
-                              ? `${workload.resources.acceleratorCount}x ${workload.resources.accelerator}`
+                              ? formatAcceleratorRequest(
+                                  workload.resources.accelerator,
+                                  workload.resources.acceleratorCount,
+                                  workload.resources.replicas,
+                                )
                               : `${workload.resources.cpu} CPU`}
                           </strong>
                           <small>

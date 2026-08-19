@@ -83,3 +83,25 @@ export function formatAgeSeconds(seconds: number | null | undefined): string {
   if (seconds < 5400) return `${Math.floor(seconds / 60)}m ago`;
   return `${Math.floor(seconds / 3600)}h ago`;
 }
+
+/**
+ * Describe what a workload asked for, without inflating it.
+ *
+ * The accelerator count is *chips*, and a TPU slice type already states its own
+ * size: `v5p-16` is one slice of 8 chips. Rendering the pair as `8x v5p-16`
+ * therefore claimed eight slices -- 64 chips -- for a request that asked for
+ * one, and multiplied every shape on the page by its own chip count.
+ *
+ * The multiplier belongs to replicas, which is what `pods=N` actually
+ * allocates. The chip count is kept as detail, because it is the number
+ * admission checks and the one a person compares against their quota.
+ */
+export function formatAcceleratorRequest(
+  accelerator: string | undefined,
+  chips: number | undefined,
+  replicas: number,
+): string {
+  if (!accelerator) return chips ? `${chips} chips` : "None";
+  const slices = replicas > 1 ? `${replicas} x ${accelerator}` : accelerator;
+  return chips ? `${slices} · ${chips} chips` : slices;
+}
