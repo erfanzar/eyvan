@@ -287,9 +287,10 @@ def test_use_persists_active_context_and_context_displays_it(monkeypatch) -> Non
             "acme",
             "--project",
             "training",
+            "--json",
         ],
     )
-    shown = runner.invoke(cli.main, ["context"])
+    shown = runner.invoke(cli.main, ["context", "--json"])
 
     expected = {
         "active_context": "research",
@@ -310,7 +311,7 @@ def test_use_persists_active_context_and_context_displays_it(monkeypatch) -> Non
 def test_use_applies_documented_scope_defaults(monkeypatch) -> None:
     monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: FakeClient())
 
-    selected = CliRunner().invoke(cli.main, ["use", "research"])
+    selected = CliRunner().invoke(cli.main, ["use", "research", "--json"])
 
     assert selected.exit_code == 0, selected.output
     assert json.loads(selected.output) == {
@@ -565,7 +566,7 @@ def test_use_switches_to_an_existing_named_context_without_overwriting_it(monkey
         cli.main,
         ["--url", "https://serving.example.com", "use", "serving", "--org", "prod", "--project", "inference"],
     )
-    selected = runner.invoke(cli.main, ["use", "research"])
+    selected = runner.invoke(cli.main, ["use", "research", "--json"])
 
     assert research.exit_code == 0, research.output
     assert serving.exit_code == 0, serving.output
@@ -702,7 +703,7 @@ def test_up_does_not_supervise_a_remote_control_plane(monkeypatch, tmp_path) -> 
 def test_up_dry_run_and_config_validate_do_not_call_api(monkeypatch, tmp_path) -> None:
     fake = FakeClient()
 
-    dry_run = _invoke(monkeypatch, tmp_path, fake, "up", "--dry-run")
+    dry_run = _invoke(monkeypatch, tmp_path, fake, "up", "--dry-run", "--json")
     validated = _invoke(monkeypatch, tmp_path, fake, "config", "validate")
 
     assert dry_run.exit_code == 0, dry_run.output
@@ -1226,6 +1227,7 @@ def test_up_cached_selector_groups_tpu_families_by_zone(monkeypatch, tmp_path) -
             "fleet_admin",
             "up",
             "--dry-run",
+            "--json",
             "--cache-dir",
             str(cache_dir),
         ],
@@ -1274,6 +1276,7 @@ def test_quota_based_up_shows_preemptible_quota_and_generates_only_matching_conf
             "--quota-based",
             "--preemptible",
             "--dry-run",
+            "--json",
             "--zone",
             "us-east5-a",
             "--tpu-generation",

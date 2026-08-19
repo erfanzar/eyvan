@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 import eyvan.sdk.commands.autoscale as autoscale_commands
 import eyvan.sdk.commands.fleet_status as fleet_status_rendering
-from eyvan._internal.json_types import JsonObject, model_json
+from eyvan._internal.json_types import JsonObject, is_json_object, model_json
 from eyvan.capacity.autoscale import AutoscaleConfigCache, CachedAutoscaleConfig, QueueAdmissionDenialRecorder
 from eyvan.capacity.fleet_config import EyvanFleetConfig, validate_fleet_name
 from eyvan.capacity.providers.gcp.runtime.supervisor import (
@@ -34,6 +34,7 @@ from eyvan.sdk.client.identity import resolve_control_plane_identity
 from eyvan.sdk.commands.common import FleetConfigLoader, JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import ContextConfigError
+from eyvan.sdk.shapes import summarize_shapes
 from eyvan.server.api.schemas import CellUpsertRequest, FleetApplyRequest, FleetStatusResponse
 from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, ensure_loopback_control_plane
 
@@ -138,6 +139,62 @@ def _record_queue_admission_denials(cache: AutoscaleConfigCache, status: FleetSt
         recorder.record_cell(cell)
 
 
+def _render_planned_fleet(payload: JsonObject) -> tuple[str, ...]:
+    """Describe what applying a fleet would create, for a person.
+
+    ``--dry-run`` printed the whole apply request: seventeen pools of
+    thirty-odd keys each, several hundred lines to answer "is this the fleet I
+    meant". The document is still what ``--json`` returns; this is the summary
+    somebody validating a config actually reads.
+
+    Only facts that differ between fleets are shown. A field every pool shares
+    is stated once, and one that varies is ranged, because seventeen identical
+    lines is the wall this replaces.
+    """
+
+    pools = payload.get("pools")
+    pools = pools if isinstance(pools, list) else []
+    entries = [pool for pool in pools if is_json_object(pool)]
+    lines = [f"Would apply fleet {payload.get('fleet')}"]
+
+    def row(label: str, value: object) -> None:
+        if value not in (None, "", []):
+            lines.append(f"  {label:<16} {value}")
+
+    def spread(key: str) -> str | None:
+        """One value if every pool agrees, otherwise the range they span."""
+
+        seen = sorted({pool.get(key) for pool in entries if pool.get(key) is not None})  # type: ignore[type-var]
+        if not seen:
+            return None
+        return str(seen[0]) if len(seen) == 1 else f"{seen[0]}-{seen[-1]}"
+
+    zones = sorted({str(pool.get("zone")) for pool in entries if pool.get("zone")})
+    row("zone", ", ".join(zones))
+    shapes = summarize_shapes(sorted(str(pool.get("accelerator_type") or "") for pool in entries))
+    row("pools", f"{len(entries)}  ·  {shapes}" if shapes else str(len(entries)))
+    classes = sorted({str(pool.get("capacity_class")) for pool in entries if pool.get("capacity_class")})
+    row("capacity", ", ".join(classes))
+    disabled = sum(1 for pool in entries if pool.get("enabled") is False)
+    if disabled:
+        row("disabled", f"{disabled} of {len(entries)} pools")
+
+    idle = spread("idle_timeout_s")
+    if idle is not None:
+        # Seconds is what the config says and minutes is what somebody checks,
+        # so both, rather than making the reader divide.
+        try:
+            minutes = f" ({float(idle) / 60:.0f}m)" if "-" not in idle else ""
+        except ValueError:
+            minutes = ""
+        row("idle window", f"{idle}s{minutes} before a freed cell is released")
+    row("cells per pool", f"{spread('min_cells')} min, {spread('max_cells')} max")
+    started = payload.get("desired_initial_cells")
+    started = started if isinstance(started, list) else []
+    row("started now", f"{len(started)} cell(s)" if started else "none; capacity is requested on demand")
+    return tuple(lines)
+
+
 @dataclass(frozen=True, slots=True)
 class FleetCommandService:
     """Typed application service for declarative fleet operations."""
@@ -197,7 +254,11 @@ class FleetCommandService:
             }
             if generated_payload is not None:
                 payload["autoscale"] = generated_payload
-            self.renderer.emit(payload)
+            if as_json:
+                self.renderer.emit(payload)
+            else:
+                for line in _render_planned_fleet(payload):
+                    click.echo(line)
             return
 
         applied = self.session.client.request(

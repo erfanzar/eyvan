@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import model_json
 from eyvan.records import Role, RoleGrant
+from eyvan.sdk.commands.common import emit_result
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.api.schemas import (
@@ -87,6 +88,7 @@ def get_organization(session: CliSession, org_id: str) -> None:
     help="Register without accepting work. Existing history stays readable either way.",
 )
 @click.option("--idempotency-key")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def create_organization(
     session: CliSession,
@@ -96,6 +98,7 @@ def create_organization(
     labels: tuple[str, ...],
     disabled: bool,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Register a tenant, or update the one already registered under this id."""
 
@@ -106,14 +109,13 @@ def create_organization(
         enabled=not disabled,
     )
     service = _service(session)
-    service.renderer.emit(
-        session.client.request(
-            "PUT",
-            f"/api/v1/organizations/{org_id}",
-            json=model_json(request),
-            headers={"Idempotency-Key": service.keys.create("organization.register", idempotency_key)},
-        )
+    response = session.client.request(
+        "PUT",
+        f"/api/v1/organizations/{org_id}",
+        json=model_json(request),
+        headers={"Idempotency-Key": service.keys.create("organization.register", idempotency_key)},
     )
+    emit_result(service.renderer, response, f"Registered organization {org_id}", as_json=as_json)
 
 
 @click.group("project")
@@ -139,6 +141,7 @@ def list_projects(session: CliSession, org_id: str | None) -> None:
 @click.option("--label", "labels", multiple=True, metavar="KEY=VALUE")
 @click.option("--disabled", is_flag=True, help="Register without accepting work.")
 @click.option("--idempotency-key")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def create_project(
     session: CliSession,
@@ -149,6 +152,7 @@ def create_project(
     labels: tuple[str, ...],
     disabled: bool,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Register a project, or update the one already registered under this id.
 
@@ -164,14 +168,13 @@ def create_project(
         enabled=not disabled,
     )
     service = _service(session)
-    service.renderer.emit(
-        session.client.request(
-            "PUT",
-            f"/api/v1/organizations/{scope.org_id}/projects/{project_id}",
-            json=model_json(request),
-            headers={"Idempotency-Key": service.keys.create("project.register", idempotency_key)},
-        )
+    response = session.client.request(
+        "PUT",
+        f"/api/v1/organizations/{scope.org_id}/projects/{project_id}",
+        json=model_json(request),
+        headers={"Idempotency-Key": service.keys.create("project.register", idempotency_key)},
     )
+    emit_result(service.renderer, response, f"Registered project {scope.org_id}/{project_id}", as_json=as_json)
 
 
 @click.group("grant")
@@ -216,6 +219,7 @@ def list_grants(session: CliSession, subject: str | None, org_id: str | None) ->
 )
 @click.option("--reason", default="", help="Why this was granted, recorded in the ledger.")
 @click.option("--idempotency-key")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def add_grant(
     session: CliSession,
@@ -226,6 +230,7 @@ def add_grant(
     expires_at: datetime | None,
     reason: str,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Grant SUBJECT a role, effective on their next request."""
 
@@ -239,14 +244,14 @@ def add_grant(
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
     service = _service(session)
-    service.renderer.emit(
-        session.client.request(
-            "POST",
-            "/api/v1/grants",
-            json=model_json(request),
-            headers={"Idempotency-Key": service.keys.create("grant.issue", idempotency_key)},
-        )
+    response = session.client.request(
+        "POST",
+        "/api/v1/grants",
+        json=model_json(request),
+        headers={"Idempotency-Key": service.keys.create("grant.issue", idempotency_key)},
     )
+    scope = "/".join(part for part in (org_id, project_id) if part) or "every tenant"
+    emit_result(service.renderer, response, f"Granted {subject} the {role} role on {scope}", as_json=as_json)
 
 
 @grant.command("revoke")

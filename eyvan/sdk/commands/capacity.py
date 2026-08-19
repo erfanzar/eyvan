@@ -29,6 +29,7 @@ from eyvan.domain.accelerators import sort_accelerator_types
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
+from eyvan.sdk.shapes import summarize_shapes
 
 
 def _emit(payload: object, *, as_json: bool, renderer: JsonRenderer) -> None:
@@ -631,10 +632,10 @@ def fleets(session: CliSession, as_json: bool) -> None:
         entry = _entry(row)
         shapes = tp.cast("list[str]", entry["shapes"])
         zones = tp.cast("list[str]", entry["zones"])
-        # The first three shapes and a count. A twenty-pool fleet listed in full
-        # is the wall of repetition this command exists to replace, and the
-        # question it answers is "which fleet", not "which shape".
-        listed = ", ".join(shapes[:3]) + (f" +{len(shapes) - 3} more" if len(shapes) > 3 else "")
+        # One entry per generation rather than the first three shapes and a
+        # count: the count used to swallow whole families, because shapes sort
+        # by generation and the v6e half of a v5p-heavy fleet fell inside it.
+        listed = summarize_shapes(shapes)
         disabled = f"  ({entry['disabled_pools']} disabled)" if entry["disabled_pools"] else ""
         where = ", ".join(zones) or "local"
         click.echo(f"  {entry['fleet']:26} {where:16} {entry['pools']:>3} pools  {listed}{disabled}")

@@ -44,7 +44,6 @@ from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
-from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.api.server_startup import (
     StartupConfigurationSource,
@@ -182,6 +181,7 @@ class DoctorCommandService:
     session: CliSession
     renderer: JsonRenderer = field(default_factory=JsonRenderer)
     server_bind_host: str = DEFAULT_SERVER_BIND_HOST
+    as_json: bool = False
 
     def _server_startup_check(self) -> CheckResult:
         """Report every setting a server bound to ``server_bind_host`` would refuse without.
@@ -793,29 +793,53 @@ class DoctorCommandService:
         return report
 
     def run(self) -> None:
-        """Emit the report and exit non-zero when a check failed."""
+        """Emit the report and exit non-zero when a check failed.
+
+        The readable report used to go to stderr, and only when stderr was a
+        terminal, while stdout always received the JSON. So the answer a person
+        wanted vanished the moment they piped the command anywhere, and what
+        survived was the document. Report to stdout, and keep the document
+        behind ``--json`` like every other read command here.
+        """
 
         report = self.report()
-        stream = click.get_text_stream("stderr")
-        if stream_is_terminal(stream):
-            step = report.next_step
-            if step is not None:
-                click.echo(f"  next: {step.detail}", file=stream)
-                for line in step.remedy.splitlines():
-                    click.echo(f"        {line}", file=stream)
-                click.echo("", file=stream)
-            for check in report.checks:
-                click.echo(f"  {check.status.value.upper():5} {check.name}  {check.detail}", file=stream)
-                # A remedy that lists several settings is several lines; printing
-                # it as one would wrap the whole preflight into a wall. Identical
-                # output for every single-line remedy.
-                prefix = "        -> "
-                for line in check.remedy.splitlines():
-                    click.echo(f"{prefix}{line}", file=stream)
-                    prefix = "           "
-        self.renderer.emit(report.as_json())
+        if self.as_json:
+            self.renderer.emit(report.as_json())
+        else:
+            for line in self.render(report):
+                click.echo(line)
         if not report.ok:
             raise SystemExit(1)
+
+    @staticmethod
+    def render(report: DoctorReport) -> tuple[str, ...]:
+        """Render one report as the lines a person reads."""
+
+        lines: list[str] = []
+        step = report.next_step
+        if step is not None:
+            lines.append(f"  next: {step.detail}")
+            lines.extend(f"        {line}" for line in step.remedy.splitlines())
+            lines.append("")
+        for check in report.checks:
+            lines.append(f"  {check.status.value.upper():5} {check.name}  {check.detail}")
+            # A remedy that lists several settings is several lines; printing it
+            # as one would wrap the whole preflight into a wall. Identical output
+            # for every single-line remedy.
+            prefix = "        -> "
+            for line in check.remedy.splitlines():
+                lines.append(f"{prefix}{line}")
+                prefix = "           "
+        failed = sum(1 for check in report.checks if check.status is CheckStatus.FAIL)
+        warned = sum(1 for check in report.checks if check.status is CheckStatus.WARN)
+        summary = f"{len(report.checks)} checks"
+        if failed:
+            summary += f", {failed} failed"
+        if warned:
+            summary += f", {warned} warned"
+        lines.append("")
+        lines.append(f"  {summary if failed or warned else summary + ', all passing'}")
+        return tuple(lines)
 
 
 def _unpriced_pool_names(payload: JsonValue) -> set[str]:
@@ -886,11 +910,12 @@ def _fleet_names(payload: JsonValue) -> tuple[str, ...]:
     show_default=True,
     help="Bind address to preflight a server for; the same value `eyvan-server --host` takes.",
 )
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def doctor(session: CliSession, server_host: str) -> None:
+def doctor(session: CliSession, server_host: str, as_json: bool) -> None:
     """Check credentials, connectivity, and fleet readiness before submitting."""
 
-    DoctorCommandService(session, server_bind_host=server_host).run()
+    DoctorCommandService(session, server_bind_host=server_host, as_json=as_json).run()
 
 
 def register_doctor_commands(group: click.Group) -> None:

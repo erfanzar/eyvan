@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonValue
 from eyvan.capacity.fleet_config import EyvanFleetConfig
+from eyvan.sdk.tables import describe
 
 
 class JsonRenderer:
@@ -27,6 +28,29 @@ class JsonRenderer:
         """Write one deterministic JSON document to stdout."""
 
         click.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+def emit_result(
+    renderer: JsonRenderer,
+    response: JsonValue,
+    headline: str,
+    *,
+    as_json: bool,
+    fields: tuple[str, ...] | None = None,
+) -> None:
+    """Report what a mutation did, or its record when asked for the record.
+
+    Mutating commands answered with the stored document -- creating an
+    organization printed thirty keys, and whether it worked was somewhere
+    inside. The caller knows what it just did and the record does not, so the
+    sentence comes from here and the identity comes from the response.
+    """
+
+    if as_json:
+        renderer.emit(response)
+        return
+    for line in describe(headline, response, fields=fields):
+        click.echo(line)
 
 
 class FleetConfigLoader:

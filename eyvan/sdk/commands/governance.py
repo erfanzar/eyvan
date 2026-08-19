@@ -27,7 +27,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonValue, is_json_object, model_json
 from eyvan.records import CapacityClass, EffectiveQuota, ResourceLimits
-from eyvan.sdk.commands.common import JsonRenderer
+from eyvan.sdk.commands.common import JsonRenderer, emit_result
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.terminal import stream_is_terminal
@@ -261,8 +261,9 @@ def budget_status(session: CliSession, org_id: str | None, project_id: str | Non
 @budget.command("roll")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def roll_budget(session: CliSession, org_id: str | None, project_id: str | None) -> None:
+def roll_budget(session: CliSession, org_id: str | None, project_id: str | None, as_json: bool) -> None:
     """Close an elapsed budget period without waiting for the next settlement.
 
     Not a force-reset: a period that has not elapsed is left alone, because
@@ -270,8 +271,10 @@ def roll_budget(session: CliSession, org_id: str | None, project_id: str | None)
     """
 
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
-    renderer = JsonRenderer()
-    renderer.emit(session.client.request("POST", f"/api/v1/budgets/{scope.org_id}/{scope.project_id}/roll"))
+    response = session.client.request("POST", f"/api/v1/budgets/{scope.org_id}/{scope.project_id}/roll")
+    emit_result(
+        JsonRenderer(), response, f"Rolled the budget period for {scope.org_id}/{scope.project_id}", as_json=as_json
+    )
 
 
 @budget.command("set")

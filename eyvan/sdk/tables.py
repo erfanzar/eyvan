@@ -115,4 +115,47 @@ def field(*path: str) -> tp.Callable[[JsonObject], object]:
     return read
 
 
-__all__ = ("ABSENT", "MAX_WIDTH", "Column", "cell", "field", "render")
+#: Keys worth showing first when describing one record, in this order. A record
+#: has thirty keys and about four of them say what it is; the rest are the
+#: document, which ``--json`` returns.
+_IDENTIFYING = ("id", "name", "state", "status", "org_id", "project_id", "fleet", "role", "scope", "amount")
+
+
+def describe(headline: str, record: object, *, fields: tp.Sequence[str] | None = None) -> tuple[str, ...]:
+    """Render one record as a result somebody just caused.
+
+    A mutation used to answer with the stored record, which is complete and
+    unreadable: creating an organization printed thirty keys, and the one fact
+    the caller wanted -- that it worked, and what it is called -- was somewhere
+    inside. This says what happened, then the few fields that identify the thing
+    it happened to.
+
+    Args:
+        headline: What just happened, as a sentence. The caller knows this and
+            the record does not.
+        record: The server's response. Anything that is not an object renders as
+            the headline alone rather than inventing detail.
+        fields: Keys to show, in order. Defaults to whichever of
+            :data:`_IDENTIFYING` the record carries, so a caller that has
+            nothing special to say does not have to choose.
+
+    Returns:
+        Lines to print, headline first.
+    """
+
+    lines = [headline]
+    if not is_json_object(record):
+        return tuple(lines)
+    keys = tuple(fields) if fields is not None else tuple(key for key in _IDENTIFYING if key in record)
+    width = max((len(key) for key in keys), default=0)
+    for key in keys:
+        value = record.get(key)
+        # Nested structure is the document, not the identity of the thing; a
+        # dict rendered inline here is how the wall of JSON grows back.
+        if value is None or value == "" or isinstance(value, (dict, list, tuple)):
+            continue
+        lines.append(f"  {key.replace('_', ' '):<{width}}  {cell(value)}")
+    return tuple(lines)
+
+
+__all__ = ("ABSENT", "MAX_WIDTH", "Column", "cell", "describe", "field", "render")

@@ -36,7 +36,7 @@ from eyvan.records import (
 )
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.requests import pool_workload_request
-from eyvan.sdk.commands.common import JsonRenderer, parse_environment, shell_command
+from eyvan.sdk.commands.common import JsonRenderer, emit_result, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
 from eyvan.sdk.follow import WorkloadFollower, parse_duration
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
@@ -884,6 +884,7 @@ def run_workload(
 @click.option("--rank", type=int, default=None, help="Run on one rank only. Omitted runs on every rank.")
 @click.option("--timeout", "timeout_s", type=float, default=30.0, show_default=True)
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def exec_in_workload(
     session: CliSession,
@@ -891,6 +892,7 @@ def exec_in_workload(
     rank: int | None,
     timeout_s: float,
     command: tuple[str, ...],
+    as_json: bool,
 ) -> None:
     """Run COMMAND beside a running workload, on every rank by default.
 
@@ -901,13 +903,14 @@ def exec_in_workload(
     slow step.
     """
 
-    WorkloadCommandService(session).renderer.emit(
-        session.client.request(
-            "POST",
-            f"/api/v1/workloads/{workload_id}/exec",
-            json={"command": list(command), "timeout_s": timeout_s, "rank": rank},
-        )
+    service = WorkloadCommandService(session)
+    response = session.client.request(
+        "POST",
+        f"/api/v1/workloads/{workload_id}/exec",
+        json={"command": list(command), "timeout_s": timeout_s, "rank": rank},
     )
+    where = "every rank" if rank is None else f"rank {rank}"
+    emit_result(service.renderer, response, f"Ran {' '.join(command)} on {where}", as_json=as_json)
 
 
 @click.group("workload")
@@ -1605,6 +1608,7 @@ def workload_logs(
     default=False,
     help="Do not ask before kicking more than one workload.",
 )
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def kick_workload(
     session: CliSession,
@@ -1613,6 +1617,7 @@ def kick_workload(
     project_id: str | None,
     prefix: str | None,
     confirmed: bool,
+    as_json: bool,
 ) -> None:
     """Interrupt this attempt and let WORKLOAD_ID reschedule elsewhere.
 
@@ -1641,12 +1646,14 @@ def kick_workload(
                 click.echo(f"  {match.id}  {match.state.value:<12}{match.spec.name}", err=True)
             raise click.ClickException(f"kick would apply to {len(matches)} workloads; pass --yes to confirm")
         for match in matches:
-            service.renderer.emit(session.client.request("POST", f"/api/v1/workloads/{match.id}/kick"))
+            response = session.client.request("POST", f"/api/v1/workloads/{match.id}/kick")
+            emit_result(service.renderer, response, f"Kicked {match.id}", as_json=as_json)
         return
     if workload_id is None:
         raise click.UsageError("give a workload id, or --prefix to match several")
     resolved = service.resolve(workload_id, org_id=org_id, project_id=project_id)
-    service.renderer.emit(session.client.request("POST", f"/api/v1/workloads/{resolved}/kick"))
+    response = session.client.request("POST", f"/api/v1/workloads/{resolved}/kick")
+    emit_result(service.renderer, response, f"Kicked {resolved}", as_json=as_json)
 
 
 def _workload_action_command(action: WorkloadAction) -> click.Command:

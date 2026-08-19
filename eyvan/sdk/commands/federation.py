@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.json_types import model_json
 from eyvan.records import ResourceLimits
+from eyvan.sdk.commands.common import emit_result
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.api.schemas import (
@@ -73,8 +74,16 @@ def list_peers(session: CliSession) -> None:
     is_flag=True,
     help="Register without allowing new grants. Existing grants are unaffected; revoke those explicitly.",
 )
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def add_peer(session: CliSession, plane_id: str, endpoint: str, description: str, disabled: bool) -> None:
+def add_peer(
+    session: CliSession,
+    plane_id: str,
+    endpoint: str,
+    description: str,
+    disabled: bool,
+    as_json: bool,
+) -> None:
     """Register PLANE_ID as a peer, or update the registration.
 
     Peers are written down, never discovered. A plane that could join by
@@ -87,9 +96,8 @@ def add_peer(session: CliSession, plane_id: str, endpoint: str, description: str
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
     service = _service(session)
-    service.renderer.emit(
-        session.client.request("PUT", f"/api/v1/federation/peers/{plane_id}", json=model_json(request))
-    )
+    response = session.client.request("PUT", f"/api/v1/federation/peers/{plane_id}", json=model_json(request))
+    emit_result(service.renderer, response, f"Registered peer plane {plane_id}", as_json=as_json)
 
 
 @federation.group("grant")
@@ -131,6 +139,7 @@ def list_grants(session: CliSession, org_id: str | None, project_id: str | None,
     help="When the slice lapses. Required: a grant that cannot lapse makes a home plane going away permanent spend.",
 )
 @click.option("--idempotency-key")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def issue_grant(
     session: CliSession,
@@ -140,6 +149,7 @@ def issue_grant(
     amount: float,
     expires_at: datetime,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Grant GRANTEE_PLANE_ID a slice of one tenant's budget.
 
@@ -161,27 +171,33 @@ def issue_grant(
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
     service = _service(session)
-    service.renderer.emit(
-        session.client.request(
-            "POST",
-            "/api/v1/federation/budget-grants",
-            json=model_json(request),
-            headers={"Idempotency-Key": service.keys.create("budget.grant", idempotency_key)},
-        )
+    response = session.client.request(
+        "POST",
+        "/api/v1/federation/budget-grants",
+        json=model_json(request),
+        headers={"Idempotency-Key": service.keys.create("budget.grant", idempotency_key)},
     )
+    emit_result(service.renderer, response, "Issued a budget grant", as_json=as_json)
 
 
 @grant.command("revoke")
 @click.argument("grant_id")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def revoke_grant(session: CliSession, grant_id: str) -> None:
+def revoke_grant(
+    session: CliSession,
+    grant_id: str,
+    as_json: bool,
+) -> None:
     """Withdraw GRANT_ID, stopping new admission on the grantee.
 
     Says nothing about what already ran: that money is spent, and clawing it
     back would make the home plane's ledger disagree with the invoice.
     """
 
-    _service(session).renderer.emit(session.client.request("DELETE", f"/api/v1/federation/budget-grants/{grant_id}"))
+    service = _service(session)
+    response = session.client.request("DELETE", f"/api/v1/federation/budget-grants/{grant_id}")
+    emit_result(service.renderer, response, f"Revoked budget grant {grant_id}", as_json=as_json)
 
 
 @federation.group("quota-grant")
@@ -228,6 +244,7 @@ def list_quota_grants(session: CliSession, org_id: str | None, project_id: str |
     help="When the slice lapses. Required, for the same reason a budget slice's expiry is.",
 )
 @click.option("--idempotency-key")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def issue_quota_grant(
     session: CliSession,
@@ -240,6 +257,7 @@ def issue_quota_grant(
     tpu: float,
     expires_at: datetime,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Grant GRANTEE_PLANE_ID a slice of one tenant's quota.
 
@@ -260,20 +278,24 @@ def issue_quota_grant(
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
     service = _service(session)
-    service.renderer.emit(
-        session.client.request(
-            "POST",
-            "/api/v1/federation/quota-grants",
-            json=model_json(request),
-            headers={"Idempotency-Key": service.keys.create("quota.grant", idempotency_key)},
-        )
+    response = session.client.request(
+        "POST",
+        "/api/v1/federation/quota-grants",
+        json=model_json(request),
+        headers={"Idempotency-Key": service.keys.create("quota.grant", idempotency_key)},
     )
+    emit_result(service.renderer, response, "Issued a quota grant", as_json=as_json)
 
 
 @quota_grant.command("revoke")
 @click.argument("grant_id")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def revoke_quota_grant(session: CliSession, grant_id: str) -> None:
+def revoke_quota_grant(
+    session: CliSession,
+    grant_id: str,
+    as_json: bool,
+) -> None:
     """Withdraw GRANT_ID, stopping new admission on the grantee.
 
     Does not disturb what is already running: a quota is a concurrent ceiling,
@@ -281,7 +303,9 @@ def revoke_quota_grant(session: CliSession, grant_id: str) -> None:
     outage rather than an administrative act.
     """
 
-    _service(session).renderer.emit(session.client.request("DELETE", f"/api/v1/federation/quota-grants/{grant_id}"))
+    service = _service(session)
+    response = session.client.request("DELETE", f"/api/v1/federation/quota-grants/{grant_id}")
+    emit_result(service.renderer, response, f"Revoked quota grant {grant_id}", as_json=as_json)
 
 
 def register_federation_commands(main: click.Group) -> None:
