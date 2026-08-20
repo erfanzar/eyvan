@@ -70,7 +70,10 @@ describe("applied fleets", () => {
       .getAllByRole("row")
       .find((row) => row.textContent?.includes("research"))!;
 
-    expect(research.textContent).toContain("v6e-8");
+    // One entry per generation with its size range, rather than the first three
+    // shapes and a count -- that hid whole generations, because shapes sort by
+    // generation and the tail of the list fell inside the count.
+    expect(research.textContent).toContain("v6e 8-64");
     expect(research.textContent).toContain("asia-east1-c");
   });
 

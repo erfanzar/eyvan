@@ -117,3 +117,42 @@ def test_writer_sink_remains_plain_even_when_terminal_color_is_forced() -> None:
     ).submission(_RECEIPT)
 
     assert lines == list(_RECEIPT.plain_lines)
+
+
+def test_waiting_states_redraw_one_line_instead_of_stacking_a_block_each() -> None:
+    """Waiting for a spot TPU must not bury the run in its own status.
+
+    A job sits in requesting/queued/provisioning/connecting for minutes with no
+    output of its own, and each change printed a fresh two-line block. A run
+    that eventually started had a screenful of its own waiting above it, which
+    reads as breakage rather than progress. The waiting line is redrawn in
+    place; anything that is not waiting settles it and prints normally.
+    """
+
+    stream = io.StringIO()
+    output = JobTerminalOutput(stream=stream, force_terminal=True, environment={})
+
+    for state in (JobLifecycleState.QUEUED, JobLifecycleState.PROVISIONING, JobLifecycleState.CONNECTING):
+        output.lifecycle(JobLifecycleUpdate(state, "v6e-8 | us-central1-a", f"waiting on {state}", None))
+    # A live region paints on refresh or on stop, so read it after it settles --
+    # which is what the next non-waiting event does.
+    output.lifecycle(JobLifecycleUpdate(JobLifecycleState.RUNNING, "v6e-8 | us-central1-a", "started", None))
+    rendered = stream.getvalue()
+
+    # The last thing it was waiting on survives: how a run got here is part of
+    # the story, so the live display is not transient.
+    assert "connecting" in rendered.lower()
+    # The earlier waiting summaries were redrawn over, not each given a line.
+    assert "waiting on queued" not in rendered
+    assert "waiting on provisioning" not in rendered
+    # And a real event lands in scrollback rather than inside the live region.
+    assert "started" in rendered
+
+
+def test_settle_is_safe_to_call_when_nothing_is_being_drawn() -> None:
+    """The follower settles on every exit path, including ones that never waited."""
+
+    output = JobTerminalOutput(stream=io.StringIO(), force_terminal=True, environment={})
+
+    output.settle()
+    output.settle()

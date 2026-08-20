@@ -23,7 +23,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatDateTime, formatMoney, percent } from "../lib/format";
+import { formatDateTime, formatMoney, percent, summarizeShapes } from "../lib/format";
 import type {
   BillingReport,
   CapacityLease,
@@ -299,8 +299,7 @@ export function FleetPage({
                     <td>{fleet.pools.length}</td>
                     <td>
                       <span className="resource-cell">
-                        <strong>{fleet.shapes.slice(0, 3).join(", ")}</strong>
-                        {fleet.shapes.length > 3 && <small>+{fleet.shapes.length - 3} more</small>}
+                        <strong>{summarizeShapes(fleet.shapes)}</strong>
                       </span>
                     </td>
                     <td className="monospace">{fleet.zones.join(", ") || "—"}</td>

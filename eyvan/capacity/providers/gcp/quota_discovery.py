@@ -23,6 +23,7 @@ from eyvan.capacity.providers.gcp.accelerator_catalog import (
     AcceleratorCatalogError,
     ApiAcceleratorCatalog,
 )
+from eyvan.capacity.providers.gcp.quota_catalog import ApiQuotaCatalog, QuotaCatalogError
 from eyvan.capacity.providers.gcp.quota_usage import GcpQuotaUsageError, GcpTpuQuotaUsageDiscovery, TpuQuotaUsage
 from eyvan.capacity.providers.gcp.tpu_types import accelerator_generation
 
@@ -288,6 +289,7 @@ class GcpTpuQuotaDiscovery:
         lookup_concurrency: int = 8,
         usage_discovery: TpuQuotaUsageDiscovery | None = None,
         catalog: ApiAcceleratorCatalog | None = None,
+        quota_catalog: ApiQuotaCatalog | None = None,
     ):
         if isinstance(lookup_concurrency, bool) or not isinstance(lookup_concurrency, int) or lookup_concurrency < 1:
             raise ValueError("lookup_concurrency must be a positive integer")
@@ -298,6 +300,10 @@ class GcpTpuQuotaDiscovery:
         # whole deadline spawning gcloud. Set to ``False`` to force the
         # subprocess path; ``None`` means build the default reader.
         self._catalog = ApiAcceleratorCatalog() if catalog is None else catalog
+        # The other fast path. `gcloud beta quotas info list` is ~4s of the same
+        # interpreter startup for a single response; the API answers it in one
+        # request. ``None`` builds the default reader, as with the catalogue.
+        self._quota_catalog = ApiQuotaCatalog(_TPU_QUOTA_SERVICE) if quota_catalog is None else quota_catalog
         #: One provider response per project, reused across capacity classes
         #: within a single discovery. Not a TTL cache: the caller above already
         #: owns freshness, and holding it longer here would hide a re-read.
@@ -382,6 +388,29 @@ class GcpTpuQuotaDiscovery:
                 )
         return tuple(sorted(results, key=lambda item: (item.zone, item.accelerator_type)))
 
+    def _read_quota_limits(self, project: str, command: tuple[str, ...]) -> JsonValue:
+        """Read quota limits over the API, falling back to the gcloud command.
+
+        The API is one HTTPS request; the gcloud form is about four seconds of
+        interpreter startup for the same answer. The fallback is kept because it
+        works where a raw call may not -- a proxy configured only for gcloud, or
+        a host where the token cannot be minted -- and both return the same rows,
+        so nothing downstream can tell which path answered.
+        """
+
+        if self._quota_catalog is not None:
+            try:
+                entries = self._quota_catalog.limits(project)
+                if is_json_value(entries):
+                    return entries
+            except QuotaCatalogError:
+                # Fall through to gcloud, matching how the accelerator catalogue
+                # degrades. Reached at most once per project per discovery -- the
+                # response cache above sees to that -- and the fallback produces
+                # the same rows, so a caller cannot tell which path answered.
+                pass
+        return self._run_json(command)
+
     def _quota_limits(self, project: str, *, preemptible: bool) -> _QuotaLimits:
         command = (
             "beta",
@@ -399,7 +428,7 @@ class GcpTpuQuotaDiscovery:
         # gcloud call twice per read for one response.
         raw = self._quota_response_cache.get(project)
         if raw is None:
-            raw = self._run_json(command)
+            raw = self._read_quota_limits(project, command)
             self._quota_response_cache[project] = raw
         if not isinstance(raw, list):
             raise GcloudQuotaError("gcloud quota response was not a list")

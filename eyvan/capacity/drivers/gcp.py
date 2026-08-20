@@ -1103,6 +1103,42 @@ class GcpTpuCapacityDriver:
             return self._observation(record)
 
     def release(self, cell_id: str, context: MutationContext) -> CellObservation:
+        """Release one cell's provider capacity, holding the fleet lock only to claim it.
+
+        Releasing used to hold ``_mutation_lock`` and the durable fleet-state
+        lease across the provider deletes. Every cell sharing a fleet-state
+        document therefore released strictly one at a time, and each mutation is
+        a compare-and-swap against object storage, so draining a fleet queued
+        every release behind every earlier one. The tail exceeded the cell
+        agent's 700-second client timeout, the control plane recorded "the cell
+        agent could not be reached" for work the agent had in fact completed,
+        and retried -- adding load to the queue it was waiting on. Cells sat in
+        ``deleting`` for hours. Observed on 2026-08-19 across three zones whose
+        provider capacity was already gone.
+
+        The lock exists to make the *record* transition safe, not to serialise
+        Google. So claim under it, delete outside it, and tombstone under it
+        again. The fence survives the gap by construction: the claim stamps this
+        generation and fencing token, and ``still_owned`` re-checks both before
+        the tombstone, which is exactly the check it was written for. A rival
+        mutation that takes the record in between loses the tombstone rather
+        than corrupting it.
+        """
+
+        record = self._claim_for_release(cell_id, context)
+        if isinstance(record, CellObservation):
+            return record
+        if record is not None:
+            # Outside the lock on purpose: this is the slow part, it is
+            # idempotent, and the record is already stamped DELETING with this
+            # fence, so nothing else will hand the capacity to anybody.
+            self._delete_owned_capacity(record)
+            self._release_auxiliary_resources(record)
+        return self._tombstone_after_release(cell_id, context, claimed=record is not None)
+
+    def _claim_for_release(self, cell_id: str, context: MutationContext) -> FleetCellRecord | CellObservation | None:
+        """Mark one cell DELETING under this fence, or report it already released."""
+
         with self._mutation_lock, self.state.exclusive():
             owned: dict[str, FleetCellRecord] = {}
 
@@ -1140,14 +1176,21 @@ class GcpTpuCapacityDriver:
                 raise StaleMutationError(str(exc)) from exc
 
             record = owned.get("record")
-            if record is not None:
-                self._delete_owned_capacity(record)
-                self._release_auxiliary_resources(record)
-
-            def still_owned(current: FleetCellRecord) -> bool:
-                return current.generation == context.generation and current.fencing_token == context.fencing_token
-
             if record is None and self.state.get(cell_id) is not None:
+                return self.observe(cell_id)
+            return record
+
+    def _tombstone_after_release(self, cell_id: str, context: MutationContext, *, claimed: bool) -> CellObservation:
+        """Retire the record, refusing if anything took ownership during the deletes."""
+
+        def still_owned(current: FleetCellRecord) -> bool:
+            return current.generation == context.generation and current.fencing_token == context.fencing_token
+
+        with self._mutation_lock, self.state.exclusive():
+            # Re-read rather than trusting the pre-delete snapshot: the point of
+            # dropping the lock is that something else may have run, and this is
+            # where that is caught.
+            if not claimed and self.state.get(cell_id) is not None:
                 return self.observe(cell_id)
             try:
                 removed = self.state.tombstone_record(

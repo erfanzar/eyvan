@@ -1450,16 +1450,6 @@ export class EyvanApiClient {
     return Array.isArray(pools) ? pools.length : 0;
   }
 
-  /** Remove one pool, leaving the rest of its fleet alone. */
-  async removeCapacityPool(poolId: string, signal?: AbortSignal): Promise<void> {
-    if (this.forceDemo) throw new ApiError("Demo mode has no pool to remove", 400);
-    await this.request<unknown>(`/capacity-pools/${encodeURIComponent(poolId)}`, {
-      method: "DELETE",
-      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
-      signal,
-    });
-  }
-
   async updatePolicy(
     policy: SchedulingPolicy,
     preemptionEnabled: boolean,

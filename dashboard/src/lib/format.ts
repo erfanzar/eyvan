@@ -105,3 +105,38 @@ export function formatAcceleratorRequest(
   const slices = replicas > 1 ? `${replicas} x ${accelerator}` : accelerator;
   return chips ? `${slices} · ${chips} chips` : slices;
 }
+
+/**
+ * Summarise accelerator shapes as one entry per generation with its size range.
+ *
+ * The fleet table showed the first three shapes and a count, which is a
+ * truncation rather than a summary and truncates in the worst place: shapes
+ * sort by generation, so a fleet offering eleven v5p sizes and six v6e ones
+ * rendered as "v5p-16, v5p-32, v5p-64 +14 more" and its entire v6e half was
+ * invisible. Somebody checking whether a fleet could run a v6e-8 was told no by
+ * a display decision. This is the same rule the CLI applies, so the two agree.
+ */
+export function summarizeShapes(shapes: readonly string[]): string {
+  const grouped = new Map<string, number[]>();
+  for (const shape of shapes) {
+    const split = shape.lastIndexOf("-");
+    const generation = split > 0 ? shape.slice(0, split) : "";
+    const size = split > 0 ? shape.slice(split + 1) : "";
+    // A name that is not <generation>-<size> ("cpu") is its own group: it names
+    // no family to collapse into, and inventing one would be a guess.
+    if (generation && /^\d+$/.test(size)) {
+      const sizes = grouped.get(generation) ?? [];
+      sizes.push(Number(size));
+      grouped.set(generation, sizes);
+    } else if (!grouped.has(shape)) {
+      grouped.set(shape, []);
+    }
+  }
+  const parts: string[] = [];
+  for (const [generation, sizes] of grouped) {
+    if (sizes.length === 0) parts.push(generation);
+    else if (sizes.length === 1) parts.push(`${generation}-${sizes[0]}`);
+    else parts.push(`${generation} ${Math.min(...sizes)}-${Math.max(...sizes)}`);
+  }
+  return parts.join(", ");
+}

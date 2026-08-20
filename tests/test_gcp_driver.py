@@ -897,3 +897,55 @@ def test_drain_fences_absent_incarnation_and_newer_generation_can_recreate(tmp_p
         driver.apply_capacity("cell", desired(), context("late", generation=1, token="cell-1"))
     recreated = driver.apply_capacity("cell", desired(), context("new", generation=2, token="cell-2"))
     assert recreated.generation == 2
+
+
+def test_a_release_does_not_hold_the_fleet_lock_while_it_talks_to_the_provider(tmp_path) -> None:
+    """Two cells release concurrently instead of one waiting out the other's deletes.
+
+    Releasing used to hold ``_mutation_lock`` and the durable fleet-state lease
+    across the provider deletes, so every cell sharing a fleet-state document
+    released strictly one at a time -- and each state mutation is a
+    compare-and-swap against object storage. Draining a fleet queued every
+    release behind every earlier one, the tail passed the cell agent's
+    700-second timeout, and the control plane retried work the agent had already
+    finished. Cells sat in ``deleting`` for hours on 2026-08-19 while the
+    provider held nothing.
+
+    The property is asserted by making the first release block *inside* the
+    provider call and requiring the second to finish anyway. Under the old code
+    the second cannot even start, so this deadlocks rather than fails -- hence
+    the timeout on the join, which turns "still serialised" into a failure
+    instead of a hung suite.
+    """
+
+    import threading
+
+    inside_provider = threading.Event()
+    may_finish = threading.Event()
+
+    class BlockingProvider(FakeProvider):
+        def delete(self, qr_id: str, *, project: str, zone: str, management_uid: str | None = None) -> None:
+            if qr_id.startswith("first"):
+                inside_provider.set()
+                # Held until the other release has completed, so finishing at
+                # all proves the lock was not being held here.
+                assert may_finish.wait(timeout=10), "the second release never completed"
+            super().delete(qr_id, project=project, zone=zone, management_uid=management_uid)
+
+    state, _provider, driver = make_driver(tmp_path, BlockingProvider())
+    driver.apply_capacity("first", desired(), context("create-first"))
+    driver.apply_capacity("second", desired(), context("create-second"))
+
+    slow = threading.Thread(
+        target=driver.release, args=("first", context("release-first", generation=2, token="leader-2"))
+    )
+    slow.start()
+    assert inside_provider.wait(timeout=10), "the first release never reached the provider"
+
+    driver.release("second", context("release-second", generation=2, token="leader-2"))
+    assert state.get("second") is None
+
+    may_finish.set()
+    slow.join(timeout=10)
+    assert not slow.is_alive(), "the first release never finished"
+    assert state.get("first") is None

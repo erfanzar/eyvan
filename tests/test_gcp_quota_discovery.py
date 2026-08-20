@@ -14,6 +14,8 @@ import pytest
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonValue
+from eyvan.capacity.providers.gcp.accelerator_catalog import AcceleratorCatalogError
+from eyvan.capacity.providers.gcp.quota_catalog import QuotaCatalogError
 from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
 from eyvan.capacity.providers.gcp.quota_usage import TpuQuotaUsage
 
@@ -43,10 +45,38 @@ class FakeUsageDiscovery:
         )
 
 
+class OfflineQuotaCatalog:
+    """A quota reader that always defers to the runner these tests supply.
+
+    Without it every test here mints a real access token and calls Google:
+    ``GcpTpuQuotaDiscovery`` builds the API readers by default, which is right
+    for a CLI and wrong for a unit test. The suite took sixteen seconds for
+    seven cases and its result depended on the machine's gcloud login.
+    """
+
+    def limits(self, project: str) -> list[dict[str, object]]:
+        raise QuotaCatalogError("offline in tests")
+
+
+class OfflineAcceleratorCatalog:
+    """The same, for the per-zone accelerator listing."""
+
+    def types_for_zones(self, project: str, zones) -> dict[str, tuple[str, ...]]:
+        raise AcceleratorCatalogError("offline in tests")
+
+
+def _offline(**kwargs) -> GcpTpuQuotaDiscovery:
+    """Build discovery that reaches no network, whatever else the caller sets."""
+
+    kwargs.setdefault("catalog", OfflineAcceleratorCatalog())
+    kwargs.setdefault("quota_catalog", OfflineQuotaCatalog())
+    return GcpTpuQuotaDiscovery(**kwargs)
+
+
 def _discovery(runner) -> GcpTpuQuotaDiscovery:
     """Build discovery with a deterministic read-only Cloud Monitoring source."""
 
-    return GcpTpuQuotaDiscovery(runner=runner, usage_discovery=FakeUsageDiscovery())
+    return _offline(runner=runner, usage_discovery=FakeUsageDiscovery())
 
 
 def test_quota_discovery_filters_spot_metrics_and_exact_accelerator_types() -> None:
@@ -289,7 +319,7 @@ def test_quota_discovery_uses_minimum_region_and_zone_headroom_not_the_quota_cei
                 ),
             )
 
-    records = GcpTpuQuotaDiscovery(runner=runner, usage_discovery=UsageDiscovery()).discover(
+    records = _offline(runner=runner, usage_discovery=UsageDiscovery()).discover(
         project="project-a", generations=("v5p",)
     )
 
@@ -320,7 +350,7 @@ def test_quota_discovery_preserves_missing_monitoring_usage_as_unknown() -> None
             assert tuple(metrics) == ("tpu.googleapis.com/tpu-v5p-preemptible",)
             return ()
 
-    records = GcpTpuQuotaDiscovery(runner=runner, usage_discovery=EmptyUsageDiscovery()).discover(
+    records = _offline(runner=runner, usage_discovery=EmptyUsageDiscovery()).discover(
         project="project-a", generations=("v5p",)
     )
 

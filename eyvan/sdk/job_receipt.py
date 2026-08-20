@@ -12,12 +12,20 @@ import typing as tp
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from rich.live import Live
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 from eyvan._internal.compat import StrEnum
 from eyvan.sdk.terminal import print_block, terminal_console
+
+#: States reached before the job produces a line of its own. Everything here is
+#: waiting -- for admission, for a provider, for a host to answer -- so each is
+#: a place a run can sit for many minutes with nothing to show, which is exactly
+#: where a scrolling block per change reads as breakage rather than progress.
+_WAITING_STATES = frozenset({"requesting", "queued", "provisioning", "allocated", "connecting", "ready", "dispatching"})
 
 
 class JobLifecycleState(StrEnum):
@@ -142,6 +150,9 @@ class JobTerminalOutput:
         if writer is not None and stream is not None:
             raise ValueError("JobTerminalOutput accepts writer or stream, not both")
         self._writer = writer
+        #: The in-place waiting line, live only while the job has yet to say
+        #: anything of its own. ``None`` whenever nothing is being repainted.
+        self._live: Live | None = None
         self._console = (
             None
             if writer is not None
@@ -192,8 +203,50 @@ class JobTerminalOutput:
             ),
         )
 
+    def _render_waiting(self, update: JobLifecycleUpdate) -> None:
+        """Draw or redraw the single line that stands in for a waiting job."""
+
+        console = self._console
+        assert console is not None
+        line = Text.assemble(
+            (_STATE_LABELS[update.state], _STATE_STYLES[update.state]),
+            ("  ", ""),
+            (update.scope or "", "dim"),
+        )
+        if update.summary:
+            line.append("  ")
+            line.append(update.summary, style="white")
+        spinner = Spinner("dots", text=line, style="cyan")
+        if self._live is None:
+            # transient=False so the last thing it drew survives the stop: what
+            # the job was waiting on is part of the story of the run.
+            self._live = Live(spinner, console=console, refresh_per_second=8, transient=False)
+            self._live.start()
+        else:
+            self._live.update(spinner)
+
+    def settle(self) -> None:
+        """Stop the live waiting line, leaving its last frame on screen.
+
+        Called before anything else prints, so a log line or a state change is
+        never interleaved into the region the live display is repainting.
+        """
+
+        live, self._live = self._live, None
+        if live is not None:
+            live.stop()
+
     def lifecycle(self, update: JobLifecycleUpdate) -> None:
-        """Render one changed lifecycle observation without repeating the job receipt."""
+        """Render one changed lifecycle observation without repeating the job receipt.
+
+        While the job is still waiting -- queued, provisioning, connecting -- the
+        line is drawn *in place* rather than appended. Waiting for a spot TPU is
+        minutes of state changes with no output of the job's own, and printing a
+        fresh block for each one buries the run in its own status. Once the job
+        reaches a state that produces output, or a terminal one, the live line is
+        settled into permanent scrollback and everything after it prints
+        normally, so the transcript still records how the run got there.
+        """
 
         writer = self._writer
         if writer is not None:
@@ -204,6 +257,12 @@ class JobTerminalOutput:
         if not console.is_terminal:
             self._write_plain(console.print, update.plain_lines)
             return
+        if str(update.state) in _WAITING_STATES:
+            self._render_waiting(update)
+            return
+        # Anything else is the job itself starting, stopping or going wrong;
+        # settle the live line so this lands above it and stays.
+        self.settle()
 
         heading = Text("Eyvan", style="bold cyan")
         heading.append("  ")

@@ -191,6 +191,11 @@ class WorkloadFollower:
             # long training run because someone wanted their terminal back.
             self.output.detached(workload_id)
             return FollowOutcome(state=None, exit_code=EXIT_DETACHED, detached=True)
+        finally:
+            # However this ends -- completion, Ctrl-C, or an error on the way
+            # out -- the terminal must not be left with a live region nothing
+            # is repainting any more.
+            self._settle_output()
 
     def _follow(self, workload_id: str) -> FollowOutcome:
         while True:
@@ -248,11 +253,26 @@ class WorkloadFollower:
             for rank, message, at in window.lines:
                 if cutoff is not None and at is not None and at < cutoff:
                     continue
+                # The job has something to say, so the waiting line has done its
+                # job; settle it first or the log scrolls through the region the
+                # live display is still repainting.
+                self._settle_output()
                 self.write(f"[{rank}] {message}" if self._rank_prefixes else message)
             if window.cursor:
                 self._cursor = window.cursor
             if not window.lines:
                 return
+
+    def _settle_output(self) -> None:
+        """Stop any in-place status the output is drawing, if it draws one.
+
+        Optional on the protocol: a plain writer has nothing to settle, and the
+        follower must not require every output to grow a method it cannot use.
+        """
+
+        settle = getattr(self.output, "settle", None)
+        if callable(settle):
+            settle()
 
     def _emit(self, workload: WorkloadRecord) -> None:
         """Show one lifecycle change, never the same one twice."""
