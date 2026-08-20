@@ -31,7 +31,7 @@ from eyvan.records import NativeRuntimeConfig
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.identity import resolve_control_plane_identity
-from eyvan.sdk.commands.common import FleetConfigLoader, JsonRenderer
+from eyvan.sdk.commands.common import FleetConfigLoader, JsonRenderer, emit_result
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import ContextConfigError
 from eyvan.sdk.shapes import summarize_shapes
@@ -137,6 +137,43 @@ def _record_queue_admission_denials(cache: AutoscaleConfigCache, status: FleetSt
     recorder = QueueAdmissionDenialRecorder(cache)
     for cell in status.cells:
         recorder.record_cell(cell)
+
+
+def _render_fleet_teardown(payload: JsonObject) -> tuple[str, ...]:
+    """Describe what tearing a fleet down would release.
+
+    ``down --dry-run`` exists to be read before something irreversible, and it
+    answered with the fleet record: twenty pools of forty keys, in which the
+    number that matters -- how much live capacity this would release -- appears
+    nowhere as a number. What somebody is deciding here is whether they are
+    about to drop capacity they waited hours for, so that is what this says.
+    """
+
+    pools = payload.get("pools")
+    pools = [pool for pool in pools if is_json_object(pool)] if isinstance(pools, list) else []
+    cells = payload.get("cells")
+    cells = [cell for cell in cells if is_json_object(cell)] if isinstance(cells, list) else []
+    live = [cell for cell in cells if cell.get("state") not in {"deleted", "deleting"}]
+    lines = [f"Would disable, drain and release fleet {payload.get('name')}"]
+
+    def row(label: str, value: object) -> None:
+        if value not in (None, "", []):
+            lines.append(f"  {label:<16} {value}")
+
+    enabled = [pool for pool in pools if pool.get("enabled")]
+    shapes = summarize_shapes(sorted(str(pool.get("accelerator_type") or "") for pool in enabled))
+    row("pools", f"{len(enabled)} enabled of {len(pools)}" + (f"  ·  {shapes}" if shapes else ""))
+    if live:
+        # The whole point of reading this first. A cell holding accelerators is
+        # named individually, because "3 cells" and "3 v5p-128 slices you queued
+        # two days for" are different decisions.
+        row("would release", f"{len(live)} live cell(s)")
+        for cell in live:
+            shape = cell.get("accelerator_type") or "cell"
+            lines.append(f"      {cell.get('state'):<12} {shape:<10} {cell.get('id')}")
+    else:
+        row("would release", "no live cells; this fleet holds no capacity right now")
+    return tuple(lines)
 
 
 def _render_planned_fleet(payload: JsonObject) -> tuple[str, ...]:
@@ -288,23 +325,30 @@ class FleetCommandService:
         *,
         yes: bool,
         dry_run: bool,
+        as_json: bool,
         idempotency_key: str | None,
     ) -> None:
         """Disable and release one declared fleet."""
 
         config = self.loader.load(config_path)
         if dry_run:
-            self.renderer.emit(self.session.client.request("GET", f"/api/v1/fleets/{config.name}"))
+            planned = self.session.client.request("GET", f"/api/v1/fleets/{config.name}")
+            if as_json:
+                self.renderer.emit(planned)
+            elif is_json_object(planned):
+                for line in _render_fleet_teardown(planned):
+                    click.echo(line)
+            else:
+                self.renderer.emit(planned)
             return
         if not yes:
             click.confirm(f"Disable, drain, and release fleet {config.name!r}?", abort=True)
-        self.renderer.emit(
-            self.session.client.request(
-                "DELETE",
-                f"/api/v1/fleets/{config.name}",
-                headers={"Idempotency-Key": self.keys.create("down", idempotency_key)},
-            )
+        response = self.session.client.request(
+            "DELETE",
+            f"/api/v1/fleets/{config.name}",
+            headers={"Idempotency-Key": self.keys.create("down", idempotency_key)},
         )
+        emit_result(self.renderer, response, f"Released fleet {config.name}", as_json=as_json)
 
 
 @click.command("up")
@@ -481,6 +525,7 @@ def up_fleet(
 @click.option("-y", "--yes", is_flag=True, help="Do not ask for confirmation.")
 @click.option("--dry-run", is_flag=True, help="Print managed cells without draining or deleting them.")
 @click.option("--idempotency-key", help="Reuse one key only when retrying the same disable operation.")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def down_fleet(
     session: CliSession,
@@ -488,6 +533,7 @@ def down_fleet(
     yes: bool,
     dry_run: bool,
     idempotency_key: str | None,
+    as_json: bool,
 ) -> None:
     """Drain and release every cell managed by CONFIG_PATH."""
 
@@ -495,6 +541,7 @@ def down_fleet(
         config_path,
         yes=yes,
         dry_run=dry_run,
+        as_json=as_json,
         idempotency_key=idempotency_key,
     )
 

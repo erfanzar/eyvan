@@ -1765,7 +1765,7 @@ def test_status_rejects_unsafe_fleet_name(monkeypatch) -> None:
 def test_down_atomically_disables_pools_before_server_side_drain(monkeypatch, tmp_path) -> None:
     fake = FakeClient()
 
-    result = _invoke(monkeypatch, tmp_path, fake, "down", "--yes")
+    result = _invoke(monkeypatch, tmp_path, fake, "down", "--yes", "--json")
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
