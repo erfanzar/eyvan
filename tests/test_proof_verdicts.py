@@ -349,6 +349,77 @@ def test_a_reclaimed_cell_that_is_gone_cannot_vouch_for_the_absence_of_a_cooldow
     assert result.verdict is not Verdict.PASS
 
 
+def test_a_replacement_cell_backing_off_for_its_own_reasons_is_not_this_proof_s_business() -> None:
+    """Read off the live run of 2026-08-13, which failed on this and should not have.
+
+    The reclaimed cell recorded exactly what it should -- ``interruptions``, no
+    failure, no cooldown. Four minutes later its *replacement* hit a transient
+    ``could not describe TPU node``, was classified PROVIDER_ERROR, took the 15s
+    backoff, and recovered on the next pass. Scoped to the pool rather than to
+    the reclaimed cell, that unrelated and already-recovering backoff failed a
+    criterion about how the reclamation was classified.
+
+    This is the sibling of the unrelated-pool case below, one level down, and it
+    matters more: a replacement cell is churning *because* a reclamation just
+    happened, so this is the cooldown most likely to be present and least likely
+    to be about the claim.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {
+                "id": "cell-0001",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "availability": {"interruptions": 1.9604, "consecutive_failures": 0, "cooldown_until": None},
+            },
+            {
+                "id": "cell-0002",
+                "pool_id": "research/v5p",
+                "provider_failure_code": None,
+                "availability": {
+                    "interruptions": 0.0,
+                    "consecutive_failures": 1,
+                    "cooldown_until": "2026-08-13T19:08:05Z",
+                },
+            },
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+
+
+def test_the_reclaimed_cell_cooling_still_fails_even_beside_a_healthy_replacement() -> None:
+    """The half that must survive the narrowing above.
+
+    Same two-cell shape, with the cooldown moved onto the cell that carries the
+    reclamation. That is the defect P5 exists to catch, and no amount of healthy
+    replacement capacity beside it makes it acceptable.
+    """
+
+    result = evaluate_spot_preemption(
+        _preempted(),
+        [
+            {
+                "id": "cell-0001",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "availability": {
+                    "interruptions": 1.9604,
+                    "consecutive_failures": 1,
+                    "cooldown_until": "2026-08-13T17:14:29Z",
+                },
+            },
+            {"id": "cell-0002", "pool_id": "research/v5p", "availability": {"cooldown_until": None}},
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL
+
+
 def test_a_recreated_cell_still_witnesses_the_reclamation_it_recorded() -> None:
     """The run that goes best must not be the one that settles least.
 

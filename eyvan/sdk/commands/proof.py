@@ -316,15 +316,25 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     # The criterion would then go inconclusive precisely on the runs that went
     # best. ``availability.interruptions`` is the durable record of the same
     # event and is the belief this criterion is actually about, so either will do.
+    #
+    # Read on the reclaimed cells only. The claim is about how *this
+    # reclamation* was classified, and a cooldown is recorded against the cell
+    # whose provision outcome produced it -- so a sibling's backoff, from a
+    # later and separately logged cause, is evidence about that cause instead.
+    # Scoping to the pool but not to the cell fails the proof for a transient
+    # provider error on a replacement that is already recovering, which is the
+    # same way an unrelated pool's backoff would have, and how a proof turns
+    # into something people re-run until it is green.
     pool_ids = {pool["id"] for pool in pools}
     mine = [cell for cell in cells if cell.get("pool_id") in pool_ids]
-    cooling = [cell["id"] for cell in mine if (cell.get("availability") or {}).get("cooldown_until")]
-    witnesses = [
-        cell["id"]
+    reclaimed = [
+        cell
         for cell in mine
         if cell.get("provider_failure_code") == "preempted"
         or _is_positive_number((cell.get("availability") or {}).get("interruptions"))
     ]
+    cooling = [cell["id"] for cell in reclaimed if (cell.get("availability") or {}).get("cooldown_until")]
+    witnesses = [cell["id"] for cell in reclaimed]
     if cooling:
         checks.append(
             _failed(
