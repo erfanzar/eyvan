@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+
+
 def test_a_slow_start_leaves_the_server_running_instead_of_killing_it(tmp_path) -> None:
     """The failure that left a fleet with no control plane.
 
@@ -148,3 +152,82 @@ def test_a_stale_pid_under_a_different_profile_is_still_refused(tmp_path) -> Non
 
     with pytest.raises(LocalDaemonConfigurationError, match="different runtime profile"):
         supervisor._existing_result(endpoint, record_path, paths.log_path(target), str(tmp_path / "profile.json"))
+
+
+def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> None:
+    """The failure that left a healthy plane unreachable.
+
+    Two commands can try to start a plane at once -- `runtime deploy` followed
+    immediately by anything else, where the second probes health while the first
+    is still booting. The loser used to stamp its own PID over the winner's
+    record, fail on the state lease, then correctly clear "its" record on the way
+    out. A healthy plane was left with no record at all, and every later command
+    refused to talk to it: "no owner-only PID record exists".
+
+    Losing the race is not an error. The winner is a control plane at the
+    endpoint this one wanted, so the loser stops and adopts it, and the winner's
+    record is left exactly as it was.
+    """
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.server.local.daemon import (
+        LocalDaemonPaths,
+        LocalDaemonRecord,
+        LocalDaemonState,
+        LocalDaemonSupervisor,
+        LocalDaemonTarget,
+        read_owner_only_record,
+        write_owner_only_record,
+    )
+
+    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8080")
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    record_path = paths.record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = str(tmp_path / "profile.json")
+
+    # The winner: already serving, and its record says so.
+    winner_pid = os.getpid()
+    write_owner_only_record(
+        record_path,
+        LocalDaemonRecord(endpoint=endpoint, pid=winner_pid, runtime_profile_path=profile),
+    )
+
+    stopped: list[int] = []
+
+    class _Loser:
+        """The process that started second and must give the endpoint back."""
+
+        pid = winner_pid + 1_000_000
+
+        def poll(self) -> None:
+            return None if not stopped else 1
+
+        def terminate(self) -> None:
+            stopped.append(self.pid)
+
+        def kill(self) -> None:
+            stopped.append(self.pid)
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 1
+
+    # `ensure` probes twice before it decides to start -- once before taking the
+    # startup lock and once inside it -- so both must miss for the race to
+    # happen at all. The winner finishes booting after that.
+    probes = iter([False, False])
+
+    supervisor = LocalDaemonSupervisor(
+        paths=paths,
+        launcher=type("L", (), {"start": lambda self, command: _Loser()})(),
+        health_probe=lambda _endpoint: next(probes, True),
+    )
+
+    result = supervisor.ensure(endpoint, runtime_profile_path=Path(profile))
+
+    assert result.state is LocalDaemonState.REUSED, "the loser did not adopt the plane that won"
+    surviving = read_owner_only_record(record_path)
+    assert surviving is not None, "the winner's record was deleted by the loser"
+    assert surviving.pid == winner_pid, "the loser stamped its own pid over the winner's record"

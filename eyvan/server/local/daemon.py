@@ -757,6 +757,26 @@ class LocalDaemonSupervisor:
                 process = self.launcher.start(command)
             except OSError as exc:
                 raise LocalDaemonStartupError(configured_endpoint, log_path, str(exc)) from exc
+            # A plane that is already serving owns this record, and a process
+            # that has not proven it can serve must not take it. Overwriting here
+            # is what destroyed a working plane's record: the loser of a startup
+            # race stamped its own PID over the winner's, then correctly cleared
+            # "its" record on the way out -- leaving a healthy plane with no
+            # record at all, and every later command refusing to talk to it.
+            #
+            # Losing the race is not an error. The other process is a control
+            # plane at the endpoint this one wanted, so stop and adopt it.
+            claimed = read_owner_only_record(record_path)
+            if claimed is not None and claimed.pid != process.pid and process_is_alive(claimed.pid):
+                stop_owned_process(process)
+                adopted = self._existing_result(configured_endpoint, record_path, log_path, profile_identifier)
+                if adopted is not None:
+                    return adopted
+                raise LocalDaemonStartupError(
+                    configured_endpoint,
+                    log_path,
+                    f"another Eyvan control plane claimed {configured_endpoint.url} while this one was starting",
+                )
             try:
                 write_owner_only_record(
                     record_path,
