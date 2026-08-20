@@ -112,6 +112,10 @@ def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
         # what is already here. tests/test_startup_preflight.py covers the
         # network bind this check exists for.
         "server-startup-settings": CheckStatus.PASS,
+        # A loopback development plane trusts its own default project, so the
+        # default bind this suite uses passes rather than warning. The network
+        # bind it exists for is covered below.
+        "callable-trust": CheckStatus.PASS,
         "control-plane-url": CheckStatus.PASS,
         "control-plane-reachable": CheckStatus.PASS,
         "controller-mode": CheckStatus.PASS,

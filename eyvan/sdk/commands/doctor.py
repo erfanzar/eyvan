@@ -63,6 +63,10 @@ DEFAULT_SERVER_BIND_HOST = "127.0.0.1"
 #: One check name, used by the CLI, the JSON report, and the divergence test.
 SERVER_STARTUP_CHECK = "server-startup-settings"
 
+#: The callable-trust check. A warning, never a refusal: a plane that trusts no
+#: project serves every command workload correctly and only refuses ``@execute``.
+CALLABLE_TRUST_CHECK = "callable-trust"
+
 
 def _positive_resource(document: dict[str, JsonValue], name: str) -> bool:
     """Return whether a raw API resource field is a positive finite number."""
@@ -221,6 +225,51 @@ class DoctorCommandService:
             f"a server started here on {bind.host} would refuse; "
             f"{len(missing)} {noun} unset or wrong in this environment: {names}",
             format_requirement_bullets(missing),
+        )
+
+    def _callable_trust_check(self) -> CheckResult:
+        """Report whether any project on this plane may submit serialized callables.
+
+        Deliberately not a startup requirement. ``unsatisfied_startup_requirements``
+        is the list the server *refuses* to start without, and a plane that trusts
+        nobody serves every command workload correctly -- refusing there would
+        break deployments this setting does not concern.
+
+        But the loss is silent, which is why it is here at all: the whole
+        ``@execute`` API authenticates and is only then refused, with a 403 that
+        names the workload rather than the variable that refused it. So it is a
+        warning on this surface, and a warning from ``eyvan head up`` on the way
+        out, and neither turns a healthy environment red.
+        """
+
+        try:
+            bind = ServerBindPolicy.from_host(self.server_bind_host)
+        except ValueError:
+            # The startup check above already failed on this and named the cause.
+            return CheckResult(CALLABLE_TRUST_CHECK, CheckStatus.SKIP, "the bind address is not usable")
+        try:
+            settings = EyvanSettings.from_env()
+        except ValidationError:
+            return CheckResult(CALLABLE_TRUST_CHECK, CheckStatus.SKIP, "the EYVAN_* environment does not parse")
+        if bind.is_loopback:
+            return CheckResult(
+                CALLABLE_TRUST_CHECK,
+                CheckStatus.PASS,
+                "a loopback development plane trusts its own default project",
+            )
+        if settings.trusted_callable_projects:
+            named = ", ".join(settings.trusted_callable_projects)
+            return CheckResult(
+                CALLABLE_TRUST_CHECK,
+                CheckStatus.PASS,
+                f"callable workloads are trusted for: {named}",
+            )
+        return CheckResult(
+            CALLABLE_TRUST_CHECK,
+            CheckStatus.WARN,
+            "no project may submit serialized callables, so every @execute submission would be refused with 403",
+            "set EYVAN_TRUSTED_CALLABLE_PROJECTS=<org>/<project> on the server, or stand the head up with "
+            "`eyvan head up --trust-callable-project <org>/<project>`; command workloads need none of this",
         )
 
     def _endpoint_check(self) -> CheckResult:
@@ -681,6 +730,11 @@ class DoctorCommandService:
         # control plane exists, which is exactly when an operator is standing one
         # up and every check below would report "unreachable".
         report.checks.append(self._server_startup_check())
+        # Second, and for the same reason: it reads the same environment, so it
+        # also answers with no control plane running. Placed before the endpoint
+        # check so an unreachable plane cannot skip it, and after the startup
+        # check so ``checks[0]`` stays the refusal list.
+        report.checks.append(self._callable_trust_check())
         endpoint = self._endpoint_check()
         report.checks.append(endpoint)
         if endpoint.status is CheckStatus.FAIL:
@@ -791,6 +845,7 @@ def register_doctor_commands(group: click.Group) -> None:
 
 
 __all__ = (
+    "CALLABLE_TRUST_CHECK",
     "DEFAULT_SERVER_BIND_HOST",
     "SERVER_STARTUP_CHECK",
     "CheckResult",

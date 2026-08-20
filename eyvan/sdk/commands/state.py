@@ -177,7 +177,13 @@ class CliSession:
                 or (existing.project_id if existing is not None else None)
                 or DEFAULT_PROJECT_ID
             ),
-            base_url=self.base_url,
+            # Mirrors ``select_context`` rather than taking the session URL
+            # unconditionally. The two sat in this file with opposite precedence,
+            # and the consequence ran the wrong way: `eyvan --url <private-ip> up`
+            # -- the exact command `head up` prints -- overwrote a fleet's saved
+            # reachable endpoint with an address only the VPC can route, and that
+            # became the default for every later command on the machine.
+            base_url=self.overrides.base_url or (existing.base_url if existing is not None else self.base_url),
             autoscale_cache_dir=(
                 str(autoscale_cache_dir)
                 if autoscale_cache_dir is not None

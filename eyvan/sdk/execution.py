@@ -55,6 +55,7 @@ from eyvan.sdk.contexts import (
     context_config_path,
     get_active_context,
 )
+from eyvan.sdk.node import discover_node_context, discover_node_token
 from eyvan.server.local.daemon import ensure_loopback_control_plane
 from eyvan.worker.runtime.callables import dump_callable
 from eyvan.worker.runtime.in_job import in_job_context
@@ -154,16 +155,35 @@ def init(
 
     environment = os.environ if environ is None else environ
     active_context = get_active_context(context_config_path(environment))
+    # What control plane is this *machine* part of. Consulted after the caller's
+    # own context and never before it: discovery fills a vacuum, it does not
+    # overrule a choice someone made on this machine.
+    #
+    # Skipped inside a job, where the dispatching plane has already issued this
+    # process an endpoint. A workload that happened to land on the head would
+    # otherwise prefer the node's own answer over the one it was given.
+    node_context = discover_node_context(environment) if in_job_context(environment) is None else None
     configured_fleet = _optional(
-        fleet or environment.get("EYVAN_FLEET") or (active_context.fleet if active_context else None)
+        fleet
+        or environment.get("EYVAN_FLEET")
+        or (active_context.fleet if active_context else None)
+        or (node_context.fleet if node_context else None)
     )
     configured_org = (
-        _optional(org_id or environment.get("EYVAN_ORG") or (active_context.org_id if active_context else None))
+        _optional(
+            org_id
+            or environment.get("EYVAN_ORG")
+            or (active_context.org_id if active_context else None)
+            or (node_context.org_id if node_context else None)
+        )
         or DEFAULT_ORG_ID
     )
     configured_project = (
         _optional(
-            project_id or environment.get("EYVAN_PROJECT") or (active_context.project_id if active_context else None)
+            project_id
+            or environment.get("EYVAN_PROJECT")
+            or (active_context.project_id if active_context else None)
+            or (node_context.project_id if node_context else None)
         )
         or DEFAULT_PROJECT_ID
     )
@@ -178,6 +198,12 @@ def init(
         base_url
         or environment.get("EYVAN_URL")
         or (active_context.base_url if active_context else None)
+        # A head's own address, and the reason a process on a head needs no
+        # environment at all. It is also what keeps the endpoint below
+        # *non-loopback*: loopback is the signal that starts a local development
+        # plane, and on a head that would mean starting a second control plane
+        # on the machine already running one.
+        or (node_context.base_url if node_context else None)
         or DEFAULT_BASE_URL
     )
     endpoint = ControlPlaneEndpoint.parse(configured_base_url)
@@ -203,7 +229,10 @@ def init(
         configured_role = environment.get("EYVAN_ROLE", "operator")
         identity = resolve_control_plane_identity(
             endpoint,
-            token=token or environment.get("EYVAN_TOKEN"),
+            # Read from this node's own installer-written credential when the
+            # endpoint is exactly the plane this node serves. Never copied
+            # anywhere; see ``discover_node_token``.
+            token=token or environment.get("EYVAN_TOKEN") or discover_node_token(endpoint, environment),
             dev_user=dev_user or environment.get("EYVAN_DEV_USER"),
             dev_org=configured_org,
             dev_project=configured_project,

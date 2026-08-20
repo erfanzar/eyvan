@@ -30,6 +30,7 @@ from test_doctor import _healthy, _Store
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.sdk.client.identity import ClientIdentity
 from eyvan.sdk.commands.doctor import (
+    CALLABLE_TRUST_CHECK,
     SERVER_STARTUP_CHECK,
     CheckStatus,
     DoctorCommandService,
@@ -388,3 +389,45 @@ def test_a_network_bind_with_missing_settings_still_refuses(monkeypatch: pytest.
 
     with pytest.raises(ValueError, match="EYVAN_METRICS_TOKEN"):
         ServerStartupSettings.from_environment(_NETWORK)
+
+
+def test_a_network_bind_that_trusts_no_project_warns_without_turning_the_run_red(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The silent half of standing a head up, given a surface before it bites.
+
+    A plane that trusts no project serves every command workload correctly, so
+    this is deliberately not a startup requirement -- refusing there would break
+    deployments the setting does not concern, and `unsatisfied_startup_requirements`
+    is exactly the list the server refuses to start without.
+
+    What it must not do is stay invisible. Without this, the whole `@execute` API
+    authenticates and is then refused with a 403 naming the workload rather than
+    the unset variable, and nothing anywhere says so first.
+    """
+
+    _configure(
+        monkeypatch,
+        {
+            "EYVAN_REPOSITORY_BACKEND": "postgres",
+            "EYVAN_ARTIFACT_TOKEN_KEY": "k" * 32,
+            "EYVAN_METRICS_TOKEN": "m" * 32,
+        },
+    )
+
+    report = DoctorCommandService(_session(), server_bind_host="0.0.0.0").report()
+    trust = next(check for check in report.checks if check.name == CALLABLE_TRUST_CHECK)
+
+    assert trust.status is CheckStatus.WARN
+    assert "403" in trust.detail
+    assert "EYVAN_TRUSTED_CALLABLE_PROJECTS" in (trust.remedy or "")
+    # A warning never turns a healthy environment red: an operator running only
+    # command workloads is not misconfigured.
+    assert report.ok is True
+
+    monkeypatch.setenv("EYVAN_TRUSTED_CALLABLE_PROJECTS", "acme/research")
+    granted = DoctorCommandService(_session(), server_bind_host="0.0.0.0").report()
+    named = next(check for check in granted.checks if check.name == CALLABLE_TRUST_CHECK)
+
+    assert named.status is CheckStatus.PASS
+    assert "acme/research" in named.detail

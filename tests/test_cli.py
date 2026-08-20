@@ -534,6 +534,38 @@ def test_use_switches_to_an_existing_named_context_without_overwriting_it(monkey
     }
 
 
+def test_applying_a_fleet_does_not_borrow_the_active_fleets_endpoint(monkeypatch, tmp_path) -> None:
+    """`up` overwrote the applied fleet's saved URL with whichever one was active.
+
+    `activate_fleet` took the *session* URL unconditionally while its sibling
+    `select_context` preferred the fleet's own saved value -- opposite precedence,
+    same file. With another fleet selected, applying `dev-fleet` repointed it at
+    the selected fleet's address, which for a head is a private VPC IP only the
+    VPC can route. Nothing said the endpoint had moved.
+    """
+
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: FakeClient())
+    runner = CliRunner()
+
+    # dev-fleet is reachable at its own address...
+    saved = runner.invoke(
+        cli.main, ["--url", "https://dev.example.com", "use", "dev-fleet", "--org", "acme", "--project", "training"]
+    )
+    # ...and something else is the active context when `up` runs.
+    other = runner.invoke(
+        cli.main, ["--url", "http://10.128.0.7:8080", "use", "other-fleet", "--org", "acme", "--project", "training"]
+    )
+    assert saved.exit_code == 0, saved.output
+    assert other.exit_code == 0, other.output
+
+    applied = _invoke(monkeypatch, tmp_path, FakeClient(), "up")
+    assert applied.exit_code == 0, applied.output
+
+    stored = json.loads((tmp_path / "eyvan-config.json").read_text())
+
+    assert stored["contexts"]["dev-fleet"]["base_url"] == "https://dev.example.com"
+
+
 def test_up_applies_all_initial_cells_with_distinct_operation_keys(monkeypatch, tmp_path) -> None:
     fake = FakeClient()
 
@@ -889,17 +921,17 @@ def test_autoscale_init_prompts_once_and_persists_a_yaml_profile(monkeypatch, tm
 def test_autoscale_init_rejects_a_gcs_uri_and_reprompts_for_project_id(monkeypatch, tmp_path) -> None:
     cache_dir = tmp_path / "autoscale"
     monkeypatch.setattr(autoscale_commands, "is_interactive", lambda: True)
-    monkeypatch.setattr(autoscale_commands, "gcloud_default_project", lambda: "example-project")
+    monkeypatch.setattr(autoscale_commands, "gcloud_default_project", lambda: "example-project-1")
 
     result = CliRunner().invoke(
         cli.main,
         ["autoscale", "init", "--cache-dir", str(cache_dir)],
-        input="gs://example-bucket/eyvan\nexample-project\nresearch\n\n0\n0\ny\n",
+        input="gs://example-bucket/eyvan\nexample-project-1\nresearch\n\n0\n0\ny\n",
     )
 
     assert result.exit_code == 0, result.output
     assert "not bucket URI" in result.output
-    assert AutoscaleConfigCache(cache_dir).load_defaults().project == "example-project"
+    assert AutoscaleConfigCache(cache_dir).load_defaults().project == "example-project-1"
 
 
 def test_autoscale_init_repairs_an_invalid_profile_written_by_the_old_wizard(monkeypatch, tmp_path) -> None:
@@ -918,7 +950,7 @@ def test_autoscale_init_repairs_an_invalid_profile_written_by_the_old_wizard(mon
         encoding="utf-8",
     )
     monkeypatch.setattr(autoscale_commands, "is_interactive", lambda: True)
-    monkeypatch.setattr(autoscale_commands, "gcloud_default_project", lambda: "example-project")
+    monkeypatch.setattr(autoscale_commands, "gcloud_default_project", lambda: "example-project-1")
 
     result = CliRunner().invoke(
         cli.main,
@@ -929,7 +961,7 @@ def test_autoscale_init_repairs_an_invalid_profile_written_by_the_old_wizard(mon
     assert result.exit_code == 0, result.output
     assert "Repair saved defaults" not in result.output
     assert "GCS bucket URI" not in result.output
-    assert cache.load_defaults().project == "example-project"
+    assert cache.load_defaults().project == "example-project-1"
     assert "worker_service_account" not in cache.defaults_path.read_text(encoding="utf-8")
 
 

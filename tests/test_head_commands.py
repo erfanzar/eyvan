@@ -19,6 +19,7 @@ whether a mock was called.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import re
@@ -55,7 +56,7 @@ version: 1
 name: research
 provider:
   type: gcp
-  project: example-project
+  project: example-project-1
   region: us-east5
   zone: us-east5-a
 executor: eyvan-native
@@ -99,7 +100,7 @@ def _spec(**overrides: tp.Any) -> HeadSpec:
 
     values: dict[str, tp.Any] = {
         "fleet": "research",
-        "project": "example-project",
+        "project": "example-project-1",
         "region": "us-east5",
         "zone": "us-east5-a",
         "egress": "private-google-access",
@@ -434,7 +435,13 @@ def test_up_creates_one_labelled_head_and_returns_its_internal_address() -> None
     assert "--no-address" in created
     assert result.address == "10.128.0.7"
     assert result.url == "http://10.128.0.7:8080"
-    assert result.next_command == "eyvan --url http://10.128.0.7:8080 up <fleet.yaml>"
+    # Two audiences, two commands. On the head the installer recorded the plane,
+    # so nothing is passed; from a laptop the address is private and needs both a
+    # tunnel and explicit flags.
+    assert result.next_command == (
+        "on the head: eyvan up <fleet.yaml>   |   "
+        "elsewhere: eyvan --url http://10.128.0.7:8080 --token <token> up <fleet.yaml>"
+    )
     assert result.service_state == "active"
     assert result.adopted_instance is False
 
@@ -641,7 +648,13 @@ def test_generated_credentials_are_distinct_high_entropy_values() -> None:
     generated = HeadSecrets.generate()
 
     values = generated.values()
-    assert len(set(values)) == 4
+    # Five, and derived from the dataclass rather than written as a literal: the
+    # count was 4 while the class held 5 fields, and the missing one was
+    # `bootstrap_token` -- the credential that authenticates the whole control
+    # plane, and therefore the one every redaction assertion below silently
+    # stopped covering.
+    assert len(values) == len(dataclasses.fields(generated))
+    assert len(set(values)) == len(values)
     assert all(len(value) >= 24 for value in values)
     assert all(len(value) >= 32 for value in values[:3])
     assert "***" in repr(generated)
@@ -691,6 +704,76 @@ def test_configuring_an_issuer_removes_the_warning_and_reaches_the_head() -> Non
     assert environment["EYVAN_OIDC_ISSUER"] == "https://issuer.example.com"
     assert environment["EYVAN_OIDC_AUDIENCE"] == "eyvan-prod"
     assert result.authentication_warning is None
+
+
+def test_an_issuer_head_grants_callable_trust_only_where_an_operator_named_it() -> None:
+    """The reported defect: trust was written only in the branch with no issuer.
+
+    ``@execute`` worked on a laptop, because a loopback development plane trusts
+    its own default project, and was refused on a real head with a 403 *after*
+    authenticating. Writing the default inside the bootstrap branch fixed that
+    for the deployment with no identity provider and left it broken for the one
+    that has one -- the deployment anyone runs for real.
+
+    The fix is not to auto-grant under an issuer. Deserializing a callable runs
+    arbitrary code on the fleet, and the trust policy grants that to every
+    principal holding SUBMIT in a trusted project, which under OIDC is a set the
+    operator never enumerated. So the operator names it, and is told when nobody
+    has.
+    """
+
+    issuer = "https://issuer.example.com"
+    granted = _spec(oidc_issuer=issuer, trusted_callable_projects=("acme/research",))
+    gcloud = FakeGcloud(spec=granted)
+
+    result = HeadProvisioner(granted, runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    assert environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] == "acme/research"
+    assert result.callable_trust_warning is None
+
+    ungranted = _spec(oidc_issuer=issuer)
+    gcloud = FakeGcloud(spec=ungranted)
+
+    result = HeadProvisioner(ungranted, runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    assert "EYVAN_TRUSTED_CALLABLE_PROJECTS" not in environment
+    # The warning has to name the remedy, because the 403 the operator would
+    # otherwise meet names the workload rather than the setting.
+    warning = result.callable_trust_warning
+    assert warning is not None
+    assert "--trust-callable-project" in warning
+    assert "command workloads are unaffected" in warning
+
+
+def test_a_bootstrap_head_keeps_trusting_its_one_principal_and_an_operator_can_replace_it() -> None:
+    """Bootstrap mode has exactly one principal; naming projects replaces, never widens."""
+
+    gcloud = FakeGcloud(spec=_spec())
+    result = HeadProvisioner(_spec(), runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    assert environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] == "default/default"
+    assert result.callable_trust_warning is None
+
+    replaced = _spec(trusted_callable_projects=("acme/research", "acme/eval"))
+    gcloud = FakeGcloud(spec=replaced)
+    HeadProvisioner(replaced, runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    assert environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] == "acme/research,acme/eval"
+
+
+def test_a_trusted_project_containing_a_comma_is_refused() -> None:
+    """The variable is one comma-separated line in a file a shell also sources.
+
+    A comma inside an entry would silently become two entries and grant code
+    execution on this fleet to a project nobody named.
+    """
+
+    with pytest.raises(ValueError, match="must not contain a comma"):
+        _spec(trusted_callable_projects=("acme/research,evil/project",))
 
 
 def test_a_step_that_fails_midway_names_the_step_and_stops_the_sequence() -> None:
@@ -789,6 +872,59 @@ def test_the_installer_carries_no_credential_and_does_not_require_uv() -> None:
     assert not any(line.rstrip().endswith(" eyvan") for line in script.splitlines() if "pip install" in line)
 
 
+def test_the_installer_records_the_control_plane_this_node_serves() -> None:
+    """So a process on the head needs neither EYVAN_URL nor EYVAN_TOKEN.
+
+    The Ray property: whatever stands a node up writes the answer down on that
+    node. Everything needed already existed -- the context format, the reader in
+    `init()` -- and nothing wrote the file, so `head up` finished holding the URL
+    it had just created and only pasted it into a printed command.
+
+    It is also what keeps the SDK's endpoint non-loopback on the head, which is
+    what stops `init()` from trying to start a *second* control plane there.
+    """
+
+    script = render_head_bootstrap_script(_spec())
+
+    assert "write_node_context" in script
+    assert "/etc/eyvan/node.json" not in script, "the path belongs to eyvan.sdk.node, not to a literal here"
+    # Written before the unit starts, so the file is there for anything that runs
+    # after this script returns.
+    assert script.index("write_node_context") < script.index("systemctl daemon-reload")
+    # And the operator can read the credential without a sudo round trip.
+    assert 'usermod -aG eyvan-head "${SUDO_USER}"' in script
+
+
+def test_a_staged_wheel_is_reinstalled_even_at_an_unchanged_version() -> None:
+    """`--upgrade` alone is a no-op at an equal version, so the head kept old code.
+
+    The observed failure: `eyvan head up` was re-run against a head after a code
+    change that did not bump the version, pip reported "Requirement already
+    satisfied", the unit restarted on the previous wheel, and every later
+    observation described code that was not running. A staged wheel's version is
+    the version of the tree that built it, so this is the *ordinary* case rather
+    than an edge one.
+    """
+
+    script = render_head_bootstrap_script(_spec())
+    install_lines = [line for line in script.splitlines() if "pip install" in line]
+
+    assert any("--force-reinstall" in line and "--no-deps" in line for line in install_lines), install_lines
+    # The dependency-resolving pass still has to come first: --no-deps on its own
+    # would install Eyvan into a venv with nothing under it.
+    upgrade_index = next(index for index, line in enumerate(install_lines) if "--upgrade" in line)
+    forced_index = next(index for index, line in enumerate(install_lines) if "--force-reinstall" in line)
+    assert upgrade_index < forced_index
+
+
+def test_an_index_install_is_not_forced() -> None:
+    """A version specifier is real resolution work; forcing it only redoes it."""
+
+    script = render_head_bootstrap_script(_spec(package="eyvan==0.0.1"))
+
+    assert not any("--force-reinstall" in line for line in script.splitlines() if "pip install" in line)
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required to parse the generated installer")
 def test_the_generated_installer_is_syntactically_valid_bash() -> None:
     """It runs unattended under sudo on a machine nobody is watching."""
@@ -875,7 +1011,7 @@ def test_a_head_inherits_project_zone_and_egress_from_the_fleet_it_will_control(
 
     spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(config))
 
-    assert (spec.project, spec.region, spec.zone) == ("example-project", "us-east5", "us-east5-a")
+    assert (spec.project, spec.region, spec.zone) == ("example-project-1", "us-east5", "us-east5-a")
     assert spec.egress == "private-google-access"
     assert spec.instance_name == "research-head"
     assert spec.has_external_address is False
@@ -1018,7 +1154,7 @@ def test_the_down_command_requires_the_flag_and_not_merely_a_terminal(monkeypatc
             "--fleet",
             "research",
             "--project",
-            "example-project",
+            "example-project-1",
             "--region",
             "us-east5",
             "--zone",
@@ -1046,7 +1182,7 @@ def test_the_up_command_refuses_to_provision_without_confirmation_outside_a_term
             "--fleet",
             "research",
             "--project",
-            "example-project",
+            "example-project-1",
             "--region",
             "us-east5",
             "--zone",
@@ -1075,7 +1211,7 @@ def test_the_up_command_reports_the_address_the_ingress_and_the_next_command(mon
             "--fleet",
             "research",
             "--project",
-            "example-project",
+            "example-project-1",
             "--region",
             "us-east5",
             "--zone",
@@ -1089,7 +1225,8 @@ def test_the_up_command_reports_the_address_the_ingress_and_the_next_command(mon
     assert invoked.exit_code == 0, invoked.output
     assert "http://10.128.0.7:8080" in invoked.output
     assert "restricted to 10.128.0.0/20" in invoked.output
-    assert "Next: eyvan --url http://10.128.0.7:8080 up <fleet.yaml>" in invoked.output
+    assert "Next: on the head: eyvan up <fleet.yaml>" in invoked.output
+    assert "elsewhere: eyvan --url http://10.128.0.7:8080 --token <token> up <fleet.yaml>" in invoked.output
     assert not any(value in invoked.output for value in STUB_SECRETS.values())
 
 
@@ -1154,7 +1291,7 @@ def test_status_and_down_do_not_demand_an_egress_mode_to_read_or_delete_a_head(m
     """
 
     monkeypatch.setenv("EYVAN_CONFIG_FILE", str(tmp_path / "contexts.json"))
-    where = ["--fleet", "research", "--project", "example-project", "--region", "us-east5", "--zone", "us-east5-a"]
+    where = ["--fleet", "research", "--project", "example-project-1", "--region", "us-east5", "--zone", "us-east5-a"]
 
     status = CliRunner().invoke(head_commands.head_group, ["status", *where, "--json"])
     teardown = CliRunner().invoke(head_commands.head_group, ["down", *where, "--dry-run", "--json"])

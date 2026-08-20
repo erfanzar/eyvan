@@ -40,6 +40,7 @@ from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
+from eyvan.sdk.node import discover_node_context, discover_node_token
 from eyvan.sdk.terminal import stream_is_terminal
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
@@ -69,7 +70,11 @@ def main(
         context_config = context_store.load()
     except ContextConfigError as exc:
         raise click.ClickException(str(exc)) from exc
-    active_context = context_config.active
+    # The operator's own context first; then what this machine is part of. On a
+    # head that makes every `eyvan` command work with no flags at all, and it is
+    # what keeps the endpoint non-loopback there -- loopback is the signal that
+    # elects a local development plane on the machine already running the real one.
+    active_context = context_config.active or discover_node_context()
     overrides = ContextOverrides(base_url=url, org_id=org, project_id=project)
     endpoint = ControlPlaneEndpoint.parse(url or (active_context.base_url if active_context else DEFAULT_BASE_URL))
     org_id = org or (active_context.org_id if active_context else None)
@@ -89,7 +94,7 @@ def main(
             )
     identity = resolve_control_plane_identity(
         endpoint,
-        token=token,
+        token=token or discover_node_token(endpoint),
         dev_user=user,
         dev_org=org_id,
         dev_project=project_id,

@@ -47,6 +47,8 @@ from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.sdk.commands.autoscale import autoscale_console, is_interactive
 from eyvan.sdk.commands.common import FleetConfigLoader
+from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
+from eyvan.sdk.node import NODE_CONTEXT_PATH
 
 #: Legal ``bootstrap_egress`` values, restated here because an operator who
 #: guesses wrong learns the set from a rejection rather than from a page.
@@ -67,6 +69,10 @@ HEAD_FIREWALL_DESCRIPTION_PREFIX = "eyvan-control-plane-head:v1"
 #: not the internet either: only Google's IAP front end originates from it, and
 #: reaching it still requires ``roles/iap.tunnelResourceAccessor``.
 IAP_TCP_FORWARDING_RANGE = "35.235.240.0/20"
+
+#: The one project a head with no identity provider trusts for callable
+#: workloads. Bootstrap mode has exactly one principal, and this is its project.
+BOOTSTRAP_CALLABLE_PROJECT = f"{DEFAULT_ORG_ID}/{DEFAULT_PROJECT_ID}"
 
 DEFAULT_HEAD_MACHINE_TYPE = "e2-standard-4"
 DEFAULT_HEAD_PORT = 8080
@@ -102,6 +108,14 @@ HEAD_SERVICE_NAME = "eyvan-head.service"
 HEAD_AGENT_SERVICE_NAME = "eyvan-head-agent.service"
 HEAD_AGENT_PORT = 8090
 PLATFORM_CONFIG_PATH = "/etc/eyvan/platform.yaml"
+
+#: What the installer runs to record this node's own control plane. Written as
+#: one call into ``eyvan.sdk.node`` rather than as generated JSON so the format
+#: has exactly one producer, and that producer is the module that reads it back.
+_NODE_CONTEXT_SNIPPET = (
+    "from eyvan.sdk.node import HEAD_ENVIRONMENT_PATH, NODE_CONTEXT_PATH, write_node_context; "
+    "write_node_context(HEAD_ENVIRONMENT_PATH, NODE_CONTEXT_PATH, fleet={fleet!r})"
+)
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _RESOURCE_NAME_PATTERN = re.compile(r"^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -271,6 +285,11 @@ class HeadSpec:
     artifact_store_uri: str | None = None
     oidc_issuer: str | None = None
     oidc_audience: str = "eyvan"
+    #: Projects whose principals may submit serialized callables. Granted by name
+    #: and never inferred from an identity provider: a callable is a pickle this
+    #: fleet deserializes and runs, so authenticating a principal answers who it
+    #: is, not whether its project may execute arbitrary code here.
+    trusted_callable_projects: tuple[str, ...] = ()
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
 
@@ -315,6 +334,13 @@ class HeadSpec:
             value = getattr(self, name)
             if value is not None:
                 _shell_safe(value, field_name=name.replace("_", " "))
+        for value in self.trusted_callable_projects:
+            _shell_safe(value, field_name="trusted callable project")
+            # EYVAN_TRUSTED_CALLABLE_PROJECTS is one comma-separated line in that
+            # same file, so a comma inside an entry would silently become two
+            # entries and grant code execution to a project nobody named.
+            if "," in value:
+                raise ValueError(f"trusted callable project {value!r} must not contain a comma")
         for value in self.source_ranges:
             _private_network(value, field_name="control-plane source range")
         if len(self.instance_name) > 63:
@@ -433,6 +459,10 @@ class HeadSpec:
             "project": self.project,
             "region": self.region,
             "resources": dict(sorted(self.resource_names.items())),
+            # A trust grant is the one decision in this document a reviewer most
+            # needs to see before it is made, and it would otherwise appear only
+            # inside an environment file on a machine that does not exist yet.
+            "trusted_callable_projects": list(self.trusted_callable_projects),
             "zone": self.zone,
         }
 
@@ -508,7 +538,17 @@ class HeadSecrets:
     def values(self) -> tuple[str, ...]:
         """Return every secret value, for redaction checks only."""
 
-        return (self.metrics_token, self.artifact_token_key, self.agent_shared_secret, self.database_password)
+        # ``bootstrap_token`` belongs here and was missing: every redaction
+        # assertion in the suite goes through this tuple, so the one credential
+        # that authenticates a whole control plane was the one credential no
+        # test could catch leaking.
+        return (
+            self.metrics_token,
+            self.artifact_token_key,
+            self.agent_shared_secret,
+            self.database_password,
+            self.bootstrap_token,
+        )
 
     def database_url(self, spec: HeadSpec) -> str:
         """Return the external URL when one was given, else the head-local one."""
@@ -537,11 +577,25 @@ class HeadSecrets:
         else:
             # Startup refuses both at once, so this only ever fills the gap.
             environment["EYVAN_BOOTSTRAP_TOKEN"] = self.bootstrap_token
-            # A loopback development plane trusts its own default project for
-            # callable workloads; a real head trusts nothing, so the decorator
-            # API was refused with 403 after authenticating. In bootstrap mode
-            # there is exactly one principal, and this is its own project.
-            environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] = "default/default"
+        # Callable trust, decided outside that branch because it is not a
+        # property of how principals authenticate. A loopback development plane
+        # trusts its own default project, so the decorator API worked on a laptop
+        # and was refused with 403 after authenticating on a real head. Writing
+        # the default only in the bootstrap branch fixed that for exactly the
+        # deployment that has no identity provider, and left it broken for the
+        # one that does -- which is the deployment anyone runs for real.
+        #
+        # Deliberately not auto-granted under an issuer. Deserializing a callable
+        # executes arbitrary code on the fleet, and `callable_trust` grants that
+        # to *every* principal holding SUBMIT in a trusted project -- under OIDC,
+        # a set the head operator never enumerated. So an operator names the
+        # projects; bootstrap mode, which has exactly one principal, keeps
+        # trusting that principal's own project as before.
+        trusted = spec.trusted_callable_projects
+        if not trusted and spec.oidc_issuer is None:
+            trusted = (BOOTSTRAP_CALLABLE_PROJECT,)
+        if trusted:
+            environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] = ",".join(trusted)
         return environment
 
     def environment_file(self, spec: HeadSpec, *, address: str) -> str:
@@ -752,6 +806,13 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "install -d -o eyvan-head -g eyvan-head -m 0750 /var/lib/eyvan",
         f"chown root:eyvan-head {HEAD_ENVIRONMENT_PATH}",
         f"chmod 0640 {HEAD_ENVIRONMENT_PATH}",
+        "# Group membership rather than a copy of the credential. Anyone who can",
+        "# reach this host over IAP already has sudo and can already read this",
+        "# file -- which is exactly what `head up` used to tell them to do. This",
+        "# removes the sudo round trip and grants no authority they lacked. It",
+        "# takes effect at their next login, which is why the SDK names the group",
+        "# when the read is refused.",
+        'if [ -n "${SUDO_USER:-}" ]; then usermod -aG eyvan-head "${SUDO_USER}"; fi',
         "",
         "# The virtual environment, built with the interpreter the image ships.",
         "# `uv` is deliberately not required: a missing uv is one of the failures",
@@ -766,16 +827,32 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "  install -d -m 0755 /opt/eyvan",
         f"  python3 -m venv {HEAD_VENV_PATH}",
         "fi",
-        (
-            # The glob is deliberate and must not be quoted: the wheel keeps
-            # its own PEP 427 filename, which this script does not know at
-            # render time. Installing the file rather than the name `eyvan`
-            # means no index is consulted for Eyvan itself, while its
-            # dependencies still resolve normally -- --no-index blocked those
-            # too and the install died on alembic.
-            f"{venv_python} -m pip install --disable-pip-version-check --upgrade {HEAD_WHEEL_DIR}/*.whl"
+        *(
+            (
+                # The glob is deliberate and must not be quoted: the wheel keeps
+                # its own PEP 427 filename, which this script does not know at
+                # render time. Installing the file rather than the name `eyvan`
+                # means no index is consulted for Eyvan itself, while its
+                # dependencies still resolve normally -- --no-index blocked those
+                # too and the install died on alembic.
+                f"{venv_python} -m pip install --disable-pip-version-check --upgrade {HEAD_WHEEL_DIR}/*.whl",
+                # Then the same wheel again, forced. A staged wheel carries the
+                # version of the tree that built it, so a head re-run after a code
+                # change is almost always an install of the *same* version -- and
+                # `--upgrade` is a no-op there. The head kept serving the previous
+                # wheel while reporting a successful install, which is the worst
+                # available combination: every later observation describes code
+                # that is not running. `--no-deps` because the line above has
+                # already resolved the dependency tree, and repeating it would
+                # rebuild every dependency on every head up.
+                f"{venv_python} -m pip install --disable-pip-version-check --force-reinstall --no-deps "
+                f"{HEAD_WHEEL_DIR}/*.whl",
+            )
             if staged
-            else f"{venv_python} -m pip install --disable-pip-version-check --upgrade {shlex.quote(package)}"
+            # An index install is a version specifier, so --upgrade is doing real
+            # resolution work and a forced pass would only reinstall what it just
+            # chose.
+            else (f"{venv_python} -m pip install --disable-pip-version-check --upgrade {shlex.quote(package)}",)
         ),
         f"chmod -R a+rX {HEAD_VENV_PATH}",
         "",
@@ -867,6 +944,11 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
             f"    endpoint: http://127.0.0.1:{HEAD_AGENT_PORT}",
             "EYVAN_PLATFORM",
             f"chmod 0644 {PLATFORM_CONFIG_PATH}",
+            # What makes this node answer "which control plane am I part of"
+            # without being told. Run with the venv interpreter, which holds the
+            # exact wheel this head will serve, and on every `up` including an
+            # adopting one -- so a changed address self-heals.
+            f"{venv_python} -c {shlex.quote(_NODE_CONTEXT_SNIPPET.format(fleet=spec.fleet))}",
             "systemctl daemon-reload",
             f"systemctl enable --now {HEAD_AGENT_SERVICE_NAME}",
             "",
@@ -897,7 +979,14 @@ class HeadUpResult:
     def next_command(self) -> str:
         """Return the exact command an operator runs next."""
 
-        return f"eyvan --url {self.url} up <fleet.yaml>"
+        # Both audiences, because they need different commands. From the head
+        # itself nothing has to be passed: the installer recorded the plane this
+        # node serves, so the CLI and the SDK discover the URL and the credential.
+        # From anywhere else the address is a private VPC one, so it needs a
+        # tunnel and an explicit flag.
+        return (
+            f"on the head: eyvan up <fleet.yaml>   |   elsewhere: eyvan --url {self.url} --token <token> up <fleet.yaml>"
+        )
 
     @property
     def authentication_warning(self) -> str | None:
@@ -912,9 +1001,30 @@ class HeadUpResult:
             return None
         return (
             "This head has no EYVAN_OIDC_ISSUER, so it authenticates with a generated bootstrap token instead. "
-            "Read it with: sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env. Pass it to the CLI as "
-            "`eyvan --token <token> --url <address>`, or export EYVAN_TOKEN for the Python SDK. "
+            "On the head itself nothing needs configuring: the CLI and the Python SDK discover this plane's "
+            "address and credential from the node. From anywhere else, read it with "
+            "`sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env` and pass `eyvan --token <token> --url <address>`. "
             "Register an identity provider and re-run with --oidc-issuer to retire it."
+        )
+
+    @property
+    def callable_trust_warning(self) -> str | None:
+        """Warn when this head will refuse every ``@execute`` submission.
+
+        Trust is named, never inferred: an identity provider says who a principal
+        is, not whether its project may hand this fleet a pickle to deserialize.
+        So a head stood up with ``--oidc-issuer`` trusts nobody until an operator
+        says who -- and the loss is otherwise silent, because the submission
+        authenticates and is only then refused, with a 403 naming the workload
+        rather than the setting that refused it.
+        """
+
+        if self.spec.trusted_callable_projects or self.spec.oidc_issuer is None:
+            return None
+        return (
+            "This head trusts no project for callable workloads, so every @execute submission is refused with "
+            "403 after authenticating; command workloads are unaffected. Re-run with "
+            "`eyvan head up --trust-callable-project <org>/<project>` to grant it."
         )
 
     def as_document(self) -> JsonObject:
@@ -924,7 +1034,10 @@ class HeadUpResult:
             "address": self.address,
             "adopted_instance": self.adopted_instance,
             "authentication_warning": self.authentication_warning,
+            "callable_trust_warning": self.callable_trust_warning,
             "created_firewall_rules": list(self.created_firewall_rules),
+            # A path, never a value: this document is the automation-safe one.
+            "node_context_path": str(NODE_CONTEXT_PATH),
             "instance": self.spec.instance_name,
             "next_command": self.next_command,
             "service_state": self.service_state,
@@ -1860,6 +1973,13 @@ def head_group() -> None:
 @click.option("--artifact-store-uri", help="Set EYVAN_ARTIFACT_STORE_URI, normally a gs:// prefix.")
 @click.option("--oidc-issuer", help="Set EYVAN_OIDC_ISSUER; without it the head refuses every request with 401.")
 @click.option("--oidc-audience", help="Set EYVAN_OIDC_AUDIENCE. [default: eyvan]")
+@click.option(
+    "--trust-callable-project",
+    "trusted_callable_projects",
+    multiple=True,
+    help="Let this org/project submit serialized callables; repeatable. Without it a head with an issuer "
+    "refuses every @execute submission with 403.",
+)
 @click.option("--service-account", help="Service account attached to the head VM.")
 @click.option(
     "--source-range",
@@ -1894,6 +2014,7 @@ def head_up(
     artifact_store_uri: str | None,
     oidc_issuer: str | None,
     oidc_audience: str | None,
+    trusted_callable_projects: tuple[str, ...],
     service_account: str | None,
     source_ranges: tuple[str, ...],
     boot_disk_size_gb: int | None,
@@ -1932,6 +2053,7 @@ def head_up(
             artifact_store_uri=artifact_store_uri,
             oidc_issuer=oidc_issuer,
             oidc_audience=oidc_audience,
+            trusted_callable_projects=tuple(trusted_callable_projects),
             service_account=service_account,
             source_ranges=tuple(source_ranges),
             boot_disk_size_gb=boot_disk_size_gb,
@@ -1967,6 +2089,9 @@ def head_up(
     warning = result.authentication_warning
     if warning is not None:
         click.echo(warning, err=True)
+    trust_warning = result.callable_trust_warning
+    if trust_warning is not None:
+        click.echo(trust_warning, err=True)
     click.echo(f"Next: {result.next_command}")
 
 
