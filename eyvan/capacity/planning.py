@@ -397,6 +397,22 @@ def cell_provides_pool_supply(cell: CellRecord, pool: CapacityPoolRecord, now: d
         return True
     if cell.state not in {CellState.REGISTERING, CellState.UNAVAILABLE}:
         return False
+    if phase is None:
+        # Nothing has been asked of the provider yet: ``capacity.apply`` is
+        # durable in the outbox and has not run, so no request exists that could
+        # be late. Timing this out charges the cell for a provisioning it never
+        # started, and the cost is not one wasted cell but an unbounded loop --
+        # the reaped cell's queued apply is discarded as stale, a replacement is
+        # launched, its apply goes to the back of the same queue, and the next
+        # timeout repeats it. Observed on 2026-08-21: cells living 1805s against
+        # a 1800s budget, every one with ``provider_phase`` still None and
+        # nothing in the zone, for as long as the outbox stayed behind.
+        #
+        # A slow outbox is a reason to wait for the apply, never a reason to
+        # destroy the cell it belongs to. Provisioning is timed from when
+        # provisioning actually begins, which is what ``provider_phase_started_at``
+        # records.
+        return True
     phase_started_at = cell.provider_phase_started_at or cell.created_at
     elapsed_s = max(0.0, (now - phase_started_at).total_seconds())
     if phase in QUEUED_CAPACITY_STATUSES:

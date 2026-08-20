@@ -1178,6 +1178,19 @@ async def test_definitively_absent_cell_is_drained_immediately() -> None:
 
 @pytest.mark.asyncio
 async def test_registering_cell_is_replaced_after_provisioning_timeout() -> None:
+    """The timeout applies to a cell the provider was actually asked about.
+
+    This used to age ``created_at`` on a cell whose ``provider_phase`` was still
+    None -- a cell nothing had been asked about yet -- and assert it was drained.
+    That is the loop: the reaped cell's queued ``capacity.apply`` is discarded as
+    stale, a replacement launches, its apply joins the back of the same queue,
+    and the next timeout repeats it while the zone stays empty.
+
+    Provisioning is now timed from when provisioning starts, so the phase is set
+    here. See ``test_an_undispatched_cell_is_not_drained_by_the_provisioning_timeout``
+    for the case this test used to cover by accident.
+    """
+
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
     controller = EyvanController(repository, service)
@@ -1201,11 +1214,63 @@ async def test_registering_cell_is_replaced_after_provisioning_timeout() -> None
     await controller.reconcile_capacity_pools_once()
     async with repository.transaction() as transaction:
         cell = (await transaction.list_cells())[0]
-        await transaction.put_cell(cell.model_copy(update={"created_at": cell.created_at - timedelta(seconds=2)}))
+        await transaction.put_cell(
+            cell.model_copy(
+                update={
+                    "provider_phase": CapacityStatus.PROVISIONING,
+                    "provider_phase_started_at": cell.created_at - timedelta(seconds=2),
+                    "created_at": cell.created_at - timedelta(seconds=2),
+                }
+            )
+        )
 
     result = await controller.reconcile_capacity_pools_once()
 
     assert result == {"launched": 0, "drained": 1, "deleted": 0}
+
+
+@pytest.mark.asyncio
+async def test_an_undispatched_cell_is_not_drained_by_the_provisioning_timeout() -> None:
+    """A cell nobody has asked the provider about cannot be late.
+
+    ``capacity.apply`` is durable in the outbox; until it runs there is no
+    provider request, so charging the cell for a slow queue destroys the very
+    cell the pending apply belongs to and launches another behind it. On
+    2026-08-21 that ran unbounded: cells living 1805s against a 1800s budget,
+    every one with ``provider_phase`` still None and nothing in the zone.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    await service.apply_fleet(
+        fleet_admin(),
+        "research",
+        (cpu_pool(max_cells=1, provisioning_timeout_s=1),),
+        idempotency_key="fleet-v1",
+    )
+    await service.submit_workload(
+        operator(),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="cpu-job",
+            execution=CommandExecution(command="python train.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 4, "memory_gib": 16}},
+        ),
+        idempotency_key="workload-1",
+    )
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        cell = (await transaction.list_cells())[0]
+        # Far past the budget, and still undispatched: no phase, no phase start.
+        await transaction.put_cell(cell.model_copy(update={"created_at": cell.created_at - timedelta(seconds=3600)}))
+
+    result = await controller.reconcile_capacity_pools_once()
+
+    assert result["drained"] == 0, "a cell with no provider request was reaped for failing to provision"
+    async with repository.transaction() as transaction:
+        assert (await transaction.list_cells())[0].state is CellState.REGISTERING
 
 
 @pytest.mark.asyncio

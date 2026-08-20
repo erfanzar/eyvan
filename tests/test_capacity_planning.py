@@ -22,11 +22,13 @@ from eyvan.capacity.planning import (
     _candidate_pool_ids,
     _preferred_candidate,
     cell_matches_pool,
+    cell_provides_pool_supply,
     cell_requires_replacement,
 )
 from eyvan.domain.models import PriorityBand
 from eyvan.records import (
     CapacityPoolRecord,
+    CapacityStatus,
     CellRecord,
     CellState,
     CommandExecution,
@@ -1061,3 +1063,48 @@ def test_one_healthy_alternate_keeps_the_workload_launching() -> None:
     assert simulation.acquisition_exhausted_workload_ids == frozenset()
     assert len(simulation.cells) == 1
     assert simulation.pool_by_cell_id[simulation.cells[0].id] == warm.id
+
+
+def test_a_cell_whose_provider_request_has_not_started_is_never_timed_out() -> None:
+    """The churn loop: a provisioning timeout charged for provisioning nobody began.
+
+    ``capacity.apply`` is durable in the outbox. Until it runs the cell has
+    ``provider_phase`` None and no request exists at the provider -- so measuring
+    ``provisioning_timeout_s`` from ``created_at`` times out something that never
+    started.
+
+    The cost is not one wasted cell. The reaped cell's queued apply is discarded
+    as stale, a replacement is launched, its apply joins the back of the same
+    queue, and the next timeout repeats it -- forever, while the zone stays
+    empty. Observed on 2026-08-21: cells living 1805s against a 1800s budget,
+    every one with ``provider_phase`` still None.
+
+    Once provisioning genuinely starts, the budget applies exactly as before.
+    """
+
+    pool = _shape_pool("research/zone-a")
+    now = utcnow()
+    undispatched = pool.make_cell("cell-undispatched", worker_count=2).model_copy(
+        update={
+            "state": CellState.REGISTERING,
+            "provider_phase": None,
+            "provider_phase_started_at": None,
+            "created_at": now - timedelta(seconds=pool.provisioning_timeout_s * 4),
+        }
+    )
+
+    assert cell_provides_pool_supply(undispatched, pool, now), (
+        "a cell whose provider request never started was reaped for failing to provision"
+    )
+
+    # The budget still bites once the provider has actually been asked.
+    dispatched = undispatched.model_copy(
+        update={
+            "provider_phase": CapacityStatus.PROVISIONING,
+            "provider_phase_started_at": now - timedelta(seconds=pool.provisioning_timeout_s + 1),
+        }
+    )
+    assert not cell_provides_pool_supply(dispatched, pool, now)
+
+    fresh = dispatched.model_copy(update={"provider_phase_started_at": now - timedelta(seconds=1)})
+    assert cell_provides_pool_supply(fresh, pool, now)
