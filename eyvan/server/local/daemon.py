@@ -961,11 +961,38 @@ class LocalDaemonSupervisor:
                 elif record.endpoint != endpoint:
                     detail = f"the record at {record_path} names endpoint {record.endpoint.url}"
                     remedy = "that record belongs to a different control plane"
+                elif record.runtime_profile_path == runtime_profile_path:
+                    # A dead PID beside a healthy listener is a stale *record*,
+                    # not a foreign process. The health probe above already got
+                    # a typed Eyvan response from this endpoint and the record
+                    # names this endpoint and this runtime profile, which is
+                    # more evidence than the live-PID branch below ever checks
+                    # -- that one never confirms the recorded PID is the process
+                    # holding the port either.
+                    #
+                    # Refusing here helped nobody. The plane is Eyvan's, it is
+                    # serving, and the only way past the refusal was editing the
+                    # record's JSON by hand -- which is what the operator did
+                    # three times in one session before this was fixed. The
+                    # record goes stale on its own: a later start that fails
+                    # overwrites a working plane's record with the PID it just
+                    # launched, and then that PID dies.
+                    #
+                    # Adopted without rewriting. Guessing which PID holds a
+                    # socket is not portable, and the serving process rewrites
+                    # its own record at startup, so the stale value heals on the
+                    # next restart rather than being invented here.
+                    return LocalDaemonResult(
+                        endpoint=endpoint, state=LocalDaemonState.REUSED, pid=None, log_path=log_path
+                    )
                 else:
-                    detail = f"the record at {record_path} names pid {record.pid}, which is not running"
+                    detail = (
+                        f"the record at {record_path} names pid {record.pid}, which is not running, and "
+                        f"runtime profile {record.runtime_profile_path}"
+                    )
                     remedy = (
-                        "the record is stale while something healthy holds the port; stop that listener, or "
-                        "remove the stale record if you are certain it is orphaned"
+                        "that record belongs to a control plane started with a different runtime profile; select "
+                        "that profile, or stop that listener"
                     )
                 raise LocalDaemonConfigurationError(
                     f"a local Eyvan control plane is already listening at {endpoint.url}, but this supervisor "

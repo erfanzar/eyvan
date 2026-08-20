@@ -53,3 +53,98 @@ def test_the_startup_budget_fits_a_fleet_rather_than_one_local_pool() -> None:
     from eyvan.server.local.daemon import LocalDaemonSupervisor
 
     assert LocalDaemonSupervisor().startup_timeout_s >= 60
+
+
+#: A process id high enough that nothing on the machine can be using it, so the
+#: test never depends on which pids happen to be live.
+_DEAD_PID = 999_999_998
+
+
+def test_a_stale_pid_beside_a_healthy_plane_is_adopted_not_refused(tmp_path) -> None:
+    """A dead PID in the record is a stale record, not somebody else's process.
+
+    The supervisor refused to proceed whenever the recorded PID was not running,
+    even though the health probe had just got a typed Eyvan response from the
+    endpoint and the record named that same endpoint and runtime profile. The
+    record goes stale on its own -- a later start that fails overwrites a
+    working plane's record with the PID it just launched, and then that PID dies
+    -- so the refusal fired on a plane that was Eyvan's and serving.
+
+    The only way past it was hand-editing the record's JSON, which happened
+    three times in one session. Adopt instead.
+    """
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.server.local.daemon import (
+        LocalDaemonPaths,
+        LocalDaemonRecord,
+        LocalDaemonState,
+        LocalDaemonSupervisor,
+        LocalDaemonTarget,
+        write_owner_only_record,
+    )
+
+    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8080")
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    record_path = paths.record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = str(tmp_path / "profile.json")
+    # Written through the real writer so the file carries the owner-only mode
+    # the reader insists on; a hand-written file fails for the wrong reason.
+    write_owner_only_record(
+        record_path, LocalDaemonRecord(endpoint=endpoint, pid=_DEAD_PID, runtime_profile_path=profile)
+    )
+
+    supervisor = LocalDaemonSupervisor(
+        paths=paths,
+        launcher=type("L", (), {"start": lambda self, command: None})(),
+        health_probe=lambda _endpoint: True,
+        process_liveness=lambda _pid: False,
+    )
+
+    result = supervisor._existing_result(endpoint, record_path, paths.log_path(target), profile)
+
+    assert result is not None, "a healthy Eyvan plane must not be refused over a stale pid"
+    assert result.state is LocalDaemonState.REUSED
+    # Not invented: which pid holds a socket is not portable to discover, and the
+    # serving process rewrites its own record at startup.
+    assert result.pid is None
+
+
+def test_a_stale_pid_under_a_different_profile_is_still_refused(tmp_path) -> None:
+    """Adoption is scoped to the profile; a foreign plane is still a refusal."""
+
+    import pytest
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.server.local.daemon import (
+        LocalDaemonConfigurationError,
+        LocalDaemonPaths,
+        LocalDaemonRecord,
+        LocalDaemonSupervisor,
+        LocalDaemonTarget,
+        write_owner_only_record,
+    )
+
+    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8080")
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    record_path = paths.record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    write_owner_only_record(
+        record_path,
+        LocalDaemonRecord(endpoint=endpoint, pid=_DEAD_PID, runtime_profile_path="/some/other/profile.json"),
+    )
+
+    supervisor = LocalDaemonSupervisor(
+        paths=paths,
+        launcher=type("L", (), {"start": lambda self, command: None})(),
+        health_probe=lambda _endpoint: True,
+        process_liveness=lambda _pid: False,
+    )
+
+    with pytest.raises(LocalDaemonConfigurationError, match="different runtime profile"):
+        supervisor._existing_result(endpoint, record_path, paths.log_path(target), str(tmp_path / "profile.json"))
