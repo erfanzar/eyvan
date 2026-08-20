@@ -769,13 +769,30 @@ class LocalDaemonSupervisor:
             claimed = read_owner_only_record(record_path)
             if claimed is not None and claimed.pid != process.pid and process_is_alive(claimed.pid):
                 stop_owned_process(process)
-                adopted = self._existing_result(configured_endpoint, record_path, log_path, profile_identifier)
-                if adopted is not None:
-                    return adopted
+                if claimed.endpoint == configured_endpoint and claimed.runtime_profile_path == profile_identifier:
+                    # Adopted on the record, not on a fresh health probe. The
+                    # record is owner-only, names this endpoint and this runtime
+                    # profile, and its PID is running: that is ownership, and it
+                    # is the same evidence the live-PID branch of
+                    # ``_existing_result`` accepts.
+                    #
+                    # Re-probing here made the outcome depend on whether the
+                    # winner answered within one timeout while it was still
+                    # finishing its own startup -- and when it did not, this
+                    # raised at a plane that was healthy seconds later. A
+                    # supervisor that has just lost a race must not also have to
+                    # win a race with the winner's boot.
+                    return LocalDaemonResult(
+                        endpoint=configured_endpoint,
+                        state=LocalDaemonState.REUSED,
+                        pid=claimed.pid,
+                        log_path=log_path,
+                    )
                 raise LocalDaemonStartupError(
                     configured_endpoint,
                     log_path,
-                    f"another Eyvan control plane claimed {configured_endpoint.url} while this one was starting",
+                    f"another Eyvan control plane claimed {configured_endpoint.url} while this one was "
+                    f"starting, under runtime profile {claimed.runtime_profile_path}",
                 )
             try:
                 write_owner_only_record(

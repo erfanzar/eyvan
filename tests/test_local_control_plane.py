@@ -214,15 +214,16 @@ def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> Non
         def wait(self, timeout: float | None = None) -> int:
             return 1
 
-    # `ensure` probes twice before it decides to start -- once before taking the
-    # startup lock and once inside it -- so both must miss for the race to
-    # happen at all. The winner finishes booting after that.
-    probes = iter([False, False])
+    # Every probe misses: the winner is still finishing its own startup and does
+    # not answer health within a timeout. That is the case that raised at a plane
+    # which was healthy seconds later, so adoption must not depend on a probe.
+    def _never_answers(_endpoint: object) -> bool:
+        return False
 
     supervisor = LocalDaemonSupervisor(
         paths=paths,
         launcher=type("L", (), {"start": lambda self, command: _Loser()})(),
-        health_probe=lambda _endpoint: next(probes, True),
+        health_probe=_never_answers,
     )
 
     result = supervisor.ensure(endpoint, runtime_profile_path=Path(profile))
