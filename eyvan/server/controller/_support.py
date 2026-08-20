@@ -44,6 +44,14 @@ from eyvan.records import (
 logger = logging.getLogger(__name__)
 
 _SHARED_TPU_QUOTA_SCHEDULING_REASON = "shared Spot TPU quota cannot fit this job's requested complete worker capacity"
+#: Said when every pool a workload accepts has failed to acquire capacity
+#: ``MAX_CONSECUTIVE_ACQUISITION_FAILURES`` times running. Names the remedy,
+#: because the job is not going to progress where it is and the operator has to
+#: choose a different zone or shape.
+_ACQUISITION_EXHAUSTED_SCHEDULING_REASON = (
+    "every zone this job accepts has failed to grant capacity five times running; "
+    "choose another zone or shape, or wait for the provider to free some"
+)
 
 _PREEMPTION_TERMINAL_WORKLOAD_STATUSES = frozenset(
     {

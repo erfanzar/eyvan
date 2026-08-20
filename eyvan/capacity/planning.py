@@ -171,6 +171,26 @@ def candidate_zone_report(
     )
 
 
+#: Consecutive failed capacity acquisitions after which a pool stops being asked
+#: for *new* capacity on behalf of a workload. Belief already ranks a cold pool
+#: last, which decides *where* to ask but never whether to stop: a workload whose
+#: only candidate pool keeps failing asks it again every time the cooldown
+#: expires, and ``max_backoff_s`` caps that at an hour. One probe produced twenty
+#: cells in a single zone over nineteen hours that way, each granted and released
+#: without ever becoming READY.
+#:
+#: Five because a spot stockout is ordinary and a handful of retries is how spot
+#: capacity is normally won; five failures in a row is the zone telling you
+#: something a sixth attempt will not change.
+MAX_CONSECUTIVE_ACQUISITION_FAILURES = 5
+
+
+def _acquisition_exhausted(pool: CapacityPoolRecord, pool_consecutive_failures: Counter[str]) -> bool:
+    """Return whether this pool has failed to acquire capacity too often to ask again."""
+
+    return pool_consecutive_failures[pool.id] >= MAX_CONSECUTIVE_ACQUISITION_FAILURES
+
+
 def _preferred_candidate(
     candidates: list[CapacityPoolRecord],
     *,
@@ -474,6 +494,11 @@ class CapacitySimulation:
     cells: tuple[CellRecord, ...]
     pool_by_cell_id: dict[str, str]
     virtual_worker_count_by_cell_id: dict[str, int]
+    #: Workloads whose every acceptable pool has stopped granting capacity. They
+    #: get no virtual candidate, so nothing is launched for them; carried out of
+    #: the simulation so the caller can say so on the workload instead of leaving
+    #: it pending with no reason.
+    acquisition_exhausted_workload_ids: frozenset[str] = frozenset()
 
     @classmethod
     def build(
@@ -495,6 +520,20 @@ class CapacitySimulation:
         free_owned_exact_supply: Counter[tuple[str, int, str]] = Counter()
         pool_cooling: Counter[str] = Counter()
         pool_consecutive_failures: Counter[str] = Counter()
+        acquisition_exhausted_workload_ids: set[str] = set()
+        # Counted separately from ``pool_consecutive_failures``, which is only
+        # populated for cells that still supply the pool -- a cell reclaimed
+        # after failing to provision supplies nothing, so the very belief this
+        # bound needs is the belief that loop skips. Ranking wants "how cold is
+        # the capacity I could still use"; this wants "how often has asking here
+        # failed", and they are different questions about the same field.
+        pool_acquisition_failures: Counter[str] = Counter()
+        for cell in cells:
+            pool_id = cell.pool_id or ""
+            if pool_id in pools_by_id:
+                pool_acquisition_failures[pool_id] = max(
+                    pool_acquisition_failures[pool_id], int(cell.availability.consecutive_failures)
+                )
 
         for cell in cells:
             pool = pools_by_id.get(cell.pool_id or "")
@@ -545,11 +584,21 @@ class CapacitySimulation:
         for workload in workloads:
             if workload.state is not WorkloadState.PENDING:
                 continue
-            candidates = [
+            named = [
                 candidate
                 for candidate in (pools_by_id.get(pool_id) for pool_id in _candidate_pool_ids(workload))
                 if candidate is not None and candidate.enabled
             ]
+            # A pool that has failed this many times running is not asked for new
+            # capacity again. Existing free capacity is still usable -- this bounds
+            # acquisition, not placement -- so a pool that suddenly grants is picked
+            # up by the free-supply branch below without waiting for belief to decay.
+            candidates = [pool for pool in named if not _acquisition_exhausted(pool, pool_acquisition_failures)]
+            if named and not candidates:
+                # Every zone it accepts has stopped granting. Say so once, durably,
+                # instead of asking again on the next tick forever.
+                acquisition_exhausted_workload_ids.add(workload.id)
+                continue
             if not candidates:
                 generic_workloads.append(workload)
                 continue
@@ -614,6 +663,7 @@ class CapacitySimulation:
             cells=tuple(scheduler_cells),
             pool_by_cell_id=pool_by_cell_id,
             virtual_worker_count_by_cell_id=virtual_worker_count_by_cell_id,
+            acquisition_exhausted_workload_ids=frozenset(acquisition_exhausted_workload_ids),
         )
 
     def demand(

@@ -14,6 +14,7 @@ from datetime import timedelta
 import pytest
 
 from eyvan.capacity.planning import (
+    MAX_CONSECUTIVE_ACQUISITION_FAILURES,
     POOL_ALTERNATES_LABEL,
     CapacityPlanner,
     CapacitySimulation,
@@ -986,3 +987,77 @@ def test_equally_healthy_empty_zones_keep_the_primary() -> None:
     )
 
     assert chosen.id == first.id
+
+
+def _failing_cell(pool: CapacityPoolRecord, cell_id: str, *, consecutive_failures: int) -> CellRecord:
+    """One reclaimed cell carrying the belief a failed acquisition writes."""
+
+    cell = pool.make_cell(cell_id, worker_count=2)
+    return cell.model_copy(
+        update={
+            "state": CellState.DELETING,
+            "availability": cell.availability.model_copy(update={"consecutive_failures": consecutive_failures}),
+        }
+    )
+
+
+def test_a_pool_that_keeps_failing_stops_being_asked_for_new_capacity() -> None:
+    """The twenty-cell loop: retrying forever is not a plan.
+
+    Belief already ranks a cold pool last, which decides *where* to ask and never
+    whether to stop. A workload whose only candidate keeps failing therefore asks
+    it again every time the cooldown expires, and ``max_backoff_s`` caps that at
+    an hour -- so one probe produced twenty cells in a single zone across
+    nineteen hours, each granted and released without ever becoming READY, while
+    the workload sat PENDING with no reason given.
+
+    Below the bound the pool is still asked, because a handful of retries is how
+    spot capacity is normally won.
+    """
+
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+    now = utcnow()
+
+    tolerated = CapacitySimulation.build(
+        (pool,),
+        (_failing_cell(pool, "cell-1", consecutive_failures=MAX_CONSECUTIVE_ACQUISITION_FAILURES - 1),),
+        (workload,),
+        (),
+        now,
+    )
+    assert len(tolerated.cells) == 1, "a pool below the bound must still be asked"
+    assert tolerated.acquisition_exhausted_workload_ids == frozenset()
+
+    exhausted = CapacitySimulation.build(
+        (pool,),
+        (_failing_cell(pool, "cell-1", consecutive_failures=MAX_CONSECUTIVE_ACQUISITION_FAILURES),),
+        (workload,),
+        (),
+        now,
+    )
+    # No virtual candidate means nothing is launched -- that is the loop broken.
+    assert exhausted.cells == ()
+    # And the workload is named, so the caller can say why it is not progressing
+    # rather than leaving it pending in silence.
+    assert exhausted.acquisition_exhausted_workload_ids == frozenset({workload.id})
+
+
+def test_one_healthy_alternate_keeps_the_workload_launching() -> None:
+    """The bound is per pool, not per workload: another zone is still tried."""
+
+    cold = _shape_pool("research/zone-a")
+    warm = _shape_pool("research/zone-b")
+    workload = _pending_workload(alternates="research/zone-b")
+
+    simulation = CapacitySimulation.build(
+        (cold, warm),
+        (_failing_cell(cold, "cell-1", consecutive_failures=MAX_CONSECUTIVE_ACQUISITION_FAILURES),),
+        (workload,),
+        (),
+        utcnow(),
+    )
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset()
+    assert len(simulation.cells) == 1
+    assert simulation.pool_by_cell_id[simulation.cells[0].id] == warm.id

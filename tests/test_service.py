@@ -1666,3 +1666,36 @@ async def test_a_shape_served_by_two_zones_carries_them_as_alternates() -> None:
     labels = workload.spec.required_labels
     assert labels["eyvan_pool"] == "research/east", "the primary must be deterministic"
     assert labels[POOL_ALTERNATES_LABEL] == "research/west"
+
+
+@pytest.mark.asyncio
+async def test_re_applying_an_unchanged_fleet_does_not_invalidate_its_capacity() -> None:
+    """Applying the same YAML twice must not throw away capacity in flight.
+
+    Every apply bumped every pool's generation, and the generation is what cells
+    are fenced against -- so a second apply of an identical fleet made every cell
+    stale, drained it and launched a replacement, including requests the provider
+    had not answered yet. Twenty cells accumulated in one zone across nineteen
+    hours that way, each granted and released without ever becoming READY, while
+    the workload sat pending.
+
+    Bringing a drained fleet back is still a change, and still bumps, because
+    that is what re-enables its pools.
+    """
+
+    service = ControlPlaneService(InMemoryRepository())
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pools = (_capacity_pool(pool_id="research/v5p-16", node_type="v5p-16"),)
+
+    first, _ = await service.apply_fleet(fleet_admin, "research-fleet", pools, idempotency_key="apply-1")
+    # A distinct key, which is what a second `eyvan up` sends: idempotency does
+    # not cover this, so the no-op has to be decided from the declaration.
+    second, _ = await service.apply_fleet(fleet_admin, "research-fleet", pools, idempotency_key="apply-2")
+
+    assert [pool.generation for pool in first] == [pool.generation for pool in second], (
+        "an unchanged apply bumped the generation, which invalidates every cell of the pool"
+    )
+
+    changed = (pools[0].model_copy(update={"max_cells": pools[0].max_cells + 1}),)
+    third, _ = await service.apply_fleet(fleet_admin, "research-fleet", changed, idempotency_key="apply-3")
+    assert third[0].generation > second[0].generation, "a real change must still bump"

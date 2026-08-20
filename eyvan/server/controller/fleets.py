@@ -399,6 +399,7 @@ class _ControllerFleets:
         planner = CapacityPlanner(pool_records, cells_by_pool, now)
         plans = planner.plan(demand_by_pool)
         await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)
+        await self._record_acquisition_exhausted(tuple(workloads), simulation.acquisition_exhausted_workload_ids)
 
         # Kueue's own view of the cluster, read once per Kubernetes pool. Taken
         # here on purpose: every transaction above is closed and the launch loop

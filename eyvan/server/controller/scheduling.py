@@ -33,6 +33,7 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.controller._support import (
+    _ACQUISITION_EXHAUSTED_SCHEDULING_REASON,
     _SHARED_TPU_QUOTA_SCHEDULING_REASON,
     _api_resources,
     _PreemptionVictim,
@@ -356,6 +357,57 @@ class _ControllerScheduling:
             cell.state is CellState.REGISTERING
             for cell in await transaction.list_cells_for_autoscale_request(workload.id)
         )
+
+    async def _record_acquisition_exhausted(
+        self,
+        workloads: tuple[WorkloadRecord, ...],
+        exhausted_workload_ids: frozenset[str],
+    ) -> None:
+        """Say once, durably, that every zone a workload accepts stopped granting.
+
+        Without this the workload stays PENDING with no reason while the
+        autoscaler asks the same zone again each time belief decays -- twenty
+        cells over nineteen hours, in the case that prompted it. A pending job
+        that will not progress has to say so; retrying silently forever is
+        indistinguishable from working.
+
+        Cleared the moment a pool grants again, because the bound is on
+        consecutive failures and one success ends the run.
+        """
+
+        pending = tuple(sorted({workload.id for workload in workloads if workload.state is WorkloadState.PENDING}))
+        if not pending:
+            return
+        async with self.repository.transaction() as transaction:
+            for workload_id in pending:
+                workload = await transaction.get_workload(workload_id)
+                if workload is None or workload.state is not WorkloadState.PENDING:
+                    continue
+                exhausted = workload.id in exhausted_workload_ids
+                already = workload.autoscale_block_reason is AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED
+                if exhausted and not already:
+                    await transaction.put_workload(
+                        workload.model_copy(
+                            update={
+                                "autoscale_block_reason": AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED,
+                                "scheduling_reason": _ACQUISITION_EXHAUSTED_SCHEDULING_REASON,
+                                "updated_at": utcnow(),
+                            }
+                        )
+                    )
+                elif already and not exhausted:
+                    reason = workload.scheduling_reason
+                    await transaction.put_workload(
+                        workload.model_copy(
+                            update={
+                                "autoscale_block_reason": None,
+                                "scheduling_reason": (
+                                    None if reason == _ACQUISITION_EXHAUSTED_SCHEDULING_REASON else reason
+                                ),
+                                "updated_at": utcnow(),
+                            }
+                        )
+                    )
 
     async def _record_autoscale_quota_blocks(
         self,

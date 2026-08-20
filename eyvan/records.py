@@ -506,6 +506,14 @@ class AutoscaleBlockReason(StrEnum):
 
     SHARED_TPU_QUOTA = "shared_tpu_quota"
     QUEUE_ADMISSION_DENIED = "queue_admission_denied"
+    #: Every pool this workload accepts has failed to acquire capacity too many
+    #: times in a row. Without a terminal state the autoscaler asks the same zone
+    #: again every time the belief cooldown expires -- observed producing twenty
+    #: cells for one workload over nineteen hours, one an hour, because
+    #: ``max_backoff_s`` caps the cooldown at an hour and nothing counted the
+    #: attempts. Retrying forever is indistinguishable from working, so the
+    #: workload is told instead.
+    CAPACITY_ACQUISITION_EXHAUSTED = "capacity_acquisition_exhausted"
 
 
 class CellState(StrEnum):

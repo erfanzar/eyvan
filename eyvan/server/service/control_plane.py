@@ -606,6 +606,28 @@ def _explain_from_scheduling_result(workload: WorkloadRecord, result: Scheduling
 STUCK_CANCEL_AFTER_S = 900.0
 
 
+def _pool_declaration(pool: CapacityPoolRecord) -> JsonObject:
+    """Return only what a fleet config declares about one pool.
+
+    Generation, timestamps and ``initialized_at`` are the plane's bookkeeping,
+    not the operator's declaration, so two applies of the same YAML must compare
+    equal through this even though the stored records differ.
+    """
+
+    return tp.cast(
+        "JsonObject",
+        pool.model_copy(
+            update={
+                "generation": 1,
+                "created_at": datetime.min,
+                "updated_at": datetime.min,
+                "initialized_at": None,
+                "enabled": True,
+            }
+        ).model_dump(mode="json"),
+    )
+
+
 class ControlPlaneService:
     """Own authorization, lifecycle validation, idempotency, and audit atomicity."""
 
@@ -3942,6 +3964,20 @@ class ControlPlaneService:
             supplied_ids = {pool.id for pool in pools}
             for pool in pools:
                 previous = existing.get(pool.id)
+                # An apply that declares exactly what is already stored changes
+                # nothing and must bump nothing. The generation is what cells are
+                # fenced against, so bumping it invalidates every cell of the pool
+                # -- including requests still in flight at the provider, which are
+                # then drained and re-launched. Re-applying an unchanged fleet
+                # therefore threw away in-flight capacity and asked for it again:
+                # twenty cells in one zone across nineteen hours, one per apply,
+                # each granted and released without ever becoming READY.
+                #
+                # `enabled` is normalised to True on both sides, so re-applying a
+                # drained fleet still counts as a change and still bumps, which is
+                # what brings its pools back.
+                if previous is not None and _pool_declaration(previous) == _pool_declaration(pool):
+                    continue
                 await tx.put_capacity_pool(
                     pool.model_copy(
                         update={
