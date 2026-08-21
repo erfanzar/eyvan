@@ -55,6 +55,7 @@ def _fleet_document(
     zone: str,
     pools: JsonObject,
     runtime_python: str | None = None,
+    runtime_init_commands: tuple[str, ...] = (),
 ) -> JsonObject:
     """Return the common public fleet envelope shared by profile and zone forms.
 
@@ -78,8 +79,13 @@ def _fleet_document(
         "executor": "eyvan-native",
         "pools": pools,
     }
+    runtime: JsonObject = {}
     if runtime_python is not None:
-        document["runtime"] = {"python": runtime_python}
+        runtime["python"] = runtime_python
+    if runtime_init_commands:
+        runtime["init_commands"] = list(runtime_init_commands)
+    if runtime:
+        document["runtime"] = runtime
     return document
 
 
@@ -138,6 +144,7 @@ def generate_autoscale_config(
         zone=request.zone,
         pools=pools,
         runtime_python=request.runtime_python,
+        runtime_init_commands=request.runtime_init_commands,
     )
     return GeneratedAutoscaleConfig(
         config=validate_generated_fleet(document),
@@ -251,6 +258,7 @@ def generate_zone_autoscale_config(
                     max_workers=request.max_workers,
                     bootstrap_egress=request.bootstrap_egress,
                     runtime_python=request.runtime_python,
+                    runtime_init_commands=request.runtime_init_commands,
                 ),
                 quota=profile_quota,
             )
@@ -276,6 +284,7 @@ def generate_zone_autoscale_config(
         zone=request.zone,
         pools=pools,
         runtime_python=request.runtime_python,
+        runtime_init_commands=request.runtime_init_commands,
     )
     return GeneratedZoneAutoscaleConfig(
         config=validate_generated_fleet(document),

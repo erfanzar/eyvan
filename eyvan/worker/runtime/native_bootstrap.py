@@ -369,7 +369,12 @@ def build_native_worker_startup_script(
             "    exit 1",
             "  fi",
             f"  rm -rf {venv_dir}",
-            f"  uv venv --python {quoted_python} {venv_dir}",
+            # --seed, because the very next block recreates any environment
+            # whose `python -m pip` does not answer -- and a uv venv has no pip
+            # unless asked. Without it this builds 3.13 and is immediately
+            # replaced by one on the image's own interpreter, which is the
+            # failure it exists to prevent.
+            f"  uv venv --seed --python {quoted_python} {venv_dir}",
             "fi",
         )
     runtime_dir = "/run/eyvan-native"

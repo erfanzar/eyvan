@@ -585,7 +585,15 @@ def test_a_declared_python_builds_the_worker_environment_with_uv() -> None:
         runtime_python="3.13",
     )
 
-    assert "uv venv --python 3.13 /opt/eyvan-native/venv" in script
+    assert "uv venv --seed --python 3.13 /opt/eyvan-native/venv" in script
+    # --seed is load-bearing, not tidiness. The block immediately after this one
+    # recreates any environment whose `python -m pip` does not answer, and a uv
+    # venv has no pip unless asked -- so an unseeded 3.13 environment is built
+    # and then instantly replaced by one on the image's own interpreter, which
+    # is precisely the failure being prevented.
+    seeded = script.index("uv venv --seed --python 3.13")
+    recreate = script.index("-m pip --version >/dev/null 2>&1; then", seeded)
+    assert seeded < recreate, "the recreate guard must come after the declared build"
     # The declared environment must not inherit the image's interpreter's
     # packages; that is the bug, not a convenience.
     assert "uv venv --python 3.13 --system-site-packages" not in script
