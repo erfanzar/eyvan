@@ -31,6 +31,7 @@ from eyvan.sdk.client.jobs import (
 )
 from eyvan.sdk.client.sync import EyvanClient
 from eyvan.sdk.client.transport import EyvanHTTPError, EyvanUnavailableError
+from eyvan.sdk.follow import EXIT_DETACHED
 from eyvan.sdk.job_receipt import (
     JobLifecycleState,
     JobLifecycleUpdate,
@@ -329,10 +330,22 @@ class _SdkJobBackend:
         return self._completion(workload)
 
     def wait_with_progress(self, job_id: str, timeout: float | None = None) -> JobCompletion:
-        """Wait for a callable workload while rendering durable lifecycle transitions."""
+        """Wait for a callable workload while rendering durable lifecycle transitions.
+
+        Ctrl-C detaches this client; it does not cancel. The workload is durable
+        and nothing here owns it, so a client that cancelled on Ctrl-C would
+        destroy a training run because somebody wanted their terminal back. The
+        follower has always said this; a callable raised a KeyboardInterrupt
+        traceback through ``time.sleep`` instead, which reads exactly like the
+        job died with it.
+        """
 
         renderer = _CallableProgressRenderer(self.client, self._terminal_output, self._queue_admission_recorder)
-        workload = self.client.wait_workload(job_id, timeout=timeout, on_update=renderer)
+        try:
+            workload = self.client.wait_workload(job_id, timeout=timeout, on_update=renderer)
+        except KeyboardInterrupt:
+            self._terminal_output.detached(job_id)
+            raise SystemExit(EXIT_DETACHED) from None
         if self._queue_admission_recorder is not None:
             self._queue_admission_recorder.record_workload(workload)
         return self._completion(workload)

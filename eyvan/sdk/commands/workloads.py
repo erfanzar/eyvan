@@ -57,6 +57,14 @@ from eyvan.server.service.batch import DEFAULT_MAX_FAN_OUT
 WorkloadAction = tp.Literal["cancel", "checkpoint", "retry"]
 _WORKLOAD_ACTIONS: tuple[WorkloadAction, ...] = ("cancel", "checkpoint", "retry")
 
+#: What each mutation did, in the past tense, because it has already happened by
+#: the time this is printed.
+_ACTION_HEADLINES: dict[str, str] = {
+    "cancel": "Cancelled",
+    "checkpoint": "Asked for a checkpoint of",
+    "retry": "Retrying",
+}
+
 
 def _requirements(declared: tp.Sequence[str], path: Path | None) -> tuple[str, ...]:
     """Combine --with packages with a requirements file, read on this machine.
@@ -579,15 +587,33 @@ class WorkloadCommandService:
             lines.append(f"  queue       admission denied for {explanation.queue_admission_denial}")
         click.echo("\n".join(lines), file=stream)
 
-    def mutate(self, workload_id: str, action: WorkloadAction, idempotency_key: str | None) -> None:
-        """Apply one workload lifecycle mutation."""
+    def mutate(
+        self,
+        workload_id: str,
+        action: WorkloadAction,
+        idempotency_key: str | None,
+        *,
+        as_json: bool = False,
+    ) -> None:
+        """Apply one workload lifecycle mutation and say what it did.
+
+        Cancelling printed the sixty-key record. Somebody who has just cancelled
+        a job wants to know it is cancelled; the document is for something
+        parsing, and stays behind ``--json``.
+        """
 
         response = self.session.client.request(
             "POST",
             f"/api/v1/workloads/{workload_id}/{action}",
             headers={"Idempotency-Key": self.keys.create(action, idempotency_key)},
         )
-        self.renderer.emit(response)
+        emit_result(
+            self.renderer,
+            response,
+            f"{_ACTION_HEADLINES[action]} {workload_id}",
+            as_json=as_json,
+            fields=("state", "attempt", "failure_reason"),
+        )
 
     def _scoped_workloads(self, scope: WorkloadScope) -> tuple[WorkloadRecord, ...]:
         """Read every workload this scope can see."""
@@ -1674,6 +1700,7 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
         default=False,
         help="Do not ask before applying this to more than one workload.",
     )
+    @click.option("--json", "as_json", is_flag=True)
     @click.pass_obj
     def command(
         session: CliSession,
@@ -1683,6 +1710,7 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
         project_id: str | None,
         prefix: str | None,
         confirmed: bool,
+        as_json: bool,
     ) -> None:
         service = WorkloadCommandService(session)
         if prefix is not None:
@@ -1693,7 +1721,12 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
             return
         if workload_id is None:
             raise click.UsageError("give a workload id, or --prefix to match several")
-        service.mutate(service.resolve(workload_id, org_id=org_id, project_id=project_id), action, idempotency_key)
+        service.mutate(
+            service.resolve(workload_id, org_id=org_id, project_id=project_id),
+            action,
+            idempotency_key,
+            as_json=as_json,
+        )
 
     command.help = (
         f"{action.capitalize()} one workload, or every workload matching --prefix.\n\n"
