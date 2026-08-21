@@ -289,7 +289,13 @@ class GcsBackend:
         # fleet-state object: 5.42s of gcloud per read against 1.87s over the
         # API. ``None`` builds the default reader; pass ``False`` to force the
         # subprocess path.
-        self._rest: GcsRestObject | None = GcsRestObject(uri) if rest is None else (rest or None)
+        # Only when this backend is using the real gcloud transport. A caller
+        # that injects a runner is saying "drive the object through this", and
+        # silently preferring an API path would bypass it -- which is what made
+        # tests that supply a fake runner reach the network, mint a real token,
+        # and fail or pass depending on suite order.
+        default_rest = GcsRestObject(uri) if runner is _gcloud else None
+        self._rest: GcsRestObject | None = default_rest if rest is None else (rest or None)
 
     @property
     def mutation_scope(self) -> str:

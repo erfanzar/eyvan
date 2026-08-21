@@ -695,3 +695,39 @@ def test_a_hand_written_zero_is_still_warned_about(tmp_path) -> None:
 
     with pytest.warns(UserWarning, match="max_workers: 0 means unbounded"):
         EyvanFleetConfig.model_validate(document)
+
+
+def test_a_declared_worker_python_reaches_the_generated_fleet() -> None:
+    """The refusal that could not fire from a generated fleet.
+
+    ``submit_pool_callable`` refuses a callable pickled on an interpreter the
+    pool does not run, and has since a live multislice v5p-16 provisioned two
+    slices, dispatched to four ranks, and had every rank die on it. The check
+    reads ``pool.runtime.python``, and nothing in autoscale generation ever wrote
+    that field -- so on a generated fleet the mismatch was still discovered on
+    the accelerator, at the cost of a full provisioning cycle. It happened again
+    on 2026-08-21: Python 3.13 on the laptop, 3.11 in the image.
+
+    Declared, it reaches the fleet document. Undeclared, the document is exactly
+    what it was, so a fleet that says nothing behaves as it did.
+    """
+
+    from eyvan.capacity.autoscale.compiler import _fleet_document
+
+    declared = _fleet_document(name="f", project="p", zone="us-central2-b", pools={}, runtime_python="3.11")
+    assert declared["runtime"] == {"python": "3.11"}
+
+    silent = _fleet_document(name="f", project="p", zone="us-central2-b", pools={})
+    assert "runtime" not in silent
+
+
+def test_defaults_carry_the_worker_python_across_a_save_and_load() -> None:
+    """An operator sets this once; it has to survive the file."""
+
+    from eyvan.capacity.autoscale.models import AutoscaleDefaults
+
+    declared = AutoscaleDefaults(project="p", runtime_python="3.11")
+    assert AutoscaleDefaults.from_document(declared.as_document()).runtime_python == "3.11"
+    # Absent rather than null when unset: a fleet that declares nothing must
+    # generate the document it always generated.
+    assert "runtime_python" not in AutoscaleDefaults(project="p").as_document()

@@ -54,8 +54,16 @@ def _fleet_document(
     project: str,
     zone: str,
     pools: JsonObject,
+    runtime_python: str | None = None,
 ) -> JsonObject:
-    """Return the common public fleet envelope shared by profile and zone forms."""
+    """Return the common public fleet envelope shared by profile and zone forms.
+
+    ``runtime_python`` is emitted only when declared. The control plane refuses a
+    callable pickled on a different interpreter before provisioning, and that
+    check reads this field -- omitting it entirely keeps a fleet that declares
+    nothing behaving exactly as it did, discovering the mismatch on the
+    accelerator instead.
+    """
 
     provider: JsonObject = {
         "type": "gcp",
@@ -70,6 +78,8 @@ def _fleet_document(
         "executor": "eyvan-native",
         "pools": pools,
     }
+    if runtime_python is not None:
+        document["runtime"] = {"python": runtime_python}
     return document
 
 
@@ -127,6 +137,7 @@ def generate_autoscale_config(
         project=request.project,
         zone=request.zone,
         pools=pools,
+        runtime_python=request.runtime_python,
     )
     return GeneratedAutoscaleConfig(
         config=validate_generated_fleet(document),
@@ -239,6 +250,7 @@ def generate_zone_autoscale_config(
                     min_workers=request.min_workers,
                     max_workers=request.max_workers,
                     bootstrap_egress=request.bootstrap_egress,
+                    runtime_python=request.runtime_python,
                 ),
                 quota=profile_quota,
             )
@@ -263,6 +275,7 @@ def generate_zone_autoscale_config(
         project=request.project,
         zone=request.zone,
         pools=pools,
+        runtime_python=request.runtime_python,
     )
     return GeneratedZoneAutoscaleConfig(
         config=validate_generated_fleet(document),

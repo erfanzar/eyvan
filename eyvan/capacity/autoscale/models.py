@@ -181,6 +181,13 @@ class AutoscaleDefaults:
     project: str | None = None
     fleet_prefix: str = "eyvan"
     bootstrap_egress: str = "public-internet"
+    #: The Python a worker on these images runs, as ``major.minor``. Declared so
+    #: the control plane can refuse a callable pickled on a different
+    #: interpreter *before* provisioning: that check has existed since a live
+    #: multislice v5p-16 died on it in every rank, and it was unreachable from a
+    #: generated fleet because nothing here filled the field in. Left unset the
+    #: behaviour is unchanged and the mismatch is discovered on the accelerator.
+    runtime_python: str | None = None
     min_workers: int = 0
     max_workers: int = 0
 
@@ -188,6 +195,7 @@ class AutoscaleDefaults:
         object.__setattr__(self, "project", _optional_trimmed(self.project, "project"))
         fleet_prefix = _optional_trimmed(self.fleet_prefix, "fleet_prefix")
         bootstrap_egress = _optional_trimmed(self.bootstrap_egress, "bootstrap_egress")
+        object.__setattr__(self, "runtime_python", _optional_trimmed(self.runtime_python, "runtime_python"))
         if fleet_prefix is None:
             raise ValueError("fleet_prefix must be a non-empty trimmed string")
         if bootstrap_egress is None:
@@ -241,6 +249,7 @@ class AutoscaleDefaults:
             "bootstrap_egress": self.bootstrap_egress,
             "min_workers": self.min_workers,
             "max_workers": self.max_workers,
+            **({} if self.runtime_python is None else {"runtime_python": self.runtime_python}),
         }
 
     @classmethod
@@ -260,6 +269,7 @@ class AutoscaleDefaults:
             "bootstrap_egress",
             "min_workers",
             "max_workers",
+            "runtime_python",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -274,12 +284,14 @@ class AutoscaleDefaults:
         )
         min_workers = _document_integer(value.get("min_workers", 0), "min_workers")
         max_workers = _document_integer(value.get("max_workers", 0), "max_workers")
+        runtime_python = _document_optional_string(value.get("runtime_python"), "runtime_python")
         return cls(
             project=project,
             fleet_prefix=fleet_prefix,
             bootstrap_egress=bootstrap_egress,
             min_workers=min_workers,
             max_workers=max_workers,
+            runtime_python=runtime_python,
         )
 
 
@@ -433,6 +445,13 @@ class AutoscaleRequest:
     min_workers: int = 0
     max_workers: int = 0
     bootstrap_egress: str = "public-internet"
+    #: The Python a worker on these images runs, as ``major.minor``. Declared so
+    #: the control plane can refuse a callable pickled on a different
+    #: interpreter *before* provisioning: that check has existed since a live
+    #: multislice v5p-16 died on it in every rank, and it was unreachable from a
+    #: generated fleet because nothing here filled the field in. Left unset the
+    #: behaviour is unchanged and the mismatch is discovered on the accelerator.
+    runtime_python: str | None = None
 
     def __post_init__(self) -> None:
         validate_gcp_project_id(self.project)
@@ -470,6 +489,13 @@ class AutoscaleZoneRequest:
     min_workers: int = 0
     max_workers: int = 0
     bootstrap_egress: str = "public-internet"
+    #: The Python a worker on these images runs, as ``major.minor``. Declared so
+    #: the control plane can refuse a callable pickled on a different
+    #: interpreter *before* provisioning: that check has existed since a live
+    #: multislice v5p-16 died on it in every rank, and it was unreachable from a
+    #: generated fleet because nothing here filled the field in. Left unset the
+    #: behaviour is unchanged and the mismatch is discovered on the accelerator.
+    runtime_python: str | None = None
 
     def __post_init__(self) -> None:
         validate_gcp_project_id(self.project)

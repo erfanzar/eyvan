@@ -227,6 +227,7 @@ class AutoscaleGenerationService:
                         min_workers=defaults.min_workers,
                         max_workers=defaults.max_workers,
                         bootstrap_egress=defaults.bootstrap_egress,
+                        runtime_python=defaults.runtime_python,
                     ),
                     # The catalog is quota-backed even without a CLI-specific
                     # mode, so each generated fleet retains the finite shared
