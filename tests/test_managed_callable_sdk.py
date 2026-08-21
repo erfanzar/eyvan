@@ -251,6 +251,12 @@ def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, mo
                 200,
                 json=stored.model_copy(update={"state": WorkloadState.SUCCEEDED}).model_dump(mode="json"),
             )
+        if request.method == "GET" and request.url.path.startswith("/api/v1/fleets/"):
+            # `init` checks whether the fleet it was given is serving, so a job
+            # can be submitted without `eyvan up` first. Answering "already
+            # serving" leaves these tests exercising submission, which is what
+            # they are about.
+            return httpx.Response(200, json={"name": "research", "pools": [{"id": "p", "enabled": True}]})
         if request.method == "GET" and request.url.path.startswith("/api/v1/artifacts/results/"):
             return httpx.Response(200, content=encoded_result)
         raise AssertionError((request.method, request.url))
@@ -280,16 +286,28 @@ def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, mo
         "  cancel  eyvan workload cancel wl-managed-sdk",
     ]
     assert job.result() == 9
-    upload_request = requests[0]
-    assert upload_request.method == "PUT"
+    # Found by method rather than by position: `init` now reads the fleet
+    # first, to bring it up if it is not serving, so the upload is no longer
+    # request zero. The assertion is that the callable is uploaded at all, and
+    # as a PUT -- which is what the positional check was really saying.
+    uploads = [item for item in requests if item.method == "PUT"]
+    assert len(uploads) == 1, "the callable artifact should be uploaded exactly once"
+    assert uploads[0].url.path.startswith("/api/v1/artifacts/")
     assert client_kwargs[0]["headers"] == {
         CLIENT_VERSION_HEADER: client_version(),
         "X-Eyvan-Org": "acme",
         "X-Eyvan-Project": "models",
-        "X-Eyvan-Roles": "operator",
+        # fleet_admin, not operator: no token, no explicit user, no explicit
+        # role, and a loopback plane -- the same rule `eyvan` itself applies,
+        # and what lets `init` bring up a fleet that is not serving instead of
+        # sending the operator to `eyvan up`. Naming any of those three keeps
+        # the identity named; a remote plane is never elevated.
+        "X-Eyvan-Roles": "fleet_admin",
         "X-Eyvan-User": "alice",
     }
-    submitted = json.loads(requests[1].content)
+    # By path, not by position: `init` reads the fleet before anything is
+    # uploaded or submitted, so the submission is no longer request one.
+    submitted = json.loads(next(item for item in requests if item.url.path.endswith("/callables")).content)
     assert submitted["accelerator_type"] == "v5p-512"
     assert submitted["execution"]["artifact_uri"].startswith("eyvan://callables/")
     assert submitted["execution"]["result_uri"].startswith("eyvan://results/")
@@ -343,6 +361,11 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
                 }
             )
             return httpx.Response(200, json=denied.model_dump(mode="json"))
+        if request.method == "GET" and request.url.path.startswith("/api/v1/fleets/"):
+            # `init` reads the fleet so it can bring one up that is not serving,
+            # which is what makes submitting the whole workflow. Answering
+            # "already serving" keeps these tests about submission.
+            return httpx.Response(200, json={"name": "research", "pools": [{"id": "p", "enabled": True}]})
         raise AssertionError((request.method, request.url))
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8080")
@@ -396,6 +419,11 @@ def test_decorator_job_result_reports_control_plane_unavailability_without_httpx
             return httpx.Response(201, json=workload.model_dump(mode="json"))
         if request.method == "GET" and request.url.path == "/api/v1/workloads/wl-lost-control-plane":
             raise httpx.ConnectError("connection refused", request=request)
+        if request.method == "GET" and request.url.path.startswith("/api/v1/fleets/"):
+            # `init` reads the fleet so it can bring one up that is not serving,
+            # which is what makes submitting the whole workflow. Answering
+            # "already serving" keeps these tests about submission.
+            return httpx.Response(200, json={"name": "research", "pools": [{"id": "p", "enabled": True}]})
         raise AssertionError((request.method, request.url))
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8080")
@@ -454,6 +482,11 @@ def test_decorator_reports_actionable_error_when_selected_fleet_has_no_matching_
                     "future_top_level_field": True,
                 },
             )
+        if request.method == "GET" and request.url.path.startswith("/api/v1/fleets/"):
+            # `init` reads the fleet so it can bring one up that is not serving,
+            # which is what makes submitting the whole workflow. Answering
+            # "already serving" keeps these tests about submission.
+            return httpx.Response(200, json={"name": "research", "pools": [{"id": "p", "enabled": True}]})
         raise AssertionError((request.method, request.url))
 
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")

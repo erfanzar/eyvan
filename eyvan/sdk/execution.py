@@ -17,7 +17,9 @@ import typing as tp
 import uuid
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from eyvan._internal.json_types import model_json
 from eyvan._internal.workspace import build_workspace
 from eyvan.artifacts import (
     ArtifactStore,
@@ -48,7 +50,7 @@ from eyvan.sdk.client.jobs import (
     TpuConfig,
     reject_remote_callable_signing_key,
 )
-from eyvan.sdk.client.transport import EyvanUnavailableError
+from eyvan.sdk.client.transport import EyvanHTTPError, EyvanUnavailableError
 from eyvan.sdk.contexts import (
     DEFAULT_BASE_URL,
     DEFAULT_ORG_ID,
@@ -128,6 +130,60 @@ def _prepared_gcp_runtime_profile(
     if profile is None:
         return None
     return ensure_gcp_native_runtime(endpoint).profile
+
+
+def _ensure_fleet_applied(client: tp.Any, fleet: str | None, cache_dir: Path | None) -> None:
+    """Bring a named fleet up if it is not already accepting work.
+
+    Submitting is meant to be the whole workflow. Without this the operator runs
+    ``eyvan autoscale generate``, then ``eyvan up --select``, then edits their
+    script, and any one of those forgotten produces a failure naming none of
+    them -- a placement refusal, or a callable rejected for an interpreter the
+    stale config still declares. Ray is ``ray job submit``; a second command
+    here is a defect, not a prerequisite.
+
+    Only ever *adds* capacity a generated config already describes. A fleet
+    already serving is left exactly as it is, and one with no cached config is
+    left to the placement error, which names what does exist.
+
+    Failures are narrow on purpose. An earlier version caught every exception
+    around the read, which silently swallowed an ``AttributeError`` from calling
+    a method the client does not have -- so this did nothing at all and said so
+    nowhere.
+    """
+
+    if not fleet:
+        return
+    transport = getattr(client, "_transport", None)
+    if transport is None:
+        return
+    try:
+        response = transport.request_checked("GET", f"/api/v1/fleets/{fleet}")
+        applied = response.json()
+    except EyvanHTTPError:
+        # No such fleet, or this caller may not read it. Submission reports both
+        # far better than a setup helper can.
+        return
+    pools = applied.get("pools") if isinstance(applied, dict) else None
+    if not isinstance(pools, list):
+        return
+    if any(isinstance(pool, dict) and pool.get("enabled") for pool in pools):
+        return
+
+    from eyvan.capacity.autoscale.cache import GeneratedAutoscaleCache
+    from eyvan.sdk.commands.fleets import FleetCommandService
+
+    root = cache_dir if cache_dir is not None else Path("~/.eyvan/autoscale").expanduser()
+    cached = GeneratedAutoscaleCache(root).get(fleet)
+    if cached is None:
+        return
+    request = FleetCommandService.apply_request(cached.config)
+    transport.mutate(
+        "PUT",
+        f"/api/v1/fleets/{fleet}",
+        json=model_json(request),
+        idempotency_key=f"init:{fleet}:{uuid.uuid4().hex}",
+    )
 
 
 def _validate_native_gcp_artifact_override(
@@ -281,7 +337,26 @@ def init(
     if requires_default_client:
         from eyvan.sdk.client.sync import EyvanClient
 
-        configured_role = environment.get("EYVAN_ROLE", "operator")
+        # The same rule `eyvan` itself applies, and for the same reason: on a
+        # loopback development plane with no token and no explicit user, the
+        # person submitting owns the plane. Running as `operator` there means
+        # init cannot read its own fleet -- 403 lacks manage_fleet -- so it
+        # could not bring one up, and the operator was sent to `eyvan up`
+        # instead. Anything that names a token, a user, or a role keeps exactly
+        # the identity it named, and a remote plane is untouched.
+        default_role = (
+            "fleet_admin"
+            if (
+                token is None
+                and dev_user is None
+                and environment.get("EYVAN_TOKEN") is None
+                and environment.get("EYVAN_DEV_USER") is None
+                and environment.get("EYVAN_ROLE") is None
+                and endpoint.is_loopback
+            )
+            else "operator"
+        )
+        configured_role = environment.get("EYVAN_ROLE", default_role)
         identity = resolve_control_plane_identity(
             endpoint,
             # Read from this node's own installer-written credential when the
@@ -328,6 +403,15 @@ def init(
             queue_admission_cache=AutoscaleConfigCache(
                 active_context.autoscale_cache_dir if active_context is not None else None
             ),
+        )
+    # Bring the named fleet up before anything is submitted to it. Doing it here
+    # rather than leaving it to the operator is the difference between one
+    # command and four, and a fleet that is already serving is untouched.
+    if client is not None and endpoint.is_loopback and in_job_context(environment) is None:
+        _ensure_fleet_applied(
+            client,
+            configured_fleet,
+            active_context.autoscale_cache_dir if active_context is not None else None,
         )
     context = ExecutionContext(
         fleet=configured_fleet,

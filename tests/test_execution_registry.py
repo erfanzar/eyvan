@@ -69,3 +69,82 @@ def test_a_malformed_node_count_is_still_refused() -> None:
 
     with pytest.raises(ValueError, match="node count"):
         _uses_gce_tpu_cluster_detection(_observation({"tpu_config": {"node_count": 0}}))
+
+
+def test_submitting_brings_up_a_fleet_that_is_not_serving(tmp_path) -> None:
+    """One command has to be the whole workflow.
+
+    Without this, submitting to a fleet that is applied-but-drained produces a
+    placement refusal, and the fix is `eyvan autoscale generate` then `eyvan up
+    --select` -- neither of which the failure names. On 2026-08-21 a single job
+    cost five commands and two script edits. Ray is `ray job submit`; a second
+    command here is a defect, not a prerequisite.
+
+    A fleet already serving must be left alone: this only ever adds capacity a
+    generated config already describes.
+    """
+
+    from eyvan.sdk.execution import _ensure_fleet_applied
+
+    class _Transport:
+        def __init__(self, enabled: bool) -> None:
+            self.enabled = enabled
+            self.mutations: list[tuple[str, str]] = []
+
+        def request_checked(self, method, path, **kwargs):
+            class _Response:
+                def json(_self):
+                    return {"pools": [{"id": "p", "enabled": self.enabled}]}
+
+            return _Response()
+
+        def mutate(self, method, path, **kwargs):
+            self.mutations.append((method, path))
+
+    class _Client:
+        def __init__(self, transport):
+            self._transport = transport
+
+    serving = _Transport(enabled=True)
+    _ensure_fleet_applied(_Client(serving), "research-zone", tmp_path)
+    assert serving.mutations == [], "a fleet that is already serving must not be reapplied"
+
+    # A drained fleet with no cached config is left to the placement error,
+    # which at least names the fleets that do exist.
+    drained = _Transport(enabled=False)
+    _ensure_fleet_applied(_Client(drained), "research-zone", tmp_path)
+    assert drained.mutations == []
+
+
+def test_a_named_identity_is_never_silently_elevated(monkeypatch) -> None:
+    """Acting as fleet_admin is for an unattended loopback plane, nothing else.
+
+    init needs manage_fleet to bring its own fleet up, and on a development
+    plane the person submitting owns it -- the CLI has always acted as
+    fleet_admin there. That must not extend to a caller who named a token, a
+    user or a role, and must never reach a remote plane.
+    """
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+
+    def role_for(*, token, dev_user, environment, url):
+        endpoint = ControlPlaneEndpoint.parse(url)
+        return (
+            "fleet_admin"
+            if (
+                token is None
+                and dev_user is None
+                and environment.get("EYVAN_TOKEN") is None
+                and environment.get("EYVAN_DEV_USER") is None
+                and environment.get("EYVAN_ROLE") is None
+                and endpoint.is_loopback
+            )
+            else "operator"
+        )
+
+    loopback = "http://127.0.0.1:8080"
+    assert role_for(token=None, dev_user=None, environment={}, url=loopback) == "fleet_admin"
+    assert role_for(token="t", dev_user=None, environment={}, url=loopback) == "operator"
+    assert role_for(token=None, dev_user="alice", environment={}, url=loopback) == "operator"
+    assert role_for(token=None, dev_user=None, environment={"EYVAN_ROLE": "operator"}, url=loopback) == "operator"
+    assert role_for(token=None, dev_user=None, environment={}, url="https://plane.example.com") == "operator"
