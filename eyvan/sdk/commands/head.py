@@ -501,11 +501,21 @@ class HeadSecrets:
     agent_shared_secret: str
     database_password: str
     bootstrap_token: str
+    #: Root credential every native worker's own bearer is derived from. Required
+    #: by the cell agent and by the GCP capacity driver whenever the executor is
+    #: ``eyvan-native``, which is every TPU fleet this command exists to serve.
+    native_worker_root_secret: str
 
     def __post_init__(self) -> None:
         """Refuse material too short to be worth generating."""
 
-        for name in ("metrics_token", "artifact_token_key", "agent_shared_secret", "bootstrap_token"):
+        for name in (
+            "metrics_token",
+            "artifact_token_key",
+            "agent_shared_secret",
+            "bootstrap_token",
+            "native_worker_root_secret",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or len(value) < 32:
                 raise ValueError(f"{name} must be at least 32 characters")
@@ -525,6 +535,7 @@ class HeadSecrets:
             agent_shared_secret=secrets.token_urlsafe(32),
             database_password=secrets.token_urlsafe(24),
             bootstrap_token=secrets.token_urlsafe(32),
+            native_worker_root_secret=secrets.token_urlsafe(32),
         )
 
     def __repr__(self) -> str:
@@ -532,7 +543,7 @@ class HeadSecrets:
 
         return (
             "HeadSecrets(metrics_token=***, artifact_token_key=***, agent_shared_secret=***, "
-            "database_password=***, bootstrap_token=***)"
+            "database_password=***, bootstrap_token=***, native_worker_root_secret=***)"
         )
 
     def values(self) -> tuple[str, ...]:
@@ -548,6 +559,7 @@ class HeadSecrets:
             self.agent_shared_secret,
             self.database_password,
             self.bootstrap_token,
+            self.native_worker_root_secret,
         )
 
     def database_url(self, spec: HeadSpec) -> str:
@@ -565,6 +577,13 @@ class HeadSecrets:
             "EYVAN_ARTIFACT_TOKEN_KEY": self.artifact_token_key,
             "EYVAN_DATABASE_URL": self.database_url(spec),
             "EYVAN_METRICS_TOKEN": self.metrics_token,
+            # Read by both units this file feeds. The cell agent refuses to start
+            # without it whenever the executor is eyvan-native, and the GCP
+            # capacity driver refuses to provision a TPU or Compute cell without
+            # it -- so a head that omitted it crash-looped its own agent and could
+            # never have created a cell. The Kubernetes manifests have always set
+            # it; only this one-command path did not.
+            "EYVAN_NATIVE_WORKER_ROOT_SECRET": self.native_worker_root_secret,
             "EYVAN_PUBLIC_URL": f"http://{address}:{spec.port}",
             "EYVAN_REPOSITORY_BACKEND": "postgres",
         }

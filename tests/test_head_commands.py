@@ -80,6 +80,7 @@ STUB_SECRETS = HeadSecrets(
     agent_shared_secret="agent-" + "g" * 32,
     database_password="database-" + "d" * 24,
     bootstrap_token="bootstrap-" + "b" * 32,
+    native_worker_root_secret="native-root-" + "n" * 32,
 )
 
 
@@ -870,6 +871,35 @@ def test_the_installer_carries_no_credential_and_does_not_require_uv() -> None:
     # index, and a real bootstrap died on "No matching distribution found".
     assert "--upgrade /opt/eyvan/wheels/*.whl" in script
     assert not any(line.rstrip().endswith(" eyvan") for line in script.splitlines() if "pip install" in line)
+
+
+def test_the_head_environment_carries_every_secret_its_own_units_require() -> None:
+    """Found on the first real head: the agent crash-looped on a secret nobody wrote.
+
+    `eyvan-head-agent.service` refuses to start without
+    `EYVAN_NATIVE_WORKER_ROOT_SECRET` whenever the executor is `eyvan-native` --
+    which is every TPU fleet this command exists to serve -- and the GCP capacity
+    driver refuses to provision a TPU or Compute cell without it too. So a head
+    built without it restarted its agent forever and could never have created a
+    cell, while `systemctl is-active` still answered "active" between restarts.
+
+    The Kubernetes manifests have always set it. Only this one-command path did
+    not, which is the same shape as every other setting a loopback development
+    plane supplies for free and a real head does not.
+    """
+
+    spec = _spec()
+    gcloud = FakeGcloud(spec=spec)
+
+    HeadProvisioner(spec, runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+
+    assert environment["EYVAN_NATIVE_WORKER_ROOT_SECRET"] == STUB_SECRETS.native_worker_root_secret
+    # Both units read this one file, so writing it once serves the agent and the
+    # server's capacity driver alike.
+    script = render_head_bootstrap_script(spec)
+    assert script.count(f"EnvironmentFile={HEAD_ENVIRONMENT_PATH}") == 2
 
 
 def test_the_installer_records_the_control_plane_this_node_serves() -> None:
