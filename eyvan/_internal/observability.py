@@ -79,15 +79,15 @@ class EyvanMetrics:
             ("org", "project", "kind"),
             registry=registry,
         )
-        #: How far each rank says it has got, as a fraction of its own declared
-        #: total. Only ``step``/``total`` becomes a series: the free-form metrics
-        #: a job reports alongside them are displayed and never exported, because
-        #: label names chosen by user code are unbounded cardinality and one
-        #: mistyped metric name would be a self-inflicted outage.
-        #:
-        #: ``workload`` is unbounded over the fleet's lifetime, so the export
-        #: phase drops the series of any workload that has reached a terminal
-        #: state. Without that this family would grow forever.
+        # How far each rank says it has got, as a fraction of its own declared
+        # total. Only ``step``/``total`` becomes a series: the free-form metrics
+        # a job reports alongside them are displayed and never exported, because
+        # label names chosen by user code are unbounded cardinality and one
+        # mistyped metric name would be a self-inflicted outage.
+        #
+        # ``workload`` is unbounded over the fleet's lifetime, so the export
+        # phase drops the series of any workload that has reached a terminal
+        # state. Without that this family would grow forever.
         self.workload_progress = Gauge(
             "eyvan_workload_progress_fraction",
             "Self-reported completion fraction by workload and rank.",

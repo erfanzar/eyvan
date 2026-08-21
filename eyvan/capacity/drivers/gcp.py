@@ -600,6 +600,7 @@ class GcpTpuCapacityDriver:
             runtime_env=runtime.env,
             runtime_container=runtime.container,
             container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+            runtime_python=runtime.python,
         )
 
         def persist(current: FleetCellRecord) -> None:
@@ -856,6 +857,7 @@ class GcpTpuCapacityDriver:
             runtime_env=runtime.env,
             runtime_container=runtime.container,
             container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+            runtime_python=runtime.python,
         )
 
         def persist(current: FleetCellRecord) -> None:
@@ -989,6 +991,7 @@ class GcpTpuCapacityDriver:
         runtime_env: tp.Mapping[str, str] | None = None,
         runtime_container: NativeContainerConfig | None = None,
         container_artifact_mounts: tp.Sequence[str] = (),
+        runtime_python: str | None = None,
     ) -> NativeWorkerEndpointMode:
         """Inject a shared native-worker bootstrap into every TPU VM in a queued resource."""
 
@@ -1069,6 +1072,7 @@ class GcpTpuCapacityDriver:
             runtime_env=runtime_env,
             runtime_container=runtime_container,
             container_artifact_mounts=container_artifact_mounts,
+            runtime_python=runtime_python,
         )
         record.metadata["native_worker_port"] = self.native_worker_port
         record.metadata["execution_backend"] = self.execution_backend
@@ -1366,6 +1370,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             runtime_env=runtime.env,
             runtime_container=runtime.container,
             container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+            runtime_python=runtime.python,
         )
 
         def persist(current: FleetCellRecord) -> None:
@@ -1400,6 +1405,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         runtime_env: tp.Mapping[str, str] | None = None,
         runtime_container: NativeContainerConfig | None = None,
         container_artifact_mounts: tp.Sequence[str] = (),
+        runtime_python: str | None = None,
     ) -> NativeWorkerEndpointMode:
         """Inject a private worker bootstrap without writing its token to VM metadata."""
 
@@ -1481,6 +1487,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             runtime_env=runtime_env,
             runtime_container=runtime_container,
             container_artifact_mounts=container_artifact_mounts,
+            runtime_python=runtime_python,
         )
         record.metadata["native_worker_port"] = self.native_worker_port
         record.metadata["execution_backend"] = self.execution_backend
@@ -1507,6 +1514,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
             runtime_env=runtime.env,
             runtime_container=runtime.container,
             container_artifact_mounts=tuple(artifact.destination for artifact in runtime.artifacts),
+            runtime_python=runtime.python,
         )
 
         def persist(current: FleetCellRecord) -> None:

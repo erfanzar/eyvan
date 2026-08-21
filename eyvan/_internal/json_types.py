@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import typing as tp
+from typing import Any, TypeGuard
 
 from pydantic import BaseModel
 
@@ -31,7 +32,7 @@ def is_json_value(value: object) -> tp.TypeGuard[JsonValue]:
     return False
 
 
-def is_json_object(value: object) -> tp.TypeGuard[JsonObject]:
+def is_json_object(value: object) -> bool | TypeGuard[str | int | float | bool | None | list[Any] | dict[str, Any]]:
     """Return whether a decoded value is a JSON object."""
 
     return isinstance(value, dict) and is_json_value(value)

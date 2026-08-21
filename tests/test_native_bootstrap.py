@@ -560,3 +560,51 @@ def _interpreter_selection(script: str) -> str:
         if lines[index].strip().startswith('if ! "${eyvan_python}" -m ensurepip')
     )
     return "\n".join(line.strip() for line in lines[start:end])
+
+
+def test_a_declared_python_builds_the_worker_environment_with_uv() -> None:
+    """A TPU image ships whatever Python it ships; a pickled callable does not care.
+
+    A serialized callable is pinned to the interpreter that pickled it, and the
+    images in use are 3.11 against a 3.13 laptop -- a mismatch discovered only
+    once a slice is ACTIVE and the workload dispatched. Declaring the
+    interpreter builds the environment on it instead.
+
+    uv rather than apt or ensurepip, because the whole premise is that the image
+    does not already have this Python, and uv fetches it. Deliberately without
+    ``--system-site-packages``: those packages are built for the image's own
+    interpreter, and importing them under another is the failure being avoided,
+    so the fleet installs its own accelerator stack in ``runtime.init_commands``.
+    """
+
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/p/secrets/s/versions/1",
+        runtime_python="3.13",
+    )
+
+    assert "uv venv --python 3.13 /opt/eyvan-native/venv" in script
+    # The declared environment must not inherit the image's interpreter's
+    # packages; that is the bug, not a convenience.
+    assert "uv venv --python 3.13 --system-site-packages" not in script
+    # uv is fetched only when the host lacks it, and its absence is a typed
+    # failure rather than a venv silently built on the wrong Python.
+    assert "command -v uv" in script
+    assert "Eyvan needs uv to build a Python 3.13 worker environment" in script
+
+
+def test_an_undeclared_python_renders_exactly_the_script_it_always_did() -> None:
+    """A fleet that declares nothing must boot the way it always booted."""
+
+    plain = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/p/secrets/s/versions/1",
+    )
+
+    assert "uv venv" not in plain
+    # Still the image's own interpreter, still inheriting its JAX and libtpu.
+    assert "-m venv --system-site-packages /opt/eyvan-native/venv" in plain

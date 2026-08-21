@@ -272,6 +272,7 @@ def build_native_worker_startup_script(
     runtime_env: tp.Mapping[str, str] | None = None,
     runtime_container: NativeContainerConfig | None = None,
     container_artifact_mounts: tp.Sequence[str] | None = None,
+    runtime_python: str | None = None,
 ) -> str:
     """Render an idempotent systemd bootstrap for one native worker.
 
@@ -282,6 +283,21 @@ def build_native_worker_startup_script(
     submission. ``runtime_container`` is a typed OCI handoff; its Docker
     engine preflight intentionally runs after setup so fleet init commands can
     install or configure the engine.
+
+    ``runtime_python`` builds the worker virtual environment on a named
+    interpreter instead of the image's ``python3``. A serialized callable is
+    pinned to the interpreter that pickled it, and a TPU image ships whatever
+    Python it ships -- 3.11 on the images in use, against a 3.13 laptop, which
+    is a failure discovered only once a slice is ACTIVE and the workload
+    dispatched.
+
+    **Declaring it gives up the image's site packages.** The default venv is
+    built ``--system-site-packages`` so the worker inherits the preinstalled
+    JAX and libtpu, which exist for the image's own Python and no other. A venv
+    on a different interpreter cannot use them, so a fleet that declares this
+    must install its own accelerator stack in ``runtime.init_commands`` -- which
+    run after the venv exists and before the worker unit starts, exactly so they
+    can. Left unset, nothing about the bootstrap changes.
     """
 
     package = _required(package, "package")
@@ -332,6 +348,30 @@ def build_native_worker_startup_script(
 
     venv_dir = "/opt/eyvan-native/venv"
     venv_python = f"{venv_dir}/bin/python"
+    # A declared interpreter is built with uv, which fetches the interpreter
+    # itself rather than asking the image to already have it -- the whole point
+    # is that the image's Python is the wrong one. Deliberately *not*
+    # `--system-site-packages`: those packages are built for the image's Python
+    # and importing them under another interpreter is the failure this is meant
+    # to avoid, so the fleet installs its own stack in `runtime.init_commands`.
+    declared_python_lines: tuple[str, ...] = ()
+    if runtime_python is not None:
+        quoted_python = shlex.quote(runtime_python)
+        declared_python_lines = (
+            f"# Eyvan fleet declares Python {runtime_python} for its workers.",
+            f'if ! {venv_python} -c "import sys; raise SystemExit(0 if '
+            f"'.'.join(map(str, sys.version_info[:2])) == {quoted_python} else 1)\" >/dev/null 2>&1; then",
+            "  if ! command -v uv >/dev/null 2>&1; then",
+            "    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh",
+            "  fi",
+            "  if ! command -v uv >/dev/null 2>&1; then",
+            f"    echo 'Eyvan needs uv to build a Python {runtime_python} worker environment' >&2",
+            "    exit 1",
+            "  fi",
+            f"  rm -rf {venv_dir}",
+            f"  uv venv --python {quoted_python} {venv_dir}",
+            "fi",
+        )
     runtime_dir = "/run/eyvan-native"
     secret_path = f"{runtime_dir}/worker-secret"
     workload_user = "eyvan-workload"
@@ -434,6 +474,7 @@ def build_native_worker_startup_script(
             "chmod 0644 /etc/eyvan-native/systemd-runtime.env",
             *runtime_environment_lines,
             *runtime_container_lines,
+            *declared_python_lines,
             f"if ! {venv_python} -m pip --version >/dev/null 2>&1; then",
             f"  rm -rf {venv_dir}",
             # Ask every interpreter on the host before asking apt for one. The
