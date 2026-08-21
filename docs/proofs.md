@@ -974,6 +974,41 @@ the very defect above, with no operator action in between. Passing now requires 
 witness: a cell that reports the reclamation and carries no cooldown. Absent one,
 the verdict is inconclusive.
 
+### Run 2026-08-13 (second), exit 0
+
+A second v5p-16 spot slice in `us-central1-a` on the fixed build, same
+submission. GCP reclaimed it 12 minutes in, and all five criteria passed:
+
+```
+preemption-observed                pass   preemption_count=1, capacity_loss_count=0
+charged-to-the-preemption-budget   pass   only preemption_count moved
+classified-as-preempted            pass   cells report ['preempted']
+no-stockout-cooldown               pass   the reclaimed cell carries no cooldown
+workload-survived                  pass   workload is running
+```
+
+What makes this evidence rather than a green run is that GCP produced the
+*identical* provider state both times. `TPU VM is terminal (DELETING)` is the
+string that, hours earlier, was read as an untyped capacity loss, charged to
+`max_retries`, and killed the workload. On the fixed build the same string
+yielded `provider_failure_code=preempted`, `interruptions=1.9604`,
+`consecutive_failures=0`, no cooldown, and a workload that came back on
+attempt 2. Two runs, one changed variable.
+
+`eyvan proof verify` on the receipt returns pass on all four: the receipt
+digests to its recorded value, the run passed, the criterion that decided it is
+the one running here, and the candidate is the build running here.
+
+**What this run does not establish.** `eyvan capacity builds` exits 1 against
+it: the head was redeployed twice mid-run, so the worker ranks kept the wheel
+their cell was provisioned with while the control plane and cell agent moved on.
+The receipt records that itself -- *"nothing about agent builds can be assumed
+from this run"* -- and it is left recorded rather than papered over. It does not
+touch what P5 claims, because every one of those claims is decided by the plane
+and the cell agent, which agree, while the ranks only run the shell loop that
+prints a step counter. A run wanting that dimension too must not restage the
+head while the slice is up.
+
 ## P6 — a warm window held and released across its own boundary
 
 **Establishes** that a window configured in fleet YAML holds a cell warm through

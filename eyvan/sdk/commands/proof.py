@@ -804,15 +804,28 @@ class _ProofRun:
         return value
 
     def preflight(self) -> None:
-        """Refuse an output path that already holds a receipt.
+        """Refuse an output path this run could not record its result to.
 
         Checked before the plane is polled, so a run that cannot record its
         result is stopped while it is still free rather than after the spend.
+
+        A directory that does not exist is refused here for the same reason the
+        taken path is. Left to the write, it surfaces as a ``FileNotFoundError``
+        *after* the verdict is decided, and the non-zero exit that escapes is
+        indistinguishable from a failing proof -- so a mistyped ``--evidence``
+        path reports that the build failed a criterion it actually passed. That
+        is the one thing a refusal exit code exists to prevent, and it happened
+        on the P5 run of 2026-08-13.
         """
 
         for label, path in (("receipt", self.receipt), ("evidence", self.evidence)):
-            if path is not None and Path(path).exists():
+            if path is None:
+                continue
+            if Path(path).exists():
                 _refuse(f"{label} path {path} already exists; a receipt is written once, never over another run")
+            parent = Path(path).parent
+            if not parent.is_dir():
+                _refuse(f"{label} path {path} is not writable: {parent} is not a directory")
 
     def _plane_build(self) -> tuple[dict[str, object] | None, str]:
         """Ask the plane what code it is running.
