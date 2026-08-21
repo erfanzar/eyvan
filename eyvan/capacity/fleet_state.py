@@ -446,7 +446,13 @@ class GcsBackend:
             try:
                 body, generation = self._rest.read()
             except GcsRestError:
-                self._rest = None
+                # Not disabled. One failure is a token that aged out or a blip;
+                # turning the fast path off for the life of the process meant a
+                # single blip pinned every later mutation onto the subprocess --
+                # and on 2026-08-21 that subprocess was a `gcloud` that could not
+                # start, so every reconcile 500'd and no cell could reach ready
+                # while its TPU sat ACTIVE. Fall back for this call only.
+                pass
             else:
                 if body is None:
                     return _empty_document(), 0
@@ -469,7 +475,8 @@ class GcsBackend:
             except GcsPreconditionFailed as exc:
                 raise ConflictError(str(exc)) from exc
             except GcsRestError:
-                self._rest = None
+                # Per call, not for the life of the process. See ``_read_fast``.
+                pass
         self._write(document, generation)
 
 

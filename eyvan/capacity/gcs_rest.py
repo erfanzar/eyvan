@@ -53,6 +53,11 @@ def _default_token() -> str:
 #: socket cannot hold a fleet lease open.
 REQUEST_TIMEOUT_S = 30.0
 
+#: Answers that mean "this credential is no longer good", as opposed to
+#: "this object is not yours" -- both are 401/403 on the wire, and retrying once
+#: with a fresh token tells them apart without a second way to be wrong.
+_AUTH_FAILURES = frozenset({401, 403})
+
 _OBJECT = "https://storage.googleapis.com/storage/v1/b/{bucket}/o/{object}"
 _UPLOAD = "https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
 
@@ -93,10 +98,20 @@ class GcsRestObject:
     def __post_init__(self) -> None:
         self.bucket, self.name = split_uri(self.uri)
 
-    def _headers(self) -> dict[str, str]:
-        token = self._token or self.token_source()
-        self._token = token
-        return {"Authorization": f"Bearer {token}"}
+    def _headers(self, *, refresh: bool = False) -> dict[str, str]:
+        """Return the bearer header, minting a token when there is none or on demand.
+
+        ``refresh`` is what makes a long-lived process work at all. A Google
+        access token lasts about an hour; caching one for the life of the
+        process means every call after that hour is a 401, which this reports as
+        a plain read failure -- and the caller then falls back to a subprocess.
+        On 2026-08-21 that subprocess was a broken ``gcloud``, so an aged-out
+        token became "no cell can reach ready while its TPU sits ACTIVE".
+        """
+
+        if refresh or self._token is None:
+            self._token = self.token_source()
+        return {"Authorization": f"Bearer {self._token}"}
 
     def read(self) -> tuple[JsonObject | None, int]:
         """Return the object's parsed body and generation, or ``(None, 0)`` if absent.
@@ -114,6 +129,8 @@ class GcsRestObject:
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT_S, trust_env=False) as client:
                 response = client.get(url, params={"alt": "media"}, headers=self._headers())
+                if response.status_code in _AUTH_FAILURES:
+                    response = client.get(url, params={"alt": "media"}, headers=self._headers(refresh=True))
         except httpx.HTTPError as exc:
             raise GcsRestError(f"could not read {self.uri}: {exc}") from exc
         if response.status_code == 404:
@@ -148,16 +165,29 @@ class GcsRestObject:
         payload = json.dumps(document, indent=2, sort_keys=True).encode()
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT_S, trust_env=False) as client:
+                params = {
+                    "uploadType": "media",
+                    "name": self.name,
+                    "ifGenerationMatch": str(generation),
+                }
+                url = _UPLOAD.format(bucket=self.bucket)
                 response = client.post(
-                    _UPLOAD.format(bucket=self.bucket),
-                    params={
-                        "uploadType": "media",
-                        "name": self.name,
-                        "ifGenerationMatch": str(generation),
-                    },
+                    url,
+                    params=params,
                     headers={**self._headers(), "Content-Type": "application/json"},
                     content=payload,
                 )
+                if response.status_code in _AUTH_FAILURES:
+                    # Safe to repeat: ifGenerationMatch makes the write
+                    # idempotent -- if the first attempt somehow landed, the
+                    # second is refused as a precondition failure, which the
+                    # caller already handles by re-reading.
+                    response = client.post(
+                        url,
+                        params=params,
+                        headers={**self._headers(refresh=True), "Content-Type": "application/json"},
+                        content=payload,
+                    )
         except httpx.HTTPError as exc:
             raise GcsRestError(f"could not write {self.uri}: {exc}") from exc
         if response.status_code == 412:

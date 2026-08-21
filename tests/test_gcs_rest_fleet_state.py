@@ -88,6 +88,75 @@ def test_an_unreachable_api_falls_back_instead_of_failing_the_mutation() -> None
     with pytest.raises(RuntimeError, match="subprocess path reached"):
         backend._write_fast({"schema": "eyvan.fleet-state", "version": 1, "cells": {}}, 7)
     assert calls, "the fallback was never attempted"
-    # And the failed reader is dropped, so one outage does not cost a failed
-    # round trip on every later mutation.
-    assert backend._rest is None
+    # The reader is kept. Dropping it meant one aged-out token pinned every
+    # later mutation onto the subprocess for the life of the process, which is
+    # how a broken `gcloud` stranded a live TPU.
+    assert backend._rest is rest
+
+
+def test_one_api_failure_does_not_pin_every_later_call_onto_the_subprocess() -> None:
+    """The failure that stranded a live TPU.
+
+    The fast path used to disable itself for the life of the process on any
+    error. A Google access token lasts about an hour, so a long-running agent
+    reliably hit one -- and from then on every fleet-state mutation went through
+    `gcloud`. On 2026-08-21 that `gcloud` could not start, so every reconcile
+    500'd, no cell could reach ready, and a TPU sat ACTIVE and unusable.
+
+    One failure is a blip or an aged-out token, not a verdict about the network.
+    """
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self):
+            self.reads += 1
+            if self.reads == 1:
+                raise GcsRestError("token aged out")
+            from eyvan.capacity.fleet_state import _empty_document
+
+            return _empty_document(), 11
+
+        def write(self, document, generation):
+            return None
+
+    rest = _Flaky()
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        calls.append(tuple(args))
+        raise RuntimeError("subprocess path reached")
+
+    backend = GcsBackend("gs://bucket/state.json", runner=runner, rest=rest)
+
+    with pytest.raises(RuntimeError, match="subprocess path reached"):
+        backend._read_fast()
+    assert calls, "the first failure should fall back for that call"
+
+    # The second call uses the API again rather than the subprocess.
+    document, generation = backend._read_fast()
+    assert generation == 11
+    assert document["cells"] == {}
+    assert len(calls) == 1, "the fast path was disabled instead of retried"
+
+
+def test_an_expired_token_is_reminted_rather_than_reported_as_a_read_failure() -> None:
+    """A 401 means this credential aged out, not that the object is unreachable."""
+
+    from eyvan.capacity.gcs_rest import GcsRestObject
+
+    minted: list[str] = []
+
+    def token_source() -> str:
+        minted.append(f"token-{len(minted)}")
+        return minted[-1]
+
+    obj = GcsRestObject("gs://bucket/state.json", token_source=token_source)
+    first = obj._headers()
+    assert first["Authorization"] == "Bearer token-0"
+    # Cached: a token is not minted per request.
+    assert obj._headers()["Authorization"] == "Bearer token-0"
+    # Until something says it is no longer good.
+    assert obj._headers(refresh=True)["Authorization"] == "Bearer token-1"
+    assert len(minted) == 2
