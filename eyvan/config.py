@@ -14,7 +14,10 @@ from pathlib import Path
 
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
-from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.capacity.providers.gcp.runtime.profile import (
+    DEFAULT_GCP_NATIVE_FLEET_STATE_PATH,
+    GcpNativeRuntimeProfile,
+)
 from eyvan.capacity.stage_policy import CellStagePolicy, StageEvictionPolicy
 from eyvan.identity.mtls import MutualTlsFiles, MutualTlsMode, parse_mutual_tls_mode
 from eyvan.soak_evidence import DEFAULT_EVIDENCE_MAX_AGE_S
@@ -557,7 +560,14 @@ class EyvanSettings:
         return cls(
             agent_shared_secret=profile.agent_shared_secret,
             native_worker_root_secret=profile.native_worker_root_secret,
-            fleet_state_uri=os.getenv("EYVAN_FLEET_STATE_URI", profile.fleet_state_uri),
+            # The profile's agent runs on this machine beside its control plane,
+            # so fleet state defaults to a local file: the document is a cache
+            # of provider-owned facts plus Eyvan's fences, and a bucket write on
+            # that cache's critical path once left ACTIVE TPUs unusable while
+            # they billed (2026-08-22). An explicit EYVAN_FLEET_STATE_URI --
+            # which is how a remote head shares one document across agents --
+            # still wins.
+            fleet_state_uri=os.getenv("EYVAN_FLEET_STATE_URI") or str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH),
             # Operator-owned and *not* something a runtime profile can know, so it
             # is read from the environment here for the same reason
             # ``fleet_state_uri`` is. Dropping it made the documented

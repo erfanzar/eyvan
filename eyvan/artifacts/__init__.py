@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan._internal.workspace import create_private_directory
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.worker.runtime.callables import CallableArtifact
@@ -69,6 +70,22 @@ class CommandRunner(tp.Protocol):
         check: bool,
         capture_output: bool,
     ) -> subprocess.CompletedProcess[bytes]: ...
+
+
+def _default_gcloud_runner(
+    args: tp.Sequence[str],
+    *,
+    check: bool,
+    capture_output: bool,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``gcloud`` without the caller's Python interpreter steering.
+
+    The default used to be a bare ``subprocess.run``, which leaked a submitting
+    process's ``PYTHONPATH`` into gcloud's own interpreter; see
+    ``eyvan._internal.subprocess_env``.
+    """
+
+    return subprocess.run(args, check=check, capture_output=capture_output, env=provider_cli_env())
 
 
 class ManagedArtifactClient(tp.Protocol):
@@ -197,13 +214,13 @@ class LocalArtifactStore:
 class GCSArtifactStore:
     """Content-addressed artifact store backed by ``gcloud storage``."""
 
-    def __init__(self, root_uri: str, *, runner: CommandRunner = subprocess.run):
+    def __init__(self, root_uri: str, *, runner: CommandRunner = None):
         root_uri = root_uri.rstrip("/")
         parsed = urlparse(root_uri)
         if parsed.scheme != "gs" or not parsed.netloc:
             raise ValueError("GCS artifact storage requires a gs://bucket[/prefix] URI")
         self.root_uri = root_uri
-        self._runner = runner
+        self._runner = _default_gcloud_runner if runner is None else runner
 
     def _put_digest_object(self, payload: bytes, sha256: str, *, kind: str, extension: str) -> str:
         """Upload one immutable digest-named object only when it is absent.

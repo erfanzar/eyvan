@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import DriverBusyError
@@ -265,6 +266,7 @@ def _gcloud(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        env=provider_cli_env(),
     )
 
 

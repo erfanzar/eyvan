@@ -23,6 +23,13 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WORKLOAD_RUNTIME_ENVIRONMENT = "/etc/eyvan-native/workload-runtime.json"
 _WORKLOAD_CONTAINER_RUNTIME = "/etc/eyvan-native/container-runtime.json"
 
+#: Revision of the rendered startup script's *behavior*. The driver's bootstrap
+#: identity pins the byte sources it stages (wheel, wheelhouse); the script
+#: itself was not pinned, so a script fix with identical artifacts never
+#: reached existing cells -- the same staleness the key exists to prevent, one
+#: level up. Bump on any bootstrap behavior change existing cells must receive.
+NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-22.1"
+
 
 def _required(value: str, name: str) -> str:
     normalized = value.strip()
@@ -354,13 +361,30 @@ def build_native_worker_startup_script(
     # `--system-site-packages`: those packages are built for the image's Python
     # and importing them under another interpreter is the failure this is meant
     # to avoid, so the fleet installs its own stack in `runtime.init_commands`.
+    #
+    # The interpreter's home must be shared, not uv's default: uv installs
+    # managed interpreters under the invoking user's $HOME, which on a VM
+    # startup script is /root -- mode 0700 -- so the unprivileged workload user
+    # was locked out of the very venv built for it, the bootstrap's own final
+    # verification failed, and the cell churned EXECUTION_CONNECTING until it
+    # was replaced by an identically broken one (found live 2026-08-22).
+    python_home = "/opt/eyvan-native/python"
     declared_python_lines: tuple[str, ...] = ()
     if runtime_python is not None:
         quoted_python = shlex.quote(runtime_python)
         declared_python_lines = (
             f"# Eyvan fleet declares Python {runtime_python} for its workers.",
+            # Rebuild not only on a version mismatch but also when the existing
+            # interpreter resolves into a private home directory: that venv
+            # predates the shared interpreter home and can never pass the
+            # workload-user executability check this script ends with.
+            # The declared version is compared as a Python *string*: passed
+            # through shlex.quote alone it rendered as a float literal
+            # (`== 3.13`), which never equals the joined version string and so
+            # rebuilt the venv on every boot.
             f'if ! {venv_python} -c "import sys; raise SystemExit(0 if '
-            f"'.'.join(map(str, sys.version_info[:2])) == {quoted_python} else 1)\" >/dev/null 2>&1; then",
+            f"'.'.join(map(str, sys.version_info[:2])) == '{runtime_python}' else 1)\" >/dev/null 2>&1 || "
+            f'readlink -f {venv_python} | grep -qE "^/(root|home)/"; then',
             "  if ! command -v uv >/dev/null 2>&1; then",
             "    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh",
             "  fi",
@@ -368,13 +392,14 @@ def build_native_worker_startup_script(
             f"    echo 'Eyvan needs uv to build a Python {runtime_python} worker environment' >&2",
             "    exit 1",
             "  fi",
+            f"  install -d -m 0755 {python_home}",
             f"  rm -rf {venv_dir}",
             # --seed, because the very next block recreates any environment
             # whose `python -m pip` does not answer -- and a uv venv has no pip
             # unless asked. Without it this builds 3.13 and is immediately
             # replaced by one on the image's own interpreter, which is the
             # failure it exists to prevent.
-            f"  uv venv --seed --python {quoted_python} {venv_dir}",
+            f"  env UV_PYTHON_INSTALL_DIR={python_home} uv venv --seed --python {quoted_python} {venv_dir}",
             "fi",
         )
     runtime_dir = "/run/eyvan-native"

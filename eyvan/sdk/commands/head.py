@@ -47,6 +47,7 @@ from rich.prompt import Confirm
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.sdk.commands.autoscale import autoscale_console, is_interactive
 from eyvan.sdk.commands.common import FleetConfigLoader
@@ -239,6 +240,7 @@ def _run_gcloud(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=provider_cli_env(),
     )
 
 

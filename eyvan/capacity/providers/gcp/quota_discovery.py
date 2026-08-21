@@ -19,6 +19,7 @@ from typing import Protocol
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_value
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.providers.gcp.accelerator_catalog import (
     AcceleratorCatalogError,
     ApiAcceleratorCatalog,
@@ -53,7 +54,9 @@ class TpuQuotaUsageDiscovery(Protocol):
 
 def _runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_QUOTA_TIMEOUT_S", "60")), 1.0)
-    return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s)
+    return subprocess.run(
+        ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+    )
 
 
 @dataclass(frozen=True, slots=True)

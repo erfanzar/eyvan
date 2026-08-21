@@ -16,6 +16,7 @@ import pytest
 from eyvan.capacity.providers.gcp.runtime.bootstrap import (
     GcpRuntimeBootstrap,
     GcpRuntimeBootstrapStep,
+    GcpRuntimeBucketEnsureError,
     GcpRuntimePreflightError,
     GcpRuntimeWheelBuildError,
     GcpRuntimeWheelStageError,
@@ -288,3 +289,108 @@ def test_destinations_preserve_a_valid_wheel_filename_under_its_content_hash() -
 def test_destinations_reject_invalid_or_unsafe_wheel_filenames(wheel_filename: str) -> None:
     with pytest.raises(ValueError, match="PEP 427 wheel filename"):
         GcpRuntimeBootstrap.destinations_for(profile(), "a" * 64, wheel_filename)
+
+
+_BUCKET_DESCRIBE = (
+    "gcloud",
+    "storage",
+    "buckets",
+    "describe",
+    "gs://eyvan-runtime-artifacts",
+    "--project=project-a",
+    "--format=value(name)",
+)
+_BUCKET_CREATE_PREFIX = ("gcloud", "storage", "buckets", "create", "gs://eyvan-runtime-artifacts")
+
+
+def test_preflight_tolerates_a_missing_artifact_bucket(tmp_path: Path) -> None:
+    """ "The bucket does not exist yet" is a state, not an access failure."""
+
+    runner = FakeGcloudRunner(failures={_BUCKET_DESCRIBE: (1, b"", b"404 bucket not found")})
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=runner)
+
+    checked = bootstrap.preflight(profile())
+
+    assert GcpRuntimeBootstrapStep.STORAGE_ACCESS in checked.checks
+
+
+def test_preflight_still_fails_on_a_real_bucket_access_error(tmp_path: Path) -> None:
+    runner = FakeGcloudRunner(failures={_BUCKET_DESCRIBE: (1, b"", b"PERMISSION_DENIED")})
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=runner)
+
+    with pytest.raises(GcpRuntimePreflightError, match="PERMISSION_DENIED") as raised:
+        bootstrap.preflight(profile())
+
+    assert raised.value.step is GcpRuntimeBootstrapStep.STORAGE_ACCESS
+
+
+def test_ensure_artifact_bucket_is_a_noop_when_the_bucket_exists(tmp_path: Path) -> None:
+    runner = FakeGcloudRunner()
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=runner)
+
+    assert bootstrap.ensure_artifact_bucket(profile()) == "gs://eyvan-runtime-artifacts"
+    assert not [call for call in runner.calls if call[: len(_BUCKET_CREATE_PREFIX)] == _BUCKET_CREATE_PREFIX]
+
+
+def test_ensure_artifact_bucket_creates_an_absent_bucket_with_uniform_access(tmp_path: Path) -> None:
+    """First-time setup never depends on a hand-created bucket."""
+
+    runner = FakeGcloudRunner(failures={_BUCKET_DESCRIBE: (1, b"", b"404 bucket not found")})
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=runner)
+
+    assert bootstrap.ensure_artifact_bucket(profile()) == "gs://eyvan-runtime-artifacts"
+    creates = [call for call in runner.calls if call[: len(_BUCKET_CREATE_PREFIX)] == _BUCKET_CREATE_PREFIX]
+    assert creates == [
+        (
+            "gcloud",
+            "storage",
+            "buckets",
+            "create",
+            "gs://eyvan-runtime-artifacts",
+            "--project=project-a",
+            "--location=us-central1",
+            "--uniform-bucket-level-access",
+        )
+    ]
+
+
+def test_ensure_artifact_bucket_confirms_a_create_race(tmp_path: Path) -> None:
+    """A concurrent initializer's win is as good as ours once it describes."""
+
+    runner = FakeGcloudRunner(failures={_BUCKET_DESCRIBE: (1, b"", b"404 bucket not found")})
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=runner)
+
+    def fail_create_once(args, *, check, capture_output, timeout):
+        command = tuple(args)
+        if command[: len(_BUCKET_CREATE_PREFIX)] == _BUCKET_CREATE_PREFIX:
+            # The raced winner answers the confirming describe afterwards.
+            runner.failures.pop(_BUCKET_DESCRIBE, None)
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"already exists")
+        return runner(args, check=check, capture_output=capture_output, timeout=timeout)
+
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=fail_create_once)
+
+    assert bootstrap.ensure_artifact_bucket(profile()) == "gs://eyvan-runtime-artifacts"
+
+
+def test_ensure_artifact_bucket_raises_typed_error_when_creation_is_refused(tmp_path: Path) -> None:
+    runner = FakeGcloudRunner(
+        failures={
+            _BUCKET_DESCRIBE: (1, b"", b"404 bucket not found"),
+        }
+    )
+
+    def refuse_create(args, *, check, capture_output, timeout):
+        command = tuple(args)
+        if command[: len(_BUCKET_CREATE_PREFIX)] == _BUCKET_CREATE_PREFIX:
+            return subprocess.CompletedProcess(
+                command, 1, stdout=b"", stderr=b"PERMISSION_DENIED: storage.buckets.create"
+            )
+        return runner(args, check=check, capture_output=capture_output, timeout=timeout)
+
+    bootstrap = GcpRuntimeBootstrap(FakeWheelBuilder(create_wheel(tmp_path)), runner=refuse_create)
+
+    with pytest.raises(GcpRuntimeBucketEnsureError, match="PERMISSION_DENIED") as raised:
+        bootstrap.ensure_artifact_bucket(profile())
+
+    assert raised.value.step is GcpRuntimeBootstrapStep.STORAGE_ENSURE

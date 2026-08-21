@@ -20,7 +20,10 @@ from prometheus_client import CollectorRegistry, generate_latest
 import eyvan.server.api.app as app_module
 from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
 from eyvan.artifacts.managed import callable_uri
-from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.profile import (
+    DEFAULT_GCP_NATIVE_FLEET_STATE_PATH,
+    GcpNativeRuntimeProfileStore,
+)
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.records import CapacityPoolRecord, CellState, Principal, ResourceVector, Role, RoleGrant
 from eyvan.server.api.app import (
@@ -268,6 +271,7 @@ def test_local_daemon_app_uses_its_exact_loopback_url_and_isolated_profile(monke
 
 def test_local_daemon_app_uses_the_gcp_profile_artifact_root(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("EYVAN_FLEET_STATE_URI", raising=False)
     runtime_store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
     runtime_profile = runtime_store.create(
         project_id="eyvan-project",
@@ -287,7 +291,9 @@ def test_local_daemon_app_uses_the_gcp_profile_artifact_root(monkeypatch, tmp_pa
 
     configured = application.state.server_startup.settings
     assert configured.artifact_store_uri == runtime_profile.artifact_root_uri
-    assert configured.fleet_state_uri == runtime_profile.fleet_state_uri
+    # The profile-owned local pair keeps its fleet-state cache on the local
+    # filesystem unless EYVAN_FLEET_STATE_URI names a shared document instead.
+    assert configured.fleet_state_uri == str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH)
     assert configured.agent_shared_secret == runtime_profile.agent_shared_secret
     assert configured.native_worker_root_secret == runtime_profile.native_worker_root_secret
 

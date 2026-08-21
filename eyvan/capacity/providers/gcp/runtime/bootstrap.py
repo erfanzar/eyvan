@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfile,
     GcpNativeRuntimeProfileError,
@@ -26,6 +27,11 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
 _WHEEL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DEFAULT_COMMAND_TIMEOUT_S = 60.0
 _DEFAULT_MAX_WHEEL_BYTES = 512 * 1024 * 1024
+#: Location used when Eyvan creates the artifact bucket itself. Artifacts are
+#: wheels and pickled callables -- small, written once, read at dispatch -- so a
+#: predictable fixed region beats a clever one. Operators who care name their
+#: own bucket with --artifact-root instead.
+DEFAULT_ARTIFACT_BUCKET_LOCATION = "us-central1"
 
 
 class GcpRuntimeBootstrapStep(StrEnum):
@@ -33,6 +39,7 @@ class GcpRuntimeBootstrapStep(StrEnum):
 
     PROJECT_ACCESS = "project_access"
     STORAGE_ACCESS = "storage_access"
+    STORAGE_ENSURE = "storage_ensure"
     TPU_ACCESS = "tpu_access"
     WHEEL_BUILD = "wheel_build"
     WHEEL_STAGE = "wheel_stage"
@@ -49,6 +56,10 @@ class GcpRuntimeBootstrapError(RuntimeError):
 
 class GcpRuntimePreflightError(GcpRuntimeBootstrapError):
     """A non-mutating GCP project, bucket, or TPU access probe failed."""
+
+
+class GcpRuntimeBucketEnsureError(GcpRuntimeBootstrapError):
+    """The artifact bucket did not exist and could not be created."""
 
 
 class GcpRuntimeWheelBuildError(GcpRuntimeBootstrapError):
@@ -87,7 +98,7 @@ def _run_gcloud(
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one bounded GCP CLI command without inheriting terminal output."""
 
-    return subprocess.run(args, check=check, capture_output=capture_output, timeout=timeout)
+    return subprocess.run(args, check=check, capture_output=capture_output, timeout=timeout, env=provider_cli_env())
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,9 +124,10 @@ class GcpRuntimeBootstrap:
     """Prepare a native GCP profile without provisioning any TPU capacity.
 
     The class is intentionally narrow: it verifies that the configured account
-    can read the project, artifact bucket, and Cloud TPU locations, then stages
-    a locally built wheel under its SHA-256. It never creates a TPU, modifies
-    IAM, changes quotas, or persists the returned profile.
+    can read the project, artifact bucket, and Cloud TPU locations, creates the
+    artifact bucket when it is absent (the one mutation it owns), then stages a
+    locally built wheel under its SHA-256. It never creates a TPU, modifies IAM,
+    changes quotas, or persists the returned profile.
     """
 
     def __init__(
@@ -143,6 +155,11 @@ class GcpRuntimeBootstrap:
         Every command in this method is read-only. A successful preflight does
         not imply that Spot capacity is currently available or that the account
         may create TPU resources; those are provider-side admission checks.
+
+        A missing artifact bucket passes here and is created by
+        :meth:`ensure_artifact_bucket`: "the bucket does not exist yet" is a
+        state, not an access failure, and failing preflight on it made every
+        first run require a hand-created bucket.
         """
 
         root_uri, artifact_bucket_uri = self._artifact_root(profile)
@@ -151,18 +168,7 @@ class GcpRuntimeBootstrap:
             GcpRuntimeBootstrapStep.PROJECT_ACCESS,
             ("gcloud", "projects", "describe", project, "--format=value(projectId)"),
         )
-        self._run_read_only(
-            GcpRuntimeBootstrapStep.STORAGE_ACCESS,
-            (
-                "gcloud",
-                "storage",
-                "buckets",
-                "describe",
-                artifact_bucket_uri,
-                f"--project={project}",
-                "--format=value(name)",
-            ),
-        )
+        self._run_bucket_access_probe(artifact_bucket_uri, project=project)
         self._run_read_only(
             GcpRuntimeBootstrapStep.TPU_ACCESS,
             (
@@ -187,10 +193,105 @@ class GcpRuntimeBootstrap:
             ),
         )
 
+    def _run_bucket_access_probe(self, artifact_bucket_uri: str, *, project: str) -> None:
+        """Pass when the bucket is readable or merely absent; fail on real access errors."""
+
+        result = self._invoke(
+            GcpRuntimeBootstrapStep.STORAGE_ACCESS,
+            (
+                "gcloud",
+                "storage",
+                "buckets",
+                "describe",
+                artifact_bucket_uri,
+                f"--project={project}",
+                "--format=value(name)",
+            ),
+            GcpRuntimePreflightError,
+        )
+        if result.returncode == 0 or self._is_missing(result):
+            return
+        raise GcpRuntimePreflightError(
+            GcpRuntimeBootstrapStep.STORAGE_ACCESS,
+            self._failed_command_detail("gcloud access check failed", result),
+        )
+
+    def ensure_artifact_bucket(
+        self,
+        profile: GcpNativeRuntimeProfile,
+        *,
+        location: str = DEFAULT_ARTIFACT_BUCKET_LOCATION,
+    ) -> str:
+        """Create the profile's artifact bucket when it is absent, and return its URI.
+
+        This is the one mutating step in runtime preparation: Eyvan owns the
+        bucket it stages wheels and callables into, the way the autoscalers it
+        replaces own theirs, so an operator never hand-creates one. Creation is
+        idempotent -- a describe-first check plus a create that treats "already
+        exists" as success when the describe says the bucket is ours to read.
+        """
+
+        _, artifact_bucket_uri = self._artifact_root(profile)
+        project = profile.project_id
+        describe_args = (
+            "gcloud",
+            "storage",
+            "buckets",
+            "describe",
+            artifact_bucket_uri,
+            f"--project={project}",
+            "--format=value(name)",
+        )
+        existing = self._invoke(
+            GcpRuntimeBootstrapStep.STORAGE_ENSURE,
+            describe_args,
+            GcpRuntimeBucketEnsureError,
+            f"could not inspect artifact bucket {artifact_bucket_uri}",
+        )
+        if existing.returncode == 0:
+            return artifact_bucket_uri
+        if not self._is_missing(existing):
+            raise GcpRuntimeBucketEnsureError(
+                GcpRuntimeBootstrapStep.STORAGE_ENSURE,
+                self._failed_command_detail(f"could not inspect artifact bucket {artifact_bucket_uri}", existing),
+            )
+        created = self._invoke(
+            GcpRuntimeBootstrapStep.STORAGE_ENSURE,
+            (
+                "gcloud",
+                "storage",
+                "buckets",
+                "create",
+                artifact_bucket_uri,
+                f"--project={project}",
+                f"--location={location}",
+                "--uniform-bucket-level-access",
+            ),
+            GcpRuntimeBucketEnsureError,
+            f"could not create artifact bucket {artifact_bucket_uri}",
+        )
+        if created.returncode == 0:
+            return artifact_bucket_uri
+        # A concurrent initializer can win the create race; the bucket is then
+        # exactly as good as if this call had created it.
+        confirmed = self._invoke(
+            GcpRuntimeBootstrapStep.STORAGE_ENSURE,
+            describe_args,
+            GcpRuntimeBucketEnsureError,
+            f"could not confirm artifact bucket {artifact_bucket_uri} after create failed",
+        )
+        if confirmed.returncode == 0:
+            return artifact_bucket_uri
+        raise GcpRuntimeBucketEnsureError(
+            GcpRuntimeBootstrapStep.STORAGE_ENSURE,
+            self._failed_command_detail(f"could not create artifact bucket {artifact_bucket_uri}", created),
+        )
+
     def bootstrap(self, profile: GcpNativeRuntimeProfile) -> GcpNativeRuntimeProfile:
-        """Run non-mutating preflight then return a profile pinned to a staged wheel."""
+        """Run preflight, ensure the artifact bucket, then pin the profile to a staged wheel."""
 
         self.preflight(profile)
+        self.ensure_artifact_bucket(profile)
         return self.stage_native_worker_wheel(profile)
 
     def stage_native_worker_wheel(self, profile: GcpNativeRuntimeProfile) -> GcpNativeRuntimeProfile:
@@ -411,10 +512,12 @@ class GcpRuntimeBootstrap:
 
 
 __all__ = (
+    "DEFAULT_ARTIFACT_BUCKET_LOCATION",
     "GcloudRunner",
     "GcpRuntimeBootstrap",
     "GcpRuntimeBootstrapError",
     "GcpRuntimeBootstrapStep",
+    "GcpRuntimeBucketEnsureError",
     "GcpRuntimeDestinations",
     "GcpRuntimePreflight",
     "GcpRuntimePreflightError",

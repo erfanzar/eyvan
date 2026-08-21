@@ -815,10 +815,18 @@ class GcpTpuCapacityDriver:
         The identity includes both artifact URIs, their verified content hashes,
         and any GCS generation pins. Changing any supplied byte source rewrites
         the script, while identical qualified artifacts do not churn the host.
+
+        The script's own behavior revision is pinned for the same reason:
+        identical artifacts with a fixed script still means a new bootstrap,
+        otherwise a bootstrap bug fix would never reach the cells it marooned
+        (the 2026-08-22 interpreter-home failure).
         """
+
+        from eyvan.worker.runtime.native_bootstrap import NATIVE_WORKER_BOOTSTRAP_REVISION
 
         identity = "|".join(
             (
+                NATIVE_WORKER_BOOTSTRAP_REVISION,
                 self.native_worker_package or "",
                 self.native_worker_package_sha256 or "",
                 self.native_worker_package_generation or "",

@@ -10,7 +10,10 @@ from __future__ import annotations
 from eyvan.capacity.drivers.gcp import GcpCapacityDriver
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.capacity.providers.gcp import GcloudNativeWorkerPublicIngress, GcsArtifactBucket
-from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfile
+from eyvan.capacity.providers.gcp.runtime.profile import (
+    DEFAULT_GCP_NATIVE_FLEET_STATE_PATH,
+    GcpNativeRuntimeProfile,
+)
 from eyvan.config import EyvanSettings
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.worker.agent.service import CellAgentService
@@ -31,14 +34,19 @@ def _profile(
     )
 
 
-def test_gcp_native_runtime_profile_maps_to_api_and_agent_settings() -> None:
+def test_gcp_native_runtime_profile_maps_to_api_and_agent_settings(monkeypatch) -> None:
+    monkeypatch.delenv("EYVAN_FLEET_STATE_URI", raising=False)
     profile = _profile()
 
     settings = EyvanSettings.from_gcp_native_runtime_profile(profile)
 
     assert settings.agent_shared_secret == profile.agent_shared_secret
     assert settings.native_worker_root_secret == profile.native_worker_root_secret
-    assert settings.fleet_state_uri == "gs://eyvan-artifacts/eyvan/control-plane/fleet-state.json"
+    # The profile-owned local agent shares a host with its control plane, so
+    # fleet state defaults to a local file: a bucket write on that cache's
+    # critical path once kept ACTIVE TPUs from ever becoming usable while they
+    # billed (2026-08-22). GCS remains one explicit env var away.
+    assert settings.fleet_state_uri == str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH)
     assert settings.artifact_store_uri == profile.artifact_root_uri
     assert settings.native_worker_package == profile.native_worker_wheel_uri
     assert settings.native_worker_artifact_root_uri == profile.artifact_root_uri
@@ -47,6 +55,16 @@ def test_gcp_native_runtime_profile_maps_to_api_and_agent_settings() -> None:
     assert settings.execution_backend == "eyvan-native"
     assert profile.agent_shared_secret not in repr(settings)
     assert profile.native_worker_root_secret not in repr(settings)
+
+
+def test_fleet_state_uri_honours_an_explicit_environment_override(monkeypatch) -> None:
+    """A remote head sharing one document across agents sets the GCS URI itself."""
+
+    monkeypatch.setenv("EYVAN_FLEET_STATE_URI", "gs://eyvan-artifacts/eyvan/control-plane/fleet-state.json")
+
+    settings = EyvanSettings.from_gcp_native_runtime_profile(_profile())
+
+    assert settings.fleet_state_uri == "gs://eyvan-artifacts/eyvan/control-plane/fleet-state.json"
 
 
 def test_gcp_native_runtime_profile_allows_staging_before_a_wheel_exists() -> None:

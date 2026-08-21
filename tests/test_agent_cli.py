@@ -13,11 +13,17 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
+from eyvan.capacity.providers.gcp.runtime.profile import (
+    DEFAULT_GCP_NATIVE_FLEET_STATE_PATH,
+    GcpNativeRuntimeProfileStore,
+)
 from eyvan.worker.agent.cli import _settings_for_runtime_profile, main
 
 
-def test_agent_cli_loads_native_gcp_settings_from_the_owner_profile(tmp_path: Path) -> None:
+def test_agent_cli_loads_native_gcp_settings_from_the_owner_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EYVAN_FLEET_STATE_URI", raising=False)
     store = GcpNativeRuntimeProfileStore(tmp_path / "profile" / "runtime.json")
     profile = store.create(
         project_id="eyvan-project",
@@ -29,7 +35,9 @@ def test_agent_cli_loads_native_gcp_settings_from_the_owner_profile(tmp_path: Pa
 
     assert settings.agent_shared_secret == profile.agent_shared_secret
     assert settings.native_worker_root_secret == profile.native_worker_root_secret
-    assert settings.fleet_state_uri == profile.fleet_state_uri
+    # The profile-owned local agent keeps its fleet-state cache on its own
+    # filesystem; only an explicit EYVAN_FLEET_STATE_URI moves it to a bucket.
+    assert settings.fleet_state_uri == str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH)
     assert settings.native_worker_package == profile.native_worker_wheel_uri
     assert settings.native_worker_artifact_root_uri == profile.artifact_root_uri
 

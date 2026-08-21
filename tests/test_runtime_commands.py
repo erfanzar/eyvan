@@ -47,6 +47,7 @@ class FakeBootstrap:
     """In-memory GCP preparation boundary for service-level coverage."""
 
     profiles: list[GcpNativeRuntimeProfile] = field(default_factory=list)
+    ensured_buckets: list[str] = field(default_factory=list)
 
     def preflight(self, profile: GcpNativeRuntimeProfile) -> GcpRuntimePreflight:
         self.profiles.append(profile)
@@ -60,6 +61,11 @@ class FakeBootstrap:
                 GcpRuntimeBootstrapStep.TPU_ACCESS,
             ),
         )
+
+    def ensure_artifact_bucket(self, profile: GcpNativeRuntimeProfile) -> str:
+        bucket_uri = profile.artifact_root_uri.split("/", 3)[2]
+        self.ensured_buckets.append(f"gs://{bucket_uri}")
+        return f"gs://{bucket_uri}"
 
     def stage_native_worker_wheel(self, profile: GcpNativeRuntimeProfile) -> GcpNativeRuntimeProfile:
         self.profiles.append(profile)
@@ -82,6 +88,9 @@ def test_initializer_persists_only_the_staged_profile_and_returns_nonsecret_summ
 
     assert result.profile_path == store.path
     assert store.load() == result.profile
+    # Preflight and staging see the profile; the bucket is ensured in between,
+    # so a first run never depends on a hand-created bucket.
+    assert bootstrap.ensured_buckets == ["gs://eyvan-runtime-artifacts"]
     assert len(bootstrap.profiles) == 2
     assert bootstrap.profiles[0].native_worker_wheel_uri is None
     assert result.profile.native_worker_wheel_uri == (
@@ -105,6 +114,9 @@ class MissingWheelBootstrap:
             fleet_state_uri=profile.fleet_state_uri,
             checks=(),
         )
+
+    def ensure_artifact_bucket(self, profile: GcpNativeRuntimeProfile) -> str:
+        return profile.artifact_root_uri
 
     def stage_native_worker_wheel(self, profile: GcpNativeRuntimeProfile) -> GcpNativeRuntimeProfile:
         return profile
@@ -222,14 +234,29 @@ def test_runtime_init_json_uses_explicit_public_inputs_and_never_emits_profile_s
     assert "worker-secret-" not in invoked.output
 
 
-def test_runtime_init_requires_a_gcs_root_in_noninteractive_mode() -> None:
+def test_runtime_init_derives_an_eyvan_managed_root_in_noninteractive_mode(monkeypatch, tmp_path: Path) -> None:
+    """No --artifact-root names the Eyvan-managed bucket, which init itself creates."""
+
+    calls: list[tuple[str, str, Path]] = []
+
+    def initialize(
+        *,
+        project_id: str,
+        artifact_root_uri: str,
+        profile_path: Path,
+    ) -> runtime_commands.RuntimeInitializationResult:
+        calls.append((project_id, artifact_root_uri, profile_path))
+        return _result(profile_path)
+
+    monkeypatch.setattr(runtime_commands, "_initialize_native_runtime", initialize)
+
     invoked = CliRunner().invoke(
         runtime_commands.runtime_group,
-        ["init", "--project", "example-project-1", "--yes"],
+        ["init", "--project", "example-project-1", "--profile", str(tmp_path / "runtime.json"), "--yes"],
     )
 
-    assert invoked.exit_code != 0
-    assert "requires --artifact-root outside a terminal" in invoked.output
+    assert invoked.exit_code == 0, invoked.output
+    assert calls == [("example-project-1", "gs://eyvan-example-project-1", tmp_path / "runtime.json")]
 
 
 def test_runtime_group_is_registered_without_service_account_or_agent_endpoint_options(

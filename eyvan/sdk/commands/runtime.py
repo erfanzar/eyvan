@@ -31,6 +31,7 @@ from rich.table import Table
 
 import eyvan
 from eyvan._internal.json_types import JsonObject
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.autoscale import AutoscaleConfigCache, validate_gcp_project_id
 from eyvan.capacity.providers.gcp.runtime.bootstrap import (
     GcpRuntimeBootstrap,
@@ -42,6 +43,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfile,
     GcpNativeRuntimeProfileError,
     GcpNativeRuntimeProfileStore,
+    default_artifact_root_uri,
 )
 from eyvan.capacity.providers.gcp.runtime.supervisor import LocalAgentState, LocalAgentSupervisor
 from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
@@ -151,6 +153,11 @@ class RuntimeBootstrapper(tp.Protocol):
 
         ...
 
+    def ensure_artifact_bucket(self, profile: GcpNativeRuntimeProfile) -> str:
+        """Create the profile's artifact bucket when it is absent."""
+
+        ...
+
     def stage_native_worker_wheel(self, profile: GcpNativeRuntimeProfile) -> GcpNativeRuntimeProfile:
         """Stage the content-addressed Eyvan native-worker wheel."""
 
@@ -167,7 +174,9 @@ def _run_uv_build(
 ) -> subprocess.CompletedProcess[bytes]:
     """Run a bounded local wheel build without streaming its output into the CLI."""
 
-    return subprocess.run(args, cwd=cwd, check=check, capture_output=capture_output, timeout=timeout)
+    return subprocess.run(
+        args, cwd=cwd, check=check, capture_output=capture_output, timeout=timeout, env=provider_cli_env()
+    )
 
 
 class UvNativeWorkerWheelBuilder:
@@ -645,6 +654,7 @@ class GcpRuntimeInitializer:
             artifact_root_uri=artifact_root_uri,
         )
         preflight = self._bootstrap.preflight(profile)
+        self._bootstrap.ensure_artifact_bucket(profile)
         staged_profile = self._bootstrap.stage_native_worker_wheel(profile)
         if staged_profile.native_worker_wheel_uri is None:
             raise GcpRuntimeInitializationError("native runtime wheel staging completed without a worker wheel URI")
@@ -855,7 +865,11 @@ def runtime_group() -> None:
 
 @runtime_group.command("init")
 @click.option("--project", "project_id", help="GCP project ID. Defaults to autoscale defaults or active gcloud project.")
-@click.option("--artifact-root", help="GCS bucket or prefix used for Eyvan artifacts and native worker staging.")
+@click.option(
+    "--artifact-root",
+    help="GCS bucket or prefix used for Eyvan artifacts and native worker staging. "
+    "Defaults to gs://eyvan-<project>, which Eyvan creates when absent.",
+)
 @click.option(
     "--profile",
     "profile_path",
@@ -908,9 +922,13 @@ def initialize_runtime(
             raise click.ClickException(f"invalid GCP project: {exc}") from exc
 
     if artifact_root is None:
-        if not interactive:
-            raise click.ClickException("runtime init requires --artifact-root outside a terminal")
-        artifact_root = _prompt_artifact_root(console, project_id, default=None)
+        # The bucket is Eyvan-managed: derived from the project and created by
+        # the bootstrap when absent, so setup never depends on a hand-made one.
+        derived_default = default_artifact_root_uri(project_id)
+        if interactive:
+            artifact_root = _prompt_artifact_root(console, project_id, default=derived_default)
+        else:
+            artifact_root = derived_default
     else:
         try:
             artifact_root = normalize_runtime_artifact_root(project_id, artifact_root)

@@ -40,6 +40,8 @@ import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+from eyvan._internal.subprocess_env import provider_cli_env
+
 #: How many zones are read at once. Chosen from measurement rather than taste:
 #: 24 leaves the run network-bound at ~9s, 48 halves it, and 96 buys only
 #: another half second while opening twice the sockets for it.
@@ -75,6 +77,7 @@ def gcloud_access_token(timeout_s: float = 30.0) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            env=provider_cli_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AcceleratorCatalogError(f"could not run gcloud to mint a token: {exc}") from exc

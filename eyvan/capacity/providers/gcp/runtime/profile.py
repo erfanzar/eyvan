@@ -23,6 +23,13 @@ from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan._internal.workspace import create_private_directory
 
 DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH = Path("~/.eyvan/gcp-native-runtime.json")
+#: Where the profile-owned local agent keeps its fleet-state document when the
+#: operator did not name one. A local plane and its local agent are the same
+#: machine, so the document needs no bucket: keeping it on the local filesystem
+#: means a GCS or CLI failure can never stop the agent from recording that
+#: capacity it is already paying for exists (the 2026-08-22 outage). An
+#: explicit ``EYVAN_FLEET_STATE_URI`` still wins.
+DEFAULT_GCP_NATIVE_FLEET_STATE_PATH = Path("~/.eyvan/gcp-native-fleet-state.json")
 GCP_NATIVE_RUNTIME_PROFILE_SCHEMA = "eyvan.gcp-native-runtime-profile"
 GCP_NATIVE_RUNTIME_PROFILE_VERSION = 1
 
@@ -106,7 +113,13 @@ class GcpNativeRuntimeProfile:
 
     @property
     def fleet_state_uri(self) -> str:
-        """Return the stable GCS state document URI owned by this runtime profile."""
+        """Return the GCS state document URI derived from this profile's artifact root.
+
+        This remains the right default for a *remote* head whose agent's disk is
+        not durable. The profile-owned local agent defaults to
+        ``DEFAULT_GCP_NATIVE_FLEET_STATE_PATH`` instead (see
+        ``EyvanSettings.from_gcp_native_runtime_profile``).
+        """
 
         return f"{self.artifact_root_uri}/control-plane/fleet-state.json"
 
@@ -469,6 +482,18 @@ class GcpNativeRuntimeProfileStore:
             os.close(descriptor)
 
 
+def default_artifact_root_uri(project_id: str) -> str:
+    """Return the artifact root Eyvan manages for one project when none is named.
+
+    The bucket name derives entirely from the project ID, which is already
+    globally unique, so two operators of one project converge on the same root
+    and two projects never collide. :func:`GcpRuntimeBootstrap.ensure_artifact_bucket`
+    creates the bucket on first use -- an operator never hand-creates one.
+    """
+
+    return f"gs://eyvan-{_validate_project_id(project_id)}"
+
+
 def _new_secret() -> str:
     """Generate one high-entropy ASCII secret suitable for private profile storage."""
 
@@ -600,11 +625,13 @@ def _encode_profile(profile: GcpNativeRuntimeProfile) -> bytes:
 
 
 __all__ = (
+    "DEFAULT_GCP_NATIVE_FLEET_STATE_PATH",
     "DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
     "GCP_NATIVE_RUNTIME_PROFILE_SCHEMA",
     "GCP_NATIVE_RUNTIME_PROFILE_VERSION",
     "GcpNativeRuntimeProfile",
     "GcpNativeRuntimeProfileError",
     "GcpNativeRuntimeProfileStore",
+    "default_artifact_root_uri",
     "validate_native_worker_wheel_filename",
 )

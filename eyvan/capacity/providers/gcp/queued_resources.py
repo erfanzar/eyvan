@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, is_json_value
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
 from eyvan.capacity.fleet_state import FleetCellRecord
@@ -444,7 +445,9 @@ def decode_gcloud_object(output: str, *, resource: str) -> JsonObject:
 
 def _runner(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_TPU_TIMEOUT_S", "600")), 1.0)
-    return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s)
+    return subprocess.run(
+        ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+    )
 
 
 class GcloudTpuProvider:

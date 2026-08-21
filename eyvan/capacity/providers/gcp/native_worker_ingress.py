@@ -26,11 +26,25 @@ import httpx
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
 
 _DEFAULT_NETWORK = "default"
 _FIREWALL_PRIORITY = 1000
 _INGRESS_DESCRIPTION_PREFIX = "eyvan-native-worker-ingress:v1"
+
+
+def _managed_rule_name(network: FirewallNetworkReference, network_tag: str, port: int) -> str:
+    """Return the deterministic rule name, derived without the source range.
+
+    The name deliberately excludes the source /32, so an existing rule can be
+    found and kept even on a day when the local public IPv4 cannot be resolved.
+    """
+
+    suffix = hashlib.sha256(network.canonical_name.encode("utf-8")).hexdigest()[:12]
+    return f"{network_tag}-p{port}-{suffix}"
+
+
 _NETWORK_NAME_PATTERN = re.compile(r"^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _TAG_PATTERN = re.compile(r"^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -53,7 +67,20 @@ class NativeWorkerIngressError(CapacityProviderError):
 
 
 class PublicIpv4ResolutionError(NativeWorkerIngressError):
-    """Eyvan could not safely determine the local public IPv4 address."""
+    """Eyvan could not safely determine the local public IPv4 address.
+
+    Resolution runs on the operator's own network, so a failure here is "could
+    not find out", never "the provider errored": it is classified retryable and
+    unavailable rather than a defect charged to the capacity pool.
+    """
+
+    def __init__(self, diagnostic: str, *, _endpoint_failures: tp.Sequence[str] = ()) -> None:
+        super().__init__(
+            diagnostic,
+            code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE,
+            retryable=True,
+        )
+        self.endpoint_failures = tuple(_endpoint_failures)
 
 
 class GcloudFirewallRuleError(NativeWorkerIngressError):
@@ -158,8 +185,7 @@ class FirewallRuleSpec:
     def rule_name(self) -> str:
         """Return a deterministic VPC-scoped managed firewall rule name."""
 
-        suffix = hashlib.sha256(self.network.canonical_name.encode("utf-8")).hexdigest()[:12]
-        return f"{self.network_tag}-p{self.port}-{suffix}"
+        return _managed_rule_name(self.network, self.network_tag, self.port)
 
     @property
     def description(self) -> str:
@@ -229,33 +255,65 @@ class FirewallRuleSpec:
 
 @dataclass(frozen=True, slots=True)
 class HttpPublicIpv4Resolver:
-    """Resolve a local public IPv4 from a fixed HTTPS service without proxy use."""
+    """Resolve a local public IPv4 from fixed HTTPS services without proxy use.
 
-    endpoint: str = "https://api.ipify.org"
+    One endpoint failing used to fail the whole resolution: a cell that was
+    otherwise fine was marked PROVIDER_ERROR while its TPU kept billing, only
+    because api.ipify.org had a bad minute. Resolution now walks every endpoint
+    and only reports failure when *all* of them failed -- "I could not find
+    out" requires more than one unanswered question.
+    """
+
+    endpoints: tuple[str, ...] = (
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+        "https://ipv4.icanhazip.com",
+    )
     timeout_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        if not self.endpoints:
+            raise ValueError("public IPv4 resolution requires at least one endpoint")
+        for endpoint in self.endpoints:
+            # Fail closed: an address read over plain HTTP can be steered, and
+            # the answer becomes a firewall source range.
+            if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+                raise ValueError("public IPv4 endpoints must be HTTPS URLs")
 
     def resolve(self) -> ipaddress.IPv4Address:
         """Return a strictly parsed public IPv4 address or fail closed."""
 
+        failures: list[str] = []
+        for endpoint in self.endpoints:
+            try:
+                value = self._fetch(endpoint)
+            except PublicIpv4ResolutionError as exc:
+                failures.append(f"{endpoint}: {exc.diagnostic}")
+                continue
+            return value
+        raise PublicIpv4ResolutionError(
+            "could not determine the local public IPv4 address from any discovery endpoint; "
+            "Eyvan did not change firewall ingress",
+            _endpoint_failures=failures,
+        )
+
+    def _fetch(self, endpoint: str) -> ipaddress.IPv4Address:
+        """Read one endpoint and strictly validate its answer."""
+
         try:
             with httpx.Client(timeout=self.timeout_s, trust_env=False, follow_redirects=False) as client:
-                response = client.get(self.endpoint)
+                response = client.get(endpoint)
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise PublicIpv4ResolutionError(
-                "could not determine the local public IPv4 address; Eyvan did not change firewall ingress"
-            ) from exc
+            raise PublicIpv4ResolutionError(f"request failed: {exc}") from exc
         value = response.text.strip()
         try:
             parsed = ipaddress.ip_address(value)
         except ValueError as exc:
-            raise PublicIpv4ResolutionError(
-                "public IPv4 discovery returned an invalid address; Eyvan did not change firewall ingress"
-            ) from exc
+            raise PublicIpv4ResolutionError("discovery returned an invalid address") from exc
         if not isinstance(parsed, ipaddress.IPv4Address):
-            raise PublicIpv4ResolutionError(
-                "public IPv4 discovery returned an IPv6 address; Eyvan did not change firewall ingress"
-            )
+            raise PublicIpv4ResolutionError("discovery returned an IPv6 address")
         return parsed
 
 
@@ -287,7 +345,9 @@ def _gcloud_runner(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
 
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_INGRESS_TIMEOUT_S", DEFAULT_INGRESS_TIMEOUT_S)), 1.0)
     try:
-        return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s)
+        return subprocess.run(
+            ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+        )
     except subprocess.TimeoutExpired as exc:
         raise CapacityProviderError(
             f"native worker ingress reconciliation timed out after {timeout_s:g}s: gcloud {' '.join(args[:3])}",
@@ -314,11 +374,24 @@ class GcloudNativeWorkerPublicIngress:
 
         This method does not delete rules during capacity scale-down.  The rule
         is runtime-owned and must remain available for a later scale-from-zero.
+
+        When the local public IPv4 cannot be resolved, an existing managed rule
+        is kept as it stands instead of failing the reconciliation: the rule's
+        source range was good yesterday, the readiness probe is what actually
+        decides reachability, and tearing the pass down here would strand
+        capacity that may already be serving. With no existing rule there is
+        nothing safe to keep, so the resolution error propagates.
         """
 
         target_network = FirewallNetworkReference.from_config(capacity_project=project, network=network)
         _validate_port(port)
-        source_range = ipaddress.IPv4Network(f"{self.public_ipv4_resolver.resolve()}/32")
+        try:
+            resolved = self.public_ipv4_resolver.resolve()
+        except PublicIpv4ResolutionError:
+            if self._existing_rule_is_managed(target_network, port):
+                return self.network_tag
+            raise
+        source_range = ipaddress.IPv4Network(f"{resolved}/32")
         spec = FirewallRuleSpec(
             network=target_network,
             network_tag=self.network_tag,
@@ -338,6 +411,42 @@ class GcloudNativeWorkerPublicIngress:
             return self.network_tag
         self._reconcile_existing(spec, existing)
         return self.network_tag
+
+    def _existing_rule_is_managed(self, network: FirewallNetworkReference, port: int) -> bool:
+        """Return whether the deterministic rule already exists and is ours and enabled.
+
+        Anything unreadable or surprising is answered ``False``: this path only
+        ever *keeps* a rule, and keeping requires knowing exactly what is kept.
+        """
+
+        name = _managed_rule_name(network, self.network_tag, port)
+        result = self.runner(
+            (
+                "compute",
+                "firewall-rules",
+                "describe",
+                name,
+                "--project",
+                network.project,
+                "--format=json",
+            )
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            raw = _decode_object(result.stdout, resource=f"firewall rule {name!r}")
+        except GcloudFirewallRuleError:
+            return False
+        if raw.get("disabled", False) is not False:
+            return False
+        parsed = _parse_managed_rule(raw)
+        return (
+            parsed is not None
+            and parsed.name == name
+            and parsed.network == network
+            and parsed.network_tag == self.network_tag
+            and parsed.port == port
+        )
 
     def _describe(self, spec: FirewallRuleSpec) -> JsonObject | None:
         """Return the exact rule or ``None`` when gcloud reports it absent."""

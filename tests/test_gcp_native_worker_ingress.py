@@ -16,11 +16,14 @@ from dataclasses import dataclass, field
 import pytest
 
 from eyvan._internal.json_types import JsonObject
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.providers.gcp.native_worker_ingress import (
     FirewallNetworkReference,
     FirewallRuleConflictError,
     FirewallRuleSpec,
     GcloudNativeWorkerPublicIngress,
+    HttpPublicIpv4Resolver,
+    PublicIpv4ResolutionError,
     list_managed_ingress_rules,
     release_managed_ingress_rule,
 )
@@ -327,3 +330,126 @@ def test_create_then_list_then_release_closes_the_leak() -> None:
     release_managed_ingress_rule(project="project-a", rule_name=found[0].name, runner=runner)
 
     assert list_managed_ingress_rules(project="project-a", runner=runner) == ()
+
+
+@dataclass(frozen=True, slots=True)
+class FailingPublicIpv4Resolver:
+    """A resolver that never answers, for the keep-the-existing-rule path."""
+
+    def resolve(self) -> ipaddress.IPv4Address:
+        raise PublicIpv4ResolutionError("could not determine the local public IPv4 address")
+
+
+def test_resolution_failure_keeps_an_existing_managed_rule_instead_of_failing() -> None:
+    """A bad minute at the discovery services must not strand reachable capacity.
+
+    Live on 2026-08-22: cells sat EXECUTION_CONNECTING while their TPUs billed
+    because api.ipify.org alone could not be reached and the reconciliation
+    raised instead of keeping the rule it had already written.
+    """
+
+    runner = FirewallRunner()
+    _manager(runner).ensure(project="project-a", network="research", port=8100)
+    calls_before = list(runner.calls)
+
+    manager = GcloudNativeWorkerPublicIngress(
+        network_tag=_TAG,
+        public_ipv4_resolver=FailingPublicIpv4Resolver(),
+        runner=runner,
+    )
+
+    assert manager.ensure(project="project-a", network="research", port=8100) == _TAG
+    # Keeping the rule is one describe; nothing is created or updated.
+    new_calls = runner.calls[len(calls_before) :]
+    assert [call[2] for call in new_calls] == ["describe"]
+
+
+def test_resolution_failure_without_an_existing_rule_fails_closed_and_retryable() -> None:
+    """No rule plus no address means nothing safe exists to keep."""
+
+    manager = GcloudNativeWorkerPublicIngress(
+        network_tag=_TAG,
+        public_ipv4_resolver=FailingPublicIpv4Resolver(),
+        runner=FirewallRunner(),
+    )
+
+    with pytest.raises(PublicIpv4ResolutionError) as caught:
+        manager.ensure(project="project-a", network="research", port=8100)
+
+    # "I could not find out" on the operator's own network is retryable and is
+    # never charged to the pool as a provider defect.
+    assert caught.value.code is CapacityProviderFailureCode.PROVIDER_UNAVAILABLE
+    assert caught.value.retryable is True
+
+
+def test_resolution_failure_does_not_keep_a_disabled_rule() -> None:
+    runner = FirewallRunner()
+    _manager(runner).ensure(project="project-a", network="research", port=8100)
+    runner.rules[_rule_name()]["disabled"] = True
+
+    manager = GcloudNativeWorkerPublicIngress(
+        network_tag=_TAG,
+        public_ipv4_resolver=FailingPublicIpv4Resolver(),
+        runner=runner,
+    )
+
+    with pytest.raises(PublicIpv4ResolutionError):
+        manager.ensure(project="project-a", network="research", port=8100)
+
+
+def test_resolver_walks_every_endpoint_before_failing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One discovery endpoint having a bad minute is not 'could not find out'."""
+
+    import httpx
+
+    tried: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tried.append(request.url.host)
+        if request.url.host == "api.ipify.org":
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, text="203.0.113.24\n")
+
+    original = httpx.Client
+
+    class _MappedClient(original):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _MappedClient)
+
+    resolver = HttpPublicIpv4Resolver(endpoints=("https://api.ipify.org", "https://checkip.amazonaws.com"))
+
+    assert str(resolver.resolve()) == "203.0.113.24"
+    assert tried == ["api.ipify.org", "checkip.amazonaws.com"]
+
+
+def test_resolver_records_every_failure_when_all_endpoints_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="try later")
+
+    original = httpx.Client
+
+    class _MappedClient(original):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _MappedClient)
+
+    resolver = HttpPublicIpv4Resolver(endpoints=("https://api.ipify.org", "https://checkip.amazonaws.com"))
+
+    with pytest.raises(PublicIpv4ResolutionError) as caught:
+        resolver.resolve()
+
+    assert len(caught.value.endpoint_failures) == 2
+
+
+def test_resolver_refuses_plain_http_endpoints() -> None:
+    """The answer becomes a firewall source range; it must not be steerable in cleartext."""
+
+    with pytest.raises(ValueError):
+        HttpPublicIpv4Resolver(endpoints=("http://api.ipify.org",))

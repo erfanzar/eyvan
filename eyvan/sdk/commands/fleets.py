@@ -19,6 +19,7 @@ from pydantic import ValidationError
 import eyvan.sdk.commands.autoscale as autoscale_commands
 import eyvan.sdk.commands.fleet_status as fleet_status_rendering
 from eyvan._internal.json_types import JsonObject, is_json_object, model_json
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.autoscale import AutoscaleConfigCache, CachedAutoscaleConfig, QueueAdmissionDenialRecorder
 from eyvan.capacity.fleet_config import EyvanFleetConfig, validate_fleet_name
 from eyvan.capacity.providers.gcp.runtime.supervisor import (
@@ -65,6 +66,7 @@ def _zones_for_region(region: str, project: str) -> tuple[str, ...]:
         text=True,
         check=False,
         timeout=60,
+        env=provider_cli_env(),
     )
     if result.returncode != 0:
         raise click.ClickException(f"could not list zones for {region}: {result.stderr.strip()}")

@@ -46,6 +46,7 @@ from pathlib import Path
 
 import click
 
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.records import CellState
 from eyvan.sdk.commands.state import CliSession
 from eyvan.soak_contract import MAX_SAFE_COUNTER, is_opaque_id
@@ -96,13 +97,16 @@ def _run_command(argv: tp.Sequence[str], *, timeout_s: float) -> subprocess.Comp
 
     try:
         # No shell: the operator's argv is executed literally, so quoting and
-        # $IFS in the surrounding environment cannot change what runs.
+        # $IFS in the surrounding environment cannot change what runs. The
+        # environment is still scrubbed of interpreter steering, because the
+        # command is usually a provider CLI embedding its own Python.
         return subprocess.run(
             list(argv),
             capture_output=True,
             text=True,
             timeout=timeout_s,
             check=False,
+            env=provider_cli_env(),
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None

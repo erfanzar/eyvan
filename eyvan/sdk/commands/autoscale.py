@@ -22,6 +22,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.autoscale import (
     AutoscaleConfigCache,
     AutoscaleDefaults,
@@ -61,6 +62,7 @@ def gcloud_default_project() -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            env=provider_cli_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

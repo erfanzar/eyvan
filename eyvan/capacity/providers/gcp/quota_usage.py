@@ -20,6 +20,7 @@ import httpx
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.subprocess_env import provider_cli_env
 
 _MONITORING_TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
 _QUOTA_USAGE_METRIC = "serviceruntime.googleapis.com/quota/allocation/usage"
@@ -40,7 +41,9 @@ def _token_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run the installed gcloud CLI only to obtain an active access token."""
 
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_QUOTA_TIMEOUT_S", "60")), 1.0)
-    return subprocess.run(["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s)
+    return subprocess.run(
+        ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+    )
 
 
 def _utc_now() -> datetime:
