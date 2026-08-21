@@ -236,6 +236,34 @@ def discover_node_token(
         raise NodeContextError(f"could not read this node's control-plane credential {source}: {exc}") from exc
 
 
+def discover_node_token_or_warn(
+    endpoint: ControlPlaneEndpoint,
+    environ: tp.Mapping[str, str] | None = None,
+    *,
+    warn: tp.Callable[[str], None] | None = None,
+) -> str | None:
+    """Discover this node's credential, reporting rather than raising when it cannot.
+
+    :func:`discover_node_token` raises on an unreadable credential because
+    silence there becomes an unexplained 401 much later. That is right for a
+    caller that needs the credential and wrong as a *startup* step: most commands
+    need no credential at all, and failing `eyvan context` because a token file
+    is unreadable turns one degraded capability into a completely unusable CLI.
+
+    So the explanation is delivered where it is discovered, and the process
+    continues without a token. A command that genuinely needed one still fails --
+    but the operator has already been told exactly why, and by then it reads as
+    the cause rather than a mystery.
+    """
+
+    try:
+        return discover_node_token(endpoint, environ)
+    except NodeContextError as error:
+        if warn is not None:
+            warn(str(error))
+        return None
+
+
 __all__ = (
     "HEAD_ENVIRONMENT_PATH",
     "NODE_CONTEXT_PATH",
@@ -244,6 +272,7 @@ __all__ = (
     "NodeContextError",
     "discover_node_context",
     "discover_node_token",
+    "discover_node_token_or_warn",
     "head_environment_path",
     "node_context_path",
     "write_node_context",

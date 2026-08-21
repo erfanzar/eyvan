@@ -15,6 +15,7 @@ import os
 import threading
 import typing as tp
 import uuid
+import warnings
 from dataclasses import dataclass, field
 
 from eyvan._internal.workspace import build_workspace
@@ -55,7 +56,7 @@ from eyvan.sdk.contexts import (
     context_config_path,
     get_active_context,
 )
-from eyvan.sdk.node import discover_node_context, discover_node_token
+from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
 from eyvan.server.local.daemon import ensure_loopback_control_plane
 from eyvan.worker.runtime.callables import dump_callable
 from eyvan.worker.runtime.in_job import in_job_context
@@ -232,7 +233,13 @@ def init(
             # Read from this node's own installer-written credential when the
             # endpoint is exactly the plane this node serves. Never copied
             # anywhere; see ``discover_node_token``.
-            token=token or environment.get("EYVAN_TOKEN") or discover_node_token(endpoint, environment),
+            token=token
+            or environment.get("EYVAN_TOKEN")
+            or discover_node_token_or_warn(
+                endpoint,
+                environment,
+                warn=lambda message: warnings.warn(message, RuntimeWarning, stacklevel=2),
+            ),
             dev_user=dev_user or environment.get("EYVAN_DEV_USER"),
             dev_org=configured_org,
             dev_project=configured_project,

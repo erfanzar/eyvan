@@ -17,6 +17,7 @@ from eyvan.sdk.node import (
     NodeContextError,
     discover_node_context,
     discover_node_token,
+    discover_node_token_or_warn,
     write_node_context,
 )
 
@@ -204,3 +205,47 @@ def test_an_unreadable_credential_names_the_group_instead_of_401ing_later(
 
     with pytest.raises(NodeContextError, match="eyvan-head"):
         discover_node_token(ControlPlaneEndpoint.parse(_INTERNAL_URL), environ)
+
+
+def test_an_unreadable_credential_does_not_break_commands_that_need_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Found on the first real head: this broke every command, including `eyvan context`.
+
+    Raising is right for a caller that needs the credential -- silence there
+    becomes an unexplained 401 much later. It is wrong as a startup step, which
+    is where both the CLI and `init()` call it: most commands need no credential,
+    and one unreadable file turned a degraded capability into a CLI that could
+    not run at all, with a traceback instead of the message.
+
+    The explanation is still delivered, once, where it is discovered.
+    """
+
+    environ = _node(tmp_path)
+    original = Path.open
+
+    def deny(self: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if self.name == "head.env":
+            raise PermissionError(13, "Permission denied")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", deny)
+    reported: list[str] = []
+
+    token = discover_node_token_or_warn(
+        ControlPlaneEndpoint.parse(_INTERNAL_URL),
+        environ,
+        warn=reported.append,
+    )
+
+    assert token is None
+    assert len(reported) == 1
+    assert "eyvan-head" in reported[0]
+
+    # And `init()` still produces a usable client -- pointed at the right plane,
+    # simply without a credential it could not read.
+    context = init(environ=environ)
+    url, authorization = _wire(context)
+    assert url.rstrip("/") == _INTERNAL_URL
+    assert authorization is None

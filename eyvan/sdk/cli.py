@@ -40,7 +40,7 @@ from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
-from eyvan.sdk.node import discover_node_context, discover_node_token
+from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
 from eyvan.sdk.terminal import stream_is_terminal
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
@@ -94,7 +94,11 @@ def main(
             )
     identity = resolve_control_plane_identity(
         endpoint,
-        token=token or discover_node_token(endpoint),
+        token=token
+        or discover_node_token_or_warn(
+            endpoint,
+            warn=lambda message: click.echo(message, err=True),
+        ),
         dev_user=user,
         dev_org=org_id,
         dev_project=project_id,
