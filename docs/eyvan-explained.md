@@ -30,12 +30,12 @@ orchestrator*, not reimplementing its runtime.
 | | |
 |---|---|
 | Python | 222 modules |
-| Tests | 4,488 passing against real PostgreSQL 17.5 |
-| HTTP routes | 103 |
-| CLI commands | 95 leaf commands in 32 groups |
+| Tests | 5,718 passing against real PostgreSQL 17.5 |
+| HTTP routes | 92 unique method/path pairs |
+| CLI commands | 122 leaf commands in 25 groups |
 | Durable tables | 26 |
 | Migrations | 21, single head `0018_service_operations` |
-| Leader phases | 25 |
+| Leader phases | 27 |
 | Layering contracts | 7, CI-enforced |
 
 ---
@@ -345,9 +345,10 @@ than as a shorter complete-looking page · terminal logs are archived before the
 capacity is released · only proved artifacts are readable.
 
 **Not guaranteed, and stated rather than implied:**
-nothing here is qualified on real hardware beyond three recorded proofs
-(P1, P6, P7) · four proofs (P2–P5) have never exercised their behaviour and exit
-**2** · no image has been published, signed, or deployed · GPU support is
+nothing here is qualified on real hardware beyond the proofs with exit-0
+receipts in `docs/proofs.md` (P1, P2, P3 both halves, P4, P5, P6, P7 as of
+2026-08-13; P8/P9 remain open) · no image has been published, signed, or
+deployed · GPU support is
 modelled and reachable but no GPU has executed an Eyvan workload · federation is
 deferred until there is real PKI.
 

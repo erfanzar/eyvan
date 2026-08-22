@@ -27,7 +27,9 @@ than a silent duplicate or skip.
 
 Still pending: a retained legacy multi-rank cursor is answered with a reset
 rather than resumed, because nothing can prove which rank space it names; and
-none of this is qualified on real multi-host hardware -- P2 remains at exit 2.
+none of this is qualified on real multi-host hardware -- P2 recorded an exit-0
+receipt on 2026-08-13, but the v2 cursor and manifest writers it exercised remain
+off by default pending fleet decode coverage.
 
 **Scope:** Live structured logs, multi-worker cells, multi-cell gangs, resume
 cursors, terminal archives, and legacy readers. The context below records the
