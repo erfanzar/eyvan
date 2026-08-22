@@ -151,6 +151,44 @@ Read `collectable` before enabling collection, not after. It is the only view
 that distinguishes "unreferenced and past its window" from "still referenced by
 a queued workload", and those look identical in a bucket listing.
 
+## Native-worker ingress rules outlive their heads
+
+Eyvan has no code path that deletes a native-worker ingress firewall rule. It
+creates one -- `ensure` in
+`eyvan/capacity/providers/gcp/native_worker_ingress.py` -- and reconciles it,
+and nothing in this package removes it. `eyvan head down` deletes the head's
+*own* rules, the control-plane port and SSH, which is why a clean teardown still
+leaves these behind.
+
+One accumulates per head, because the target tag is
+`HMAC(native_worker_root_secret, project_id)` and each head is given its own
+secret. The source range is the public IPv4 of whatever machine ran the CLI, so
+a laptop on a new network adds another. GCP allows 100 firewall rules per
+project by default, and reaching that stops *every* fleet in the project from
+provisioning -- including other people's, on a shared project.
+
+List them, and read before deleting:
+
+```
+gcloud compute firewall-rules list --project <p> \
+  --filter='description ~ eyvan-native-worker-ingress' \
+  --format='table(name, creationTimestamp, sourceRanges.list(), targetTags.list())'
+```
+
+A rule is reclaimable when no live head answers on the IP in `sourceRanges` and
+no instance carries its `targetTags`. Neither is implied by the cells being
+gone: the tag belongs to the *head's* secret rather than to a cell, so a rule
+whose slices were all deleted may still be the one a running head needs to reach
+the workers it provisions next. Delete on that evidence, not on age.
+
+```
+gcloud compute firewall-rules delete <name> --project <p>
+```
+
+Observed 2026-08-13: two rules dated 2026-07-13 and 2026-08-10 in
+`example-project`, both orphaned, after a `head down` that correctly removed
+the two rules it did own.
+
 ## Several GPU ranks on one host
 
 A GPU gang places one process per native-worker endpoint. By default a host
