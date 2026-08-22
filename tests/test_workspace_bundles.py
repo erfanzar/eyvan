@@ -519,3 +519,62 @@ def test_no_signing_key_means_no_bundle_signature(tmp_path: Path) -> None:
 
     assert captured[0].workspace_signature is None
     assert captured[0].workspace_sha256 is not None
+
+
+def test_a_preemption_retry_serves_the_callable_from_the_cell_cache(
+    tmp_path: Path,
+    restore_process_state,
+) -> None:
+    """Second run with the source gone still works: sha256 is the validity check."""
+
+    cache_root = tmp_path / "callable-cache"
+    artifact = dump_callable(lambda: 41)
+    first = _MemoryTransfer({"mem://callable": artifact.payload})
+    environment = {
+        "EYVAN_NATIVE_WORKER_STATE_DIR": str(tmp_path),
+        "EYVAN_CALL_ARGS_JSON": "[]",
+    }
+
+    common = [
+        "--uri",
+        "mem://callable",
+        "--sha256",
+        artifact.sha256,
+        "--python",
+        artifact.python,
+    ]
+
+    # First attempt: a miss, which fills the cache after verifying the digest.
+    assert (
+        execute_callable(
+            [*common, "--result-uri", "mem://result"],
+            transfer=first,
+            environment=environment,
+        )
+        == 0
+    )
+    cached = cache_root / f"{artifact.sha256}.pkl"
+    assert cached.is_file()
+
+    # The retry: the origin has lost the object entirely (a spot reclaim
+    # between attempts), and the run still succeeds from the cached bytes --
+    # which the normal digest + signature verification still checks.
+    empty = _MemoryTransfer({})
+    assert (
+        execute_callable(
+            [*common, "--result-uri", "mem://result"],
+            transfer=empty,
+            environment=environment,
+        )
+        == 0
+    )
+
+    # Corrupt cache bytes are refused by the existing integrity path, not
+    # silently served.
+    cached.write_bytes(b"tampered")
+    with pytest.raises(Exception):
+        execute_callable(
+            [*common],
+            transfer=_MemoryTransfer({}),
+            environment=environment,
+        )

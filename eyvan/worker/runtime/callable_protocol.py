@@ -422,6 +422,87 @@ def _materialize_workspace(
     return destination
 
 
+#: Content-addressed read cache for callable and workspace bytes. The digest
+#: IS the validity check -- a file named by sha256 can only be served if it
+#: was written after a byte-for-byte match -- so caching needs no invalidation
+#: logic, and a preemption retry skips the re-download Ray pays every time.
+_CACHE_MAX_FILES = 128
+
+
+def _cache_root(environment: tp.Mapping[str, str]) -> Path | None:
+    """Resolve the cache directory, or ``None`` when caching is unavailable.
+
+    Caching opts in through the native worker's existing state directory: the
+    worker process always knows one, while ad-hoc invocations (and tests that
+    count fetches against a fake origin) stay exactly as they were.
+    """
+
+    base = environment.get("EYVAN_NATIVE_WORKER_STATE_DIR")
+    if not base:
+        return None
+    root = Path(base) / "callable-cache"
+    try:
+        _ensure_private_dir(root)
+        return root
+    except OSError:
+        return None
+
+
+def _ensure_private_dir(root: Path) -> None:
+    # Inlined rather than imported: this module is copied into the OCI
+    # callable runner, which must not import eyvan.
+    missing: list[Path] = []
+    cursor = root
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        existing_mode = directory.stat().st_mode & 0o777
+        if existing_mode != 0o700:
+            directory.chmod(0o700)
+
+
+def _prune_cache(root: Path) -> None:
+    """Keep the cache bounded; oldest entries go first."""
+
+    entries = sorted(
+        (path for path in root.iterdir() if path.is_file() and path.suffix == ".pkl"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    for path in entries[: max(len(entries) - _CACHE_MAX_FILES, 0)]:
+        path.unlink(missing_ok=True)
+
+
+def _read_cached(
+    transfer: ArtifactTransfer,
+    *,
+    uri: str,
+    token: str | None,
+    expected_sha256: str,
+    cache_root: Path | None,
+) -> bytes:
+    """Serve content-addressed bytes from the cell's cache, filling on miss."""
+
+    if not expected_sha256 or cache_root is None:
+        return transfer.read(uri, token=token)
+    candidate = cache_root / f"{expected_sha256}.pkl"
+    try:
+        return candidate.read_bytes()
+    except OSError:
+        pass
+    payload = transfer.read(uri, token=token)
+    if hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256):
+        try:
+            temporary = candidate.with_name(f"{candidate.name}.{os.getpid()}.tmp")
+            temporary.write_bytes(payload)
+            os.replace(temporary, candidate)
+            _prune_cache(cache_root)
+        except OSError:
+            pass
+    return payload
+
+
 def execute_callable(
     argv: tp.Sequence[str] | None,
     *,
@@ -469,7 +550,13 @@ def execute_callable(
         # The workspace lands before the callable is unpickled: unpickling may
         # import modules that only exist inside the shipped working directory.
         _materialize_workspace(
-            transfer.read(workspace_uri, token=environment.get(args.workspace_token_env or "") or None),
+            _read_cached(
+                transfer,
+                uri=workspace_uri,
+                token=environment.get(args.workspace_token_env or "") or None,
+                expected_sha256=args.workspace_sha256,
+                cache_root=_cache_root(environment),
+            ),
             sha256=args.workspace_sha256,
             signature=args.workspace_signature,
             signing_key=signing_key,
@@ -478,7 +565,13 @@ def execute_callable(
 
     fn = load_callable(
         CallableArtifact(
-            payload=transfer.read(artifact_uri, token=artifact_token),
+            payload=_read_cached(
+                transfer,
+                uri=artifact_uri,
+                token=artifact_token,
+                expected_sha256=args.sha256,
+                cache_root=_cache_root(environment),
+            ),
             sha256=args.sha256,
             python=args.python,
             format_version=args.format_version,
