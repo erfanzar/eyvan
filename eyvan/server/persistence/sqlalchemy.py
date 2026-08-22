@@ -1593,7 +1593,15 @@ class SqlAlchemySession:
         return _decode_rows(AuditEvent, rows, table="audit_events")
 
 
+class _TransactionBodyFailure(Exception):
+    """Marks an exception raised by a transaction's caller, not its commit."""
+
+
 class SqlAlchemyRepository:
+    #: Serialization failures and deadlocks are retried inside the service;
+    #: unique violations are not (a replay would fail identically).
+    _RETRYABLE_SQLSTATES: tp.ClassVar[frozenset[str]] = frozenset({"40001", "40P01"})
+    MAX_TRANSACTION_ATTEMPTS: tp.ClassVar[int] = 6
     """Production repository; each service operation commits as one DB transaction."""
 
     def __init__(self, engine: AsyncEngine):
@@ -1736,14 +1744,45 @@ class SqlAlchemyRepository:
 
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[SqlAlchemySession]:
-        try:
-            async with self._sessions.begin() as session:
-                yield SqlAlchemySession(session)
-        except DBAPIError as exc:
-            translated = self._translated(exc)
-            if translated is exc:
-                raise
-            raise translated from exc
+        body_failure: BaseException | None = None
+        for attempt in range(self.MAX_TRANSACTION_ATTEMPTS):
+            try:
+                async with self._sessions.begin() as session:
+                    try:
+                        yield SqlAlchemySession(session)
+                    except BaseException as body_exc:
+                        # The caller's unit of work already aborted; re-running
+                        # it from here is impossible and replaying the commit
+                        # is not the same thing. Translate it exactly as a
+                        # single-shot transaction would have, so a conflict
+                        # raised by one of its statements still surfaces as the
+                        # typed retryable error callers already handle.
+                        body_failure = body_exc
+                        raise _TransactionBodyFailure(body_exc) from body_exc
+            except _TransactionBodyFailure as wrapper:
+                original = wrapper.__cause__
+                assert original is not None
+                if isinstance(original, DBAPIError):
+                    translated = self._translated(original)
+                    raise (original if translated is original else translated) from original
+                raise original from None
+            except DBAPIError as exc:
+                sqlstate = _transaction_sqlstate(exc.orig)
+                if sqlstate not in self._RETRYABLE_SQLSTATES:
+                    translated = self._translated(exc)
+                    raise (exc if translated is exc else translated) from exc
+                # A serialization failure or deadlock means PostgreSQL told us
+                # the *same call* would likely succeed now: retrying here keeps
+                # every client from having to implement that loop, and the
+                # 503+Retry-After path becomes what it always should have been
+                # -- the answer after the service itself gave up.
+                if attempt == self.MAX_TRANSACTION_ATTEMPTS - 1:
+                    translated = self._translated(exc)
+                    raise (exc if translated is exc else translated) from exc
+                await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
+            else:
+                return
+        assert body_failure is None  # unreachable: body failures re-raise above
 
     async def wait_for_events(
         self,

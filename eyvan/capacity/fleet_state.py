@@ -544,7 +544,18 @@ class _GangMember(BaseModel):
 class FleetStateStore:
     """Typed, fenced operations over a shared Eyvan fleet document."""
 
-    def __init__(self, backend: DocumentBackend, *, lease_ttl_s: float = 3600, owner: str | None = None):
+    #: How long a mutation lease outlives its holder's last renewal. The
+    #: renewal thread inside ``exclusive`` refreshes every ttl/3 while a
+    #: mutation runs, so a live holder never loses its lease however long the
+    #: provider takes -- which is what makes a *short* default safe. The point
+    #: of the bound is the holder that cannot renew: a crashed or fully wedged
+    #: agent, on any host, freezes fleet mutations only until the TTL expires
+    #: instead of for an hour. Same-host dead PIDs were already breakable
+    #: (``_holder_is_dead``); this closes the cross-host gap, where nothing can
+    #: observe the process at all.
+    DEFAULT_LEASE_TTL_S: tp.ClassVar[float] = 300
+
+    def __init__(self, backend: DocumentBackend, *, lease_ttl_s: float = DEFAULT_LEASE_TTL_S, owner: str | None = None):
         if lease_ttl_s <= 0:
             raise ValueError("fleet mutation lease TTL must be positive")
         self.backend = backend
@@ -557,7 +568,7 @@ class FleetStateStore:
         self._exclusive_lock = _lock_for(self._owner, backend.mutation_scope)
 
     @classmethod
-    def from_uri(cls, uri: str | None, *, lease_ttl_s: float = 3600, owner: str | None = None) -> FleetStateStore:
+    def from_uri(cls, uri: str | None, *, lease_ttl_s: float = 300, owner: str | None = None) -> FleetStateStore:
         if uri and "://" in uri:
             if uri.startswith("gs://"):
                 return cls(GcsBackend(uri), lease_ttl_s=lease_ttl_s, owner=owner)

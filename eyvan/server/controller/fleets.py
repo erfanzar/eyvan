@@ -21,6 +21,7 @@ from eyvan.capacity.autoscale.pool_capacity import ClusterCapacityPass
 from eyvan.capacity.planning import (
     CapacityPlanner,
     CapacitySimulation,
+    PoolScalePlan,
     cell_matches_pool,
     cell_requires_replacement,
     next_pool_cell_index,
@@ -398,6 +399,7 @@ class _ControllerFleets:
         )
         planner = CapacityPlanner(pool_records, cells_by_pool, now)
         plans = planner.plan(demand_by_pool)
+        await self._persist_shrink_clocks(pool_records, plans, now)
         await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)
         await self._record_acquisition_exhausted(tuple(workloads), simulation.acquisition_exhausted_workload_ids)
 
@@ -600,6 +602,32 @@ class _ControllerFleets:
                 drained += 1
 
         return {"launched": launched, "drained": drained, "deleted": deleted}
+
+    async def _persist_shrink_clocks(
+        self,
+        pools: tuple[CapacityPoolRecord, ...],
+        plans: dict[str, PoolScalePlan],
+        now: datetime,
+    ) -> None:
+        """Persist what the planner decided about each pool's shrink clock.
+
+        The planner reads ``demand_below_supply_since`` and decides; this is the
+        write side. A pool whose record moved underneath the pass (an operator
+        edit bumped its generation) is skipped -- the next pass re-judges from
+        fresh state rather than stamping a stale view.
+        """
+
+        for pool in pools:
+            plan = plans[pool.id]
+            if not plan.shrink_since_changed:
+                continue
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_capacity_pool(pool.id)
+                if current is None or current.generation != pool.generation:
+                    continue
+                await transaction.put_capacity_pool(
+                    current.model_copy(update={"demand_below_supply_since": plan.shrink_since_update})
+                )
 
     async def reconcile_unmanaged_capacity_recoveries_once(self) -> int:
         """Resume manual cells whose agent fence conflict survived a controller interruption."""

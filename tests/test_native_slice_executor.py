@@ -15,6 +15,7 @@ import pytest
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
+from eyvan.worker.runtime._multihost_site import GangInitializationPolicy
 from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
 
 
@@ -321,7 +322,15 @@ def test_native_slice_aggregates_worker_statuses_and_fans_out_stop_and_logs() ->
     endpoints = ("http://worker-a:8100", "http://worker-b:8100")
     clients = [_client(endpoints[0], first_worker), _client(endpoints[1], second_worker)]
     try:
-        executor = NativeSliceExecutor(endpoints, secret="worker-secret", clients=clients)
+        # Fatality off keeps this test about aggregation alone; with the fatal
+        # hook on, a FAILED aggregate also polls each rank's process status,
+        # which is covered by the cold-gang-initialization suite.
+        executor = NativeSliceExecutor(
+            endpoints,
+            secret="worker-secret",
+            clients=clients,
+            initialization=GangInitializationPolicy(fatal=False),
+        )
 
         partial = executor.status("slice-job")
         assert partial["remote_id"] == "slice-job"

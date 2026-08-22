@@ -65,6 +65,7 @@ def cpu_pool(
     queue_timeout_s: float | None = None,
     provisioning_timeout_s: float = 1800,
     hourly_cpu_price: float = 0,
+    shrink_stabilization_s: float = 0,
 ) -> CapacityPoolRecord:
     return CapacityPoolRecord(
         id=pool_id,
@@ -87,6 +88,7 @@ def cpu_pool(
         idle_timeout_s=idle_timeout_s,
         queue_timeout_s=queue_timeout_s,
         provisioning_timeout_s=provisioning_timeout_s,
+        shrink_stabilization_s=shrink_stabilization_s,
     )
 
 
@@ -95,6 +97,7 @@ def tpu_pool(
     *,
     accelerator_type: str = "v5p-512",
     max_cells: int = 4,
+    shrink_stabilization_s: float = 0,
 ) -> CapacityPoolRecord:
     return CapacityPoolRecord(
         id=pool_id,
@@ -114,6 +117,7 @@ def tpu_pool(
         labels={"eyvan_resource_kind": "tpu"},
         min_cells=0,
         max_cells=max_cells,
+        shrink_stabilization_s=shrink_stabilization_s,
     )
 
 
@@ -122,6 +126,7 @@ def multislice_tpu_pool(
     min_workers: int = 0,
     max_workers: int = 10_000,
     idle_timeout_s: float = 300,
+    shrink_stabilization_s: float = 0,
 ) -> CapacityPoolRecord:
     """Return the autoscaler template for one v5p-16 TPU slice."""
 
@@ -133,6 +138,7 @@ def multislice_tpu_pool(
             "launch_batch": 8,
             "min_cells": min_workers,
             "idle_timeout_s": idle_timeout_s,
+            "shrink_stabilization_s": shrink_stabilization_s,
         }
     )
 
@@ -1673,3 +1679,75 @@ async def test_an_idle_cell_is_kept_for_reuse_until_its_window_expires() -> None
     async with repository.transaction() as transaction:
         released = (await transaction.list_cells())[0]
     assert released.state is CellState.DRAINING
+
+
+async def test_a_demand_shortfall_must_hold_before_the_pool_begins_idling_out_supply() -> None:
+    """Shrink hysteresis: one quiet pass does not tear down what cold starts buy.
+
+    With a stabilization window configured, demand that drops below supply
+    holds the pool's shape until the shortfall has persisted for the window;
+    only then does the idle clock get its turn. The controller is what makes
+    the clock real: it stamps the pool on first sight and clears it when
+    supply is wanted again.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    await service.apply_fleet(
+        fleet_admin(),
+        "research",
+        (cpu_pool(initial_cells=1).model_copy(update={"idle_timeout_s": 60, "shrink_stabilization_s": 3600}),),
+        idempotency_key="fleet-v1",
+    )
+    await controller.reconcile_capacity_pools_once()
+
+    async def set_idle_for(seconds: float) -> None:
+        async with repository.transaction() as transaction:
+            cell = (await transaction.list_cells())[0]
+            await transaction.put_cell(
+                cell.model_copy(
+                    update={
+                        "state": CellState.READY,
+                        "provider_phase": CapacityStatus.HEALTHY,
+                        "idle_since": cell.created_at - timedelta(seconds=seconds),
+                    }
+                )
+            )
+
+    # The cell is long past its idle timeout, but the shortfall was first seen
+    # this pass: the shape holds and the clock starts.
+    await set_idle_for(10_000)
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        cell = (await transaction.list_cells())[0]
+        assert cell.state is CellState.READY
+        pool = await transaction.get_capacity_pool("research/cpu")
+        assert pool is not None
+        assert pool.demand_below_supply_since is not None
+
+    # The shortfall holds past the window: the target falls, and the idle
+    # timeout drains the surplus.
+    async def age_the_clock() -> None:
+        async with repository.transaction() as transaction:
+            current = await transaction.get_capacity_pool("research/cpu")
+            assert current is not None and current.demand_below_supply_since is not None
+            await transaction.put_capacity_pool(
+                current.model_copy(
+                    update={
+                        "demand_below_supply_since": current.demand_below_supply_since - timedelta(seconds=7200),
+                    }
+                )
+            )
+
+    await age_the_clock()
+    # Held passes kept clearing the idle clock; re-age it now that the window
+    # has elapsed, so the idle timeout itself can fire.
+    await set_idle_for(10_000)
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        cell = (await transaction.list_cells())[0]
+        assert cell.state is CellState.DRAINING
+        cleared = await transaction.get_capacity_pool("research/cpu")
+        assert cleared is not None
+        assert cleared.demand_below_supply_since is None

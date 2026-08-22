@@ -3882,6 +3882,21 @@ class ControlPlaneService:
                 # from here on, which deserves its own deliberate call rather
                 # than being a side effect of an update that changed max_cells.
                 self.authorizer.require(principal, Permission.MANAGE_FLEET)
+            # A pool joining (or editing) a shared-quota group must agree with
+            # the group it lands in. The planner spends the *minimum* member
+            # limit, so a silently disagreeing upsert would tighten the whole
+            # group's budget without telling anyone; rejecting it here turns
+            # that into a loud, per-pool configuration error instead.
+            if stored_quota_group := pool.quota_group:
+                peers = [
+                    candidate
+                    for candidate in await tx.list_capacity_pools(fleet_name=pool.fleet_name)
+                    if candidate.quota_group == stored_quota_group and candidate.id != pool.id
+                ]
+                try:
+                    validate_capacity_pool_quota_groups([*peers, pool])
+                except ValueError as exc:
+                    raise InputError(str(exc)) from exc
             now = utcnow()
             stored = pool.model_copy(
                 update={

@@ -9,11 +9,13 @@ import asyncio
 import importlib
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from eyvan._internal.json_types import JsonObject, model_json
@@ -36,7 +38,8 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
-from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow
+from eyvan.server.persistence.base import TransientRepositoryError
+from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow, SqlAlchemyRepository
 
 
 def _legacy_multislice_cell() -> JsonObject:
@@ -855,3 +858,104 @@ def test_migration_0004_downgrade_drops_exactly_added_indexes_and_columns(monkey
     expected_columns = {(table, column) for table, columns in _EXPECTED_FILTER_COLUMNS.items() for column, _ in columns}
     assert set(dropped_indexes) == expected_indexes
     assert set(dropped_columns) == expected_columns
+
+
+class _FlakyBeginSessions:
+    """A session factory whose first commits fail like SERIALIZABLE does."""
+
+    def __init__(self, failures: int, sqlstate: str = "40001") -> None:
+        self.failures = failures
+        self.sqlstate = sqlstate
+        self.begins = 0
+
+    @asynccontextmanager
+    async def begin(self):
+        self.begins += 1
+        if self.begins <= self.failures:
+
+            class _Orig(OSError):
+                pgcode = self.sqlstate
+
+            raise DBAPIError("SELECT 1", {}, _Orig("conflict"))
+        yield object()
+
+
+class _RaisingBody:
+    """A body that fails inside the transaction, the way caller bugs do."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.runs = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def run(self):
+        raise self.error
+
+
+def test_transaction_retries_a_serialization_failure_in_service(tmp_path) -> None:
+    repository = SqlAlchemyRepository.__new__(SqlAlchemyRepository)
+    sessions = _FlakyBeginSessions(failures=2)
+    repository._sessions = sessions
+
+    seen: list[object] = []
+
+    async def scenario() -> None:
+        async with repository.transaction() as session:
+            seen.append(session)
+
+    asyncio.run(scenario())
+
+    # Three attempts were made; only the successful one reached the body --
+    # a failed begin or commit never ran it.
+    assert sessions.begins == 3
+    assert len(seen) == 1
+
+
+def test_transaction_gives_up_after_its_attempt_budget(tmp_path) -> None:
+
+    repository = SqlAlchemyRepository.__new__(SqlAlchemyRepository)
+    repository._sessions = _FlakyBeginSessions(failures=99)
+
+    async def scenario() -> None:
+        async with repository.transaction():
+            pass
+
+    try:
+        asyncio.run(scenario())
+    except TransientRepositoryError:
+        pass
+    else:
+        raise AssertionError("an exhausted retry budget must surface as transient")
+    assert repository._sessions.begins == SqlAlchemyRepository.MAX_TRANSACTION_ATTEMPTS
+
+
+def test_transaction_does_not_retry_a_body_failure() -> None:
+    repository = SqlAlchemyRepository.__new__(SqlAlchemyRepository)
+    sessions = _FlakyBeginSessions(failures=0)
+    repository._sessions = sessions
+
+    class _Orig(OSError):
+        pgcode = "40001"
+
+    body = _RaisingBody(DBAPIError("INSERT 1", {}, _Orig("duplicate key")))
+
+    async def scenario() -> None:
+        async with repository.transaction():
+            await body.run()
+
+    try:
+        asyncio.run(scenario())
+    except TransientRepositoryError:
+        pass
+    except DBAPIError as raw:  # pragma: no cover - contract guard
+        raise AssertionError("a body conflict must surface translated, not raw") from raw
+    else:
+        raise AssertionError("a caller's own failure must not be swallowed")
+    # Exactly one begin: a body failure cannot be retried by re-yielding, but
+    # it is still translated so callers see the typed retryable error.
+    assert sessions.begins == 1

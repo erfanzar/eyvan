@@ -10,7 +10,7 @@ import os
 import stat
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -25,6 +25,7 @@ from eyvan.capacity.autoscale import (
     AutoscaleRequest,
     AutoscaleZoneRequest,
     GeneratedAutoscaleConfig,
+    QueueAdmissionDenialCache,
     QueueAdmissionDenialKey,
     QuotaSnapshot,
     TpuProfile,
@@ -200,12 +201,31 @@ def test_cache_round_trips_yaml_and_non_secret_quota_metadata(tmp_path) -> None:
 
 def test_queue_admission_denial_cache_is_exact_owner_only_and_explicitly_clearable(tmp_path) -> None:
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
-    recorded = cache.record_queue_admission_denial(
+    # A denial blocks only while it is fresh: one from a day and a half ago has
+    # expired, so the exact shape becomes selectable again without a human.
+    stale = cache.record_queue_admission_denial(
         project="project-a",
         zone="us-east5-a",
         accelerator_type="v6e-16",
         capacity_class=CapacityClass.SPOT,
-        observed_at=datetime(2026, 7, 15, 12, 30, tzinfo=UTC),
+        observed_at=datetime.now(UTC) - timedelta(seconds=QueueAdmissionDenialCache.DEFAULT_TTL_S + 60),
+    )
+    assert (
+        cache.blocks_queue_admission_denial(
+            project="project-a",
+            zone="us-east5-a",
+            accelerator_type="v6e-16",
+            capacity_class=CapacityClass.SPOT,
+        )
+        is False
+    )
+    assert cache.list_queue_admission_denials() == ()
+    fresh = cache.record_queue_admission_denial(
+        project="project-a",
+        zone="us-east5-a",
+        accelerator_type="v6e-16",
+        capacity_class=CapacityClass.SPOT,
+        observed_at=datetime.now(UTC) - timedelta(seconds=60),
     )
     key = QueueAdmissionDenialKey(
         project="project-a",
@@ -214,7 +234,8 @@ def test_queue_admission_denial_cache_is_exact_owner_only_and_explicitly_clearab
         capacity_class=CapacityClass.SPOT,
     )
 
-    assert recorded.key == key
+    assert fresh.key == key
+    del stale
     assert cache.blocks_queue_admission_denial(
         project="project-a",
         zone="us-east5-a",
@@ -248,7 +269,7 @@ def test_queue_admission_denial_cache_is_exact_owner_only_and_explicitly_clearab
         )
         is False
     )
-    assert cache.list_queue_admission_denials() == (recorded,)
+    assert cache.list_queue_admission_denials() == (fresh,)
     denial_path = cache.root / "queue-admission-denials.json"
     assert stat.S_IMODE(denial_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(cache.root.stat().st_mode) == 0o700

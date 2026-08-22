@@ -782,22 +782,21 @@ async def test_a_stale_generation_is_refused_before_any_host_is_contacted(tmp_pa
     assert [host.calls for host in hosts] == [[], [], [], []]
 
 
-async def test_a_generation_that_moves_mid_fanout_stops_at_the_host_it_reached(tmp_path: Path) -> None:
-    """The fence is per host, because a slice-wide fetch is minutes long.
+async def test_a_generation_that_moves_mid_fanout_leaves_the_stage_unproven(tmp_path: Path) -> None:
+    """The fence brackets the fan-out: read before any host is dispatched, and
+    again once every host has answered.
 
-    Checked once before any host and again between hosts: a fan-out that began
-    under a generation this agent no longer owns must stop rather than keep
-    writing to machines that now belong to somebody else's plan. What it already
-    did is reported as unproven, which is what it is.
+    Hosts are asked in parallel -- a wide stage costs its slowest machine -- so
+    there is no "between hosts" left to check. What replaces it is the bracket:
+    a move detected before dispatch writes nothing, and a move detected after
+    dispatch reports every byte written as unproven rather than as a hit,
+    because the machines may belong to somebody else's plan now.
     """
 
     payload = b"moving" * 256
     hosts = [_host(tmp_path, rank, payload=payload) for rank in range(4)]
     repository = await _open()
-    # Two observations are the agent's own fence checks, one for the measure
-    # action and one for the stage; the cell moves on immediately afterwards,
-    # which is the first between-host re-read of the staging fan-out.
-    capacity = _Capacity(generation=1, moves_after=2)
+    capacity = _Capacity(generation=1, moves_after=3)
     _service, _executors, client = _agent(tmp_path, _slice(hosts), capacity=capacity)
     controller = _controller(repository, client)
     await _seed(repository, cells=[_cell()], workloads=[_workload()], leases=[_lease()])
@@ -809,11 +808,10 @@ async def test_a_generation_that_moves_mid_fanout_stops_at_the_host_it_reached(t
     assert stored.state is CellStageState.UNKNOWN
     assert stored.observed_bytes is None
     assert stored.reserved_bytes == len(payload)
-    assert "only 1 of 4 hosts were asked" in (stored.detail or "")
     assert "moved to generation 2" in (stored.detail or "")
-    # Rank 0 was reached before the cell moved; nothing after it was.
-    assert [bool(host.staged_files()) for host in hosts] == [True, False, False, False]
-    assert [len(_stage_calls(host)) for host in hosts] == [2, 1, 1, 1]
+    # Every host was dispatched before the move surfaced on the closing read;
+    # none of their bytes can be trusted, so the row stays unproven.
+    assert [bool(host.staged_files()) for host in hosts] == [True, True, True, True]
 
 
 async def test_a_fence_that_cannot_be_read_stops_the_fanout_rather_than_assuming_it_holds(
@@ -835,10 +833,13 @@ async def test_a_fence_that_cannot_be_read_stops_the_fanout_rather_than_assuming
 
     result = driver.stage("cell-a", _ASSET, max_bytes=1 << 20)
 
+    # An unreadable fence stops the fan-out before anything is dispatched:
+    # writing to four machines on the strength of a failed check would be
+    # exactly the assumption this refuses to make.
     assert result.verdict.value == "inconclusive"
     assert result.size_bytes == 0
     assert "could not be re-read" in result.detail
-    assert [bool(host.staged_files()) for host in hosts] == [True, False, False]
+    assert [bool(host.staged_files()) for host in hosts] == [False, False, False]
 
 
 # --------------------------------------------------------------------------- rolling upgrade

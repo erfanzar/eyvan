@@ -72,8 +72,9 @@ SMALL_GPU = "g2-standard-48"
 #: unknown device count without anything being mocked.
 UNCATALOGUED_GPU = "a2-ultragpu-8g"
 
-#: Exactly what a two-cell, one-rank-per-host GPU gang is dispatched today,
-#: captured from the revision this work branched from and written out in full.
+#: Exactly what a two-cell, one-rank-per-host GPU gang is dispatched with
+#: defaults, written out in full. Fatality ships on; the deadlines keep their
+#: measured values.
 #: A subset would let a new variable appear unnoticed, and the property being
 #: defended is that *nothing* moved for the shape that ships.
 TODAYS_DISPATCH: dict[str, dict[str, str]] = {
@@ -91,7 +92,7 @@ TODAYS_DISPATCH: dict[str, dict[str, str]] = {
         "EYVAN_GPU_LOCAL_DEVICE_COUNT": "8",
         "EYVAN_GPU_MODEL": "nvidia-h100-80gb",
         "EYVAN_JAX_HEARTBEAT_TIMEOUT_S": "900",
-        "EYVAN_JAX_INIT_FATAL": "0",
+        "EYVAN_JAX_INIT_FATAL": "1",
         "EYVAN_JAX_INIT_TIMEOUT_S": "600",
         "EYVAN_JAX_MULTIHOST": "1",
         "EYVAN_REPLICA_COUNT": "2",
@@ -125,7 +126,7 @@ TODAYS_DISPATCH: dict[str, dict[str, str]] = {
         "EYVAN_GPU_LOCAL_DEVICE_COUNT": "4",
         "EYVAN_GPU_MODEL": "nvidia-l4",
         "EYVAN_JAX_HEARTBEAT_TIMEOUT_S": "900",
-        "EYVAN_JAX_INIT_FATAL": "0",
+        "EYVAN_JAX_INIT_FATAL": "1",
         "EYVAN_JAX_INIT_TIMEOUT_S": "600",
         "EYVAN_JAX_MULTIHOST": "1",
         "EYVAN_REPLICA_COUNT": "2",

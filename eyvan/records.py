@@ -1872,6 +1872,15 @@ class CapacityPoolRecord(EyvanModel):
     provisioning_timeout_s: float = Field(default=1800, gt=0)
     upscaling_speed: float = Field(default=1.0, gt=0)
     launch_batch: int = Field(default=5, ge=1)
+    #: How long demand must stay below supply before autoscaling shrinks this
+    #: pool. Without it one quiet minute starts draining cells that the next
+    #: busy minute has to buy back at full cold-start price.
+    shrink_stabilization_s: float = Field(default=300.0, ge=0)
+    #: When the current shortfall below supply was first seen. ``None`` means
+    #: supply is not in surplus (or no controller has judged it yet); the
+    #: planner holds today's shape until this ages past
+    #: ``shrink_stabilization_s``.
+    demand_below_supply_since: datetime | None = None
     enabled: bool = True
     initialized_at: datetime | None = None
     generation: int = Field(default=1, ge=1)

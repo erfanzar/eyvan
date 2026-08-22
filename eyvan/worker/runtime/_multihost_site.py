@@ -128,11 +128,11 @@ class GangInitializationPolicy:
             environment -- and the ranks that *did* arrive abort the whole gang.
         heartbeat_timeout_s: How long a joined rank may go without heartbeating
             before the coordination service declares it dead.
-        fatal: Whether a rank that never joined ends its own workload. Off is
-            today's behaviour and it is not a safe one: ``site.py`` swallows
-            every ordinary exception raised from ``sitecustomize``, so a failed
-            join currently leaves the workload running as an unwitting
-            single-process job with exit status 0.
+        fatal: Whether a rank that never joined ends its own workload. On by
+            default: ``site.py`` swallows every ordinary exception raised from
+            ``sitecustomize``, so without it a failed join leaves the workload
+            running as an unwitting single-process job that can exit 0. A rank
+            that cannot form its gang has nothing useful to compute.
     """
 
     __slots__ = ("fatal", "heartbeat_timeout_s", "initialization_timeout_s")
@@ -141,7 +141,7 @@ class GangInitializationPolicy:
         self,
         initialization_timeout_s: int = DEFAULT_INITIALIZATION_TIMEOUT_S,
         heartbeat_timeout_s: int = DEFAULT_HEARTBEAT_TIMEOUT_S,
-        fatal: bool = False,
+        fatal: bool = True,
     ) -> None:
         """Validate one gang's deadlines, refusing values that bound nothing.
 

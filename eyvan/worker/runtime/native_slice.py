@@ -43,17 +43,18 @@ touch a disk. A fan-out that began under a generation this agent no longer owns
 stops where it is and reports what it cannot prove, rather than continuing to
 write to machines that belong to somebody else's plan.
 
-Hosts are visited one at a time, as every other fan-out here does. That makes a
-wide, slow stage take the sum of its hosts rather than the longest of them, and
-a fetch that outlives the control plane's patience is reported as unproven --
-never as a false hit.
+Hosts are asked in parallel, so a wide stage costs its slowest host rather than
+the sum of them. A fetch that outlives the control plane's patience is still
+reported as unproven -- never as a false hit.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import logging
 import typing as tp
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 
@@ -522,28 +523,72 @@ class NativeSliceStageDriver:
                 exactly as it is for a cell with one host.
         """
 
-        answers: list[_HostStageAnswer] = []
-        for rank, (endpoint, worker) in enumerate(zip(self._endpoints, self._workers, strict=True)):
-            if rank and mutating:
-                moved = self._fence_moved()
-                if moved:
-                    return self._stopped(action, asset, cell_id, rank, answers, moved)
-            try:
-                result = self._act(worker, action, cell_id, asset, max_bytes=max_bytes)
-            except UnsupportedCapabilityError as exc:
-                reason = (
-                    f"rank {rank} of cell {cell_id!r} ({endpoint}) has no staging executor, so this cell has none: {exc}"
+        # All hosts are asked at once: a wide stage costs its slowest host,
+        # not the sum of them. What the sequential walk bought -- stopping
+        # before an *unreached* host when the fence moved underneath it -- is
+        # replaced by checking the fence before dispatch and again after every
+        # host has answered; a host already writing when the fence moves was
+        # never protected by the between-hosts check either, and the higher
+        # fencing on generations remains what actually decides ownership.
+        if mutating:
+            moved = self._fence_moved()
+            if moved:
+                return self._stopped(action, asset, cell_id, 0, (), moved)
+
+        pairs = list(zip(self._endpoints, self._workers, strict=True))
+        answers_by_rank: list[_HostStageAnswer | None] = [None] * len(pairs)
+        capability_failures: list[tuple[int, str, UnsupportedCapabilityError]] = []
+        with ThreadPoolExecutor(max_workers=len(pairs), thread_name_prefix=f"eyvan-{action}") as pool:
+            futures = {
+                pool.submit(self._act, worker, action, cell_id, asset, max_bytes=max_bytes): (
+                    rank,
+                    endpoint,
                 )
-                if not mutating or not answers:
-                    raise UnsupportedCapabilityError(reason) from exc
-                return self._stopped(action, asset, cell_id, rank, answers, reason)
-            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-                result = AssetStageResult(
-                    verdict=AssetStageVerdict.INCONCLUSIVE,
-                    detail=f"native worker {endpoint} could not be asked: {type(exc).__name__}: {exc}",
+                for rank, (endpoint, worker) in enumerate(pairs)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                rank, endpoint = futures[future]
+                try:
+                    result = future.result()
+                except UnsupportedCapabilityError as exc:
+                    capability_failures.append(
+                        (
+                            rank,
+                            f"rank {rank} of cell {cell_id!r} ({endpoint}) has no staging executor, "
+                            f"so this cell has none: {exc}",
+                            exc,
+                        )
+                    )
+                    continue
+                except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                    result = AssetStageResult(
+                        verdict=AssetStageVerdict.INCONCLUSIVE,
+                        detail=f"native worker {endpoint} could not be asked: {type(exc).__name__}: {exc}",
+                    )
+                answers_by_rank[rank] = _HostStageAnswer(rank=rank, endpoint=endpoint, result=result)
+
+        # A host with no staging route is absence of a capability only if
+        # nothing reached a disk. In parallel everything was attempted at once,
+        # so any successful or inconclusive-but-dispatched sibling means the
+        # action is under way: report stopped rather than "not capable".
+        acted = [answer for answer in answers_by_rank if answer is not None]
+        if capability_failures:
+            capability_failures.sort(key=lambda item: item[0])
+            rank, reason, exc = capability_failures[0]
+            if not mutating or not acted:
+                raise UnsupportedCapabilityError(reason) from exc
+            return self._stopped(action, asset, cell_id, rank, acted, reason)
+
+        if mutating:
+            moved = self._fence_moved()
+            if moved:
+                first_unanswered = next(
+                    (rank for rank, answer in enumerate(answers_by_rank) if answer is None), len(answers_by_rank)
                 )
-            answers.append(_HostStageAnswer(rank=rank, endpoint=endpoint, result=result))
-        return _SliceStageFanout(hosts=len(self._workers), answers=tuple(answers))
+                return self._stopped(action, asset, cell_id, first_unanswered, acted, moved)
+        return _SliceStageFanout(
+            hosts=len(self._workers), answers=tuple(answer for answer in answers_by_rank if answer is not None)
+        )
 
     def _stopped(
         self,

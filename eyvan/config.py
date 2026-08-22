@@ -394,14 +394,14 @@ class EyvanSettings:
     gang_heartbeat_timeout_s: int = 900
     #: Whether a rank that never joined the gang ends its own workload.
     #:
-    #: Off is today's behaviour, and today's behaviour is not safe: the
-    #: initialization hook runs from ``sitecustomize``, and ``site.py`` catches
-    #: every ordinary exception raised there, prints one line and lets the
-    #: interpreter carry on -- so a gang that never formed currently runs on as
-    #: an unwitting single-process job and can exit 0. On, that rank exits with
-    #: an Eyvan-reserved status, and the executors report the distinct terminal
-    #: reason "the gang never formed" instead of an ordinary workload failure.
-    gang_init_fatal: bool = False
+    #: The initialization hook runs from ``sitecustomize``, and ``site.py``
+    #: catches every ordinary exception raised there, prints one line and lets
+    #: the interpreter carry on -- so with fatality off, a gang that never forms
+    #: runs on as an unwitting single-process job and can exit 0. On (the
+    #: default), that rank exits with an Eyvan-reserved status, and the
+    #: executors report the distinct terminal reason "the gang never formed"
+    #: instead of an ordinary workload failure.
+    gang_init_fatal: bool = True
     #: Host replacements one scope may make inside ``host_replacement_window_s``.
     #: Zero -- the default -- means a machine that names an unrecoverable fault in
     #: its own output is still only retried, which is today's behaviour. The bound

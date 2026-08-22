@@ -48,6 +48,7 @@ from eyvan.records import (
 from eyvan.server.controller import EyvanController
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
+from eyvan.server.service.errors import InputError
 from eyvan.server.service.scheduling import CoreSchedulingService
 
 
@@ -1108,3 +1109,52 @@ def test_a_cell_whose_provider_request_has_not_started_is_never_timed_out() -> N
 
     fresh = dispatched.model_copy(update={"provider_phase_started_at": now - timedelta(seconds=1)})
     assert cell_provides_pool_supply(fresh, pool, now)
+
+
+async def test_a_pool_upsert_that_disagrees_with_its_quota_group_is_rejected_loudly() -> None:
+    """One misconfigured member must not silently tighten the whole group.
+
+    The planner spends the minimum member limit, so the write path has to be
+    where disagreement dies: a pool joining an established group with its own
+    idea of ``quota_limit`` is refused instead of shrinking everyone's budget.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    admin = fleet_admin()
+    group = "project-us-east5-a-v5p-spot"
+
+    def quota_pool(pool_id: str, *, limit: int) -> CapacityPoolRecord:
+        return shared_quota_pool(
+            multislice_tpu_pool(pool_id),
+            group=group,
+            limit=limit,
+            units_per_cell=1,
+        )
+
+    await service.upsert_capacity_pool(
+        admin,
+        quota_pool("research/shared-a", limit=8),
+        idempotency_key="pool-a",
+    )
+    stored, _ = await service.upsert_capacity_pool(
+        admin,
+        quota_pool("research/shared-b", limit=8),
+        idempotency_key="pool-b",
+    )
+    assert stored.quota_limit == 8
+
+    with pytest.raises(InputError, match="one quota_limit"):
+        await service.upsert_capacity_pool(
+            admin,
+            quota_pool("research/shared-c", limit=4),
+            idempotency_key="pool-c",
+        )
+
+    # And editing an existing member into disagreement dies the same way.
+    with pytest.raises(InputError, match="one quota_limit"):
+        await service.upsert_capacity_pool(
+            admin,
+            quota_pool("research/shared-b", limit=6),
+            idempotency_key="pool-b-2",
+        )

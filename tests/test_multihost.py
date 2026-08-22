@@ -417,7 +417,12 @@ def test_the_same_late_rank_loses_the_gang_under_jaxs_default(monkeypatch, capsy
     clock = _Clock()
     barrier = _GangBarrier(clock, last_arrival_s=450.0)
     _multihost_rank(monkeypatch, barrier, clock)
-    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(initialization_timeout_s=300).environment())
+    # Fatality off isolates what this test is about -- the deadline firing at
+    # all -- from what the fatal tests cover, which is what happens after.
+    _apply(
+        monkeypatch,
+        _multihost_site.GangInitializationPolicy(initialization_timeout_s=300, fatal=False).environment(),
+    )
 
     with pytest.raises(RuntimeError, match="DEADLINE_EXCEEDED"):
         _multihost_site.initialize_from_environment()
@@ -483,7 +488,7 @@ def test_a_join_that_fails_early_is_not_reported_as_a_deadline(monkeypatch, caps
 
 
 def test_without_the_fatal_flag_a_failed_join_keeps_todays_behaviour(monkeypatch, capsys) -> None:
-    """Default off, per the rolling-upgrade rule -- and it is not a safe default.
+    """Fatality off, per an operator's explicit choice -- and it is not a safe one.
 
     The error propagates exactly as it always has, which means ``site.py``
     swallows it and the workload runs on. The marker line is still written, so
@@ -493,7 +498,7 @@ def test_without_the_fatal_flag_a_failed_join_keeps_todays_behaviour(monkeypatch
     clock = _Clock()
     barrier = _GangBarrier(clock, last_arrival_s=None)
     exits = _multihost_rank(monkeypatch, barrier, clock)
-    _apply(monkeypatch, _multihost_site.GangInitializationPolicy().environment())
+    _apply(monkeypatch, _multihost_site.GangInitializationPolicy(fatal=False).environment())
 
     with pytest.raises(RuntimeError, match="DEADLINE_EXCEEDED"):
         _multihost_site.initialize_from_environment()
@@ -544,15 +549,21 @@ def test_a_policy_cannot_be_built_with_a_deadline_that_aborts_every_gang() -> No
         _multihost_site.GangInitializationPolicy(heartbeat_timeout_s=-1)
 
 
-def test_the_shipped_default_is_the_value_this_module_has_always_applied() -> None:
-    """Configuring nothing must change nothing for a fleet that is running now."""
+def test_the_shipped_default_bounds_what_an_unformed_gang_can_do() -> None:
+    """Configuring nothing still ends a rank whose gang never formed.
+
+    The deadlines keep their historical values -- those are measured against
+    cold starts, not against safety -- but fatality ships on: without it a gang
+    that lost a host keeps running as unwitting single-process jobs that can
+    exit 0. An operator who wants the old behaviour says ``fatal=False``.
+    """
 
     policy = _multihost_site.GangInitializationPolicy()
 
     assert policy.environment() == {
         _multihost_site.INITIALIZATION_TIMEOUT_ENV: str(_multihost_site.DEFAULT_INITIALIZATION_TIMEOUT_S),
         _multihost_site.HEARTBEAT_TIMEOUT_ENV: str(_multihost_site.DEFAULT_HEARTBEAT_TIMEOUT_S),
-        _multihost_site.FATAL_INITIALIZATION_ENV: "0",
+        _multihost_site.FATAL_INITIALIZATION_ENV: "1",
     }
 
 

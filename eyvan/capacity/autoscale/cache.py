@@ -220,8 +220,16 @@ class QueueAdmissionDenialCache:
     remains a reproducible output of quota discovery.
     """
 
-    def __init__(self, root: Path | str):
+    #: How long one denial keeps a shape out of automatic selection. A GCP
+    #: stockout can last days, but so can the silence after a fixed one: an
+    #: unexpired-forever denial turned one bad day into a permanently
+    #: hand-cleared shape, so a denial ages out and the next attempt re-records
+    #: it if the queue is still refusing.
+    DEFAULT_TTL_S: tp.ClassVar[float] = 24 * 3600
+
+    def __init__(self, root: Path | str, *, ttl_s: float = DEFAULT_TTL_S):
         self.root = Path(root).expanduser()
+        self.ttl_s = max(float(ttl_s), 0.0)
         self.path = self.root / "queue-admission-denials.json"
         self.lock_path = self.root / ".queue-admission-denials.lock"
 
@@ -245,20 +253,41 @@ class QueueAdmissionDenialCache:
         return denial
 
     def blocks(self, key: QueueAdmissionDenialKey) -> bool:
-        """Return whether an exact prior denial still blocks this Spot worker."""
+        """Return whether an unexpired prior denial still blocks this Spot worker."""
 
         if not self.path.exists():
             return False
         with _exclusive_file_lock(self.lock_path):
-            return key in self._load_locked()
+            entries = self._load_locked()
+            denial = entries.get(key)
+            if denial is None:
+                return False
+            if self._age_s(denial) >= self.ttl_s:
+                # Expired: evict lazily so the file stops carrying stale
+                # denials and the next attempt is genuinely free to retry.
+                del entries[key]
+                self._write_locked(entries)
+                return False
+            return True
 
-    def list(self) -> tuple[QueueAdmissionDenial, ...]:
-        """Return every durable queue-admission denial in stable identity order."""
+    def _age_s(self, denial: QueueAdmissionDenial) -> float:
+        return (datetime.now(UTC) - denial.observed_at).total_seconds()
+
+    def list(self, *, include_expired: bool = False) -> tuple[QueueAdmissionDenial, ...]:
+        """Return durable denials in stable identity order, freshest policy aside.
+
+        Expired denials are hidden by default: the point of expiry is that a
+        shape becomes selectable again, and reporting a stale denial would
+        suggest otherwise. ``include_expired`` exists for inspection.
+        """
 
         if not self.path.exists():
             return ()
         with _exclusive_file_lock(self.lock_path):
-            return tuple(sorted(self._load_locked().values(), key=_queue_admission_denial_sort_key))
+            values = list(self._load_locked().values())
+        if not include_expired:
+            values = [denial for denial in values if self._age_s(denial) < self.ttl_s]
+        return tuple(sorted(values, key=_queue_admission_denial_sort_key))
 
     def clear(self, key: QueueAdmissionDenialKey | None = None) -> int:
         """Clear an exact denial, or every locally cached denial when ``key`` is absent."""

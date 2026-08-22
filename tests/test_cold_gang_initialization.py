@@ -200,11 +200,13 @@ def test_the_gang_deadline_reaches_every_host_of_one_slice() -> None:
         ).submit(_spec(), _context()),
     )
 
+    # Fatality is on by default: a rank whose gang never formed must not run on
+    # as an unwitting single-process job.
     assert len(environments) == len(_SLICE_ENDPOINTS)
     for environment in environments:
         assert environment[INITIALIZATION_TIMEOUT_ENV] == "1200"
         assert environment[HEARTBEAT_TIMEOUT_ENV] == "900"
-        assert environment[FATAL_INITIALIZATION_ENV] == "0"
+        assert environment[FATAL_INITIALIZATION_ENV] == "1"
 
 
 def test_a_caller_cannot_shorten_the_gang_deadline_through_its_own_environment() -> None:
@@ -242,7 +244,7 @@ def test_a_caller_cannot_shorten_the_gang_deadline_through_its_own_environment()
     for environment in (*gang, *slice_):
         assert environment[INITIALIZATION_TIMEOUT_ENV] == "900"
         assert environment[HEARTBEAT_TIMEOUT_ENV] == "600"
-        assert environment[FATAL_INITIALIZATION_ENV] == "0"
+        assert environment[FATAL_INITIALIZATION_ENV] == "1"
         assert environment["USER_FLAG"] == "kept"
 
 
@@ -341,11 +343,12 @@ def test_the_lost_gang_reason_is_identical_after_a_controller_restart() -> None:
     assert message.startswith(f"{GANG_NEVER_FORMED_REASON}:")
 
 
-def test_todays_default_asks_no_host_for_an_exit_status() -> None:
+def test_a_nonfatal_gang_asks_no_host_for_an_exit_status() -> None:
     """With no fatal hook no rank can carry the evidence, so nothing is asked for.
 
-    Also the cost argument: a terminal poll must not add one request per host to
-    every gang in the fleet to learn nothing.
+    The cost argument survives the fatal-by-default flip: an operator who turns
+    fatality off gives up the per-rank evidence, and the controller must not
+    pay one request per host to learn nothing.
     """
 
     paths: list[str] = []
@@ -354,7 +357,10 @@ def test_todays_default_asks_no_host_for_an_exit_status() -> None:
         paths.append(request.url.path)
         return _terminal_worker(exit_status=GANG_INITIALIZATION_DEADLINE_EXIT_CODE)(request)
 
-    report = _gang_status([handler for _ in _GANG_ENDPOINTS], initialization=GangInitializationPolicy())
+    report = _gang_status(
+        [handler for _ in _GANG_ENDPOINTS],
+        initialization=GangInitializationPolicy(fatal=False),
+    )
 
     message = report["message"]
     assert isinstance(message, str)

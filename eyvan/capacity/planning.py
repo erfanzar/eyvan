@@ -827,6 +827,9 @@ class PoolScaleIntent:
     requested_worker_counts: tuple[int, ...]
     requested_exact_count: int
     demanded_virtual_worker_counts: tuple[int, ...]
+    #: The shrink-clock movement this intent decided; see ``PoolScalePlan``.
+    shrink_since_update: datetime | None = None
+    shrink_since_changed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,6 +844,11 @@ class PoolScalePlan:
     launch_workload_ids: tuple[str | None, ...]
     protected_cell_ids: frozenset[str]
     forced_drain_cell_ids: frozenset[str]
+    #: New value for ``CapacityPoolRecord.demand_below_supply_since`` when this
+    #: plan moved the shrink clock, with ``shrink_since_changed`` saying so.
+    #: The planner reads the clock; the controller is what persists it.
+    shrink_since_update: datetime | None = None
+    shrink_since_changed: bool = False
 
     def __post_init__(self) -> None:
         """Keep every planned physical cell associated with an optional source workload."""
@@ -923,6 +931,32 @@ class CapacityPlanner:
                 max(floor, required_real_units + demanded_virtual_units),
             )
         )
+        # Shrink hysteresis: demand that dips below supply for one planning
+        # pass does not get to tear capacity down. The shortfall must hold for
+        # ``shrink_stabilization_s`` before the target falls; until then the
+        # shape is held exactly as it is, and the controller stamps the clock.
+        # Forced drains are untouched by this -- they answer real pending work,
+        # not a quiet minute, and run before held cells gain protection.
+        matching_units_now = sum(cell.worker_count for cell in matching)
+        shrink_since_update: datetime | None = None
+        shrink_since_changed = False
+        if pool.enabled and pool.shrink_stabilization_s > 0 and target < matching_units_now:
+            since = pool.demand_below_supply_since
+            if since is None or (self._now - since).total_seconds() < pool.shrink_stabilization_s:
+                # First sight of the shortfall, or it has not held long enough:
+                # keep today's shape and start (or continue) the clock.
+                target = matching_units_now
+                if since is None:
+                    shrink_since_update = self._now
+                    shrink_since_changed = True
+            else:
+                # The shortfall held: let the target fall, and clear the clock
+                # so the next surplus starts fresh.
+                shrink_since_update = None
+                shrink_since_changed = True
+        elif pool.demand_below_supply_since is not None:
+            shrink_since_update = None
+            shrink_since_changed = True
         occupied_units = sum(cell.worker_count for cell in live)
         available_units = max(pool.max_cells - occupied_units, 0)
         matching_units = sum(cell.worker_count for cell in matching)
@@ -952,6 +986,8 @@ class CapacityPlanner:
             requested_worker_counts=tuple(requested),
             requested_exact_count=requested_exact_count,
             demanded_virtual_worker_counts=demand.virtual_worker_counts,
+            shrink_since_update=shrink_since_update,
+            shrink_since_changed=shrink_since_changed,
         )
 
     def _allocate_shared_quota(self, intents: dict[str, PoolScaleIntent]) -> QuotaAllocation:
@@ -1204,4 +1240,6 @@ class CapacityPlanner:
             launch_workload_ids=launch_workload_ids,
             protected_cell_ids=frozenset(protected),
             forced_drain_cell_ids=frozenset(forced_drain),
+            shrink_since_update=intent.shrink_since_update,
+            shrink_since_changed=intent.shrink_since_changed,
         )
