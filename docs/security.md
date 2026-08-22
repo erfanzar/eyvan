@@ -78,6 +78,18 @@ fans out.
 The secret capability does expire, for the opposite reason. It hands back a
 *value*, and once read no later revocation can un-read it.
 
+The prefixes are *family tags*, deliberately not one shared version axis:
+bumping one family's format never touches the other two, and rewriting a
+prefix would invalidate every outstanding token of that family at once -- the
+rotation keyring (`identity/rotation.py`, accepted by all three signers) is
+the supported way to survive material changes without that cliff.
+
+Workload (`eyvw1`) tokens carry no org/project claims on purpose. Verifying
+one means resolving the workload through the control plane first, and that
+lookup already binds the request to the tenant; putting tenant fields inside
+the token would add a second copy of the binding that could silently drift
+from it.
+
 ## Secrets
 
 A spec carries a *reference*, never a value. `PolicyRecord.allowed_secret_references`

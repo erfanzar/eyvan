@@ -28,6 +28,14 @@ _WORKLOAD_CONTAINER_RUNTIME = "/etc/eyvan-native/container-runtime.json"
 #: itself was not pinned, so a script fix with identical artifacts never
 #: reached existing cells -- the same staleness the key exists to prevent, one
 #: level up. Bump on any bootstrap behavior change existing cells must receive.
+#:
+#: Known limit, stated rather than implied: a queued resource renders its
+#: startup script once and never re-reads it. A revision bump re-renders the
+#: *record* and is stamped into every cell created afterwards, but a VM that
+#: already exists keeps the script it booted with -- a bootstrap fix reaches
+#: running cells only when they are recreated. This is deliberate: pushing a
+#: new script under a running cell would re-run provisioning steps with no
+#: fence, and the driver has no way to know what the old script already did.
 NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-22.1"
 
 

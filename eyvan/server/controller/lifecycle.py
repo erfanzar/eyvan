@@ -77,6 +77,10 @@ class _ControllerLifecycle:
         #: Defaults to the environment, which defaults to zero -- promotion off,
         #: a failed attempt behaves exactly as it did before node health existed.
         host_replacement_budget: HostReplacementBudget | None = None,
+        #: Optional JSONL file every capacity lifecycle event is appended to,
+        #: so lifecycle auditing does not depend on log collection. Unset by
+        #: default: log lines remain the always-on record.
+        capacity_audit_sink: str | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -106,7 +110,7 @@ class _ControllerLifecycle:
         self.secret_capability = secret_capability
         self._stage_executor = stage_executor
         self._host_replacement_budget = host_replacement_budget or host_replacement_budget_from_settings(self.settings)
-        self._capacity_lifecycle = CapacityLifecycleLogger(logger)
+        self._capacity_lifecycle = CapacityLifecycleLogger(logger, sink_path=capacity_audit_sink)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:
         """Time one reconciliation operation when metrics are collected.

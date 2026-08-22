@@ -1307,3 +1307,24 @@ here therefore means the CPU test was testing the wrong thing — not that the
 feature is broken in a way the suite could have caught. That is the point of
 running them, and it is why "the tests pass" has never appeared in this
 repository as an argument that something works on hardware.
+
+## A bounded re-verification pass on 2026-08-22
+
+After the control-plane hardening landed (signer rotation keyrings, shrink
+stabilization, lease TTL, gang-init fatality, admission-denial TTL,
+transaction retry, parallel stage fanout, quota-group validation, provider
+substrate consultation), the provider read path was re-verified live against
+`example-project`, read-only and within bounded spend:
+
+- `eyvan capacity quota --fits v6e-8:1` returned per-zone spot/on-demand
+  balances with fresh usage ages through the current tree.
+- `gcloud compute tpus queued-resources list` in the fleet's zones answered
+  for the substrate the driver now consults (`list_cell_incarnations`
+  territory): ACTIVE and WAITING_FOR_RESOURCES cells listed as expected.
+
+No cell was created, drained, or reconciled: mutation paths against live
+cells are exactly what the conformance suite guards, and pointing a plane at
+a fleet that hosts unrelated ACTIVE work is how the outage in the register
+happened. What this pass witnesses is the *read* surface end to end; every
+mutation claim above remains witnessed by its CPU counterpart plus
+conformance, not by this pass.

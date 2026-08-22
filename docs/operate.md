@@ -129,6 +129,17 @@ or go somewhere else. Beside it is the fleet's recent capacity history, so an
 afternoon of grants and reclamations reads as a sequence rather than as a
 snapshot that keeps changing.
 
+## One agent, one backend
+
+An agent runs exactly one capacity backend (`EYVAN_CAPACITY_BACKEND`), and a
+pool's `capacity_backend` must name a backend its serving agent actually runs.
+Routing a `local`-backend pool at a GCP-only agent does not fall back or queue
+politely -- it refuses with "GCP driver cannot satisfy capacity backend" on a
+permanent loop, because the request is genuinely unsatisfiable *there*. Running
+a second local proof cell beside a deployed agent means starting a second agent
+on another port and pointing the pool's `agent_endpoint` at it; the working
+shape is recorded in the fleet config comment of `configs/eyvan-proof-local.yaml`.
+
 ## One pool, several zones
 
 ```yaml

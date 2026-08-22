@@ -74,11 +74,31 @@ def _resource_context(cell: CellRecord) -> tuple[str, str]:
     return "cpu", f"{_quantity(cell.capacity.cpu)}-cpu"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class CapacityLifecycleLogger:
-    """Classify and emit durable capacity transitions without poll noise."""
+    """Classify and emit durable capacity transitions without poll noise.
+
+    Every event goes to the log. An optional ``sink_path`` additionally
+    appends the same event to a JSONL file -- one self-contained object per
+    line, fields flat and string-typed where they are identifiers -- so
+    lifecycle auditing survives without log collection (register #28). The
+    sink is best-effort by design: it audits the transition, so a sink write
+    failure is logged and swallowed rather than allowed to break the
+    transition itself.
+    """
 
     logger: logging.Logger
+    sink_path: str | None = None
+
+    def __post_init__(self) -> None:
+        self._sink_handle = open(self.sink_path, "a", encoding="utf-8") if self.sink_path else None
+
+    def close(self) -> None:
+        """Release the structured sink, if one was opened."""
+
+        if self._sink_handle is not None:
+            self._sink_handle.close()
+            self._sink_handle = None
 
     @staticmethod
     def classify(previous: CellRecord, current: CellRecord) -> CapacityLifecycleEvent | None:
@@ -155,6 +175,32 @@ class CapacityLifecycleLogger:
             message = f"{message} reason={_encoded(reason[:500])}"
         level = logging.WARNING if event in _WARNING_EVENTS else logging.INFO
         self.logger.log(level, "%s", message)
+        if self._sink_handle is not None:
+            record: dict[str, object] = {
+                "event": event.value,
+                "fleet": fleet,
+                "pool": current.pool_id,
+                "cell": current.id,
+                "provider": current.provider,
+                "project": current.provider_project,
+                "location": current.zone or current.region,
+                "resource_kind": resource_kind,
+                "resource": resource_shape,
+                "workers": current.worker_count,
+                "capacity_class": current.capacity_class.value,
+                "cell_state": current.state.value,
+                "provider_state": current_phase,
+                "previous_cell_state": previous_state,
+                "previous_provider_state": previous_phase,
+                "message": message,
+            }
+            if reason is not None:
+                record["reason"] = reason[:500]
+            try:
+                self._sink_handle.write(json.dumps(record, sort_keys=True) + "\n")
+                self._sink_handle.flush()
+            except OSError as error:  # the sink audits the transition; it must not break it
+                self.logger.warning("capacity lifecycle sink write failed: %s", error)
 
 
 __all__ = ("CapacityLifecycleEvent", "CapacityLifecycleLogger", "CapacityReplacementReason")
