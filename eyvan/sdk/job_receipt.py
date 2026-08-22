@@ -294,6 +294,26 @@ class JobTerminalOutput:
         heading.append(message, style="yellow")
         console.print(heading)
 
+    def output_line(self, text: str) -> None:
+        """Print one line of the job's own output into the transcript.
+
+        The streamed counterpart of ``lifecycle``: while the client waits on a
+        running job, its stdout/stderr lands here as it is produced, so the
+        run reads like a local process rather than a status page.
+        """
+
+        writer = self._writer
+        if writer is not None:
+            self._write_plain(writer, (text,))
+            return
+        console = self._console
+        assert console is not None
+        self.settle()
+        if not console.is_terminal:
+            self._write_plain(console.print, (text,))
+            return
+        console.print(Text(text))
+
     def detached(self, workload_id: str) -> None:
         """Say that this client stopped watching, not that the job stopped.
 

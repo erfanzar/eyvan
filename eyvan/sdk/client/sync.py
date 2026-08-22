@@ -416,6 +416,20 @@ class EyvanClient:
         )
         return WorkloadRecord.model_validate(response.json())
 
+    def workload_log_page(self, workload_id: str, *, after: str, limit: int) -> dict[str, tp.Any]:
+        """Read one page of a workload's archived output.
+
+        The same surface ``eyvan workload logs --follow`` streams from; exposed
+        so a blocking SDK wait can tail its job's output as it is produced.
+        """
+
+        payload = self._transport.request_checked(
+            "GET",
+            f"/api/v1/workloads/{workload_id}/log-page",
+            params={"after": after, "limit": limit},
+        )
+        return payload.json()
+
     def workload_logs(self, workload_id: str) -> str:
         """Return currently available workload logs."""
 

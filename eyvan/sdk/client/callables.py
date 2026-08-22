@@ -31,7 +31,7 @@ from eyvan.sdk.client.jobs import (
 )
 from eyvan.sdk.client.sync import EyvanClient
 from eyvan.sdk.client.transport import EyvanHTTPError, EyvanUnavailableError
-from eyvan.sdk.follow import EXIT_DETACHED
+from eyvan.sdk.follow import EXIT_DETACHED, _LogWindow
 from eyvan.sdk.job_receipt import (
     JobLifecycleState,
     JobLifecycleUpdate,
@@ -88,12 +88,18 @@ class _CallableProgressRenderer:
         self._queue_admission_recorder = queue_admission_recorder
         self._last_update: JobLifecycleUpdate | None = None
         self._last_diagnostic: str | None = None
+        #: Where the streamed transcript stopped reading. Ray-style: a blocking
+        #: wait tails the job's own output, so the run reads like a local process.
+        self._log_cursor = ""
 
     def __call__(self, workload: WorkloadRecord) -> None:
         """Render one control-plane observation without repeating unchanged state."""
 
         terminal = workload.state in TERMINAL_STATES
         if terminal:
+            # Settlement archives remaining output before the terminal state is
+            # visible; drain first so the job's last lines precede its verdict.
+            self._drain_output(workload.id)
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
             self._emit(self._terminal_workload_update(workload))
@@ -111,10 +117,12 @@ class _CallableProgressRenderer:
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
             self._emit(self._fallback_or_terminal_update(workload))
+            self._drain_output(workload.id)
             return
         if self._queue_admission_recorder is not None:
             self._queue_admission_recorder.record_workload(workload)
         self._emit(self._progress_update(progress))
+        self._drain_output(workload.id)
 
     def _emit(self, update: JobLifecycleUpdate) -> None:
         if update == self._last_update:
@@ -127,6 +135,36 @@ class _CallableProgressRenderer:
         self._last_update = update
         if update.diagnostic is not None:
             self._last_diagnostic = update.diagnostic
+
+    def _drain_output(self, workload_id: str) -> None:
+        """Print every produced output line this renderer has not shown yet.
+
+        The control-plane log page is the same surface ``eyvan workload logs
+        --follow`` reads; polling it here makes a blocking callable wait tail
+        its job like ``ray job submit`` does. Reading is best-effort: an
+        unreachable plane or an attempt that is still archiving must never
+        break the wait that owns it.
+        """
+
+        for _page in range(16):
+            try:
+                payload = self._client.workload_log_page(workload_id, after=self._log_cursor, limit=200)
+            except (EyvanUnavailableError, EyvanHTTPError):
+                return
+            window = _LogWindow.parse(payload)
+            if window.attempt_changed:
+                # A preemption retry started a new attempt; its output begins
+                # at a fresh cursor and the retired attempt's pages are gone.
+                self._log_cursor = ""
+                continue
+            multi = (window.expected_ranks or 1) > 1
+            for rank, message, _timestamp in window.lines:
+                text = message.rstrip("\n")
+                self._output.output_line(f"r{rank} | {text}" if multi else text)
+            if not window.cursor or not window.lines:
+                self._log_cursor = window.cursor or self._log_cursor
+                return
+            self._log_cursor = window.cursor
 
     @staticmethod
     def _required_workers(progress: WorkloadProgress) -> int:

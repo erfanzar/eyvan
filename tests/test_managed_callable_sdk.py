@@ -86,6 +86,9 @@ def test_init_ensures_a_literal_loopback_control_plane_before_constructing_the_d
             assert identity.dev_user is not None
             events.append("client")
 
+        def workload_log_page(self, workload_id: str, *, after: str, limit: int):
+            return {"records": [], "next_cursor": after}
+
     def ensure(configured_endpoint: str | ControlPlaneEndpoint) -> LocalDaemonResult:
         parsed = ControlPlaneEndpoint.parse(configured_endpoint)
         events.append("daemon")
@@ -150,6 +153,9 @@ def test_init_uses_direct_gcs_artifacts_after_native_gcp_runtime_setup(tmp_path,
         def __init__(self, *, base_url: str, identity: ClientIdentity) -> None:
             assert base_url == endpoint.url
             assert identity.dev_user is not None
+
+        def workload_log_page(self, workload_id: str, *, after: str, limit: int):
+            return {"records": [], "next_cursor": after}
 
     monkeypatch.setattr(execution_module, "_context", None)
     monkeypatch.setattr(execution_module, "ensure_gcp_native_runtime", ensure)
@@ -228,6 +234,8 @@ def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, mo
     stored: WorkloadRecord | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         nonlocal stored
         requests.append(request)
         if request.method == "PUT" and "/artifacts/callables/" in request.url.path:
@@ -333,6 +341,8 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
     submitted: WorkloadRecord | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         nonlocal submitted
         if request.method == "POST" and request.url.path == "/api/v1/fleets/research/callables":
             payload = json.loads(request.content)
@@ -403,6 +413,8 @@ def test_decorator_job_result_reports_control_plane_unavailability_without_httpx
     monkeypatch.setattr(execution_module, "_context", None)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "PUT" and "/artifacts/callables/" in request.url.path:
             digest = request.url.path.rsplit("/", 1)[-1]
             return httpx.Response(200, json={"uri": f"eyvan://callables/{digest}", "sha256": digest})
@@ -462,6 +474,8 @@ def test_decorator_reports_actionable_error_when_selected_fleet_has_no_matching_
     monkeypatch.setattr(execution_module, "_context", None)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "PUT" and "/artifacts/callables/" in request.url.path:
             digest = request.url.path.rsplit("/", 1)[-1]
             return httpx.Response(200, json={"uri": f"eyvan://callables/{digest}", "sha256": digest})
@@ -534,6 +548,8 @@ def test_executable_auto_resolves_fleet_when_context_fleet_is_none(tmp_path: Pat
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         requests.append(request)
         if request.method == "GET":
             return httpx.Response(
@@ -598,6 +614,8 @@ def test_auto_resolve_without_a_matching_pool_raises_placement_error_not_type_er
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         requests.append(request)
         return httpx.Response(200, json={"pools": []})
 

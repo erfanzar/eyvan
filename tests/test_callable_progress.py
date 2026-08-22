@@ -145,6 +145,8 @@ def test_callable_submission_prints_durable_job_controls(tmp_path, capsys, tpu: 
     requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         requests.append((request.method, request.url.path))
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
@@ -200,6 +202,8 @@ def test_callable_submission_does_not_block_an_explicit_target_after_discovery_d
     requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         requests.append((request.method, request.url.path))
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
@@ -264,6 +268,8 @@ def test_callable_result_renders_scale_from_zero_and_provider_diagnostic_once(tm
     progress_updates = iter((queued, provider_failure, provider_failure))
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -344,6 +350,8 @@ def test_callable_wait_caches_a_terminal_queue_denial_without_progress_polling(t
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -414,6 +422,8 @@ def test_callable_result_preserves_queue_denial_when_local_cache_target_is_inval
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -468,6 +478,8 @@ def test_callable_result_does_not_hide_progress_authorization_errors(tmp_path, c
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -518,6 +530,8 @@ def test_callable_result_uses_the_durable_workload_fallback_when_progress_is_tem
     states = iter((WorkloadState.PENDING, WorkloadState.CANCELLED))
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -678,6 +692,8 @@ def test_callable_result_renders_nonterminal_states(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
@@ -734,6 +750,8 @@ def test_callable_progress_wait_short_circuits_progress_polling_on_a_terminal_ob
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/log-page"):
+            return httpx.Response(200, json={"records": [], "next_cursor": ""})
         if request.method == "POST":
             return httpx.Response(201, json=_workload(execution, WorkloadState.PENDING).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16":

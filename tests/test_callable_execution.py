@@ -11,6 +11,7 @@ import typing as tp
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
+import httpx
 import pytest
 
 import eyvan
@@ -23,7 +24,9 @@ from eyvan.records import (
     WorkloadState,
 )
 from eyvan.sdk import EyvanCallableSubmitter
+from eyvan.sdk.client.callables import _CallableProgressRenderer
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.transport import EyvanHTTPError
 from eyvan.sdk.execution import (
     CallableSubmission,
     ExecutionContext,
@@ -35,6 +38,7 @@ from eyvan.sdk.execution import (
     execute,
     init,
 )
+from eyvan.sdk.job_receipt import JobTerminalOutput
 from eyvan.worker.runtime.callables import CallableArtifact, dump_callable, load_callable
 
 T = tp.TypeVar("T")
@@ -540,3 +544,57 @@ def test_the_same_address_twice_is_not_a_conflict(monkeypatch) -> None:
     )
 
     assert context.base_url == "http://10.0.0.5:8080"
+
+
+def test_a_blocking_wait_tails_its_job_output_like_ray() -> None:
+    """The synchronous wait streams produced lines as they land, then the verdict."""
+
+    lines: list[str] = []
+    output = JobTerminalOutput(writer=lines.append)
+    pages = {
+        "": {
+            "records": [{"rank": 0, "message": "hello from the cell\n"}],
+            "next_cursor": "c1",
+            "expected_ranks": 1,
+        },
+        "c1": {
+            "records": [{"rank": 0, "message": "second line"}],
+            "next_cursor": "c2",
+            "expected_ranks": 1,
+        },
+    }
+    served: list[str] = []
+
+    not_found = EyvanHTTPError(
+        response=httpx.Response(404, request=httpx.Request("GET", "http://plane/api")),
+        detail="no progress",
+    )
+
+    class _Client:
+        def get_workload_progress(self, workload_id: str):
+            raise not_found
+
+        def workload_log_page(self, workload_id: str, *, after: str, limit: int):
+            served.append(after)
+            return pages.get(after, {"records": [], "next_cursor": after})
+
+    def record(state: WorkloadState) -> WorkloadRecord:
+        return WorkloadRecord(
+            id="wl-stream",
+            org_id="acme",
+            project_id="models",
+            spec=WorkloadDefinition(name="stream", execution=CommandExecution(command="true")),
+            state=state,
+            created_by="tester",
+        )
+
+    renderer = _CallableProgressRenderer(_Client(), output, None)  # type: ignore[arg-type]
+    renderer(record(WorkloadState.RUNNING))
+    renderer(record(WorkloadState.SUCCEEDED))
+
+    assert "hello from the cell" in lines
+    assert "second line" in lines
+    # Every page was read, and the verdict renders after the output it follows.
+    assert served == ["", "c1", "c2"]
+    assert any(line.startswith("Eyvan") for line in lines)
+    assert lines.index("  job completed") > lines.index("second line")
