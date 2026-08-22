@@ -34,9 +34,10 @@ import re
 import secrets
 import shlex
 import subprocess
+import tempfile
 import time
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import click
@@ -109,6 +110,11 @@ HEAD_AGENT_SERVICE_NAME = "eyvan-head-agent.service"
 HEAD_AGENT_PORT = 8090
 PLATFORM_CONFIG_PATH = "/etc/eyvan/platform.yaml"
 
+#: Stand-in for the wheel path in a planned upload, replaced at execution time.
+#: The plan is rendered before the temporary file exists, and a dry run must be
+#: able to print the command without creating one.
+_WORKER_WHEEL_PLACEHOLDER = "<staged-worker-wheel>"
+
 #: What the installer runs to record this node's own control plane. Written as
 #: one call into ``eyvan.sdk.node`` rather than as generated JSON so the format
 #: has exactly one producer, and that producer is the module that reads it back.
@@ -145,6 +151,8 @@ class HeadStep(StrEnum):
     FIREWALL_CREATE = "firewall_create"
     SECRET_LOOKUP = "secret_lookup"
     CONFIGURE = "configure"
+    STAGE_WORKER_PACKAGE = "stage_worker_package"
+    WORKER_PACKAGE_GENERATION = "worker_package_generation"
     STAGE_WHEEL = "stage_wheel"
     INSTALL = "install"
     BOOTSTRAP = "bootstrap"
@@ -569,7 +577,13 @@ class HeadSecrets:
             return spec.database_url
         return f"postgresql+asyncpg://eyvan:{self.database_password}@127.0.0.1:5432/eyvan"
 
-    def environment(self, spec: HeadSpec, *, address: str) -> dict[str, str]:
+    def environment(
+        self,
+        spec: HeadSpec,
+        *,
+        address: str,
+        worker_package: WorkerPackage | None = None,
+    ) -> dict[str, str]:
         """Return the complete server environment for this head."""
 
         environment = {
@@ -589,6 +603,20 @@ class HeadSecrets:
         }
         if spec.artifact_store_uri is not None:
             environment["EYVAN_ARTIFACT_STORE_URI"] = spec.artifact_store_uri
+            # The one document every agent for this fleet reconciles against.
+            # Left unset, each agent keeps a private local copy, so the capacity
+            # driver's writes and the control plane's reads never meet: a cell
+            # reaches `ready` publishing no worker endpoints, and dispatch waits
+            # forever for an address nobody wrote down. Observed on a live v5p-16
+            # whose worker was up and serving the whole time.
+            environment["EYVAN_FLEET_STATE_URI"] = fleet_state_uri(spec.artifact_store_uri, spec.fleet)
+        if worker_package is not None:
+            # Without these three the GCP capacity driver refuses every request
+            # with "eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_PACKAGE",
+            # which surfaces on the first submission rather than at install time.
+            environment["EYVAN_NATIVE_WORKER_PACKAGE"] = worker_package.uri
+            environment["EYVAN_NATIVE_WORKER_PACKAGE_SHA256"] = worker_package.sha256
+            environment["EYVAN_NATIVE_WORKER_PACKAGE_GENERATION"] = worker_package.generation
         if spec.oidc_issuer is not None:
             environment["EYVAN_OIDC_ISSUER"] = spec.oidc_issuer
             if spec.oidc_audience is not None:
@@ -617,10 +645,17 @@ class HeadSecrets:
             environment["EYVAN_TRUSTED_CALLABLE_PROJECTS"] = ",".join(trusted)
         return environment
 
-    def environment_file(self, spec: HeadSpec, *, address: str) -> str:
+    def environment_file(
+        self,
+        spec: HeadSpec,
+        *,
+        address: str,
+        worker_package: WorkerPackage | None = None,
+    ) -> str:
         """Render the systemd ``EnvironmentFile`` this head reads at start."""
 
-        lines = [f"{key}={value}" for key, value in sorted(self.environment(spec, address=address).items())]
+        resolved = self.environment(spec, address=address, worker_package=worker_package)
+        lines = [f"{key}={value}" for key, value in sorted(resolved.items())]
         return "\n".join(lines) + "\n"
 
 
@@ -717,6 +752,24 @@ _ENVIRONMENT_ABSENT = "eyvan-head-env-absent"
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerPackage:
+    """The wheel a native worker downloads, and the two facts that pin it.
+
+    A TPU or Compute worker bootstraps by fetching this object and refusing it
+    unless the bytes hash to ``sha256``; the generation makes the URI name one
+    immutable object rather than whatever currently sits at that path. Both are
+    required by the GCP capacity driver, and a head that omitted them had every
+    capacity request rejected with "requires EYVAN_NATIVE_WORKER_PACKAGE" --
+    after the fleet applied, so the failure surfaced on the first submission
+    rather than at install time.
+    """
+
+    uri: str
+    sha256: str
+    generation: str
+
+
+@dataclass(frozen=True, slots=True)
 class _LocalWheel:
     """One built wheel and the digest the head must reproduce."""
 
@@ -737,6 +790,38 @@ def staged_wheel_filename() -> str:
     from eyvan import __version__
 
     return f"eyvan-{__version__}-py3-none-any.whl"
+
+
+def worker_package_uri(artifact_store_uri: str, digest: str, filename: str) -> str:
+    """Return the immutable object name this head's worker wheel is staged under.
+
+    Content-addressed, so two heads that install the same distribution converge
+    on one object and a changed wheel can never overwrite the bytes an existing
+    worker was told to expect.
+    """
+
+    return f"{artifact_store_uri.rstrip('/')}/native-worker/{digest}/{filename}"
+
+
+def fleet_state_uri(artifact_store_uri: str, fleet: str) -> str:
+    """Return the shared fleet-state document this head's agents reconcile against.
+
+    Unset, every agent falls back to a private local path, so the driver's writes
+    and the control plane's reads never meet: a cell reaches ``ready`` carrying no
+    worker endpoints and dispatch waits forever on an address nobody published.
+    """
+
+    return f"{artifact_store_uri.rstrip('/')}/fleet-state/{fleet}.json"
+
+
+def _planned_worker_wheel() -> _LocalWheel:
+    """Return a wheel stand-in for rendering the plan, which builds nothing.
+
+    ``--dry-run`` has to name the object it would publish without producing the
+    bytes to publish, so the digest is unknown at plan time and shown as such.
+    """
+
+    return _LocalWheel(data=b"", digest="<sha256-of-this-distribution>", filename=staged_wheel_filename())
 
 
 def _local_wheel_bytes() -> _LocalWheel:
@@ -1192,6 +1277,11 @@ class HeadProvisioner:
         actions.extend(
             (
                 self._environment_lookup_action(),
+                *(
+                    self._worker_package_actions(_planned_worker_wheel())
+                    if self.spec.artifact_store_uri is not None
+                    else ()
+                ),
                 self._configure_action(),
                 *([self._stage_wheel_action()] if self.spec.stages_wheel else []),
                 self._install_action(),
@@ -1220,14 +1310,23 @@ class HeadProvisioner:
             if self._ensure_firewall(rule):
                 created.append(rule.name)
         write_environment = rotate_secrets or not self._environment_present()
+        # Built once and used twice: the head installs this wheel on itself, and
+        # publishes the same one for workers that have no ssh path from here. Two
+        # different distributions serving one fleet is a class of failure nobody
+        # would think to look for.
+        wheel = (self._wheel_source or _local_wheel_bytes)() if (spec.stages_wheel or write_environment) else None
+        worker_package = self._stage_worker_package(wheel) if wheel is not None and write_environment else None
         if write_environment:
             head_secrets = self._secret_factory()
             self._execute(
                 self._configure_action(),
-                stdin_text=head_secrets.environment_file(spec, address=address),
+                # Staged before this, because the environment names the object and
+                # its generation: writing the file first would mean a head whose
+                # configuration described a wheel that did not exist yet.
+                stdin_text=head_secrets.environment_file(spec, address=address, worker_package=worker_package),
             )
         if spec.stages_wheel:
-            wheel = (self._wheel_source or _local_wheel_bytes)()
+            assert wheel is not None
             observed = self._execute(
                 self._stage_wheel_action(),
                 stdin_text=base64.b64encode(wheel.data).decode("ascii"),
@@ -1586,6 +1685,78 @@ class HeadProvisioner:
             sends_stdin=True,
             skipped_when_present=True,
         )
+
+    def _worker_package_actions(self, wheel: _LocalWheel) -> tuple[HeadAction, HeadAction]:
+        """Build the upload of the worker wheel and the read-back of its generation.
+
+        A native worker is not the head: it bootstraps on a TPU or Compute VM that
+        has no ssh path from here, so it fetches its Eyvan from object storage
+        rather than being handed it. The head therefore has to publish the same
+        distribution it installs on itself, and record the two facts the worker
+        verifies it by.
+
+        Content-addressed and never overwritten, so a re-run with an unchanged
+        wheel converges on the object that already exists, and a changed wheel
+        cannot replace bytes an existing worker was told to expect.
+        """
+
+        spec = self.spec
+        assert spec.artifact_store_uri is not None
+        uri = worker_package_uri(spec.artifact_store_uri, wheel.digest, wheel.filename)
+        upload = HeadAction(
+            step=HeadStep.STAGE_WORKER_PACKAGE,
+            summary=f"publish the native-worker wheel to {uri}",
+            # A path rather than stdin: the runner boundary carries text, and a
+            # wheel is bytes. The file is written under an owner-only temporary
+            # directory and removed in a `finally`, so a failed upload leaves
+            # nothing behind.
+            args=("storage", "cp", _WORKER_WHEEL_PLACEHOLDER, uri, "--project", spec.project, "--quiet"),
+            mutates=True,
+        )
+        generation = HeadAction(
+            step=HeadStep.WORKER_PACKAGE_GENERATION,
+            summary="read the staged object's generation, which pins the URI to these exact bytes",
+            args=(
+                "storage",
+                "objects",
+                "describe",
+                uri,
+                "--project",
+                spec.project,
+                "--format=value(generation)",
+                "--quiet",
+            ),
+        )
+        return upload, generation
+
+    def _stage_worker_package(self, wheel: _LocalWheel) -> WorkerPackage | None:
+        """Publish the worker wheel and return what a worker needs to verify it.
+
+        ``None`` when this head has no artifact store: there is nowhere to publish
+        to, and inventing a location would produce a head that looks configured
+        and fails on its first submission.
+        """
+
+        if self.spec.artifact_store_uri is None:
+            return None
+        upload, generation = self._worker_package_actions(wheel)
+        with tempfile.TemporaryDirectory(prefix="eyvan-worker-wheel-") as directory:
+            source = Path(directory) / wheel.filename
+            source.write_bytes(wheel.data)
+            resolved = replace(
+                upload,
+                args=tuple(str(source) if part is _WORKER_WHEEL_PLACEHOLDER else part for part in upload.args),
+            )
+            self._execute(resolved)
+        result = self._execute(generation)
+        staged = result.stdout.strip()
+        if not staged.isdigit():
+            raise HeadCommandError(
+                HeadStep.WORKER_PACKAGE_GENERATION,
+                f"GCS reported {staged!r} as the generation of the staged worker wheel; a positive integer is "
+                "required, because it is what pins the package URI to the exact bytes a worker will verify",
+            )
+        return WorkerPackage(uri=generation.args[3], sha256=wheel.digest, generation=staged)
 
     def _stage_wheel_action(self, filename: str | None = None) -> HeadAction:
         filename = filename or staged_wheel_filename()

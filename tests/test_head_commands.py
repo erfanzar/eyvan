@@ -49,6 +49,7 @@ from eyvan.sdk.commands.head import (
     HeadStep,
     _LocalWheel,
     render_head_bootstrap_script,
+    staged_wheel_filename,
 )
 
 FLEET_YAML = """
@@ -93,7 +94,7 @@ _FAKE_WHEEL_DIGEST = __import__("hashlib").sha256(_FAKE_WHEEL_BYTES).hexdigest()
 def _fake_wheel() -> _LocalWheel:
     """Return a deterministic stand-in for this installation's wheel."""
 
-    return _LocalWheel(data=_FAKE_WHEEL_BYTES, digest=_FAKE_WHEEL_DIGEST)
+    return _LocalWheel(data=_FAKE_WHEEL_BYTES, digest=_FAKE_WHEEL_DIGEST, filename=staged_wheel_filename())
 
 
 def _spec(**overrides: tp.Any) -> HeadSpec:
@@ -160,6 +161,8 @@ class FakeGcloud:
     subnets: tuple[str, ...] = ("10.128.0.0/20",)
     address: str = "10.128.0.7"
     environment_present: bool = False
+    #: What GCS reports as the staged worker wheel's object generation.
+    object_generation: str = "1786489052345332"
     #: Remote-command or gcloud-verb fragment that should fail, and its result.
     failures: dict[str, subprocess.CompletedProcess[str]] = field(default_factory=dict)
     calls: list[Call] = field(default_factory=list)
@@ -215,6 +218,10 @@ class FakeGcloud:
 
     def _dispatch(self, call: Call) -> subprocess.CompletedProcess[str]:
         args = call.args
+        if args[:2] == ("storage", "cp"):
+            return _ok(args, "")
+        if args[:3] == ("storage", "objects", "describe"):
+            return _ok(args, f"{self.object_generation}\n")
         if args[:3] == ("compute", "instances", "describe"):
             if self.instance is None:
                 return _missing(args)
@@ -1436,3 +1443,83 @@ def test_a_unit_that_did_not_start_is_never_reported_as_a_running_head() -> None
 
     assert failure.value.step is HeadStep.SERVICE_VERIFY
     assert "journalctl -u eyvan-head.service" in failure.value.detail
+
+
+def test_the_head_publishes_the_worker_wheel_and_names_the_state_agents_share() -> None:
+    """Both failures that stopped a live v5p-16 after the TPU was already up.
+
+    A native worker bootstraps on a TPU with no ssh path from the head, so it
+    fetches Eyvan from object storage and refuses it unless the bytes hash to
+    what it was told. `head up` published nothing, so the capacity driver
+    rejected every request with "requires EYVAN_NATIVE_WORKER_PACKAGE" -- after
+    the fleet applied, so it surfaced on the first submission.
+
+    `EYVAN_FLEET_STATE_URI` is the second half. Unset, each agent keeps a private
+    local copy of the fleet state, so the driver's writes and the control plane's
+    reads never meet: the cell reached `ready` publishing no worker endpoints and
+    dispatch waited forever, while the worker sat healthy and serving.
+    """
+
+    spec = _spec(artifact_store_uri="gs://fleet-bucket/artifacts")
+    gcloud = FakeGcloud(spec=spec)
+
+    HeadProvisioner(
+        spec,
+        runner=gcloud,
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+    ).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+    expected_uri = f"gs://fleet-bucket/artifacts/native-worker/{_FAKE_WHEEL_DIGEST}/{staged_wheel_filename()}"
+
+    assert environment["EYVAN_NATIVE_WORKER_PACKAGE"] == expected_uri
+    assert environment["EYVAN_NATIVE_WORKER_PACKAGE_SHA256"] == _FAKE_WHEEL_DIGEST
+    assert environment["EYVAN_NATIVE_WORKER_PACKAGE_GENERATION"] == gcloud.object_generation
+    assert environment["EYVAN_FLEET_STATE_URI"] == "gs://fleet-bucket/artifacts/fleet-state/research.json"
+
+    # Content-addressed by the digest of the wheel this head installs on itself,
+    # so one fleet never runs two different distributions.
+    assert _FAKE_WHEEL_DIGEST in expected_uri
+    uploads = gcloud.issued_matching("storage", "cp")
+    # ("storage", "cp", <local path>, <destination uri>, "--project", ...)
+    assert len(uploads) == 1 and uploads[0][3] == expected_uri
+
+    # And published before the environment that names it, or the head would
+    # describe an object that does not exist yet.
+    upload_index = next(i for i, call in enumerate(gcloud.calls) if call.args[:2] == ("storage", "cp"))
+    configure_index = next(
+        i
+        for i, call in enumerate(gcloud.calls)
+        if call.stdin_text is not None and HEAD_ENVIRONMENT_PATH in (call.remote_command or "")
+    )
+    assert upload_index < configure_index
+
+
+def test_a_head_with_no_artifact_store_publishes_nothing_rather_than_inventing_a_location() -> None:
+    """Guessing a bucket produces a head that looks configured and fails on submission."""
+
+    gcloud = FakeGcloud(spec=_spec())
+
+    HeadProvisioner(_spec(), runner=gcloud, secret_factory=lambda: STUB_SECRETS, wheel_source=_fake_wheel).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+
+    assert "EYVAN_NATIVE_WORKER_PACKAGE" not in environment
+    assert "EYVAN_FLEET_STATE_URI" not in environment
+    assert gcloud.issued_matching("storage", "cp") == []
+
+
+def test_a_non_numeric_object_generation_is_refused() -> None:
+    """The generation is what pins the URI to exact bytes; a blank one pins nothing."""
+
+    spec = _spec(artifact_store_uri="gs://fleet-bucket/artifacts")
+    gcloud = FakeGcloud(spec=spec, object_generation="")
+
+    with pytest.raises(HeadCommandError, match="generation"):
+        HeadProvisioner(
+            spec,
+            runner=gcloud,
+            secret_factory=lambda: STUB_SECRETS,
+            wheel_source=_fake_wheel,
+        ).up()
