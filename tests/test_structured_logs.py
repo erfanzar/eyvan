@@ -2505,3 +2505,33 @@ def test_routine_unit_supervisor_lines_never_reach_the_transcript() -> None:
     ]
     # Skipping chatter still advances the stream: no re-read, no rewind.
     assert page.next_cursor == "s3"
+
+
+def test_archived_unit_chatter_is_dropped_at_read_time_and_job_output_kept() -> None:
+    """Pages archived before ingestion-side filtering still render clean.
+
+    The read-side match is message-shape-only, so it must be precise: the
+    supervisor's bookkeeping goes, a job's own prose that merely begins with
+    "Starting" stays.
+    """
+
+    from eyvan.sdk.follow import _LogWindow
+
+    window = _LogWindow.parse(
+        {
+            "records": [
+                {"message": "Starting /bin/sh -c python -m eyvan.worker.runtime.callable_worker --sha256 ab", "rank": 0},
+                {"message": "eyvan-wl_x-a1.service: Deactivated successfully.", "rank": 0},
+                {"message": "eyvan-wl_x-a1.service: Consumed 1min 12.996s CPU time.", "rank": 0},
+                {"message": "[TpuDevice(id=0), TpuDevice(id=1)]", "rank": 0},
+                {"message": "Starting the second epoch", "rank": 0},
+            ],
+            "next_cursor": "c9",
+        }
+    )
+
+    assert [line for _r, line, _t in window.lines] == [
+        "[TpuDevice(id=0), TpuDevice(id=1)]",
+        "Starting the second epoch",
+    ]
+    assert window.cursor == "c9"

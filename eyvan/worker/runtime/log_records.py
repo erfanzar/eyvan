@@ -1189,6 +1189,19 @@ _ROUTINE_UNIT_LINES = (
 _UNIT_CHATTER = re.compile(r"\.service: (?:" + "|".join(re.escape(line.strip()) for line in _ROUTINE_UNIT_LINES) + ")")
 
 
+#: Read-side companion: archived records carry no journald identifier, so the
+#: transcript filter matches on message shape alone. Only unambiguous forms
+#: qualify -- a unit-prefixed bookkeeping line, or the launcher echo for this
+#: worker's own entrypoint -- never a bare "Starting ..." a job may print.
+_WORKER_LAUNCH_CHATTER = re.compile(r"^(?:Starting |Started |Stopped ).*eyvan\.worker\.runtime\.callable_worker")
+
+
+def routine_unit_chatter(message: str) -> bool:
+    """True when one already-archived log line is unit-supervisor noise."""
+
+    return bool(_UNIT_CHATTER.search(message)) or bool(_WORKER_LAUNCH_CHATTER.match(message))
+
+
 def _is_routine_unit_chatter(entry: dict[str, tp.Any]) -> bool:
     identifier = entry.get("SYSLOG_IDENTIFIER", entry.get("_COMM"))
     if identifier != _SYSTEMD_IDENTIFIER:

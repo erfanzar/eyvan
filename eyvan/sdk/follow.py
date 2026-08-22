@@ -16,6 +16,7 @@ from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.records import WorkloadRecord, WorkloadState
 from eyvan.sdk.job_receipt import JobLifecycleUpdate, JobTerminalOutput
 from eyvan.sdk.lifecycle import TERMINAL_STATES, workload_lifecycle_update
+from eyvan.worker.runtime.log_records import routine_unit_chatter
 
 #: What the process exits with once the workload it followed has stopped.
 #:
@@ -68,11 +69,13 @@ class _LogWindow:
             if not is_json_object(record):
                 continue
             message = record.get("message")
+            if not isinstance(message, str) or routine_unit_chatter(message):
+                continue
             rank = record.get("rank")
             lines.append(
                 (
                     rank if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0 else 0,
-                    message if isinstance(message, str) else "",
+                    message,
                     _timestamp(record.get("timestamp")),
                 )
             )
