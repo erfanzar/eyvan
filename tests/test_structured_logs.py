@@ -2465,3 +2465,43 @@ def test_a_retained_legacy_cursor_is_answered_with_a_reset_not_a_refusal() -> No
 
     assert response.status_code == 200
     assert "hi" in response.text
+
+
+def test_routine_unit_supervisor_lines_never_reach_the_transcript() -> None:
+    """systemd's start/stop bookkeeping is transport noise, not job output.
+
+    The workload runs under a transient unit, so journald interleaves
+    "Starting ...", "Deactivated successfully", and CPU accounting between the
+    lines the job actually printed -- which read exactly as if the job had
+    printed them. They are dropped at ingestion, while anything systemd says
+    about a failure is kept.
+    """
+
+    page = parse_journal_json(
+        _journal(
+            {
+                "MESSAGE": "Starting /bin/sh -c python -m eyvan.worker.runtime.callable_worker ...",
+                "SYSLOG_IDENTIFIER": "systemd",
+                "__CURSOR": "s1",
+            },
+            {"MESSAGE": "[TpuDevice(id=0, process_index=0)]", "__CURSOR": "u1"},
+            {
+                "MESSAGE": "eyvan-wl_x.service: Consumed 1min 12.996s CPU time.",
+                "SYSLOG_IDENTIFIER": "systemd",
+                "__CURSOR": "s2",
+            },
+            {
+                "MESSAGE": "eyvan-wl_x.service: Main process exited, code=killed, status=9/OOM-KILL",
+                "SYSLOG_IDENTIFIER": "systemd",
+                "__CURSOR": "s3",
+            },
+        ),
+    )
+
+    messages = [record.message for record in page.records]
+    assert messages == [
+        "[TpuDevice(id=0, process_index=0)]",
+        "eyvan-wl_x.service: Main process exited, code=killed, status=9/OOM-KILL",
+    ]
+    # Skipping chatter still advances the stream: no re-read, no rewind.
+    assert page.next_cursor == "s3"

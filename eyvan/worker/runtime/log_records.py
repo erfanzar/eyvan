@@ -1167,6 +1167,37 @@ def stream_for_priority(priority: str | int | None) -> LogStream:
     return "unknown"
 
 
+#: The unit supervisor writes start/stop bookkeeping into the same journal
+#: the workload's output lands in. Its routine lines -- "Starting ...",
+#: "Started ...", "Stopped ...", "Deactivated successfully", CPU accounting --
+#: interleave with a job's real stdout and read as if the job had printed
+#: them. They are transport noise, filtered at ingestion; anything systemd
+#: says about a *failure* (a main process exiting non-zero, an OOM kill) does
+#: not match these prefixes and is deliberately kept.
+_SYSTEMD_IDENTIFIER = "systemd"
+_ROUTINE_UNIT_LINES = (
+    "Started ",
+    "Starting ",
+    "Stopped ",
+    "Stopping ",
+    "Finished ",
+    "Deactivated successfully",
+    "Consumed ",
+)
+#: journald usually prefixes the unit name: "eyvan-wl_<id>-a1-g1-<sha>.service:
+#: Consumed 1min ...". The unit name varies, so match what follows it.
+_UNIT_CHATTER = re.compile(r"\.service: (?:" + "|".join(re.escape(line.strip()) for line in _ROUTINE_UNIT_LINES) + ")")
+
+
+def _is_routine_unit_chatter(entry: dict[str, tp.Any]) -> bool:
+    identifier = entry.get("SYSLOG_IDENTIFIER", entry.get("_COMM"))
+    if identifier != _SYSTEMD_IDENTIFIER:
+        return False
+    message = entry.get("MESSAGE")
+    message = message if isinstance(message, str) else ""
+    return message.startswith(_ROUTINE_UNIT_LINES) or bool(_UNIT_CHATTER.search(message))
+
+
 def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
     """Parse ``journalctl --output=json`` output into records.
 
@@ -1194,7 +1225,10 @@ def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
             message = bytes(item for item in message if isinstance(item, int)).decode("utf-8", errors="replace")
         elif not isinstance(message, str):
             continue
+        # Advance past it: a dropped line must never rewind the stream.
         cursor = str(entry.get("__CURSOR", cursor))
+        if _is_routine_unit_chatter(entry):
+            continue
         records.append(
             LogRecord(
                 message=message,
