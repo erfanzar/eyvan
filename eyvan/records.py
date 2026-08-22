@@ -48,7 +48,7 @@ DEFAULT_MAX_RETRIES = 3
 #: capability table rather than written here, so the durable model stops being
 #: the place a provider's ceiling is recorded. Kept under its original name
 #: because it is imported across the package and by tests.
-MAX_GCP_TPU_MULTISLICE_WORKERS = max_multi_worker_cell_width()
+MAX_GCP_TPU_MULTISLICE_WORKERS = backend_capabilities("gcp-tpu").max_workers_per_cell
 WORKER_COUNT_LABEL = "eyvan_worker_count"
 CALLABLE_SIGNING_KEY_ENV = "EYVAN_CALLABLE_SIGNING_KEY"
 REMOTE_CALLABLE_SIGNATURE_ERROR = (
@@ -1108,8 +1108,11 @@ class WorkloadDefinition(EyvanModel):
                 raise ValueError("multi-worker capacity requires the eyvan-native executor")
             if self.gang.per_replica.tpu <= 0 or self.gang.per_replica.gpu > 0:
                 raise ValueError("multi-worker capacity requires a TPU resource request")
-            if self.worker_count > MAX_GCP_TPU_MULTISLICE_WORKERS:
-                raise ValueError(f"GCP TPU multislice worker_count must not exceed {MAX_GCP_TPU_MULTISLICE_WORKERS}")
+            if self.worker_count > max_multi_worker_cell_width():
+                raise ValueError(
+                    f"multi-worker cells support at most {max_multi_worker_cell_width()} workers "
+                    "across known capacity backends"
+                )
         return self
 
     @property
@@ -1737,24 +1740,35 @@ class CellRecord(EyvanModel):
             raise ValueError("GCP cells require provider_project and zone")
         if self.capacity_backend == "gcp-tpu" and not self.accelerator_type:
             raise ValueError("GCP TPU cells require accelerator_type")
-        node_count = self.provider_options.get("node_count", 1)
-        if isinstance(node_count, bool) or not isinstance(node_count, int) or node_count < 1:
-            raise ValueError("GCP TPU provider_options.node_count must be a positive integer")
-        if node_count != self.worker_count:
-            raise ValueError("cell worker_count must match provider_options.node_count")
+        tpu_backend = self.capacity_backend in {"gcp-tpu", "tpu"}
+        if tpu_backend:
+            # ``node_count`` is how a Cloud TPU queued resource states its
+            # width; other backends size cells differently (indexed jobs,
+            # host lists) and must not be measured with this ruler.
+            node_count = self.provider_options.get("node_count", 1)
+            if isinstance(node_count, bool) or not isinstance(node_count, int) or node_count < 1:
+                raise ValueError("GCP TPU provider_options.node_count must be a positive integer")
+            if node_count != self.worker_count:
+                raise ValueError("cell worker_count must match provider_options.node_count")
         node_prefix = self.provider_options.get("node_prefix")
         if self.worker_count == 1 and node_prefix is not None:
             raise ValueError("provider_options.node_prefix requires worker_count greater than one")
         if self.worker_count > 1:
-            if not backend_capabilities(self.capacity_backend).multi_worker_cells:
+            capabilities = backend_capabilities(self.capacity_backend)
+            if not capabilities.multi_worker_cells:
                 raise ValueError(
                     f"capacity backend {self.capacity_backend!r} does not build cells spanning several machines"
                 )
             if self.executor != "eyvan-native":
                 raise ValueError("multi-worker cells require the eyvan-native executor")
-            if self.worker_count > MAX_GCP_TPU_MULTISLICE_WORKERS:
-                raise ValueError(f"GCP TPU multislice worker_count must not exceed {MAX_GCP_TPU_MULTISLICE_WORKERS}")
-            if not isinstance(node_prefix, str) or not node_prefix.strip() or node_prefix != node_prefix.strip():
+            if self.worker_count > capabilities.max_workers_per_cell:
+                raise ValueError(
+                    f"capacity backend {self.capacity_backend!r} builds at most "
+                    f"{capabilities.max_workers_per_cell} workers per cell"
+                )
+            if tpu_backend and (
+                not isinstance(node_prefix, str) or not node_prefix.strip() or node_prefix != node_prefix.strip()
+            ):
                 raise ValueError("multi-worker GCP TPU cells require provider_options.node_prefix")
         declared_worker_count = self.labels.get(WORKER_COUNT_LABEL)
         if declared_worker_count is not None and declared_worker_count != str(self.worker_count):

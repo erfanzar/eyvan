@@ -231,6 +231,7 @@ class KubernetesCapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            capacity_backends=("kubernetes",),
             supports_callables=True,
             supports_checkpoint=True,
             # ``kubectl exec`` exists regardless; routing it through Eyvan is what
@@ -1603,6 +1604,11 @@ class KubernetesCapacityDriver:
         with self._mutation_lock, self.state.exclusive():
 
             def mutate(record: FleetCellRecord) -> None:
+                # Draining takes capacity out of service, so a superseded
+                # controller must not be able to do it -- the same fence check
+                # the release tombstone gets, applied before anything moves.
+                if not self._accept_mutation(record, context):
+                    return
                 self._require_no_inflight_creates(record, "drain")
                 record.desired_state = "down"
                 record.state = CapacityStatus.DRAINING

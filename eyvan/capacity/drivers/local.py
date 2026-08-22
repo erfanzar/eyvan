@@ -44,6 +44,7 @@ class LocalCapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            capacity_backends=("local",),
             supports_callables=True,
             max_gang_replicas=1,
             # Local development runs on the operator's own machine, where a shell is

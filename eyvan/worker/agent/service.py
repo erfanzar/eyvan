@@ -309,6 +309,11 @@ class CellAgentService:
             executor=capabilities.executor,
             accelerator_types=capabilities.accelerator_types,
             capacity_classes=capabilities.capacity_classes,
+            # Forwarded rather than dropped: capability-based routing reads
+            # this to decide which agents can serve a requested capacity
+            # backend, and an agent whose declaration was stripped here
+            # looked like an older agent that declares nothing.
+            capacity_backends=capabilities.capacity_backends,
             supports_checkpoint=capabilities.supports_checkpoint,
             supports_callables=capabilities.supports_callables,
             supports_exec=capabilities.supports_exec,

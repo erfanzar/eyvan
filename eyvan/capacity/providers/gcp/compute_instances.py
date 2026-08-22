@@ -685,6 +685,16 @@ class GcloudNativeWorkerArtifactAccessStore:
 
         ``gcloud storage buckets add-iam-policy-binding`` is idempotent, so this
         remains safe across controller retries and replacement capacity.
+
+        The matching grant is deliberately never revoked on release. The reader
+        identity is the worker VM's service account -- by default the
+        project-wide Compute default service account, which every other VM in
+        the project may also be using -- and these roles are scoped to exactly
+        one artifact bucket. Revoking on release therefore risks breaking
+        unrelated workloads that share the identity to save one narrow binding
+        on one bucket, so the grant is left in place and auditable through
+        normal IAM tooling. Revisit only if workers move to dedicated
+        per-cell identities.
         """
 
         member = f"serviceAccount:{reader_service_account}"
@@ -862,7 +872,14 @@ class GcloudComputeProvider:
                 pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"Compute instance {name!r} still exists after delete")
+                # Typed like the TPU path: a bare TimeoutError carries no
+                # retryability or failure code, so the controller cannot tell
+                # it from a real failure.
+                raise GcloudError(
+                    f"Compute instance {name!r} still exists after delete "
+                    f"(waited {self.delete_wait_timeout_s:g} seconds for its removal)",
+                    code=CapacityProviderFailureCode.PROVIDER_ERROR,
+                )
             time.sleep(min(2, remaining))
 
     @staticmethod

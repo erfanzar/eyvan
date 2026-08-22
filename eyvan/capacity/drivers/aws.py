@@ -41,6 +41,7 @@ and a weaker one than having run.
 from __future__ import annotations
 
 import typing as tp
+from dataclasses import replace
 from datetime import datetime
 from threading import RLock
 
@@ -108,6 +109,7 @@ class AwsEc2CapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            capacity_backends=("aws-ec2",),
             supports_callables=True,
             supports_checkpoint=True,
             # One instance per cell for now. Placement groups would make a
@@ -257,8 +259,28 @@ class AwsEc2CapacityDriver:
         remembered = record.metadata.get(_INSTANCE_KEY)
         for instance in owned:
             if instance.instance_id == remembered:
-                return instance
-        return owned[0]
+                return self._with_spot_interruption(instance)
+        return self._with_spot_interruption(owned[0])
+
+    def _with_spot_interruption(self, instance: Ec2Instance) -> Ec2Instance:
+        """Attach EC2's reclamation notice to the instance, when one exists.
+
+        DescribeInstances never carries the signal: it lives on the spot
+        request, and only ``DescribeSpotInstanceRequests`` answers it. A
+        provider that cannot ask (an older fake, a narrower seam) changes
+        nothing; a marked instance comes back carrying the reason, which is
+        what makes the reclamation reportable as a preemption rather than as
+        a machine that vanished.
+        """
+
+        ask = getattr(self.api, "describe_spot_instance_requests", None)
+        if not callable(ask):
+            return instance
+        statuses = ask([instance.instance_id])
+        code = statuses.get(instance.instance_id) if isinstance(statuses, dict) else None
+        if isinstance(code, str) and code.startswith("marked-for-"):
+            return replace(instance, spot_interruption=code)
+        return instance
 
     def _observation(self, record: FleetCellRecord, instance: Ec2Instance | None) -> CellObservation:
         """Project the record and its instance into one observation."""
@@ -273,6 +295,7 @@ class AwsEc2CapacityDriver:
         }
         state = record.state
         endpoint = record.execution_endpoint
+        failure_code: CapacityProviderFailureCode | None = None
         if record.desired_state != "up":
             # Drain has already decided. A running instance is exactly what a
             # draining cell has -- deriving the state from it here would report
@@ -291,13 +314,17 @@ class AwsEc2CapacityDriver:
             if instance.spot_interruption:
                 # A reclamation, not a machine that vanished. Reported so the
                 # fleet charges it to the preemption budget rather than to the
-                # one that decides a pool cannot give capacity at all.
+                # one that decides a pool cannot give capacity at all -- and
+                # carried as the typed PREEMPTED failure code, not just prose,
+                # because routing reads the code and humans read the text.
                 metadata["preemption_reason"] = instance.spot_interruption
             if instance.state == "running":
                 state = CapacityStatus.HEALTHY
                 endpoint = endpoint or instance.private_ip
             elif instance.state == "pending":
                 state = CapacityStatus.WAITING
+            if instance.spot_interruption:
+                failure_code = CapacityProviderFailureCode.PREEMPTED
         elif record.desired_state == "up" and record.state is not CapacityStatus.ABSENT:
             # The record wants a machine and EC2 has none carrying its tags.
             # Waiting rather than healthy: publishing an endpoint for capacity
@@ -313,6 +340,7 @@ class AwsEc2CapacityDriver:
             execution_endpoint=endpoint,
             observed_at=datetime.now(UTC),
             runtime_process_count=1,
+            failure_code=failure_code,
             metadata=metadata,
         )
 

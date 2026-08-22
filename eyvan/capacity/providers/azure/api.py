@@ -85,6 +85,10 @@ class AzureVirtualMachine:
     provisioning_state: str
     tags: dict[str, str] = field(default_factory=dict)
     private_ip: str | None = None
+    #: Resource ids of the VM's network interfaces. Real ARM documents never
+    #: embed addresses here -- they carry only references -- so a driver that
+    #: needs an address resolves one of these.
+    nic_ids: tuple[str, ...] = ()
     vm_size: str | None = None
     zone: str | None = None
     #: Set when Azure has deallocated a Spot VM. The signal that separates a
@@ -104,6 +108,8 @@ class AzureApi(tp.Protocol):
 
     def delete_vm(self, name: str) -> None: ...
 
+    def get_network_interface(self, nic_id: str) -> JsonObject | None: ...
+
 
 def parse_vm(payload: JsonObject) -> AzureVirtualMachine:
     """Read one VM out of an ARM resource document."""
@@ -117,6 +123,7 @@ def parse_vm(payload: JsonObject) -> AzureVirtualMachine:
         provisioning_state=str(properties.get("provisioningState") or "Unknown"),
         tags={str(key): str(value) for key, value in tags.items()},
         private_ip=_private_ip(properties),
+        nic_ids=_nic_ids(properties),
         vm_size=str(hardware.get("vmSize")) if hardware.get("vmSize") else None,
         zone=str(zones[0]) if isinstance(zones, list) and zones else None,
         eviction_reason=_eviction_reason(properties),
@@ -129,7 +136,8 @@ def _private_ip(properties: tp.Mapping[str, tp.Any]) -> str | None:
     ARM does not put the address on the VM: it lives on a network interface,
     which is a separate resource. A document that carries it has been assembled
     by something that already looked, so this reads it rather than issuing a
-    second call from inside a parser.
+    second call from inside a parser; real ARM documents carry only interface
+    *references*, which ``_nic_ids`` collects for exactly that follow-up.
     """
 
     network = properties.get("networkProfile")
@@ -142,6 +150,47 @@ def _private_ip(properties: tp.Mapping[str, tp.Any]) -> str | None:
         if not is_json_object(interface):
             continue
         address = interface.get("privateIPAddress")
+        if isinstance(address, str) and address:
+            return address
+    return None
+
+
+def _nic_ids(properties: tp.Mapping[str, tp.Any]) -> tuple[str, ...]:
+    """Return the resource ids of the VM's network interfaces, in order."""
+
+    network = properties.get("networkProfile")
+    if not is_json_object(network):
+        return ()
+    interfaces = network.get("networkInterfaces")
+    if not isinstance(interfaces, list):
+        return ()
+    ids = [
+        str(interface["id"])
+        for interface in interfaces
+        if isinstance(interface, dict) and isinstance(interface.get("id"), str) and interface["id"]
+    ]
+    return tuple(ids)
+
+
+def parse_nic_private_ip(payload: JsonObject | None) -> str | None:
+    """Read the private address out of one ARM network-interface document.
+
+    The address lives at ``properties.ipConfigurations[*].properties.privateIPAddress``;
+    anything else (a different shape, a missing configuration) yields ``None``
+    rather than a guess.
+    """
+
+    if not is_json_object(payload):
+        return None
+    properties = payload.get("properties") if is_json_object(payload.get("properties")) else {}
+    configurations = properties.get("ipConfigurations")
+    if not isinstance(configurations, list):
+        return None
+    for configuration in configurations:
+        if not is_json_object(configuration):
+            continue
+        inner = configuration.get("properties") if is_json_object(configuration.get("properties")) else {}
+        address = inner.get("privateIPAddress")
         if isinstance(address, str) and address:
             return address
     return None
@@ -279,6 +328,11 @@ class HttpAzureApi:
 
     def delete_vm(self, name: str) -> None:
         self._call("DELETE", self._path(name))
+
+    def get_network_interface(self, nic_id: str) -> JsonObject | None:
+        # Interface ids are absolute resource paths; the api-version query
+        # parameter is what ARM needs beside them.
+        return self._call("GET", f"{self.endpoint}/{nic_id.lstrip('/')}")
 
 
 def _payload(response: httpx.Response) -> JsonObject | str:

@@ -34,7 +34,7 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
-from eyvan.capacity.fleet_state import FleetStateStore
+from eyvan.capacity.fleet_state import FleetCellRecord, FleetStateStore
 from eyvan.capacity.providers.azure.api import AzureVirtualMachine, failure_for, parse_vm
 from eyvan.capacity.providers.azure.machines import CELL_TAG, FENCE_TAG, GENERATION_TAG, vm_name
 
@@ -52,6 +52,7 @@ class FakeArm:
         self.creates: list[tuple[str, JsonObject]] = []
         self.deleted: list[str] = []
         self.location = "eastus"
+        self.nics: dict[str, JsonObject] = {}
         self._fail: Exception | None = None
 
     @contextmanager
@@ -93,6 +94,9 @@ class FakeArm:
         self._check()
         self.deleted.append(name)
         self.machines.pop(name, None)
+
+    def get_network_interface(self, nic_id: str) -> JsonObject | None:
+        return self.nics.get(nic_id)
 
     def live_for(self, cell_id: str) -> int:
         return sum(1 for item in self.machines.values() if item.tags.get(CELL_TAG) == cell_id)
@@ -343,3 +347,45 @@ def test_a_transport_failure_is_never_conclusive(driver) -> None:
 def test_a_document_that_cannot_create_is_refused_by_name(driver, field: str, value: str) -> None:
     with pytest.raises(ValueError, match=field.split("_")[0]):
         driver.apply_capacity("cell-a", desired(**{field: value}), context("apply-1"))
+
+
+def test_an_endpoint_is_resolved_through_the_nic_when_the_vm_document_has_none(tmp_path) -> None:
+    """Real ARM documents carry interface references, never addresses."""
+
+    state = FleetStateStore.from_uri(str(tmp_path / "state.json"))
+    api = FakeArm()
+    driver = AzureVmCapacityDriver(state, api=api, location="eastus")
+    applied = driver.apply_capacity("cell-a", desired(), context("apply"))
+    assert applied.state is CapacityStatus.HEALTHY
+
+    machine = api.machines[applied.metadata["azure_vm_name"]]
+    object.__setattr__(machine, "private_ip", None)
+
+    def forget(record: FleetCellRecord) -> None:
+        # The record remembered the address it saw at apply time; the point of
+        # this scenario is resolving one that was never embedded.
+        record.execution_endpoint = None
+
+    state.mutate_record("cell-a", forget)
+    nic_id = "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/cell-a-nic"
+    object.__setattr__(machine, "nic_ids", (nic_id,))
+    api.nics[nic_id] = {
+        "properties": {
+            "ipConfigurations": [
+                {"properties": {"privateIPAddress": "10.0.0.7"}},
+            ]
+        }
+    }
+
+    observation = driver.observe("cell-a")
+
+    assert observation.execution_endpoint == "10.0.0.7"
+
+
+def test_parse_nic_private_ip_reads_the_arm_shape() -> None:
+    from eyvan.capacity.providers.azure.api import parse_nic_private_ip
+
+    payload = {"properties": {"ipConfigurations": [{"properties": {"privateIPAddress": "10.1.2.3"}}]}}
+    assert parse_nic_private_ip(payload) == "10.1.2.3"
+    assert parse_nic_private_ip({"properties": {}}) is None
+    assert parse_nic_private_ip(None) is None

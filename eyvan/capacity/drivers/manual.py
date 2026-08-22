@@ -87,6 +87,7 @@ class ManualCapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            capacity_backends=("manual",),
             supports_callables=True,
             supports_checkpoint=True,
             # The operator owns these hosts, so a diagnostic beside a stuck job is
@@ -313,6 +314,10 @@ class ManualCapacityDriver:
         with self._mutation_lock, self.state.exclusive():
 
             def mutate(record: FleetCellRecord) -> None:
+                # A superseded controller must not be able to drain: the fence
+                # is checked exactly as onprem-ssh checks it.
+                if not self._accept_mutation(record, context):
+                    return
                 record.desired_state = "down"
                 record.state = CapacityStatus.DRAINING
                 self._stamp(record, context)

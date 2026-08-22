@@ -103,6 +103,21 @@ _BACKEND_CAPABILITIES: dict[str, BackendCapabilities] = {
     # One Cloud TPU multislice queued resource. 256 is the provider's own
     # ceiling on workers in a single request, not a number Eyvan chose.
     "gcp-tpu": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=256),
+    # One Compute Engine instance, EC2 instance, or Azure VM per cell today.
+    # Declared at the single-machine default on purpose: an entry here is a
+    # statement, and "one machine per cell" is the honest one for these.
+    "gcp-compute": BackendCapabilities(),
+    "aws-ec2": BackendCapabilities(),
+    "azure-vm": BackendCapabilities(),
+    "local": BackendCapabilities(),
+    # One Kubernetes indexed job per cell; 512 is the job controller's own
+    # worker ceiling (MAX_INDEXED_JOB_WORKERS), not a number Eyvan chose.
+    "kubernetes": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
+    # Operator-owned host sets joined over SSH or declared by hand share the
+    # drivers' own 512-host ceilings (onprem_ssh.MAX_HOSTS and the manual
+    # driver's limit), which is why the two numbers agree.
+    "onprem-ssh": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
+    "manual": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
 }
 
 

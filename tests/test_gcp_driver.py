@@ -1138,3 +1138,71 @@ def test_provider_failure_classification_names_quota_and_stockout() -> None:
     assert quota is CapacityProviderFailureCode.QUOTA_EXCEEDED
     assert stockout is CapacityProviderFailureCode.STOCKOUT
     assert unclassified is None
+
+
+def test_router_sends_record_backed_operations_to_the_owning_kind(tmp_path) -> None:
+    from eyvan.capacity.drivers.gcp import GcpCapacityDriver
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    tpu_provider = FakeProvider()
+    compute_provider = FakeProvider()
+    router = GcpCapacityDriver(
+        state,
+        tpu_provider=tpu_provider,
+        compute_provider=compute_provider,
+        execution_backend="native-local",
+    )
+
+    router.apply_capacity(
+        "cpu-cell",
+        {
+            **desired(),
+            "capacity_backend": "gcp-compute",
+            "provider_options": {"machine_type": "n2-standard-8"},
+        },
+        context("create"),
+    )
+
+    assert compute_provider.ensured and not tpu_provider.ensured
+    observation = router.observe("cpu-cell")
+    assert observation.state is CapacityStatus.WAITING
+    assert tpu_provider.deleted == []
+    router.release("cpu-cell", context("release", generation=2, token="leader-2"))
+    assert len(compute_provider.deleted) == 1
+    assert tpu_provider.deleted == []
+
+
+def test_router_routes_a_damaged_compute_record_by_its_backend_marker(tmp_path) -> None:
+    """A compute record that lost its config metadata must not fall through to TPU."""
+
+    from eyvan.capacity.drivers.gcp import GcpCapacityDriver
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    tpu_provider = FakeProvider()
+    compute_provider = FakeProvider()
+    router = GcpCapacityDriver(
+        state,
+        tpu_provider=tpu_provider,
+        compute_provider=compute_provider,
+        execution_backend="native-local",
+    )
+    router.apply_capacity(
+        "gpu-cell",
+        {
+            **desired(),
+            "capacity_backend": "gcp-compute",
+            "provider_options": {"machine_type": "n2-standard-8"},
+        },
+        context("create"),
+    )
+
+    def damage(record: FleetCellRecord) -> None:
+        record.metadata.pop("capacity_kind", None)
+        record.metadata.pop("compute_config", None)
+
+    state.mutate_record("gpu-cell", damage)
+
+    router.release("gpu-cell", context("release", generation=2, token="leader-2"))
+
+    assert len(compute_provider.deleted) == 1
+    assert tpu_provider.deleted == []

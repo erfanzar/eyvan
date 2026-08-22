@@ -180,3 +180,15 @@ def test_registry_rejects_duplicate_registration_without_replace() -> None:
     with pytest.raises(ValueError, match="already registered"):
         registry.register("x", lambda name, *, state, settings: None)  # type: ignore[arg-type,return-value]
     registry.register("x", lambda name, *, state, settings: None, replace=True)  # type: ignore[arg-type,return-value]
+
+
+def test_drain_refuses_a_superseded_fence(tmp_path) -> None:
+    """A controller that lost the cell must not be able to drain it."""
+
+    driver = _driver(tmp_path)
+    driver.apply_capacity("cell-a", _desired("http://host-a:8100"), _context("apply"))
+
+    with pytest.raises(StaleMutationError):
+        driver.drain("cell-a", _context("drain", generation=0))
+
+    assert driver.observe("cell-a").state is CapacityStatus.HEALTHY

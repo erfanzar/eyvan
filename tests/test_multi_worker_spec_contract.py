@@ -26,8 +26,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from eyvan.capacity.drivers.base import max_multi_worker_cell_width
 from eyvan.records import (
-    MAX_GCP_TPU_MULTISLICE_WORKERS,
     WORKER_COUNT_LABEL,
     CommandExecution,
     WorkloadDefinition,
@@ -65,7 +65,7 @@ def test_a_valid_multi_worker_spec_is_accepted() -> None:
         ({"provider": "aws"}, "requires a provider that builds it"),
         ({"required_executor": "ray-jobs"}, "requires the eyvan-native executor"),
         ({"gang": {"replicas": 1, "per_replica": {"cpu": 1, "gpu": 2}}}, "requires a TPU resource request"),
-        ({"worker_count": MAX_GCP_TPU_MULTISLICE_WORKERS + 1}, "must not exceed"),
+        ({"worker_count": max_multi_worker_cell_width() + 1}, "at most"),
     ],
     ids=["multi-cell-group", "provider-without-the-capability", "wrong-executor", "gpu-gang", "over-ceiling"],
 )

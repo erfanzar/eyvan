@@ -53,6 +53,7 @@ class FakeEc2:
         self._tokens: dict[str, str] = {}
         self._next = 1
         self._fail: Exception | None = None
+        self.spot_statuses: dict[str, str] = {}
 
     # -- failure injection ----------------------------------------------------
 
@@ -129,6 +130,16 @@ class FakeEc2:
                 tags={**current.tags, **tags},
                 private_ip=current.private_ip,
             )
+
+    def describe_spot_instance_requests(self, instance_ids: tp.Sequence[str]) -> dict[str, str]:
+        """Return the reclamation notices this fake has been told about."""
+
+        self._check()
+        return {
+            instance_id: self.spot_statuses[instance_id]
+            for instance_id in instance_ids
+            if instance_id in self.spot_statuses
+        }
 
     # -- what conformance counts ---------------------------------------------
 
@@ -425,3 +436,48 @@ def test_a_transport_failure_is_never_conclusive(driver) -> None:
         driver.apply_capacity("cell-a", desired(), context("apply-1"))
 
     assert raised.value.code is CapacityProviderFailureCode.PROVIDER_UNAVAILABLE
+
+
+def test_a_marked_spot_instance_is_reported_as_a_preemption(tmp_path) -> None:
+    """A reclamation notice becomes the typed PREEMPTED outcome, not a vanishing."""
+
+    api = FakeEc2()
+    driver = AwsEc2CapacityDriver(FleetStateStore.from_uri(str(tmp_path / "state.json")), api=api)
+    applied = driver.apply_capacity("cell-a", desired(), context("apply", generation=2, token="leader-2"))
+    instance_id = applied.metadata["instance_id"]
+    api.spot_statuses[instance_id] = "marked-for-termination"
+
+    observation = driver.observe("cell-a")
+
+    assert observation.failure_code is CapacityProviderFailureCode.PREEMPTED
+    assert observation.metadata["preemption_reason"] == "marked-for-termination"
+
+
+def test_an_unmarked_spot_instance_carries_no_preemption(tmp_path) -> None:
+    api = FakeEc2()
+    driver = AwsEc2CapacityDriver(FleetStateStore.from_uri(str(tmp_path / "state.json")), api=api)
+    applied = driver.apply_capacity("cell-a", desired(), context("apply", generation=2, token="leader-2"))
+    api.spot_statuses[applied.metadata["instance_id"]] = "fulfilled"
+
+    observation = driver.observe("cell-a")
+
+    assert "preemption_reason" not in observation.metadata
+
+
+def test_spot_request_status_codes_are_parsed_from_the_query_response() -> None:
+    from eyvan.capacity.providers.aws.api import parse_spot_instance_requests
+
+    document = """<DescribeSpotInstanceRequestsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+      <spotInstanceRequestSet>
+        <item>
+          <instanceId>i-1</instanceId>
+          <status><code>marked-for-termination</code></status>
+        </item>
+        <item>
+          <instanceId>i-2</instanceId>
+          <status><code>fulfilled</code></status>
+        </item>
+      </spotInstanceRequestSet>
+    </DescribeSpotInstanceRequestsResponse>"""
+
+    assert parse_spot_instance_requests(document) == {"i-1": "marked-for-termination", "i-2": "fulfilled"}

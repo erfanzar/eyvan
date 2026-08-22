@@ -1030,11 +1030,9 @@ class OnPremSshCapacityDriver:
         be running the workload that is checkpointing, and a host whose marker
         disappeared would be claimable by another cell while that work runs.
 
-        The fence is checked here, unlike in ``manual.py`` and
-        ``kubernetes.py``, whose drains validate only against the release
-        tombstone. Draining is a mutation with consequences -- it takes capacity
-        out of service and starts a workload teardown -- so a superseded
-        controller must not be able to do it.
+        Draining is a mutation with consequences -- it takes capacity out of
+        service and starts a workload teardown -- so a superseded controller
+        must not be able to do it; every driver's drain checks this fence.
         """
 
         with self._mutation_lock, self.state.exclusive():

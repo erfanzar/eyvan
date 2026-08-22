@@ -122,6 +122,38 @@ class Ec2Api(tp.Protocol):
 
     def create_tags(self, instance_ids: tp.Sequence[str], tags: tp.Mapping[str, str]) -> None: ...
 
+    def describe_spot_instance_requests(self, instance_ids: tp.Sequence[str]) -> dict[str, str]: ...
+
+
+def parse_spot_instance_requests(document: str) -> dict[str, str]:
+    """Map each spot request's instance id to its status code.
+
+    ``marked-for-termination`` and friends are EC2's only pollable signal that a
+    spot reclamation has begun -- DescribeInstances never carries it -- so this
+    is what turns a vanishing machine into a reportable preemption. Requests
+    without an attached instance id are skipped.
+    """
+
+    root = ElementTree.fromstring(document)
+    statuses: dict[str, str] = {}
+    for node in root.iter():
+        if _strip_namespace(node.tag) != "spotInstanceRequestSet":
+            continue
+        for item in node:
+            if _strip_namespace(item.tag) != "item":
+                continue
+            instance_id: str | None = None
+            code: str | None = None
+            for child in item:
+                name = _strip_namespace(child.tag)
+                if name == "instanceId":
+                    instance_id = _text(child)
+                elif name == "status":
+                    code = next((_text(part) for part in child if _strip_namespace(part.tag) == "code"), None)
+            if instance_id is not None and code is not None:
+                statuses[instance_id] = code
+    return statuses
+
 
 def _text(node: ElementTree.Element | None) -> str | None:
     return None if node is None or node.text is None else node.text.strip()
@@ -314,6 +346,10 @@ class HttpEc2Api:
             params[f"Tag.{index}.Key"] = key
             params[f"Tag.{index}.Value"] = value
         self._call("CreateTags", params)
+
+    def describe_spot_instance_requests(self, instance_ids: tp.Sequence[str]) -> dict[str, str]:
+        params = {f"InstanceId.{index}": value for index, value in enumerate(instance_ids, start=1)}
+        return parse_spot_instance_requests(self._call("DescribeSpotInstanceRequests", params))
 
 
 def _body_digest(body: tp.Mapping[str, str]) -> str:

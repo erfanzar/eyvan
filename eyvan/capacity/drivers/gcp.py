@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import typing as tp
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import RLock
 
@@ -246,6 +246,11 @@ class GcpTpuCapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            # Exactly the ``capacity_backend`` values _desired_kind accepts:
+            # routing reads this to decide whether this agent can serve a
+            # requested backend, so overclaiming would route cells here
+            # only to fail validation.
+            capacity_backends=("gcp", "gcp-tpu", "tpu"),
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
@@ -266,12 +271,54 @@ class GcpTpuCapacityDriver:
                 generation=0,
                 observed_at=datetime.now(UTC),
             )
+        disowned = self._disowned_incarnations(record)
+        if disowned is not None and disowned:
+            # Hardware carrying this cell's resource-id scheme but a generation
+            # the fence disowns. The controller has to be told to *replace* the
+            # cell rather than schedule onto it: reporting the record's own
+            # state here would send work to capacity nobody is tracking.
+            return CellObservation(
+                cell_id=record.name,
+                state=CapacityStatus.NEEDS_RECREATE,
+                generation=record.generation,
+                execution_endpoint=None,
+                observed_at=datetime.now(UTC),
+                observed_tpu_vms=GcpTpuCapacityDriver._observed_tpu_vms(record),
+                runtime_process_count=GcpTpuCapacityDriver._runtime_process_count(record),
+                failure_code=GcpTpuCapacityDriver._failure_code(record),
+                metadata={
+                    **GcpTpuCapacityDriver._observation(record).metadata,
+                    "disowned_incarnations": disowned,
+                },
+            )
         return self._observation(record)
+
+    def _disowned_incarnations(self, record: FleetCellRecord) -> tuple[str, ...] | None:
+        """Return provider incarnations of this cell the fence does not own.
+
+        Consulted only when the provider can enumerate them; ``None`` means
+        the substrate could not be asked at all. A failing listing raises its
+        typed provider error rather than dissolving into "looks fine": an
+        observation made over a broken link must carry the reason it is
+        inconclusive, not present stale record state as fact.
+        """
+
+        listing = getattr(self.provider, "list_cell_incarnations", None)
+        if not callable(listing) or not record.project or not record.zone or not record.qr_id:
+            return None
+        incarnations = listing(project=record.project, zone=record.zone, cell_id=record.name)
+        prefix = f"{record.name}-r"
+        return tuple(
+            incarnation
+            for incarnation in incarnations
+            if isinstance(incarnation, str) and incarnation != record.qr_id and incarnation.startswith(prefix)
+        )
 
     @staticmethod
     def _observation(record: FleetCellRecord, *, detail: str = "") -> CellObservation:
         metadata: JsonObject = {
             **record.metadata,
+            "provider": record.metadata.get("provider", record.metadata.get("capacity_backend", "gcp-tpu")),
             "project": record.project,
             "zone": record.zone,
             "accelerator_type": record.accelerator_type,
@@ -1397,6 +1444,15 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
     accelerator_types = ("cpu", "gpu", "tpu")
     capacity_classes = ("spot", "on-demand", "reserved")
 
+    def capabilities(self) -> CellCapabilities:
+        """Describe Compute-backed capacity with this backend's own names.
+
+        Inherited otherwise from the TPU driver, whose ``capacity_backends``
+        would advertise TPU queueing this driver cannot do.
+        """
+
+        return replace(super().capabilities(), capacity_backends=("gcp", "gcp-compute", "compute"))
+
     def __init__(
         self,
         state: FleetStateStore | None = None,
@@ -1803,11 +1859,18 @@ class GcpCapacityDriver:
             return self.tpu.capabilities()
         if self.mode == "compute":
             return self.compute.capabilities()
+        if self.mode == "tpu":
+            backends: tuple[str, ...] = ("gcp", "gcp-tpu", "tpu")
+        elif self.mode == "compute":
+            backends = ("gcp", "gcp-compute", "compute")
+        else:
+            backends = ("gcp", "gcp-tpu", "gcp-compute", "tpu", "compute")
         return CellCapabilities(
             provider="gcp",
             executor=self.execution_backend,
             accelerator_types=("cpu", "gpu", "tpu"),
             capacity_classes=("spot", "on-demand", "reserved", "guaranteed"),
+            capacity_backends=backends,
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
@@ -1874,6 +1937,18 @@ class GcpCapacityDriver:
         return selected
 
     def _record_kind(self, cell_id: str) -> str:
+        """Route record-backed operations to the driver that owns the cell.
+
+        ``capacity_kind`` is stamped by the owning driver at apply time and
+        cross-kind takeover is refused, so in practice the first check
+        decides. The remaining markers are redundancy against a record whose
+        metadata was damaged after apply: ``capacity_backend``, then the
+        persisted provider-config key each kind writes. The final default is
+        deliberate -- creates never consult this method (they route from the
+        requested spec), TPU was the only kind before markers existed, and
+        refusing to route an ambiguous record would leave it impossible to
+        observe or release.
+        """
         if self.mode != "auto":
             return self.mode
         record = self.state.get(cell_id)
@@ -1882,8 +1957,17 @@ class GcpCapacityDriver:
         kind = record.metadata.get("capacity_kind")
         if kind in {"tpu", "compute"}:
             return str(kind)
+        backend = record.metadata.get("capacity_backend")
+        if isinstance(backend, str) and len(backend.strip()) > 0:
+            normalized = backend.strip().lower().replace("_", "-")
+            if normalized == "gcp-compute":
+                return "compute"
+            if normalized == "gcp-tpu":
+                return "tpu"
         if "compute_config" in record.metadata:
             return "compute"
+        if "tpu_config" in record.metadata:
+            return "tpu"
         return "tpu"
 
     def _driver(self, kind: str) -> GcpTpuCapacityDriver:

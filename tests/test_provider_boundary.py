@@ -132,13 +132,37 @@ def test_a_backend_that_declares_nothing_hosts_one_machine_per_cell() -> None:
 
 
 def test_the_multislice_ceiling_comes_from_the_backend_that_sets_it() -> None:
-    """256 is GCP's limit on one queued resource, not a number Eyvan chose."""
+    """Each backend's ceiling is its own: 256 is GCP's queued-resource limit.
 
-    from eyvan.capacity.drivers.base import backend_capabilities, max_multi_worker_cell_width
+    The durable constant tracks the GCP TPU entry specifically, and the
+    widest cell any backend builds comes from the table as a whole.
+    """
+
+    from eyvan.capacity.drivers.base import (
+        _BACKEND_CAPABILITIES,
+        backend_capabilities,
+        max_multi_worker_cell_width,
+    )
     from eyvan.records import MAX_GCP_TPU_MULTISLICE_WORKERS
 
     assert backend_capabilities("gcp-tpu").max_workers_per_cell == 256
-    assert MAX_GCP_TPU_MULTISLICE_WORKERS == max_multi_worker_cell_width()
+    assert MAX_GCP_TPU_MULTISLICE_WORKERS == backend_capabilities("gcp-tpu").max_workers_per_cell
+    assert max_multi_worker_cell_width() == max(
+        capabilities.max_workers_per_cell for capabilities in _BACKEND_CAPABILITIES.values()
+    )
+
+
+def test_multi_worker_backends_declare_their_own_ceilings() -> None:
+    """Kubernetes and the operator-hosted backends build wide cells too."""
+
+    from eyvan.capacity.drivers.base import backend_capabilities
+
+    for name in ("kubernetes", "onprem-ssh", "manual"):
+        capabilities = backend_capabilities(name)
+        assert capabilities.multi_worker_cells, name
+        assert capabilities.max_workers_per_cell == 512, name
+    for name in ("gcp-compute", "aws-ec2", "azure-vm"):
+        assert not backend_capabilities(name).multi_worker_cells, name
 
 
 def test_a_provider_becomes_eligible_by_declaring_a_capable_backend() -> None:

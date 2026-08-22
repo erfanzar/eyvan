@@ -45,7 +45,7 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
 )
 from eyvan.capacity.fleet_state import FleetCellNotRegisteredError, FleetCellRecord, FleetStateStore, StaleFenceError
-from eyvan.capacity.providers.azure.api import AzureApi, AzureVirtualMachine
+from eyvan.capacity.providers.azure.api import AzureApi, AzureVirtualMachine, parse_nic_private_ip
 from eyvan.capacity.providers.azure.machines import (
     CELL_TAG,
     FENCE_TAG,
@@ -100,6 +100,7 @@ class AzureVmCapacityDriver:
             executor=self.execution_backend,
             accelerator_types=self.accelerator_types,
             capacity_classes=self.capacity_classes,
+            capacity_backends=("azure-vm",),
             supports_callables=True,
             supports_checkpoint=True,
             # One VM per cell. A scale set would make a multi-machine cell
@@ -225,6 +226,26 @@ class AzureVmCapacityDriver:
                 disowned.append(machine)
         return disowned
 
+    def _resolved_private_ip(self, machine: AzureVirtualMachine) -> str | None:
+        """Return the VM's private address, resolving through its NIC if needed.
+
+        Real ARM VM documents carry interface *references* only -- the address
+        lives one GET away on the network interface. A payload that already
+        embeds an address short-circuits; a provider that cannot ask changes
+        nothing.
+        """
+
+        if machine.private_ip:
+            return machine.private_ip
+        get_nic = getattr(self.api, "get_network_interface", None)
+        if not callable(get_nic):
+            return None
+        for nic_id in machine.nic_ids:
+            address = parse_nic_private_ip(get_nic(nic_id))
+            if address:
+                return address
+        return None
+
     def _observation(self, record: FleetCellRecord, machine: AzureVirtualMachine | None) -> CellObservation:
         metadata: JsonObject = {
             "provider": self.provider_name,
@@ -256,7 +277,7 @@ class AzureVmCapacityDriver:
                 metadata["preemption_reason"] = machine.eviction_reason
             if machine.provisioning_state in _READY_STATES:
                 state = CapacityStatus.HEALTHY
-                endpoint = endpoint or machine.private_ip
+                endpoint = endpoint or self._resolved_private_ip(machine)
             elif machine.provisioning_state in _PENDING_STATES:
                 state = CapacityStatus.WAITING
         elif record.state is not CapacityStatus.ABSENT:
@@ -321,7 +342,7 @@ class AzureVmCapacityDriver:
                     CapacityStatus.HEALTHY if existing.provisioning_state in _READY_STATES else CapacityStatus.WAITING
                 )
                 if existing.provisioning_state in _READY_STATES:
-                    current.execution_endpoint = existing.private_ip
+                    current.execution_endpoint = self._resolved_private_ip(existing)
 
             try:
                 record = self.state.mutate_record(cell_id, record_vm, generation=context.generation)
@@ -350,7 +371,7 @@ class AzureVmCapacityDriver:
                     current.metadata["azure_vm_name"] = machine.name
                     if machine.provisioning_state in _READY_STATES:
                         current.state = CapacityStatus.HEALTHY
-                        current.execution_endpoint = machine.private_ip
+                        current.execution_endpoint = self._resolved_private_ip(machine)
                 self._stamp(current, context)
 
             try:

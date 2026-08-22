@@ -1148,3 +1148,30 @@ def test_wire_omits_unset_optionals_so_an_older_agent_still_parses() -> None:
     # An agent that does know the field parses the trimmed payload identically,
     # so this costs nothing when both sides match.
     assert NativeRuntimeConfig.model_validate(payload) == config
+
+
+def test_agent_capabilities_forward_the_driver_backend_declaration(tmp_path) -> None:
+    """Capability-based routing reads ``capacity_backends``; dropping it here
+    made every agent look like an older one that declares nothing."""
+
+    class DeclaringCapacity(FakeCapacity):
+        def capabilities(self):
+            return CellCapabilities(
+                provider="gcp",
+                executor="eyvan-native",
+                accelerator_types=("cpu", "gpu", "tpu"),
+                capacity_classes=("spot", "on-demand"),
+                capacity_backends=("gcp", "gcp-tpu", "gcp-compute"),
+            )
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    state._owner = "agent"
+    service = CellAgentService(
+        capacity=DeclaringCapacity(),  # type: ignore[arg-type]
+        state=state,
+        executors=StaticResolver(NoopExecutor()),  # type: ignore[arg-type]
+    )
+
+    capabilities = service.capabilities()
+
+    assert capabilities.capacity_backends == ("gcp", "gcp-tpu", "gcp-compute")

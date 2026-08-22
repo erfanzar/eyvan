@@ -526,6 +526,45 @@ class GcloudTpuProvider:
         value = decode_gcloud_object(result.stdout, resource=f"queued resource {qr_id!r}")
         return self._parse_qr(value)
 
+    def list_qr_names(self, *, project: str, zone: str, prefix: str) -> tuple[str, ...]:
+        """Return ids of this zone's queued resources whose name carries ``prefix``.
+
+        This is the substrate-side leak detector: a queued resource is billed
+        from the moment its provision request is admitted, so one that no
+        record points at must be findable without knowing its id.
+        """
+
+        args = (
+            "compute",
+            "tpus",
+            "queued-resources",
+            "list",
+            "--zone",
+            zone,
+            "--project",
+            project,
+            f"--filter=name~{prefix}",
+            "--format=value(name)",
+        )
+        result = self._run(args)
+        if result.returncode != 0:
+            raise GcloudError(
+                (result.stderr or result.stdout).strip() or f"could not list queued resources matching {prefix!r}"
+            )
+        ids: list[str] = []
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            # Full names look like projects/P/locations/Z/queuedResources/<id>.
+            ids.append(name.rstrip("/").rsplit("/", 1)[-1])
+        return tuple(ids)
+
+    def list_cell_incarnations(self, *, project: str, zone: str, cell_id: str) -> tuple[str, ...]:
+        """Return every queued-resource id this zone holds for ``cell_id``."""
+
+        return self.list_qr_names(project=project, zone=zone, prefix=f"{cell_id}-r")
+
     def describe_node(self, node_id: str, *, project: str, zone: str) -> JsonObject | None:
         args = (
             "compute",

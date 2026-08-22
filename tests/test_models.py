@@ -210,12 +210,23 @@ def test_tpu_capacity_pool_materializes_one_atomic_multi_worker_cell() -> None:
 @pytest.mark.parametrize(
     ("updates", "match"),
     [
-        ({"worker_count": 2}, "must match provider_options.node_count"),
+        # A TPU cell measures its width by provider_options.node_count.
         (
-            # The cell declares no capacity backend, so nothing has said it can
-            # build a cell spanning several machines. Refused on that capability
-            # rather than on a provider's name, so a second cloud that declares
-            # the capability is not blocked by this validator.
+            {
+                "worker_count": 2,
+                "capacity_backend": "gcp-tpu",
+                "accelerator_type": "v5p-16",
+                "provider_project": "project-a",
+                "zone": "us-central2-b",
+            },
+            "must match provider_options.node_count",
+        ),
+        (
+            # A non-TPU backend is not measured with the TPU ruler at all -- it
+            # is refused on capability, since none has said it can build a cell
+            # spanning several machines. Refused on that capability rather than
+            # on a provider's name, so a second cloud that declares the
+            # capability is not blocked by this validator.
             {"worker_count": 2, "provider_options": {"node_count": 2, "node_prefix": "two-workers"}},
             "does not build cells spanning several machines",
         ),

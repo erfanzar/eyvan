@@ -1479,3 +1479,17 @@ def test_a_local_queue_that_cannot_be_resolved_refuses_the_create(tmp_path) -> N
             ),
             _context(),
         )
+
+
+def test_drain_refuses_a_superseded_fence(tmp_path) -> None:
+    """Draining takes capacity out of service, so an old controller cannot."""
+
+    api = _FakeApi()
+    driver = _driver(tmp_path, api)
+    driver.apply_capacity("cell-a", _desired(), _context())
+
+    with pytest.raises(StaleMutationError):
+        driver.drain("cell-a", _context(generation=0))
+
+    record = driver.observe("cell-a")
+    assert record.state is not CapacityStatus.DRAINING
