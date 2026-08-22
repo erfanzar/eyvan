@@ -429,3 +429,28 @@ def test_the_remedy_names_the_address_the_rule_must_allow(monkeypatch) -> None:
     assert result.remedy is not None
     assert "203.0.113.7/32" in result.remedy
     assert "EXECUTION_CONNECTING" in result.remedy
+
+
+def test_the_fleet_check_reads_the_shape_the_route_actually_returns() -> None:
+    """Found against a live head: `GET /api/v1/fleets` returns bare names.
+
+    Only a list of objects was ever read, so every entry of `["research"]` was
+    skipped and a plane with a fleet applied reported "no fleet is applied" --
+    on every healthy plane, forever, with a non-zero exit. A preflight that
+    always fails is worse than no preflight: it teaches an operator to ignore
+    the one command that tells them what is wrong.
+
+    The fixture in this module had been asserting an invented shape, which is
+    how the defect survived a passing suite.
+    """
+
+    report = DoctorCommandService(_session(_healthy(fleets=["research"]))).report()
+
+    assert _by_name(report)["submittable-fleet"] is CheckStatus.PASS
+    assert report.ok is True
+
+    # Object entries stay accepted: not trusting the shape is the point.
+    mixed = DoctorCommandService(_session(_healthy(fleets=["research", {"name": "serving"}]))).report()
+    detail = next(c for c in mixed.checks if c.name == "submittable-fleet")
+    assert detail.status is CheckStatus.WARN
+    assert "research" in detail.detail and "serving" in detail.detail

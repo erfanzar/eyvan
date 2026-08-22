@@ -816,9 +816,18 @@ def _fleet_names(payload: JsonValue) -> tuple[str, ...]:
         return ()
     names: list[str] = []
     for entry in payload:
-        if not is_json_object(entry):
+        # The route returns bare names -- `["research"]` -- and only objects were
+        # ever read, so every entry was skipped and a correctly configured plane
+        # was reported as having no fleet at all. That is the worst shape a
+        # preflight failure can take: it fires on every healthy plane, exits
+        # non-zero forever, and teaches an operator to stop reading it. Objects
+        # are still accepted because "without trusting its shape" is the point.
+        if isinstance(entry, str):
+            name: JsonValue | None = entry
+        elif is_json_object(entry):
+            name = entry.get("name") or entry.get("fleet")
+        else:
             continue
-        name = entry.get("name") or entry.get("fleet")
         if isinstance(name, str) and name and name not in names:
             names.append(name)
     return tuple(names)
