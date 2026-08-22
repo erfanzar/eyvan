@@ -205,6 +205,53 @@ _PROVISION_OUTCOMES: dict[CapacityProviderFailureCode, ProvisionOutcome] = {
     CapacityProviderFailureCode.PROVIDER_ERROR: ProvisionOutcome.PROVIDER_ERROR,
 }
 
+#: Provider diagnostics that name an exhausted project quota, casefolded.
+#: Deliberately short and confident: a wrong quota classification poisons the
+#: placement belief in the *opposite* direction (permanently routing away from
+#: a zone whose real problem was transient), so anything ambiguous must stay
+#: unclassified and fall through to PROVIDER_ERROR.
+_DIAGNOSTIC_QUOTA_SIGNATURES = (
+    "quota exceeded",
+    "quota has been exceeded",
+    "quota_exceeded",
+    "exceeds allocated quota",
+    "quota limit has been reached",
+)
+
+#: Provider diagnostics that name a capacity shortage in the requested zone --
+#: the provider's stockout vocabulary across Cloud TPU and Compute Engine.
+_DIAGNOSTIC_STOCKOUT_SIGNATURES = (
+    "stockout",
+    "does not have enough resources available",
+    "zone_resource_pool_exhausted",
+    "resource pool exhausted",
+    "insufficient capacity available",
+    "no more resources available in zone",
+    "capacity is not available in zone",
+)
+
+
+def provider_failure_from_diagnostic(diagnostic: str) -> CapacityProviderFailureCode | None:
+    """Return the failure code named by a provider's own diagnostic text.
+
+    ``STOCKOUT`` and ``QUOTA_EXCEEDED`` exist because the placement engine
+    routes on them -- a stockout says "another zone might work", a quota halt
+    says "no zone will work until a human raises a limit" -- but for their
+    entire existence every GCP provisioning failure surfaced as the default
+    ``PROVIDER_ERROR``, so the distinction was dead on every path. This reads
+    the provider's own words; when it names nothing confidently, return
+    ``None`` and let the caller keep its default rather than guessing.
+    """
+
+    normalized = " ".join(diagnostic.casefold().split())
+    if not normalized:
+        return None
+    if any(signature in normalized for signature in _DIAGNOSTIC_QUOTA_SIGNATURES):
+        return CapacityProviderFailureCode.QUOTA_EXCEEDED
+    if any(signature in normalized for signature in _DIAGNOSTIC_STOCKOUT_SIGNATURES):
+        return CapacityProviderFailureCode.STOCKOUT
+    return None
+
 
 def provision_outcome(
     failure_code: CapacityProviderFailureCode | None,

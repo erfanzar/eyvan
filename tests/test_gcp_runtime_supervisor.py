@@ -35,7 +35,7 @@ from eyvan.server.local.daemon import (
     LocalDaemonTarget,
     write_owner_only_record,
 )
-from eyvan.worker.agent.models import AgentCapabilities
+from eyvan.worker.agent.models import AgentBuild, AgentCapabilities
 
 _DEFAULT_WHEEL_URI = f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'a' * 64}/eyvan-0.1.0-py3-none-any.whl"
 
@@ -647,3 +647,132 @@ def test_runtime_supervisor_rolls_back_a_new_control_plane_when_agent_startup_fa
     stopped, profile_path = control_plane.stop_calls[0]
     assert stopped.state is LocalDaemonState.STARTED
     assert profile_path == store.path
+
+
+@dataclass
+class BuildResponses:
+    """Return an ordered sequence of agent build identities."""
+
+    values: list[AgentBuild | None]
+
+    def __call__(self, endpoint: ControlPlaneEndpoint, secret: str) -> AgentBuild | None:
+        """Return the next configured build identity."""
+
+        del endpoint, secret
+        if not self.values:
+            raise AssertionError("unexpected cell-agent build probe")
+        return self.values.pop(0)
+
+
+def _agent_build(source_digest: str | None) -> AgentBuild:
+    return AgentBuild(
+        version="0.0.0",
+        origin="source",
+        source_digest=source_digest,
+        python="3.13.0",
+        platform="test",
+    )
+
+
+def test_agent_supervisor_replaces_an_owned_agent_running_different_code(monkeypatch, tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9140,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("current-build-digest"), raising=False)
+    launcher = FakeAgentLauncher(process=FakeProcess(pid=9141))
+    capabilities = _capabilities()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        capability_probe=CapabilityResponses([None, None, capabilities]),
+        build_probe=BuildResponses([_agent_build("stale-agent-digest")]),
+        process_argument_reader=lambda pid: (
+            sys.executable,
+            "-m",
+            "eyvan.worker.agent.cli",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8090",
+            "--runtime-profile",
+            str(profile_path),
+            "--log-level",
+            "info",
+        ),
+        process_liveness=AgentProcessLiveness([True, True, False]),
+        process_terminator=AgentProcessTerminator(),
+        process_killer=AgentProcessKiller(),
+        clock=AdvancingClock(),
+        sleeper=lambda duration: None,
+    )
+
+    result = supervisor.ensure(profile_path, profile)
+
+    assert result.state is LocalAgentState.STARTED
+    assert result.pid == 9141
+    assert len(launcher.commands) == 1
+
+
+def test_agent_supervisor_refuses_to_replace_an_agent_it_does_not_own(monkeypatch, tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("current-build-digest"), raising=False)
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(),
+        capability_probe=CapabilityResponses([_capabilities()]),
+        build_probe=BuildResponses([_agent_build("stale-agent-digest")]),
+        process_liveness=AgentProcessLiveness([]),
+    )
+
+    with pytest.raises(LocalAgentConfigurationError, match="different code"):
+        supervisor.ensure(tmp_path / "runtime.json", profile)
+
+
+def test_agent_supervisor_reuses_an_owned_agent_running_this_build(monkeypatch, tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9142,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("current-build-digest"), raising=False)
+    capabilities = _capabilities()
+    launcher = FakeAgentLauncher()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        capability_probe=CapabilityResponses([capabilities]),
+        build_probe=BuildResponses([_agent_build("current-build-digest")]),
+        process_liveness=AgentProcessLiveness([True]),
+    )
+
+    result = supervisor.ensure(profile_path, profile)
+
+    assert result.state is LocalAgentState.REUSED
+    assert launcher.commands == []

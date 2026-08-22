@@ -16,9 +16,13 @@ from threading import RLock
 
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+
+if tp.TYPE_CHECKING:
+    from eyvan.capacity.providers.gcp.native_worker_ingress import FirewallNetworkReference
 from eyvan.capacity import READY_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import (
     CELL_ACCELERATOR_METADATA_KEY,
+    CapacityProviderError,
     CapacityProviderFailureCode,
     CellCapabilities,
     CellObservation,
@@ -1140,13 +1144,27 @@ class GcpTpuCapacityDriver:
         record = self._claim_for_release(cell_id, context)
         if isinstance(record, CellObservation):
             return record
+        released_project: str | None = None
+        released_uid: str | None = None
         if record is not None:
             # Outside the lock on purpose: this is the slow part, it is
             # idempotent, and the record is already stamped DELETING with this
             # fence, so nothing else will hand the capacity to anybody.
             self._delete_owned_capacity(record)
             self._release_auxiliary_resources(record)
-        return self._tombstone_after_release(cell_id, context, claimed=record is not None)
+            uid = record.metadata.get("management_uid")
+            if isinstance(record.project, str) and isinstance(uid, str) and uid:
+                released_project, released_uid = record.project, uid
+        result = self._tombstone_after_release(
+            cell_id,
+            context,
+            claimed=record is not None,
+            extra_metadata={"management_uid": released_uid} if released_uid is not None else None,
+        )
+        if released_project is not None:
+            # After the tombstone lands: the sweep reads tombstone metadata.
+            self._sweep_orphaned_native_worker_secrets(released_project)
+        return result
 
     def _claim_for_release(self, cell_id: str, context: MutationContext) -> FleetCellRecord | CellObservation | None:
         """Mark one cell DELETING under this fence, or report it already released."""
@@ -1192,7 +1210,14 @@ class GcpTpuCapacityDriver:
                 return self.observe(cell_id)
             return record
 
-    def _tombstone_after_release(self, cell_id: str, context: MutationContext, *, claimed: bool) -> CellObservation:
+    def _tombstone_after_release(
+        self,
+        cell_id: str,
+        context: MutationContext,
+        *,
+        claimed: bool,
+        extra_metadata: tp.Mapping[str, str] | None = None,
+    ) -> CellObservation:
         """Retire the record, refusing if anything took ownership during the deletes."""
 
         def still_owned(current: FleetCellRecord) -> bool:
@@ -1210,6 +1235,7 @@ class GcpTpuCapacityDriver:
                     context.generation,
                     context.fencing_token,
                     still_owned,
+                    metadata=extra_metadata,
                 )
             except StaleFenceError as exc:
                 raise StaleMutationError(str(exc)) from exc
@@ -1226,6 +1252,132 @@ class GcpTpuCapacityDriver:
         if not isinstance(management_uid, str) or not management_uid:
             raise ValueError("native TPU cleanup requires an Eyvan management UID")
         self.native_worker_secrets.delete(project=record.project, management_uid=management_uid)
+        self._release_unused_native_ingress_rules(record)
+
+    def _release_unused_native_ingress_rules(self, record: FleetCellRecord) -> None:
+        """Delete managed worker ingress rules whose last user this cell was.
+
+        The rule is per (network tag, port) and deliberately survives
+        scale-to-zero -- ``ensure`` never deletes so the next cell can reach
+        its worker -- which is also why nothing else ever deleted one: rules
+        outlived their runtime forever and accumulated toward the project's
+        firewall cap (issue-register E22). This consults the fleet-state
+        document: a rule dies here only when no *other* registered native
+        cell of this runtime still targets the same network, tag, and port,
+        and deletion re-confirms ownership itself. Best-effort by contract:
+        the capacity is already gone, so a failed sweep must never fail the
+        release.
+        """
+
+        network_tag = getattr(self.native_worker_public_ingress, "network_tag", None)
+        if not isinstance(network_tag, str) or not network_tag or not isinstance(record.project, str):
+            return
+        from eyvan.capacity.providers.gcp.native_worker_ingress import (
+            list_managed_ingress_rules,
+            release_managed_ingress_rule,
+        )
+
+        try:
+            rules = list_managed_ingress_rules(project=record.project)
+        except (CapacityProviderError, OSError, ValueError):
+            return
+        for rule in rules:
+            if rule.network_tag != network_tag or rule.port != self.native_worker_port:
+                continue
+            if self._native_cell_remains_for_network(record, rule.network):
+                continue
+            try:
+                release_managed_ingress_rule(project=record.project, rule_name=rule.name)
+            except (CapacityProviderError, OSError):
+                # One failure means GCP-side trouble; stop sweeping rather
+                # than hammering a provider that just stopped answering.
+                return
+
+    def _sweep_orphaned_native_worker_secrets(self, project: str) -> None:
+        """Delete native-worker secrets left behind by interrupted releases.
+
+        A release deletes the cell's secret *before* it tombstones the record,
+        so a crash between those two steps leaked the secret forever -- ten
+        accumulated live in one project before 2026-08-22. Releases now stamp
+        the cell's management UID into its tombstone, and every later release
+        re-checks those uids: a secret whose uid this document released but
+        which still exists is swept here. Uids this runtime never released are
+        never candidates, so another profile sharing the project cannot be
+        damaged by a sweep keyed to tombstones it did not write. Best-effort
+        like the ingress sweep: the release already succeeded.
+        """
+
+        sweep = getattr(self.native_worker_secrets, "list_managed", None)
+        if project == "" or not callable(sweep):
+            return
+        try:
+            document, _ = self.state.backend.read()
+        except (CapacityProviderError, OSError, ValueError):
+            return
+        tombstones = document.get("cell_tombstones")
+        cells = document.get("cells")
+        if not isinstance(tombstones, dict) or not isinstance(cells, dict):
+            return
+
+        def record_uid(value: object) -> str | None:
+            # Live records nest the uid under metadata; tombstones flatten
+            # their extra keys alongside the generation fence.
+            uid: object = None
+            if isinstance(value, dict):
+                metadata = value.get("metadata")
+                uid = metadata.get("management_uid") if isinstance(metadata, dict) else value.get("management_uid")
+            return uid if isinstance(uid, str) and uid else None
+
+        live = {uid for value in cells.values() if (uid := record_uid(value))}
+        candidates: set[str] = set()
+        for value in tombstones.values():
+            uid = record_uid(value)
+            if uid is not None and uid not in live:
+                candidates.add(uid)
+        if not candidates:
+            return
+        try:
+            managed = sweep(project=project)
+        except (CapacityProviderError, OSError):
+            return
+        for uid, _secret_id in managed:
+            if uid not in candidates:
+                continue
+            try:
+                self.native_worker_secrets.delete(project=project, management_uid=uid)
+            except (CapacityProviderError, OSError):
+                return
+
+    def _native_cell_remains_for_network(self, released: FleetCellRecord, network: FirewallNetworkReference) -> bool:
+        """Return whether a registered native cell still needs rules for ``network``."""
+
+        from eyvan.capacity.providers.gcp.native_worker_ingress import FirewallNetworkReference
+
+        try:
+            for other in self.state.load().values():
+                if other.name == released.name or other.project != released.project:
+                    continue
+                if other.metadata.get("execution_backend") != "eyvan-native":
+                    continue
+                if other.state in (CapacityStatus.DELETING, CapacityStatus.RELEASED):
+                    continue
+                # Compute cells persist their options under ``compute_config``,
+                # TPU cells under ``tpu_config``; both carry ``network``.
+                config = other.metadata.get("compute_config")
+                if not isinstance(config, dict) or not isinstance(config.get("network"), str):
+                    config = other.metadata.get("tpu_config")
+                if not isinstance(config, dict) or not isinstance(config.get("network"), str):
+                    continue
+                other_network = FirewallNetworkReference.from_config(
+                    capacity_project=other.project, network=config["network"]
+                )
+                if other_network.canonical_name == network.canonical_name:
+                    return True
+        except (CapacityProviderError, ValueError):
+            # An unreadable sibling must not cause a deletion: treat it as a
+            # remaining user and keep the rule.
+            return True
+        return False
 
     @staticmethod
     def _released(cell_id: str, generation: int) -> CellObservation:
@@ -1552,6 +1704,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
         if not isinstance(management_uid, str) or not management_uid:
             raise ValueError("native worker cleanup requires an Eyvan management UID")
         self.native_worker_secrets.delete(project=record.project, management_uid=management_uid)
+        self._release_unused_native_ingress_rules(record)
 
     @staticmethod
     def _resource_id(cell_id: str, provider_generation: int) -> str:

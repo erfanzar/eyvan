@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 from pydantic import ValidationError
 
+from eyvan._internal.build_identity import build_identity
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfile,
@@ -53,7 +54,7 @@ from eyvan.server.local.daemon import (
     write_owner_only_record,
 )
 from eyvan.worker.agent.client import CellAgentClient, CellAgentUnavailableError
-from eyvan.worker.agent.models import AgentCapabilities
+from eyvan.worker.agent.models import AgentBuild, AgentCapabilities
 
 if tp.TYPE_CHECKING:
     from eyvan.capacity.fleet_config import EyvanFleetConfig
@@ -230,6 +231,32 @@ def _default_clock() -> Clock:
     return time.monotonic
 
 
+@dataclass(frozen=True, slots=True)
+class HttpCellAgentBuildProbe:
+    """Read the build identity of a running agent, tolerating its absence.
+
+    An agent older than the ``/api/v1/build`` route answers ``None`` here, and
+    an unknowable identity must never trigger a replacement: the guard exists
+    to stop verified staleness, not to churn agents it cannot measure.
+    """
+
+    timeout_s: float = 0.5
+
+    def __call__(self, endpoint: ControlPlaneEndpoint, secret: str) -> AgentBuild | None:
+        """Return the running agent's build identity, or ``None`` when it cannot be read."""
+
+        try:
+            with httpx.Client(
+                base_url=endpoint.url,
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=self.timeout_s,
+                trust_env=False,
+            ) as transport:
+                return CellAgentClient(endpoint.url, client=transport).build()
+        except (CellAgentUnavailableError, httpx.HTTPError, ValidationError, ValueError):
+            return None
+
+
 def _default_sleeper() -> Sleeper:
     """Return the blocking sleep function used by the default local-agent supervisor."""
 
@@ -302,6 +329,9 @@ class LocalAgentSupervisor:
     paths: LocalDaemonPaths = field(default_factory=LocalDaemonPaths)
     launcher: LocalAgentLauncher = field(default_factory=SubprocessLocalAgentLauncher)
     capability_probe: AgentCapabilitiesProbe = field(default_factory=HttpCellAgentCapabilitiesProbe)
+    build_probe: tp.Callable[[ControlPlaneEndpoint, str], AgentBuild | None] = field(
+        default_factory=HttpCellAgentBuildProbe
+    )
     endpoint: ControlPlaneEndpoint = field(
         default_factory=lambda: ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
     )
@@ -323,12 +353,21 @@ class LocalAgentSupervisor:
             raise ValueError("local GCP cell agent endpoint must be literal HTTP loopback")
 
     def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
-        """Start the profile's local agent or reuse its authenticated capability contract."""
+        """Start the profile's local agent or reuse its authenticated capability contract.
+
+        Reuse requires the running agent to be *this build*: a compatible
+        agent compiled from older code is replaced (when this process owns it)
+        rather than silently reused. Code fixes that never reach a long-lived
+        daemon have marooned cells before -- a supervisor that re-verifies
+        only profile and secret would have kept reusing the very agent an
+        operator just fixed (observed 2026-08-22).
+        """
 
         expanded_profile_path, profile_id = self._prepared_profile(profile_path, profile)
         target = self._target()
         record_path = self.paths.agent_record_path(target)
         log_path = self.paths.agent_log_path(target)
+        self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, target)
         existing = self._existing_result(profile, profile_id, record_path, log_path)
         if existing is not None:
             return existing
@@ -452,6 +491,50 @@ class LocalAgentSupervisor:
             stop_owned_process(process)
             raise
         return self._wait_for_ready(process, profile, record_path, log_path)
+
+    def _replace_agent_running_stale_code(
+        self,
+        profile: GcpNativeRuntimeProfile,
+        profile_id: str,
+        record_path: Path,
+        log_path: Path,
+        target: LocalDaemonTarget,
+    ) -> None:
+        """Stop a profile-owned agent whose build identity differs from this process.
+
+        An unknowable identity (route absent, digest uncomputable on either
+        side) never triggers replacement. An agent this process does not own
+        is refused loudly instead of stopped, pointing the operator at the
+        restart command that validates ownership the same way.
+        """
+
+        probe = self.build_probe
+        remote = probe(self.endpoint, profile.agent_shared_secret) if probe is not None else None
+        if remote is None or remote.source_digest is None:
+            return
+        current = build_identity()
+        if current.source_digest is None or current.source_digest == remote.source_digest:
+            return
+        record = read_owner_only_record(record_path)
+        if (
+            record is None
+            or record.endpoint != self.endpoint
+            or not self.process_liveness(record.pid)
+            or record.runtime_profile_path != profile_id
+        ):
+            raise LocalAgentConfigurationError(
+                f"a cell agent built from different code is listening at {self.endpoint.url} "
+                f"(running digest {remote.source_digest[:12]}, this process {current.source_digest[:12]}); "
+                "it is not owned by the selected runtime profile, so it was not replaced automatically -- "
+                "run 'eyvan runtime restart --yes' to replace it explicitly"
+            )
+        self._stop_recorded_agent(
+            record,
+            target=target,
+            log_path=log_path,
+            expected_runtime_profile_path=profile_id,
+        )
+        clear_owner_only_record(record_path, pid=record.pid)
 
     def _existing_result(
         self,
@@ -728,6 +811,7 @@ __all__ = (
     "GcpRuntimeError",
     "GcpRuntimeProfileNotPreparedError",
     "GcpRuntimeResult",
+    "HttpCellAgentBuildProbe",
     "HttpCellAgentCapabilitiesProbe",
     "LocalAgentCommand",
     "LocalAgentConfigurationError",

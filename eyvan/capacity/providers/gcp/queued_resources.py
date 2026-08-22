@@ -20,7 +20,11 @@ from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, is
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
 from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity import CapacityStatus
-from eyvan.capacity.drivers.base import CapacityProviderError, CapacityProviderFailureCode
+from eyvan.capacity.drivers.base import (
+    CapacityProviderError,
+    CapacityProviderFailureCode,
+    provider_failure_from_diagnostic,
+)
 from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
@@ -571,7 +575,10 @@ class GcloudTpuProvider:
             diagnostic = (result.stderr or result.stdout).strip() or f"could not create {qr_id}"
             if self._is_queue_admission_denied(diagnostic):
                 raise GcloudQueueAdmissionDeniedError(diagnostic)
-            raise GcloudError(diagnostic)
+            classified = provider_failure_from_diagnostic(diagnostic)
+            if classified is None:
+                raise GcloudError(diagnostic)
+            raise GcloudError(diagnostic, code=classified)
         created = self.describe_qr(qr_id, project=spec.project, zone=spec.zone)
         if created is None:
             raise GcloudError(f"queued resource {qr_id!r} was not visible after creation")

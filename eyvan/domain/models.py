@@ -261,6 +261,7 @@ class InfeasibilityCode(StrEnum):
     INSUFFICIENT_CAPACITY = "insufficient_capacity"
     QUOTA_EXCEEDED = "quota_exceeded"
     BUDGET_EXCEEDED = "budget_exceeded"
+    UNPRICED_CELL = "unpriced_cell"
     PREEMPTION_UNSAFE = "preemption_unsafe"
 
 
@@ -601,6 +602,28 @@ class CapacityCell:
         """Return this cell's hourly price for ``resources``."""
         return resources.dot(self.unit_prices)
 
+    @property
+    def declares_prices(self) -> bool:
+        """Return whether the operator declared a price model at all.
+
+        A ``unit_prices`` vector with no entries means pricing is unknown,
+        not free. Declared zeros are knowledge: they make the model known
+        even though every price on it is zero.
+        """
+        return len(self.unit_prices._items) > 0
+
+    def prices_cover(self, resources: ResourceVector) -> bool:
+        """Return whether every requested resource has a *declared* unit price.
+
+        By contract a cell's ``unit_prices`` are the operator's complete
+        statement of what the runtime charges for; unlisted resources are
+        uncharged, so a partial vector still yields a deterministic cost
+        estimate -- but not a complete one, which the scheduler surfaces as
+        ``cost_unknown`` so fully priced cells win cost tie-breaks. Declared
+        zeros count as covered; missing names do not (issue-register C10).
+        """
+        return all(name in self.unit_prices for name in resources)
+
 
 @dataclass(frozen=True, slots=True)
 class CapacityLease:
@@ -641,13 +664,20 @@ class CapacityLease:
 
 @dataclass(frozen=True, slots=True, order=True)
 class PlacementScore:
-    """An explainable lexicographic cell score; lower values are preferred."""
+    """An explainable lexicographic cell score; lower values are preferred.
+
+    ``cost_unknown`` sits immediately before ``estimated_cost`` so a cell with
+    undeclared prices loses the cost tie-break to every priced cell outright,
+    and two unpriced cells tie into the later keys instead of both reading as
+    free. Unknown is not zero.
+    """
 
     preferred_cell_rank: int
     preferred_label_misses: int
     route_priority: int
     capacity_class_rank: int
     startup_latency_seconds: int
+    cost_unknown: bool
     estimated_cost: Decimal
     fractional_waste: Decimal
     cell_id: str

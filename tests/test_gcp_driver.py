@@ -807,7 +807,13 @@ def test_release_deletes_current_queued_resource_and_is_replay_safe(tmp_path) ->
     assert provider.deleted == [("cell-r1", "project-a", "us-central2-b")]
     assert provider.deleted_ownership_uids == [management_uid]
     assert state.get("cell") is None
-    assert state.cell_tombstone("cell") == {"generation": 2, "fencing_token": "leader-2"}
+    # The tombstone carries the management UID so a later release can sweep a
+    # secret that an interrupted earlier release left behind.
+    assert state.cell_tombstone("cell") == {
+        "generation": 2,
+        "fencing_token": "leader-2",
+        "management_uid": management_uid,
+    }
 
 
 def test_release_does_not_remove_newer_owner_after_provider_call(tmp_path) -> None:
@@ -834,6 +840,7 @@ def test_release_does_not_remove_newer_owner_after_provider_call(tmp_path) -> No
 def test_release_with_a_consumed_key_still_deletes_live_capacity(tmp_path) -> None:
     state, provider, driver = make_driver(tmp_path)
     driver.apply_capacity("cell", desired(), context("create"))
+    management_uid = state.get("cell").metadata["management_uid"]
     # A colliding idempotency key is consumed by another mutation while the
     # record still shows live capacity.
     driver.reconcile("cell", context("release", generation=2, token="leader-2"))
@@ -843,7 +850,11 @@ def test_release_with_a_consumed_key_still_deletes_live_capacity(tmp_path) -> No
     assert observation.state is CapacityStatus.RELEASED
     assert provider.deleted == [("cell-r1", "project-a", "us-central2-b")]
     assert state.get("cell") is None
-    assert state.cell_tombstone("cell") == {"generation": 2, "fencing_token": "leader-2"}
+    assert state.cell_tombstone("cell") == {
+        "generation": 2,
+        "fencing_token": "leader-2",
+        "management_uid": management_uid,
+    }
 
 
 def test_replayed_release_on_a_deleting_record_still_deletes_capacity(tmp_path) -> None:
@@ -949,3 +960,181 @@ def test_a_release_does_not_hold_the_fleet_lock_while_it_talks_to_the_provider(t
     slow.join(timeout=10)
     assert not slow.is_alive(), "the first release never finished"
     assert state.get("first") is None
+
+
+class _TaggedIngress:
+    """An ingress manager that reports its profile tag, as the real one does."""
+
+    def __init__(self, network_tag: str = "eyvan-nw-profile") -> None:
+        self.network_tag = network_tag
+
+    def ensure(self, *, project: str, network: str | None, port: int) -> str:
+        return self.network_tag
+
+
+def _native_driver(state, provider, secrets, ingress, accounts=None):
+    return GcpTpuCapacityDriver(
+        state,
+        provider=provider,
+        execution_backend="eyvan-native",
+        native_worker_port=8100,
+        native_worker_package="gs://artifacts/eyvan/eyvan.whl",
+        native_worker_package_sha256=_SHA256,
+        native_worker_shared_secret="agent-global-secret",
+        native_worker_secrets=secrets,
+        native_worker_public_ingress=ingress,
+        native_worker_service_account_resolver=accounts or FakeNativeWorkerServiceAccountResolver(),
+    )
+
+
+def _register_native_cell(state, cell_id, network="default"):
+    def create(record: FleetCellRecord) -> None:
+        record.project = "project-a"
+        record.state = CapacityStatus.HEALTHY
+        record.metadata["execution_backend"] = "eyvan-native"
+        record.metadata["compute_config"] = {"network": network}
+
+    state.mutate_or_create_record(cell_id, create, generation=1)
+
+
+def test_release_sweeps_ingress_rule_whose_last_user_it_was(monkeypatch, tmp_path) -> None:
+    import eyvan.capacity.providers.gcp.native_worker_ingress as ingress_module
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    provider = FakeProvider()
+    driver = _native_driver(
+        state, provider, FakeNativeWorkerSecrets(), _TaggedIngress(), FakeNativeWorkerServiceAccountResolver()
+    )
+    driver.apply_capacity(
+        "cell",
+        {
+            **desired(),
+            "executor": "eyvan-native",
+            "provider_options": {"bootstrap_egress": "public-internet", "network": "default"},
+        },
+        context("create"),
+    )
+    released_rules: list[str] = []
+    managed = [
+        ingress_module.ManagedIngressRule(
+            name="eyvan-nw-rule-8100",
+            network=ingress_module.FirewallNetworkReference.from_config(capacity_project="project-a", network=None),
+            network_tag="eyvan-nw-profile",
+            port=8100,
+            source_range="127.0.0.1/32",
+        )
+    ]
+    monkeypatch.setattr(ingress_module, "list_managed_ingress_rules", lambda *, project: managed)
+    monkeypatch.setattr(
+        ingress_module, "release_managed_ingress_rule", lambda *, project, rule_name: released_rules.append(rule_name)
+    )
+
+    driver.release("cell", context("release", generation=2, token="leader-2"))
+
+    assert released_rules == ["eyvan-nw-rule-8100"]
+
+
+def test_release_keeps_an_ingress_rule_another_native_cell_still_uses(monkeypatch, tmp_path) -> None:
+    import eyvan.capacity.providers.gcp.native_worker_ingress as ingress_module
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    provider = FakeProvider()
+    driver = _native_driver(
+        state, provider, FakeNativeWorkerSecrets(), _TaggedIngress(), FakeNativeWorkerServiceAccountResolver()
+    )
+    driver.apply_capacity(
+        "cell",
+        {
+            **desired(),
+            "executor": "eyvan-native",
+            "provider_options": {"bootstrap_egress": "public-internet", "network": "default"},
+        },
+        context("create"),
+    )
+    _register_native_cell(state, "sibling", network="default")
+    released_rules: list[str] = []
+    managed = [
+        ingress_module.ManagedIngressRule(
+            name="eyvan-nw-rule-8100",
+            network=ingress_module.FirewallNetworkReference.from_config(capacity_project="project-a", network=None),
+            network_tag="eyvan-nw-profile",
+            port=8100,
+            source_range="127.0.0.1/32",
+        )
+    ]
+    monkeypatch.setattr(ingress_module, "list_managed_ingress_rules", lambda *, project: managed)
+    monkeypatch.setattr(
+        ingress_module, "release_managed_ingress_rule", lambda *, project, rule_name: released_rules.append(rule_name)
+    )
+
+    driver.release("cell", context("release", generation=2, token="leader-2"))
+
+    assert released_rules == []
+
+
+def test_release_sweeps_secrets_left_behind_by_interrupted_releases(monkeypatch, tmp_path) -> None:
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    provider = FakeProvider()
+    secrets = FakeNativeWorkerSecrets()
+    accounts = FakeNativeWorkerServiceAccountResolver()
+    driver = _native_driver(state, provider, secrets, _TaggedIngress(), accounts)
+    driver.apply_capacity(
+        "cell",
+        {
+            **desired(),
+            "executor": "eyvan-native",
+            "provider_options": {"bootstrap_egress": "public-internet", "network": "default"},
+        },
+        context("create"),
+    )
+    live_uid = state.get("cell").metadata["management_uid"]
+    # A previous release crashed between its secret delete and its tombstone;
+    # the tombstone metadata names the uid whose secret survived.
+    crashed_uid = "0123456789abcdef0123456789abcdef"
+
+    def tombstone_with_uid(self, name, generation, fencing_token, predicate, *, metadata=None) -> bool:
+        state.backend.update(
+            lambda doc: doc.setdefault("cell_tombstones", {}).update(
+                {"crashed": {"generation": 1, "fencing_token": "old", "management_uid": crashed_uid}}
+            )
+        )
+        return True
+
+    monkeypatch.setattr(type(driver.state), "tombstone_record", tombstone_with_uid, raising=False)
+    monkeypatch.setattr(
+        secrets,
+        "list_managed",
+        lambda *, project: ((crashed_uid, "eyvan-native-crashed-x"), (live_uid, "eyvan-native-live-x")),
+        raising=False,
+    )
+    swept: list[str] = []
+    original_delete = type(secrets).delete
+
+    def recording_delete(self, **kwargs):
+        swept.append(kwargs["management_uid"])
+        original_delete(self, **kwargs)
+
+    monkeypatch.setattr(type(secrets), "delete", recording_delete)
+
+    driver.release("cell", context("release", generation=2, token="leader-2"))
+
+    # The normal per-cell delete runs first; the sweep then removes only the
+    # interrupted release's leftover.
+    assert swept == [live_uid, crashed_uid]
+
+
+def test_provider_failure_classification_names_quota_and_stockout() -> None:
+    from eyvan.capacity.drivers.base import (
+        CapacityProviderFailureCode,
+        provider_failure_from_diagnostic,
+    )
+
+    quota = provider_failure_from_diagnostic("ERROR: (gcloud.alpha.compute.tpus) Quota exceeded for quota metric")
+    stockout = provider_failure_from_diagnostic(
+        "The zone 'projects/p/zones/us-central2-b' does not have enough resources available"
+    )
+    unclassified = provider_failure_from_diagnostic("something entirely unexpected happened")
+
+    assert quota is CapacityProviderFailureCode.QUOTA_EXCEEDED
+    assert stockout is CapacityProviderFailureCode.STOCKOUT
+    assert unclassified is None

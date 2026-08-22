@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -23,7 +24,7 @@ from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan._internal.network import format_http_ip_endpoint, normalize_ip_address
 from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity import CapacityStatus
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, provider_failure_from_diagnostic
 from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerEndpointMode, endpoint_mode_from_metadata
 from eyvan.capacity.providers.gcp.queued_resources import (
@@ -624,6 +625,43 @@ class GcloudNativeWorkerSecretStore:
         if deleted.returncode != 0 and self._describe(secret_id, project=project) is not None:
             raise GcloudError((deleted.stderr or deleted.stdout).strip() or f"could not delete secret {secret_id!r}")
 
+    def list_managed(self, *, project: str) -> tuple[tuple[str, str], ...]:
+        """Return every ``(management_uid, secret_id)`` this runtime owns in ``project``.
+
+        Ownership is decided exactly as ``ensure`` decides it when creating:
+        the ``eyvan-managed=true`` label carries the decision and
+        ``eyvan-uid`` names the cell. Entries missing either mark are skipped
+        rather than guessed about -- a janitor must never act on an ambiguous
+        identity in a project it shares.
+        """
+
+        result = self._runner(
+            ("secrets", "list", "--project", project, "--filter=labels.eyvan-managed=true", "--format=json")
+        )
+        if result.returncode != 0:
+            raise GcloudError(
+                (result.stderr or result.stdout).strip() or f"could not list native worker secrets in {project!r}"
+            )
+        try:
+            decoded = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise GcloudError(f"native worker secret listing returned invalid JSON: {exc.msg}") from exc
+        if not isinstance(decoded, list):
+            raise GcloudError("native worker secret listing did not return a JSON array")
+        managed: list[tuple[str, str]] = []
+        for entry in decoded:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            labels = entry.get("labels")
+            if not isinstance(name, str) or not isinstance(labels, dict):
+                continue
+            uid = labels.get("eyvan-uid")
+            if not isinstance(uid, str) or not uid:
+                continue
+            managed.append((uid, name.rsplit("/", 1)[-1]))
+        return tuple(managed)
+
 
 class GcloudNativeWorkerArtifactAccessStore:
     """Grant native workers the minimum bucket access needed for Eyvan artifacts."""
@@ -786,9 +824,11 @@ class GcloudComputeProvider:
             if existing is not None:
                 self._validate_instance(existing, spec)
                 return existing
-            raise GcloudError(
-                (result.stderr or result.stdout).strip() or f"could not create Compute instance {spec.name}"
-            )
+            diagnostic = (result.stderr or result.stdout).strip() or f"could not create Compute instance {spec.name}"
+            classified = provider_failure_from_diagnostic(diagnostic)
+            if classified is None:
+                raise GcloudError(diagnostic)
+            raise GcloudError(diagnostic, code=classified)
         created = self.describe(spec.name, project=spec.project, zone=spec.zone)
         if created is None:
             raise GcloudError(f"Compute instance {spec.name!r} was not visible after creation")

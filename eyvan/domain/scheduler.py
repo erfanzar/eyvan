@@ -255,6 +255,8 @@ class _PreemptionCandidate:
             score.route_priority,
             score.capacity_class_rank,
             score.startup_latency_seconds,
+            # Unknown pricing sorts after every known price, not as free.
+            score.cost_unknown,
             score.estimated_cost,
             self.victim_priority_sum,
             self.victim_count,
@@ -471,6 +473,18 @@ class Scheduler:
         budget_allowed_cells: list[CapacityCell] = []
         for cell in feasible_cells:
             hourly_cost, reserved_cost, resource_hours = self._cost(workload, requested, cell)
+            if self._unpriced_under_hard_budget(workload, cell, budgets):
+                dynamic_failures.append(
+                    CellInfeasibility(
+                        cell_id=cell.cell_id,
+                        code=InfeasibilityCode.UNPRICED_CELL,
+                        message=(
+                            "cell declares no unit prices at all, so its cost is unknown; "
+                            "a hard budget cannot be enforced against unknown prices"
+                        ),
+                    )
+                )
+                continue
             if budgets and not self._budget_allows(
                 workload.identity,
                 reserved_cost,
@@ -539,8 +553,15 @@ class Scheduler:
             return min(preemption_plans, key=lambda candidate: candidate.sort_key).plan
 
         if not budget_allowed_cells:
-            code = InfeasibilityCode.BUDGET_EXCEEDED
-            message = "every feasible cell exceeds an ancestor budget"
+            if dynamic_failures and all(failure.code is InfeasibilityCode.UNPRICED_CELL for failure in dynamic_failures):
+                code = InfeasibilityCode.UNPRICED_CELL
+                message = (
+                    "every feasible cell lacks declared prices entirely, so costs are unknown; "
+                    "hard budgets cannot be enforced against unknown prices"
+                )
+            else:
+                code = InfeasibilityCode.BUDGET_EXCEEDED
+                message = "every feasible cell exceeds an ancestor budget"
         elif quota_failure is not None:
             code = InfeasibilityCode.QUOTA_EXCEEDED
             message = quota_failure.message
@@ -608,6 +629,18 @@ class Scheduler:
                 )
                 continue
             hourly_cost, reserved_cost, resource_hours = self._cost(workload, requested, cell)
+            if self._unpriced_under_hard_budget(workload, cell, budgets):
+                dynamic_failures.append(
+                    CellInfeasibility(
+                        cell_id=cell.cell_id,
+                        code=InfeasibilityCode.UNPRICED_CELL,
+                        message=(
+                            "cell declares no unit prices at all, so its cost is unknown; "
+                            "a hard budget cannot be enforced against unknown prices"
+                        ),
+                    )
+                )
+                continue
             candidates.append(
                 (
                     cell,
@@ -623,6 +656,20 @@ class Scheduler:
         if len(candidates) < workload.cell_group_count:
             if not candidates and static_failures:
                 return self._summarize_static_failures(workload, static_failures)
+            if (
+                not candidates
+                and dynamic_failures
+                and all(failure.code is InfeasibilityCode.UNPRICED_CELL for failure in dynamic_failures)
+            ):
+                return Infeasibility(
+                    workload_id=workload.workload_id,
+                    code=InfeasibilityCode.UNPRICED_CELL,
+                    message=(
+                        "every feasible cell lacks declared prices entirely, so costs are unknown; "
+                        "hard budgets cannot be enforced against unknown prices"
+                    ),
+                    cells=tuple(sorted(dynamic_failures, key=lambda failure: failure.cell_id)),
+                )
             return Infeasibility(
                 workload_id=workload.workload_id,
                 code=InfeasibilityCode.INSUFFICIENT_CAPACITY,
@@ -660,6 +707,7 @@ class Scheduler:
             route_priority=leader_score.route_priority,
             capacity_class_rank=leader_score.capacity_class_rank,
             startup_latency_seconds=leader_score.startup_latency_seconds,
+            cost_unknown=any(candidate[4].cost_unknown for candidate in selected),
             estimated_cost=total_reserved_cost,
             fractional_waste=sum((candidate[4].fractional_waste for candidate in selected), Decimal(0)),
             cell_id=leader_score.cell_id,
@@ -796,6 +844,31 @@ class Scheduler:
         return None
 
     @staticmethod
+    def _unpriced_under_hard_budget(
+        workload: WorkloadSpec,
+        cell: CapacityCell,
+        budgets: dict[IdentityScope, Budget],
+    ) -> bool:
+        """Return whether placing on ``cell`` would defeat a hard budget.
+
+        A hard budget is only enforceable against a cell that declares a
+        price model at all: an unpriced cell computes zero reservation cost
+        for everything, which used to sail through the gate, and unknown is
+        not zero. A *partially* priced cell is different by contract -- its
+        ``unit_prices`` are the operator's complete statement of what the
+        runtime charges for (unlisted resources are uncharged), so its cost
+        estimate stays deterministic and the budget gate stays meaningful;
+        the ``cost_unknown`` score flag still prefers fully priced cells
+        when costs tie-break.
+        """
+        if not budgets:
+            return False
+        hard_scopes = {scope for scope, budget in budgets.items() if budget.hard_limit}
+        if not hard_scopes.intersection(workload.identity.scopes):
+            return False
+        return not cell.declares_prices
+
+    @staticmethod
     def _budget_allows(
         identity: WorkloadIdentity,
         reserved_cost: Decimal,
@@ -883,6 +956,7 @@ class Scheduler:
             route_priority=cell.route_priority,
             capacity_class_rank=capacity_class_rank,
             startup_latency_seconds=cell.startup_latency_seconds,
+            cost_unknown=not cell.prices_cover(requested),
             estimated_cost=estimated_cost,
             fractional_waste=fractional_waste,
             cell_id=cell.cell_id,

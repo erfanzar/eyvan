@@ -324,12 +324,75 @@ def test_budget_accounts_for_existing_accelerator_hour_reservations() -> None:
 
     result = Scheduler().schedule(
         (pending,),
-        (_cell("cell", capacity=ResourceVector(tpu=8)),),
+        (_cell("cell", capacity=ResourceVector(tpu=8), unit_prices=ResourceVector(tpu=5)),),
         leases=(running,),
         budgets=(budget,),
     )
 
     assert result.infeasibilities[0].code is InfeasibilityCode.BUDGET_EXCEEDED
+
+
+def test_unpriced_cell_is_refused_under_a_hard_budget() -> None:
+    """A hard budget cannot be enforced against unknown prices: unknown is not zero.
+
+    Only a cell with no price model at all is unknown; a partially priced
+    cell has a deterministic estimate by contract (unlisted resources are
+    uncharged), so it still places -- flagged ``cost_unknown`` so cost
+    tie-breaks prefer fully priced cells.
+    """
+
+    pending = _workload("training", resources=ResourceVector(tpu=2), estimated_duration_seconds=3600)
+    unpriced = _cell("unpriced", capacity=ResourceVector(tpu=8))
+    partially_priced = _cell("partial", capacity=ResourceVector(tpu=8), unit_prices=ResourceVector(cpu=10))
+    budget = Budget(IdentityScope("tenant"), limit=15)
+
+    result = Scheduler().schedule((pending,), (unpriced, partially_priced), budgets=(budget,))
+
+    assert [placement.workload_id for placement in result.placements] == ["training"]
+    assert result.placements[0].lease.cell_id == "partial"
+    assert result.infeasibilities == ()
+
+
+def test_unpriced_cell_still_places_under_a_soft_budget() -> None:
+    budget = Budget(IdentityScope("tenant"), limit=1, hard_limit=False)
+    pending = _workload("training", resources=ResourceVector(tpu=2))
+    unpriced = _cell("unpriced", capacity=ResourceVector(tpu=8))
+
+    result = Scheduler().schedule((pending,), (unpriced,), budgets=(budget,))
+
+    assert [placement.workload_id for placement in result.placements] == ["training"]
+
+
+def test_declared_zero_price_counts_as_priced() -> None:
+    """A declared zero is knowledge; only missing prices are unknown.
+
+    A zero-priced cell under a zero hard budget places: the reservation costs
+    nothing and the budget enforces exactly that.
+    """
+
+    pending = _workload("training", resources=ResourceVector(tpu=2), estimated_duration_seconds=3600)
+    free = _cell("free", capacity=ResourceVector(tpu=8), unit_prices=ResourceVector(tpu=0))
+    budget = Budget(IdentityScope("tenant"), limit=0)
+
+    result = Scheduler().schedule((pending,), (free,), budgets=(budget,))
+
+    assert [placement.workload_id for placement in result.placements] == ["training"]
+    assert result.placements[0].score.cost_unknown is False
+    assert result.infeasibilities == ()
+
+
+def test_unpriced_cell_loses_the_cost_tiebreak_to_a_priced_cell() -> None:
+    """Equal earlier keys: the priced cell wins even when it is more expensive."""
+
+    pending = _workload("training", resources=ResourceVector(cpu=1))
+    unpriced = _cell("a-unpriced", capacity=ResourceVector(cpu=8))
+    priced = _cell("z-priced", capacity=ResourceVector(cpu=8), unit_prices=ResourceVector(cpu=50))
+
+    result = Scheduler().schedule((pending,), (unpriced, priced))
+
+    assert [placement.workload_id for placement in result.placements] == ["training"]
+    assert result.placements[0].lease.cell_id == "z-priced"
+    assert result.placements[0].score.cost_unknown is False
 
 
 def test_topology_and_capacity_class_are_hard_constraints() -> None:
