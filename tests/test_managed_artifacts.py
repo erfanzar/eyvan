@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -43,6 +44,7 @@ from eyvan.artifacts.managed import (
     storage_scope,
 )
 from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.identity.rotation import RotatingCredential
 
 
 def test_managed_uri_helpers_are_canonical_and_reject_path_traversal() -> None:
@@ -2341,3 +2343,34 @@ def test_gcs_inventory_root_rejects_wildcards_that_could_escape_the_requested_pr
         GCSManagedArtifactStore("gs://eyvan-managed/artifacts-*/tenant")
     with pytest.raises(ValueError, match="control characters"):
         GCSManagedArtifactStore("gs://eyvan-managed/artifacts/tenant\tother")
+
+
+def test_an_artifact_token_keyring_rotates_without_orphaning_outstanding_tokens() -> None:
+    """Tokens minted before a rotate keep verifying inside the overlap window."""
+
+    old_secret = secrets.token_bytes(32)
+    new_secret = secrets.token_bytes(32)
+    keyring = RotatingCredential(old_secret)
+    signer = ArtifactTokenSigner(keyring)
+
+    uri = result_uri("obj-1")
+
+    def issue(workload_id: str) -> str:
+        return signer.issue("read", uri, org_id="acme", project_id="research", workload_id=workload_id)
+
+    stale = issue("w-old")
+
+    keyring.begin("rotate-artifacts")
+    keyring.commit("rotate-artifacts", new_secret, overlap_s=600.0)
+
+    fresh = issue("w-new")
+    assert fresh != stale
+    # The pre-rotation token still verifies against the retired material...
+    claims = signer.verify(stale, "read", uri, org_id="acme", project_id="research", workload_id="w-old")
+    assert claims.workload_id == "w-old"
+    # ...and the new one mints under, and verifies against, the new material.
+    verified = signer.verify(fresh, "read", uri, org_id="acme", project_id="research", workload_id="w-new")
+    assert verified.workload_id == "w-new"
+    # Scope mismatches still refuse under either material.
+    with pytest.raises(InvalidArtifactToken):
+        signer.verify(stale, "read", uri, org_id="acme", project_id="research", workload_id="w-other")

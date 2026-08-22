@@ -41,6 +41,7 @@ from eyvan.artifacts._capability_tokens import (
     sign_claims,
     verify_signature,
 )
+from eyvan.identity.rotation import CapabilityKeyring, StaticCredential
 
 #: Distinct from the artifact token's prefix, and inside the signed material.
 #: A stolen artifact token cannot verify here even if the claim checks were
@@ -74,10 +75,19 @@ class WorkloadTokenClaims:
 
 
 class WorkloadCapabilitySigner:
-    """Issue and verify the capability a running attempt submits children with."""
+    """Issue and verify the capability a running attempt submits children with.
 
-    def __init__(self, secret: bytes, *, clock: tp.Callable[[], float] = time.time):
-        self._secret = require_secret(secret, "workload capability secret")
+    ``secret`` is bytes or a :class:`~eyvan.identity.rotation.CapabilityKeyring`.
+    The keyring form is what lets the workload capability secret rotate without
+    invalidating every outstanding attempt: minting uses the signing material,
+    verification walks all materials still inside their retirement window.
+    """
+
+    def __init__(self, secret: bytes | CapabilityKeyring, *, clock: tp.Callable[[], float] = time.time):
+        if isinstance(secret, bytes):
+            self._keyring: CapabilityKeyring = StaticCredential(require_secret(secret, "workload capability secret"))
+        else:
+            self._keyring = secret
         self._clock = clock
 
     def issue(self, *, workload_id: str, org_id: str, project_id: str, generation: int) -> str:
@@ -94,7 +104,7 @@ class WorkloadCapabilitySigner:
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
             raise ValueError("a workload capability requires a positive generation")
         return sign_claims(
-            self._secret,
+            self._keyring.signing_material(),
             WORKLOAD_TOKEN_VERSION,
             {
                 "action": SUBMIT_CHILDREN,
@@ -119,7 +129,19 @@ class WorkloadCapabilitySigner:
         exists -- without a revocation list, a TTL, or anything to expire.
         """
 
-        claims = verify_signature(self._secret, WORKLOAD_TOKEN_VERSION, token)
+        materials = self._keyring.verification_materials()
+        if not materials:
+            raise InvalidCapabilityToken("workload capability signer has no verifiable signing material")
+        claims = None
+        for material in materials:
+            try:
+                claims = verify_signature(material, WORKLOAD_TOKEN_VERSION, token)
+                break
+            except InvalidCapabilityToken:
+                continue
+        if claims is None:
+            # One indistinguishable refusal, exactly as with a single secret.
+            raise InvalidCapabilityToken("invalid capability token")
         if set(claims) != _CLAIM_KEYS:
             # Exact, not a superset. An unexpected claim means a token this
             # build does not fully understand, and honoring the parts it

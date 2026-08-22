@@ -33,6 +33,7 @@ import httpx
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.workspace import create_private_directory
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims, verify_signature
+from eyvan.identity.rotation import CapabilityKeyring, StaticCredential
 
 _CALLABLE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -3394,19 +3395,23 @@ def _constant_time_text_equal(left: str, right: str) -> bool:
 
 
 class ArtifactTokenSigner:
-    """Issue and verify scoped HMAC capabilities for managed object actions."""
+    """Issue and verify scoped HMAC capabilities for managed object actions.
+
+    ``secret`` is bytes or a :class:`~eyvan.identity.rotation.CapabilityKeyring`.
+    The keyring form is what makes rotation survivable: tokens mint under the
+    signing material, while verification walks every material still inside its
+    retirement window, so outstanding capabilities outlive the swap.
+    """
 
     def __init__(
         self,
-        secret: bytes,
+        secret: bytes | CapabilityKeyring,
         *,
         default_ttl_seconds: int = 300,
         max_ttl_seconds: int = 3600,
         clock_skew_seconds: int = 0,
         clock: tp.Callable[[], float] = time.time,
     ):
-        if not isinstance(secret, bytes) or len(secret) < 32:
-            raise ValueError("artifact token secret must contain at least 32 bytes")
         for value, name, allow_zero in (
             (default_ttl_seconds, "default_ttl_seconds", False),
             (max_ttl_seconds, "max_ttl_seconds", False),
@@ -3417,11 +3422,34 @@ class ArtifactTokenSigner:
                 raise ValueError(f"{name} must be a {qualifier} integer")
         if default_ttl_seconds > max_ttl_seconds:
             raise ValueError("default_ttl_seconds cannot exceed max_ttl_seconds")
-        self._secret = secret
+        if isinstance(secret, bytes):
+            if len(secret) < 32:
+                raise ValueError("artifact token secret must contain at least 32 bytes")
+            self._keyring: CapabilityKeyring = StaticCredential(secret)
+        else:
+            self._keyring = secret
         self._default_ttl_seconds = default_ttl_seconds
         self._max_ttl_seconds = max_ttl_seconds
         self._clock_skew_seconds = clock_skew_seconds
         self._clock = clock
+
+    def _verified_payload(self, token: str) -> dict[str, object]:
+        """Verify a token against every material the keyring still trusts.
+
+        Newest first, so the common case costs one HMAC. Which generation a
+        token failed against is never reported: that would tell a prober when
+        a rotation happened.
+        """
+
+        materials = self._keyring.verification_materials()
+        if not materials:
+            raise InvalidCapabilityToken("artifact token signer has no verifiable signing material")
+        for material in materials:
+            try:
+                return verify_signature(material, _TOKEN_VERSION, token)
+            except InvalidCapabilityToken:
+                continue
+        raise InvalidCapabilityToken("invalid artifact token")
 
     @staticmethod
     def _action(value: ArtifactAction | str) -> ArtifactAction:
@@ -3480,7 +3508,7 @@ class ArtifactTokenSigner:
         }
         if workload_id is not None:
             payload["workload_id"] = workload_id
-        return sign_claims(self._secret, _TOKEN_VERSION, payload)
+        return sign_claims(self._keyring.signing_material(), _TOKEN_VERSION, payload)
 
     def verify(
         self,
@@ -3500,7 +3528,7 @@ class ArtifactTokenSigner:
         project_id = _validate_scope_value(project_id, "project_id")
         workload_id = self._workload(workload_id)
         try:
-            payload = verify_signature(self._secret, _TOKEN_VERSION, token)
+            payload = self._verified_payload(token)
         except InvalidCapabilityToken as exc:
             raise InvalidArtifactToken("invalid artifact transfer token") from exc
         required = {

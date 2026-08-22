@@ -25,6 +25,8 @@ instant attempt 2 exists.
 
 from __future__ import annotations
 
+import secrets
+
 import pytest
 
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, encode_segment, sign_claims
@@ -34,6 +36,7 @@ from eyvan.artifacts.workload_capability import (
     InvalidWorkloadToken,
     WorkloadCapabilitySigner,
 )
+from eyvan.identity.rotation import RotatingCredential, StaticCredential
 
 SECRET = b"k" * 32
 
@@ -869,3 +872,47 @@ async def test_the_delivered_credential_is_pinned_to_the_live_generation(tmp_pat
     signer.verify(token, workload_id=workload.id, generation=4)
     with pytest.raises(InvalidWorkloadToken):
         signer.verify(token, workload_id=workload.id, generation=1)
+
+
+def test_a_keyring_rotates_without_orphaning_outstanding_tokens() -> None:
+    """Mint under the old material, rotate, and the token still verifies.
+
+    This is the property raw bytes could never offer: rotation invalidated
+    every outstanding attempt at once. With a keyring the retired material
+    stays verifiable inside its window while new tokens mint under the new
+    one.
+    """
+
+    old_secret = secrets.token_bytes(32)
+    new_secret = secrets.token_bytes(32)
+    keyring = RotatingCredential(old_secret)
+    signer = WorkloadCapabilitySigner(keyring)
+
+    token = signer.issue(workload_id="w-1", org_id="acme", project_id="research", generation=3)
+
+    keyring.begin("rotate-1")
+    keyring.commit("rotate-1", new_secret, overlap_s=600.0)
+
+    # New tokens mint under the new material, while the retired one is still
+    # trusted for verification until its window closes.
+    fresh = signer.issue(workload_id="w-2", org_id="acme", project_id="research", generation=1)
+    assert fresh != token
+    assert signer.verify(token, workload_id="w-1", generation=3).workload_id == "w-1"
+    assert signer.verify(fresh, workload_id="w-2", generation=1).generation == 1
+
+    # A newer generation still refuses the old attempt's token: that is the
+    # revocation, and rotation must not have weakened it.
+    with pytest.raises(InvalidCapabilityToken):
+        signer.verify(token, workload_id="w-1", generation=4)
+
+
+def test_bytes_and_a_static_credential_behave_identically() -> None:
+    """Wrapping bytes in a one-material credential changes no behaviour."""
+
+    secret = secrets.token_bytes(32)
+    plain = WorkloadCapabilitySigner(secret)
+    wrapped = WorkloadCapabilitySigner(StaticCredential(secret))
+    for issuer in (plain, wrapped):
+        token = issuer.issue(workload_id="w", org_id="o", project_id="p", generation=2)
+        assert plain.verify(token, workload_id="w", generation=2).generation == 2
+        assert wrapped.verify(token, workload_id="w", generation=2).workload_id == "w"
