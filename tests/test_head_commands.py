@@ -855,7 +855,10 @@ def test_the_installed_unit_survives_ssh_exit_and_reboot() -> None:
     assert "systemctl daemon-reload" in script
     plan = HeadProvisioner(_spec()).plan()
     start = next(action for action in plan.actions if action.step is HeadStep.SERVICE_START)
-    assert start.args[-1] == "sudo systemctl enable --now eyvan-head.service"
+    # Restart, not `enable --now`: the latter is a no-op on an already-active
+    # unit, so a re-run replaced the wheel and rewrote the environment while the
+    # server went on serving the code and credentials it started with.
+    assert start.args[-1] == "sudo systemctl enable eyvan-head.service && sudo systemctl restart eyvan-head.service"
 
 
 def test_the_installer_carries_no_credential_and_does_not_require_uv() -> None:
@@ -1009,7 +1012,9 @@ def test_migration_runs_with_the_heads_own_environment_before_the_service_starts
     remote_commands = [call.remote_command for call in gcloud.calls if call.remote_command]
     migrate = next(command for command in remote_commands if "eyvan-migrate" in command)
     assert HEAD_ENVIRONMENT_PATH in migrate
-    assert remote_commands.index(migrate) < remote_commands.index("sudo systemctl enable --now eyvan-head.service")
+    assert remote_commands.index(migrate) < remote_commands.index(
+        "sudo systemctl enable eyvan-head.service && sudo systemctl restart eyvan-head.service"
+    )
 
 
 def test_public_internet_egress_keeps_an_external_address_and_still_no_public_ingress() -> None:

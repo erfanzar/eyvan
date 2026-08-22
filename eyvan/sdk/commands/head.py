@@ -969,7 +969,11 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
             # adopting one -- so a changed address self-heals.
             f"{venv_python} -c {shlex.quote(_NODE_CONTEXT_SNIPPET.format(fleet=spec.fleet))}",
             "systemctl daemon-reload",
-            f"systemctl enable --now {HEAD_AGENT_SERVICE_NAME}",
+            # Restarted, not merely enabled, for the reason the server unit is:
+            # this script has just replaced the wheel underneath it and may have
+            # rewritten the environment it reads.
+            f"systemctl enable {HEAD_AGENT_SERVICE_NAME}",
+            f"systemctl restart {HEAD_AGENT_SERVICE_NAME}",
             "",
         )
     )
@@ -1659,12 +1663,24 @@ class HeadProvisioner:
         )
 
     def _service_start_action(self) -> HeadAction:
-        """Build the enable-and-start that survives both ssh exit and reboot."""
+        """Build the enable-and-restart that survives ssh exit, reboot, and a re-run.
+
+        ``enable --now`` alone is a no-op against an already-active unit, which
+        made every re-run of this command a lie: the wheel was replaced on disk
+        and the environment file rewritten, and the server went on serving the
+        code and the credentials it started with. Observed on a real head --
+        `--rotate-secrets` wrote new credentials at 17:17 while the server kept
+        running with 16:39's, so the token an operator read out of
+        ``head.env`` was rejected by the process that file describes.
+
+        ``restart`` is what makes an adopting run mean anything, and it is
+        idempotent on a unit that was not running.
+        """
 
         return self._ssh_action(
             HeadStep.SERVICE_START,
-            f"enable and start {HEAD_SERVICE_NAME} so it survives ssh exit and reboot",
-            f"sudo systemctl enable --now {HEAD_SERVICE_NAME}",
+            f"enable and restart {HEAD_SERVICE_NAME} so it runs the installed wheel and the current environment",
+            f"sudo systemctl enable {HEAD_SERVICE_NAME} && sudo systemctl restart {HEAD_SERVICE_NAME}",
             mutates=True,
         )
 

@@ -29,7 +29,11 @@ def test_the_head_installs_and_starts_a_cell_agent() -> None:
     script = render_head_bootstrap_script(HeadSpec(**_FLEET))
 
     assert HEAD_AGENT_SERVICE_NAME in script
-    assert f"systemctl enable --now {HEAD_AGENT_SERVICE_NAME}" in script
+    # Enable *and* restart: `enable --now` does nothing to an already-active
+    # unit, so a re-run would leave the agent on the wheel and environment it
+    # started with while reporting success.
+    assert f"systemctl enable {HEAD_AGENT_SERVICE_NAME}" in script
+    assert f"systemctl restart {HEAD_AGENT_SERVICE_NAME}" in script
     assert f"--port {HEAD_AGENT_PORT}" in script
 
 
