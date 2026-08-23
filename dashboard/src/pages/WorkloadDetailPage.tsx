@@ -140,6 +140,18 @@ function SpendPanel({ spend, error }: { spend: WorkloadSpend | null; error: stri
   );
 }
 
+function formatWaited(createdIso: string): string {
+  const started = new Date(createdIso).getTime();
+  if (!Number.isFinite(started)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - started) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${rest}s`;
+  return `${rest}s`;
+}
+
 export function WorkloadDetailPage({
   workload,
   onBack,
@@ -311,6 +323,14 @@ export function WorkloadDetailPage({
               <StatusBadge value={workload.status} tone={workload.status} />
             </div>
             <p>{workload.id} · {workload.project} · submitted by {workload.user}</p>
+            {workload.queueReason && (
+              <p className="detail-wait-reason">
+                Waiting: {workload.queueReason}
+                {workload.submittedAt && (
+                  <span className="timeline-gap"> waited {formatWaited(workload.submittedAt)}</span>
+                )}
+              </p>
+            )}
           </div>
         </div>
         {canOperate && (

@@ -1798,3 +1798,9 @@ code,
     animation-iteration-count: 1 !important;
   }
 }
+
+.detail-wait-reason {
+  margin-top: 0.35rem;
+  font-size: var(--text-sm, 0.85rem);
+  color: var(--warning, #d97706);
+}
