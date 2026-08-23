@@ -580,3 +580,36 @@ def test_a_preemption_retry_serves_the_callable_from_the_cell_cache(
             transfer=_MemoryTransfer({}),
             environment=environment,
         )
+
+
+def test_a_rerun_of_the_same_bundle_reuses_its_extraction(tmp_path, monkeypatch) -> None:
+    """Iteration -- run, see the error, fix nothing, rerun -- must not need cell surgery."""
+
+    import os
+    from eyvan.worker.runtime.callable_protocol import _materialize_workspace
+    from eyvan._internal.workspace import build_workspace
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "helper.py").write_text("VALUE = 1\n")
+    archive = build_workspace(root)
+    payload = archive.payload
+    digest = archive.sha256
+
+    monkeypatch.chdir(tmp_path)
+    first = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
+    second = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
+
+    assert first == second
+    assert (first / ".eyvan-extraction-complete").is_file()
+    assert os.path.isdir(first)
+
+    # A partial extraction (no marker) is torn down rather than trusted.
+    import shutil
+
+    shutil.rmtree(first)
+    first.mkdir(parents=True)
+    (first / "leftover-shadow.py").write_text("VALUE = 2\n")  # simulate a torn extraction
+    third = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
+    assert third == first
+    assert not (first / "leftover-shadow.py").exists()

@@ -386,6 +386,9 @@ def _workspace_extractor() -> tp.Callable[..., int]:
     return extract_workspace
 
 
+_WORKSPACE_BASE_ANCHOR: Path | None = None
+
+
 def _materialize_workspace(
     payload: bytes,
     *,
@@ -413,7 +416,19 @@ def _materialize_workspace(
             # workspace is attached: cloudpickle resolves imports by reference,
             # so an unsigned bundle chooses what those references find.
             raise ValueError("workspace bundle signature mismatch")
-    base = Path(environment.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / ".eyvan-workspace"))
+    # The anchor survives os.chdir below: an in-process retry must land in the
+    # same base, not nest a workspace inside the previous one.
+    global _WORKSPACE_BASE_ANCHOR
+    explicit = environment.get("EYVAN_WORKSPACE_DIR")
+    if explicit:
+        base = Path(explicit)
+    else:
+        # An explicit directory always wins; the implicit one is anchored so
+        # an in-process retry lands beside the first extraction instead of
+        # nesting inside it.
+        if _WORKSPACE_BASE_ANCHOR is None or not _WORKSPACE_BASE_ANCHOR.is_dir():
+            _WORKSPACE_BASE_ANCHOR = Path.cwd() / ".eyvan-workspace"
+        base = _WORKSPACE_BASE_ANCHOR
     # One directory per bundle digest: a digest's contents are immutable, so a
     # resubmission reuses its extraction and a changed bundle never meets the
     # old one. Iteration -- run, see the error, fix, rerun -- must not require
@@ -426,7 +441,18 @@ def _materialize_workspace(
                 _remove_tree(stale)
     except OSError:
         pass
-    _workspace_extractor()(payload, destination)
+    # A completed extraction is reusable -- the directory is named by the
+    # bundle's digest, so its contents are pinned. But an extraction that died
+    # mid-write leaves a partial directory that would silently shadow modules;
+    # only the completion marker makes "exists" mean "whole".
+    marker = destination / ".eyvan-extraction-complete"
+    if marker.is_file():
+        pass
+    else:
+        if destination.exists():
+            _remove_tree(destination)
+        _workspace_extractor()(payload, destination)
+        marker.write_text(sha256)
     # Enter the workspace so relative paths behave as they did for the caller,
     # and make its modules importable by the unpickling that follows.
     os.chdir(destination)
