@@ -224,6 +224,7 @@ from eyvan.soak_contract import (
     safe_scope_id,
 )
 from eyvan.soak_evidence import MAX_EVIDENCE_BODY_BYTES, ExternalEvidenceSample, SoakEvidenceStore
+from eyvan.worker.agent.client import CellAgentUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -2605,7 +2606,18 @@ def create_app(
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> str:
         await service.get_workload(principal, workload_id)
-        return await controller.workload_logs(workload_id)
+        try:
+            return await controller.workload_logs(workload_id)
+        except CellAgentUnavailableError:
+            # An unreachable cell is routine -- spot churn, a rebooting VM -- not
+            # a server fault, and a 500 here blanked the dashboard's whole detail
+            # page for a workload whose record, events and leases all answered.
+            # The archive still serves this attempt's history through log-page.
+            return (
+                "cell agent unreachable; live output is unavailable right now. "
+                "Archived output remains available via 'eyvan workload logs' "
+                "once the run settles or through the archive."
+            )
 
     # response_model=None: the page is a plain JSON document whose record shape
     # LogRecord already defines; a response model would restate it.
