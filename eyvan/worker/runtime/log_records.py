@@ -1191,6 +1191,15 @@ _ROUTINE_UNIT_LINES = (
 )
 #: journald usually prefixes the unit name: "eyvan-wl_<id>-a1-g1-<sha>.service:
 #: Consumed 1min ...". The unit name varies, so match what follows it.
+#: Per-process import noise that is identical on every rank. Kept exact-match:
+#: a near-miss here hides a real failure mode someday.
+_ROUTINE_PROCESS_LINES = frozenset(
+    {
+        "PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.",  # noqa: E501
+        "please install `torch` (cpu) if you want to use `AutoEasyDeLModel*.from_torch_pretrained`",
+    }
+)
+
 _UNIT_CHATTER = re.compile(r"\.service: (?:" + "|".join(re.escape(line.strip()) for line in _ROUTINE_UNIT_LINES) + ")")
 
 
@@ -1262,6 +1271,12 @@ def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
         # Advance past it: a dropped line must never rewind the stream.
         cursor = str(entry.get("__CURSOR", cursor))
         if _is_routine_unit_chatter(entry):
+            continue
+        # Transformers prints the same two torch-absence lines on every rank
+        # at import; four slices means eight identical announcements per run,
+        # none of which ever changes. Exact-match, so a near-miss failure mode
+        # still gets through.
+        if message in _ROUTINE_PROCESS_LINES:
             continue
         records.append(
             LogRecord(
