@@ -988,3 +988,26 @@ more -- "are you sure" is answered yes by the same reflex that produced the
 first click -- while typing a cell's name is not something a reflex does. The
 dialog also says how many workloads currently hold capacity there before you
 type it.
+
+## Managed-artifact collection
+
+Finished workloads stop needing most of their bytes, but nothing deletes them
+by itself until collection is enabled. The controller runs one bounded pass
+per `artifact_collection_interval_s` (default one hour); each pass protects
+everything named by any non-terminal workload and by terminal workloads
+inside their retention windows, then claim/version-deletes/finalizes only
+what remains. A hold (`eyvan artifacts hold --uri ... --reason ...`) survives
+incidents and outranks the window.
+
+Inspect before enabling or tightening:
+
+```bash
+eyvan artifacts collectable            # candidates and why each qualifies
+eyvan artifacts references --uri ...   # who names this object
+eyvan artifacts collect                # one dry-run pass: reports, deletes nothing
+eyvan artifacts collect --apply        # same pass, deleting through the store's
+                                       # version-conditional transaction
+```
+
+A failed listing aborts a pass rather than reading as empty: partial
+knowledge never deletes what the reference scan could not see.
