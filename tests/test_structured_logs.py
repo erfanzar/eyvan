@@ -2582,3 +2582,22 @@ def test_records_prefer_the_reachable_address_over_the_hostname() -> None:
         assert page.records[0].host == "some-node"
     else:
         assert page.records[0].host == address
+
+
+def test_worker_prefixes_render_cyan_only_where_color_is_wanted(monkeypatch) -> None:
+    """Attribution recedes; piped logs stay clean bytes."""
+
+    import io
+
+    from eyvan.sdk.terminal import cyan
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    class _Tty:
+        def isatty(self) -> bool:
+            return True
+
+    assert cyan("(Worker pid=7) ", stream=_Tty()).startswith("\033[36m")
+
+    plain = cyan("(Worker pid=7) ", stream=io.StringIO())
+    assert plain == "(Worker pid=7) "

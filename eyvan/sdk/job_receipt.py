@@ -334,7 +334,7 @@ class JobTerminalOutput:
         heading.append(message, style="yellow")
         console.print(heading)
 
-    def output_line(self, text: str) -> None:
+    def output_line(self, text: str | Text) -> None:
         """Print one line of the job's own output into the transcript.
 
         The streamed counterpart of ``lifecycle``: while the client waits on a
@@ -344,15 +344,15 @@ class JobTerminalOutput:
 
         writer = self._writer
         if writer is not None:
-            self._write_plain(writer, (text,))
+            self._write_plain(writer, (text if isinstance(text, str) else text.plain,))
             return
         console = self._console
         assert console is not None
         self.settle()
         if not console.is_terminal:
-            self._write_plain(console.print, (text,))
+            self._write_plain(console.print, (text if isinstance(text, str) else text.plain,))
             return
-        console.print(Text(text))
+        console.print(text if isinstance(text, Text) else Text(text))
 
     def detached(self, workload_id: str) -> None:
         """Say that this client stopped watching, not that the job stopped.

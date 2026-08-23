@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import typing as tp
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -70,6 +71,20 @@ class TerminalRendering:
         else:
             is_terminal = stream_is_terminal(stream)
         return cls(is_terminal=is_terminal, color_enabled=is_terminal and not no_color)
+
+
+def cyan(text: str, *, stream: tp.TextIO | None = None) -> str:
+    """Return ``text`` wrapped in ANSI cyan when the stream renders color.
+
+    Worker-log prefixes are attribution, not content: they should recede next
+    to what the job actually printed. Piped or redirected output gets the bare
+    string -- escape codes in a log file are corruption, not decoration.
+    """
+
+    resolved = TerminalRendering.resolve(sys.stdout if stream is None else stream)
+    if not resolved.color_enabled:
+        return text
+    return f"\033[36m{text}\033[0m"
 
 
 def print_block(console: Console, renderable: object) -> None:

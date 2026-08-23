@@ -293,7 +293,12 @@ class WorkloadFollower:
                 # live display is still repainting.
                 self._settle_output()
                 prefix = _ray_style_prefix(rank, window.provenance[index]) if self._rank_prefixes else ""
-                self.write(f"{prefix}{message}" if prefix else message)
+                if prefix:
+                    from eyvan.sdk.terminal import cyan
+
+                    self.write(f"{cyan(prefix)}{message}")
+                else:
+                    self.write(message)
             if window.cursor:
                 self._cursor = window.cursor
             if not window.lines:

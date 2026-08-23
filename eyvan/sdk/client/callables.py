@@ -172,12 +172,20 @@ class _CallableProgressRenderer:
                 # worker that produced it -- pid and host when the archive
                 # reports them, nothing invented when it does not.
                 provenance = window.provenance[index]
+                line = message.rstrip("\n")
+                if provenance[0] is None:
+                    self._output.output_line(line)
+                    continue
                 prefix = (
                     f"(Worker pid={provenance[0]}, {provenance[1]}) "
-                    if provenance[0] is not None and provenance[1]
-                    else f"(Worker pid={provenance[0]}) " if provenance[0] is not None else ""
+                    if provenance[1]
+                    else f"(Worker pid={provenance[0]}) "
                 )
-                self._output.output_line(f"{prefix}{message.rstrip(chr(10))}")
+                from rich.text import Text
+
+                # Attribution recedes next to the job's own words: cyan when a
+                # terminal renders it, plain bytes everywhere else.
+                self._output.output_line(Text(prefix, style="cyan").append(line))
             if not window.cursor or not window.lines:
                 self._log_cursor = window.cursor or self._log_cursor
                 return
