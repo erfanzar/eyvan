@@ -277,7 +277,7 @@ def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, mo
 
     monkeypatch.setattr(transport_module.httpx, "Client", client)
 
-    @eyvan.execute(eyvan.TpuConfig(type="v5p-512"))
+    @eyvan.execute(eyvan.TpuConfig(type="v5p-512"), workspace=False)
     def train(value: int) -> int:
         return value + 1
 
@@ -382,7 +382,7 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
     monkeypatch.setattr(transport_module.httpx, "Client", lambda **_kwargs: raw)
     eyvan.init(artifact_store=LocalArtifactStore(tmp_path / "artifacts"))
 
-    @eyvan.execute(eyvan.TpuConfig(type="v6e-16"))
+    @eyvan.execute(eyvan.TpuConfig(type="v6e-16"), workspace=False)
     def train() -> None:
         return None
 
@@ -441,7 +441,7 @@ def test_decorator_job_result_reports_control_plane_unavailability_without_httpx
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8080")
     monkeypatch.setattr(transport_module.httpx, "Client", lambda **_kwargs: raw)
 
-    @eyvan.execute(eyvan.TpuConfig(type="v6e-16", pods=2))
+    @eyvan.execute(eyvan.TpuConfig(type="v6e-16", pods=2), workspace=False)
     def train() -> None:
         pass
 
@@ -506,7 +506,7 @@ def test_decorator_reports_actionable_error_when_selected_fleet_has_no_matching_
     raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://eyvan.test")
     monkeypatch.setattr(transport_module.httpx, "Client", lambda **_kwargs: raw)
 
-    @eyvan.execute(eyvan.TpuConfig(type="v5p-16"))
+    @eyvan.execute(eyvan.TpuConfig(type="v5p-16"), workspace=False)
     def train() -> None:
         pass
 

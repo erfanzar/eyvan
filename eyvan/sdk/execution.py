@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from eyvan._internal.json_types import model_json
-from eyvan._internal.workspace import build_workspace
+from eyvan._internal.workspace import WorkspaceError, build_workspace
 from eyvan.artifacts import (
     ArtifactStore,
     EyvanManagedArtifactStore,
@@ -549,16 +549,31 @@ class Executable(tp.Generic[P, R]):
         workspace_uri: str | None = None
         workspace_sha256: str | None = None
         workspace_signature: str | None = None
-        if self._workspace is not None:
-            bundle = build_workspace(self._workspace)
-            workspace_uri = context.artifact_store.put_workspace(bundle.payload, bundle.sha256)
-            workspace_sha256 = bundle.sha256
-            # Signed under the same key as the callable. The bundle is entered
-            # and put on sys.path before the pickle is loaded, so an unsigned
-            # workspace can shadow any module the signed callable resolves by
-            # reference -- and the callable's signature would prove nothing.
-            if context.signing_key is not None:
-                workspace_signature = hmac.new(context.signing_key, bundle.payload, hashlib.sha256).hexdigest()
+        if self._workspace is False:
+            pass  # Explicit opt-out.
+        else:
+            # Default is the caller's working directory, .gitignore-respected,
+            # the ray --working-dir . expectation. An explicit path that cannot
+            # be packaged fails the submit; an automatic one degrades to no
+            # workspace with a note rather than blocking runs from directories
+            # no one intended to ship (tests, huge checkouts past the caps).
+            root = self._workspace if self._workspace is not None else Path.cwd()
+            automatic = self._workspace is None
+            try:
+                bundle = build_workspace(root)
+            except WorkspaceError:
+                if not automatic:
+                    raise
+                bundle = None
+            if bundle is not None:
+                workspace_uri = context.artifact_store.put_workspace(bundle.payload, bundle.sha256)
+                workspace_sha256 = bundle.sha256
+                # Signed under the same key as the callable. The bundle is entered
+                # and put on sys.path before the pickle is loaded, so an unsigned
+                # workspace can shadow any module the signed callable resolves by
+                # reference -- and the callable's signature would prove nothing.
+                if context.signing_key is not None:
+                    workspace_signature = hmac.new(context.signing_key, bundle.payload, hashlib.sha256).hexdigest()
         request = CallableSubmission(
             invocation_id=invocation_id,
             fleet=fleet,

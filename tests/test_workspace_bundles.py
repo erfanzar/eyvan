@@ -258,7 +258,7 @@ def test_decorator_without_a_workspace_sends_no_bundle_fields(tmp_path: Path) ->
         submitter=EyvanCallableSubmitter(sync_module.EyvanClient(client=raw), store),
     )
 
-    @execution_module.execute(execution_module.TpuConfig(type="v5p-16"), context=context)
+    @execution_module.execute(execution_module.TpuConfig(type="v5p-16"), context=context, workspace=False)
     def train() -> int:
         return 1
 
