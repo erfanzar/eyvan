@@ -426,6 +426,10 @@ class WorkloadCommandService:
             return
         for line in lines:
             click.echo(line)
+        # The summary says what state a run is in; the timeline is where "why
+        # is it still pending" gets answered, and nobody finds a command they
+        # were never told about.
+        click.echo(f"  timeline  eyvan workload timeline {workload_id}")
 
     def process_status(self, workload_id: str) -> None:
         """Emit live process detail for one workload attempt."""

@@ -465,23 +465,48 @@ export function WorkloadDetailPage({
         </div>
       )}
 
-      {tab === "timeline" && (
-        <section className="panel timeline-panel">
-          <div className="panel-header"><div><h2>Lifecycle timeline</h2><p>Admission, placement, lease, and runtime transitions</p></div></div>
-          <ol className="timeline-list">
-            {workload.timeline.map((event) => (
-              <li key={event.id} className={`timeline-${event.severity}`}>
-                <span className="timeline-marker" aria-hidden="true" />
-                <div>
-                  <span className="timeline-heading"><strong>{event.title}</strong><time>{formatDateTime(event.timestamp)}</time></span>
-                  <p>{event.detail}</p>
-                  {event.actor && <small>{event.actor}</small>}
-                </div>
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
+      {tab === "timeline" && (() => {
+        // Durations are the answer to "where did the time go": each row shows
+        // how long after the previous transition it happened, so a nine-hour
+        // admission wait is a number on the screen, not arithmetic.
+        const parse = (value: string) => new Date(value).getTime();
+        const fmtGap = (ms: number) => {
+          if (!Number.isFinite(ms) || ms < 0) return "";
+          const s = Math.round(ms / 1000);
+          const h = Math.floor(s / 3600);
+          const m = Math.floor((s % 3600) / 60);
+          const r = s % 60;
+          return h > 0 ? `${h}h ${m}m ${r}s` : m > 0 ? `${m}m ${r}s` : `${r}s`;
+        };
+        let previous: number | null = null;
+        const rows = workload.timeline.map((event) => {
+          const at = parse(event.timestamp);
+          const gap = previous === null ? "" : fmtGap(at - previous);
+          previous = Number.isFinite(at) ? at : previous;
+          return { event, gap };
+        });
+        return (
+          <section className="panel timeline-panel">
+            <div className="panel-header"><div><h2>Lifecycle timeline</h2><p>Admission, placement, lease, and runtime transitions</p></div></div>
+            <ol className="timeline-list">
+              {rows.map(({ event, gap }) => (
+                <li key={event.id} className={`timeline-${event.severity}`}>
+                  <span className="timeline-marker" aria-hidden="true" />
+                  <div>
+                    <span className="timeline-heading">
+                      <strong>{event.title}</strong>
+                      {gap && <span className="timeline-gap">+{gap}</span>}
+                      <time>{formatDateTime(event.timestamp)}</time>
+                    </span>
+                    <p>{event.detail}</p>
+                    {event.actor && <small>{event.actor}</small>}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </section>
+        );
+      })()}
 
       {tab === "logs" && (
         <section className="panel logs-panel">

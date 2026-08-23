@@ -1478,6 +1478,15 @@ code,
 .timeline-warning .timeline-marker { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
 .timeline-critical .timeline-marker { background: var(--red); box-shadow: 0 0 0 1px var(--red); }
 .timeline-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.timeline-gap {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary, #94a3b8);
+}
 .timeline-heading strong { font-size: var(--text-sm); }
 .timeline-heading time { color: var(--text-muted); font-size: var(--text-2xs); }
 .timeline-list p { margin: 5px 0; color: var(--text-muted); font-size: var(--text-sm); line-height: 1.45; }
