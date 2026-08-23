@@ -188,9 +188,11 @@ from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
 from eyvan.server.service.control_plane import (
+    DEFAULT_ARTIFACT_GRACE_PERIOD_S,
     QUEUE_TREND_MAX_BUCKETS,
     QUEUE_TREND_MAX_WINDOW_S,
     QUEUE_TREND_MIN_WINDOW_S,
+    ArtifactCollection,
     ControlPlaneService,
 )
 from eyvan.server.service.credential_rotation import CredentialRotationService
@@ -1520,6 +1522,31 @@ def create_app(
         """
 
         return await service.collectable_artifacts(principal, org_id=org_id, project_id=project_id)
+
+    @app.post("/api/v1/artifacts/collect", response_model=ArtifactCollection, tags=["artifacts"])
+    async def collect_artifacts(
+        org_id: str,
+        project_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        dry_run: bool = True,
+        grace_period_s: float = DEFAULT_ARTIFACT_GRACE_PERIOD_S,
+        limit: int = 500,
+    ) -> ArtifactCollection:
+        """Run one bounded collection pass; dry-run reports without deleting.
+
+        Deletion here is the store's claim/version-delete/finalize sequence,
+        never an unlink: a workload that re-validated its artifact between
+        listing and sweep is refused rather than destroyed.
+        """
+
+        return await service.collect_artifacts_once(
+            principal=principal,
+            org_id=org_id,
+            project_id=project_id,
+            dry_run=dry_run,
+            grace_period_s=grace_period_s,
+            limit=limit,
+        )
 
     @app.post("/api/v1/artifacts/holds", response_model=ManagedArtifactRecord, tags=["artifacts"])
     async def hold_artifact(

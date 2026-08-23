@@ -165,6 +165,40 @@ def references(session: CliSession, org_id: str | None, project_id: str | None, 
     )
 
 
+@artifacts.command("collect")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--apply/--dry-run", "apply", default=False, show_default="dry-run")
+@click.option("--grace-period-s", type=float, default=None)
+@click.option("--limit", type=int, default=500)
+@click.pass_obj
+def collect(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    apply: bool,
+    grace_period_s: float | None,
+    limit: int,
+) -> None:
+    """Run one bounded collection pass over managed artifacts.
+
+    Dry-run is the default because deletion here is real: claim,
+    version-conditional delete, finalize. Read `collectable` first; collect
+    when the list says what you expect.
+    """
+
+    scope = session.workload_scope(org_id=org_id, project_id=project_id)
+    body: dict = {
+        "org_id": scope.org_id,
+        "project_id": scope.project_id,
+        "dry_run": not apply,
+        "limit": limit,
+    }
+    if grace_period_s is not None:
+        body["grace_period_s"] = grace_period_s
+    _emit(session.client.request("POST", "/api/v1/artifacts/collect", json=body))
+
+
 @artifacts.command("hold")
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")

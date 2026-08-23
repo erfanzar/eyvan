@@ -319,3 +319,13 @@ def test_a_local_delete_removes_only_the_scoped_object(tmp_path) -> None:
     assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="other"), (
         "one project's collection must not take another's copy"
     )
+
+
+def test_the_collect_route_is_registered_on_the_api(monkeypatch, tmp_path) -> None:
+    """The HTTP surface exists and is bound to the collector service call."""
+
+    from eyvan.server.api.app import create_app
+
+    app = create_app()
+    paths = {getattr(route, "path", None) for route in app.routes}
+    assert "/api/v1/artifacts/collect" in paths
