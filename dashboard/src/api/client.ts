@@ -87,6 +87,7 @@ interface RawWorkload {
     priority_band: PriorityBand;
   /** Slices allocated together (pods=N). Absent on planes predating multislice. */
   cell_group_count?: number;
+  worker_count?: number;
   };
 }
 
@@ -277,7 +278,12 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
       accelerator,
       acceleratorCount: resources.tpu || undefined,
       replicas: raw.spec.gang.replicas,
-      slices: typeof raw.spec.cell_group_count === "number" ? raw.spec.cell_group_count : undefined,
+      // Replicas are the product of both counts: cells × workers-per-cell.
+      // The callable path stores `pods` as worker_count with one cell group,
+      // so reading either field alone reported x1 for every SDK submission.
+      slices:
+        (typeof raw.spec.cell_group_count === "number" ? raw.spec.cell_group_count : 1) *
+        (typeof raw.spec.worker_count === "number" ? raw.spec.worker_count : 1),
       topology: Object.values(raw.spec.gang.required_topology).join(", ") || undefined,
     },
     submittedAt: raw.created_at,
