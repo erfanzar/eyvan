@@ -38,6 +38,7 @@ import base64
 import json
 import os
 import re
+import socket
 import typing as tp
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1241,6 +1242,37 @@ def _is_routine_unit_chatter(entry: dict[str, tp.Any]) -> bool:
     return message.startswith(_ROUTINE_UNIT_LINES) or bool(_UNIT_CHATTER.search(message))
 
 
+_LOCAL_ADDRESS_LOCK = __import__("threading").Lock()
+_LOCAL_ADDRESS_CACHE: str | None | bool = False
+
+
+def _local_worker_address() -> str | None:
+    """This host's primary address, resolved once per process.
+
+    A routing-table probe (connect a UDP socket toward a public address --
+    no packet is sent) answers "which interface would carry traffic off this
+    machine", which on a TPU VM is the internal address the rest of the
+    fleet reaches it by. Ray prints exactly this in its worker prefix.
+    """
+
+    global _LOCAL_ADDRESS_CACHE
+    with _LOCAL_ADDRESS_LOCK:
+        if _LOCAL_ADDRESS_CACHE is not False:
+            return tp.cast("str | None", _LOCAL_ADDRESS_CACHE)
+        address: str | None = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("8.8.8.8", 80))
+                address = probe.getsockname()[0]
+            finally:
+                probe.close()
+        except OSError:
+            address = None
+        _LOCAL_ADDRESS_CACHE = address or None
+        return tp.cast("str | None", _LOCAL_ADDRESS_CACHE)
+
+
 def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
     """Parse ``journalctl --output=json`` output into records.
 
@@ -1286,7 +1318,10 @@ def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
                 cursor=str(entry.get("__CURSOR", "")),
                 rank=rank,
                 pid=_optional_int(entry.get("_PID")),
-                host=entry.get("_HOSTNAME") if isinstance(entry.get("_HOSTNAME"), str) else None,
+                # The reachable address outranks the hostname in a prefix:
+                # operators paste an ip into ssh/gcloud, not a node name.
+                host=_local_worker_address()
+                or (entry.get("_HOSTNAME") if isinstance(entry.get("_HOSTNAME"), str) else None),
             )
         )
     return LogPage(records=tuple(records), next_cursor=cursor)

@@ -2565,3 +2565,20 @@ def test_log_lines_carry_ray_style_worker_provenance() -> None:
 
     assert _ray_style_prefix(2, window.provenance[0]) == "(Worker pid=4102, …-node-2) "
     assert _ray_style_prefix(1, window.provenance[1]) == "(rank 1) "
+
+
+def test_records_prefer_the_reachable_address_over_the_hostname() -> None:
+    """Ray prints the ip operators can ssh to, not the node name."""
+
+    from eyvan.worker.runtime.log_records import _local_worker_address, parse_journal_json
+
+    address = _local_worker_address()
+    page = parse_journal_json(
+        '{"__CURSOR":"c1","MESSAGE":"hi","PRIORITY":"6","_PID":"77","_HOSTNAME":"some-node"}',
+        rank=2,
+    )
+
+    if address is None:  # no route off-box (sandboxed CI): hostname fallback
+        assert page.records[0].host == "some-node"
+    else:
+        assert page.records[0].host == address
