@@ -36,7 +36,7 @@ _WORKLOAD_CONTAINER_RUNTIME = "/etc/eyvan-native/container-runtime.json"
 #: running cells only when they are recreated. This is deliberate: pushing a
 #: new script under a running cell would re-run provisioning steps with no
 #: fence, and the driver has no way to know what the old script already did.
-NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-23.2"
+NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-23.3"
 
 
 def _required(value: str, name: str) -> str:
