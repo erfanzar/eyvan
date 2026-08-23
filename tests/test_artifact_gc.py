@@ -11,6 +11,7 @@ readable, a week-old failure must clean up, and an inventory error must abort
 rather than delete blindly.
 """
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -51,8 +52,6 @@ class _Repository:
         return list(self.workloads)
 
 
-import hashlib
-
 
 def _uri(name: str, payload: bytes | None = None) -> str:
     return f"eyvan://callables/{hashlib.sha256(_payload(name) if payload is None else payload).hexdigest()}"
@@ -70,7 +69,9 @@ def store(tmp_path):
 async def test_a_live_workload_protects_every_artifact_it_names(store) -> None:
     store.put_versioned(_uri("live"), _payload("live"), org_id=ORG, project_id=PROJECT)
     repo = _Repository(
-        _workload("wl_live", state=WorkloadState.RUNNING, artifact_uri=_uri("live", _payload("live")), updated=NOW - timedelta(days=30))
+        _workload(
+        "wl_live", state=WorkloadState.RUNNING, artifact_uri=_uri("live"), updated=NOW - timedelta(days=30)
+    )
     )
 
     plan = await plan_gc(store, repo, org_id=ORG, project_id=PROJECT, now=NOW)
@@ -83,7 +84,10 @@ async def test_a_recent_success_keeps_its_result_readable(store) -> None:
     store.put_versioned(_uri("recent"), _payload("recent"), org_id=ORG, project_id=PROJECT)
     repo = _Repository(
         _workload(
-            "wl_done", state=WorkloadState.SUCCEEDED, artifact_uri=_uri("recent", _payload("recent")), updated=NOW - timedelta(days=2)
+            "wl_done",
+            state=WorkloadState.SUCCEEDED,
+            artifact_uri=_uri("recent"),
+            updated=NOW - timedelta(days=2),
         )
     )
 
@@ -95,7 +99,12 @@ async def test_a_recent_success_keeps_its_result_readable(store) -> None:
 async def test_an_expired_failure_becomes_collectable(store) -> None:
     store.put_versioned(_uri("old"), _payload("old"), org_id=ORG, project_id=PROJECT)
     repo = _Repository(
-        _workload("wl_old", state=WorkloadState.FAILED, artifact_uri=_uri("old", _payload("old")), updated=NOW - timedelta(days=9))
+        _workload(
+        "wl_old",
+        state=WorkloadState.FAILED,
+        artifact_uri=_uri("old"),
+        updated=NOW - timedelta(days=9),
+    )
     )
 
     plan = await run_gc(store, repo, org_id=ORG, project_id=PROJECT, now=NOW)
@@ -110,7 +119,12 @@ async def test_apply_deletes_orphans_and_never_the_referenced(store) -> None:
     store.put_versioned(_uri("old"), _payload("old"), org_id=ORG, project_id=PROJECT)
     store.put_versioned(_uri("kept"), _payload("kept"), org_id=ORG, project_id=PROJECT)
     repo = _Repository(
-        _workload("wl_old", state=WorkloadState.CANCELLED, artifact_uri=_uri("old", _payload("old")), updated=NOW - timedelta(days=9)),
+        _workload(
+            "wl_old",
+            state=WorkloadState.CANCELLED,
+            artifact_uri=_uri("old"),
+            updated=NOW - timedelta(days=9),
+        ),
         _workload("wl_new", state=WorkloadState.RUNNING, artifact_uri=_uri("kept", _payload("kept")), updated=NOW),
     )
 
