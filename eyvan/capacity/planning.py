@@ -11,7 +11,7 @@ import math
 import re
 import typing as tp
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from eyvan._internal.identifiers import stable_id
@@ -21,6 +21,7 @@ from eyvan.capacity import (
     QUEUED_CAPACITY_STATUSES,
 )
 from eyvan.domain import SchedulingResult
+from eyvan.domain.models import PriorityBand
 from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
@@ -30,6 +31,17 @@ from eyvan.records import (
     WorkloadState,
 )
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
+
+#: How long a shape must have gone unplaced before one pool may reclaim another
+#: pool's capacity for it.
+#:
+#: Contention and fragmentation look identical for the first few passes: both are
+#: "the group's quota is spent and this shape does not fit". They separate over
+#: time, because contention clears when the current holders finish and
+#: fragmentation does not. Reclaiming immediately would evict work to serve a
+#: demand that was about to be satisfied anyway, and pay a whole provisioning
+#: cycle to do it.
+_DEFRAG_MIN_PENDING_SECONDS = 180.0
 
 #: ``CellRecord.id`` is ``max_length=96`` and a cell id becomes a provider
 #: resource name, so the minted form must fit whatever the widest counter is.
@@ -222,6 +234,51 @@ def cell_execution_runtime_is_pending(cell: CellRecord) -> bool:
     return cell.provider_phase in EXECUTION_PENDING_CAPACITY_STATUSES
 
 
+def _workload_band(record: WorkloadRecord | None) -> PriorityBand | None:
+    """Return one workload's scheduler band, or ``None`` when it is not known.
+
+    The record layer spells bands as strings and the scheduler orders them as an
+    ``IntEnum``; this is the same ``PriorityBand[name]`` conversion the core
+    scheduling service performs, kept here so the capacity layer does not import
+    from the server.
+    """
+
+    if record is None:
+        return None
+    try:
+        return PriorityBand[record.spec.priority_band.name]
+    except KeyError:  # pragma: no cover - a band the scheduler does not order
+        return None
+
+
+def _demand_band(demand: PoolDemand, index: int) -> PriorityBand | None:
+    """Return the band of one virtual shape, or ``None`` when it is not known."""
+
+    if index >= len(demand.virtual_priorities):
+        return None
+    return demand.virtual_priorities[index]
+
+
+def _demand_pending_seconds(demand: PoolDemand, index: int) -> float:
+    """Return how long one virtual shape has waited, or 0 when that is unknown."""
+
+    if index >= len(demand.virtual_pending_seconds):
+        return 0.0
+    return demand.virtual_pending_seconds[index]
+
+
+def _pending_seconds(record: WorkloadRecord | None, now: datetime | None) -> float:
+    """Return how long a workload has been waiting, or 0 when that is unknown.
+
+    Zero is the safe unknown: the defragmentation gate is a *minimum* wait, so an
+    unknown wait never authorises reclaiming another pool's capacity.
+    """
+
+    if record is None or now is None:
+        return 0.0
+    return max((now - record.created_at).total_seconds(), 0.0)
+
+
 @dataclass(frozen=True, slots=True)
 class PoolDemand:
     """Scheduler-selected real capacity and exact virtual cell shapes."""
@@ -229,12 +286,29 @@ class PoolDemand:
     real_cell_ids: frozenset[str]
     virtual_worker_counts: tuple[int, ...]
     virtual_workload_ids: tuple[str, ...]
+    #: Priority band of each virtual shape's requesting workload, and how long
+    #: that workload has been waiting. Cross-pool defragmentation needs both: the
+    #: band decides whether taking capacity from another pool is allowed at all,
+    #: and the wait separates ordinary contention from fragmentation. Empty on a
+    #: demand built without workloads, which reads as "not eligible" rather than
+    #: as batch priority -- absence must never authorise an eviction.
+    virtual_priorities: tuple[PriorityBand, ...] = ()
+    virtual_pending_seconds: tuple[float, ...] = ()
+    #: Highest band any active lease on that cell is serving. A cell absent from
+    #: this mapping carries no active lease and is the cheapest thing to reclaim.
+    real_cell_priorities: tp.Mapping[str, PriorityBand] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Keep each virtual capacity shape attached to its requesting workload."""
 
         if len(self.virtual_worker_counts) != len(self.virtual_workload_ids):
             raise ValueError("virtual worker counts must align with virtual workload ids")
+        for name, values in (
+            ("priorities", self.virtual_priorities),
+            ("pending seconds", self.virtual_pending_seconds),
+        ):
+            if values and len(values) != len(self.virtual_worker_counts):
+                raise ValueError(f"virtual {name} must align with virtual worker counts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,18 +443,33 @@ class CapacitySimulation:
         pools: tuple[CapacityPoolRecord, ...],
         leases: tuple[LeaseRecord, ...],
         result: SchedulingResult,
+        workloads: tuple[WorkloadRecord, ...] = (),
+        now: datetime | None = None,
     ) -> dict[str, PoolDemand]:
-        """Resolve scheduler placements to physical cell shapes per pool."""
+        """Resolve scheduler placements to physical cell shapes per pool.
+
+        ``workloads`` and ``now`` are what let the planner decide whether one
+        pool may reclaim another's capacity. Both are optional so a caller that
+        does not defragment is unchanged; omitting them yields a demand that is
+        never eligible to take capacity from a peer.
+        """
 
         real_ids: dict[str, set[str]] = {pool.id: set() for pool in pools}
         virtual_counts: dict[str, list[int]] = {pool.id: [] for pool in pools}
         virtual_workload_ids: dict[str, list[str]] = {pool.id: [] for pool in pools}
+        by_workload_id = {record.id: record for record in workloads}
+        cell_priorities: dict[str, dict[str, PriorityBand]] = {pool.id: {} for pool in pools}
         for lease in leases:
             if lease.state not in ACTIVE_LEASE_STATES:
                 continue
             pool_id = self.pool_by_cell_id.get(lease.cell_id)
             if pool_id in real_ids:
                 real_ids[pool_id].add(lease.cell_id)
+                band = _workload_band(by_workload_id.get(lease.workload_id))
+                if band is not None:
+                    served = cell_priorities[pool_id]
+                    current = served.get(lease.cell_id)
+                    served[lease.cell_id] = band if current is None else max(current, band)
         for placement in result.placements:
             for lease in placement.all_leases:
                 pool_id = self.pool_by_cell_id.get(lease.cell_id)
@@ -397,6 +486,19 @@ class CapacitySimulation:
                 real_cell_ids=frozenset(real_ids[pool.id]),
                 virtual_worker_counts=tuple(virtual_counts[pool.id]),
                 virtual_workload_ids=tuple(virtual_workload_ids[pool.id]),
+                virtual_priorities=tuple(
+                    _workload_band(by_workload_id.get(workload_id)) or PriorityBand.BATCH
+                    for workload_id in virtual_workload_ids[pool.id]
+                )
+                if by_workload_id
+                else (),
+                virtual_pending_seconds=tuple(
+                    _pending_seconds(by_workload_id.get(workload_id), now)
+                    for workload_id in virtual_workload_ids[pool.id]
+                )
+                if by_workload_id and now is not None
+                else (),
+                real_cell_priorities=dict(cell_priorities[pool.id]),
             )
             for pool in pools
         }
@@ -442,11 +544,16 @@ class PoolScalePlan:
 
 @dataclass(frozen=True, slots=True)
 class QuotaAllocation:
-    """Shared-quota launches and same-pool units that must be reclaimed."""
+    """Shared-quota launches and the units that must be reclaimed to allow them."""
 
     launch_worker_counts: dict[str, tuple[int, ...]]
     reclaim_worker_units: dict[str, int]
     blocked_workload_ids: frozenset[str]
+    #: Worker units each pool must give up so a *different* pool in its quota
+    #: group can launch a shape it cannot otherwise fit. Keyed by the pool that
+    #: owns the cells, so the drain lands in that pool's own plan and the
+    #: executor stays unchanged.
+    donated_worker_units: dict[str, int] = field(default_factory=dict)
 
 
 class CapacityPlanner:
@@ -457,10 +564,12 @@ class CapacityPlanner:
         pools: tuple[CapacityPoolRecord, ...],
         cells_by_pool: dict[str, list[CellRecord]],
         now: datetime,
+        defragmentation_min_pending_seconds: float = _DEFRAG_MIN_PENDING_SECONDS,
     ):
         self._pools = pools
         self._cells_by_pool = cells_by_pool
         self._now = now
+        self._defrag_min_pending_seconds = defragmentation_min_pending_seconds
         self._quota_blocked_workload_ids: frozenset[str] = frozenset()
 
     @property
@@ -480,6 +589,7 @@ class CapacityPlanner:
                 intents[pool.id],
                 quota.launch_worker_counts[pool.id],
                 quota.reclaim_worker_units[pool.id],
+                quota.donated_worker_units.get(pool.id, 0),
             )
             for pool in self._pools
         }
@@ -536,6 +646,7 @@ class CapacityPlanner:
     def _allocate_shared_quota(self, intents: dict[str, PoolScaleIntent]) -> QuotaAllocation:
         allowed = {pool_id: intent.requested_worker_counts for pool_id, intent in intents.items()}
         reclaim_worker_units = {pool_id: 0 for pool_id in intents}
+        donated_worker_units: dict[str, int] = {}
         blocked_workload_ids: set[str] = set()
         grouped: dict[str, list[PoolScaleIntent]] = {}
         for intent in intents.values():
@@ -602,17 +713,100 @@ class CapacityPlanner:
                     raise ValueError("quota group pools must configure quota_units_per_cell")
                 quota_shortage = worker_count * units_per_worker - remaining_units
                 reclaim_worker_units[intent.pool.id] = math.ceil(quota_shortage / units_per_worker)
+                self._donate_across_pools(
+                    blocked=intent,
+                    accepted_index=accepted_count,
+                    quota_shortage=quota_shortage,
+                    members=members,
+                    denied_pool_ids={candidate.pool.id for candidate in denied_exact},
+                    donated=donated_worker_units,
+                )
         return QuotaAllocation(
             launch_worker_counts=allowed,
             reclaim_worker_units=reclaim_worker_units,
             blocked_workload_ids=frozenset(blocked_workload_ids),
+            donated_worker_units=donated_worker_units,
         )
+
+    def _donate_across_pools(
+        self,
+        *,
+        blocked: PoolScaleIntent,
+        accepted_index: int,
+        quota_shortage: int,
+        members: list[PoolScaleIntent],
+        denied_pool_ids: set[str],
+        donated: dict[str, int],
+    ) -> None:
+        """Take quota from peer pools so ``blocked`` can launch the shape it needs.
+
+        Reclaiming a pool's own wrong-shaped cells is already handled by
+        ``_finalize``. This is the case that leaves a fleet stuck: the group's
+        quota is spent on *other* pools' cells, so nothing the blocked pool owns
+        can be given up to fit a larger shape, and the demand waits forever while
+        the chips it needs sit in slices too small to use.
+
+        Deliberately narrow:
+
+        * **idle capacity only.** ``_finalize`` protects every cell serving
+          demand, so a busy cell could be promised here and never actually
+          drained -- the shortage would read as covered while nothing was freed.
+          Matching its rule keeps the two honest, and has the better property
+          besides: defragmentation never stops running work. Fragmentation is
+          idle cells holding quota, which is exactly what this can take.
+        * never from a pool that is itself blocked, which would trade one stuck
+          demand for another;
+        * never below a peer's warm floor, which an operator is paying to hold;
+        * only once the demand has waited past the fragmentation threshold;
+        * all or nothing -- a partial donation drains capacity and still does
+          not fit the shape.
+        """
+
+        band = _demand_band(blocked.demand, accepted_index)
+        waited = _demand_pending_seconds(blocked.demand, accepted_index)
+        if band is None or waited < self._defrag_min_pending_seconds:
+            return
+
+        candidates: list[tuple[int, str, str, int]] = []
+        for peer in members:
+            if peer.pool.id == blocked.pool.id or peer.pool.id in denied_pool_ids:
+                continue
+            units_per_worker = peer.pool.quota_units_per_cell
+            if units_per_worker is None:
+                continue
+            idle = [
+                cell
+                for cell in peer.live
+                if cell.id not in peer.demand.real_cell_ids
+                and cell.autoscale_request_workload_id is None
+                and cell.state not in {CellState.DRAINING, CellState.DELETING}
+            ]
+            spare_units = sum(cell.worker_count for cell in idle) - peer.pool.warm_floor(self._now)
+            for cell in sorted(idle, key=lambda candidate: (candidate.worker_count, candidate.id)):
+                if spare_units < cell.worker_count:
+                    break
+                spare_units -= cell.worker_count
+                candidates.append((cell.worker_count, cell.id, peer.pool.id, units_per_worker))
+        candidates.sort()
+
+        freed_quota_units = 0
+        taken: Counter[str] = Counter()
+        for worker_count, _cell_id, pool_id, units_per_worker in candidates:
+            if freed_quota_units >= quota_shortage:
+                break
+            taken[pool_id] += worker_count
+            freed_quota_units += worker_count * units_per_worker
+        if freed_quota_units < quota_shortage:
+            return
+        for pool_id, worker_units in taken.items():
+            donated[pool_id] = max(donated.get(pool_id, 0), worker_units)
 
     def _finalize(
         self,
         intent: PoolScaleIntent,
         launch_worker_counts: tuple[int, ...],
         quota_reclaim_worker_units: int,
+        donated_worker_units: int = 0,
     ) -> PoolScalePlan:
         if launch_worker_counts != intent.requested_worker_counts[: len(launch_worker_counts)]:
             raise ValueError("quota allocation must preserve the requested launch order")
@@ -651,7 +845,14 @@ class CapacityPlanner:
             else 0
         )
         quota_units_to_free = max(quota_reclaim_worker_units - reclaiming_units, 0) if unlaunched_exact else 0
-        units_to_free = max(capacity_units_to_free, quota_units_to_free)
+        # A donation is not gated on this pool having unlaunched demand -- the
+        # whole point is that the capacity leaves for a peer. Combined with
+        # ``max`` rather than a sum: a pool that is both blocked and a donor
+        # frees the larger requirement, and the next pass asks again if that was
+        # not enough. Summing would over-drain on the strength of two estimates
+        # of the same shortage.
+        donation_units_to_free = max(donated_worker_units - reclaiming_units, 0)
+        units_to_free = max(capacity_units_to_free, quota_units_to_free, donation_units_to_free)
         if units_to_free:
             drainable = sorted(
                 (

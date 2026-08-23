@@ -19,6 +19,7 @@ from eyvan.capacity.planning import (
     cell_matches_pool,
     cell_requires_replacement,
 )
+from eyvan.domain.models import PriorityBand
 from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
@@ -259,6 +260,196 @@ def test_quota_group_pool_missing_units_fails_with_value_error_during_reclaim() 
 
     with pytest.raises(ValueError, match="quota group pools must configure quota_units_per_cell"):
         planner.plan(demand)
+
+
+# --------------------------------------------------------------- defragmentation
+#
+# The fleet shape these describe: a quota group whose units are all spent on one
+# pool's *idle* small cells, and a peer that cannot launch a larger shape because
+# of it. Nothing the blocked pool owns can be given up -- it owns nothing -- so
+# before this it waited for as long as the idle cells lived, with the
+# accelerators it needed sitting in slices too small to use.
+
+
+def _idle_cell(pool: CapacityPoolRecord, index: int, *, worker_count: int = 1) -> CellRecord:
+    from eyvan.capacity.planning import pool_cell_id
+
+    return CellRecord(
+        id=pool_cell_id(pool, index),
+        provider="gcp",
+        provider_project="project-a",
+        region="us-east5",
+        zone="us-east5-a",
+        state=CellState.READY,
+        capacity=pool.capacity,
+        allocatable=pool.allocatable,
+        pool_id=pool.id,
+        worker_count=worker_count,
+    )
+
+
+def _defrag_group() -> tuple[CapacityPoolRecord, CapacityPoolRecord]:
+    group = "gcp-project-a-us-east5-a-v5p"
+    small = shared_quota_pool(multislice_tpu_pool("research/v5p-small"), group=group, limit=4, units_per_cell=1)
+    large = shared_quota_pool(multislice_tpu_pool("research/v5p-large"), group=group, limit=4, units_per_cell=1)
+    return small, large
+
+
+def _blocked_demand(*, worker_count: int, waited_seconds: float) -> PoolDemand:
+    return PoolDemand(
+        real_cell_ids=frozenset(),
+        virtual_worker_counts=(worker_count,),
+        virtual_workload_ids=("workload-large",),
+        virtual_priorities=(PriorityBand.PRODUCTION,),
+        virtual_pending_seconds=(waited_seconds,),
+    )
+
+
+def test_idle_cells_are_reclaimed_so_a_peer_pool_can_launch_a_larger_shape() -> None:
+    """The case that leaves a fleet stuck, and the reason this exists.
+
+    Four idle single-worker cells hold the whole group quota. A four-worker
+    shape is pending in a peer pool and fits nowhere: the blocked pool owns no
+    cells to reclaim, and the small pool has no reason of its own to scale down.
+    """
+
+    small, large = _defrag_group()
+    idle = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    demand = {
+        small.id: demand_for(small, (), ()),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=600),
+    }
+
+    plans = CapacityPlanner((small, large), {small.id: idle, large.id: []}, utcnow()).plan(demand)
+
+    assert plans[small.id].forced_drain_cell_ids == frozenset(cell.id for cell in idle)
+    # The drain lands in the *owning* pool's plan, so the executor that already
+    # drains cells needs no knowledge that another pool asked for it.
+    assert plans[large.id].forced_drain_cell_ids == frozenset()
+
+
+def test_a_busy_peer_keeps_its_cells() -> None:
+    """Defragmentation reclaims idle capacity, never running work.
+
+    A cell serving demand is protected from draining, so counting its units here
+    would report a shortage as covered while nothing was actually freed. Taking
+    only idle cells keeps the promise and the drain consistent -- and means this
+    can never stop a running job.
+    """
+
+    small, large = _defrag_group()
+    busy = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    demand = {
+        small.id: PoolDemand(
+            real_cell_ids=frozenset(cell.id for cell in busy),
+            virtual_worker_counts=(),
+            virtual_workload_ids=(),
+        ),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=600),
+    }
+
+    plans = CapacityPlanner((small, large), {small.id: busy, large.id: []}, utcnow()).plan(demand)
+
+    assert plans[small.id].forced_drain_cell_ids == frozenset()
+
+
+def test_a_demand_that_has_barely_waited_does_not_reclaim_a_peer_s_capacity() -> None:
+    """Contention and fragmentation are indistinguishable in the first passes.
+
+    Both read as "the group's quota is spent and this shape does not fit". Only
+    time separates them, so reclaiming immediately would destroy warm capacity
+    to serve a demand that was about to be satisfied anyway, and pay a whole
+    provisioning cycle to do it.
+    """
+
+    small, large = _defrag_group()
+    idle = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    demand = {
+        small.id: demand_for(small, (), ()),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=5),
+    }
+
+    plans = CapacityPlanner((small, large), {small.id: idle, large.id: []}, utcnow()).plan(demand)
+
+    assert plans[small.id].forced_drain_cell_ids == frozenset()
+
+
+def test_a_partial_donation_is_not_taken() -> None:
+    """All or nothing: the idle half frees capacity and still does not fit.
+
+    Two of the four cells are busy and cannot be taken, so at most two units are
+    available against a shortage of four. Draining them would leave the
+    four-worker shape exactly as unplaceable as before, having destroyed warm
+    capacity to achieve it.
+    """
+
+    small, large = _defrag_group()
+    cells = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    busy_ids = frozenset(cell.id for cell in cells[:2])
+    demand = {
+        small.id: PoolDemand(
+            real_cell_ids=busy_ids,
+            virtual_worker_counts=(),
+            virtual_workload_ids=(),
+        ),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=600),
+    }
+
+    plans = CapacityPlanner((small, large), {small.id: cells, large.id: []}, utcnow()).plan(demand)
+
+    assert plans[small.id].forced_drain_cell_ids == frozenset()
+
+
+def test_a_pool_that_is_itself_blocked_is_not_asked_to_donate() -> None:
+    """Otherwise one stuck demand is traded for another.
+
+    Both pools want capacity the group cannot give. The small pool still
+    reclaims *for itself* -- that is the pre-existing same-pool behaviour, and it
+    gives up exactly the one cell its own pending shape needs. What must not
+    happen is the larger pool taking all four on top of that, which would leave
+    the small pool with nothing and its own demand no closer to placed.
+    """
+
+    small, large = _defrag_group()
+    idle = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    demand = {
+        small.id: PoolDemand(
+            real_cell_ids=frozenset(),
+            virtual_worker_counts=(1,),
+            virtual_workload_ids=("workload-small",),
+            virtual_priorities=(PriorityBand.PRODUCTION,),
+            virtual_pending_seconds=(600.0,),
+        ),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=600),
+    }
+
+    plans = CapacityPlanner((small, large), {small.id: idle, large.id: []}, utcnow()).plan(demand)
+
+    assert len(plans[small.id].forced_drain_cell_ids) == 1
+
+
+def test_reclaiming_does_not_repeat_while_the_capacity_is_already_coming_back() -> None:
+    """Planning must converge rather than alternate.
+
+    A donation that reappeared every pass would drain the peer, watch it refill,
+    and drain it again -- paying a provisioning cycle each time and never
+    placing the shape it was for.
+    """
+
+    small, large = _defrag_group()
+    idle = [_idle_cell(small, index) for index in (1, 2, 3, 4)]
+    demand = {
+        small.id: demand_for(small, (), ()),
+        large.id: _blocked_demand(worker_count=4, waited_seconds=600),
+    }
+    now = utcnow()
+
+    first = CapacityPlanner((small, large), {small.id: idle, large.id: []}, now).plan(demand)
+    draining = [cell.model_copy(update={"state": CellState.DRAINING}) for cell in idle]
+    second = CapacityPlanner((small, large), {small.id: draining, large.id: []}, now).plan(demand)
+
+    assert first[small.id].forced_drain_cell_ids == frozenset(cell.id for cell in idle)
+    assert second[small.id].forced_drain_cell_ids == frozenset()
 
 
 @pytest.mark.asyncio
