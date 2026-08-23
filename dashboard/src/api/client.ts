@@ -900,7 +900,20 @@ export class EyvanApiClient {
       resource: describeResources(lease.resources.per_replica, lease.resources.replicas),
       state: leaseAllocationState(lease.state),
     }));
-    detail.timeline = events.map((event): TimelineEvent => ({ id: event.id, timestamp: event.timestamp, title: event.action, detail: `${event.previous_state ?? "new"} -> ${event.new_state ?? "recorded"}`, severity: event.action.includes("failed") ? "critical" : "info", actor: event.actor }));
+    detail.timeline = events.map((event): TimelineEvent => {
+      const payload = (event as { payload?: Record<string, unknown> }).payload ?? {};
+      const elapsed = payload["dispatch_elapsed_s"];
+      const stage =
+        typeof elapsed === "number" ? `dispatch took ${elapsed < 1 ? "<1" : Math.round(elapsed)}s` : "";
+      return {
+        id: event.id,
+        timestamp: event.timestamp,
+        title: event.action,
+        detail: `${event.previous_state ?? "new"} -> ${event.new_state ?? "recorded"}${stage ? ` (${stage})` : ""}`,
+        severity: event.action.includes("failed") ? "critical" : "info",
+        actor: event.actor,
+      };
+    });
     detail.logs = logs.split("\n").filter(Boolean).map((line, index): LogEntry => ({ id: `${id}-log-${index}`, ...parseLogLine(line) }));
     if (progress) {
       detail.progress = mapProgressPercent(progress);

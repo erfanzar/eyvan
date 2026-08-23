@@ -63,6 +63,7 @@ _PHRASES: dict[str, str] = {
 #: that answer "why" rather than restating the event.
 _DETAIL_KEYS: tuple[str, ...] = (
     "reason",
+    "dispatch_elapsed_s",
     "failure_reason",
     "scheduling_reason",
     "diagnostic",

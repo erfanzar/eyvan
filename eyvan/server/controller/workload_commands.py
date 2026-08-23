@@ -1274,7 +1274,13 @@ class _ControllerWorkloadCommands:
                     action="workload.dispatched",
                     previous_state=workload.state.value,
                     new_state=dispatched.state.value,
-                    payload={"remote_id": remote_id, "lease_ids": list(reservation.lease_ids)},
+                    payload={
+                        "remote_id": remote_id,
+                        "lease_ids": list(reservation.lease_ids),
+                        # The stage duration the operator asks about when a run
+                        # feels slow: command created (reserve) to agent ack.
+                        "dispatch_elapsed_s": round((now - command.created_at).total_seconds(), 3),
+                    },
                 )
             )
 
