@@ -105,8 +105,9 @@ def test_worker_extracts_the_bundle_before_loading_the_callable(tmp_path: Path, 
     )
 
     assert exit_code == 0
-    assert (destination / "shipped_pkg" / "__init__.py").exists()
-    assert Path.cwd() == destination.resolve()
+    extracted = next(destination.iterdir())  # extraction lands under the bundle's digest directory
+    assert (extracted / "shipped_pkg" / "__init__.py").exists()
+    assert Path.cwd() == extracted.resolve()
     # 41 from the shipped module + len("from the workspace") == 18
     assert transfer.written["mem://result"]
 
@@ -396,7 +397,8 @@ def test_a_correctly_signed_workspace_runs(tmp_path: Path, restore_process_state
     )
 
     assert exit_code == 0
-    assert (destination / "shipped_pkg" / "__init__.py").exists()
+    extracted = next(destination.iterdir())  # extraction lands under the bundle's digest directory
+    assert (extracted / "shipped_pkg" / "__init__.py").exists()
 
 
 def test_a_workspace_without_a_digest_is_refused(tmp_path: Path, restore_process_state) -> None:

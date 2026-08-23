@@ -413,7 +413,19 @@ def _materialize_workspace(
             # workspace is attached: cloudpickle resolves imports by reference,
             # so an unsigned bundle chooses what those references find.
             raise ValueError("workspace bundle signature mismatch")
-    destination = Path(environment.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / ".eyvan-workspace"))
+    base = Path(environment.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / ".eyvan-workspace"))
+    # One directory per bundle digest: a digest's contents are immutable, so a
+    # resubmission reuses its extraction and a changed bundle never meets the
+    # old one. Iteration -- run, see the error, fix, rerun -- must not require
+    # cleaning cells between attempts.
+    destination = base / sha256[:12]
+    _ensure_private_dir(base)
+    try:
+        for stale in sorted(base.iterdir())[:-4]:
+            if stale.is_dir() and stale.name not in (sha256[:12],):
+                _remove_tree(stale)
+    except OSError:
+        pass
     _workspace_extractor()(payload, destination)
     # Enter the workspace so relative paths behave as they did for the caller,
     # and make its modules importable by the unpickling that follows.
@@ -446,6 +458,14 @@ def _cache_root(environment: tp.Mapping[str, str]) -> Path | None:
         return root
     except OSError:
         return None
+
+
+def _remove_tree(root: Path) -> None:
+    """Best-effort recursive remove for stale workspace extractions."""
+
+    import shutil
+
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _ensure_private_dir(root: Path) -> None:
