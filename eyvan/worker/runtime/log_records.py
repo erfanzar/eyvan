@@ -1202,6 +1202,9 @@ _WORKER_LAUNCH_CHATTER = re.compile(r"^(?:Starting |Started |Stopped ).*eyvan\.w
 #: The failure marker is deliberately absent here: a gang that never formed is
 #: exactly what someone reading logs needs to see.
 _GANG_JOINED_MARKER = "eyvan-gang-init-joined"
+#: systemd answers post-teardown bookkeeping queries with this error once the
+#: transient unit file is gone. It names no state a reader can act on.
+_UNIT_FILE_GONE_CHATTER = ".service: Failed to open /run/systemd/transient/"
 
 
 def routine_unit_chatter(message: str) -> bool:
@@ -1211,6 +1214,7 @@ def routine_unit_chatter(message: str) -> bool:
         bool(_UNIT_CHATTER.search(message))
         or bool(_WORKER_LAUNCH_CHATTER.match(message))
         or message.startswith(_GANG_JOINED_MARKER)
+        or _UNIT_FILE_GONE_CHATTER in message
     )
 
 
