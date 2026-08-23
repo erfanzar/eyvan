@@ -4627,3 +4627,111 @@ async def test_a_slow_command_does_not_block_delivery_for_unrelated_cells() -> N
     finally:
         blocking.allow_apply.set()
         await delivery
+
+
+async def test_dispatch_refuses_a_cell_running_a_different_build(monkeypatch) -> None:
+    """A cell outliving its head must not receive work it will execute wrongly."""
+
+    from types import SimpleNamespace
+
+    import eyvan._internal.build_identity as build_identity_module
+
+    monkeypatch.setattr(
+        build_identity_module,
+        "build_identity",
+        lambda: SimpleNamespace(source_digest="a" * 64),
+    )
+
+    from eyvan.worker.agent.client import AgentBuild
+
+    class SkewedAgent(FakeAgent):
+        def build(self):
+            return AgentBuild(
+                version="0.0.1",
+                origin="wheel",
+                origin_detail="",
+                source_digest="b" * 64,
+                digest_detail="",
+                file_count=1,
+                python="3.13",
+                platform="linux",
+            )
+
+        def worker_builds(self, cell_id):
+            return [{"source_digest": "c" * 64}]
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    fake_agent = SkewedAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: fake_agent,
+    )
+    cell = CellRecord(
+        id="cell-skewed",
+        provider="local",
+        region="local",
+        state=CellState.READY,
+        capacity=ResourceVector(tpu=8),
+        allocatable=ResourceVector(tpu=8),
+    )
+
+    from eyvan.server.controller.workload_commands import PermanentDispatchRefusal
+
+    with pytest.raises(PermanentDispatchRefusal) as refused:
+        await controller._refuse_stale_cell_builds((cell,))
+    message = str(refused.value)
+    assert "bbbbbbbbbbbb" in message and "cccccccccccc" in message and "aaaaaaaaaaaa" in message
+    assert fake_agent.submissions == []
+
+
+async def test_a_matching_cell_build_dispatches(monkeypatch) -> None:
+    """The guard reads builds but never refuses an honest fleet."""
+
+    from types import SimpleNamespace
+
+    import eyvan._internal.build_identity as build_identity_module
+
+    monkeypatch.setattr(
+        build_identity_module,
+        "build_identity",
+        lambda: SimpleNamespace(source_digest="a" * 64),
+    )
+
+    from eyvan.worker.agent.client import AgentBuild
+
+    class HonestAgent(FakeAgent):
+        def build(self):
+            return AgentBuild(
+                version="0.0.1",
+                origin="wheel",
+                origin_detail="",
+                source_digest="a" * 64,
+                digest_detail="",
+                file_count=1,
+                python="3.13",
+                platform="linux",
+            )
+
+        def worker_builds(self, cell_id):
+            return [{"source_digest": "a" * 64}]
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda _cell: HonestAgent(),
+    )
+    cell = CellRecord(
+        id="cell-honest",
+        provider="local",
+        region="local",
+        state=CellState.READY,
+        capacity=ResourceVector(tpu=8),
+        allocatable=ResourceVector(tpu=8),
+    )
+    await controller._refuse_stale_cell_builds((cell,))

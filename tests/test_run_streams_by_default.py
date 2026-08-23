@@ -166,8 +166,9 @@ def test_a_multi_rank_job_attributes_every_line_to_its_rank() -> None:
 
     _follower(plane, written).follow("wl-1")
 
-    assert "[0] rank zero" in written
-    assert "[1] rank one" in written
+    # Ray-style attribution: a rank with no provenance reads "(rank N)".
+    assert "(rank 0) rank zero" in written
+    assert "(rank 1) rank one" in written
 
 
 def test_a_single_rank_job_is_not_cluttered_with_prefixes() -> None:

@@ -1311,6 +1311,54 @@ class _ControllerWorkloadCommands:
             failure_reason=str(refusal),
         )
 
+    async def _refuse_stale_cell_builds(self, cells: tp.Sequence[CellRecord]) -> None:
+        """Refuse dispatch onto any cell running a different build than this plane.
+
+        A cell outlives the head that staged its wheel, and a workload handed to
+        stale worker code fails in ways that look like the job's fault -- wrong
+        extraction rules, absent log fields, old protocol shapes. Asking each
+        agent (and its workers) what they run costs two reads per cell and
+        converts that silence into a refusal naming both digests.
+        """
+
+        from eyvan._internal.build_identity import build_identity
+
+        head = build_identity()
+        if not head.source_digest:
+            return  # a source tree with no identity cannot judge anyone
+        for cell in cells:
+            bound_agent = self._agent_factory(cell)
+            bound_cell_id = cell.id
+
+            def _read(
+                bound_agent: tp.Any = bound_agent,
+                bound_cell_id: str = bound_cell_id,
+            ) -> tuple[str | None, list[dict[str, object]] | None]:
+                try:
+                    build = bound_agent.build()
+                except AttributeError:
+                    return None, None  # an agent with no build surface cannot be judged
+                workers: list[dict[str, object]] | None
+                try:
+                    workers = bound_agent.worker_builds(bound_cell_id)
+                except AttributeError:
+                    workers = None
+                return (build.source_digest if build is not None else None), workers
+
+            reported, workers = await asyncio.to_thread(_read)
+            stale: list[str] = []
+            if reported is not None and reported != head.source_digest:
+                stale.append(f"agent {reported[:12]}")
+            for worker in workers or ():
+                digest = worker.get("source_digest") if isinstance(worker, dict) else None
+                if isinstance(digest, str) and digest != head.source_digest:
+                    stale.append(f"worker {digest[:12]}")
+            if stale:
+                raise PermanentDispatchRefusal(
+                    f"cell {cell.id!r} runs {' and '.join(stale)} but this plane stages "
+                    f"{head.source_digest[:12]}; redeploy or recycle the cell before dispatching"
+                )
+
     async def _dispatch_workload(self, command: OutboxRecord) -> None:
         lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
         if len(lease_ids) > 1:
@@ -1326,6 +1374,7 @@ class _ControllerWorkloadCommands:
         if prepared is None:
             return
         _workload, _lease, cell, request, reservation = prepared
+        await self._refuse_stale_cell_builds((cell,))
         try:
             remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
         except Exception:
@@ -1344,7 +1393,8 @@ class _ControllerWorkloadCommands:
             return
         if prepared is None:
             return
-        _workload, _members, _cells, coordinator_lease, coordinator_cell, request, reservation = prepared
+        _workload, _members, cells, coordinator_lease, coordinator_cell, request, reservation = prepared
+        await self._refuse_stale_cell_builds(cells)
         try:
             remote = await asyncio.to_thread(
                 self._agent_factory(coordinator_cell).submit_gang,
