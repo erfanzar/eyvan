@@ -586,8 +586,9 @@ def test_a_rerun_of_the_same_bundle_reuses_its_extraction(tmp_path, monkeypatch)
     """Iteration -- run, see the error, fix nothing, rerun -- must not need cell surgery."""
 
     import os
-    from eyvan.worker.runtime.callable_protocol import _materialize_workspace
+
     from eyvan._internal.workspace import build_workspace
+    from eyvan.worker.runtime.callable_protocol import _materialize_workspace
 
     root = tmp_path / "ws"
     root.mkdir()
