@@ -82,6 +82,7 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "GET /api/v1/artifacts/inventory": "inventory another org's physical namespace",
     "POST /api/v1/artifacts/inventory/reindex": "reindex metadata into another org",
     "GET /api/v1/artifacts/collectable": "read another org's collection candidates",
+    "POST /api/v1/artifacts/collect": "collect (and with apply, delete) another org's artifacts",
     "GET /api/v1/artifacts/references": "read another org's artifact references",
     "POST /api/v1/artifacts/holds": "hold another org's artifact",
     "DELETE /api/v1/artifacts/holds": "release another org's artifact hold",
