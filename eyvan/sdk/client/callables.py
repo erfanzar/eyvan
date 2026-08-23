@@ -167,10 +167,11 @@ class _CallableProgressRenderer:
                 # at a fresh cursor and the retired attempt's pages are gone.
                 self._log_cursor = ""
                 continue
-            multi = (window.expected_ranks or 1) > 1
-            for rank, message, _timestamp in window.lines:
-                text = message.rstrip("\n")
-                self._output.output_line(f"r{rank} | {text}" if multi else text)
+            for _rank, message, _timestamp in window.lines:
+                # Ray-style: a blocking wait streams the job's output raw, no
+                # per-line decoration. Attribution stays available where it is
+                # asked for -- ``eyvan workload logs --follow`` keeps rank tags.
+                self._output.output_line(message.rstrip("\n"))
             if not window.cursor or not window.lines:
                 self._log_cursor = window.cursor or self._log_cursor
                 return
