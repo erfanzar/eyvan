@@ -85,6 +85,8 @@ interface RawWorkload {
     metadata: Record<string, string>;
     accelerator_type?: string;
     priority_band: PriorityBand;
+  /** Slices allocated together (pods=N). Absent on planes predating multislice. */
+  cell_group_count?: number;
   };
 }
 
@@ -141,7 +143,7 @@ interface RawLease {
   project_id: string;
   cell_id: string;
   state: string;
-  resources: { replicas: number; per_replica: RawResources };
+  resources: { replicas: number; slices?: number; per_replica: RawResources };
   hourly_cost: number;
   expires_at: string;
 }
@@ -275,6 +277,7 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
       accelerator,
       acceleratorCount: resources.tpu || undefined,
       replicas: raw.spec.gang.replicas,
+      slices: typeof raw.spec.cell_group_count === "number" ? raw.spec.cell_group_count : undefined,
       topology: Object.values(raw.spec.gang.required_topology).join(", ") || undefined,
     },
     submittedAt: raw.created_at,

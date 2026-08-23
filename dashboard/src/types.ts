@@ -51,6 +51,7 @@ export interface ResourceRequest {
   accelerator?: string;
   acceleratorCount?: number;
   replicas: number;
+  slices?: number;
   topology?: string;
 }
 

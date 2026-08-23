@@ -379,9 +379,9 @@ export function WorkloadDetailPage({
           <section className="panel detail-section">
             <div className="panel-header"><div><h2>Admission envelope</h2><p>What this shape occupies on a cell — derived from the accelerator type, not requested verbatim</p></div><Server size={18} /></div>
             <dl className="definition-grid">
-              <div><dt>Request</dt><dd>{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)} × {workload.resources.replicas} {workload.resources.replicas === 1 ? "replica" : "replicas"}</dd></div>
-              <div><dt>Envelope CPU</dt><dd>{workload.resources.cpu} cores</dd></div>
-              <div><dt>Envelope memory</dt><dd>{workload.resources.memoryGb} GB</dd></div>
+              <div><dt>Request</dt><dd>{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices} slices` : ""}</dd></div>
+              <div><dt>Envelope CPU</dt><dd>{workload.resources.cpu} cores{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              <div><dt>Envelope memory</dt><dd>{workload.resources.memoryGb} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
               <div><dt>Topology</dt><dd>{workload.resources.topology ?? "No strict constraint"}</dd></div>
               <div><dt>Capacity lease</dt><dd className="monospace">{workload.leaseId ?? "None held"}</dd></div>
             </dl>
