@@ -1196,10 +1196,22 @@ _UNIT_CHATTER = re.compile(r"\.service: (?:" + "|".join(re.escape(line.strip()) 
 _WORKER_LAUNCH_CHATTER = re.compile(r"^(?:Starting |Started |Stopped ).*eyvan\.worker\.runtime\.callable_worker")
 
 
-def routine_unit_chatter(message: str) -> bool:
-    """True when one already-archived log line is unit-supervisor noise."""
+#: The multi-host join writes a machine-readable heartbeat to each rank's
+#: stderr once the gang forms -- useful to scrapers, noise in a human
+#: transcript, and it carries no facts a reader could act on ("rank=unknown").
+#: The failure marker is deliberately absent here: a gang that never formed is
+#: exactly what someone reading logs needs to see.
+_GANG_JOINED_MARKER = "eyvan-gang-init-joined"
 
-    return bool(_UNIT_CHATTER.search(message)) or bool(_WORKER_LAUNCH_CHATTER.match(message))
+
+def routine_unit_chatter(message: str) -> bool:
+    """True when one already-archived log line is transport noise, not output."""
+
+    return (
+        bool(_UNIT_CHATTER.search(message))
+        or bool(_WORKER_LAUNCH_CHATTER.match(message))
+        or message.startswith(_GANG_JOINED_MARKER)
+    )
 
 
 def _is_routine_unit_chatter(entry: dict[str, tp.Any]) -> bool:

@@ -572,7 +572,7 @@ def test_a_preemption_retry_serves_the_callable_from_the_cell_cache(
     # Corrupt cache bytes are refused by the existing integrity path, not
     # silently served.
     cached.write_bytes(b"tampered")
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017 -- the integrity path raises several concrete types
         execute_callable(
             [*common],
             transfer=_MemoryTransfer({}),

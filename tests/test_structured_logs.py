@@ -2525,6 +2525,11 @@ def test_archived_unit_chatter_is_dropped_at_read_time_and_job_output_kept() -> 
                 {"message": "eyvan-wl_x-a1.service: Consumed 1min 12.996s CPU time.", "rank": 0},
                 {"message": "[TpuDevice(id=0), TpuDevice(id=1)]", "rank": 0},
                 {"message": "Starting the second epoch", "rank": 0},
+                {
+                    "message": "eyvan-gang-init-joined rank=unknown processes=unknown waited_s=1.8 deadline_s=600",
+                    "rank": 2,
+                },
+                {"message": "eyvan-gang-init-failed waited_s=600 deadline_s=600", "rank": 3},
             ],
             "next_cursor": "c9",
         }
@@ -2533,5 +2538,7 @@ def test_archived_unit_chatter_is_dropped_at_read_time_and_job_output_kept() -> 
     assert [line for _r, line, _t in window.lines] == [
         "[TpuDevice(id=0), TpuDevice(id=1)]",
         "Starting the second epoch",
+        # A gang that never formed is signal, not chatter.
+        "eyvan-gang-init-failed waited_s=600 deadline_s=600",
     ]
     assert window.cursor == "c9"
