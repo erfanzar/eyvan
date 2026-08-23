@@ -38,7 +38,7 @@ from eyvan.sdk.execution import (
     execute,
     init,
 )
-from eyvan.sdk.job_receipt import JobTerminalOutput
+from eyvan.sdk.job_receipt import JobLifecycleState, JobLifecycleUpdate, JobTerminalOutput
 from eyvan.worker.runtime.callables import CallableArtifact, dump_callable, load_callable
 
 T = tp.TypeVar("T")
@@ -598,3 +598,20 @@ def test_a_blocking_wait_tails_its_job_output_like_ray() -> None:
     assert served == ["", "c1", "c2"]
     assert any(line.startswith("Eyvan") for line in lines)
     assert lines.index("  job completed") > lines.index("second line")
+
+
+def test_a_worker_count_change_never_reprints_the_state_heading() -> None:
+    """A cell draining before SUCCEEDED is progress, not a new status block."""
+
+    rendered: list[tuple[str, ...]] = []
+    output = JobTerminalOutput(writer=lambda line: None)
+    output.lifecycle = lambda update: rendered.append(update.plain_lines)  # type: ignore[method-assign]
+    output.lifecycle_detail = lambda update: rendered.append(update.detail_lines)  # type: ignore[method-assign]
+    renderer = _CallableProgressRenderer(client=None, output=output, queue_admission_recorder=None)  # type: ignore[arg-type]
+
+    renderer._emit(JobLifecycleUpdate(JobLifecycleState.RUNNING, "v6e-8 x 1 worker", "1/1 workers ready"))
+    renderer._emit(JobLifecycleUpdate(JobLifecycleState.RUNNING, "v6e-8 x 1 worker", "0/1 workers ready"))
+
+    headings = [lines for lines in rendered if lines and lines[0].startswith("Eyvan")]
+    assert len(headings) == 1
+    assert rendered[-1] == ("  0/1 workers ready",)

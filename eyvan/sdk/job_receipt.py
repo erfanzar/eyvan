@@ -122,6 +122,17 @@ class JobLifecycleUpdate:
     diagnostic: str | None = None
 
     @property
+    def detail_lines(self) -> tuple[str, ...]:
+        """Return just the indented progress lines under a state heading."""
+
+        lines = []
+        if self.summary:
+            lines.append(f"  {self.summary}")
+        if self.diagnostic:
+            lines.append(f"  {self.diagnostic}")
+        return tuple(lines)
+
+    @property
     def plain_lines(self) -> tuple[str, ...]:
         """Return a compact ANSI-free lifecycle update."""
 
@@ -271,6 +282,35 @@ class JobTerminalOutput:
             heading.append("  ")
             heading.append(update.scope, style="dim")
         console.print(heading)
+        if update.summary:
+            console.print(Text(f"  {update.summary}", style="white"))
+        if update.diagnostic:
+            style = "bold red" if update.state in {JobLifecycleState.BLOCKED, JobLifecycleState.FAILED} else "yellow"
+            console.print(Text(f"  {update.diagnostic}", style=style))
+
+    def lifecycle_detail(self, update: JobLifecycleUpdate) -> None:
+        """Render only the progress line when the state heading is unchanged.
+
+        A worker count that moves while the state does not -- a cell draining
+        in the moments before SUCCEEDED -- is new information, but reprinting
+        the whole status block for it reads as the state changing twice.
+        """
+
+        if not update.detail_lines:
+            return
+        writer = self._writer
+        if writer is not None:
+            self._write_plain(writer, update.detail_lines)
+            return
+        console = self._console
+        assert console is not None
+        if not console.is_terminal:
+            self._write_plain(console.print, update.detail_lines)
+            return
+        if str(update.state) in _WAITING_STATES:
+            self._render_waiting(update)
+            return
+        self.settle()
         if update.summary:
             console.print(Text(f"  {update.summary}", style="white"))
         if update.diagnostic:

@@ -131,7 +131,17 @@ class _CallableProgressRenderer:
             update = replace(update, diagnostic=None)
         if update == self._last_update:
             return
-        self._output.lifecycle(update)
+        previous = self._last_update
+        if (
+            previous is not None
+            and update.state == previous.state
+            and update.state
+            not in {JobLifecycleState.SUCCEEDED, JobLifecycleState.FAILED, JobLifecycleState.CANCELLED}
+        ):
+            # Same state, new progress: draw only the line under the heading.
+            self._output.lifecycle_detail(update)
+        else:
+            self._output.lifecycle(update)
         self._last_update = update
         if update.diagnostic is not None:
             self._last_diagnostic = update.diagnostic

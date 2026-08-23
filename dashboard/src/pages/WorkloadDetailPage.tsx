@@ -377,20 +377,13 @@ export function WorkloadDetailPage({
       {tab === "overview" && (
         <div className="detail-overview-grid">
           <section className="panel detail-section">
-            <div className="panel-header"><div><h2>Resource request</h2><p>Gang and topology requirements</p></div><Server size={18} /></div>
+            <div className="panel-header"><div><h2>Admission envelope</h2><p>What this shape occupies on a cell — derived from the accelerator type, not requested verbatim</p></div><Server size={18} /></div>
             <dl className="definition-grid">
-              <div><dt>Replicas</dt><dd>{workload.resources.replicas}</dd></div>
-              <div><dt>CPU</dt><dd>{workload.resources.cpu} cores</dd></div>
-              <div><dt>Memory</dt><dd>{workload.resources.memoryGb} GB</dd></div>
-              <div><dt>Accelerators</dt><dd>
-                {formatAcceleratorRequest(
-                  workload.resources.accelerator,
-                  workload.resources.acceleratorCount,
-                  workload.resources.replicas,
-                )}
-              </dd></div>
+              <div><dt>Request</dt><dd>{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)} × {workload.resources.replicas} {workload.resources.replicas === 1 ? "replica" : "replicas"}</dd></div>
+              <div><dt>Envelope CPU</dt><dd>{workload.resources.cpu} cores</dd></div>
+              <div><dt>Envelope memory</dt><dd>{workload.resources.memoryGb} GB</dd></div>
               <div><dt>Topology</dt><dd>{workload.resources.topology ?? "No strict constraint"}</dd></div>
-              <div><dt>Lease</dt><dd className="monospace">{workload.leaseId ?? "Not active"}</dd></div>
+              <div><dt>Capacity lease</dt><dd className="monospace">{workload.leaseId ?? "None held"}</dd></div>
             </dl>
           </section>
 
