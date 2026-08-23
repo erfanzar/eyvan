@@ -93,6 +93,9 @@ class LogRecord:
     cursor: str = ""
     rank: int = 0
     pid: int | None = None
+    #: journald's ``_HOSTNAME``: which machine produced the line. None for
+    #: backends that do not report one.
+    host: str | None = None
 
     def as_json(self) -> dict[str, object]:
         """Return the stable wire shape."""
@@ -104,6 +107,7 @@ class LogRecord:
             "cursor": self.cursor,
             "rank": self.rank,
             "pid": self.pid,
+            "host": self.host,
         }
 
 
@@ -1130,6 +1134,7 @@ def log_page_from_json(payload: object) -> LogPage:
                 cursor=str(item.get("cursor", "")),
                 rank=rank if _is_rank(rank) else INVALID_LOG_RANK,
                 pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+                host=item.get("host") if isinstance(item.get("host"), str) else None,
             )
         )
     truncated = payload.get("truncated_ranks")
@@ -1266,6 +1271,7 @@ def parse_journal_json(payload: str, *, rank: int = 0) -> LogPage:
                 cursor=str(entry.get("__CURSOR", "")),
                 rank=rank,
                 pid=_optional_int(entry.get("_PID")),
+                host=entry.get("_HOSTNAME") if isinstance(entry.get("_HOSTNAME"), str) else None,
             )
         )
     return LogPage(records=tuple(records), next_cursor=cursor)

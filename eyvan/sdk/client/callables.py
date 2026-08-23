@@ -167,11 +167,17 @@ class _CallableProgressRenderer:
                 # at a fresh cursor and the retired attempt's pages are gone.
                 self._log_cursor = ""
                 continue
-            for _rank, message, _timestamp in window.lines:
-                # Ray-style: a blocking wait streams the job's output raw, no
-                # per-line decoration. Attribution stays available where it is
-                # asked for -- ``eyvan workload logs --follow`` keeps rank tags.
-                self._output.output_line(message.rstrip("\n"))
+            for index, (_rank, message, _timestamp) in enumerate(window.lines):
+                # Ray-style: a blocking wait decorates each line with the
+                # worker that produced it -- pid and host when the archive
+                # reports them, nothing invented when it does not.
+                provenance = window.provenance[index]
+                prefix = (
+                    f"(Worker pid={provenance[0]}, {provenance[1]}) "
+                    if provenance[0] is not None and provenance[1]
+                    else f"(Worker pid={provenance[0]}) " if provenance[0] is not None else ""
+                )
+                self._output.output_line(f"{prefix}{message.rstrip(chr(10))}")
             if not window.cursor or not window.lines:
                 self._log_cursor = window.cursor or self._log_cursor
                 return

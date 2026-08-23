@@ -51,6 +51,9 @@ class _LogWindow:
     """One page of output as the follower needs it."""
 
     lines: tuple[tuple[int, str, datetime | None], ...] = ()
+    #: Parallel to ``lines``: ``(pid, host)`` provenance when the archive
+    #: reports it, else ``(None, None)``. Ray-style prefixes are built from it.
+    provenance: tuple[tuple[int | None, str | None], ...] = ()
     cursor: str = ""
     attempt_changed: bool = False
     expected_ranks: int | None = None
@@ -65,12 +68,21 @@ class _LogWindow:
             return cls()
         raw = payload.get("records")
         lines: list[tuple[int, str, datetime | None]] = []
+        provenance: list[tuple[int | None, str | None]] = []
         for record in raw if isinstance(raw, list) else []:
             if not is_json_object(record):
                 continue
             message = record.get("message")
             if not isinstance(message, str) or routine_unit_chatter(message):
                 continue
+            pid = record.get("pid")
+            host = record.get("host")
+            provenance.append(
+                (
+                    pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+                    host if isinstance(host, str) else None,
+                )
+            )
             rank = record.get("rank")
             lines.append(
                 (
@@ -84,6 +96,7 @@ class _LogWindow:
         detail = payload.get("detail")
         return cls(
             lines=tuple(lines),
+            provenance=tuple(provenance),
             cursor=cursor if isinstance(cursor, str) else "",
             attempt_changed=bool(payload.get("attempt_changed")),
             expected_ranks=expected if isinstance(expected, int) and not isinstance(expected, bool) else None,
@@ -145,6 +158,25 @@ class _Transport(tp.Protocol):
         """Send a JSON request and return its decoded response."""
 
         ...
+
+
+def _ray_style_prefix(rank: int, provenance: tuple[int | None, str | None]) -> str:
+    """Ray's worker-log prefix: ``(Worker pid=4102, ip=10.130.0.138) ``.
+
+    Whatever the archive reports goes in; what it does not is left out rather
+    than invented -- a rank with no pid reads ``(rank 2)``, bare if neither.
+    """
+
+    pid, host = provenance
+    parts: list[str] = []
+    if pid is not None:
+        parts.append(f"pid={pid}")
+    if host is not None:
+        parts.append(host)
+    if not parts:
+        return f"(rank {rank}) "
+    inner = ", ".join(parts)
+    return f"(Worker {inner}) "
 
 
 @dataclass(slots=True)
@@ -253,14 +285,15 @@ class WorkloadFollower:
             if not self._rank_prefixes and any(rank for rank, _message, _at in window.lines):
                 self._rank_prefixes = True
             cutoff = None if self.since is None else datetime.now(timezone.utc) - self.since
-            for rank, message, at in window.lines:
+            for index, (rank, message, at) in enumerate(window.lines):
                 if cutoff is not None and at is not None and at < cutoff:
                     continue
                 # The job has something to say, so the waiting line has done its
                 # job; settle it first or the log scrolls through the region the
                 # live display is still repainting.
                 self._settle_output()
-                self.write(f"[{rank}] {message}" if self._rank_prefixes else message)
+                prefix = _ray_style_prefix(rank, window.provenance[index]) if self._rank_prefixes else ""
+                self.write(f"{prefix}{message}" if prefix else message)
             if window.cursor:
                 self._cursor = window.cursor
             if not window.lines:

@@ -2542,3 +2542,26 @@ def test_archived_unit_chatter_is_dropped_at_read_time_and_job_output_kept() -> 
         "eyvan-gang-init-failed waited_s=600 deadline_s=600",
     ]
     assert window.cursor == "c9"
+
+
+def test_log_lines_carry_ray_style_worker_provenance() -> None:
+    """pid and host ride the record; the prefix is built, never invented."""
+
+    from eyvan.sdk.follow import _LogWindow
+
+    window = _LogWindow.parse(
+        {
+            "records": [
+                {"message": "8 local devices", "rank": 2, "pid": 4102, "host": "…-node-2"},
+                {"message": "no provenance reported", "rank": 1},
+                {"message": "eyvan-gang-init-failed waited_s=600 deadline_s=600", "rank": 3},
+            ],
+        }
+    )
+
+    assert window.provenance[0] == (4102, "…-node-2")
+    assert window.provenance[1] == (None, None)
+    from eyvan.sdk.follow import _ray_style_prefix
+
+    assert _ray_style_prefix(2, window.provenance[0]) == "(Worker pid=4102, …-node-2) "
+    assert _ray_style_prefix(1, window.provenance[1]) == "(rank 1) "
