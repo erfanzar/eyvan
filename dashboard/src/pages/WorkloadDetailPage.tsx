@@ -25,6 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
+import { StagePipeline } from "../components/StagePipeline";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
 import type { LogEntry, WorkloadDetail, WorkloadExplanation, WorkloadSpend } from "../types";
 
@@ -394,6 +395,11 @@ export function WorkloadDetailPage({
         ))}
       </div>
 
+      {tab === "overview" && (
+        <section className="panel pipeline-panel">
+          <StagePipeline status={workload.status} phase={workload.phase} timeline={workload.timeline} />
+        </section>
+      )}
       {tab === "overview" && (
         <div className="detail-overview-grid">
           <section className="panel detail-section">

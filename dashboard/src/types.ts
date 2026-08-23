@@ -72,6 +72,8 @@ export interface WorkloadSummary {
   budgetSpent?: number;
   budgetLimit?: number;
   queueReason?: string;
+  /** Capacity-acquisition phase from the control plane's progress contract. */
+  phase?: string;
   /**
    * Which attempt is running, and what the earlier ones were charged to.
    *

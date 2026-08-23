@@ -1804,3 +1804,49 @@ code,
   font-size: var(--text-sm, 0.85rem);
   color: var(--warning, #d97706);
 }
+
+/* --- dispatch pipeline strip --- */
+.stage-pipeline {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  flex-wrap: wrap;
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 0;
+}
+.stage-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 86px;
+  padding: 0 6px;
+  color: var(--text-secondary, #94a3b8);
+}
+.stage-node .stage-icon {
+  display: inline-flex;
+  z-index: 1;
+}
+.stage-node .stage-label {
+  font-size: 0.72rem;
+  text-align: center;
+  line-height: 1.2;
+}
+.stage-done { color: var(--success, #34d399); }
+.stage-active {
+  color: var(--accent, #22d3ee);
+}
+.stage-active .stage-label { font-weight: 600; }
+.spin { animation: stage-spin 1.2s linear infinite; }
+@keyframes stage-spin { to { transform: rotate(360deg); } }
+.timeline-gap {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary, #94a3b8);
+}

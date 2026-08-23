@@ -924,6 +924,7 @@ export class EyvanApiClient {
     if (progress) {
       detail.progress = mapProgressPercent(progress);
       detail.queueReason ??= progress.failure_reason ?? progress.scheduling_reason ?? undefined;
+      detail.phase = progress.phase;
     }
     return detail;
   }
