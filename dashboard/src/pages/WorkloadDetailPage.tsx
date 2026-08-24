@@ -172,6 +172,15 @@ function formatWaited(createdIso: string): string {
   return `${rest}s`;
 }
 
+
+/** On-package HBM per chip, by generation prefix (v6e Trillium = 32 GB). */
+function hbmGb(acceleratorType: string): number {
+  const perChip: Record<string, number> = { v4: 32, v5e: 16, v5p: 95, v5: 95, v6e: 32 };
+  const generation = /^v\d+[a-z]*/.exec(acceleratorType)?.[0] ?? "";
+  const chips = Number(/-(\d+)$/.exec(acceleratorType)?.[1] ?? 0);
+  return (perChip[generation] ?? 0) * chips;
+}
+
 export function WorkloadDetailPage({
   workload,
   onBack,
@@ -464,8 +473,13 @@ const filteredLogs = useMemo(() => {
             <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Admission envelope</h2><p>What this shape occupies on a cell</p></div></div>
             <dl className="definition-grid">
               <div><dt>Request</dt><dd className="monospace">{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices} replicas` : ""}</dd></div>
-              <div><dt>Envelope CPU</dt><dd>{workload.resources.cpu} cores{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
-              <div><dt>Envelope memory</dt><dd>{workload.resources.memoryGb} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              {/* These are the VM host's DIMMs, not the accelerators' HBM --
+                  conflating them sent an operator hunting for phantom memory. */}
+              <div><dt>Host vCPUs</dt><dd>{workload.resources.cpu}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              <div><dt>Host RAM</dt><dd>{workload.resources.memoryGb} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              {workload.resources.accelerator && (
+                <div><dt>Accelerator HBM</dt><dd>{hbmGb(workload.resources.accelerator)} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              )}
               <div><dt>Topology</dt><dd className="monospace">{workload.resources.topology ?? "No strict constraint"}</dd></div>
               <div><dt>Priority</dt><dd>{workload.priority}</dd></div>
               {/* Facts the header used to carry in a metric strip. They belong
