@@ -317,7 +317,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
             </p>
           </div>
           <button className="button button-ghost" type="button" disabled={refreshing} onClick={() => void refresh()}>
-            <RefreshCw className={refreshing ? "spin" : undefined} size={16} aria-hidden="true" />
+            <RefreshCw className={refreshing ? "spin" : undefined} size={14} aria-hidden="true" />
             {refreshing ? "Reading provider" : "Re-read provider"}
           </button>
         </div>
@@ -378,27 +378,23 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
               label="Zones with free capacity"
               value={measuredZones.size.toString()}
               detail="measured balance above zero"
-              icon={MapPin}
               tone={measuredZones.size ? "positive" : "warning"}
             />
             <MetricCard
               label="Free chips"
               value={freeChips.toString()}
               detail="quota units across measured rows only"
-              icon={Gauge}
             />
             <MetricCard
               label="Zones with unknown usage"
               value={unmeasuredZones.size.toString()}
               detail="not empty and not full -- nobody could tell"
-              icon={HelpCircle}
               tone={unmeasuredZones.size ? "warning" : "neutral"}
             />
             <MetricCard
               label="Rows read"
               value={entries.length.toString()}
               detail={`${snapshot.entries.filter((entry) => entry.capacity_class === "spot").length} on preemptible quota`}
-              icon={Search}
             />
           </section>
 
@@ -406,7 +402,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
             <div className="table-toolbar">
               <div className="filter-group">
                 <label className="search-field">
-                  <Search size={16} aria-hidden="true" />
+                  <Search size={14} aria-hidden="true" />
                   <span className="sr-only">Filter by zone or region</span>
                   <input
                     type="search"
@@ -465,7 +461,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                 </label>
                 {filtered && (
                   <button className="button button-ghost" type="button" onClick={clearFilters}>
-                    <FilterX size={16} aria-hidden="true" />
+                    <FilterX size={14} aria-hidden="true" />
                     Clear
                   </button>
                 )}
@@ -493,11 +489,11 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                       <th>Zone</th>
                       <th>Generation</th>
                       <th>Class</th>
-                      <th>Limit</th>
-                      <th>In use</th>
-                      <th>Free</th>
-                      <th>Fits</th>
-                      <th>Usage read</th>
+                      <th className="numeric">Limit</th>
+                      <th className="numeric">In use</th>
+                      <th className="numeric">Free</th>
+                      <th className="numeric">Fits</th>
+                      <th className="numeric">Usage read</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -523,16 +519,16 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         <td>
                           <StatusBadge value={entry.capacity_class} tone={entry.capacity_class} dot={false} />
                         </td>
-                        <td>{chips(entry.limit_chips)}</td>
-                        <td>{chips(entry.in_use_chips)}</td>
+                        <td className="numeric">{chips(entry.limit_chips)}</td>
+                        <td className="numeric">{chips(entry.in_use_chips)}</td>
                         <td>
                           <strong>{chips(entry.free_chips)}</strong>
                         </td>
-                        <td>{bestFit.free_slices === null ? UNKNOWN : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}</td>
+                        <td className="numeric">{bestFit.free_slices === null ? UNKNOWN : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}</td>
                         {/* The balance was measured at a point in time by a gauge
                             that lags by minutes. Presenting it without that is
                             how a stale number becomes a placement decision. */}
-                        <td>{formatAgeSeconds(entry.usage_age_s)}</td>
+                        <td className="numeric">{formatAgeSeconds(entry.usage_age_s)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -557,8 +553,8 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                       <th>Zone</th>
                       <th>Generation</th>
                       <th>Class</th>
-                      <th>Limit</th>
-                      <th>Free</th>
+                      <th className="numeric">Limit</th>
+                      <th className="numeric">Free</th>
                       <th>Why</th>
                     </tr>
                   </thead>
@@ -582,8 +578,8 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         <td>
                           <StatusBadge value={entry.capacity_class} tone={entry.capacity_class} dot={false} />
                         </td>
-                        <td>{chips(entry.limit_chips)}</td>
-                        <td>{UNKNOWN}</td>
+                        <td className="numeric">{chips(entry.limit_chips)}</td>
+                        <td className="numeric">{UNKNOWN}</td>
                         <td>{reasonForNoBalance(entry)}</td>
                       </tr>
                     ))}

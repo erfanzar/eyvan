@@ -30,6 +30,14 @@ describe("dashboard routing", () => {
   });
 });
 
+describe("every section the rail offers", () => {
+  it("parses back to itself, so pressing it and reloading land in the same place", () => {
+    for (const section of ["workloads", "fleet", "capacity", "billing", "budgets", "audit"] as const) {
+      expect(parseRoute(routeHash({ section }))).toEqual({ section });
+    }
+  });
+});
+
 describe("the quota section", () => {
   it("is a first-class route so a zone choice can be linked to", () => {
     expect(parseRoute("#/capacity")).toEqual({ section: "capacity" });

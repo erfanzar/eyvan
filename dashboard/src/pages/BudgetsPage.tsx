@@ -3,16 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {
-  AlertTriangle,
-  Banknote,
-  CircleDollarSign,
-  Edit3,
-  Gauge,
-  Scale,
-  Shield,
-  Users,
-} from "lucide-react";
+import { AlertTriangle, Edit3, Shield } from "lucide-react";
 import { useState } from "react";
 
 import { MetricCard } from "../components/MetricCard";
@@ -50,10 +41,10 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
   return (
     <div className="page-stack">
       <section className="metric-grid metric-grid-four" aria-label="Budget metrics">
-        <MetricCard label="Scoped spend" value={orgBudget ? formatMoney(orgBudget.spent, true) : "Not set"} detail={orgBudget ? `of ${formatMoney(orgBudget.limit, true)} for ${orgBudget.owner}` : "No budget returned for this scope"} icon={CircleDollarSign} tone="warning" />
-        <MetricCard label="Current forecast" value={orgBudget?.forecast !== undefined ? formatMoney(orgBudget.forecast, true) : "Unavailable"} detail={orgBudget?.forecast !== undefined ? `${percent(orgBudget.forecast, orgBudget.limit)}% of ${orgBudget.owner} limit` : "Not reported by the control plane"} icon={Gauge} tone="warning" />
-        <MetricCard label="Hard budgets" value={hardBudgets.length.toString()} detail="reject admission at limit" icon={Shield} />
-        <MetricCard label="Forecast alerts" value={overForecast.length.toString()} detail="scopes projected above limit" icon={Banknote} tone={overForecast.length ? "critical" : "positive"} />
+        <MetricCard label="Scoped spend" value={orgBudget ? formatMoney(orgBudget.spent, true) : "Not set"} detail={orgBudget ? `of ${formatMoney(orgBudget.limit, true)} for ${orgBudget.owner}` : "No budget returned for this scope"} tone="warning" />
+        <MetricCard label="Current forecast" value={orgBudget?.forecast !== undefined ? formatMoney(orgBudget.forecast, true) : "Unavailable"} detail={orgBudget?.forecast !== undefined ? `${percent(orgBudget.forecast, orgBudget.limit)}% of ${orgBudget.owner} limit` : "Not reported by the control plane"} tone="warning" />
+        <MetricCard label="Hard budgets" value={hardBudgets.length.toString()} detail="reject admission at limit" />
+        <MetricCard label="Forecast alerts" value={overForecast.length.toString()} detail="scopes projected above limit" tone={overForecast.length ? "critical" : "positive"} />
       </section>
 
       <section className="budget-layout">
@@ -66,27 +57,34 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
               return (
                 <article className="budget-card" key={budget.id}>
                   <div className="budget-card-heading">
-                    <span className="budget-scope-icon" aria-hidden="true">
-                      {budget.scope === "organization" ? <Scale size={17} /> : budget.scope === "project" ? <Users size={17} /> : <CircleDollarSign size={17} />}
-                    </span>
-                    <span><small>{budget.scope}</small><strong>{budget.owner}</strong></span>
-                    <StatusBadge value={budget.enforcement} tone={budget.enforcement} dot={false} />
+                    <span className="budget-scope">{budget.scope}</span>
+                    <StatusBadge value={budget.enforcement} tone={budget.enforcement} dot={false} chip />
                     <span title="Budget changes are available through the Eyvan API and SDK">
-                      <button className="icon-button" type="button" aria-label={`Editing ${budget.owner} budget is unavailable in the dashboard`} disabled>
-                        <Edit3 size={16} />
+                      <button className="icon-button icon-button-small" type="button" aria-label={`Editing ${budget.owner} budget is unavailable in the dashboard`} disabled>
+                        <Edit3 size={14} />
                       </button>
                     </span>
                   </div>
+                  <div className="budget-owner">{budget.owner}</div>
                   <div className="budget-amount-row">
-                    <span><small>Spent</small><strong>{formatMoney(budget.spent)}</strong></span>
-                    <span><small>Forecast</small><strong className={budget.forecast !== undefined && budget.forecast > budget.limit ? "text-critical" : ""}>{budget.forecast === undefined ? "Not reported" : formatMoney(budget.forecast)}</strong></span>
-                    <span><small>Limit</small><strong>{formatMoney(budget.limit)}</strong></span>
+                    <strong>{formatMoney(budget.spent)}</strong>
+                    <span>of {formatMoney(budget.limit)}</span>
                   </div>
+                  {/* The forecast is a tick above the bar, not a second fill:
+                      it has not been spent, and a filled track would say it
+                      has. */}
                   <div className="dual-progress">
-                    <ProgressBar value={spentPercent} label={`${budget.owner} current budget usage`} tone={spentPercent > 90 ? "red" : "blue"} />
+                    <ProgressBar value={spentPercent} label={`${budget.owner} current budget usage`} tone={spentPercent > 90 ? "red" : spentPercent > 75 ? "amber" : "accent"} />
                     {forecastPercent !== undefined && <span className="forecast-marker" style={{ left: `${Math.min(forecastPercent, 100)}%` }} title={`Forecast ${forecastPercent}%`} />}
                   </div>
-                  <div className="resource-row-detail"><span>{spentPercent}% spent</span><span>{forecastPercent === undefined ? "forecast unavailable" : `forecast ${forecastPercent}%`}</span></div>
+                  <div className="budget-card-footer">
+                    <span>{spentPercent}% spent</span>
+                    <span className={budget.forecast !== undefined && budget.forecast > budget.limit ? "text-critical" : ""}>
+                      {budget.forecast === undefined
+                        ? "forecast unavailable"
+                        : `forecast ${formatMoney(budget.forecast)}`}
+                    </span>
+                  </div>
                 </article>
               );
             })}

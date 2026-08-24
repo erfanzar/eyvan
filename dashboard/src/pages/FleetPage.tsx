@@ -4,11 +4,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
-  Cloud,
   AlertTriangle,
   Cpu,
   Gauge,
-  KeyRound,
   Layers,
   MapPin,
   MinusCircle,
@@ -193,10 +191,10 @@ export function FleetPage({
   return (
     <div className="page-stack">
       <section className="metric-grid metric-grid-four" aria-label="Fleet metrics">
-        <MetricCard label="Cells online" value={`${healthyCount}/${cells.length}`} detail={`${cells.length - healthyCount} not ready`} icon={Server} tone={healthyCount === cells.length ? "positive" : "warning"} />
-        <MetricCard label="Mean scoped utilization" value={`${averageUtilization}%`} detail="active leases in the configured project" icon={Gauge} />
-        <MetricCard label="Active leases" value={activeLeases.length.toString()} detail={`${leases.filter((lease) => lease.class === "spot").length} on preemptible capacity`} icon={KeyRound} />
-        <MetricCard label="Lease spend" value={`${formatMoney(totalSpend)}/h`} detail="active and activating leases" icon={Cloud} tone="positive" />
+        <MetricCard label="Cells online" value={`${healthyCount}/${cells.length}`} detail={`${cells.length - healthyCount} not ready`} tone={healthyCount === cells.length ? "positive" : "warning"} />
+        <MetricCard label="Mean scoped utilization" value={`${averageUtilization}%`} detail="active leases in the configured project" tone={averageUtilization > 85 ? "warning" : "positive"} />
+        <MetricCard label="Active leases" value={activeLeases.length.toString()} detail={`${leases.filter((lease) => lease.class === "spot").length} on preemptible capacity`} tone="accent" />
+        <MetricCard label="Lease spend" value={`${formatMoney(totalSpend)}/h`} detail="active and activating leases" tone="accent" />
       </section>
 
       {/* Warmth and billing are reported together on purpose. Warm capacity is
@@ -206,7 +204,7 @@ export function FleetPage({
       <section className="panel data-panel" aria-label="Warm capacity and cost">
         <div className="panel-header">
           <div><h2>Warm capacity and cost</h2><p>Which idle cost you asked for, and which you did not</p></div>
-          <Gauge size={18} />
+          <Gauge size={15} />
         </div>
         {costError && <div className="resource-row-detail"><span>{costError}</span></div>}
         {!costError && !billing && <div className="resource-row-detail"><span>Reading the billing clock…</span></div>}
@@ -243,7 +241,7 @@ export function FleetPage({
       <section className="panel data-panel" aria-label="Launch latency">
         <div className="panel-header">
           <div><h2>Launch latency</h2><p>How long each pool takes to hand over usable capacity</p></div>
-          <Timer size={18} />
+          <Timer size={15} />
         </div>
         {latencyError && <div className="resource-row-detail"><span>{latencyError}</span></div>}
         {!latencyError && !latency && <div className="resource-row-detail"><span>Reading provisioning history…</span></div>}
@@ -390,7 +388,7 @@ export function FleetPage({
       </div>
 
       {tab === "cells" && (
-        <section className="fleet-cells-section">
+        <section className="panel fleet-cells-section">
           <div className="section-toolbar">
             <div><h2>Scheduling cells</h2><p>Backend inventory, topology, and committed resources</p></div>
             <label className="select-field">
@@ -405,8 +403,7 @@ export function FleetPage({
             {visibleCells.map((cell) => (
               <article className="cell-card" key={cell.id}>
                 <div className="cell-card-heading">
-                  <div className="cell-icon"><Server size={18} aria-hidden="true" /></div>
-                  <div><h3>{cell.name}</h3><p>{cell.backend} · {cell.zone}</p></div>
+                                    <div><h3>{cell.name}</h3><p>{cell.backend} · {cell.zone}</p></div>
                   <StatusBadge value={cell.status} tone={cell.status} />
                 </div>
                 <div className="cell-stat-row">
@@ -419,7 +416,7 @@ export function FleetPage({
                     return (
                       <div key={resource.name}>
                         <div className="resource-row-heading"><span>{resource.name}</span><strong>{resource.used} / {resource.total}</strong></div>
-                        <ProgressBar value={utilization} label={`${cell.name} ${resource.name} utilization`} tone={utilization > 85 ? "amber" : "green"} />
+                        <ProgressBar value={utilization} label={`${cell.name} ${resource.name} utilization`} tone={utilization > 85 ? "amber" : "accent"} />
                       </div>
                     );
                   })}

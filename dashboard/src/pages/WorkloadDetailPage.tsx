@@ -4,20 +4,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  AlertTriangle,
   ArrowLeft,
   Ban,
   Check,
   Clipboard,
-  Clock3,
   Code2,
   Database,
   HardDrive,
+  Loader2,
   Pause,
   Play,
   RefreshCw,
   Search,
   Server,
-  ShieldCheck,
   WalletCards,
   Zap,
 } from "lucide-react";
@@ -25,11 +25,30 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { StagePipeline } from "../components/StagePipeline";
+import { pipelineCaption, StagePipeline, type PipelineVariant } from "../components/StagePipeline";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
 import type { LogEntry, WorkloadDetail, WorkloadExplanation, WorkloadSpend } from "../types";
 
 type DetailTab = "overview" | "timeline" | "logs";
+
+/**
+ * How the dispatch strip is drawn.
+ *
+ * Kept as a control rather than a decision, because the three treatments
+ * answer three different questions -- where is it now, where did the time go,
+ * what is worth looking at -- and which one is wanted depends on why somebody
+ * opened the page.
+ */
+const PIPELINE_TREATMENTS: Array<{ id: PipelineVariant; label: string; title: string }> = [
+  { id: "rail", label: "Rail", title: "Stage rail - status forward" },
+  { id: "bar", label: "To scale", title: "Measured bar - duration proportional" },
+  { id: "ledger", label: "Ledger", title: "Exceptions only - what held the run" },
+];
+
+const LOG_LEVELS = ["all", "DEBUG", "INFO", "WARN", "ERROR"] as const;
+
+/** A wait this long is somebody's afternoon, and gets said in amber. */
+const HEAVY_GAP_SECONDS = 600;
 
 /** Handlers the follow stream drives. Mirrors the client's contract. */
 export interface LogFollowHandlers {
@@ -163,6 +182,7 @@ export function WorkloadDetailPage({
   followLogs,
 }: WorkloadDetailPageProps) {
   const [tab, setTab] = useState<DetailTab>("overview");
+  const [pipe, setPipe] = useState<PipelineVariant>("rail");
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState("all");
   const [copied, setCopied] = useState(false);
@@ -311,40 +331,36 @@ export function WorkloadDetailPage({
     globalThis.setTimeout(() => setCopied(false), 1800);
   };
 
+  const waitingBadly = workload.status === "failed" || workload.status === "preempting";
+
   return (
     <div className="page-stack">
       <div className="detail-heading">
         <div className="detail-title-row">
-          <button className="icon-button" type="button" onClick={onBack} aria-label="Back to workloads" title="Back to workloads">
-            <ArrowLeft size={19} />
+          <button className="icon-button icon-button-bordered" type="button" onClick={onBack} aria-label="Back to workloads" title="Back to workloads">
+            <ArrowLeft size={15} />
           </button>
           <div>
             <div className="detail-title-with-status">
               <h2>{workload.name}</h2>
-              <StatusBadge value={workload.status} tone={workload.status} />
+              <StatusBadge value={workload.status} tone={workload.status} chip />
             </div>
-            <p>{workload.id} · {workload.project} · submitted by {workload.user}</p>
-            {workload.queueReason && (
-              <p className="detail-wait-reason">
-                Waiting: {workload.queueReason}
-                {workload.submittedAt && (
-                  <span className="timeline-gap"> waited {formatWaited(workload.submittedAt)}</span>
-                )}
-              </p>
-            )}
+            <p>
+              <span className="monospace">{workload.id}</span> · {workload.project} · submitted by {workload.user}
+            </p>
           </div>
         </div>
         {canOperate && (
           <div className="detail-actions">
             {workload.status === "failed" && (
               <button className="button button-primary" type="button" onClick={() => onAction("retry")}>
-                <RefreshCw size={16} aria-hidden="true" />
+                <RefreshCw size={14} aria-hidden="true" />
                 Retry
               </button>
             )}
             {checkpointable && (
               <button className="button button-primary" type="button" onClick={() => onAction("checkpoint")}>
-                <HardDrive size={16} aria-hidden="true" />
+                <HardDrive size={14} aria-hidden="true" />
                 Checkpoint
               </button>
             )}
@@ -355,13 +371,13 @@ export function WorkloadDetailPage({
                 onClick={() => onAction("kick")}
                 title="Interrupt this attempt and let the job reschedule elsewhere"
               >
-                <Zap size={16} aria-hidden="true" />
+                <Zap size={14} aria-hidden="true" />
                 Kick
               </button>
             )}
             {cancellable && (
               <button className="button button-secondary" type="button" onClick={() => onAction("cancel")}>
-                <Ban size={16} aria-hidden="true" />
+                <Ban size={14} aria-hidden="true" />
                 Cancel
               </button>
             )}
@@ -369,15 +385,43 @@ export function WorkloadDetailPage({
         )}
       </div>
 
-      <section className="detail-metric-grid" aria-label="Workload metrics">
-        <div className="detail-metric"><Clock3 size={17} /><span><small>Submitted</small><strong>{formatDateTime(workload.submittedAt)}</strong></span></div>
-        <div className="detail-metric"><Server size={17} /><span><small>Placement</small><strong>{workload.cell ?? "Pending"}</strong></span></div>
-        <div className="detail-metric"><WalletCards size={17} /><span><small>Spend</small><strong>{budgetTracked ? `${formatMoney(workload.budgetSpent!)} / ${formatMoney(workload.budgetLimit!)}` : "Not tracked"}</strong></span></div>
-        <div className="detail-metric"><ShieldCheck size={17} /><span><small>Priority</small><strong>{workload.priority}</strong></span></div>
-        <div className="detail-progress-metric">
-          <span><small>Progress</small><strong>{workload.progress === undefined ? "—" : `${workload.progress}%`}</strong></span>
-          {workload.progress !== undefined && <ProgressBar value={workload.progress} label="Workload progress" />}
+      {/* Why this job is not running, said once at the top. The age beside it
+          is what turns a reason into a problem: waiting on capacity is normal,
+          waiting on it since yesterday is not. */}
+      {workload.queueReason && (
+        <div className={`detail-wait-banner${waitingBadly ? " detail-wait-banner-bad" : ""}`} role="status">
+          {waitingBadly ? (
+            <AlertTriangle size={15} aria-hidden="true" />
+          ) : (
+            <Loader2 size={15} className="spin" aria-hidden="true" />
+          )}
+          <span className="detail-wait-message">Waiting: {workload.queueReason}</span>
+          {workload.submittedAt && <span className="detail-wait-age">waited {formatWaited(workload.submittedAt)}</span>}
         </div>
+      )}
+
+      <section className="panel pipeline-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Dispatch pipeline</h2>
+            <p className="pipeline-caption">{pipelineCaption(workload.status, workload.phase)}</p>
+          </div>
+          <div className="segmented" role="group" aria-label="Pipeline strip treatment">
+            {PIPELINE_TREATMENTS.map((treatment) => (
+              <button
+                key={treatment.id}
+                type="button"
+                className={pipe === treatment.id ? "segment-active" : ""}
+                aria-pressed={pipe === treatment.id}
+                title={treatment.title}
+                onClick={() => setPipe(treatment.id)}
+              >
+                {treatment.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <StagePipeline status={workload.status} phase={workload.phase} timeline={workload.timeline} variant={pipe} />
       </section>
 
       <div className="tabs" role="tablist" aria-label="Workload detail sections">
@@ -396,51 +440,32 @@ export function WorkloadDetailPage({
       </div>
 
       {tab === "overview" && (
-        <section className="panel pipeline-panel">
-          <StagePipeline status={workload.status} phase={workload.phase} timeline={workload.timeline} />
-        </section>
-      )}
-      {tab === "overview" && (
         <div className="detail-overview-grid">
           <section className="panel detail-section">
-            <div className="panel-header"><div><h2>Admission envelope</h2><p>What this shape occupies on a cell — derived from the accelerator type, not requested verbatim</p></div><Server size={18} /></div>
+            <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Admission envelope</h2><p>What this shape occupies on a cell</p></div></div>
             <dl className="definition-grid">
-              <div><dt>Request</dt><dd>{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices} replicas` : ""}</dd></div>
+              <div><dt>Request</dt><dd className="monospace">{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices} replicas` : ""}</dd></div>
               <div><dt>Envelope CPU</dt><dd>{workload.resources.cpu} cores{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
               <div><dt>Envelope memory</dt><dd>{workload.resources.memoryGb} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
-              <div><dt>Topology</dt><dd>{workload.resources.topology ?? "No strict constraint"}</dd></div>
+              <div><dt>Topology</dt><dd className="monospace">{workload.resources.topology ?? "No strict constraint"}</dd></div>
+              <div><dt>Priority</dt><dd>{workload.priority}</dd></div>
+              {/* Facts the header used to carry in a metric strip. They belong
+                  beside the shape they qualify, not in a band of five tiles
+                  repeating what the panels below already say. */}
+              <div><dt>Submitted</dt><dd>{formatDateTime(workload.submittedAt)}</dd></div>
+              <div><dt>Placement</dt><dd className="monospace">{workload.cell ?? "Pending"}</dd></div>
+              <div><dt>Progress</dt><dd>{workload.progress === undefined ? "—" : `${workload.progress}%`}</dd></div>
               <div><dt>Capacity lease</dt><dd className="monospace">{workload.leaseId ?? "None held"}</dd></div>
             </dl>
           </section>
 
           <section className="panel detail-section">
-            <div className="panel-header"><div><h2>Budget</h2><p>Workload-level spend guardrail</p></div><WalletCards size={18} /></div>
-            {budgetTracked ? (
-              <>
-                <div className="large-budget-value">
-                  <strong>{formatMoney(workload.budgetSpent!)}</strong>
-                  <span>of {formatMoney(workload.budgetLimit!)}</span>
-                </div>
-                <ProgressBar value={budgetPercent} label="Workload budget utilization" tone={budgetPercent > 90 ? "red" : "blue"} />
-                <div className="resource-row-detail"><span>{budgetPercent}% consumed</span><span>{formatMoney(workload.budgetLimit! - workload.budgetSpent!)} remaining</span></div>
-              </>
-            ) : (
-              <div className="resource-row-detail"><span>Per-workload spend is not reported by the control plane.</span></div>
-            )}
-          </section>
-
-          <section className="panel detail-section">
-            <div className="panel-header"><div><h2>What this run cost</h2><p>Measured hours, and the on-demand alternative</p></div><WalletCards size={18} /></div>
-            <SpendPanel spend={spend} error={spendError} />
-          </section>
-
-          <section className="panel detail-section">
-            <div className="panel-header"><div><h2>Placement verdict</h2><p>Why the scheduler did or did not place this</p></div><Server size={18} /></div>
+            <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Placement verdict</h2><p>Why the scheduler did or did not place this</p></div></div>
             {explainError && <div className="resource-row-detail"><span>{explainError}</span></div>}
             {!explainError && !explanation && <div className="resource-row-detail"><span>Asking the scheduler…</span></div>}
             {explanation && (
               <dl className="definition-grid">
-                <div><dt>Placeable</dt><dd>{explanation.placeable ? "Yes" : "No"}</dd></div>
+                <div><dt>Placeable</dt><dd className={explanation.placeable ? "" : "text-critical"}>{explanation.placeable ? "Yes" : "No"}</dd></div>
                 <div><dt>Reason</dt><dd>{explanation.message ?? explanation.scheduling_reason ?? "None reported"}</dd></div>
                 <div><dt>Cells considered</dt><dd>{explanation.considered_cell_count}</dd></div>
                 {/* The field that separates "waiting for capacity" from "can
@@ -454,25 +479,49 @@ export function WorkloadDetailPage({
             )}
           </section>
 
+          <section className="panel detail-section">
+            <div className="panel-header"><WalletCards size={15} aria-hidden="true" /><div><h2>What this run cost</h2><p>Measured hours, and the on-demand alternative</p></div></div>
+            <SpendPanel spend={spend} error={spendError} />
+          </section>
+
+          <section className="panel detail-section">
+            <div className="panel-header"><WalletCards size={15} aria-hidden="true" /><div><h2>Budget</h2><p>Workload-level spend guardrail</p></div></div>
+            {budgetTracked ? (
+              <>
+                <div className="large-budget-value">
+                  <strong>{formatMoney(workload.budgetSpent!)}</strong>
+                  <span>of {formatMoney(workload.budgetLimit!)}</span>
+                </div>
+                <ProgressBar value={budgetPercent} label="Workload budget utilization" tone={budgetPercent > 90 ? "red" : "accent"} />
+                <div className="resource-row-detail"><span>{budgetPercent}% consumed</span><span>{formatMoney(workload.budgetLimit! - workload.budgetSpent!)} remaining</span></div>
+              </>
+            ) : (
+              <div className="resource-row-detail"><span>Per-workload spend is not reported by the control plane.</span></div>
+            )}
+          </section>
+
           <section className="panel allocation-section">
-            <div className="panel-header"><div><h2>Allocation</h2><p>Committed hosts and failure domains</p></div><Database size={18} /></div>
+            <div className="panel-header"><Database size={15} aria-hidden="true" /><div><h2>Allocation</h2><p>Committed hosts and failure domains</p></div></div>
             <div className="allocation-grid">
               {workload.allocation.map((allocation) => (
                 <div className="allocation-item" key={allocation.host}>
                   <span className={`allocation-state allocation-${allocation.state}`} aria-hidden="true" />
-                  <span><strong>{allocation.host}</strong><small>{allocation.rack} · {allocation.resource}</small></span>
-                  <StatusBadge value={allocation.state} tone={allocation.state === "ready" ? "healthy" : allocation.state === "starting" ? "activating" : "revoking"} />
+                  <span>
+                    <strong>{allocation.host}</strong>
+                    <small>{allocation.rack} · {allocation.resource}</small>
+                    <StatusBadge value={allocation.state} tone={allocation.state === "ready" ? "healthy" : allocation.state === "starting" ? "activating" : "revoking"} dot={false} />
+                  </span>
                 </div>
               ))}
             </div>
           </section>
 
           <section className="panel runtime-section">
-            <div className="panel-header"><div><h2>Runtime</h2><p>Entrypoint and durable state</p></div><Code2 size={18} /></div>
+            <div className="panel-header"><Code2 size={15} aria-hidden="true" /><div><h2>Runtime</h2><p>Entrypoint and durable state</p></div></div>
             <div className="code-block">
               <code>{workload.command}</code>
               <button className="icon-button code-copy" type="button" onClick={copyCommand} aria-label="Copy command" title="Copy command">
-                {copied ? <Check size={16} /> : <Clipboard size={16} />}
+                {copied ? <Check size={15} /> : <Clipboard size={15} />}
               </button>
             </div>
             <dl className="runtime-list">
@@ -484,7 +533,7 @@ export function WorkloadDetailPage({
                   capacity is not, and the two look identical under one count. */}
               <div><dt>Reclaimed</dt><dd>{workload.preemptionCount ?? "Unknown"}</dd></div>
               <div><dt>Capacity lost</dt><dd>{workload.capacityLossCount ?? "Unknown"}</dd></div>
-              {workload.failureReason ? <div><dt>Failure</dt><dd>{workload.failureReason}</dd></div> : null}
+              {workload.failureReason ? <div><dt>Failure</dt><dd className="text-critical">{workload.failureReason}</dd></div> : null}
               <div><dt>Labels</dt><dd>{Object.entries(workload.labels).map(([key, value]) => <span className="label-chip" key={key}>{key}={value}</span>)}</dd></div>
             </dl>
           </section>
@@ -496,33 +545,46 @@ export function WorkloadDetailPage({
         // how long after the previous transition it happened, so a nine-hour
         // admission wait is a number on the screen, not arithmetic.
         const parse = (value: string) => new Date(value).getTime();
-        const fmtGap = (ms: number) => {
-          if (!Number.isFinite(ms) || ms < 0) return "";
-          const s = Math.round(ms / 1000);
-          const h = Math.floor(s / 3600);
-          const m = Math.floor((s % 3600) / 60);
-          const r = s % 60;
+        const fmtGap = (seconds: number) => {
+          const h = Math.floor(seconds / 3600);
+          const m = Math.floor((seconds % 3600) / 60);
+          const r = seconds % 60;
           return h > 0 ? `${h}h ${m}m ${r}s` : m > 0 ? `${m}m ${r}s` : `${r}s`;
         };
         let previous: number | null = null;
         const rows = workload.timeline.map((event) => {
           const at = parse(event.timestamp);
-          const gap = previous === null ? "" : fmtGap(at - previous);
+          const seconds = previous === null || !Number.isFinite(at) ? null : Math.round((at - previous) / 1000);
           previous = Number.isFinite(at) ? at : previous;
-          return { event, gap };
+          return { event, seconds: seconds !== null && seconds >= 0 ? seconds : null };
         });
+        const first = parse(workload.timeline[0]?.timestamp ?? "");
+        const last = parse(workload.timeline[workload.timeline.length - 1]?.timestamp ?? "");
+        const span =
+          Number.isFinite(first) && Number.isFinite(last) && last >= first
+            ? `${workload.timeline.length} transitions over ${fmtGap(Math.round((last - first) / 1000))}`
+            : `${workload.timeline.length} transitions`;
         return (
           <section className="panel timeline-panel">
-            <div className="panel-header"><div><h2>Lifecycle timeline</h2><p>Admission, placement, lease, and runtime transitions</p></div></div>
+            <div className="panel-header">
+              <div><h2>Lifecycle timeline</h2><p>Each row carries the gap since the previous transition</p></div>
+              <span className="timeline-span">{span}</span>
+            </div>
             <ol className="timeline-list">
-              {rows.map(({ event, gap }) => (
+              {rows.map(({ event, seconds }) => (
                 <li key={event.id} className={`timeline-${event.severity}`}>
-                  <span className="timeline-marker" aria-hidden="true" />
-                  <div>
+                  <time>{formatDateTime(event.timestamp)}</time>
+                  <span className="timeline-rail" aria-hidden="true">
+                    <span className="timeline-marker" />
+                  </span>
+                  <div className="timeline-body">
                     <span className="timeline-heading">
                       <strong>{event.title}</strong>
-                      {gap && <span className="timeline-gap">+{gap}</span>}
-                      <time>{formatDateTime(event.timestamp)}</time>
+                      {seconds !== null && seconds > 0 && (
+                        <span className={`timeline-gap${seconds > HEAVY_GAP_SECONDS ? " timeline-gap-heavy" : ""}`}>
+                          +{fmtGap(seconds)}
+                        </span>
+                      )}
                     </span>
                     <p>{event.detail}</p>
                     {event.actor && <small>{event.actor}</small>}
@@ -538,20 +600,32 @@ export function WorkloadDetailPage({
         <section className="panel logs-panel">
           <div className="table-toolbar log-toolbar">
             <label className="search-field">
-              <Search size={16} aria-hidden="true" />
+              <Search size={14} aria-hidden="true" />
               <span className="sr-only">Search logs</span>
               <input type="search" placeholder="Search log output" value={logQuery} onChange={(event) => setLogQuery(event.target.value)} />
             </label>
-            <label className="select-field">
-              <span className="sr-only">Filter log level</span>
-              <select value={logLevel} onChange={(event) => setLogLevel(event.target.value)}>
-                <option value="all">All levels</option>
-                <option value="DEBUG">Debug</option>
-                <option value="INFO">Info</option>
-                <option value="WARN">Warning</option>
-                <option value="ERROR">Error</option>
-              </select>
-            </label>
+            <div className="segmented segmented-mono" role="group" aria-label="Filter log level">
+              {LOG_LEVELS.map((level) => (
+                <button
+                  key={level}
+                  type="button"
+                  className={logLevel === level ? "segment-active" : ""}
+                  aria-pressed={logLevel === level}
+                  onClick={() => setLogLevel(level)}
+                >
+                  {level === "all" ? "ALL" : level}
+                </button>
+              ))}
+            </div>
+            <span className="spacer" />
+            {following && (
+              <span className={connected ? "log-follow-state log-follow-live" : "log-follow-state"}>
+                {/* Distinguished because they mean opposite things: a live
+                    stream with no lines is a quiet job, and a dropped one is a
+                    reader who is no longer being told anything. */}
+                {connected ? "Live" : "Reconnecting…"}
+              </span>
+            )}
             {followLogs && (
               <button
                 className={following ? "button button-secondary" : "button button-primary"}
@@ -564,21 +638,13 @@ export function WorkloadDetailPage({
                     : "Stream this workload's output as it is produced"
                 }
               >
-                {following ? <Pause size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+                {following ? <Pause size={13} aria-hidden="true" /> : <Play size={13} aria-hidden="true" />}
                 {following ? "Stop following" : "Follow"}
               </button>
             )}
-            {following && (
-              <span className={connected ? "log-follow-state log-follow-live" : "log-follow-state"}>
-                {/* Distinguished because they mean opposite things: a live
-                    stream with no lines is a quiet job, and a dropped one is a
-                    reader who is no longer being told anything. */}
-                {connected ? "Live" : "Reconnecting…"}
-              </span>
-            )}
           </div>
-          {followError && <div className="log-notice log-notice-error">{followError}</div>}
-          {attemptNotice && <div className="log-notice">{attemptNotice}</div>}
+          {followError && <div className="log-notice log-notice-error"><AlertTriangle size={14} aria-hidden="true" />{followError}</div>}
+          {attemptNotice && <div className="log-notice"><AlertTriangle size={14} aria-hidden="true" />{attemptNotice}</div>}
           {following && followed.dropped > 0 && (
             <div className="log-notice">
               Showing the last {FOLLOW_BUFFER_LINES.toLocaleString()} lines · {followed.dropped.toLocaleString()} earlier
@@ -619,6 +685,10 @@ export function WorkloadDetailPage({
                     : "Connecting to the log stream…"}
               </div>
             )}
+          </div>
+          <div className="log-footer">
+            <span>{filteredLogs.length.toLocaleString()} lines in view</span>
+            <span>Buffer holds the last {FOLLOW_BUFFER_LINES.toLocaleString()} lines of this attempt</span>
           </div>
         </section>
       )}

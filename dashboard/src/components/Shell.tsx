@@ -3,18 +3,21 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   Boxes,
+  ChevronRight,
   CircleDollarSign,
   ClipboardList,
   Gauge,
   LayoutDashboard,
   LogOut,
   Menu,
+  PanelLeft,
   Plus,
   Receipt,
+  RefreshCw,
   ServerCog,
   X,
 } from "lucide-react";
@@ -23,12 +26,19 @@ import type { AuthIdentity } from "../auth/oidc";
 import type { Route, Section, SectionAvailability } from "../routing";
 import type { ControlPlaneHealth, EffectiveProjectScope } from "../types";
 
+/** Where the rail's collapsed state is remembered between sessions. */
+const RAIL_STORAGE_KEY = "eyvan.rail.collapsed";
+
 interface ShellProps {
   route: Route;
   mobileNavigationOpen: boolean;
   onMobileNavigationChange: (open: boolean) => void;
   onNavigate: (section: Section) => void;
   onSubmit: () => void;
+  /** Re-read the whole snapshot now, rather than waiting for the next sweep. */
+  onRefresh?: () => void;
+  /** How many records each section holds, when the snapshot can say. */
+  counts?: Partial<Record<Section, number>>;
   sectionAvailability: SectionAvailability;
   health?: ControlPlaneHealth;
   /** Whether the change stream is attached; undefined in demo mode. */
@@ -68,12 +78,25 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   audit: { title: "Audit events", description: "Durable control-plane decision history" },
 };
 
+/** The rail's own memory. A rail that forgets is a rail somebody re-collapses every morning. */
+function initialCollapsed(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(RAIL_STORAGE_KEY) === "1";
+  } catch {
+    // Private windows and blocked site data throw here rather than returning
+    // null, and an expanded rail is the right answer when nobody can say.
+    return false;
+  }
+}
+
 export function Shell({
   route,
   mobileNavigationOpen,
   onMobileNavigationChange,
   onNavigate,
   onSubmit,
+  onRefresh,
+  counts,
   sectionAvailability,
   health,
   live,
@@ -85,13 +108,23 @@ export function Shell({
   children,
 }: ShellProps) {
   const drawerRef = useRef<HTMLElement>(null);
+  const [collapsed, setCollapsed] = useState(initialCollapsed);
   const meta = pageMeta[route.section];
+  const detailId = "workloadId" in route ? route.workloadId : undefined;
   const connected = health?.status === "ok";
   const initials = identity?.displayName
     .split(/\s+/)
     .slice(0, 2)
     .map((part) => part[0]?.toUpperCase())
     .join("") || "ME";
+
+  useEffect(() => {
+    try {
+      globalThis.localStorage?.setItem(RAIL_STORAGE_KEY, collapsed ? "1" : "0");
+    } catch {
+      // Remembering the rail is a convenience, never a requirement.
+    }
+  }, [collapsed]);
 
   useEffect(() => {
     if (!mobileNavigationOpen) return;
@@ -119,15 +152,25 @@ export function Shell({
         />
       )}
       <aside
-        className={`sidebar ${mobileNavigationOpen ? "sidebar-open" : ""}`}
+        className={`sidebar ${mobileNavigationOpen ? "sidebar-open" : ""} ${collapsed ? "sidebar-collapsed" : ""}`}
         ref={drawerRef}
         aria-label="Primary navigation"
       >
         <div className="brand-row">
           <span className="brand-mark" aria-hidden="true">
-            <Boxes size={20} strokeWidth={2.1} />
+            <Boxes size={13} strokeWidth={2} />
           </span>
-          <span className="brand-name">Eyvan</span>
+          <span className="brand-name rail-label">Eyvan</span>
+          <button
+            className="icon-button rail-toggle"
+            type="button"
+            aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+            aria-pressed={collapsed}
+            title={collapsed ? "Expand navigation" : "Collapse navigation"}
+            onClick={() => setCollapsed((current) => !current)}
+          >
+            <PanelLeft size={15} strokeWidth={1.6} />
+          </button>
           <button
             className="icon-button sidebar-close"
             type="button"
@@ -135,7 +178,7 @@ export function Shell({
             title="Close navigation"
             onClick={() => onMobileNavigationChange(false)}
           >
-            <X size={18} />
+            <X size={16} />
           </button>
         </div>
 
@@ -173,24 +216,37 @@ export function Shell({
 
         <nav className="sidebar-nav">
           <span className="nav-label">Control plane</span>
-          {navigation.filter(({ section }) => sectionAvailability[section] !== false).map(({ section, label, icon: Icon }) => (
-            <button
-              key={section}
-              className={`nav-item ${route.section === section ? "nav-item-active" : ""}`}
-              type="button"
-              aria-current={route.section === section ? "page" : undefined}
-              onClick={() => chooseSection(section)}
-            >
-              <Icon size={18} strokeWidth={1.9} aria-hidden="true" />
-              <span>{label}</span>
-            </button>
-          ))}
+          {navigation.filter(({ section }) => sectionAvailability[section] !== false).map(({ section, label, icon: Icon }) => {
+            const count = counts?.[section];
+            return (
+              <button
+                key={section}
+                className={`nav-item ${route.section === section ? "nav-item-active" : ""}`}
+                type="button"
+                title={label}
+                aria-current={route.section === section ? "page" : undefined}
+                onClick={() => chooseSection(section)}
+              >
+                <Icon size={15} strokeWidth={1.7} aria-hidden="true" />
+                <span className="rail-label">{label}</span>
+                {/* The count is the reason to look at the row before pressing
+                    it. Absent rather than zero when the snapshot has not said:
+                    an empty section and an unread one are the same number and
+                    opposite facts. */}
+                {count !== undefined && (
+                  <span className="nav-count rail-label" aria-hidden="true">
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="sidebar-footer">
           <div className="system-health">
             <span className={`health-indicator ${connected ? "" : "health-indicator-pending"}`} aria-hidden="true" />
-            <span>
+            <span className="rail-label">
               <strong>{connected ? "Control plane connected" : health?.status === "demo" ? "Demo mode" : "Checking control plane"}</strong>
               <small>
                 {/* A stream that stopped and a fleet where nothing is happening look
@@ -201,14 +257,14 @@ export function Shell({
           </div>
           {onLogout ? <button className="profile-button" type="button" aria-label={`Sign out ${identity?.displayName ?? "current user"}`} title="Sign out" onClick={onLogout}>
             <span className="avatar" aria-hidden="true">{initials}</span>
-            <span>
+            <span className="rail-label">
               <strong>{identity?.displayName ?? "Authenticated user"}</strong>
               <small>{identity?.detail ?? "OIDC session"}</small>
             </span>
-            <LogOut size={15} aria-hidden="true" />
+            <LogOut size={14} aria-hidden="true" />
           </button> : <div className="profile-button profile-static">
             <span className="avatar" aria-hidden="true">{initials}</span>
-            <span>
+            <span className="rail-label">
               <strong>{identity?.displayName ?? "Unauthenticated"}</strong>
               <small>{identity?.detail ?? "No identity"}</small>
             </span>
@@ -216,7 +272,7 @@ export function Shell({
         </div>
       </aside>
 
-      <div className="main-column">
+      <div className={`main-column ${collapsed ? "main-collapsed" : ""}`}>
         <header className="topbar">
           <button
             className="icon-button mobile-menu"
@@ -225,16 +281,30 @@ export function Shell({
             title="Open navigation"
             onClick={() => onMobileNavigationChange(true)}
           >
-            <Menu size={20} />
+            <Menu size={18} />
           </button>
-          <div className="page-title">
-            <h1>{"workloadId" in route ? "Workload detail" : meta.title}</h1>
-            <p>{"workloadId" in route ? route.workloadId : meta.description}</p>
-          </div>
+          {/* A breadcrumb, not a title block. The section name is context the
+              reader already has from the rail; the record ID is the one thing
+              the rail cannot say, and the thing they copy into a terminal. */}
+          <nav className="page-title" aria-label="Breadcrumb">
+            <h1>{detailId ? "Workload detail" : meta.title}</h1>
+            {detailId && (
+              <>
+                <ChevronRight size={13} strokeWidth={1.7} aria-hidden="true" />
+                <span className="crumb-target">{detailId}</span>
+              </>
+            )}
+          </nav>
           <div className="topbar-actions">
+            {onRefresh && (
+              <button className="button button-secondary" type="button" onClick={onRefresh}>
+                <RefreshCw size={14} aria-hidden="true" />
+                <span className="button-label">Refresh</span>
+              </button>
+            )}
             {identity?.capabilities.submitWorkloads && (
               <button className="button button-primary" type="button" onClick={onSubmit}>
-                <Plus size={17} aria-hidden="true" />
+                <Plus size={14} strokeWidth={2} aria-hidden="true" />
                 <span className="button-label">Submit workload</span>
               </button>
             )}

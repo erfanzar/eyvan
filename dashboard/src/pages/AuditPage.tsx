@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Activity, ChevronDown, ChevronRight, Download, FilterX, Search } from "lucide-react";
+import { Activity, ChevronRight, Download, FilterX, Search } from "lucide-react";
 import { Fragment, useMemo, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
@@ -76,7 +76,7 @@ export function AuditPage({ events, onAction }: AuditPageProps) {
   return (
     <div className="page-stack">
       <section className="audit-integrity-strip">
-        <span className="audit-integrity-icon"><Activity size={18} aria-hidden="true" /></span>
+        <span className="audit-integrity-icon" aria-hidden="true"><Activity size={16} /></span>
         <span>
           <strong>Audit event stream</strong>
           <small>
@@ -84,13 +84,14 @@ export function AuditPage({ events, onAction }: AuditPageProps) {
             {latestEvent ? ` · latest event ${formatDateTime(latestEvent.timestamp)}` : ""}
           </small>
         </span>
+        <button className="button button-secondary" type="button" onClick={exportEvents}><Download size={14} aria-hidden="true" />Export CSV</button>
       </section>
 
       <section className="panel data-panel">
         <div className="table-toolbar">
           <div className="filter-group">
             <label className="search-field">
-              <Search size={16} aria-hidden="true" />
+              <Search size={14} aria-hidden="true" />
               <span className="sr-only">Search audit events</span>
               <input type="search" placeholder="Search action, actor, target, or request ID" value={search} onChange={(event) => setSearch(event.target.value)} />
             </label>
@@ -116,10 +117,10 @@ export function AuditPage({ events, onAction }: AuditPageProps) {
               </select>
             </label>
             {(search || category !== "all" || severity !== "all") && (
-              <button className="button button-ghost" type="button" onClick={clearFilters}><FilterX size={16} />Clear</button>
+              <button className="button button-ghost" type="button" onClick={clearFilters}><FilterX size={14} aria-hidden="true" />Clear</button>
             )}
           </div>
-          <button className="button button-secondary" type="button" onClick={exportEvents}><Download size={16} />Export CSV</button>
+          <span className="table-count">{filtered.length} of {events.length}</span>
         </div>
 
         {filtered.length === 0 ? (
@@ -134,10 +135,10 @@ export function AuditPage({ events, onAction }: AuditPageProps) {
                     <tr className={expanded === event.id ? "row-expanded" : ""}>
                       <td>
                         <button className="icon-button icon-button-small" type="button" aria-label={`${expanded === event.id ? "Collapse" : "Expand"} ${event.action}`} onClick={() => setExpanded(expanded === event.id ? null : event.id)}>
-                          {expanded === event.id ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                          <ChevronRight className={`audit-caret${expanded === event.id ? " audit-caret-open" : ""}`} size={14} />
                         </button>
                       </td>
-                      <td className="nowrap">{formatDateTime(event.timestamp)}</td>
+                      <td className="nowrap numeric" style={{ textAlign: "left" }}>{formatDateTime(event.timestamp)}</td>
                       <td><strong className="monospace action-name">{event.action}</strong></td>
                       <td>{event.actor}</td>
                       <td className="monospace">{event.target}</td>

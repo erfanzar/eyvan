@@ -3,37 +3,40 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {
-  Activity,
-  AlertTriangle,
-  ArrowRight,
-  CircleCheck,
-  CircleDollarSign,
-  Clock3,
-  Layers3,
-  Server,
-} from "lucide-react";
+import { AlertTriangle, ArrowRight, CircleX, Layers3 } from "lucide-react";
 
 import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatMoney, formatRelativeTime, percent } from "../lib/format";
-import type { OverviewData, WorkloadSummary } from "../types";
+import type { AuditEvent, OverviewData, WorkloadSummary } from "../types";
 
 interface OverviewPageProps {
   overview: OverviewData;
   workloads: WorkloadSummary[];
+  /** The decision history, newest first. Empty when the ledger is out of scope. */
+  auditEvents?: AuditEvent[];
   onOpenWorkload: (id: string) => void;
   onShowWorkloads: () => void;
+  onShowAudit?: () => void;
   fleetAvailable: boolean;
+}
+
+/** How long the queue's oldest wait has been, said the way somebody says it. */
+function waited(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
 }
 
 export function OverviewPage({
   overview,
   workloads,
+  auditEvents = [],
   onOpenWorkload,
   onShowWorkloads,
+  onShowAudit,
   fleetAvailable,
 }: OverviewPageProps) {
   const activeWorkloads = workloads
@@ -45,29 +48,38 @@ export function OverviewPage({
     1,
   );
   const budgetUsed = percent(overview.monthlySpend, overview.monthlyBudget);
+  const recent = auditEvents.slice(0, 8);
+  // Depth alone does not say whether anything is stuck. The band holding the
+  // longest wait is what the bars are drawn against, so a band waiting ten
+  // hours is full and one waiting ten minutes is a sliver beside it.
+  const longestWait = Math.max(...overview.priorityQueue.map((band) => band.oldestMinutes), 1);
+  const criticalAlerts = overview.alerts.filter((alert) => alert.severity === "critical").length;
 
   return (
     <div className="page-stack">
       <section className="metric-grid" aria-label="Operations metrics">
         <MetricCard
-          label="Queued workloads"
+          label="Queued"
           value={overview.queued.toString()}
+          delta={
+            overview.priorityQueue.length
+              ? `oldest ${waited(Math.max(...overview.priorityQueue.map((band) => band.oldestMinutes)))}`
+              : undefined
+          }
           detail="production, interactive, and batch"
-          icon={Clock3}
           tone="warning"
         />
         <MetricCard
-          label="Running workloads"
+          label="Running"
           value={overview.running.toString()}
           detail="currently reported by the control plane"
-          icon={Activity}
           tone="positive"
         />
         <MetricCard
           label="Scoped utilization"
           value={fleetAvailable ? `${overview.fleetUtilization}%` : "Restricted"}
           detail={fleetAvailable ? "active leases in the configured project" : "fleet inventory requires fleet administration"}
-          icon={Server}
+          tone="accent"
         />
         <MetricCard
           label="Budgeted spend"
@@ -77,19 +89,117 @@ export function OverviewPage({
               ? `${budgetUsed}% of ${formatMoney(overview.monthlyBudget, true)}`
               : "cell cost still accrues; see Fleet for what the fleet is spending"
           }
-          icon={CircleDollarSign}
           tone="warning"
         />
         <MetricCard
           label="Completion rate"
           value={overview.successRate === undefined ? "Unavailable" : `${Math.round(overview.successRate)}%`}
           detail="terminal workloads in the current scope"
-          icon={CircleCheck}
           tone="positive"
         />
       </section>
 
       <section className="overview-primary-grid">
+        {/* What the plane decided, newest first. It is the first thing an
+            operator wants on a morning that went wrong, and every row carries
+            the target underneath because that is what gets copied next. */}
+        <div className="panel activity-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Recent activity</h2>
+              <p>Control-plane decisions, newest first</p>
+            </div>
+            {onShowAudit && (
+              <button className="text-button" type="button" onClick={onShowAudit}>
+                All events
+              </button>
+            )}
+          </div>
+          {recent.length === 0 ? (
+            <EmptyState
+              title="No control-plane decisions in this scope"
+              detail="Admission, placement, and lease events appear here as the plane commits them."
+            />
+          ) : (
+            <div>
+              {recent.map((event) => (
+                <div className="activity-row" key={event.id}>
+                  <span className={`activity-dot activity-${event.severity}`} aria-hidden="true" />
+                  <div>
+                    <div>
+                      <strong>{event.action}</strong>
+                      <span className="activity-detail"> · {event.detail}</span>
+                    </div>
+                    <span className="activity-target">{event.target}</span>
+                  </div>
+                  <span className="activity-age">{formatRelativeTime(event.timestamp)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="overview-side-column">
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h2>Queue by priority</h2>
+              </div>
+            </div>
+            {overview.priorityQueue.length === 0 ? (
+              <EmptyState title="Nothing is queued" detail="Every submitted workload in this scope has been admitted." />
+            ) : (
+              <div className="priority-queue">
+                {overview.priorityQueue.map((band) => (
+                  <div className="priority-queue-row" key={band.priority}>
+                    <div>
+                      <StatusBadge value={band.priority} tone={band.priority} dot={false} />
+                      <strong>{band.count}</strong>
+                      <small>oldest {waited(band.oldestMinutes)}</small>
+                    </div>
+                    <ProgressBar
+                      value={(band.oldestMinutes / longestWait) * 100}
+                      label={`${band.priority} oldest wait`}
+                      tone={band.priority === "production" ? "red" : band.priority === "interactive" ? "blue" : "accent"}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="panel alert-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Needs attention</h2>
+              </div>
+              {overview.alerts.length > 0 && (
+                <span className="alert-count">{criticalAlerts || overview.alerts.length}</span>
+              )}
+            </div>
+            {overview.alerts.length === 0 ? (
+              <EmptyState title="Nothing needs attention" detail="No capacity or policy condition is currently raised." />
+            ) : (
+              <div className="alert-list">
+                {overview.alerts.map((alert) => (
+                  <div className={`alert-item alert-${alert.severity}`} key={alert.id}>
+                    <span className="alert-icon" aria-hidden="true">
+                      {alert.severity === "critical" ? <CircleX size={15} /> : <AlertTriangle size={15} />}
+                    </span>
+                    <span>
+                      <strong>{alert.title}</strong>
+                      <p>{alert.detail}</p>
+                      <small>{formatRelativeTime(alert.timestamp)}</small>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      <section className="overview-secondary-grid">
         <div className="panel queue-panel">
           <div className="panel-header">
             <div>
@@ -98,7 +208,7 @@ export function OverviewPage({
             </div>
             <button className="text-button" type="button" onClick={onShowWorkloads}>
               View queue
-              <ArrowRight size={15} aria-hidden="true" />
+              <ArrowRight size={14} aria-hidden="true" />
             </button>
           </div>
           {hasQueueActivity ? <div className="queue-chart" aria-label="Submission and admission activity chart">
@@ -126,15 +236,6 @@ export function OverviewPage({
               ))}
             </div>
           </div> : <EmptyState title="No submission or admission activity" detail="No workload submission or admission event occurred in this scope during the selected window." />}
-          <div className="priority-strip">
-            {overview.priorityQueue.map((item) => (
-              <div className="priority-summary" key={item.priority}>
-                <StatusBadge value={item.priority} tone={item.priority} dot={false} />
-                <strong>{item.count}</strong>
-                <span>oldest {item.oldestMinutes}m</span>
-              </div>
-            ))}
-          </div>
         </div>
 
         <div className="panel fleet-panel">
@@ -143,7 +244,7 @@ export function OverviewPage({
               <h2>Fleet capacity</h2>
               <p>Committed resources and pending demand</p>
             </div>
-            <Layers3 size={18} aria-hidden="true" />
+            <Layers3 size={15} aria-hidden="true" />
           </div>
           {fleetAvailable ? (
             <div className="resource-list">
@@ -158,7 +259,7 @@ export function OverviewPage({
                     <ProgressBar
                       value={utilization}
                       label={`${resource.resource} utilization`}
-                      tone={utilization > 85 ? "amber" : "green"}
+                      tone={utilization > 85 ? "amber" : "accent"}
                     />
                     <div className="resource-row-detail">
                       <span>{utilization}% allocated</span>
@@ -179,19 +280,21 @@ export function OverviewPage({
               <span>Monthly budget</span>
               <strong>{formatMoney(overview.monthlySpend)} / {formatMoney(overview.monthlyBudget)}</strong>
             </div>
-            <ProgressBar value={budgetUsed} label="Monthly budget utilization" tone={budgetUsed > 85 ? "red" : "blue"} />
+            <ProgressBar value={budgetUsed} label="Monthly budget utilization" tone={budgetUsed > 85 ? "red" : "accent"} />
           </div>
         </div>
       </section>
 
-      <section className="overview-secondary-grid">
-        <div className="panel active-workloads-panel">
-          <div className="panel-header">
-            <div>
-              <h2>Active workloads</h2>
-              <p>Recently scheduled and currently progressing</p>
-            </div>
+      <section className="panel active-workloads-panel" aria-label="Active workloads">
+        <div className="panel-header">
+          <div>
+            <h2>Active workloads</h2>
+            <p>Recently scheduled and currently progressing</p>
           </div>
+        </div>
+        {activeWorkloads.length === 0 ? (
+          <EmptyState title="Nothing is running" detail="No workload in this scope is currently progressing." />
+        ) : (
           <div className="compact-workload-list">
             {activeWorkloads.map((workload) => (
               <button
@@ -210,40 +313,16 @@ export function OverviewPage({
                     <small className="muted">—</small>
                   ) : (
                     <>
-                      <ProgressBar value={workload.progress} label={`${workload.name} progress`} />
+                      <ProgressBar value={workload.progress} label={`${workload.name} progress`} tone="accent" />
                       <small>{workload.progress}%</small>
                     </>
                   )}
                 </span>
-                <ArrowRight size={16} aria-hidden="true" />
+                <ArrowRight size={15} aria-hidden="true" />
               </button>
             ))}
           </div>
-        </div>
-
-        <div className="panel alert-panel">
-          <div className="panel-header">
-            <div>
-              <h2>Needs attention</h2>
-              <p>Capacity and policy conditions</p>
-            </div>
-            <AlertTriangle size={18} aria-hidden="true" />
-          </div>
-          <div className="alert-list">
-            {overview.alerts.map((alert) => (
-              <div className={`alert-item alert-${alert.severity}`} key={alert.id}>
-                <span className="alert-icon" aria-hidden="true">
-                  <AlertTriangle size={16} />
-                </span>
-                <span>
-                  <strong>{alert.title}</strong>
-                  <p>{alert.detail}</p>
-                  <small>{formatRelativeTime(alert.timestamp)}</small>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
+        )}
       </section>
     </div>
   );

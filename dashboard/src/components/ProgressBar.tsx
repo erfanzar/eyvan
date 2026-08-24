@@ -6,10 +6,10 @@
 interface ProgressBarProps {
   value: number;
   label: string;
-  tone?: "green" | "blue" | "amber" | "red" | "violet";
+  tone?: "accent" | "green" | "blue" | "amber" | "red" | "violet";
 }
 
-export function ProgressBar({ value, label, tone = "green" }: ProgressBarProps) {
+export function ProgressBar({ value, label, tone = "accent" }: ProgressBarProps) {
   const normalized = Math.max(0, Math.min(100, value));
   return (
     <div className="progress-wrap">
@@ -21,7 +21,9 @@ export function ProgressBar({ value, label, tone = "green" }: ProgressBarProps) 
         aria-valuemax={100}
         aria-valuenow={normalized}
       >
-        <span className={`progress-fill progress-${tone}`} style={{ width: `${normalized}%` }} />
+        {/* No fill at all at zero. The 2px minimum keeps a 1% bar visible,
+            and on an empty one it draws a tick that reads as "some". */}
+        {normalized > 0 && <span className={`progress-fill progress-${tone}`} style={{ width: `${normalized}%` }} />}
       </div>
     </div>
   );

@@ -9,8 +9,8 @@ import { useMemo, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
-import { formatAcceleratorRequest, formatDateTime, formatMoney, percent } from "../lib/format";
-import type { WorkloadSummary } from "../types";
+import { formatAcceleratorRequest, formatDateTime, formatMoney, percent, titleCase } from "../lib/format";
+import type { WorkloadStatus, WorkloadSummary } from "../types";
 
 interface WorkloadsPageProps {
   workloads: WorkloadSummary[];
@@ -19,10 +19,35 @@ interface WorkloadsPageProps {
   canSubmit: boolean;
 }
 
+/** The filter row's order: what is moving, then what went wrong, then what is done. */
+const STATUS_ORDER: WorkloadStatus[] = [
+  "running",
+  "queued",
+  "planning",
+  "provisioning",
+  "checkpointing",
+  "preempting",
+  "failed",
+  "completed",
+  "cancelled",
+];
+
 export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }: WorkloadsPageProps) {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const [priority, setPriority] = useState("all");
+
+  const counts = useMemo(() => {
+    const tally: Partial<Record<WorkloadStatus, number>> = {};
+    for (const workload of workloads) tally[workload.status] = (tally[workload.status] ?? 0) + 1;
+    return tally;
+  }, [workloads]);
+
+  // Only states this scope actually holds get a chip -- a row of nine filters
+  // that mostly read zero is a row of nine things not to press. The selected
+  // one stays whatever its count falls to, so the filter never vanishes from
+  // under the person using it.
+  const chips = STATUS_ORDER.filter((value) => (counts[value] ?? 0) > 0 || status === value);
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -46,19 +71,36 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
 
   return (
     <div className="page-stack">
-      <section className="workload-summary-strip" aria-label="Workload status summary">
-        <div><span>All</span><strong>{workloads.length}</strong></div>
-        <div><span>Queued</span><strong>{workloads.filter((w) => w.status === "queued").length}</strong></div>
-        <div><span>In progress</span><strong>{workloads.filter((w) => ["running", "planning", "provisioning", "checkpointing"].includes(w.status)).length}</strong></div>
-        <div><span>Failed</span><strong>{workloads.filter((w) => w.status === "failed").length}</strong></div>
-        <div><span>Cancelled</span><strong>{workloads.filter((w) => w.status === "cancelled").length}</strong></div>
+      <section className="status-chips" aria-label="Filter by state">
+        <button
+          className={`status-chip ${status === "all" ? "status-chip-active" : ""}`}
+          type="button"
+          aria-pressed={status === "all"}
+          onClick={() => setStatus("all")}
+        >
+          All
+          <span className="status-chip-count">{workloads.length}</span>
+        </button>
+        {chips.map((value) => (
+          <button
+            key={value}
+            className={`status-chip ${status === value ? "status-chip-active" : ""}`}
+            type="button"
+            aria-pressed={status === value}
+            onClick={() => setStatus(value)}
+          >
+            <span className={`status-chip-dot status-${value}`} aria-hidden="true" />
+            {titleCase(value)}
+            <span className="status-chip-count">{counts[value] ?? 0}</span>
+          </button>
+        ))}
       </section>
 
       <section className="panel data-panel">
         <div className="table-toolbar">
           <div className="filter-group">
             <label className="search-field">
-              <Search size={16} aria-hidden="true" />
+              <Search size={14} aria-hidden="true" />
               <span className="sr-only">Search workloads</span>
               <input
                 type="search"
@@ -66,21 +108,6 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
               />
-            </label>
-            <label className="select-field">
-              <span className="sr-only">Filter by status</span>
-              <select value={status} onChange={(event) => setStatus(event.target.value)}>
-                <option value="all">All statuses</option>
-                <option value="queued">Queued</option>
-                <option value="planning">Planning</option>
-                <option value="provisioning">Provisioning</option>
-                <option value="running">Running</option>
-                <option value="checkpointing">Checkpointing</option>
-                <option value="preempting">Preempting</option>
-                <option value="completed">Completed</option>
-                <option value="failed">Failed</option>
-                <option value="cancelled">Cancelled</option>
-              </select>
             </label>
             <label className="select-field">
               <span className="sr-only">Filter by priority</span>
@@ -93,14 +120,14 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
             </label>
             {(search || status !== "all" || priority !== "all") && (
               <button className="button button-ghost" type="button" onClick={clearFilters}>
-                <FilterX size={16} aria-hidden="true" />
+                <FilterX size={14} aria-hidden="true" />
                 Clear
               </button>
             )}
           </div>
           {canSubmit && (
             <button className="button button-secondary" type="button" onClick={onSubmit}>
-              <Plus size={16} aria-hidden="true" />
+              <Plus size={14} aria-hidden="true" />
               New workload
             </button>
           )}
@@ -117,9 +144,9 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
               <thead>
                 <tr>
                   <th>Workload</th>
-                  <th>Status</th>
+                  <th>State</th>
                   <th>Priority</th>
-                  <th>Resources</th>
+                  <th>Shape</th>
                   <th>Cell</th>
                   <th>Progress</th>
                   <th>Budget</th>
@@ -157,12 +184,12 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                       </td>
                       <td>
                         <StatusBadge value={workload.status} tone={workload.status} />
-                        {workload.queueReason && <small className="cell-note">{workload.queueReason}</small>}
+                        {workload.queueReason && <small className="cell-note" title={workload.queueReason}>{workload.queueReason}</small>}
                       </td>
                       <td><StatusBadge value={workload.priority} tone={workload.priority} dot={false} /></td>
                       <td>
                         <span className="resource-cell">
-                          <strong>
+                          <strong className="monospace">
                             {workload.resources.accelerator
                               ? formatAcceleratorRequest(
                                   workload.resources.accelerator,
@@ -180,13 +207,17 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                           </small>
                         </span>
                       </td>
-                      <td>{workload.cell ?? <span className="muted">Unassigned</span>}</td>
+                      <td className="monospace">{workload.cell ?? <span className="muted">Unassigned</span>}</td>
                       <td>
                         {workload.progress === undefined ? (
                           <span className="muted">—</span>
                         ) : (
                           <span className="table-progress">
-                            <ProgressBar value={workload.progress} label={`${workload.name} progress`} />
+                            <ProgressBar
+                              value={workload.progress}
+                              label={`${workload.name} progress`}
+                              tone={workload.status === "completed" ? "green" : "accent"}
+                            />
                             <small>{workload.progress}%</small>
                           </span>
                         )}
@@ -194,13 +225,15 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                       <td>
                         {budgetTracked ? (
                           <span className="budget-cell">
-                            <strong>{formatMoney(workload.budgetSpent!)}</strong>
+                            <span className="budget-figure">
+                              <strong>{formatMoney(workload.budgetSpent!)}</strong>
+                              <small>of {formatMoney(workload.budgetLimit!)}</small>
+                            </span>
                             <ProgressBar
                               value={budgetPercent}
                               label={`${workload.name} budget utilization`}
-                              tone={budgetPercent > 90 ? "red" : "blue"}
+                              tone={budgetPercent > 90 ? "red" : "accent"}
                             />
-                            <small>of {formatMoney(workload.budgetLimit!)}</small>
                           </span>
                         ) : (
                           <span className="muted">Not tracked</span>

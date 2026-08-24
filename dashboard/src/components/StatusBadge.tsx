@@ -28,10 +28,19 @@ interface StatusBadgeProps {
   value: string;
   tone?: BadgeTone;
   dot?: boolean;
+  /**
+   * Whether the state gets a filled background.
+   *
+   * Off by default, because a table column of filled pills is a column of
+   * colored blocks: the eye reads the shape, stops reading the word, and every
+   * row shouts equally. A washed chip is for the one place there is exactly one
+   * of them -- a record's own heading.
+   */
+  chip?: boolean;
 }
 
-export function StatusBadge({ value, tone, dot = true }: StatusBadgeProps) {
-  const className = `status-badge status-${tone ?? value.toLowerCase()}`;
+export function StatusBadge({ value, tone, dot = true, chip = false }: StatusBadgeProps) {
+  const className = `status-badge${chip ? " status-badge-chip" : ""} status-${tone ?? value.toLowerCase()}`;
   return (
     <span className={className}>
       {dot && <span className="status-dot" aria-hidden="true" />}

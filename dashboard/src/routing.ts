@@ -22,7 +22,12 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   if (section === "workloads" && id) {
     return { section: "workloads", workloadId: decodeURIComponent(id) };
   }
-  if (["workloads", "fleet", "capacity", "budgets", "audit"].includes(section)) {
+  // Every section the rail offers, or the rail has an item that navigates to
+  // the overview. `billing` was missing here while it had a nav entry, a page,
+  // and an availability flag -- so pressing Billing set the hash, the hash
+  // parsed back to overview, and the section could only be reached by not
+  // reloading.
+  if (["workloads", "fleet", "capacity", "billing", "budgets", "audit"].includes(section)) {
     return { section: section as Section };
   }
   return { section: "overview" };

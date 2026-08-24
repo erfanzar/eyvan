@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Clock, Receipt, Users } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { MetricCard } from "../components/MetricCard";
@@ -72,50 +72,48 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
     <div className="page-stack">
       <section className="metric-grid" aria-label="What the fleet has run">
         <MetricCard
-          icon={Clock}
           label="Cell time"
           value={hours(billing.billed_seconds)}
           detail={`across ${billing.cells} cell(s)`}
+          tone="accent"
         />
         <MetricCard
-          icon={Clock}
           label="Idle"
           value={hours(billing.idle_seconds)}
           detail="provisioned, holding no lease"
+          tone="warning"
         />
         <MetricCard
-          icon={Receipt}
           label="Accrued"
           value={everyCellUnpriced ? "Not costed" : formatSpend(billing.accrued_cost)}
           detail={everyCellUnpriced ? "no pool declares a unit price" : "at declared unit prices"}
+          tone={everyCellUnpriced ? "warning" : "positive"}
         />
         <MetricCard
-          icon={Users}
           label="People"
           value={String(usage.subjects.length)}
           detail="submitted work in this project"
+          tone="accent"
         />
       </section>
 
       {unpriced && (
         <section className="panel data-panel" aria-label="Why cost is not reported">
           <div className="panel-header">
+            <AlertTriangle className="panel-header-warning" size={15} aria-hidden="true" />
             <div>
               <h2>{everyCellUnpriced ? "Nothing here is costed" : "Some of this is not costed"}</h2>
               <p>
                 {billing.unpriced_cells} of {billing.cells} cell(s) belong to a pool that declares no unit price
               </p>
             </div>
-            <AlertTriangle size={18} aria-hidden="true" />
           </div>
-          <div className="resource-row-detail">
-            <span>
-              The hours above are measured and real. The money is not: Eyvan multiplies usage by a price somebody
-              declares, and with none declared every total is structurally zero — which reads exactly like a free
-              fleet. Declare <code>unit_prices</code> on a pool to cost it, including <code>0</code> for capacity
-              you hold under a grant, so this page can say <em>free</em> rather than <em>unknown</em>.
-            </span>
-          </div>
+          <p className="panel-note">
+            The hours above are measured and real. The money is not: Eyvan multiplies usage by a price somebody
+            declares, and with none declared every total is structurally zero — which reads exactly like a free
+            fleet. Declare <code>unit_prices</code> on a pool to cost it, including <code>0</code> for capacity
+            you hold under a grant, so this page can say <em>free</em> rather than <em>unknown</em>.
+          </p>
         </section>
       )}
 
@@ -125,7 +123,6 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
             <h2>Who used what</h2>
             <p>Settled leases, attributed to whoever submitted the workload</p>
           </div>
-          <Users size={18} aria-hidden="true" />
         </div>
         {usage.subjects.length === 0 ? (
           <EmptyState title="Nobody has submitted work yet" detail="Usage appears here once a workload settles." />
@@ -135,10 +132,10 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
               <thead>
                 <tr>
                   <th>Person</th>
-                  <th>Runs</th>
-                  <th>Accelerator hours</th>
-                  <th>Running</th>
-                  <th>Cost</th>
+                  <th className="numeric">Runs</th>
+                  <th className="numeric">Accelerator hours</th>
+                  <th className="numeric">Running</th>
+                  <th className="numeric">Cost</th>
                 </tr>
               </thead>
               <tbody>
@@ -147,7 +144,7 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
                     <td>
                       <strong>{subject.subject}</strong>
                     </td>
-                    <td>
+                    <td className="numeric">
                       <span className="resource-cell">
                         <strong>{subject.workloads}</strong>
                         {subject.settledWorkloads !== subject.workloads && (
@@ -155,11 +152,11 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
                         )}
                       </span>
                     </td>
-                    <td>{subject.acceleratorHours.toFixed(2)}</td>
-                    <td>{hours(subject.runningSeconds)}</td>
+                    <td className="numeric">{subject.acceleratorHours.toFixed(2)}</td>
+                    <td className="numeric">{hours(subject.runningSeconds)}</td>
                     {/* Zero beside real hours is a missing price, not a free
                         run, and saying so here is the whole point of the page. */}
-                    <td>
+                    <td className="numeric">
                       {subject.unpricedLeases > 0 ? (
                         <span className="resource-cell">
                           <strong>Not costed</strong>

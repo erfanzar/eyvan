@@ -1153,8 +1153,10 @@ export default function App({ client = apiClient, identityProvider = currentIden
           <OverviewPage
             overview={data.overview}
             workloads={data.workloads}
+            auditEvents={data.auditEvents}
             onOpenWorkload={openWorkload}
             onShowWorkloads={() => goToSection("workloads")}
+            onShowAudit={sectionAvailability.audit === false ? undefined : () => goToSection("audit")}
             fleetAvailable={data.access.fleetInventory}
           />
         );
@@ -1169,6 +1171,20 @@ export default function App({ client = apiClient, identityProvider = currentIden
         onMobileNavigationChange={setMobileNavigationOpen}
         onNavigate={goToSection}
         onSubmit={openSubmit}
+        onRefresh={() => void refreshDashboard(desiredScopeRef.current)}
+        // Absent rather than zero before the first snapshot lands: a section
+        // nobody has read yet and an empty one are the same number and
+        // opposite facts.
+        counts={
+          data
+            ? {
+                workloads: data.workloads.length,
+                fleet: data.access.fleetInventory ? data.cells.length : undefined,
+                audit: data.auditEvents.length,
+                budgets: data.budgets.length,
+              }
+            : undefined
+        }
         sectionAvailability={sectionAvailability}
         health={data?.health}
         live={canReadSelectedScope ? live : undefined}
