@@ -447,6 +447,7 @@ _CELL_LIFECYCLE_TOPIC_BY_STATE: tp.Final[dict[CellState, str]] = {
     CellState.DRAINING: "capacity.drain",
     CellState.DELETING: "capacity.release",
 }
+_LIVE_OUTBOX_STATES: tp.Final[frozenset[OutboxState]] = frozenset({OutboxState.PENDING, OutboxState.PROCESSING})
 _ACTIVE_CAPACITY_APPLY_STATES: tp.Final[frozenset[OutboxState]] = frozenset(
     {OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED}
 )
@@ -708,11 +709,13 @@ class ControlPlaneService:
 
     @staticmethod
     async def _workload_delivery(tx: tp.Any, workload: WorkloadRecord) -> OutboxRecord | None:
-        """Return the newest durable command carrying this workload, if any.
+        """Return the newest still-moving command carrying this workload.
 
         Looked up by aggregate rather than remembered on the workload, so it
         cannot drift from the record that actually decides whether the workload
-        reaches its cell.
+        reaches its cell. Settled commands -- delivered, failed for good, or
+        discarded -- are excluded: explaining a succeeded run with "its dispatch
+        command is being retried" described a corpse as if it were moving.
         """
 
         try:
@@ -721,6 +724,7 @@ class ControlPlaneService:
             # Explaining a workload must never fail because the delivery lookup
             # did; the scheduling answer above is still worth returning.
             return None
+        commands = [command for command in commands if command.state in _LIVE_OUTBOX_STATES]
         if not commands:
             return None
         return max(commands, key=lambda command: command.updated_at)

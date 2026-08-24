@@ -16,6 +16,8 @@ from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
+    OutboxRecord,
+    OutboxState,
     Principal,
     ResourceGang,
     ResourceVector,
@@ -129,6 +131,36 @@ async def test_explain_does_not_schedule_a_workload_that_is_not_pending() -> Non
     assert explanation.placeable is False
     assert explanation.code is None
     assert "only pending workloads are scheduled" in (explanation.message or "")
+
+
+async def test_explain_does_not_call_a_settled_command_live() -> None:
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    workload = await _submit(service, _spec())
+    async with repository.transaction() as transaction:
+        stored = await transaction.get_workload(workload.id)
+        assert stored is not None
+        await transaction.put_workload(stored.model_copy(update={"state": WorkloadState.SUCCEEDED}))
+        await transaction.put_outbox(
+            OutboxRecord(
+                id="dispatch-corpse",
+                topic="workload.dispatch",
+                aggregate_type="workload",
+                aggregate_id=workload.id,
+                idempotency_key="dispatch:corpse",
+                generation=stored.generation,
+                payload={"lease_id": stored.lease_id or "lease_x", "cell_id": "cell_x"},
+                state=OutboxState.FAILED,
+                attempts=9,
+            )
+        )
+
+    explanation = await service.explain_workload(_principal(Role.PROJECT_OPERATOR), workload.id)
+
+    assert explanation.placeable is False
+    message = explanation.message or ""
+    assert "only pending workloads are scheduled" in message
+    assert "being retried" not in message
 
 
 async def test_explain_carries_the_durable_scheduling_reason() -> None:
