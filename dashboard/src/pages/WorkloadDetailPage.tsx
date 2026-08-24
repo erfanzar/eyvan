@@ -472,7 +472,10 @@ const filteredLogs = useMemo(() => {
                   beside the shape they qualify, not in a band of five tiles
                   repeating what the panels below already say. */}
               <div><dt>Submitted</dt><dd>{formatDateTime(workload.submittedAt)}</dd></div>
-              <div><dt>Placement</dt><dd className="monospace">{workload.cell ?? "Pending"}</dd></div>
+              <div><dt>Placement</dt><dd className="monospace">{
+                workload.cell
+                  ?? (["succeeded", "failed", "cancelled"].includes(workload.status) ? "Released" : "Pending")
+              }</dd></div>
               <div><dt>Progress</dt><dd>{workload.progress === undefined ? "—" : `${workload.progress}%`}</dd></div>
               <div><dt>Capacity lease</dt><dd className="monospace">{workload.leaseId ?? "None held"}</dd></div>
             </dl>
