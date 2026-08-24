@@ -724,7 +724,16 @@ class ControlPlaneService:
             # Explaining a workload must never fail because the delivery lookup
             # did; the scheduling answer above is still worth returning.
             return None
-        commands = [command for command in commands if command.state in _LIVE_OUTBOX_STATES]
+        # A still-scheduled workload's failed command is alive -- the outbox is
+        # retrying it. The same state on a terminal workload is a corpse: settle
+        # stops the clock, so nothing can move it again.
+        terminal = workload.state in {
+            WorkloadState.SUCCEEDED,
+            WorkloadState.FAILED,
+            WorkloadState.CANCELLED,
+        }
+        live = _LIVE_OUTBOX_STATES if terminal else _LIVE_OUTBOX_STATES | {OutboxState.FAILED}
+        commands = [command for command in commands if command.state in live]
         if not commands:
             return None
         return max(commands, key=lambda command: command.updated_at)
