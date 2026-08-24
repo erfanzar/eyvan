@@ -602,19 +602,30 @@ code,
   min-width: 0;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: 8px;
   background: var(--surface);
-  box-shadow: var(--shadow);
 }
 
 .panel-header,
 .section-toolbar {
   display: flex;
-  min-height: 61px;
+  min-height: 44px;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 13px 16px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-header h2,
+.section-toolbar h2 {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.panel-header p {
+  margin-top: 1px;
+  font-size: var(--text-xs);
 }
 
 .panel-header > div,
@@ -624,9 +635,7 @@ code,
 
 .panel-header p,
 .section-toolbar p {
-  margin-top: 3px;
   color: var(--text-muted);
-  font-size: var(--text-sm);
 }
 
 .metric-grid {
@@ -1508,7 +1517,8 @@ code,
 .log-stream { min-height: 390px; max-height: 620px; overflow: auto;
   background: #1c201d;
   color: #dce4df; font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--text-xs); }
-.log-line { display: grid; grid-template-columns: 102px 45px 100px minmax(420px, 1fr); gap: 9px; min-height: 34px; align-items: start; padding: 9px 13px; border-bottom: 1px solid rgba(255, 255, 255, 0.055); }
+.log-line { display: grid; grid-template-columns: 96px 40px 96px minmax(380px, 1fr); gap: 9px; min-height: 24px; align-items: baseline; padding: 3px 13px; border-bottom: 0; font-size: var(--text-xs); line-height: 1.55; }
+.log-line:hover { background: var(--surface-muted); }
 .log-line time { color: var(--text-soft); }
 .log-level { color: var(--ok); font-weight: 800; }
 .log-warn .log-level { color: var(--amber); }
