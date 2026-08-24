@@ -224,8 +224,8 @@ code,
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--radius-md);
-  background: #275a48;
-  color: #effaf5;
+  background: var(--accent);
+  color: #ffffff;
 }
 
 .brand-name {
@@ -305,8 +305,8 @@ code,
 .sidebar-nav {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 10px;
+  gap: 1px;
+  padding: 8px;
 }
 
 .nav-label {
@@ -320,16 +320,16 @@ code,
 .nav-item {
   display: flex;
   width: 100%;
-  min-height: 40px;
+  min-height: 34px;
   align-items: center;
-  gap: 11px;
-  padding: 0 11px;
+  gap: 9px;
+  padding: 0 10px;
   border: 0;
-  border-radius: var(--radius-md);
+  border-radius: 6px;
   background: transparent;
   color: var(--text-soft);
-  font-size: var(--text-md);
-  font-weight: 600;
+  font-size: var(--text-sm);
+  font-weight: 500;
   text-align: left;
 }
 
@@ -339,8 +339,13 @@ code,
 }
 
 .nav-item-active {
-  background: #284a3e;
-  color: #ffffff;
+  background: var(--accent-soft);
+  color: #dfe2ff;
+}
+
+.nav-item:hover .nav-icon,
+.nav-item-active .nav-icon {
+  color: var(--accent);
 }
 
 .sidebar-footer {
