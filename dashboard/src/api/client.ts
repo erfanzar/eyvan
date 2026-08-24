@@ -530,7 +530,11 @@ const CONTROL_PLANE_TIMEOUT_MS = 3_500;
  * page timed out on every workload whose logs were remote, which is every
  * workload that has actually run somewhere.
  */
-const WORKER_FORWARDED_TIMEOUT_MS = 30_000;
+// Forwarded log reads go browser -> plane -> cell agent. A dead or churning
+    // agent used to hold the whole detail page hostage for thirty seconds; the
+    // archive serves this attempt's history anyway, so five seconds is plenty
+    // before falling back to it.
+    const WORKER_FORWARDED_TIMEOUT_MS = 5_000;
 
 /**
  * Budget for a read the control plane answers by calling the cloud provider.
