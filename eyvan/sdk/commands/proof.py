@@ -410,7 +410,13 @@ def evaluate_warm_window(inside: dict, outside: dict, billing: dict, *, pool_id:
 
     if after.get("window_active"):
         checks.append(_unknown("window-closed", "the second observation was still inside the window"))
-    elif int(after.get("floor", 0)) >= floor and floor > 0:
+    elif floor <= 0:
+        # A floor that was never raised cannot be observed being released. Read
+        # as a pass, this reported the window working on a run where the window
+        # did nothing -- and it is the *cheap* half to satisfy, because a pool
+        # sitting at zero all day satisfies it every time.
+        checks.append(_unknown("floor-released", "no floor was raised, so its release says nothing"))
+    elif int(after.get("floor", 0)) >= floor:
         checks.append(
             _failed(
                 "floor-released",

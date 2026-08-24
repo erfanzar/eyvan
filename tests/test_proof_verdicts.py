@@ -534,6 +534,27 @@ def test_a_floor_that_never_released_fails() -> None:
     assert _check(result, "floor-released") is Verdict.FAIL
 
 
+def test_a_floor_that_was_never_raised_settles_nothing_by_falling() -> None:
+    """Found by auditing every criterion for the class P5's cooldown check had.
+
+    A window that raised no floor releases nothing, and reading that as a pass
+    reported the window working on a run where it did nothing at all. It is the
+    *cheap* half to satisfy, too: a pool sitting at zero all day meets it on
+    every observation, so the one shape that cannot establish the claim was the
+    one shape guaranteed to look like it had.
+    """
+
+    result = evaluate_warm_window(
+        _warmth(active=True, floor=0, warm=0),
+        _warmth(active=False, floor=0, warm=0),
+        _billing(),
+        pool_id="research/cpu",
+    )
+
+    assert _check(result, "floor-released") is Verdict.INCONCLUSIVE
+    assert result.verdict is not Verdict.PASS
+
+
 def test_a_floor_that_was_never_held_fails() -> None:
     """The window's whole promise: the 09:00 latency happens anyway without it."""
 

@@ -1225,6 +1225,33 @@ other slices. P6 needs wall-clock time and nothing else, so it can overlap
 anything. P8 goes last, after the others have confirmed the individual
 behaviours it assumes.
 
+## Every criterion audited for the vacuous pass, 2026-08-13
+
+P5's cooldown criterion could go green by garbage collection: the cell carrying
+the evidence is deleted and awaiting recreation while the proof runs, so once it
+was reaped "no cell is cooling" became true and the build that set the cooldown
+qualified itself. That was found by accident, while re-running a failure. It is
+the worst thing a proof can do -- worse than no proof, because it certifies -- so
+the same question was put to every other criterion: **can this report a pass on
+a run that never exercised the behaviour?**
+
+Mostly, no. P1, P2, P3, P4 and P7 are guarded throughout: a fleet that never
+applied, a pool with no cell, a page with no records, a parent that submitted no
+children, a ledger with no secret event, a Kubernetes case the run skipped --
+each returns INCONCLUSIVE and says which dimension is open. P4 goes further and
+refuses to credit its own log grep on a secret-bearing workload, because the
+plane serves no log output there and passing quietly would claim an inspection
+that never happened.
+
+One real instance beyond P5, in P6. `floor-released` read a floor of zero falling
+to zero as a release, so a window that raised no floor reported the release
+working. It is the cheap half to satisfy as well: a pool sitting at zero all day
+meets it on every observation, so the one shape that cannot establish the claim
+was the one shape guaranteed to look like it had. Now INCONCLUSIVE.
+
+The audit is a negative result and is recorded because of it. The next person to
+suspect this class should know it was already asked of all eight, and when.
+
 ## Historical notes are not proof receipts
 
 Unversioned operator notes and point-in-time invariant output can motivate a
