@@ -402,6 +402,7 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
         "test_migrations.py",
         "test_postgres_semantics.py",
         "test_queue_trend.py",
+        "test_readonly_query_console.py",
         "test_scoped_artifact_migration_postgres.py",
         "test_secret_dispatch_transactions.py",
         "test_services_operations_postgres.py",

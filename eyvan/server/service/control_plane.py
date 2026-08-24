@@ -131,7 +131,7 @@ from eyvan.records import (
     validate_capacity_pool_quota_groups,
 )
 from eyvan.secrets import matching_secret_reference_root
-from eyvan.server.persistence.base import Repository, RepositorySession
+from eyvan.server.persistence.base import ReadOnlyQueryResult, Repository, RepositorySession
 from eyvan.server.service.authz import Authorizer
 from eyvan.server.service.batch import (
     DEFAULT_MAX_FAN_OUT,
@@ -200,6 +200,11 @@ from eyvan.server.service.subjobs import (
     validate_parent,
 )
 from eyvan.worker.runtime.node_health import HostFaultProof, parse_host_fault_marker
+
+#: How much of a statement the audit ledger keeps. Enough to recognise the
+#: query during a review, bounded so one pasted statement cannot dominate the
+#: ledger.
+_QUERY_AUDIT_STATEMENT_LIMIT = 4000
 
 
 def _new_id(prefix: str) -> str:
@@ -4629,6 +4634,42 @@ class ControlPlaneService:
             if quota is None:
                 raise NotFoundError("quota was not found")
             return quota
+
+    async def run_readonly_query(
+        self,
+        principal: Principal,
+        statement: str,
+        *,
+        limit: int,
+        timeout_ms: int,
+    ) -> ReadOnlyQueryResult:
+        """Answer one read-only statement against this plane's own database.
+
+        Gated on ``MANAGE_FLEET`` rather than ``OPERATE``. A statement reads
+        whatever the schema holds, across every organization and project, and no
+        row filter applied afterwards could make that safe for a per-project
+        operator -- the scope of a raw read is the database, not the caller's
+        grants, so only the role whose scope is also the whole fleet may have it.
+
+        Audited before it runs and whether or not it succeeds. The interesting
+        query during an incident is often the one that timed out or was refused,
+        and a ledger that records only successes hides exactly the attempts a
+        reviewer would want to see.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        async with self.repository.transaction() as tx:
+            await self._audit_scoped(
+                tx,
+                principal,
+                org_id=None,
+                project_id=None,
+                entity_type="control-plane",
+                entity_id="readonly-query",
+                action="query.executed",
+                payload={"statement": statement[:_QUERY_AUDIT_STATEMENT_LIMIT], "limit": limit},
+            )
+        return await self.repository.readonly_query(statement, limit=limit, timeout_ms=timeout_ms)
 
     async def list_quotas(
         self,

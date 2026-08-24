@@ -94,6 +94,10 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
 #: question does not arise -- but they are listed rather than omitted, because
 #: "needs fleet admin" is a claim worth failing on if it ever stops being true.
 FLEET_ONLY_ROUTES: dict[str, str] = {
+    # Reads whatever the schema holds, across every tenant, so no filter applied
+    # to the rows afterwards could make it project-scoped. Fleet administration
+    # is the only role whose scope is also the whole database.
+    "POST /api/v1/query": "ad-hoc read-only SQL over the whole control plane",
     "GET /api/v1/cells": "fleet capacity inventory",
     "GET /api/v1/cells/{cell_id}": "one cell's provider state",
     "POST /api/v1/cells": "register capacity",

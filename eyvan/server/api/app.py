@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from pydantic import ValidationError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from eyvan._internal.build_identity import build_identity
@@ -136,6 +137,8 @@ from eyvan.server.api.schemas import (
     ProjectRegisterRequest,
     QuotaGrantIssueRequest,
     QuotaPutRequest,
+    ReadOnlyQueryRequest,
+    ReadOnlyQueryResponse,
     RoleGrantIssueRequest,
     ServiceEndpointRequest,
     ServiceHealthResponse,
@@ -161,7 +164,7 @@ from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
 from eyvan.server.local.profile import LocalArtifactTokenKeyStore
-from eyvan.server.persistence.base import Repository, TransientRepositoryError
+from eyvan.server.persistence.base import ReadOnlyQueryUnsupported, Repository, TransientRepositoryError
 from eyvan.server.persistence.leader import PostgresAdvisoryLeader
 from eyvan.server.persistence.local import LocalJsonRepository
 from eyvan.server.persistence.memory import InMemoryRepository
@@ -832,6 +835,39 @@ def create_app(
             platform=identity.platform,
             controller=startup.controller_mode,
         )
+
+    @app.post("/api/v1/query", response_model=ReadOnlyQueryResponse, tags=["system"])
+    async def readonly_query(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+        request: ReadOnlyQueryRequest,
+    ) -> ReadOnlyQueryResponse:
+        """Answer one read-only statement against this plane's own database.
+
+        The triage surface the typed endpoints cannot cover: during an incident
+        the question is usually a join nobody anticipated, and the alternative to
+        this is an operator opening ``psql`` on the head with write access and no
+        ledger entry.
+
+        Read-ness is enforced by the transaction rather than by inspecting the
+        SQL, and the authorization is ``MANAGE_FLEET`` because the scope of a raw
+        read is the whole database rather than the caller's grants.
+        """
+
+        try:
+            result = await service.run_readonly_query(
+                principal,
+                request.statement,
+                limit=request.limit,
+                timeout_ms=settings.readonly_query_timeout_ms,
+            )
+        except ReadOnlyQueryUnsupported as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
+        except DBAPIError as error:
+            # The statement was wrong -- bad column, syntax, or a write the
+            # read-only transaction refused. That is the caller's mistake rather
+            # than this plane failing, so it must not read as a 500.
+            raise HTTPException(status_code=400, detail=str(error.orig or error)) from error
+        return ReadOnlyQueryResponse(columns=result.columns, rows=result.rows, truncated=result.truncated)
 
     @app.get("/api/v1/session", response_model=SessionResponse, tags=["system"])
     async def session_authority(

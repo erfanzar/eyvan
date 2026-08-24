@@ -71,7 +71,12 @@ from eyvan.records import (
     WorkloadState,
     utcnow,
 )
-from eyvan.server.persistence.base import SchemaRevisionMismatch, TransientRepositoryError
+from eyvan.server.persistence.base import (
+    ReadOnlyQueryResult,
+    ReadOnlyQueryUnsupported,
+    SchemaRevisionMismatch,
+    TransientRepositoryError,
+)
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
 SCHEMA_REVISION = "0018_service_operations"
@@ -1565,6 +1570,52 @@ class SqlAlchemyRepository:
             engine.execution_options(isolation_level="READ COMMITTED"),
             expire_on_commit=False,
         )
+
+    async def readonly_query(
+        self,
+        statement: str,
+        *,
+        limit: int,
+        timeout_ms: int,
+    ) -> ReadOnlyQueryResult:
+        """Answer one ad-hoc statement on a transaction that cannot write.
+
+        ``SET TRANSACTION READ ONLY`` is the guarantee here, not the shape of the
+        statement. Deciding read-ness by inspecting SQL is a filter that has to
+        be right about every dialect feature -- ``WITH ... DELETE``, a volatile
+        function, a writable CTE -- and being wrong once is a write. PostgreSQL
+        already knows how to refuse writes, so it is asked to.
+
+        Which is why a database that cannot be asked is refused outright rather
+        than served without the guarantee. SQLite backs development planes and
+        has no read-only transaction mode; running arbitrary statements there
+        with only a missing ``COMMIT`` between them and the schema is precisely
+        the unguarded console this route exists to replace.
+
+        The connection is opened and never committed, so even a statement that
+        somehow slipped past the transaction mode leaves nothing behind.
+        """
+
+        if self.engine.dialect.name != "postgresql":
+            raise ReadOnlyQueryUnsupported(
+                f"a {self.engine.dialect.name!r} database cannot enforce a read-only transaction; "
+                "this console is available on PostgreSQL-backed planes"
+            )
+        async with self.engine.connect() as connection:
+            await connection.execute(text("SET TRANSACTION READ ONLY"))
+            await connection.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+            result = await connection.execute(text(statement))
+            if result.returns_rows is False:
+                return ReadOnlyQueryResult(columns=(), rows=(), truncated=False)
+            # One row past the cap, so a result that exactly fills it is still
+            # known to be complete rather than reported as truncated.
+            fetched = result.fetchmany(limit + 1)
+            truncated = len(fetched) > limit
+            return ReadOnlyQueryResult(
+                columns=tuple(str(key) for key in result.keys()),
+                rows=tuple(tuple(row) for row in fetched[:limit]),
+                truncated=truncated,
+            )
 
     async def open(self) -> None:
         """Refuse to serve a database whose schema this build does not match.

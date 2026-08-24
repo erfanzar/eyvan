@@ -43,7 +43,7 @@ from eyvan.records import (
     WorkloadState,
     utcnow,
 )
-from eyvan.server.persistence.base import RepositorySession
+from eyvan.server.persistence.base import ReadOnlyQueryUnsupported, RepositorySession
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
 #: Outbox states safe to delete. Both are absorbing, so removing a row cannot
@@ -728,6 +728,18 @@ class StateRepository:
         """Close the repository lifecycle. In-memory state has no resources."""
 
         return None
+
+    async def readonly_query(self, statement: str, *, limit: int, timeout_ms: int) -> tp.NoReturn:
+        """Refuse: this store answers typed reads, not statements.
+
+        Refusing beats returning nothing. An operator opens this console during
+        an incident, and "no rows" from a store that was never queried reads as
+        "the fleet is empty" -- the most alarming possible wrong answer at the
+        worst possible moment.
+        """
+
+        del statement, limit, timeout_ms
+        raise ReadOnlyQueryUnsupported("this control plane is not backed by a SQL database")
 
     async def ping(self) -> None:
         """In-memory state is reachable whenever this process is."""

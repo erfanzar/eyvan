@@ -45,6 +45,29 @@ class TransientRepositoryError(RuntimeError):
     """A serializable transaction must be retried from a fresh snapshot."""
 
 
+class ReadOnlyQueryUnsupported(RuntimeError):
+    """This repository cannot answer an ad-hoc read-only query.
+
+    Raised rather than returning an empty result: a console that answers "no
+    rows" on a store it cannot read at all would have an operator conclude the
+    fleet is empty during the incident they opened the console for.
+    """
+
+
+class ReadOnlyQueryResult(tp.NamedTuple):
+    """One answered read-only query.
+
+    ``truncated`` is carried rather than inferred from ``len(rows)``: a query
+    whose result happens to equal the cap is indistinguishable from one that was
+    cut short, and an operator reading a truncated answer as a complete one is
+    the failure this whole surface has to avoid.
+    """
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[object, ...], ...]
+    truncated: bool
+
+
 class SchemaRevisionMismatch(RuntimeError):
     """The database schema is not the revision this build was written against.
 

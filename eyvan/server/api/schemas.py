@@ -952,6 +952,27 @@ class BuildResponse(ApiModel):
     controller: ServerControllerMode
 
 
+class ReadOnlyQueryRequest(ApiModel):
+    """One ad-hoc read against this plane's own database."""
+
+    statement: str = Field(min_length=1, max_length=20_000)
+    limit: int = Field(default=200, ge=1, le=10_000)
+
+
+class ReadOnlyQueryResponse(ApiModel):
+    """Rows, and whether there were more of them.
+
+    ``truncated`` is reported rather than left to the caller to infer from the
+    row count against the limit: those are indistinguishable when a result
+    exactly fills the cap, and reading a cut-short answer as a complete one is
+    the mistake this surface must not make easy.
+    """
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[tp.Any, ...], ...]
+    truncated: bool
+
+
 class ErrorResponse(ApiModel):
     detail: str
 

@@ -92,6 +92,9 @@ class EyvanSettings:
     #: the workload for a reason that has nothing to do with its secrets. The
     #: binding that actually revokes is the attempt, not this.
     secret_token_ttl_s: int = 3600
+    #: Ceiling on one ad-hoc read-only query. Bounded so a mistyped join
+    #: cannot hold a database connection for the length of an incident.
+    readonly_query_timeout_ms: int = 15_000
     scheduler_interval_s: float = 2.0
     cell_reconcile_interval_s: float = 15.0
     cell_reconcile_concurrency: int = 8
@@ -537,6 +540,9 @@ class EyvanSettings:
                 os.getenv("EYVAN_ARTIFACT_MAX_RESULT_BYTES", defaults.artifact_max_result_bytes)
             ),
             secret_token_ttl_s=int(os.getenv("EYVAN_SECRET_TOKEN_TTL_S", defaults.secret_token_ttl_s)),
+            readonly_query_timeout_ms=int(
+                os.getenv("EYVAN_READONLY_QUERY_TIMEOUT_MS", defaults.readonly_query_timeout_ms)
+            ),
             artifact_max_workspace_bytes=int(
                 os.getenv("EYVAN_ARTIFACT_MAX_WORKSPACE_BYTES", defaults.artifact_max_workspace_bytes)
             ),
