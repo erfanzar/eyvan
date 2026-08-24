@@ -949,10 +949,12 @@ describe("the workload detail page under a slow worker", () => {
     expect(detail.id).toBe("wl-1");
   });
 
-  it("gives the worker-forwarded read a longer budget than a control-plane read", async () => {
-    // Not merely "a bigger number": the two reads have different physics. One is
-    // answered from the plane's own store, the other is a network round trip to a
-    // TPU VM.
+  it("gives the worker-forwarded read a longer, but bounded, budget", async () => {
+    // The two reads have different physics: one is answered from the plane's
+    // own store, the other is a network round trip to a TPU VM that may be
+    // gone. The forwarded read earns extra patience -- but it must stay
+    // bounded, because its failure holds the detail page's loading gate and
+    // the archive serves this attempt's history the moment it gives up.
     const seen: number[] = [];
     const original = globalThis.setTimeout;
     vi.stubGlobal("setTimeout", ((fn: () => void, ms?: number) => {
@@ -964,7 +966,7 @@ describe("the workload detail page under a slow worker", () => {
     await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
 
     expect(Math.max(...seen)).toBeGreaterThan(Math.min(...seen));
-    expect(Math.max(...seen)).toBeGreaterThanOrEqual(30_000);
+    expect(Math.max(...seen)).toBeLessThanOrEqual(5_000);
   });
 });
 
