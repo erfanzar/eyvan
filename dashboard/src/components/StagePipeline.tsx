@@ -83,6 +83,12 @@ function fmt(seconds: number): string {
  * Derived, never stored: the record's own facts are the only input.
  */
 export function pipelinePosition(status: string, phase?: string): { active: number; activeLabel: string } {
+  // Terminal state outranks everything. A finished job's progress record can
+  // still carry the last acquisition phase it saw before settle; trusting that
+  // left succeeded runs painted as stuck mid-acquisition.
+  if (STATE_TO_STAGE[status] === "settled") {
+    return { active: PIPELINE_STAGES.length - 1, activeLabel: "Settled" };
+  }
   const fromPhase = phase ? PHASE_TO_STAGE[phase] : undefined;
   const fromState = STATE_TO_STAGE[status];
   const key = fromPhase ?? fromState ?? "submit";
