@@ -2219,6 +2219,11 @@ code,
 .log-line { display: grid; grid-template-columns: 96px 52px 108px minmax(280px, 1fr); gap: 10px; min-height: 24px; align-items: baseline; padding: 2px 14px; line-height: 1.7; transition: background 120ms ease; }
 .log-line:hover { background: var(--surface-muted); }
 .log-line time { color: var(--log-dim); font-variant-numeric: tabular-nums; }
+/* Archive-replayed lines carry no metadata: give them the whole row
+   instead of three empty placeholders pretending to be columns. */
+.log-line.log-bare { grid-template-columns: 1fr; }
+.log-line.log-bare code { grid-column: 1; }
+.log-line .log-source { font-variant-numeric: tabular-nums; }
 .log-line code { color: var(--log-text); white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-level { color: var(--text-soft); font-weight: 500; }
 .log-warn .log-level { color: var(--amber); }

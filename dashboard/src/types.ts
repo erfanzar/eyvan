@@ -103,6 +103,8 @@ export interface TimelineEvent {
 
 export interface LogEntry {
   id: string;
+  /** Set when consecutive ranks printed this exact line: how many did. */
+  repeat?: number;
   /** Present only when the log line carries a parseable timestamp. */
   timestamp?: string;
   /** Present only when the log line carries a recognized level token. */

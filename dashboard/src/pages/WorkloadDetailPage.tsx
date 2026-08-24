@@ -308,7 +308,26 @@ export function WorkloadDetailPage({
   }, [workload.id]);
 
   const shownLogs = following ? followed.entries : workload.logs;
-  const filteredLogs = useMemo(() => {
+  // Identical lines printed by every rank say one thing N times. Collapse
+    // each consecutive run to one row carrying an xN badge -- except rank-
+    // specific lines, which differ by construction and stay separate.
+    const collapsedLogs: typeof workload.logs = [];
+    for (const entry of workload.logs) {
+      const previous = collapsedLogs[collapsedLogs.length - 1];
+      if (
+        previous &&
+        previous.message === entry.message &&
+        previous.level === entry.level &&
+        !previous.source &&
+        !entry.source
+      ) {
+        previous.repeat = (previous.repeat ?? 1) + 1;
+        continue;
+      }
+      collapsedLogs.push({ ...entry });
+    }
+const filteredLogs = useMemo(() => {
+    const source = collapsedLogs;
     const query = logQuery.trim().toLowerCase();
     return shownLogs.filter(
       (log) =>
@@ -664,12 +683,12 @@ export function WorkloadDetailPage({
           >
             {filteredLogs.map((log: LogEntry) => (
               <div
-                className={`log-line${log.level ? ` log-${log.level.toLowerCase()}` : ""}${log.stream === "stderr" ? " log-stderr" : ""}`}
+                className={`log-line${log.level ? ` log-${log.level.toLowerCase()}` : ""}${log.stream === "stderr" ? " log-stderr" : ""}${!log.timestamp && !log.level && !log.source ? " log-bare" : ""}`}
                 key={log.id}
               >
-                <time>{log.timestamp ? log.timestamp.slice(11, 23) : "—"}</time>
-                <span className="log-level">{log.level ?? "—"}</span>
-                <span className="log-source">{log.source ?? "—"}</span>
+                <time>{log.timestamp ? log.timestamp.slice(11, 23) : ""}</time>
+                <span className="log-level">{log.level ?? ""}</span>
+                <span className="log-source">{log.source ?? (log.repeat ? `×${log.repeat}` : "")}</span>
                 <code>{log.message}</code>
               </div>
             ))}
