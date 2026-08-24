@@ -1096,6 +1096,14 @@ class WorkloadExplanation(EyvanModel):
     scheduling_reason: str | None = None
     autoscale_block_reason: AutoscaleBlockReason | None = None
     queue_admission_denial: GcpQueueAdmissionDenialTarget | None = None
+    #: How the durable command that carries this workload to its cell is faring.
+    #: A workload past PENDING is no longer the scheduler's business, and the
+    #: honest answer to "why is it not running" moves to delivery -- which was
+    #: previously visible nowhere. A dispatch failed ten times over twenty-one
+    #: minutes while this endpoint said only "workload is leased".
+    delivery_state: str | None = None
+    delivery_attempts: int = Field(default=0, ge=0)
+    delivery_error: str | None = Field(default=None, max_length=2000)
     observed_at: datetime = Field(default_factory=utcnow)
 
     @property

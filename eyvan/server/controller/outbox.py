@@ -441,6 +441,23 @@ class _ControllerOutbox:
                 else:
                     error = redact_secret_material(error)
             if error is None:
+                if current.attempts > 1 or current.last_error is not None:
+                    # A command that failed and then succeeded is about to lose
+                    # every trace of why: `last_error` is cleared here and nothing
+                    # logged the failures. That combination produced a workload
+                    # that sat "waiting for dispatch" for 21 minutes across 10
+                    # attempts and then settled with attempts=10 and last_error
+                    # NULL -- an operator, and the author of this comment, had no
+                    # way to see the cause. Say it once, on the way past.
+                    logger.warning(
+                        "outbox %s (%s for %s %s) succeeded after %d attempt(s); last failure was: %s",
+                        current.id,
+                        current.topic,
+                        current.aggregate_type,
+                        current.aggregate_id,
+                        current.attempts,
+                        current.last_error or "not retained",
+                    )
                 updated = current.model_copy(
                     update={
                         "state": OutboxState.SUCCEEDED,
@@ -452,6 +469,14 @@ class _ControllerOutbox:
                     }
                 )
             elif terminal or failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
+                logger.warning(
+                    "outbox %s (%s for %s %s) will not be retried: %s",
+                    current.id,
+                    current.topic,
+                    current.aggregate_type,
+                    current.aggregate_id,
+                    error,
+                )
                 updated = current.model_copy(
                     update={
                         "state": OutboxState.DISCARDED,
@@ -464,6 +489,21 @@ class _ControllerOutbox:
                 )
             else:
                 delay = 1 if transient else min(300, 5 * (2 ** min(current.attempts - 1, 6)))
+                # Logged here rather than at each raise site, because the two
+                # handlers that matter most -- the capacity-provider error and the
+                # bare `except Exception` -- logged nothing at all, so a dispatch
+                # could fail indefinitely in complete silence while the client
+                # showed a steady "waiting for dispatch".
+                logger.warning(
+                    "outbox %s (%s for %s %s) failed on attempt %d, retrying in %ds: %s",
+                    current.id,
+                    current.topic,
+                    current.aggregate_type,
+                    current.aggregate_id,
+                    current.attempts,
+                    delay,
+                    error,
+                )
                 updated = current.model_copy(
                     update={
                         "state": OutboxState.FAILED,

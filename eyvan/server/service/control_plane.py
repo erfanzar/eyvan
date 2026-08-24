@@ -562,6 +562,25 @@ class ControlPlaneService:
             plane_id=self.plane_id,
         )
 
+    @staticmethod
+    async def _workload_delivery(tx: tp.Any, workload: WorkloadRecord) -> OutboxRecord | None:
+        """Return the newest durable command carrying this workload, if any.
+
+        Looked up by aggregate rather than remembered on the workload, so it
+        cannot drift from the record that actually decides whether the workload
+        reaches its cell.
+        """
+
+        try:
+            commands = await tx.list_outbox_for_aggregates("workload", {workload.id: workload.generation})
+        except Exception:
+            # Explaining a workload must never fail because the delivery lookup
+            # did; the scheduling answer above is still worth returning.
+            return None
+        if not commands:
+            return None
+        return max(commands, key=lambda command: command.updated_at)
+
     async def explain_workload(self, principal: Principal, workload_id: str) -> WorkloadExplanation:
         """Return why one workload is or is not placeable right now.
 
@@ -578,11 +597,25 @@ class ControlPlaneService:
             workload = await self._require_workload(tx, workload_id)
             self.authorizer.require(principal, Permission.READ, org_id=workload.org_id, project_id=workload.project_id)
             if workload.state is not WorkloadState.PENDING:
-                # Only pending workloads are scheduled, so skip the full snapshot load.
+                # Only pending workloads are scheduled, so skip the full snapshot
+                # load -- but do not stop at "not my department". Past PENDING the
+                # question "why is this not running" is answered by delivery, and
+                # reporting only the state left an operator watching a spinner
+                # while the command behind it failed and retried in silence.
+                delivery = await self._workload_delivery(tx, workload)
+                message = f"workload is {workload.state.value}; only pending workloads are scheduled"
+                if delivery is not None and delivery.attempts > 1:
+                    message = (
+                        f"workload is {workload.state.value}; its {delivery.topic} command has failed "
+                        f"{delivery.attempts} time(s) and is being retried"
+                    )
                 return WorkloadExplanation(
                     **_explain_base(workload),
                     placeable=False,
-                    message=f"workload is {workload.state.value}; only pending workloads are scheduled",
+                    message=message,
+                    delivery_state=None if delivery is None else delivery.state.value,
+                    delivery_attempts=0 if delivery is None else delivery.attempts,
+                    delivery_error=None if delivery is None else delivery.last_error,
                 )
             workloads = [
                 candidate

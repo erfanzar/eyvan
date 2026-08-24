@@ -27,9 +27,12 @@ from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
+    OutboxRecord,
+    OutboxState,
     ResourceVector,
     Role,
     WorkloadDefinition,
+    WorkloadState,
 )
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.service.control_plane import ControlPlaneService
@@ -136,3 +139,64 @@ async def test_a_deleted_cell_is_never_reported_as_provisioning() -> None:
     explanation = await service.explain_workload(principal(Role.PROJECT_OPERATOR), workload_id)
 
     assert explanation.provisioning_cell_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_a_leased_workload_reports_why_its_delivery_is_failing() -> None:
+    """Found on a live head: ten failed dispatches, and this endpoint said nothing.
+
+    Past PENDING the scheduler has no opinion, and the honest answer to "why is
+    this not running" moves to delivery. Reporting only the state produced a
+    workload that sat `waiting for dispatch` for twenty-one minutes across ten
+    attempts while `workload explain` answered "workload is leased; only pending
+    workloads are scheduled" -- true, and useless.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    workload_id = await _pending_tpu_workload(service)
+
+    async with repository.transaction() as transaction:
+        workload = await transaction.get_workload(workload_id)
+        await transaction.put_workload(workload.model_copy(update={"state": WorkloadState.LEASED}))
+        await transaction.put_outbox(
+            OutboxRecord(
+                id="cmd_stuck",
+                topic="workload.dispatch",
+                aggregate_type="workload",
+                aggregate_id=workload_id,
+                idempotency_key=f"workload.dispatch:{workload_id}:{workload.generation}",
+                generation=workload.generation,
+                state=OutboxState.FAILED,
+                attempts=10,
+                last_error="native worker refused the submission: connection refused",
+            )
+        )
+
+    explanation = await service.explain_workload(principal(Role.PROJECT_OPERATOR), workload_id)
+
+    assert explanation.placeable is False
+    assert explanation.delivery_attempts == 10
+    assert explanation.delivery_state == OutboxState.FAILED.value
+    assert "connection refused" in (explanation.delivery_error or "")
+    # And the headline says it, so an operator reading one line already knows.
+    assert "failed 10 time(s)" in (explanation.message or "")
+
+
+@pytest.mark.asyncio
+async def test_a_leased_workload_delivering_cleanly_reports_no_failure() -> None:
+    """The softened message must not imply trouble where there is none."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    workload_id = await _pending_tpu_workload(service)
+
+    async with repository.transaction() as transaction:
+        workload = await transaction.get_workload(workload_id)
+        await transaction.put_workload(workload.model_copy(update={"state": WorkloadState.LEASED}))
+
+    explanation = await service.explain_workload(principal(Role.PROJECT_OPERATOR), workload_id)
+
+    assert explanation.delivery_attempts == 0
+    assert explanation.delivery_error is None
+    assert "only pending workloads are scheduled" in (explanation.message or "")
