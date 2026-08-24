@@ -174,6 +174,8 @@ function formatWaited(createdIso: string): string {
 
 
 /** On-package HBM per chip, by generation prefix (v6e Trillium = 32 GB). */
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "completed"]);
+
 function hbmGb(acceleratorType: string): number {
   const perChip: Record<string, number> = { v4: 32, v5e: 16, v5p: 95, v5: 95, v6e: 32 };
   const generation = /^v\d+[a-z]*/.exec(acceleratorType)?.[0] ?? "";
@@ -416,7 +418,9 @@ const filteredLogs = useMemo(() => {
       {/* Why this job is not running, said once at the top. The age beside it
           is what turns a reason into a problem: waiting on capacity is normal,
           waiting on it since yesterday is not. */}
-      {workload.queueReason && (
+      {/* A settled record keeps the scheduling_reason it queued with; showing
+          it here said a finished job was still waiting, with a spinner. */}
+      {workload.queueReason && !TERMINAL_STATUSES.has(workload.status) && (
         <div className={`detail-wait-banner${waitingBadly ? " detail-wait-banner-bad" : ""}`} role="status">
           {waitingBadly ? (
             <AlertTriangle size={15} aria-hidden="true" />
@@ -495,6 +499,10 @@ const filteredLogs = useMemo(() => {
             </dl>
           </section>
 
+          {/* The scheduler only answers questions about pending work. Asking it
+              why a finished run is not placed invites "0 cells considered"
+              nonsense, so settled runs skip the panel entirely. */}
+          {!TERMINAL_STATUSES.has(workload.status) && (
           <section className="panel detail-section">
             <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Placement verdict</h2><p>Why the scheduler did or did not place this</p></div></div>
             {explainError && <div className="resource-row-detail"><span>{explainError}</span></div>}
@@ -514,6 +522,7 @@ const filteredLogs = useMemo(() => {
               </dl>
             )}
           </section>
+          )}
 
           <section className="panel detail-section">
             <div className="panel-header"><WalletCards size={15} aria-hidden="true" /><div><h2>What this run cost</h2><p>Measured hours, and the on-demand alternative</p></div></div>
