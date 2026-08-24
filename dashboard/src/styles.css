@@ -1281,6 +1281,24 @@ code,
 }
 
 .activity-row:last-child { border-bottom: 0; }
+
+/* Long identifiers (zone-cell slugs, wl_ ids) and dates are single tokens:
+   wrapping them mid-token shreds them into copy-paste garbage. Let the row
+   scroll instead -- the panel already scrolls horizontally. */
+.activity-row strong,
+.activity-detail,
+.activity-target,
+.activity-age {
+  white-space: nowrap;
+}
+.activity-row > div {
+  min-width: 0;
+}
+
+.data-table td.monospace,
+.data-table td:first-child {
+  white-space: nowrap;
+}
 .activity-row:hover { background: var(--surface-muted); }
 
 .activity-dot {
