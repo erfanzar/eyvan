@@ -98,6 +98,10 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     # to the rows afterwards could make it project-scoped. Fleet administration
     # is the only role whose scope is also the whole database.
     "POST /api/v1/query": "ad-hoc read-only SQL over the whole control plane",
+    # Named for a workload but settled through the preemption path, which is
+    # fleet-owned: it moves capacity between tenants' jobs. A tenant kicking its
+    # own attempt would be reasonable and is not what this route is.
+    "POST /api/v1/workloads/{workload_id}/kick": "interrupt an attempt via fleet preemption settlement",
     "GET /api/v1/cells": "fleet capacity inventory",
     "GET /api/v1/cells/{cell_id}": "one cell's provider state",
     "POST /api/v1/cells": "register capacity",

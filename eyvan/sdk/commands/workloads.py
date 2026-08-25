@@ -1089,6 +1089,26 @@ def workload_logs(session: CliSession, workload_id: str) -> None:
     click.echo(session.client.request_text("GET", f"/api/v1/workloads/{workload_id}/logs"))
 
 
+@click.command("kick")
+@click.argument("workload_id")
+@click.pass_obj
+def kick_workload(session: CliSession, workload_id: str) -> None:
+    """Interrupt this attempt and let WORKLOAD_ID reschedule elsewhere.
+
+    For an attempt wedged on a host that is not coming back while the job itself
+    is fine. ``cancel`` ends the job; waiting for a timeout keeps the accelerator
+    busy doing nothing until it fires.
+
+    Charged to the preemption budget rather than the failure budget: a spot job
+    sets ``--max-retries 0`` because it expects to be interrupted, so charging a
+    kick there would end the job you were trying to move.
+    """
+
+    WorkloadCommandService(session).renderer.emit(
+        session.client.request("POST", f"/api/v1/workloads/{workload_id}/kick")
+    )
+
+
 def _workload_action_command(action: WorkloadAction) -> click.Command:
     @click.command(action)
     @click.argument("workload_id")
@@ -1103,6 +1123,7 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
 for _action in _WORKLOAD_ACTIONS:
     workload.add_command(_workload_action_command(_action))
 
+workload.add_command(kick_workload)
 workload.add_command(exec_in_workload)
 
 

@@ -2635,6 +2635,35 @@ def create_app(
             response.headers["Idempotent-Replay"] = "true"
         return workload
 
+    @app.post("/api/v1/workloads/{workload_id}/kick", response_model=WorkloadRecord, tags=["workloads"])
+    async def kick_workload(
+        workload_id: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> WorkloadRecord:
+        """Interrupt one attempt and let it reschedule on its preemption budget.
+
+        The move an operator wants when an attempt is wedged on a bad host but
+        the job itself is fine: stop this attempt, put the workload back in the
+        queue, and let placement pick somewhere else. Cancelling would end the
+        job, and waiting for a timeout wastes the accelerator until it fires.
+
+        Charged to the *preemption* budget rather than the failure budget. A
+        capacity loss is charged against ``max_retries``, which a spot job sets
+        to 0 precisely because it expects to be interrupted -- so charging a kick
+        there would kill the job an operator was trying to move. The audit action
+        stays distinct from a provider reclamation, because who interrupted the
+        attempt is exactly what a later reader needs.
+        """
+
+        workload, _lease, _budget = await service.settle_preempted_workload(
+            principal,
+            workload_id,
+            scheduling_reason=f"kicked by {principal.subject}; waiting to resume",
+            action="workload.kicked",
+            provider_preempted=True,
+        )
+        return workload
+
     @app.post("/api/v1/workloads/{workload_id}/checkpoint", response_model=WorkloadRecord, tags=["workloads"])
     async def checkpoint_workload(
         workload_id: str,
