@@ -58,6 +58,12 @@ const STATE_TO_STAGE: Record<string, string> = {
 };
 
 /** Duration of each named stage, read off the audit timeline. */
+/**
+ * Seconds each timeline transition held, keyed by the transition phrase.
+ * Titles are sentences ("workload leased capacity lease_…"), so lookups
+ * substring-match rather than exact-match, and a transition claims its gap
+ * only once -- the first time it appears, chronologically.
+ */
 function stageDurations(timeline: TimelineEvent[]): Map<string, number> {
   const stamps = timeline
     .map((event) => ({ action: event.title, at: new Date(event.timestamp).getTime() }))
@@ -66,9 +72,21 @@ function stageDurations(timeline: TimelineEvent[]): Map<string, number> {
   const gaps = new Map<string, number>();
   for (let i = 1; i < stamps.length; i += 1) {
     const seconds = Math.round((stamps[i].at - stamps[i - 1].at) / 1000);
-    if (!gaps.has(stamps[i - 1].action)) gaps.set(stamps[i - 1].action, seconds);
+    const action = stamps[i - 1].action;
+    if (![...gaps.keys()].some((seen) => seen.includes(action) || action.includes(seen))) {
+      gaps.set(action, seconds);
+    }
   }
   return gaps;
+}
+
+/** The gap of the earliest transition whose title contains the needle. */
+function firstGap(durations: Map<string, number>, needle: string): number | undefined {
+  let best: number | undefined;
+  for (const [action, seconds] of durations) {
+    if (action.includes(needle) && (best === undefined || seconds < best)) best = seconds;
+  }
+  return best;
 }
 
 function fmt(seconds: number): string {
@@ -127,8 +145,22 @@ function readStages(status: string, phase: string | undefined, timeline: Timelin
   const durations = stageDurations(timeline);
   return PIPELINE_STAGES.map((stage, index) => {
     const done = terminal ? index <= active : index < active;
-    const hits = STAGE_TRANSITIONS[stage.key]
-      ?.map((needle) => durations.get(needle))
+    // First closure wins: "dispatch reserved" closes Dispatch even when the
+    // later "dispatched" sentence carries a bigger gap. A settled needle must
+    // not catch mid-run sentences like "lease failed, retrying", so Settled
+    // only closes on a title that begins with the terminal verb.
+    const needles = STAGE_TRANSITIONS[stage.key] ?? [];
+    const hits = needles
+      .map((needle) =>
+        stage.key === "settled"
+          ? (() => {
+              for (const [action, seconds] of durations) {
+                if (/^(workload )?(failed|succeeded|cancelled|settled)/.test(action)) return seconds;
+              }
+              return firstGap(durations, needle);
+            })()
+          : firstGap(durations, needle),
+      )
       .filter((value): value is number => value !== undefined);
     return {
       key: stage.key,
@@ -136,7 +168,7 @@ function readStages(status: string, phase: string | undefined, timeline: Timelin
       done,
       current: !terminal && index === active,
       failed: bad && index === PIPELINE_STAGES.length - 1,
-      duration: done && hits && hits.length > 0 ? Math.max(...hits) : undefined,
+      duration: done && hits.length > 0 ? Math.min(...hits) : undefined,
     };
   });
 }

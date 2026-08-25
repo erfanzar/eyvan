@@ -882,27 +882,33 @@ export class EyvanApiClient {
         this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`, workloadScope), {
         method: "GET",
         signal,
-      }).catch(() => [] as RawEvent[]),
+      }).catch((error: unknown) => {
+        if (signal?.aborted) throw error;
+        return [] as RawEvent[];
+      }),
       // Best-effort, and slow on purpose: this is forwarded to the worker. It
       // used to share the 3.5s control-plane budget *and* sit in this
       // `Promise.all` with no fallback, so one slow log fetch blanked a page
       // whose workload, events and progress had all answered in under half a
       // second. An empty detail page reads as "this workload does not exist".
       this.requestText(`/workloads/${encodeURIComponent(id)}/logs`, WORKER_FORWARDED_TIMEOUT_MS, signal).catch(
-        (error: unknown) => `logs unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+        (error: unknown) => {
+          if (signal?.aborted) throw error;
+          return `logs unavailable: ${error instanceof Error ? error.message : "unknown error"}`;
+        },
       ),
       // Progress is best-effort: an older control plane without the endpoint must not break the detail page.
       this.request<RawWorkloadProgress>(`/workloads/${encodeURIComponent(id)}/progress`, {
         method: "GET",
         signal,
-      }).catch(() => undefined),
+      }).catch((error: unknown) => { if (signal?.aborted) throw error; return undefined; }),
       // Allocation comes from this workload's own leases. It used to be hardcoded
       // to [], so the panel rendered nothing against a live server while the mock
       // data populated it — the page looked implemented and was not.
       this.request<RawLease[]>(
         this.scope(`/leases?workload_id=${encodeURIComponent(id)}`, workloadScope),
         { method: "GET", signal },
-      ).catch(() => []),
+      ).catch((error: unknown) => { if (signal?.aborted) throw error; return []; }),
     ]);
     detail.allocation = leases.map((lease) => ({
       host: lease.cell_id,
