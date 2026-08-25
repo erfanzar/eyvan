@@ -431,3 +431,29 @@ def test_a_network_bind_that_trusts_no_project_warns_without_turning_the_run_red
 
     assert named.status is CheckStatus.PASS
     assert "acme/research" in named.detail
+
+
+def test_a_malformed_environment_is_reported_rather_than_crashing_the_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`doctor` must survive the exact condition it exists to diagnose.
+
+    `EyvanSettings` is a plain frozen dataclass and raises `ValueError`; the
+    callable-trust check caught pydantic's `ValidationError`, which it can never
+    raise. So a bad EYVAN_* value crashed the whole preflight with a traceback
+    instead of reporting which setting was wrong -- in the one command an
+    operator runs precisely because something is misconfigured.
+    """
+
+    _configure(monkeypatch, {"EYVAN_OUTBOX_CLAIM_TTL_S": "-5"})
+
+    report = DoctorCommandService(_session(), server_bind_host="0.0.0.0").report()
+
+    startup = next(check for check in report.checks if check.name == SERVER_STARTUP_CHECK)
+    trust = next(check for check in report.checks if check.name == CALLABLE_TRUST_CHECK)
+
+    assert startup.status is CheckStatus.FAIL
+    assert "does not parse" in startup.detail
+    # Skipped, not crashed, and distinct from "no project is trusted".
+    assert trust.status is CheckStatus.SKIP
+    assert report.ok is False

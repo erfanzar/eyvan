@@ -249,7 +249,13 @@ class DoctorCommandService:
             return CheckResult(CALLABLE_TRUST_CHECK, CheckStatus.SKIP, "the bind address is not usable")
         try:
             settings = EyvanSettings.from_env()
-        except ValidationError:
+        except ValueError:
+            # ``ValueError``, not pydantic's ``ValidationError``: ``EyvanSettings``
+            # is a plain frozen dataclass and raises the former. Catching the
+            # latter here was a handler for something that cannot happen, so a
+            # malformed environment crashed `eyvan doctor` with a traceback --
+            # in the one command whose entire job is diagnosing a malformed
+            # environment. The startup check above had it right all along.
             return CheckResult(CALLABLE_TRUST_CHECK, CheckStatus.SKIP, "the EYVAN_* environment does not parse")
         if bind.is_loopback:
             return CheckResult(
