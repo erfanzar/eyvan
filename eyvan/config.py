@@ -259,6 +259,12 @@ class EyvanSettings:
     capacity_backend: str = "gcp"
     execution_backend: str = "eyvan-native"
     agent_state_dir: str = "~/.eyvan/agent"
+    #: Operator consent to send managed-artifact capability tokens over plain
+    #: HTTP. Off by default. It exists because the alternative was worse: the
+    #: refusal was unconditional, so a control plane that terminates no TLS --
+    #: which is every head `eyvan head up` builds -- could never run a callable
+    #: at all, and said so only by holding the accelerator forever.
+    allow_insecure_artifact_http: bool = False
     native_worker_port: int = 8100
     native_worker_package: str | None = None
     native_worker_package_sha256: str | None = None
@@ -595,6 +601,7 @@ class EyvanSettings:
             capacity_backend=os.getenv("EYVAN_CAPACITY_BACKEND", defaults.capacity_backend),
             execution_backend=os.getenv("EYVAN_EXECUTION_BACKEND", defaults.execution_backend),
             agent_state_dir=os.getenv("EYVAN_AGENT_STATE_DIR", defaults.agent_state_dir),
+            allow_insecure_artifact_http=truthy("EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"),
             native_worker_port=int(os.getenv("EYVAN_NATIVE_WORKER_PORT", defaults.native_worker_port)),
             native_worker_package=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE"),
             native_worker_package_sha256=os.getenv("EYVAN_NATIVE_WORKER_PACKAGE_SHA256") or None,

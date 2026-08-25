@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import ipaddress
 import json
 import re
 import secrets
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import time
 import typing as tp
@@ -101,6 +103,10 @@ HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
 #: written under its own name in a directory the installer globs.
 HEAD_WHEEL_DIR = "/opt/eyvan/wheels"
 HEAD_VENV_PATH = "/opt/eyvan/venv"
+#: Where the head unpacks the operations UI it serves at its own root.
+#: The server mounts this only when the directory exists, so a head built
+#: without a bundle simply serves the API and says so.
+HEAD_DASHBOARD_DIR = "/opt/eyvan/dashboard"
 HEAD_SERVICE_NAME = "eyvan-head.service"
 #: A cell agent on the head. Every capacity pool needs an agent endpoint, and a
 #: loopback development plane quietly supplies one -- so a fleet that applied on
@@ -154,6 +160,7 @@ class HeadStep(StrEnum):
     STAGE_WORKER_PACKAGE = "stage_worker_package"
     WORKER_PACKAGE_GENERATION = "worker_package_generation"
     STAGE_WHEEL = "stage_wheel"
+    STAGE_DASHBOARD = "stage_dashboard"
     INSTALL = "install"
     BOOTSTRAP = "bootstrap"
     MIGRATE = "migrate"
@@ -298,6 +305,13 @@ class HeadSpec:
     #: fleet deserializes and runs, so authenticating a principal answers who it
     #: is, not whether its project may execute arbitrary code here.
     trusted_callable_projects: tuple[str, ...] = ()
+    #: Accept managed-artifact capability tokens travelling in clear text. Off by
+    #: default. This command terminates no TLS and binds a private VPC address
+    #: with VPC-only ingress, so callables were refused outright -- and the
+    #: refusal held the accelerator rather than releasing it. Defensible only
+    #: because the plane is unreachable from outside that network, which is why
+    #: it is a flag an operator types rather than an inference.
+    allow_insecure_artifact_http: bool = False
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
 
@@ -583,6 +597,7 @@ class HeadSecrets:
         *,
         address: str,
         worker_package: WorkerPackage | None = None,
+        serves_dashboard: bool = False,
     ) -> dict[str, str]:
         """Return the complete server environment for this head."""
 
@@ -610,6 +625,14 @@ class HeadSecrets:
             # forever for an address nobody wrote down. Observed on a live v5p-16
             # whose worker was up and serving the whole time.
             environment["EYVAN_FLEET_STATE_URI"] = fleet_state_uri(spec.artifact_store_uri, spec.fleet)
+        if spec.allow_insecure_artifact_http:
+            environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
+        if serves_dashboard:
+            # Set only when a bundle was actually staged. The server mounts the
+            # UI only if this directory exists, so naming it unconditionally
+            # would be harmless -- and still wrong, because the head's own
+            # output would promise a dashboard that is not there.
+            environment["EYVAN_DASHBOARD_DIR"] = HEAD_DASHBOARD_DIR
         if worker_package is not None:
             # Without these three the GCP capacity driver refuses every request
             # with "eyvan-native TPU capacity requires EYVAN_NATIVE_WORKER_PACKAGE",
@@ -651,10 +674,16 @@ class HeadSecrets:
         *,
         address: str,
         worker_package: WorkerPackage | None = None,
+        serves_dashboard: bool = False,
     ) -> str:
         """Render the systemd ``EnvironmentFile`` this head reads at start."""
 
-        resolved = self.environment(spec, address=address, worker_package=worker_package)
+        resolved = self.environment(
+            spec,
+            address=address,
+            worker_package=worker_package,
+            serves_dashboard=serves_dashboard,
+        )
         lines = [f"{key}={value}" for key, value in sorted(resolved.items())]
         return "\n".join(lines) + "\n"
 
@@ -812,6 +841,45 @@ def fleet_state_uri(artifact_store_uri: str, fleet: str) -> str:
     """
 
     return f"{artifact_store_uri.rstrip('/')}/fleet-state/{fleet}.json"
+
+
+def _local_dashboard_bundle() -> bytes | None:
+    """Return this checkout's built dashboard as a gzipped tar, or ``None``.
+
+    ``None`` for a wheel install is the ordinary case and not a failure: the
+    dashboard is a Node build tree that cannot travel inside a Python wheel,
+    which is why a head installed from one served no UI at all and
+    ``eyvan dashboard`` opened a 404. A head built from a checkout that has run
+    ``npm run build`` can carry it; one that has not says so rather than
+    pretending.
+    """
+
+    dist = Path(eyvan_package_root()).parent / "dashboard" / "dist"
+    if not (dist / "index.html").is_file():
+        return None
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        # ``arcname="."`` so the archive unpacks *into* the target directory
+        # rather than creating a nested one the server would not find.
+        archive.add(dist, arcname=".", filter=_reproducible_member)
+    return buffer.getvalue()
+
+
+def _reproducible_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Strip build-host identity so the same bundle hashes the same anywhere."""
+
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    member.mtime = 0
+    return member
+
+
+def eyvan_package_root() -> Path:
+    """Return the installed package directory, without importing at module scope."""
+
+    import eyvan
+
+    return Path(eyvan.__file__).resolve().parent
 
 
 def _planned_worker_wheel() -> _LocalWheel:
@@ -1076,6 +1144,17 @@ class HeadUpResult:
     source_ranges: tuple[str, ...]
     wrote_environment: bool
     service_state: str
+    #: Whether this head serves the operations UI. False is ordinary -- the
+    #: dashboard is a Node build tree that cannot ship inside a Python wheel --
+    #: and saying so is the point: without it the head served only the API while
+    #: `eyvan dashboard` cheerfully opened a 404.
+    serves_dashboard: bool = False
+
+    @property
+    def dashboard_url(self) -> str | None:
+        """Return where this head serves its UI, or ``None`` when it serves none."""
+
+        return self.url if self.serves_dashboard else None
 
     @property
     def url(self) -> str:
@@ -1144,6 +1223,7 @@ class HeadUpResult:
             "authentication_warning": self.authentication_warning,
             "callable_trust_warning": self.callable_trust_warning,
             "created_firewall_rules": list(self.created_firewall_rules),
+            "dashboard_url": self.dashboard_url,
             # A path, never a value: this document is the automation-safe one.
             "node_context_path": str(NODE_CONTEXT_PATH),
             "instance": self.spec.instance_name,
@@ -1233,6 +1313,7 @@ class HeadProvisioner:
         ssh_ready_delay_s: float = DEFAULT_SSH_READY_DELAY_S,
         sleep: tp.Callable[[float], None] | None = None,
         wheel_source: tp.Callable[[], _LocalWheel] | None = None,
+        dashboard_source: tp.Callable[[], bytes | None] | None = None,
     ):
         if isinstance(command_timeout_s, bool) or not isinstance(command_timeout_s, (int, float)):
             raise ValueError("command_timeout_s must be a positive number")
@@ -1248,6 +1329,7 @@ class HeadProvisioner:
         self.ssh_ready_delay_s = float(ssh_ready_delay_s)
         self._sleep = sleep if sleep is not None else time.sleep
         self._wheel_source = wheel_source
+        self._dashboard_source = dashboard_source
         self.spec = spec
         # Resolved here rather than as a default argument, and the difference is
         # not cosmetic: a default binds the module function at import, so a test
@@ -1281,6 +1363,11 @@ class HeadProvisioner:
                     self._worker_package_actions(_planned_worker_wheel())
                     if self.spec.artifact_store_uri is not None
                     else ()
+                ),
+                *(
+                    [self._stage_dashboard_action()]
+                    if (self._dashboard_source or _local_dashboard_bundle)() is not None
+                    else []
                 ),
                 self._configure_action(),
                 *([self._stage_wheel_action()] if self.spec.stages_wheel else []),
@@ -1316,6 +1403,15 @@ class HeadProvisioner:
         # would think to look for.
         wheel = (self._wheel_source or _local_wheel_bytes)() if (spec.stages_wheel or write_environment) else None
         worker_package = self._stage_worker_package(wheel) if wheel is not None and write_environment else None
+        dashboard = (self._dashboard_source or _local_dashboard_bundle)()
+        if dashboard is not None:
+            # Before the environment that names the directory, for the same
+            # reason the worker wheel is staged first: the file must not describe
+            # something that is not there yet.
+            self._execute(
+                self._stage_dashboard_action(),
+                stdin_text=base64.b64encode(dashboard).decode("ascii"),
+            )
         if write_environment:
             head_secrets = self._secret_factory()
             self._execute(
@@ -1323,7 +1419,12 @@ class HeadProvisioner:
                 # Staged before this, because the environment names the object and
                 # its generation: writing the file first would mean a head whose
                 # configuration described a wheel that did not exist yet.
-                stdin_text=head_secrets.environment_file(spec, address=address, worker_package=worker_package),
+                stdin_text=head_secrets.environment_file(
+                    spec,
+                    address=address,
+                    worker_package=worker_package,
+                    serves_dashboard=dashboard is not None,
+                ),
             )
         if spec.stages_wheel:
             assert wheel is not None
@@ -1340,6 +1441,7 @@ class HeadProvisioner:
         return HeadUpResult(
             spec=spec,
             address=address,
+            serves_dashboard=dashboard is not None,
             adopted_instance=adopted,
             created_firewall_rules=tuple(created),
             source_ranges=tuple(ranges),
@@ -1757,6 +1859,28 @@ class HeadProvisioner:
                 "required, because it is what pins the package URI to the exact bytes a worker will verify",
             )
         return WorkerPackage(uri=generation.args[3], sha256=wheel.digest, generation=staged)
+
+    def _stage_dashboard_action(self) -> HeadAction:
+        """Build the delivery of the operations UI this head will serve.
+
+        Unpacked into a directory the server mounts at its own root, so the
+        dashboard is reachable at exactly the URL the control plane already
+        answers on -- no second port, no second firewall rule, and no second
+        address for an operator to hold.
+        """
+
+        return self._ssh_action(
+            HeadStep.STAGE_DASHBOARD,
+            f"stage the operations dashboard into {HEAD_DASHBOARD_DIR}",
+            "sudo /bin/sh -ec "
+            + shlex.quote(
+                f"rm -rf {HEAD_DASHBOARD_DIR}; install -d -m 0755 {HEAD_DASHBOARD_DIR}; "
+                f"base64 -d | tar -xzf - -C {HEAD_DASHBOARD_DIR}; "
+                f"chmod -R a+rX {HEAD_DASHBOARD_DIR}; test -f {HEAD_DASHBOARD_DIR}/index.html && echo staged"
+            ),
+            mutates=True,
+            sends_stdin=True,
+        )
 
     def _stage_wheel_action(self, filename: str | None = None) -> HeadAction:
         filename = filename or staged_wheel_filename()
@@ -2180,6 +2304,12 @@ def head_group() -> None:
 @click.option("--oidc-issuer", help="Set EYVAN_OIDC_ISSUER; without it the head refuses every request with 401.")
 @click.option("--oidc-audience", help="Set EYVAN_OIDC_AUDIENCE. [default: eyvan]")
 @click.option(
+    "--allow-insecure-artifact-http",
+    is_flag=True,
+    help="Let callables carry artifact capability tokens over plain HTTP. This head terminates no TLS, "
+    "so without it every @execute submission is refused. Only defensible because ingress is VPC-only.",
+)
+@click.option(
     "--trust-callable-project",
     "trusted_callable_projects",
     multiple=True,
@@ -2221,6 +2351,7 @@ def head_up(
     oidc_issuer: str | None,
     oidc_audience: str | None,
     trusted_callable_projects: tuple[str, ...],
+    allow_insecure_artifact_http: bool,
     service_account: str | None,
     source_ranges: tuple[str, ...],
     boot_disk_size_gb: int | None,
@@ -2260,6 +2391,7 @@ def head_up(
             oidc_issuer=oidc_issuer,
             oidc_audience=oidc_audience,
             trusted_callable_projects=tuple(trusted_callable_projects),
+            allow_insecure_artifact_http=allow_insecure_artifact_http,
             service_account=service_account,
             source_ranges=tuple(source_ranges),
             boot_disk_size_gb=boot_disk_size_gb,

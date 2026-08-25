@@ -4111,3 +4111,148 @@ async def test_only_phases_that_declare_it_have_their_failures_isolated() -> Non
     with pytest.raises(RuntimeError, match="phase failed"):
         await controller._run_leader_phases(now=0.0, due={})
     assert ran == []
+
+
+@pytest.mark.asyncio
+async def test_a_plain_http_plane_settles_the_attempt_instead_of_holding_the_accelerator(tmp_path) -> None:
+    """The defect that burned two live TPUs, reproduced without one.
+
+    `eyvan head up` writes an `http://` EYVAN_PUBLIC_URL and terminates no TLS,
+    and dev auth is impossible on its network bind -- so every managed-artifact
+    callable was refused. The refusal was a bare RuntimeError rather than a
+    PermanentDispatchRefusal, so the outbox retried it forever with a capped
+    backoff while the lease held its accelerator and the accelerator billed.
+
+    Observed live: ten attempts over twenty-one minutes, the workload stuck
+    `leased`, a v5p-16 and a v6e-8 held, and no diagnostic on any surface. The
+    class docstring on PermanentDispatchRefusal describes exactly this outcome;
+    this site simply did not use it.
+
+    The sibling test above covers the loopback development shape, which takes the
+    other branch -- which is why nothing caught this.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    fake_agent = FakeAgent()
+    access = ManagedArtifactAccess(
+        store=LocalManagedArtifactStore(tmp_path / "artifacts"),
+        signer=ArtifactTokenSigner(b"k" * 32, default_ttl_seconds=3600, max_ttl_seconds=3600),
+        # What a head actually writes: internal address, no TLS.
+        public_url="http://10.128.0.11:8080",
+        token_ttl_seconds=3600,
+    )
+    controller = EyvanController(
+        repository,
+        service,
+        # dev auth is refused on a network bind, so a head can never have it.
+        settings=EyvanSettings(dev_auth_enabled=False),
+        agent_factory=lambda _cell: fake_agent,  # type: ignore[arg-type]
+        artifact_access=access,
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-managed",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(tpu=8),
+                allocatable=ResourceVector(tpu=8),
+            )
+        )
+    workload, _ = await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="callable",
+            execution=CallableExecution(
+                artifact_uri=callable_uri("a" * 64),
+                sha256="a" * 64,
+                python="3.13",
+                result_uri=result_uri("call-insecure"),
+            ),
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+        ),
+        idempotency_key="insecure-http",
+    )
+
+    result = await controller.reconcile_once()
+    assert [placement.workload_id for placement in result.placements] == [workload.id]
+    await controller.dispatch_outbox_once()
+
+    async with repository.transaction() as transaction:
+        settled = await transaction.get_workload(workload.id)
+        leases = await transaction.list_leases()
+
+    # Settled with a reason, not retried forever.
+    assert settled.state is WorkloadState.FAILED
+    assert "clear text" in (settled.failure_reason or "")
+    assert "EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP" in (settled.failure_reason or "")
+    # And the capacity is given back rather than held by a lease that never resolves.
+    assert [lease for lease in leases if lease.state is LeaseState.PENDING] == []
+    assert fake_agent.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_an_operator_who_accepts_the_risk_can_run_callables_on_a_private_plane(tmp_path) -> None:
+    """The refusal must be escapable, or a VPC-only head can never run a callable."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    fake_agent = FakeAgent()
+    access = ManagedArtifactAccess(
+        store=LocalManagedArtifactStore(tmp_path / "artifacts"),
+        signer=ArtifactTokenSigner(b"k" * 32, default_ttl_seconds=3600, max_ttl_seconds=3600),
+        public_url="http://10.128.0.11:8080",
+        token_ttl_seconds=3600,
+    )
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(dev_auth_enabled=False, allow_insecure_artifact_http=True),
+        agent_factory=lambda _cell: fake_agent,  # type: ignore[arg-type]
+        artifact_access=access,
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-managed",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(tpu=8),
+                allocatable=ResourceVector(tpu=8),
+            )
+        )
+    await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="callable",
+            execution=CallableExecution(
+                artifact_uri=callable_uri("a" * 64),
+                sha256="a" * 64,
+                python="3.13",
+                result_uri=result_uri("call-consented"),
+            ),
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+        ),
+        idempotency_key="insecure-http-consented",
+    )
+
+    assert await controller.reconcile_once() is not None
+    assert await controller.dispatch_outbox_once() == 1
+
+    request = fake_agent.submissions[0][1]
+    assert request.spec["environment"]["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] == "1"

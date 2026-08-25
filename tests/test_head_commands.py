@@ -36,6 +36,7 @@ import eyvan.sdk.cli as cli
 import eyvan.sdk.commands.head as head_commands
 from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.sdk.commands.head import (
+    HEAD_DASHBOARD_DIR,
     HEAD_ENVIRONMENT_PATH,
     HEAD_FLEET_LABEL_KEY,
     HEAD_MANAGED_LABEL_KEY,
@@ -366,6 +367,9 @@ def test_a_dry_run_prints_every_action_and_resource_name_and_issues_no_command(t
         HeadStep.FIREWALL_LOOKUP,
         HeadStep.FIREWALL_CREATE,
         HeadStep.SECRET_LOOKUP,
+        # Before CONFIGURE: the environment file names the directory the UI is
+        # unpacked into, and must not describe something that is not there yet.
+        HeadStep.STAGE_DASHBOARD,
         HeadStep.CONFIGURE,
         HeadStep.STAGE_WHEEL,
         HeadStep.INSTALL,
@@ -1523,3 +1527,80 @@ def test_a_non_numeric_object_generation_is_refused() -> None:
             secret_factory=lambda: STUB_SECRETS,
             wheel_source=_fake_wheel,
         ).up()
+
+
+def _dashboard_bundle() -> bytes:
+    """A minimal but real gzipped tar, so the staging path is exercised for real."""
+
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        payload = b"<!doctype html><title>eyvan</title>"
+        info = tarfile.TarInfo("index.html")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+def test_a_head_built_with_a_dashboard_serves_it_at_its_own_url() -> None:
+    """The UI belongs on the address the plane already answers on.
+
+    No second port and no second firewall rule: an operator holding one address
+    for the API and another for the UI is one address too many, and the VPC-only
+    ingress rule would have to be duplicated to match.
+    """
+
+    spec = _spec()
+    gcloud = FakeGcloud(spec=spec)
+
+    result = HeadProvisioner(
+        spec,
+        runner=gcloud,
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+        dashboard_source=_dashboard_bundle,
+    ).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+
+    assert environment["EYVAN_DASHBOARD_DIR"] == HEAD_DASHBOARD_DIR
+    assert result.serves_dashboard is True
+    assert result.dashboard_url == result.url
+    # Unpacked before the environment that names the directory.
+    steps = [call.args for call in gcloud.calls]
+    staged = next(i for i, a in enumerate(steps) if HEAD_DASHBOARD_DIR in " ".join(a))
+    configured = next(
+        i
+        for i, call in enumerate(gcloud.calls)
+        if call.stdin_text is not None and HEAD_ENVIRONMENT_PATH in (call.remote_command or "")
+    )
+    assert staged < configured
+
+
+def test_a_head_built_without_a_dashboard_says_so_instead_of_promising_one() -> None:
+    """A wheel carries no Node build tree, and the head must not claim otherwise.
+
+    Observed live: `GET /` returned 404 on a real head while `eyvan dashboard`
+    opened that URL anyway. Reporting `serves_dashboard=False` is what lets the
+    CLI tell an operator which half is missing.
+    """
+
+    spec = _spec()
+    gcloud = FakeGcloud(spec=spec)
+
+    result = HeadProvisioner(
+        spec,
+        runner=gcloud,
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+        dashboard_source=lambda: None,
+    ).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+
+    assert "EYVAN_DASHBOARD_DIR" not in environment
+    assert result.serves_dashboard is False
+    assert result.dashboard_url is None
+    assert result.as_document()["dashboard_url"] is None

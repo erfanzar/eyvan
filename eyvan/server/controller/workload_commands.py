@@ -94,6 +94,23 @@ class PermanentDispatchRefusal(RuntimeError):
     """
 
 
+class InsecureManagedArtifactTransport(PermanentDispatchRefusal):
+    """A managed-artifact workload would carry its capability token over plain HTTP.
+
+    Retrying cannot change the scheme of ``EYVAN_PUBLIC_URL``, so this belongs in
+    the family that settles instead of the family that retries. It was raised as
+    a bare ``RuntimeError``, which is the exact shape this class exists to
+    prevent: the outbox retried it forever with a capped backoff while the lease
+    held its accelerator, and the accelerator billed the whole time. Observed on
+    a live v5p-16 and a live v6e-8 -- ten attempts over twenty-one minutes, the
+    workload stuck ``leased``, the TPU held, and no diagnostic on any surface.
+
+    Every head built by ``eyvan head up`` hits this, because that command writes
+    an ``http://`` public URL and terminates no TLS, so it refused every callable
+    it was otherwise configured to accept.
+    """
+
+
 class AttemptRankSpaceTooLarge(PermanentDispatchRefusal):
     """The composed rank space of an attempt is above the ceiling.
 
@@ -711,8 +728,13 @@ class _ControllerWorkloadCommands:
             and self.artifact_access is not None
             and self.artifact_access.public_url.startswith("http://")
         ):
-            if not self.settings.dev_auth_enabled:
-                raise RuntimeError("managed artifact transfer requires an HTTPS EYVAN_PUBLIC_URL")
+            if not (self.settings.dev_auth_enabled or self.settings.allow_insecure_artifact_http):
+                raise InsecureManagedArtifactTransport(
+                    f"managed artifact transfer would send a capability token to {self.artifact_access.public_url} "
+                    "in clear text; put the control plane behind TLS and set EYVAN_PUBLIC_URL to its https:// "
+                    "address, or accept the risk explicitly with EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP=1 "
+                    "(defensible only where the plane is unreachable outside a private network)"
+                )
             environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
         return shlex.join(parts), environment
 

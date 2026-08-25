@@ -58,6 +58,26 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
     """Open the dashboard hosted by the configured control plane."""
 
     dashboard_url = f"{session.base_url.rstrip('/')}/"
+    # Asked before a browser is opened, because a control plane installed from a
+    # wheel may serve no UI at all: the dashboard is a Node build tree that
+    # cannot travel inside a Python distribution. This command used to open that
+    # URL regardless and hand the operator a bare 404, with nothing to say which
+    # half was missing -- the plane, the route, or their own credentials.
+    #
+    # Only a 404 is treated as "no dashboard here". Any other answer, including a
+    # transport failure, leaves the old behaviour alone: guessing that a plane
+    # hosts nothing because one probe was unhappy would be its own wrong answer.
+    try:
+        status = getattr(session.client.request("GET", "/"), "status_code", None)
+    except Exception:
+        status = None
+    if status == 404:
+        raise click.ClickException(
+            f"the control plane at {session.base_url} serves its API but hosts no dashboard. "
+            "A head installed from a wheel carries no UI bundle: re-run `eyvan head up` from a checkout "
+            "that has built one (npm --prefix dashboard run build), or use the container deployment, "
+            "which builds it. `eyvan dashboard-dev` runs the UI locally against this plane."
+        )
     click.echo(f"Eyvan dashboard: {dashboard_url}")
     if open_browser:
         click.launch(dashboard_url)
