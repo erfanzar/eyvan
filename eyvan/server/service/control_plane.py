@@ -1042,6 +1042,20 @@ class ControlPlaneService:
                 raise ConflictError(
                     f"TPU pool {pool.id!r} is capped at {pool.max_cells} workers, but the callable requested pods={pods}"
                 )
+            declared_python = pool.runtime.python if pool.runtime is not None else None
+            if declared_python is not None and execution.python != declared_python:
+                # Refused here because the alternative is discovering it on the
+                # accelerator. A serialized callable is pinned to the interpreter
+                # that pickled it, and a live multislice v5p-16 provisioned two
+                # slices, dispatched to four ranks, and had every rank die with
+                # "callable requires Python 3.12; current runtime is 3.10" -- a
+                # fact this pool already knew, paid for with a full provisioning
+                # cycle and the accelerator time that takes.
+                raise ConflictError(
+                    f"this callable was serialized on Python {execution.python}, and pool {pool.id!r} runs "
+                    f"workloads on Python {declared_python}; a pickled callable cannot load on a different "
+                    "interpreter. Submit from a matching Python, or give the pool a runtime that provides yours."
+                )
 
             spec = self._pinned_pool_workload_spec(
                 pool=pool,

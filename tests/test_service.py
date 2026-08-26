@@ -22,6 +22,7 @@ from eyvan.records import (
     CommandExecution,
     LeaseRecord,
     LeaseState,
+    NativeRuntimeConfig,
     PolicyRecord,
     Principal,
     QuotaRecord,
@@ -1425,3 +1426,106 @@ async def test_lease_commit_revalidates_a_new_zero_quota() -> None:
 
     with pytest.raises(ConflictError, match="quota"):
         await service.create_lease(fleet_admin, lease, idempotency_key="stale-placement")
+
+
+@pytest.mark.asyncio
+async def test_a_callable_pinned_to_another_interpreter_is_refused_before_a_tpu_is_built() -> None:
+    """Paid for once on real hardware: two v5p-16 slices, four ranks, all dead.
+
+    A serialized callable is pinned to the interpreter that pickled it, and the
+    check lived only in the worker's loader -- so a live multislice allocation
+    provisioned two slices, dispatched to four ranks, and every rank died with
+    "callable requires Python 3.12; current runtime is 3.10". The pool already
+    knew which interpreter its cells run; nothing asked it until the accelerator
+    was already burning.
+
+    Declared rather than discovered because a scale-from-zero pool has no cell to
+    ask when the submission arrives.
+    """
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    operator = _principal(Role.PROJECT_OPERATOR)
+    resources = ResourceVector(cpu=0, memory_gib=0, tpu=8)
+    pool = _capacity_pool().model_copy(
+        update={
+            "accelerator_type": "v5p-16",
+            "capacity": resources,
+            "allocatable": resources,
+            "provider_options": {},
+            "executor": "eyvan-native",
+            "labels": {"eyvan_resource_kind": "tpu"},
+            # What the Cloud TPU image actually ships.
+            "runtime": NativeRuntimeConfig(python="3.10"),
+        }
+    )
+    await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key="v5p-16-py310")
+
+    with pytest.raises(ConflictError, match="cannot load on a different interpreter"):
+        await service.submit_pool_callable(
+            operator,
+            fleet_name="research-fleet",
+            org_id="acme",
+            project_id="research",
+            accelerator_type="v5p-16",
+            pods=1,
+            execution=CallableExecution(
+                artifact_uri="gs://trusted/train.pkl",
+                sha256="a" * 64,
+                # What a head running Ubuntu 24.04 pickles with.
+                python="3.12",
+            ),
+            idempotency_key="mismatched-python",
+        )
+
+    # A matching interpreter is accepted, so the guard refuses a mismatch rather
+    # than refusing callables.
+    workload, _ = await service.submit_pool_callable(
+        operator,
+        fleet_name="research-fleet",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-16",
+        pods=1,
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.10"),
+        idempotency_key="matching-python",
+    )
+    assert workload.state is WorkloadState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_a_pool_that_declares_no_interpreter_still_accepts_callables() -> None:
+    """Silence is not a claim: a fleet that never stated one must not be blocked."""
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    resources = ResourceVector(cpu=0, memory_gib=0, tpu=8)
+    pool = _capacity_pool().model_copy(
+        update={
+            "accelerator_type": "v5p-16",
+            "capacity": resources,
+            "allocatable": resources,
+            "provider_options": {},
+            "executor": "eyvan-native",
+            "labels": {"eyvan_resource_kind": "tpu"},
+        }
+    )
+    await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key="v5p-16-undeclared")
+
+    workload, _ = await service.submit_pool_callable(
+        _principal(Role.PROJECT_OPERATOR),
+        fleet_name="research-fleet",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-16",
+        pods=1,
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12"),
+        idempotency_key="undeclared-python",
+    )
+    assert workload.state is WorkloadState.PENDING

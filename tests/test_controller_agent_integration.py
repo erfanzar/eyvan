@@ -151,7 +151,16 @@ async def test_outbox_delivery_continues_while_leader_reconciliation_is_blocked(
                 "executor": "eyvan-native",
                 "agent_endpoint": "http://agent",
                 "provider_options": {},
-                "runtime": {"env": {}, "init_commands": [], "artifacts": [], "vm_image": None, "container": None},
+                "runtime": {
+                    "env": {},
+                    "init_commands": [],
+                    "artifacts": [],
+                    "vm_image": None,
+                    "container": None,
+                    # Declared so a callable pinned to another interpreter is
+                    # refused at submit rather than on the accelerator.
+                    "python": None,
+                },
             },
         )
     ]

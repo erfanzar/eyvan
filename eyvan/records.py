@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.compat import UTC, StrEnum
@@ -303,6 +303,29 @@ class NativeRuntimeConfig(EyvanModel):
     artifacts: tuple[NativeRuntimeArtifact, ...] = ()
     vm_image: str | None = None
     container: NativeContainerConfig | None = None
+    #: The ``major.minor`` Python these cells run workloads on, when the operator
+    #: states it. A serialized callable is pinned to the interpreter that pickled
+    #: it and cannot load on another, and that mismatch was only discovered on the
+    #: accelerator: a live multislice v5p-16 provisioned two slices, dispatched to
+    #: four ranks, and every rank died with "callable requires Python 3.12;
+    #: current runtime is 3.10" -- a fact knowable at submission, paid for with a
+    #: full provisioning cycle.
+    #:
+    #: Optional because a fleet that runs only command workloads has no
+    #: interpreter contract to state, and inventing one would refuse work that is
+    #: fine. Declared rather than discovered because a scale-from-zero pool has no
+    #: cell to ask when the submission arrives.
+    python: str | None = None
+
+    @field_validator("python")
+    @classmethod
+    def _valid_python(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parts = value.split(".")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ValueError("runtime python must be a 'major.minor' version such as '3.10'")
+        return value
 
     @property
     def is_empty(self) -> bool:
