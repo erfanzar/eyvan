@@ -98,6 +98,10 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     # to the rows afterwards could make it project-scoped. Fleet administration
     # is the only role whose scope is also the whole database.
     "POST /api/v1/query": "ad-hoc read-only SQL over the whole control plane",
+    # Stacks and allocations of the process serving every tenant; there is no
+    # per-tenant view of a shared interpreter to scope them to.
+    "GET /api/v1/process/stacks": "thread stacks of the shared control-plane process",
+    "GET /api/v1/process/allocations": "allocation snapshot of the shared control-plane process",
     # Named for a workload but settled through the preemption path, which is
     # fleet-owned: it moves capacity between tenants' jobs. A tenant kicking its
     # own attempt would be reasonable and is not what this route is.

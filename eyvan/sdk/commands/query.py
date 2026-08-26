@@ -50,6 +50,38 @@ class QueryCommandService:
         )
 
 
+@click.group("process")
+def process() -> None:
+    """Ask the control-plane process what it is doing right now."""
+
+
+@process.command("stacks")
+@click.pass_obj
+def process_stacks(session: CliSession) -> None:
+    """Dump every live thread's stack in the control plane.
+
+    The command for a plane that answers health checks and advances nothing.
+    Every external signal looks the same during a wedge; the stack is the thing
+    that differs.
+    """
+
+    JsonRenderer().emit(session.client.request("GET", "/api/v1/process/stacks"))
+
+
+@process.command("allocations")
+@click.pass_obj
+def process_allocations(session: CliSession) -> None:
+    """Report the largest tracked allocations in the control plane.
+
+    Read ``already_tracing`` first. When it is false the tracker was started by
+    this call, so the snapshot covers milliseconds rather than the leak you are
+    looking for -- and a small clean snapshot is exactly what a leak looks like
+    from that angle.
+    """
+
+    JsonRenderer().emit(session.client.request("GET", "/api/v1/process/allocations"))
+
+
 @click.command("query")
 @click.argument("statement")
 @click.option(
@@ -76,14 +108,16 @@ def query(session: CliSession, statement: str, limit: int) -> None:
 
 
 def register_query_commands(group: click.Group) -> None:
-    """Attach the read-only query console to the root command group."""
+    """Attach the read-only console and process introspection to the CLI root."""
 
     group.add_command(query)
+    group.add_command(process)
 
 
 __all__ = (
     "MAX_QUERY_ROWS",
     "QueryCommandService",
+    "process",
     "query",
     "register_query_commands",
 )

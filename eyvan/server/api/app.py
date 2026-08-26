@@ -160,6 +160,7 @@ from eyvan.server.api.server_startup import (
 )
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
 from eyvan.server.controller import EyvanController
+from eyvan.server.introspection import allocations_as_json, thread_stacks_as_json
 from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL
@@ -835,6 +836,41 @@ def create_app(
             platform=identity.platform,
             controller=startup.controller_mode,
         )
+
+    @app.get("/api/v1/process/stacks", tags=["system"])
+    async def process_stacks(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> list[dict[str, tp.Any]]:
+        """Return every live thread's stack in this control-plane process.
+
+        The one answer that identifies a wedged scheduler. Every external signal
+        looks identical when the leader holds its lease and advances nothing --
+        the API answers, health is green -- and the difference is which frame the
+        process is sitting in.
+
+        Taken as a snapshot rather than by suspending the process: a consistent
+        dump bought with a stop-the-world pause would be an outage taken to
+        investigate a stall.
+        """
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        return thread_stacks_as_json()
+
+    @app.get("/api/v1/process/allocations", tags=["system"])
+    async def process_allocations(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, tp.Any]:
+        """Return the largest tracked allocations in this process.
+
+        ``already_tracing`` is the half that decides whether the numbers mean
+        anything: ``tracemalloc`` sees only what was allocated after it started,
+        so a snapshot from a tracker this call had to switch on covers
+        milliseconds rather than the leak that has been growing since Tuesday.
+        Read it before reading the sites.
+        """
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        return allocations_as_json()
 
     @app.post("/api/v1/query", response_model=ReadOnlyQueryResponse, tags=["system"])
     async def readonly_query(
