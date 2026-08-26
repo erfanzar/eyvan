@@ -25,14 +25,29 @@ difference costs money:
   plane end to end — VM, VPC-only firewall, generated secrets, PostgreSQL,
   migrations, systemd — and `eyvan head down` removes it. It installs the wheel
   it is running; no package index is involved.
-- **Not yet reachable:** a fresh head has no identity provider, so every
-  authenticated request is refused with 401 until you pass `--oidc-issuer`. The
-  command tells you this when it finishes. Until then `eyvan up` cannot create a
-  fleet, so **no workload has run through a head built this way**.
+- **Runs work, verified against real GCP:** a `pods=2` callable submitted with
+  the `@execute` decorator acquired one Cloud TPU Multislice queued resource in
+  `us-east5-a`, provisioned two spot `v5p-16` slices, dispatched to all four
+  ranks, and printed `jax.device_count() == 16`. Nothing was configured by hand:
+  the head published its own worker wheel, named the fleet-state document its
+  agents share, and provisioned JAX through the fleet's declarative runtime.
+- **Reachable without an identity provider:** a head with no `--oidc-issuer`
+  authenticates with a generated bootstrap token, and on the head itself the CLI
+  and the Python SDK discover the plane's address and credential from the node,
+  so `eyvan up` and `@execute` need no environment at all.
 - **Not published:** Eyvan is not on PyPI. Install from source, or let
   `eyvan head up` carry its own wheel.
-- **Not qualified:** no current release has a receipt proving a real TPU, GPU,
-  Kubernetes, or object-store path. See [docs/proofs.md](docs/proofs.md).
+- **Partly qualified:** the execution path above has a receipt; the numbered
+  proofs -- structured multi-host logs, in-job submission, per-attempt secrets,
+  spot-reclamation accounting, and the soak -- do not. See
+  [docs/proofs.md](docs/proofs.md), which keeps those apart on purpose.
+- **Two things a first run still needs to know:** this command terminates no
+  TLS, so a callable's artifact token would travel in clear text and is refused
+  unless you pass `--allow-insecure-artifact-http` (defensible only because
+  ingress is VPC-only); and a serialized callable cannot load on an interpreter
+  other than the one that pickled it, so a pool that declares `runtime.python`
+  will refuse a mismatch at submission rather than after the accelerator is
+  built.
 
 ## Where it runs
 

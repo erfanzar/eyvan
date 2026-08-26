@@ -60,6 +60,62 @@ roadmap, must close independently before a hardware receipt can qualify them.
 
 ---
 
+## P0 — a callable runs on a multislice allocation
+
+**Establishes** the property every other proof presumes: that a submission
+becomes running work. Placement, leasing and provisioning were all separately
+evidenced before this; that a workload ever *executed* was not.
+
+```
+eyvan head up FLEET --allow-insecure-artifact-http --yes
+eyvan up FLEET                                    # on the head; no URL or token needed
+python train.py                                   # the callable below
+eyvan head down FLEET --yes
+```
+
+```python
+from eyvan import TpuConfig, execute
+
+
+@execute(TpuConfig(type="v5p-16", pods=2))
+def train():
+    import jax
+
+    print(jax.device_count())
+
+
+train()
+```
+
+**Passes when** the decorator returns the device count of the whole allocation --
+for `v5p-16 x 2` that is 16, the catalog's 8 chips per slice times two slices --
+and the queued resource GCP created carries more than one node.
+
+**Run 2026-08-12, exit 0.** One Cloud TPU Multislice queued resource in
+`us-east5-a`, spot, with two `v5p-16` nodes (`...-node-0`, `...-node-1`, each
+carrying GCP's own `multisliceNode` marker). Both slices provisioned, all four
+ranks -- two slices by two hosts -- received the dispatch, and the callable
+returned `16`. Submitted from a bare `@execute` decorator with no `EYVAN_URL` and
+no `EYVAN_TOKEN`: on the head, the SDK reads the plane's address and credential
+from `/etc/eyvan/node.json` and `/etc/eyvan/head.env`.
+
+Nothing was configured by hand. `eyvan head up` published its own worker wheel to
+the artifact store with a digest and object generation, named the fleet-state
+document its agents reconcile against, generated the native-worker root secret,
+and staged the operations dashboard. JAX reached the workers through the fleet's
+`runtime.init_commands`.
+
+Two conditions this run had to satisfy and a first-time operator will too. The
+head terminates no TLS, so the artifact capability token would travel in clear
+text and is refused without `--allow-insecure-artifact-http`. And a serialized
+callable cannot load on another interpreter: the head pickles on Python 3.12 and
+the Cloud TPU image ships 3.10, so the submission came from a 3.10 environment
+matching the pool's declared `runtime.python`. An earlier attempt without that
+match provisioned two slices, dispatched to four ranks, and had every rank die
+on the version check -- which is why that check now runs at submission.
+
+**Shape** v5p-16 x 2, spot, one multislice queued resource. **~25 minutes.**
+
 ## P1 — the hardware catalog is authoritative for hosts per slice
 
 **Establishes** that pool resources come from the shape catalog rather than
