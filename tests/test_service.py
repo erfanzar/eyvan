@@ -49,6 +49,7 @@ from eyvan.server.service.errors import (
     ServiceErrorCode,
 )
 from eyvan.server.service.scheduling import CoreSchedulingService, to_core_cell
+from eyvan.server.service.services import ServicePolicy
 
 
 def _principal(role: Role, *, subject: str = "alice", project: str = "research") -> Principal:
@@ -1529,3 +1530,74 @@ async def test_a_pool_that_declares_no_interpreter_still_accepts_callables() -> 
         idempotency_key="undeclared-python",
     )
     assert workload.state is WorkloadState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_no_submission_route_can_smuggle_a_pickle_past_callable_trust() -> None:
+    """Trust was a front door beside five open windows.
+
+    `callable_trust` decides whether a project may have arbitrary pickled code
+    deserialized and executed on the fleet -- the single most dangerous
+    capability the control plane grants. It was enforced on the direct
+    submission route only, while batch, DAG, group, service and in-job child
+    submission each accept a `WorkloadDefinition` and carried a
+    `CallableExecution` straight past it.
+
+    Reproduced before the fix: the same principal, with the same pickle, was
+    refused by `submit_workload` and accepted by `submit_batch`.
+
+    Parameterising over the routes rather than testing one is the point -- the
+    defect was not in any single route but in the assumption that guarding one
+    entrance guards the building.
+    """
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        scheduler=CoreSchedulingService(),
+        # Trusts nobody, which is the default a real head starts from.
+        callable_trust=CallableProjectTrustPolicy(),
+    )
+    operator = _principal(Role.PROJECT_OPERATOR)
+    pickled = WorkloadDefinition(
+        name="untrusted",
+        execution=CallableExecution(artifact_uri="gs://untrusted/evil.pkl", sha256="a" * 64, python="3.12"),
+    )
+    scope = {"org_id": "acme", "project_id": "research"}
+
+    with pytest.raises(AuthorizationError, match="not trusted"):
+        await service.submit_workload(operator, **scope, spec=pickled, idempotency_key="direct")
+
+    with pytest.raises(AuthorizationError, match="not trusted"):
+        await service.submit_batch(operator, **scope, template=pickled, count=1, idempotency_key="batch")
+
+    with pytest.raises(AuthorizationError, match="not trusted"):
+        await service.submit_service(
+            operator, **scope, spec=pickled, policy=ServicePolicy(replicas=1, revision="r1"), idempotency_key="service"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_trusted_project_still_reaches_every_submission_route() -> None:
+    """The guard must refuse untrusted pickles, not pickles."""
+
+    service = ControlPlaneService(
+        InMemoryRepository(),
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    operator = _principal(Role.PROJECT_OPERATOR)
+    pickled = WorkloadDefinition(
+        name="trusted",
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12"),
+    )
+
+    batch, _ = await service.submit_batch(
+        operator,
+        org_id="acme",
+        project_id="research",
+        template=pickled,
+        count=1,
+        idempotency_key="trusted-batch",
+    )
+
+    assert batch is not None

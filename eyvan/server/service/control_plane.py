@@ -777,12 +777,7 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
-        if isinstance(spec.execution, CallableExecution):
-            self._require_trusted_callable_project(org_id, project_id)
-            if spec.execution.signature is not None:
-                raise InputError(REMOTE_CALLABLE_SIGNATURE_ERROR)
-            if CALLABLE_SIGNING_KEY_ENV in spec.environment:
-                raise InputError(REMOTE_CALLABLE_SIGNING_KEY_ERROR)
+        self._authorize_callable_spec(spec, org_id=org_id, project_id=project_id)
         key = _validate_idempotency_key(idempotency_key)
         scope = _scope(org_id, project_id)
         # Fingerprint the spec as submitted, before locality fills anything in. A
@@ -1084,6 +1079,29 @@ class ControlPlaneService:
 
     def _require_trusted_callable_project(self, org_id: str, project_id: str) -> None:
         self.callable_trust.require(org_id, project_id)
+
+    def _authorize_callable_spec(self, spec: WorkloadDefinition, *, org_id: str, project_id: str) -> None:
+        """Apply the callable rules to any spec, however it arrived.
+
+        Trust decides whether a project may have arbitrary pickled code
+        deserialized and executed on this fleet, and it was enforced only on the
+        direct submission route. Batch, DAG, group, service and in-job child
+        submission all accept a ``WorkloadDefinition`` and all carried a
+        ``CallableExecution`` straight past it -- so the gate was a front door
+        beside five open windows. Reproduced: a principal whose project is
+        trusted for nothing is refused by ``submit_workload`` and accepted by
+        ``submit_batch`` with the same pickle.
+
+        Written once and called by every route so a sixth cannot quietly skip it.
+        """
+
+        if not isinstance(spec.execution, CallableExecution):
+            return
+        self._require_trusted_callable_project(org_id, project_id)
+        if spec.execution.signature is not None:
+            raise InputError(REMOTE_CALLABLE_SIGNATURE_ERROR)
+        if CALLABLE_SIGNING_KEY_ENV in spec.environment:
+            raise InputError(REMOTE_CALLABLE_SIGNING_KEY_ERROR)
 
     def authorize_callable_artifact(self, principal: Principal, *, org_id: str, project_id: str) -> None:
         """Authorize managed callable storage for one trusted project."""
@@ -1426,6 +1444,7 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        self._authorize_callable_spec(template, org_id=org_id, project_id=project_id)
         request = BatchRequest(template=template, count=count, name_prefix=name_prefix)
         tasks = expand(request, max_fan_out=max_fan_out)
         key = _validate_idempotency_key(idempotency_key)
@@ -1536,6 +1555,8 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        for _node in nodes:
+            self._authorize_callable_spec(_node.template, org_id=org_id, project_id=project_id)
         order = dag_validate(nodes, max_fan_out=max_fan_out)
         key = _validate_idempotency_key(idempotency_key)
         _validate_idempotency_key(child_idempotency_key(key, max(len(nodes) - 1, 0)))
@@ -1653,6 +1674,8 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        for _role in roles:
+            self._authorize_callable_spec(_role.template, org_id=org_id, project_id=project_id)
         members = group_validate(roles, max_members=max_members)
         key = _validate_idempotency_key(idempotency_key)
         _validate_idempotency_key(child_idempotency_key(key, max(members - 1, 0)))
@@ -4895,6 +4918,7 @@ class ControlPlaneService:
         """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        self._authorize_callable_spec(spec, org_id=org_id, project_id=project_id)
         key = _validate_idempotency_key(idempotency_key)
         scope = _scope(org_id, project_id)
         # The policy travels in metadata so the reconciler can read desired state
@@ -5221,6 +5245,11 @@ class ControlPlaneService:
 
         if not parent.spec.can_submit_children:
             raise AuthorizationError(f"workload {parent.id!r} was not submitted with can_submit_children")
+        # Inheriting the parent's scope does not inherit permission to have a
+        # pickle deserialized: trust is a property of the project, and a child
+        # submitted in-job reaches the same executor by the same route. Checked
+        # against the parent's scope because that is the scope the child runs in.
+        self._authorize_callable_spec(spec, org_id=parent.org_id, project_id=parent.project_id)
         if parent.state in TERMINAL_WORKLOAD_STATES or parent.state is WorkloadState.CANCELLING:
             raise ConflictError(f"workload {parent.id!r} is {parent.state.value}; it cannot gain new children")
 
