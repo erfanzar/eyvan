@@ -919,7 +919,9 @@ def initialize_runtime(
         try:
             project_id = validate_gcp_project_id(project_id)
         except ValueError as exc:
-            raise click.ClickException(f"invalid GCP project: {exc}") from exc
+            raise click.ClickException(
+                f"invalid GCP project: {exc}; pass one you can see in `gcloud projects list` with --project"
+            ) from exc
 
     if artifact_root is None:
         # The bucket is Eyvan-managed: derived from the project and created by
@@ -933,7 +935,9 @@ def initialize_runtime(
         try:
             artifact_root = normalize_runtime_artifact_root(project_id, artifact_root)
         except GcpNativeRuntimeProfileError as exc:
-            raise click.ClickException(f"invalid GCS artifact root: {exc}") from exc
+            raise click.ClickException(
+                f"invalid GCS artifact root: {exc}; pass a bucket you own as --artifact-root gs://<bucket>/eyvan"
+            ) from exc
 
     resolved_profile_path = GcpNativeRuntimeProfileStore(
         profile_path if profile_path is not None else DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH

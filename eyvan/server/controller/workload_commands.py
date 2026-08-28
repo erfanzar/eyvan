@@ -349,7 +349,8 @@ class _ControllerWorkloadCommands:
         except ValueError as exc:
             raise AttemptRankSpaceTooLarge(
                 f"workload {workload.id!r} cannot be dispatched with a bounded rank space "
-                f"(ceiling {MAX_ATTEMPT_RANK_COUNT}): {exc}"
+                f"(ceiling {MAX_ATTEMPT_RANK_COUNT}): {exc}; request fewer pods or replicas per "
+                "workload, or split the job"
             ) from exc
 
     async def _persist_attempt_topology(

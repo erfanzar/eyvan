@@ -964,7 +964,10 @@ class _ControllerSettlement:
                     workload.id,
                     WorkloadState.FAILED,
                     action="workload.orphaned",
-                    failure_reason=f"workload is unobservable: {reason}",
+                    failure_reason=(
+                        f"workload is unobservable: {reason}; if the host is truly gone, settle it "
+                        "with `eyvan workload-force-finalize <id> --reason '<what you checked>'`"
+                    ),
                     expected_generation=workload.generation,
                     expected_state=workload.state,
                     settle_without_leases=True,

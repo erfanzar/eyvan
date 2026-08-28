@@ -131,7 +131,11 @@ class WorkloadCommandService:
             headers=self.session.workload_headers(scope),
         )
         if not isinstance(payload, list) or not all(isinstance(fleet, str) for fleet in payload):
-            raise click.ClickException("control plane returned an invalid fleet-name list")
+            raise click.ClickException(
+                f"control plane at {self.session.base_url} returned an invalid fleet-name list; "
+                "a version mismatch between this CLI and the plane is the usual cause -- align them "
+                "(redeploy the plane, or upgrade this CLI) rather than retrying"
+            )
         return tuple(sorted(set(payload)))
 
     @staticmethod
@@ -502,7 +506,11 @@ class WorkloadCommandService:
             params=params,
         )
         if not is_json_object(document):
-            raise click.ClickException("control plane returned an invalid cost document")
+            raise click.ClickException(
+                f"control plane at {self.session.base_url} returned an invalid cost document; "
+                "a version mismatch between this CLI and the plane is the usual cause -- align them "
+                "(redeploy the plane, or upgrade this CLI) rather than retrying"
+            )
         for line in spend_render(
             str(document.get("workload_id") or workload_id),
             str(document.get("state") or "unknown"),
@@ -675,7 +683,10 @@ class WorkloadCommandService:
             return candidates[0].id
         shown = ", ".join(f"{workload.id} ({workload.spec.name})" for workload in candidates[:5])
         more = "" if len(candidates) <= 5 else f", and {len(candidates) - 5} more"
-        raise click.ClickException(f"{reference!r} matches {len(candidates)} workloads: {shown}{more}")
+        raise click.ClickException(
+            f"{reference!r} matches {len(candidates)} workloads: {shown}{more}; "
+            "pass one of the full workload ids instead"
+        )
 
     def mutate_prefix(
         self,

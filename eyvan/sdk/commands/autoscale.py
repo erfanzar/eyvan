@@ -519,14 +519,19 @@ def require_preemptible_tpus(config: EyvanFleetConfig) -> None:
 
     tpu_pools = [pool for pool in config.pools.values() if pool.kind == "tpu"]
     if not tpu_pools:
-        raise click.ClickException("--preemptible only applies to fleets containing TPU pools")
+        raise click.ClickException(
+            "--preemptible only applies to fleets containing TPU pools; apply it to a TPU fleet or drop the flag"
+        )
     non_spot = [
         pool.accelerator_type
         for pool in tpu_pools
         if (pool.capacity_class or config.capacity_class) is not CapacityClass.SPOT
     ]
     if non_spot:
-        raise click.ClickException(f"--preemptible requires Spot TPU pools; {non_spot[0]!r} is not Spot")
+        raise click.ClickException(
+            f"--preemptible requires Spot TPU pools; {non_spot[0]!r} is not Spot; set that pool's "
+            "capacity_class to spot in the fleet configuration, or drop --preemptible"
+        )
 
 
 def generate_autoscale_entries(

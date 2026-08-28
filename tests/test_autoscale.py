@@ -752,3 +752,56 @@ def test_defaults_carry_the_worker_python_across_a_save_and_load() -> None:
     # Absent rather than null when unset: a fleet that declares nothing must
     # generate the document it always generated.
     assert "runtime_python" not in AutoscaleDefaults(project="p").as_document()
+
+
+def test_preemptible_refusals_name_their_exits() -> None:
+    """A precondition failure that hides its exits is a dead end in print.
+
+    ``--preemptible`` has exactly two ways to be wrong and exactly two ways
+    out; both refusals must say theirs, so the operator changes one thing
+    instead of reading the apply path to find which.
+    """
+
+    import click
+    import pytest
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+    from eyvan.sdk.commands.autoscale import require_preemptible_tpus
+
+    cpu_only = EyvanFleetConfig.model_validate(
+        {
+            "version": 1,
+            "name": "research",
+            "provider": {"type": "onprem-ssh", "region": "local"},
+            "pools": {
+                "workers": {
+                    "kind": "cpu",
+                    "machine_type": "n2-standard-8",
+                    "resources": {"cpu": 4, "memory_gib": 16},
+                    "capacity_backend": "onprem",
+                    "min_cells": 0,
+                    "max_cells": 1,
+                }
+            },
+        }
+    )
+    with pytest.raises(click.ClickException, match="drop the flag"):
+        require_preemptible_tpus(cpu_only)
+
+    on_demand = EyvanFleetConfig.model_validate(
+        {
+            "version": 1,
+            "name": "research",
+            "provider": {"type": "gcp", "project": "a-project", "region": "us-central2", "zone": "us-central2-b"},
+            "pools": {
+                "tpu": {
+                    "kind": "tpu",
+                    "accelerator_type": "v6e-8",
+                    "max_workers": 1,
+                    "provider_options": {"bootstrap_egress": "public-internet"},
+                }
+            },
+        }
+    )
+    with pytest.raises(click.ClickException, match="capacity_class to spot"):
+        require_preemptible_tpus(on_demand)

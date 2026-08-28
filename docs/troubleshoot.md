@@ -154,3 +154,30 @@ liveness deliberately does not check it.
 `eyvan events` is scoped to (org, project). Every capability redemption appears
 there, granted or refused, and a refusal with no matching issuance in the same
 attempt is the shape a leaked token takes.
+
+## Errors name their exits
+
+An error that reaches a human states what happened **and what to do about
+it**, in the same breath. The codebase's exemplar is
+`EyvanPlacementError` (eyvan/sdk/client/jobs.py): it names the request,
+the compatible types, the fleets that would work, and closes with three
+exact commands. Every user-facing failure is held to that shape:
+
+- A **state error** names the commands that leave the state: proven build
+  skew names `eyvan cell-drain` and `eyvan cell-delete`; an ambiguous
+  workload reference tells you to pass a full id; an unobservable workload
+  names `eyvan workload-force-finalize`.
+- A **precondition error** names its exits: which flag to drop, which
+  config field to set, or which alternative command reaches the same goal.
+- A **protocol error** ("unexpected response") names the endpoint it asked
+  and the usual cause -- a version mismatch between CLI and plane -- so the
+  operator aligns versions instead of retrying.
+- A **wrapped cause** (`could not X: <cause>`) carries the cause verbatim;
+  when the cause is a subprocess, its stderr rides along (see
+  `GcsCommandError`).
+
+Tests pin the remediation clause, not just the condition, for the errors
+operators actually meet (see `test_cli.py`, `test_autoscale.py`,
+`test_controller.py`, `test_attempt_topology.py`). If you add or move a
+user-facing error, the test that pins it should assert the exit, not only
+the wound -- an error that hides its exit is a dead end in print.

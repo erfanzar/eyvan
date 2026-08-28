@@ -69,10 +69,16 @@ def _zones_for_region(region: str, project: str) -> tuple[str, ...]:
         env=provider_cli_env(),
     )
     if result.returncode != 0:
-        raise click.ClickException(f"could not list zones for {region}: {result.stderr.strip()}")
+        raise click.ClickException(
+            f"could not list zones for {region}: {result.stderr.strip()}; "
+            f"verify access and spelling with `gcloud compute zones list --filter=name~{region}`"
+        )
     zones = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
     if not zones:
-        raise click.ClickException(f"no zones found for region {region!r}")
+        raise click.ClickException(
+            f"no zones found for region {region!r}; check the region name with "
+            f"`gcloud compute zones list --filter=name~{region}`"
+        )
     return zones
 
 
@@ -104,7 +110,11 @@ def _print_capacity(session: CliSession, *, as_json: bool) -> None:
     )
     rows = pools.get("pools") if isinstance(pools, dict) else None
     if not isinstance(rows, list):
-        raise click.ClickException("control plane returned an unexpected capacity response")
+        raise click.ClickException(
+            f"control plane at {session.base_url} returned an unexpected capacity response; "
+            "a version mismatch between this CLI and the plane is the usual cause -- align them "
+            "(redeploy the plane, or upgrade this CLI) rather than retrying"
+        )
     if as_json:
         click.echo(json.dumps(pools, sort_keys=True, indent=2))
         return

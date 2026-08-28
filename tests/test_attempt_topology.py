@@ -979,6 +979,7 @@ async def test_dispatch_refuses_a_composed_rank_count_above_the_attempt_ceiling(
     assert workload.state is WorkloadState.FAILED
     assert "bounded rank space" in (workload.failure_reason or "")
     assert str(MAX_ATTEMPT_RANK_COUNT) in (workload.failure_reason or "")
+    assert "fewer pods" in (workload.failure_reason or ""), "the refusal must name its exit"
     assert command is not None and command.state is OutboxState.SUCCEEDED
     assert await controller.dispatch_outbox_once() == 0
 

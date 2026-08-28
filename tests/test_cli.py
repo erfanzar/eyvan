@@ -2664,3 +2664,32 @@ def test_ensuring_a_local_runtime_refreshes_the_session_after_the_plane_exists()
     )
     native.ensure_local_runtime(config)
     assert events == ["runtime", "refresh"], "the native runtime lane refreshes on the same rule"
+
+
+def test_builds_disagreement_names_the_recycle_commands(monkeypatch, tmp_path) -> None:
+    """Proven skew is only useful if the exit says how to leave it.
+
+    ``capacity builds`` exists to catch a stale agent before it executes a
+    workload wrongly. Catching it and then printing a bare condition hands the
+    operator the same mid-incident doc hunt the dispatch refusal used to.
+    """
+
+    class SkewedPlane(FakeClient):
+        def request(self, method, path, **kwargs):
+            if method == "GET" and path == "/api/v1/capacity/builds":
+                return {
+                    "plane": {"version": "0.0.1", "source_digest": "sha256:" + "a" * 64},
+                    "agents": [{"endpoint": "http://agent:8090", "build": {"source_digest": "sha256:" + "b" * 64}}],
+                    "unreachable": [],
+                    "unscanned_pools": [],
+                    "in_agreement": False,
+                }
+            return super().request(method, path, **kwargs)
+
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: SkewedPlane())
+    result = CliRunner().invoke(cli.main, ["--user", "alice", "--role", "fleet_admin", "capacity", "builds"])
+
+    assert result.exit_code != 0
+    assert "cell-drain" in result.output, "the recycle verbs must ride in the error"
+    assert "cell-delete" in result.output
+    assert "runtime deploy" in result.output, "the one-command alternative must appear too"

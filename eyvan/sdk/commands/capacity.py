@@ -131,7 +131,11 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
 
     agreement = document.get("in_agreement")
     if agreement is False:
-        raise click.ClickException("at least one cell agent is running different code than this control plane")
+        raise click.ClickException(
+            "at least one cell agent is running different code than this control plane; "
+            "list cells with `eyvan cells`, recycle each stale one with `eyvan cell-drain <id>` then "
+            "`eyvan cell-delete <id>`, or redeploy every component from one source with `eyvan runtime deploy`"
+        )
     if agreement is None:
         raise click.ClickException(
             f"the fleet could not be shown to agree: {len(agents)} agent(s) answered, {silent} without a digest, "
@@ -222,7 +226,11 @@ def list_capacity(
     )
     pools = payload.get("pools") if isinstance(payload, dict) else None
     if not isinstance(pools, list):
-        raise click.ClickException("control plane returned an unexpected capacity response")
+        raise click.ClickException(
+            f"control plane at {session.base_url} returned an unexpected capacity response; "
+            "a version mismatch between this CLI and the plane is the usual cause -- align them "
+            "(redeploy the plane, or upgrade this CLI) rather than retrying"
+        )
     rows = [
         pool
         for pool in pools
@@ -351,7 +359,11 @@ def capacity_quota(
         params["zone"] = list(zones)
     payload = session.client.request("GET", "/api/v1/capacity/quota", params=params)
     if not isinstance(payload, dict):
-        raise click.ClickException("control plane returned an unexpected quota response")
+        raise click.ClickException(
+            f"control plane at {session.base_url} returned an unexpected quota response; "
+            "a version mismatch between this CLI and the plane is the usual cause -- align them "
+            "(redeploy the plane, or upgrade this CLI) rather than retrying"
+        )
     if as_json:
         click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return
