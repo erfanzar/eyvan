@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import inspect
+import io
 import subprocess
+import tarfile
 import typing as tp
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -655,3 +657,81 @@ def test_a_worker_count_change_never_reprints_the_state_heading() -> None:
     headings = [lines for lines in rendered if lines and lines[0].startswith("Eyvan")]
     assert len(headings) == 1
     assert rendered[-1] == ("  0/1 workers ready",)
+
+
+def test_a_local_pythonpath_warns_that_it_does_not_travel(tmp_path, monkeypatch) -> None:
+    """The most natural way to make an import work locally is a silent lie.
+
+    A submitter who points ``PYTHONPATH`` at their source tree expects the
+    worker to see it. Only the callable travels; its imports resolve on the
+    worker, where no such variable was ever set -- and the job burns a real
+    provisioning cycle to die on ``ModuleNotFoundError``. Submission now says
+    so, naming the mechanism that does travel, so the fix is one line instead
+    of a blind re-submission.
+    """
+
+    store = LocalArtifactStore(tmp_path)
+    context = ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="models",
+        artifact_store=store,
+        submitter=FakeSubmitter(result=1),
+        signing_key=b"secret",
+    )
+
+    @execute(TpuConfig(type="v5p-512"), context=context)
+    def add(left: int) -> int:
+        return left
+
+    monkeypatch.setenv("PYTHONPATH", "libs/easydel:libs/spectrax")
+    with pytest.warns(UserWarning, match="workspace="):
+        add.remote(1)
+
+    monkeypatch.delenv("PYTHONPATH")
+    import warnings as warnings_module
+
+    with warnings_module.catch_warnings():
+        warnings_module.simplefilter("error")
+        add.remote(2)
+
+
+def test_a_workspace_root_ships_the_paths_the_callable_walks(tmp_path) -> None:
+    """``workspace`` is why relative layout survives the jump to a worker.
+
+    The bundle is extracted to the worker's cwd and ``sys.path[0]`` before the
+    callable loads, so a callable that inserts ``libs/easydel`` -- a path
+    relative to the workspace root -- resolves it against the extraction, not
+    against a laptop that is thousands of kilometers away.
+    """
+
+    store = LocalArtifactStore(tmp_path)
+    submitter = FakeSubmitter(result=1)
+    context = ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="models",
+        artifact_store=store,
+        submitter=submitter,
+        signing_key=b"secret",
+    )
+    workspace = tmp_path / "source"
+    (workspace / "libs" / "mysrc").mkdir(parents=True)
+    (workspace / "libs" / "mysrc" / "__init__.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    @execute(TpuConfig(type="v5p-512"), context=context, workspace=workspace)
+    def read_value() -> int:
+        import sys
+
+        sys.path.insert(0, "libs/mysrc")
+        import mysrc
+
+        return mysrc.VALUE
+
+    read_value.remote()
+
+    request = submitter.requests[0]
+    assert request.workspace_uri is not None
+    bundle = tarfile.open(fileobj=io.BytesIO(store.read(request.workspace_uri)), mode="r:gz")
+    names = bundle.getnames()
+    assert "libs/mysrc/__init__.py" in names, "the bundle must preserve the root's relative layout"

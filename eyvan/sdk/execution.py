@@ -539,6 +539,22 @@ class Executable(tp.Generic[P, R]):
         if context.submitter is None:
             raise RuntimeError("Eyvan callable execution requires a configured CallableSubmitter")
         _refuse_unplaceable_config(self._config)
+        if os.environ.get("PYTHONPATH"):
+            # A submitter who steered their own interpreter expects it to steer
+            # the worker's too. It cannot: only the callable travels, and every
+            # import inside it resolves on the worker, where ``PYTHONPATH`` was
+            # never set. The job then provisions real accelerators to die on
+            # ``ModuleNotFoundError``. The mechanism that does travel is the
+            # workspace bundle -- it is extracted to the worker's cwd and
+            # ``sys.path[0]``, so relative layout survives the jump -- and
+            # naming it here is the difference between a one-line fix and a
+            # blind re-submission.
+            warnings.warn(
+                "PYTHONPATH is set in this process and does not travel to the workers "
+                "running the callable; ship the directories it names with "
+                "@execute(..., workspace=...) instead",
+                stacklevel=2,
+            )
         inspect.signature(self._fn).bind(*args, **kwargs)
         bound = _zero_arg_invocation(self._fn, *args, **kwargs)
         artifact = context.artifact_store.put(dump_callable(bound, signing_key=context.signing_key))
