@@ -120,9 +120,18 @@ def next_pool_cell_index(pool: CapacityPoolRecord, cells: tp.Iterable[CellRecord
 
 
 def cell_matches_pool(cell: CellRecord, pool: CapacityPoolRecord) -> bool:
-    """Return whether a cell matches its pool template and physical shape."""
+    """Return whether a cell matches its pool template and physical shape.
 
-    desired = pool.make_cell(cell.id, worker_count=cell.worker_count)
+    A cell its pool can no longer mint does not match it, which is an answer
+    rather than an error -- and the same reasoning as
+    :func:`cell_requires_replacement` below, guarded here for the same reason:
+    both run inside leader phases where a raise stops the cycle.
+    """
+
+    try:
+        desired = pool.make_cell(cell.id, worker_count=cell.worker_count)
+    except ValueError:
+        return False
     return cell_matches_template(cell, desired)
 
 
@@ -154,9 +163,22 @@ def cell_matches_template(cell: CellRecord, desired: CellRecord) -> bool:
 
 
 def cell_requires_replacement(cell: CellRecord, pool: CapacityPoolRecord) -> bool:
-    """Return whether mutable metadata cannot reconcile a cell to its pool."""
+    """Return whether mutable metadata cannot reconcile a cell to its pool.
 
-    desired = pool.make_cell(cell.id, worker_count=cell.worker_count)
+    A pool its own cell can no longer mint answers this question by itself: the
+    cell cannot be reconciled, so it requires replacement. Letting ``make_cell``
+    raise here instead made an ordinary pool edit fatal -- narrowing a pool so an
+    existing multi-worker cell became unmintable raised inside the
+    ``capacity-pools`` leader phase, which carries no ``isolate_failures``, and
+    every later phase of every cycle stopped. That is the same shape as the
+    submission that once halted a whole plane, reached through a config change
+    rather than a workload.
+    """
+
+    try:
+        desired = pool.make_cell(cell.id, worker_count=cell.worker_count)
+    except ValueError:
+        return True
     return (
         cell.provider != desired.provider
         or cell.capacity_backend != desired.capacity_backend

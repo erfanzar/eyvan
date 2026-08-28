@@ -11,7 +11,13 @@ import re
 
 import pytest
 
-from eyvan.capacity.planning import CapacityPlanner, CapacitySimulation, PoolDemand
+from eyvan.capacity.planning import (
+    CapacityPlanner,
+    CapacitySimulation,
+    PoolDemand,
+    cell_matches_pool,
+    cell_requires_replacement,
+)
 from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
@@ -510,3 +516,25 @@ def test_another_pools_cells_do_not_advance_this_counter() -> None:
     )
 
     assert next_pool_cell_index(pool, [foreign]) == 1
+
+
+def test_a_pool_edit_that_orphans_a_cell_shape_does_not_stop_the_leader() -> None:
+    """The poison pill again, reached by editing a pool instead of submitting.
+
+    `cell_matches_pool` and `cell_requires_replacement` both mint a comparison
+    cell from the pool, and `make_cell` refuses a multi-worker cell on a non-TPU
+    backend by raising. Narrowing a pool that already has a multi-worker cell
+    therefore raised inside the `capacity-pools` leader phase, which carries no
+    `isolate_failures` -- so scheduling, settlement and billing stopped every
+    cycle, over a configuration change.
+
+    A pool that can no longer mint its own cell has answered both questions: the
+    cell does not match, and it requires replacement.
+    """
+
+    pool = multislice_tpu_pool()
+    wide = pool.make_cell("cell-wide", worker_count=2)
+    narrowed = pool.model_copy(update={"capacity_backend": "gcp-compute"})
+
+    assert cell_matches_pool(wide, narrowed) is False
+    assert cell_requires_replacement(wide, narrowed) is True
