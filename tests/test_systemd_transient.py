@@ -1249,3 +1249,72 @@ def test_logs_distinguish_a_journal_failure_from_an_empty_log(tmp_path: Path) ->
         executor.logs(remote_id)
     assert captured.value.unit_name == unit_name
     assert "journal unavailable" in captured.value.stderr
+
+
+def test_a_failed_worker_names_its_own_dying_words_in_the_status(tmp_path: Path) -> None:
+    """A dead rank must report why it died, not only that systemd noticed.
+
+    A multi-host job once burned its whole provisioning cycle to answer
+    ``systemd service failed with result exit-code``: every worker had died
+    seconds after start on ``ModuleNotFoundError``, a fact printed to the log
+    stream and absent from the status every consumer actually reads. The
+    unit's journal tail is read on failure, and the last line that reads like
+    an exception -- a traceback's closing line -- rides along in the message.
+    """
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(entrypoint="python -m device_test"), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+    systemd.journal[unit_name] = "\n".join(
+        [
+            "please install `torch` (cpu) if you want to use `AutoEasyDeLModel*.from_torch_pretrained`",
+            "Traceback (most recent call last):",
+            '  File "…/callable_protocol.py", line 629, in execute_callable',
+            '  File "launch-test.py", line 20, in device_test',
+            "ModuleNotFoundError: No module named 'spectrax'",
+            "eyvan-device_test.service: Main process exited, code=exited, status=1/FAILURE",
+        ]
+    )
+
+    observation = executor.status(remote_id)
+
+    assert observation.status is ExecutionWorkloadStatus.FAILED
+    assert "systemd service failed with result exit-code" in observation.message
+    assert "ModuleNotFoundError: No module named 'spectrax'" in observation.message
+
+
+def test_a_failed_worker_without_a_journal_keeps_the_plain_message(tmp_path: Path) -> None:
+    """An unreadable journal degrades to exactly the old failure message."""
+
+    systemd = FakeSystemd()
+    systemd.fail_journal = True
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+
+    observation = executor.status(remote_id)
+
+    assert observation.status is ExecutionWorkloadStatus.FAILED
+    assert observation.message == "systemd service failed with result exit-code"
+
+
+def test_a_failed_worker_names_a_non_traceback_last_word_too(tmp_path: Path) -> None:
+    """``SystemExit`` and shell errors get their closing line, not silence."""
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+    systemd.journal[unit_name] = "venv/bin/python: No module named device_test\n"
+
+    observation = executor.status(remote_id)
+
+    assert observation.status is ExecutionWorkloadStatus.FAILED
+    assert "No module named device_test" in observation.message

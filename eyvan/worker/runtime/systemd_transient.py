@@ -77,6 +77,20 @@ _UNRECOVERABLE_INDETERMINATE_FIELD = "indeterminate_unrecoverable"
 #: not fully load the unit file.
 _DEFINITIVE_ACTIVE_STATES = frozenset({"failed", "inactive"})
 
+#: Journal lines read when naming why a service died. Enough to hold any Python
+#: traceback plus the systemd noise around it, small enough to keep the status
+#: read cheap on a host that may be stopping a whole multi-host job at once.
+_FAILURE_JOURNAL_LINES = 40
+
+#: How much of the worker's closing line a failure message carries. The line is
+#: the diagnosis; a novel-length stack frame helps nobody reading a status row.
+_FAILURE_EXCERPT_LIMIT = 240
+
+#: A traceback's closing line, e.g. ``ModuleNotFoundError: No module named
+#: 'spectrax'``. Anchored and shape-checked rather than substring-matched so a
+#: traceback *frame* line or incidental prose never poses as the reason.
+_FAILURE_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Exit|Timeout):")
+
 
 def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
     """Return whether a later observation may still resolve this indeterminacy.
@@ -717,6 +731,7 @@ class SystemdTransientServiceExecutor:
         boot_id_reader: tp.Callable[[], str | None] | None = None,
         cgroup_processes_reader: CgroupProcessesReader | None = None,
         cgroup_pids_reader: CgroupPidsReader | None = None,
+        failure_journal_reader: tp.Callable[[str], str | None] | None = None,
         use_exit_type_cgroup: bool = False,
         workload_user: str | None = None,
         workload_group: str | None = None,
@@ -759,6 +774,9 @@ class SystemdTransientServiceExecutor:
         )
         self._boot_id_reader = boot_id_reader or _read_boot_id
         self._cgroup_pids_reader = cgroup_pids_reader or _cgroup_pids
+        # Best-effort by injection as by nature: a journal that cannot be read
+        # must leave the failure message untouched, never fail the status read.
+        self._failure_journal_reader = failure_journal_reader or self._read_failure_journal
         # Derive the boolean view from the PID reader unless one is injected, so
         # a test that stubs only one of the two cannot see them disagree.
         self._cgroup_processes_reader = cgroup_processes_reader or (
@@ -1004,15 +1022,75 @@ class SystemdTransientServiceExecutor:
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
             if result in {"", "success"} and main_status in {"", "0"}:
-                return ExecutionWorkloadStatus.FAILED, "systemd service became inactive before Eyvan observed completion"
-            return ExecutionWorkloadStatus.FAILED, f"systemd service exited with result {result or 'unknown'}"
+                return self._failed(record, "systemd service became inactive before Eyvan observed completion")
+            return self._failed(record, f"systemd service exited with result {result or 'unknown'}")
         if active == "failed":
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
-            return ExecutionWorkloadStatus.FAILED, f"systemd service failed with result {result or 'unknown'}"
+            return self._failed(record, f"systemd service failed with result {result or 'unknown'}")
         return ExecutionWorkloadStatus.INDETERMINATE, (
             f"systemd service reported unexpected ActiveState={active or 'missing'}"
         )
+
+    def _failed(self, record: tp.Mapping[str, JsonValue], message: str) -> tuple[ExecutionWorkloadStatus, str]:
+        """Report a dead service, naming what its own output said last.
+
+        A bare systemd result tells the submitter *that* every rank died while
+        the one sentence naming *why* -- the last line of a Python traceback,
+        usually -- sits in a log stream nobody is forced to read. A live
+        multi-host job once burned its entire provisioning cycle to report
+        ``exit-code``: the workers had died on ``ModuleNotFoundError`` seconds
+        after start. The unit's journal tail is read on a best-effort basis;
+        an unreadable journal leaves the message exactly as it was.
+        """
+
+        excerpt = self._failure_excerpt(record)
+        if excerpt:
+            return ExecutionWorkloadStatus.FAILED, f"{message}; worker output ended with: {excerpt}"
+        return ExecutionWorkloadStatus.FAILED, message
+
+    def _failure_excerpt(self, record: tp.Mapping[str, JsonValue]) -> str | None:
+        """Return the dying worker's own closing line, or ``None``.
+
+        Tracebacks end with their exception line, so the last line that reads
+        like one is the reason the process died; any other tail still earns
+        its final non-empty line, which for a ``SystemExit`` or a shell error
+        is the sentence that matters.
+        """
+
+        unit_name = record.get("unit_name")
+        if not isinstance(unit_name, str) or not unit_name:
+            return None
+        tail = self._failure_journal_reader(unit_name)
+        if not tail:
+            return None
+        lines = [stripped for line in tail.splitlines() if (stripped := line.strip())]
+        if not lines:
+            return None
+        excerpt = next(
+            (line for line in reversed(lines) if _FAILURE_EXCEPTION_LINE.match(line)),
+            lines[-1],
+        )
+        return excerpt[:_FAILURE_EXCERPT_LIMIT] or None
+
+    def _read_failure_journal(self, unit_name: str) -> str | None:
+        """Read a failed unit's journal tail, redacted, or ``None``."""
+
+        try:
+            result = self._run(
+                (
+                    "journalctl",
+                    "--no-pager",
+                    "--output=cat",
+                    f"--unit={unit_name}",
+                    f"--lines={_FAILURE_JOURNAL_LINES}",
+                )
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return redact_secret_material(result.stdout)
 
     @staticmethod
     def _record_boolean(record: tp.Mapping[str, JsonValue], field: str) -> bool:
