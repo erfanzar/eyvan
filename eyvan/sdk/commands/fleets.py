@@ -267,8 +267,14 @@ class FleetCommandService:
         if requires_native_gcp_runtime(config) or self.native_gcp_profile_available():
             runtime = self.gcp_runtime if self.gcp_runtime is not None else GcpNativeRuntimeSupervisor()
             runtime.ensure(endpoint)
+            # The runtime just started (or reused) a plane that may have minted
+            # the development credential this session resolved its identity
+            # without; present it from here on, or first run fails its first
+            # command.
+            self.session.refresh_loopback_identity()
             return
         self.loopback_control_plane(endpoint)
+        self.session.refresh_loopback_identity()
 
     def apply(
         self,

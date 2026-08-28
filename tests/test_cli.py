@@ -2546,3 +2546,121 @@ def test_a_schema_warning_names_the_file_rather_than_pydantics_internals(tmp_pat
     # Once, not once per pool: the schema warns as it validates each one, and
     # three copies of one sentence bury the file name the line exists to add.
     assert result.output.count("max_workers: 0 means unbounded") == 1
+
+
+def test_session_reresolves_loopback_credentials_minted_after_it_resolved(tmp_path, monkeypatch) -> None:
+    """First run: a session resolved before the plane must present what the plane minted.
+
+    The session's identity is fixed before the command body runs, and on a
+    machine with no development credential the plane started by that same
+    command mints one and requires it. ``refresh_loopback_identity`` is the
+    seam: a no-op while nothing changed, a full re-resolution once the
+    credential exists, and never a downgrade of a token identity.
+    """
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.sdk.client.identity import ClientIdentity, resolve_control_plane_identity
+    from eyvan.sdk.commands.state import CliSession, ContextOverrides
+    from eyvan.sdk.contexts import EyvanContextConfig
+    from eyvan.server.local.auth import LocalDevelopmentCredentialStore
+
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8098")
+    header_updates: list[dict[str, str]] = []
+
+    class _Client:
+        def replace_identity_headers(self, headers: tp.Mapping[str, str]) -> None:
+            header_updates.append(dict(headers))
+
+    def _session(identity: ClientIdentity) -> CliSession:
+        return CliSession(
+            client=_Client(),
+            identity=identity,
+            context_store=None,
+            context_config=EyvanContextConfig(),
+            base_url=endpoint.url,
+            org_id=None,
+            project_id=None,
+            overrides=ContextOverrides(),
+        )
+
+    session = _session(resolve_control_plane_identity(endpoint))
+    assert session.identity.local_development_credential is None
+
+    # Nothing has been minted yet: refreshing must not invent identity headers.
+    session.refresh_loopback_identity()
+    assert header_updates == []
+
+    # The plane starts and mints the credential it will demand. This file's
+    # autouse fixture redirects the store to a per-test path; mint there,
+    # exactly where the redirected resolution reads from.
+    LocalDevelopmentCredentialStore(tmp_path / "local-development-credential").load_or_create()
+
+    session.refresh_loopback_identity()
+    assert session.identity.local_development_credential is not None
+    assert header_updates, "the client must be told about the new credential"
+    assert all("X-Eyvan-Local-Credential" in headers for headers in header_updates)
+
+    # A token identity outranks development headers and is never re-resolved.
+    token_session = _session(ClientIdentity(token="operator-token"))
+    token_session.refresh_loopback_identity()
+    assert token_session.identity.token == "operator-token"
+
+    # A remote endpoint has no local development material to pick up.
+    remote = _session(ClientIdentity(token="operator-token"))
+    remote.base_url = "https://eyvan.example.com"
+    remote.refresh_loopback_identity()
+    assert header_updates[-1] is not None
+
+
+def test_ensuring_a_local_runtime_refreshes_the_session_after_the_plane_exists() -> None:
+    """The refresh must follow the ensure, or the session keeps its stale identity."""
+
+    from eyvan.sdk.commands.fleets import FleetCommandService
+
+    events: list[str] = []
+
+    class _Session:
+        base_url = "http://127.0.0.1:8080"
+
+        def refresh_loopback_identity(self) -> None:
+            events.append("refresh")
+
+    class _Runtime:
+        def ensure(self, endpoint: object) -> None:
+            events.append("runtime")
+
+    from eyvan.capacity.fleet_config import EyvanFleetConfig
+
+    config = EyvanFleetConfig.model_validate(
+        {
+            "version": 1,
+            "name": "research",
+            "provider": {"type": "onprem-ssh", "region": "local"},
+            "pools": {
+                "workers": {
+                    "kind": "cpu",
+                    "machine_type": "n2-standard-8",
+                    "resources": {"cpu": 4, "memory_gib": 16},
+                    "capacity_backend": "onprem",
+                    "min_cells": 0,
+                    "max_cells": 1,
+                }
+            },
+        }
+    )
+    service = FleetCommandService(
+        session=_Session(),
+        loopback_control_plane=lambda endpoint: events.append("plane"),
+        native_gcp_profile_available=lambda: False,
+    )
+    service.ensure_local_runtime(config)
+    assert events == ["plane", "refresh"], "the session must re-resolve after the plane exists"
+
+    events.clear()
+    native = FleetCommandService(
+        session=_Session(),
+        gcp_runtime=_Runtime(),
+        native_gcp_profile_available=lambda: True,
+    )
+    native.ensure_local_runtime(config)
+    assert events == ["runtime", "refresh"], "the native runtime lane refreshes on the same rule"

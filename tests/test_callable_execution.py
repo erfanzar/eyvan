@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from conftest import stop_local_daemons_recorded_under
 
 import eyvan
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
@@ -40,10 +41,8 @@ from eyvan.sdk.execution import (
 )
 from eyvan.sdk.job_receipt import JobLifecycleState, JobLifecycleUpdate, JobTerminalOutput
 from eyvan.server.local.daemon import (
-    LocalDaemonError,
     LocalDaemonPaths,
     LocalDaemonRecord,
-    LocalDaemonSupervisor,
     LocalDaemonTarget,
     process_is_alive,
     read_owner_only_record,
@@ -61,35 +60,7 @@ def _isolated_home(monkeypatch, tmp_path):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     yield home
-    _stop_local_daemons_recorded_under(home)
-
-
-def _stop_local_daemons_recorded_under(home: Path) -> None:
-    """Stop planes this test recorded, and fail on any process left behind.
-
-    A daemon started under the isolated home outlives the test process, keeps
-    the loopback port bound with a credential from a home pytest is about to
-    delete, and the next real ``eyvan up`` on that port answers 401 from a
-    plane nobody owns. The PID records are owner-only by construction, so
-    anything readable here was written during this test run. What the
-    supervisor can prove it owns, it stops; what it cannot prove (a foreign
-    command under a recycled PID) it refuses to signal, and the liveness
-    check then names the leak instead of silently passing.
-    """
-
-    for record_path in sorted(home.glob(".eyvan/*.pid")):
-        record = read_owner_only_record(record_path)
-        if record is None:
-            continue
-        try:
-            LocalDaemonSupervisor().stop(record.endpoint)
-        except LocalDaemonError:
-            pass
-        if process_is_alive(record.pid):
-            pytest.fail(
-                f"a local Eyvan daemon (pid {record.pid}, {record.endpoint.url}) outlived the test; "
-                "record it for teardown or patch ensure_loopback_control_plane out"
-            )
+    stop_local_daemons_recorded_under(home)
 
 
 def _add(left: int, right: int = 1) -> int:
@@ -186,14 +157,14 @@ def test_isolated_home_stops_recorded_daemons_and_flags_foreign_survivors(tmp_pa
         # A foreign command under a recorded PID must be refused, not killed,
         # and the refusal must surface as a failure that names the survivor.
         with pytest.raises(pytest.fail.Exception, match="outlived the test"):
-            _stop_local_daemons_recorded_under(home)
+            stop_local_daemons_recorded_under(home)
     finally:
         sleeper.terminate()
         sleeper.wait()
     assert not process_is_alive(sleeper.pid)
     # A dead PID is stale metadata, not a leak: the record is cleared and no
     # failure is raised.
-    _stop_local_daemons_recorded_under(home)
+    stop_local_daemons_recorded_under(home)
     assert not record_path.exists()
 
 

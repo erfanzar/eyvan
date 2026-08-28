@@ -33,6 +33,7 @@ from eyvan.server.local.daemon import (
     LocalDaemonResult,
     LocalDaemonState,
     LocalDaemonTarget,
+    read_owner_only_record,
     write_owner_only_record,
 )
 from eyvan.worker.agent.models import AgentBuild, AgentCapabilities
@@ -714,7 +715,7 @@ def test_agent_supervisor_replaces_an_owned_agent_running_different_code(monkeyp
             "--log-level",
             "info",
         ),
-        process_liveness=AgentProcessLiveness([True, True, False]),
+        process_liveness=AgentProcessLiveness([True, True, True, False]),
         process_terminator=AgentProcessTerminator(),
         process_killer=AgentProcessKiller(),
         clock=AdvancingClock(),
@@ -856,3 +857,83 @@ def test_agent_supervisor_replaces_a_stale_agent_relaunched_after_the_prelock_di
     assert result.state is LocalAgentState.STARTED
     assert result.pid == 9144
     assert len(launcher.commands) == 1
+
+
+def test_stop_ends_a_recorded_cell_agent_and_refuses_foreign_processes(tmp_path: Path) -> None:
+    """``ensure`` without a ``stop`` is how an agent outlives its plane's profile.
+
+    A cell agent recorded under a profile directory keeps its port and its
+    log long after the plane -- and the tests, or the operator session --
+    that started it are gone; two such orphans were found still running
+    days later. The stop demands the same ownership proof as a restart:
+    the record names this endpoint, and the recorded PID still runs the
+    expected Eyvan cell agent under its recorded runtime profile.
+    """
+
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    profile_id = str((tmp_path / "runtime" / "gcp-native-runtime.json").resolve())
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    record_path = paths.agent_record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    write_owner_only_record(record_path, LocalDaemonRecord(endpoint=endpoint, pid=9177, runtime_profile_path=profile_id))
+
+    terminated: set[int] = set()
+    graceful: list[int] = []
+
+    def _liveness(pid: int) -> bool:
+        return pid not in terminated
+
+    def _terminate(pid: int) -> None:
+        graceful.append(pid)
+        terminated.add(pid)
+
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(),
+        capability_probe=CapabilityResponses([]),
+        process_argument_reader=lambda pid: (
+            (
+                sys.executable,
+                "-m",
+                "eyvan.worker.agent.cli",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8090",
+                "--runtime-profile",
+                profile_id,
+                "--log-level",
+                "info",
+            )
+            if pid == 9177
+            else None
+        ),
+        process_liveness=_liveness,
+        process_terminator=_terminate,
+        process_killer=AgentProcessKiller(),
+    )
+
+    supervisor.stop()
+
+    assert graceful == [9177], "the recorded agent must be gracefully terminated, exactly once"
+    assert read_owner_only_record(record_path) is None, "stopping must clear the record it owned"
+    # A cleared record makes a second stop a silent no-op, not an error.
+    supervisor.stop()
+
+    # A foreign command under a recorded PID is refused, not killed.
+    write_owner_only_record(record_path, LocalDaemonRecord(endpoint=endpoint, pid=9178, runtime_profile_path=profile_id))
+    foreign = LocalAgentSupervisor(
+        paths=paths,
+        launcher=FakeAgentLauncher(),
+        capability_probe=CapabilityResponses([]),
+        process_argument_reader=lambda pid: (sys.executable, "-m", "unrelated.service") if pid == 9178 else None,
+        process_liveness=lambda _pid: True,
+        process_terminator=_terminate,
+        process_killer=AgentProcessKiller(),
+    )
+    with pytest.raises(LocalAgentConfigurationError, match="refusing to stop it"):
+        foreign.stop()
+    assert 9178 not in graceful
+    assert read_owner_only_record(record_path) is not None, "a refusal must leave the record in place"

@@ -155,6 +155,42 @@ class CliSession:
         self.client.replace_identity_headers(identity.headers())
         self.identity = identity
 
+    def refresh_loopback_identity(self) -> None:
+        """Re-resolve development material after a local plane may have minted it.
+
+        A session resolves its identity before the command body runs, and the
+        local plane may not exist yet: on a machine with no development
+        credential, starting the plane mints one and the plane then requires
+        it, so the pre-start identity would be refused by the plane the same
+        command just started -- first run, first command, 401. Re-resolving
+        after the plane exists picks up the credential that plane demands.
+        No-op for token identities, remote endpoints, and identities that
+        already carry the credential.
+        """
+
+        if self.identity.token is not None:
+            return
+        if self.identity.local_development_credential is not None:
+            return
+        from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+        from eyvan.sdk.client.identity import resolve_control_plane_identity
+
+        endpoint = ControlPlaneEndpoint.parse(self.base_url)
+        if not endpoint.is_loopback:
+            return
+        resolved = resolve_control_plane_identity(
+            endpoint,
+            dev_user=self.identity.dev_user,
+            dev_org=self.identity.dev_org,
+            dev_project=self.identity.dev_project,
+            dev_roles=self.identity.dev_roles,
+        )
+        if resolved.local_development_credential is None:
+            # Still nothing to present: leave the session exactly as it was
+            # rather than swapping an equal identity underneath the client.
+            return
+        self.replace_identity(resolved)
+
     def activate_fleet(
         self,
         fleet: str,

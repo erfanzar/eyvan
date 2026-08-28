@@ -302,3 +302,50 @@ def test_an_empty_body_on_a_status_that_promises_content_is_still_an_error() -> 
 
     with _pytest.raises(EyvanApiError, match="non-JSON response body"):
         EyvanClient._json(httpx.Response(200, text=""))
+
+
+def test_loopback_credential_refusal_is_diagnosed_from_this_machines_records(tmp_path, monkeypatch) -> None:
+    """The one 401 that means "wrong plane" must say which plane and whose.
+
+    A bare 401 sent operators to re-check their login against a plane that
+    would refuse every credential except one from a HOME that no longer
+    existed. The refusal carries enough evidence to do better: this
+    profile's credential state and its PID record for the endpoint decide
+    which sentence the operator gets.
+    """
+
+    from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL
+    from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonRecord, LocalDaemonTarget, write_owner_only_record
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def _refusal(url: str) -> EyvanHTTPError:
+        request = httpx.Request("GET", url)
+        response = httpx.Response(401, json={"detail": LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL}, request=request)
+        return EyvanHTTPError(response, LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL)
+
+    # No record for the endpoint: this profile did not start the plane.
+    unowned = str(_refusal("http://127.0.0.1:8080/api/v1/fleets"))
+    assert "A control plane is listening at http://127.0.0.1:8080" in unowned
+    assert "refused this machine's local" in unowned
+    assert "no PID record for that endpoint" in unowned
+
+    # With this profile's record naming the survivor, the pid is the remedy.
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8080")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    record_path = LocalDaemonPaths().record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    write_owner_only_record(record_path, LocalDaemonRecord(endpoint=endpoint, pid=4242))
+    owned = str(_refusal("http://127.0.0.1:8080/api/v1/fleets"))
+    assert "PID record names pid 4242" in owned
+
+    # Other 401s and remote endpoints keep their bare meaning.
+    request = httpx.Request("GET", "https://eyvan.example.com/api/v1/fleets")
+    response = httpx.Response(401, json={"detail": LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL}, request=request)
+    remote = str(EyvanHTTPError(response, LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL))
+    assert "A control plane is listening" not in remote
+    request = httpx.Request("GET", "http://127.0.0.1:8080/api/v1/fleets")
+    response = httpx.Response(401, json={"detail": "invalid bearer token"}, request=request)
+    other = str(EyvanHTTPError(response, "invalid bearer token"))
+    assert "A control plane is listening" not in other

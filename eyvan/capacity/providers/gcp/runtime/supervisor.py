@@ -439,14 +439,53 @@ class LocalAgentSupervisor:
                         "is stale; refusing to stop it"
                     )
                 clear_owner_only_record(record_path, pid=record.pid)
-            return self._start_locked(
-                target=target,
-                expanded_profile_path=expanded_profile_path,
-                profile=profile,
-                profile_id=profile_id,
-                record_path=record_path,
-                log_path=log_path,
-            )
+        return self._start_locked(
+            target=target,
+            expanded_profile_path=expanded_profile_path,
+            profile=profile,
+            profile_id=profile_id,
+            record_path=record_path,
+            log_path=log_path,
+        )
+
+    def stop(self) -> None:
+        """Stop the cell agent this profile recorded for this supervisor's endpoint.
+
+        The counterpart to :meth:`ensure` for callers that own the profile
+        directory: a developer clearing a local runtime, or a test harness
+        whose isolated home recorded the agent. The same ownership proof
+        :meth:`restart` demands -- an owner-only PID record naming this
+        endpoint, whose recorded PID still runs the expected Eyvan cell agent
+        under its recorded runtime profile -- precedes any signal, so a
+        recycled PID naming an unrelated process is refused rather than
+        killed. A missing record stops nothing: an agent this supervisor
+        cannot prove it owns is not this supervisor's to stop.
+        """
+
+        target = self._target()
+        record_path = self.paths.agent_record_path(target)
+        log_path = self.paths.agent_log_path(target)
+        with owner_only_startup_lock(self.paths.agent_lock_path(target)):
+            record = read_owner_only_record(record_path)
+            if record is None:
+                return
+            if record.endpoint != self.endpoint:
+                raise LocalAgentConfigurationError(
+                    f"the recorded Eyvan cell-agent endpoint does not match {self.endpoint.url}; refusing to stop it"
+                )
+            if self.process_liveness(record.pid):
+                if record.runtime_profile_path is None:
+                    raise LocalAgentConfigurationError(
+                        f"the recorded Eyvan cell agent at {self.endpoint.url} names no runtime profile; "
+                        "refusing to stop it"
+                    )
+                self._stop_recorded_agent(
+                    record,
+                    target=target,
+                    log_path=log_path,
+                    expected_runtime_profile_path=record.runtime_profile_path,
+                )
+            clear_owner_only_record(record_path, pid=record.pid)
 
     @staticmethod
     def _prepared_profile(

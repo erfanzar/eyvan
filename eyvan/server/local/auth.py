@@ -18,6 +18,10 @@ from eyvan._internal.workspace import create_private_directory
 
 DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH = Path("~/.eyvan/local-development-credential")
 LOCAL_DEVELOPMENT_CREDENTIAL_HEADER = "X-Eyvan-Local-Credential"
+#: The refusal a loopback plane answers when it holds a development credential
+#: the caller did not present. Shared with the SDK so a client can recognize
+#: exactly this refusal and diagnose it, instead of string-matching a guess.
+LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL = "local Eyvan development credential is required"
 _CREDENTIAL_BYTES = 32
 
 
@@ -267,6 +271,7 @@ def _validate_credential_value(value: str) -> None:
 __all__ = (
     "DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH",
     "LOCAL_DEVELOPMENT_CREDENTIAL_HEADER",
+    "LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL",
     "LocalDevelopmentCredential",
     "LocalDevelopmentCredentialError",
     "LocalDevelopmentCredentialStore",

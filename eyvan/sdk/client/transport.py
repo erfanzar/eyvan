@@ -20,6 +20,50 @@ from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.identity import ClientIdentity
 from eyvan.sdk.client.retry import RetryPolicy
 from eyvan.sdk.client.types import HeaderMap, QueryParams
+from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _local_credential_refusal_diagnosis(url: httpx.URL) -> str:
+    """Explain a loopback credential refusal in terms of this machine's real state.
+
+    The plane answered the exact refusal that means "I hold a development
+    credential you did not present". That is not a permissions problem to
+    debug blind: the cause is almost always a plane started under a different
+    HOME -- a stray test daemon, a plane from another checkout -- or one that
+    predates this machine's current credential. Say which of those this
+    profile's own records support, so the operator stops the right process
+    instead of uninstalling.
+    """
+
+    from eyvan.server.local.auth import DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH
+    from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonPaths, LocalDaemonTarget, read_owner_only_record
+
+    endpoint = ControlPlaneEndpoint(f"http://{url.host}:{url.port or 80}")
+    record: object = None
+    try:
+        target = LocalDaemonTarget.from_endpoint(endpoint)
+        if target is not None:
+            record = read_owner_only_record(LocalDaemonPaths().record_path(target))
+    except (LocalDaemonError, OSError):
+        record = None
+    credential = DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH
+    credential_state = "present" if credential.expanduser().exists() else "absent"
+    lines = [
+        f"A control plane is listening at {endpoint.url} but refused this machine's local",
+        f"development credential ({credential}, {credential_state}). That plane holds a",
+        "credential of its own: typically one started under a different HOME -- a stray",
+        "test daemon, or a plane from another checkout -- or one started before this",
+        "credential was issued.",
+    ]
+    pid = getattr(record, "pid", None)
+    if pid is not None:
+        lines.append(f"This profile's PID record names pid {pid}: stop that process and retry.")
+    else:
+        lines.append("This profile has no PID record for that endpoint, so it did not start it;")
+        lines.append("find that process (its host and port are above) and stop it, then retry.")
+    return "\n".join(lines)
 
 
 class EyvanHTTPError(httpx.HTTPStatusError):
@@ -43,6 +87,17 @@ class EyvanHTTPError(httpx.HTTPStatusError):
                 "Compare builds with 'eyvan capacity builds', then bring the plane up to this source with "
                 "'eyvan runtime deploy'."
             )
+        if (
+            response.status_code == 401
+            and detail == LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL
+            and (response.request.url.host or "") in _LOOPBACK_HOSTS
+        ):
+            # Same discipline as the version-skew note above: this refusal has
+            # exactly one meaning, and the machine already holds the evidence
+            # for which plane is answering. A bare "401" sent operators to
+            # re-login against a plane that would refuse every credential
+            # except one from a HOME that no longer exists.
+            message = f"{message}\n\n{_local_credential_refusal_diagnosis(response.request.url)}"
         super().__init__(message, request=response.request, response=response)
 
 

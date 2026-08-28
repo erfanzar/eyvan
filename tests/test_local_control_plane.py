@@ -275,3 +275,41 @@ def test_stop_ends_a_plane_this_supervisor_started(tmp_path) -> None:
     assert read_owner_only_record(record_path) is None, "stopping must clear the record it owned"
     # A cleared record makes a second stop a no-op, not an error.
     assert supervisor.stop(endpoint).state is LocalDaemonState.STOPPED
+
+
+def test_identity_resolved_before_the_plane_picks_up_the_credential_it_mints(tmp_path, monkeypatch) -> None:
+    """First run, first command: the plane mints what the plane then demands.
+
+    A CLI session resolves its identity before the command body starts the
+    local plane. On a machine with no development credential yet, starting
+    the plane mints one and the hardened loopback auth requires it
+    immediately -- so the pre-start identity is refused by the plane the
+    same command just started, and `eyvan up` failed its first-ever run on
+    any new machine. The contract this pins: resolving after the plane
+    exists picks up the credential, and only the stale identity fails.
+    """
+
+    import httpx
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.sdk.client.identity import resolve_control_plane_identity
+    from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonState, LocalDaemonSupervisor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8099")
+    supervisor = LocalDaemonSupervisor(paths=LocalDaemonPaths(tmp_path / "eyvan"))
+    # The role the CLI itself uses on a loopback plane: the default operator
+    # role has no organization scope and is refused before authorization.
+    stale = resolve_control_plane_identity(endpoint, dev_roles="fleet_admin")
+    assert stale.local_development_credential is None, "a fresh machine has no credential to present"
+    try:
+        started = supervisor.ensure(endpoint)
+        assert started.state is LocalDaemonState.STARTED
+        response = httpx.get(f"{endpoint.url}/api/v1/fleets", headers=stale.headers())
+        assert response.status_code == 401, "the stale identity must be refused, naming the real failure mode"
+        refreshed = resolve_control_plane_identity(endpoint, dev_roles="fleet_admin")
+        assert refreshed.local_development_credential is not None, "the plane minted the credential it demands"
+        response = httpx.get(f"{endpoint.url}/api/v1/fleets", headers=refreshed.headers())
+        assert response.status_code != 401, "the re-resolved identity must satisfy the plane it just started"
+    finally:
+        supervisor.stop(endpoint)

@@ -19,7 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from eyvan._internal.json_types import JsonValue
 from eyvan.config import EyvanSettings
 from eyvan.records import Principal, Role, RoleGrant
-from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, LocalDevelopmentCredential
+from eyvan.server.local.auth import (
+    LOCAL_DEVELOPMENT_CREDENTIAL_HEADER,
+    LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL,
+    LocalDevelopmentCredential,
+)
 
 
 class _OIDCDiscovery(BaseModel):
@@ -277,7 +281,7 @@ class RequestAuthenticator:
             return
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="local Eyvan development credential is required",
+            detail=LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL,
         )
 
     @staticmethod
