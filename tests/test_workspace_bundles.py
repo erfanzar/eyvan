@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
+import tarfile
 from pathlib import Path
 
 import httpx
@@ -270,11 +272,15 @@ def test_decorator_without_a_workspace_sends_no_bundle_fields(tmp_path: Path) ->
     raw.close()
 
 
-def test_the_default_decorator_packages_nothing(monkeypatch, tmp_path: Path) -> None:
-    """workspace=None is the documented off-by-default, not "upload Path.cwd()".
+def test_the_default_workspace_is_the_callables_tree_not_the_cwd(monkeypatch, tmp_path: Path) -> None:
+    """workspace=None derives the callable's directory; the cwd is never the root.
 
-    Every bare ``@execute`` submit used to package the caller's working
-    directory and ship it to the artifact store.
+    The first default was ``Path.cwd()`` -- an accident that shipped whatever
+    secrets happened to lie in the submitter's working directory -- and the
+    correction turned shipping off entirely, which stranded every newcomer
+    whose callable imports their own modules. The default is now the tree the
+    callable's own file lives in: the directory a submitter means by "my
+    code". A secret outside that tree still travels nowhere.
     """
 
     monkeypatch.chdir(tmp_path)
@@ -320,9 +326,12 @@ def test_the_default_decorator_packages_nothing(monkeypatch, tmp_path: Path) -> 
     train.remote()
 
     execution = submitted[0]["execution"]
-    assert execution["workspace_uri"] is None
-    assert execution["workspace_sha256"] is None
-    assert not (tmp_path / "artifacts" / "workspaces").exists()
+    assert execution["workspace_uri"] is not None, "the callable's own tree ships by default"
+    assert execution["workspace_sha256"] is not None
+    bundle = tarfile.open(fileobj=io.BytesIO(store.read(execution["workspace_uri"])), mode="r:gz")
+    names = bundle.getnames()
+    assert "test_workspace_bundles.py" in names, "the root is the callable's directory"
+    assert not any("secret_module" in name for name in names), "cwd contents travel nowhere"
     raw.close()
 
 
@@ -808,9 +817,7 @@ def test_two_races_to_extract_the_same_bundle_both_succeed(tmp_path: Path) -> No
     assert not list(base.glob(".*staging*"))
 
 
-def test_the_workload_command_keeps_its_own_end_of_options_marker(
-    tmp_path: Path, monkeypatch, no_execvp
-) -> None:
+def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path: Path, monkeypatch, no_execvp) -> None:
     """`python tool.py -- --fast` must not exec as `python tool.py --fast`.
 
     The wrapper consumes only its own `--`; stripping every bare double dash

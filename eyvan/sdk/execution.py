@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from eyvan._internal.json_types import model_json
-from eyvan._internal.workspace import build_workspace
+from eyvan._internal.workspace import WorkspaceError, build_workspace
 from eyvan.artifacts import (
     ArtifactStore,
     EyvanManagedArtifactStore,
@@ -447,6 +447,25 @@ def _zero_arg_invocation(fn: tp.Callable[P, R], /, *args: P.args, **kwargs: P.kw
     return invoke
 
 
+def _callable_workspace_root(fn: tp.Callable[..., tp.Any]) -> Path | None:
+    """Return the directory the callable's own file lives in, when there is one.
+
+    This is the default a submitter means by "my code": the tree their script
+    sits in, which is exactly what relative ``sys.path`` entries inside the
+    callable resolve against once the bundle is extracted to the worker's cwd.
+    A callable defined interactively -- a REPL, a notebook cell -- has no such
+    file, and inventing a root for it would ship a directory the caller never
+    pointed at, so it ships nothing until a ``workspace`` names one.
+    """
+
+    code = getattr(fn, "__code__", None)
+    filename = getattr(code, "co_filename", "")
+    if not isinstance(filename, str) or not filename.endswith(".py"):
+        return None
+    source = Path(filename).resolve()
+    return source.parent if source.is_file() else None
+
+
 def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorConfig) -> str:
     """Ask the control plane which fleet has an enabled pool matching the TpuConfig shape."""
 
@@ -518,7 +537,7 @@ class Executable(tp.Generic[P, R]):
         fn: tp.Callable[P, R],
         config: AcceleratorConfig,
         context: ExecutionContext[R] | None,
-        workspace: str | os.PathLike[str] | None = None,
+        workspace: str | os.PathLike[str] | bool | None = None,
     ):
         self._fn = fn
         self._config = config
@@ -565,16 +584,33 @@ class Executable(tp.Generic[P, R]):
         workspace_uri: str | None = None
         workspace_sha256: str | None = None
         workspace_signature: str | None = None
-        if self._workspace is None or self._workspace is False:
-            # Off by default, and ``False`` stays accepted as the explicit way
-            # to say so: packaging a directory is a visible cost and a visible
-            # trust decision, not something to do behind the caller's back.
-            pass
+        # Three contracts share this block, and each is someone's explicit
+        # decision. An explicit path is fail-loud: the caller asked for these
+        # files by name, so degrading to shipping none would hide the loss.
+        # ``False`` is the explicit refusal. The default derives the root from
+        # the callable's own file -- the directory a submitter means when they
+        # say "my code" -- and *degrades* rather than fails: a callable that
+        # needs nothing local must not die at submission because its directory
+        # happens to be unpackageable, but the loss is named, never silent.
+        if self._workspace is False:
+            explicit_root: Path | None = None
         else:
-            # An explicit path is the opt-in, and one that cannot be packaged
-            # fails the submit: the caller asked for these files by name, so
-            # degrading to shipping none of them would hide the loss.
-            bundle = build_workspace(self._workspace)
+            explicit_root = None if self._workspace is None else Path(self._workspace)
+        auto_root = _callable_workspace_root(self._fn) if self._workspace is None else None
+        for root, fail_loud in ((explicit_root, True), (auto_root, False)):
+            if root is None:
+                continue
+            try:
+                bundle = build_workspace(root)
+            except WorkspaceError as error:
+                if fail_loud:
+                    raise
+                warnings.warn(
+                    f"the callable's directory {root} could not be shipped as a workspace "
+                    f"({error}); submitting without it",
+                    stacklevel=2,
+                )
+                continue
             workspace_uri = context.artifact_store.put_workspace(bundle.payload, bundle.sha256)
             workspace_sha256 = bundle.sha256
             # Signed under the same key as the callable. The bundle is entered
@@ -583,6 +619,7 @@ class Executable(tp.Generic[P, R]):
             # reference -- and the callable's signature would prove nothing.
             if context.signing_key is not None:
                 workspace_signature = hmac.new(context.signing_key, bundle.payload, hashlib.sha256).hexdigest()
+            break
         request = CallableSubmission(
             invocation_id=invocation_id,
             fleet=fleet,
@@ -613,7 +650,7 @@ def execute(
     config: AcceleratorConfig,
     *,
     context: ExecutionContext[R] | None = None,
-    workspace: str | os.PathLike[str] | None = None,
+    workspace: str | os.PathLike[str] | bool | None = None,
 ) -> tp.Callable[[tp.Callable[P, R]], Executable[P, R]]:
     """Decorate a function for durable, scale-from-zero Eyvan execution.
 
@@ -622,12 +659,17 @@ def execute(
     while this one entry point refused them, so the only hardware the decorator
     could reach was TPU; everything below it has always been shape-agnostic.
 
-    ``workspace`` opts into shipping a working directory alongside the callable,
-    so application modules travel with the job instead of having to be baked
-    into the image or staged as fleet artifacts. It is off by default: an
-    explicit path is the opt-in, and packaging a directory is a visible cost
-    and a visible trust decision, not something to do behind the caller's back.
-    ``workspace=False`` is accepted as the explicit way to say the same thing.
+    ``workspace`` ships a working directory alongside the callable, so
+    application modules travel with the job instead of having to be baked
+    into the image or staged as fleet artifacts. The default is the directory
+    the decorated function's own file lives in: that is what a submitter
+    means by "my code", and it is why relative ``sys.path`` entries inside the
+    callable keep resolving once the bundle is extracted to the worker's cwd
+    and ``sys.path[0]``. An explicit path names a different root and fails
+    loudly when it cannot be packaged; the derived default instead degrades
+    to submitting without a workspace, with a warning naming what was lost,
+    because a callable that needs nothing local must not die at submission.
+    ``workspace=False`` is the explicit refusal of all of the above.
     """
 
     # A class object satisfies the protocol's attribute check as readily as an

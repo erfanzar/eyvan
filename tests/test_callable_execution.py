@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import io
 import subprocess
@@ -735,3 +736,116 @@ def test_a_workspace_root_ships_the_paths_the_callable_walks(tmp_path) -> None:
     bundle = tarfile.open(fileobj=io.BytesIO(store.read(request.workspace_uri)), mode="r:gz")
     names = bundle.getnames()
     assert "libs/mysrc/__init__.py" in names, "the bundle must preserve the root's relative layout"
+
+
+def test_the_default_workspace_is_the_callables_own_directory(tmp_path) -> None:
+    """A callable ships the tree its file lives in, without being asked.
+
+    The first ``@execute`` a newcomer writes imports their own modules, and the
+    framework that makes them set PYTHONPATH -- which cannot travel -- or bake
+    an image has already lost them. The default derives the root from the
+    callable's file: the bundle is extracted to the worker's cwd and
+    ``sys.path[0]``, so the directory the submitter calls "my code" is the one
+    the worker sees, relative layout intact.
+    """
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "helper.py").write_text("VALUE = 7\n", encoding="utf-8")
+    (source / "experiment.py").write_text(
+        "def run():\n    import sys\n    sys.path.insert(0, '.')\n    import helper\n    return helper.VALUE\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("experiment", source / "experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    store = LocalArtifactStore(tmp_path)
+    submitter = FakeSubmitter(result=7)
+    context = ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="models",
+        artifact_store=store,
+        submitter=submitter,
+        signing_key=b"secret",
+    )
+
+    experiment = execute(TpuConfig(type="v5p-512"), context=context)(module.run)
+    experiment.remote()
+
+    request = submitter.requests[0]
+    assert request.workspace_uri is not None
+    assert request.workspace_sha256 is not None
+    bundle = tarfile.open(fileobj=io.BytesIO(store.read(request.workspace_uri)), mode="r:gz")
+    names = bundle.getnames()
+    assert "experiment.py" in names and "helper.py" in names, "the callable's siblings must travel"
+
+
+def test_a_default_workspace_that_cannot_be_packaged_degrades_with_a_warning(tmp_path) -> None:
+    """A callable that needs nothing local must not die at submission.
+
+    The derived default is a guess about the submitter's intent, so where an
+    explicit path fails loudly, the guess degrades: it submits without a
+    workspace and names what was lost. A directory whose every file is
+    gitignored -- a scratch tree -- is the honest trigger here.
+    """
+
+    source = tmp_path / "scratch"
+    source.mkdir()
+    (source / ".gitignore").write_text("*\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    (source / "experiment.py").write_text("def run():\n    return 3\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("experiment_gitignored", source / "experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    store = LocalArtifactStore(tmp_path)
+    submitter = FakeSubmitter(result=3)
+    context = ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="models",
+        artifact_store=store,
+        submitter=submitter,
+        signing_key=b"secret",
+    )
+
+    experiment = execute(TpuConfig(type="v5p-512"), context=context)(module.run)
+    with pytest.warns(UserWarning, match="could not be shipped as a workspace"):
+        experiment.remote()
+
+    request = submitter.requests[0]
+    assert request.workspace_uri is None, "the degraded submit must still submit"
+
+
+def test_a_callable_with_no_file_ships_nothing_and_says_nothing(tmp_path) -> None:
+    """A REPL-defined callable has no directory to mean, so none is invented.
+
+    ``<string>`` and ``<stdin>`` name no file; silently shipping the cwd in
+    their place would upload a directory the caller never pointed at.
+    """
+
+    namespace: dict[str, tp.Any] = {}
+    exec("def improvised():\n    return 5\n", namespace)
+
+    store = LocalArtifactStore(tmp_path)
+    submitter = FakeSubmitter(result=5)
+    context = ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="models",
+        artifact_store=store,
+        submitter=submitter,
+        signing_key=b"secret",
+    )
+
+    improvised = execute(TpuConfig(type="v5p-512"), context=context)(namespace["improvised"])
+    import warnings as warnings_module
+
+    with warnings_module.catch_warnings():
+        warnings_module.simplefilter("error")
+        improvised.remote()
+
+    request = submitter.requests[0]
+    assert request.workspace_uri is None
