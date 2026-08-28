@@ -39,16 +39,57 @@ from eyvan.sdk.execution import (
     init,
 )
 from eyvan.sdk.job_receipt import JobLifecycleState, JobLifecycleUpdate, JobTerminalOutput
+from eyvan.server.local.daemon import (
+    LocalDaemonError,
+    LocalDaemonPaths,
+    LocalDaemonRecord,
+    LocalDaemonSupervisor,
+    LocalDaemonTarget,
+    process_is_alive,
+    read_owner_only_record,
+    write_owner_only_record,
+)
 from eyvan.worker.runtime.callables import CallableArtifact, dump_callable, load_callable
 
 T = tp.TypeVar("T")
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path) -> None:
+def _isolated_home(monkeypatch, tmp_path):
     """Keep default SDK setup independent from a developer's private GCP runtime profile."""
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    yield home
+    _stop_local_daemons_recorded_under(home)
+
+
+def _stop_local_daemons_recorded_under(home: Path) -> None:
+    """Stop planes this test recorded, and fail on any process left behind.
+
+    A daemon started under the isolated home outlives the test process, keeps
+    the loopback port bound with a credential from a home pytest is about to
+    delete, and the next real ``eyvan up`` on that port answers 401 from a
+    plane nobody owns. The PID records are owner-only by construction, so
+    anything readable here was written during this test run. What the
+    supervisor can prove it owns, it stops; what it cannot prove (a foreign
+    command under a recycled PID) it refuses to signal, and the liveness
+    check then names the leak instead of silently passing.
+    """
+
+    for record_path in sorted(home.glob(".eyvan/*.pid")):
+        record = read_owner_only_record(record_path)
+        if record is None:
+            continue
+        try:
+            LocalDaemonSupervisor().stop(record.endpoint)
+        except LocalDaemonError:
+            pass
+        if process_is_alive(record.pid):
+            pytest.fail(
+                f"a local Eyvan daemon (pid {record.pid}, {record.endpoint.url}) outlived the test; "
+                "record it for teardown or patch ensure_loopback_control_plane out"
+            )
 
 
 def _add(left: int, right: int = 1) -> int:
@@ -126,6 +167,34 @@ def test_tpu_config_is_frozen_and_validated() -> None:
         TpuConfig(type="v5p-512", max_retries=True)
     with pytest.raises(ValueError, match="capacity_class"):
         TpuConfig(type="v5p-512", capacity_class="spot")  # type: ignore[arg-type]
+
+
+def test_isolated_home_stops_recorded_daemons_and_flags_foreign_survivors(tmp_path) -> None:
+    """The teardown must stop what it owns and name what it cannot prove it owns."""
+
+    home = tmp_path / "home"
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8080")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    # The real record path for the endpoint, because stop() recomputes it.
+    record_path = LocalDaemonPaths().record_path(target)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    sleeper = subprocess.Popen(["sleep", "60"])
+    try:
+        write_owner_only_record(record_path, LocalDaemonRecord(endpoint=endpoint, pid=sleeper.pid))
+        assert read_owner_only_record(record_path) is not None
+        # A foreign command under a recorded PID must be refused, not killed,
+        # and the refusal must surface as a failure that names the survivor.
+        with pytest.raises(pytest.fail.Exception, match="outlived the test"):
+            _stop_local_daemons_recorded_under(home)
+    finally:
+        sleeper.terminate()
+        sleeper.wait()
+    assert not process_is_alive(sleeper.pid)
+    # A dead PID is stale metadata, not a leak: the record is cleared and no
+    # failure is raised.
+    _stop_local_daemons_recorded_under(home)
+    assert not record_path.exists()
 
 
 def test_callable_surface_is_exported_from_top_level_package() -> None:

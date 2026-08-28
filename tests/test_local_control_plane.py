@@ -232,3 +232,46 @@ def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> Non
     surviving = read_owner_only_record(record_path)
     assert surviving is not None, "the winner's record was deleted by the loser"
     assert surviving.pid == winner_pid, "the loser stamped its own pid over the winner's record"
+
+
+def test_stop_ends_a_plane_this_supervisor_started(tmp_path) -> None:
+    """``ensure`` without a ``stop`` is how a suite leaks a plane onto a port.
+
+    A daemon outlives the process that started it -- that is the point of a
+    daemon -- so the supervisor that records it must also be able to stop it,
+    proving the same ownership it demanded before starting. A leaked plane
+    keeps the port bound with a credential from a profile directory that has
+    since been deleted, and the next command against that port answers 401
+    from a plane nobody owns.
+    """
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.server.local.daemon import (
+        LocalDaemonPaths,
+        LocalDaemonState,
+        LocalDaemonSupervisor,
+        LocalDaemonTarget,
+        process_is_alive,
+        read_owner_only_record,
+    )
+
+    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8099")
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    supervisor = LocalDaemonSupervisor(paths=paths)
+    started = supervisor.ensure(endpoint)
+    assert started.state is LocalDaemonState.STARTED
+    assert started.pid is not None
+    pid = started.pid
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    record_path = paths.record_path(target)
+    try:
+        assert process_is_alive(pid)
+        assert read_owner_only_record(record_path) is not None
+    finally:
+        stopped = supervisor.stop(endpoint)
+    assert stopped.state is LocalDaemonState.STOPPED
+    assert not process_is_alive(pid)
+    assert read_owner_only_record(record_path) is None, "stopping must clear the record it owned"
+    # A cleared record makes a second stop a no-op, not an error.
+    assert supervisor.stop(endpoint).state is LocalDaemonState.STOPPED

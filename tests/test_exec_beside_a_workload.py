@@ -347,8 +347,16 @@ def test_init_does_not_start_a_control_plane_on_a_worker(monkeypatch) -> None:
     assert started == [], "init started a control plane inside a running job"
 
 
-def test_init_still_starts_a_control_plane_on_a_laptop(monkeypatch) -> None:
-    """The local-development path must keep working; only the in-job case changes."""
+def test_init_still_starts_a_control_plane_on_a_laptop(tmp_path, monkeypatch) -> None:
+    """The local-development path must keep working; only the in-job case changes.
+
+    Pinned to a missing context file because ``init()`` probes the active
+    fleet recorded in the operator's own context: with a real context this
+    test depended on whatever plane happened to be listening on 8080 --
+    which on a developer machine was once a plane leaked by an earlier
+    test. With no fleet to reconcile, the start attempt is the whole of the
+    contract under test.
+    """
 
     from eyvan.sdk import execution
 
@@ -356,7 +364,7 @@ def test_init_still_starts_a_control_plane_on_a_laptop(monkeypatch) -> None:
     monkeypatch.setattr(execution, "ensure_loopback_control_plane", lambda endpoint: started.append(endpoint))
     monkeypatch.setattr(execution, "_configured_gcp_runtime_profile", lambda _endpoint: None)
 
-    execution.init(environ={})
+    execution.init(environ={"EYVAN_CONFIG_FILE": str(tmp_path / "no-context.json")})
 
     assert started, "init stopped starting the local control plane"
 

@@ -66,6 +66,7 @@ class LocalDaemonState(StrEnum):
     SKIPPED = "skipped"
     REUSED = "reused"
     STARTED = "started"
+    STOPPED = "stopped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,7 +483,14 @@ def clear_owner_only_record(path: Path, *, pid: int) -> None:
 
 
 def process_is_alive(pid: int) -> bool:
-    """Check a recorded PID without ever sending it a signal."""
+    """Check a recorded PID without ever sending it a signal.
+
+    A zombie -- exited but not yet reaped by its parent -- still answers
+    signal 0, but it is not running: it holds no port and executes nothing.
+    The supervisor's own children become zombies exactly when a stop
+    succeeds while the parent that launched them is still alive, so a
+    zombie must read as gone or a verified stop never converges.
+    """
 
     try:
         os.kill(pid, 0)
@@ -490,7 +498,19 @@ def process_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    try:
+        completed = subprocess.run(
+            ("ps", "-o", "state=", "-p", str(pid)),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Signal 0 said the PID exists and no state is readable; assume live.
+        return True
+    if completed.returncode != 0:
+        return True
+    return not completed.stdout.strip().startswith(("Z", "z"))
 
 
 def _read_process_arguments(pid: int) -> tuple[str, ...] | None:
@@ -872,6 +892,58 @@ class LocalDaemonSupervisor:
             else:
                 clear_owner_only_record(record_path, pid=record.pid)
         return self.ensure(configured_endpoint, runtime_profile_path=expanded_runtime_profile_path)
+
+    def stop(self, endpoint: str | ControlPlaneEndpoint) -> LocalDaemonResult:
+        """Stop the daemon this supervisor's profile directory records for an endpoint.
+
+        The counterpart to :meth:`ensure` for callers that own the profile
+        directory: a developer clearing a local plane, or a test harness whose
+        isolated home recorded one. Like :meth:`restart`, it accepts only an
+        owner-only Eyvan PID record for the requested loopback endpoint and
+        checks the recorded PID's command before sending ``SIGTERM``, so a
+        recycled PID naming an unrelated process is refused rather than
+        killed. A missing record stops nothing: a plane this supervisor
+        cannot prove it owns is not this supervisor's to stop.
+
+        Args:
+            endpoint: The literal HTTP loopback endpoint to stop.
+
+        Returns:
+            The stopped outcome for the endpoint.
+
+        Raises:
+            LocalDaemonConfigurationError: The endpoint is not a literal HTTP
+                loopback one, or its record names another endpoint.
+        """
+
+        configured_endpoint = ControlPlaneEndpoint.parse(endpoint)
+        target = LocalDaemonTarget.from_endpoint(configured_endpoint)
+        if target is None:
+            raise LocalDaemonConfigurationError("the local control plane can stop only a literal HTTP loopback endpoint")
+        record_path = self.paths.record_path(target)
+        log_path = self.paths.log_path(target)
+        with owner_only_startup_lock(self.paths.lock_path(target)):
+            record = read_owner_only_record(record_path)
+            if record is not None:
+                if record.endpoint != configured_endpoint:
+                    raise LocalDaemonConfigurationError(
+                        f"the recorded Eyvan control-plane endpoint does not match {configured_endpoint.url}; "
+                        "refusing to stop it"
+                    )
+                if self.process_liveness(record.pid):
+                    self._stop_recorded_daemon(
+                        record,
+                        target=target,
+                        log_path=log_path,
+                        expected_runtime_profile_path=record.runtime_profile_path or "",
+                    )
+                clear_owner_only_record(record_path, pid=record.pid)
+        return LocalDaemonResult(
+            endpoint=configured_endpoint,
+            state=LocalDaemonState.STOPPED,
+            pid=None,
+            log_path=log_path,
+        )
 
     def stop_started(self, result: LocalDaemonResult, *, runtime_profile_path: Path) -> None:
         """Stop only the exact profile-aware daemon started by this supervisor.
