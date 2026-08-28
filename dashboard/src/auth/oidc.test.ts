@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   __resetRuntimeOidcConfigForTests,
+  absorbLocalCredentialFromLocation,
   apiAuthHeaders,
   beginLogin,
   capabilitiesForPermissions,
@@ -407,5 +408,80 @@ describe("which project the dashboard asks about", () => {
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
 
     expect(configuredScope()).toEqual({ orgId: "default", projectId: "default" });
+  });
+});
+
+describe("the loopback development credential bridge", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("absorbs the credential from the URL fragment and strips it from the address bar", () => {
+    const store = memoryStorage();
+    vi.stubGlobal("sessionStorage", store);
+    const replaceState = vi.fn();
+    const location = { hash: "#eyvan-local-credential=owner-secret", pathname: "/", search: "" };
+
+    const absorbed = absorbLocalCredentialFromLocation(location, { replaceState });
+
+    expect(absorbed).toBe("owner-secret");
+    expect(store.getItem("eyvan.local.credential")).toBe("owner-secret");
+    // The value must not linger in history or in URLs that get copied around.
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/");
+  });
+
+  it("keeps unrelated fragment parameters while stripping the credential", () => {
+    const store = memoryStorage();
+    vi.stubGlobal("sessionStorage", store);
+    const replaceState = vi.fn();
+    const location = { hash: "#panel=cells&eyvan-local-credential=s&tab=gang", pathname: "/", search: "" };
+
+    absorbLocalCredentialFromLocation(location, { replaceState });
+
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/#panel=cells&tab=gang");
+  });
+
+  it("leaves a URL that carries no credential exactly as it was", () => {
+    const store = memoryStorage();
+    vi.stubGlobal("sessionStorage", store);
+    const replaceState = vi.fn();
+
+    expect(absorbLocalCredentialFromLocation({ hash: "", pathname: "/", search: "" }, { replaceState })).toBeUndefined();
+    expect(absorbLocalCredentialFromLocation({ hash: "#panel=cells", pathname: "/", search: "" }, { replaceState })).toBeUndefined();
+    expect(replaceState).not.toHaveBeenCalled();
+    expect(store.length).toBe(0);
+  });
+
+  it("presents the bridged credential without claiming a build-time identity", () => {
+    // A bundle served by its plane sends no identity headers: the plane fills
+    // its own page's identity. The one thing only the owner can supply is the
+    // credential, and that is the one header this page insists on.
+    vi.stubGlobal("sessionStorage", memoryStorage({ "eyvan.local.credential": "owner-secret" }));
+
+    expect(apiAuthHeaders()).toEqual({ "X-Eyvan-Local-Credential": "owner-secret" });
+  });
+
+  it("keeps sending the credential alongside a bundle that claims a development identity", () => {
+    vi.stubEnv("VITE_EYVAN_DEV_AUTH", "true");
+    vi.stubGlobal("sessionStorage", memoryStorage({ "eyvan.local.credential": "owner-secret" }));
+
+    expect(apiAuthHeaders()).toMatchObject({
+      "X-Eyvan-User": "dashboard-dev",
+      "X-Eyvan-Local-Credential": "owner-secret",
+    });
+  });
+
+  it("never lets a bridged credential outrank a signed-in session", () => {
+    vi.stubGlobal(
+      "sessionStorage",
+      memoryStorage({
+        "eyvan.local.credential": "owner-secret",
+        "eyvan.oidc.access_token": unsignedToken({ sub: "colleague" }),
+        "eyvan.oidc.expires_at": String(Date.now() + 60_000),
+      }),
+    );
+
+    expect(apiAuthHeaders()).toEqual({ Authorization: expect.stringContaining("Bearer ") });
   });
 });

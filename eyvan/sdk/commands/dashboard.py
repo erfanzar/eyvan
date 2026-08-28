@@ -18,10 +18,12 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 
 import eyvan
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
 
@@ -59,6 +61,17 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
     """Open the dashboard hosted by the configured control plane."""
 
     dashboard_url = f"{session.base_url.rstrip('/')}/"
+    # A loopback plane demands its owner-only development credential from every
+    # caller, the dashboard it serves included -- and a browser cannot read the
+    # 0600 file the value lives in. This terminal can, so it bridges the value
+    # in the URL *fragment*: fragments are never sent to a server, never appear
+    # in a `Referer`, and the page strips this one from its address bar on
+    # arrival. The credential never leaves this machine: a remote plane gets a
+    # plain URL, and no local credential is ever printed for one.
+    endpoint = ControlPlaneEndpoint.parse(session.base_url)
+    local_credential = session.identity.local_development_credential if endpoint.is_loopback else None
+    if local_credential:
+        dashboard_url = f"{dashboard_url}#eyvan-local-credential={quote(local_credential)}"
     # Asked before a browser is opened, because a control plane installed from a
     # wheel may serve no UI at all: the dashboard is a Node build tree that
     # cannot travel inside a Python distribution. This command used to open that

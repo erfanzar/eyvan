@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import typing as tp
+from urllib.parse import quote
 
 from click.testing import CliRunner
 
@@ -15,6 +16,7 @@ import eyvan.sdk.cli as cli
 import eyvan.sdk.commands.dashboard as dashboard_commands
 from eyvan.sdk.cli import main
 from eyvan.sdk.commands.http import EyvanApiError
+from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 
 
 def _env(output: str) -> dict[str, str]:
@@ -209,3 +211,60 @@ def test_dashboard_dev_fails_explicitly_without_source_files(monkeypatch) -> Non
     assert result.exit_code != 0
     assert "requires a source checkout" in result.output
     assert "opens the hosted production UI" in result.output
+
+
+def test_a_loopback_plane_is_opened_with_the_credential_the_browser_cannot_read(tmp_path, monkeypatch) -> None:
+    """A browser cannot read the 0600 file a loopback plane demands; a terminal can.
+
+    The plane refuses its own dashboard's calls without the owner-only
+    credential, and the only sound way into the browser is through the owner's
+    terminal: the value rides in the URL fragment, which no server ever
+    receives, and the page strips it on arrival.
+    """
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credential = LocalDevelopmentCredentialStore().load_or_create().value
+    opened: list[str] = []
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+
+    result = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
+
+    assert result.exit_code == 0, result.output
+    expected = f"http://127.0.0.1:8099/#eyvan-local-credential={quote(credential)}"
+    assert opened == [expected]
+    assert expected in result.output
+
+
+def test_a_loopback_plane_with_no_credential_yet_gets_a_plain_url(tmp_path, monkeypatch) -> None:
+    """Nothing has been issued, so there is nothing to demand and nothing to bridge."""
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    opened: list[str] = []
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+
+    result = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["http://127.0.0.1:8099/"]
+    assert "eyvan-local-credential" not in result.output
+
+
+def test_the_local_credential_never_leaves_this_machine(tmp_path, monkeypatch) -> None:
+    """A remote plane gets a plain URL even when a local credential exists.
+
+    The credential authenticates this machine's owner to this machine's plane;
+    printing it into a URL for a different host would hand it to whatever is
+    listening there and paste it into a foreign terminal's scrollback.
+    """
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credential = LocalDevelopmentCredentialStore().load_or_create().value
+    opened: list[str] = []
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+
+    result = CliRunner().invoke(main, ["--url", "https://eyvan.example.com", "dashboard"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["https://eyvan.example.com/"]
+    assert "eyvan-local-credential" not in result.output
+    assert credential not in result.output

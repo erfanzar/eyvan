@@ -11,6 +11,19 @@ const EXPIRES_AT_KEY = "eyvan.oidc.expires_at";
 const STATE_KEY = "eyvan.oidc.state";
 const VERIFIER_KEY = "eyvan.oidc.verifier";
 const NONCE_KEY = "eyvan.oidc.nonce";
+/**
+ * The loopback development credential this browser was handed, if it was.
+ *
+ * The plane demands its owner-only credential from every caller once it has
+ * issued one, this page included: the headers that identify the plane's own
+ * dashboard are forgeable by any local process, so they cannot authenticate
+ * anything. The browser cannot read the 0600 file the value lives in -- the
+ * owner's terminal can, which is why `eyvan dashboard` opens this page with
+ * the value in the URL fragment and {@link absorbLocalCredentialFromLocation}
+ * moves it here before anything else runs.
+ */
+export const LOCAL_CREDENTIAL_KEY = "eyvan.local.credential";
+export const LOCAL_CREDENTIAL_FRAGMENT_PARAM = "eyvan-local-credential";
 export const AUTH_CHANGED_EVENT = "eyvan:auth-changed";
 
 interface OidcMetadata {
@@ -277,25 +290,63 @@ export function getAccessToken(): string | undefined {
   return token;
 }
 
+/** The credential this browser holds for its loopback plane, if any. */
+export function localDevelopmentCredential(): string | undefined {
+  const bridged = storage()?.getItem(LOCAL_CREDENTIAL_KEY);
+  if (bridged) return bridged;
+  // A declared-but-unset build argument becomes the empty string, not undefined.
+  return import.meta.env.VITE_EYVAN_LOCAL_CREDENTIAL || undefined;
+}
+
+/**
+ * Move a bridged development credential out of the URL and into this tab.
+ *
+ * `eyvan dashboard` puts the value in the fragment -- the one part of a URL
+ * no server, proxy, or `Referer` header ever sees -- because that is the only
+ * way the owner's terminal can hand it to a browser that cannot read the
+ * file it lives in. A fragment still lives in history and in URLs people
+ * copy, so it is moved to session storage and stripped from the address bar
+ * immediately; the tab keeps it for its lifetime and no longer than that.
+ *
+ * Returns the absorbed value so the caller can act on the transition.
+ */
+export function absorbLocalCredentialFromLocation(
+  location: Pick<Location, "hash" | "pathname" | "search"> = globalThis.location,
+  historyLike: Pick<History, "replaceState"> = globalThis.history,
+): string | undefined {
+  const hash = location?.hash ?? "";
+  if (!hash.startsWith("#")) return undefined;
+  const params = new URLSearchParams(hash.slice(1));
+  const value = params.get(LOCAL_CREDENTIAL_FRAGMENT_PARAM);
+  if (!value) return undefined;
+  storage()?.setItem(LOCAL_CREDENTIAL_KEY, value);
+  params.delete(LOCAL_CREDENTIAL_FRAGMENT_PARAM);
+  const remaining = params.toString();
+  historyLike?.replaceState(null, "", `${location.pathname}${location.search}${remaining ? `#${remaining}` : ""}`);
+  return value;
+}
+
 export function apiAuthHeaders(): Record<string, string> {
   const token = getAccessToken();
   if (token) return { Authorization: `Bearer ${token}` };
-  if (!isDevelopmentAuthEnabled()) return {};
-  const headers: Record<string, string> = {
-    "X-Eyvan-User": import.meta.env.VITE_EYVAN_DEV_USER ?? "dashboard-dev",
-    "X-Eyvan-Org": import.meta.env.VITE_EYVAN_ORG ?? "acme",
-    "X-Eyvan-Project": import.meta.env.VITE_EYVAN_PROJECT ?? "research",
-    "X-Eyvan-Roles": import.meta.env.VITE_EYVAN_DEV_ROLE ?? "viewer",
-  };
-  // A default `eyvan-server` runs in LOOPBACK_DEFAULT auth mode, which requires
-  // this owner-only credential in addition to the identity headers. Without it
-  // every request 401s against a stock local server. The browser cannot read the
-  // 0600 file itself, so the developer supplies it:
+  const localCredential = localDevelopmentCredential();
+  if (!isDevelopmentAuthEnabled() && !localCredential) return {};
+  const headers: Record<string, string> = {};
+  if (isDevelopmentAuthEnabled()) {
+    headers["X-Eyvan-User"] = import.meta.env.VITE_EYVAN_DEV_USER ?? "dashboard-dev";
+    headers["X-Eyvan-Org"] = import.meta.env.VITE_EYVAN_ORG ?? "acme";
+    headers["X-Eyvan-Project"] = import.meta.env.VITE_EYVAN_PROJECT ?? "research";
+    headers["X-Eyvan-Roles"] = import.meta.env.VITE_EYVAN_DEV_ROLE ?? "viewer";
+  }
+  // The credential travels without the identity headers above: those are for
+  // a bundle *built* to claim a development identity, while a plane serving
+  // its own bundle fills that page's identity itself -- this machine's owner,
+  // fleet_admin over the default scope, exactly what the CLI elects on
+  // loopback. What the page cannot get from anywhere but its owner is the
+  // credential, so that is the one thing this header set insists on.
   //
+  // For the source-checkout dev server the value still arrives build-time:
   //   VITE_EYVAN_LOCAL_CREDENTIAL=$(cat ~/.eyvan/local-development-credential) npm run dev
-  //
-  // It is absent for OIDC or explicitly-dev-auth servers, which need no header.
-  const localCredential = import.meta.env.VITE_EYVAN_LOCAL_CREDENTIAL;
   if (localCredential) headers["X-Eyvan-Local-Credential"] = localCredential;
   return headers;
 }

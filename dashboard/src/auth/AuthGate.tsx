@@ -8,6 +8,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import {
   AUTH_CHANGED_EVENT,
+  absorbLocalCredentialFromLocation,
   beginLogin,
   completeLogin,
   consumeSessionNotice,
@@ -16,6 +17,7 @@ import {
   isDemoMode,
   isOidcConfigured,
   loadRuntimeOidcConfig,
+  localDevelopmentCredential,
   planeRequiresLocalCredential,
 } from "./oidc";
 
@@ -26,6 +28,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    // First, before anything reads the OIDC configuration or issues an API
+    // call: a credential may have arrived in this URL's fragment, and it must
+    // be in session storage -- with the address bar cleaned -- before the
+    // first request could otherwise leave without it.
+    absorbLocalCredentialFromLocation();
     // Before anything reads the OIDC configuration. Build-time values still
     // win; this only fills the gap they leave, which is what lets one image
     // serve two identity providers.
@@ -58,22 +65,39 @@ export function AuthGate({ children }: { children: ReactNode }) {
     return <AuthState icon={<LoaderCircle className="spin" size={22} />} title="Completing secure sign-in" />;
   }
   // `planeRequiresLocalCredential` is the plane saying it runs loopback
-  // development auth. This bundle was served *by* that plane, so its API calls
-  // are same-origin and the plane authenticates them as its own page -- the
-  // browser cannot read the owner-only credential and no longer has to.
+  // development auth and demands its owner-only credential from every caller
+  // -- the headers that identify this page as the plane's own are forgeable
+  // by any local process, so they no longer authenticate anything. This
+  // bundle is served *by* that plane, but being its page is not being its
+  // owner: the browser cannot read the 0600 file the credential lives in.
+  // `eyvan dashboard` bridges it through the URL fragment, so the page renders
+  // the fleet only once that value actually arrived.
   //
   // Behind OIDC, though, and deliberately: a plane that names an identity
   // provider wants a real identity, and the plane's own authenticator agrees --
   // a presented token is resolved before the development path is reached.
   const ownPlane = planeRequiresLocalCredential() && !isOidcConfigured();
-  if (identity || isDemoMode() || isDevelopmentAuthEnabled() || ownPlane) return children;
+  const ownPlaneAuthenticated = ownPlane && localDevelopmentCredential() !== undefined;
+  if (identity || isDemoMode() || isDevelopmentAuthEnabled() || ownPlaneAuthenticated) return children;
 
-  // No local-plane screen below. There was one, explaining that the page could
-  // not read the plane's owner-only credential and naming the command that
-  // supplies it -- and then the plane learned to authenticate the page it
-  // serves, so the wall it described stopped existing. A screen for a state
-  // that can no longer happen is worse than no screen: it is the first thing
-  // somebody debugs when the real fault is elsewhere.
+  // The plane's own page, opened without the credential -- a raw URL typed by
+  // hand. This is reachable and ordinary, not an error state to hide: the fix
+  // is one command in the owner's terminal, and naming it here is the
+  // difference between "Unable to load Eyvan state" on every panel and a
+  // working dashboard.
+  if (ownPlane) {
+    return (
+      <AuthState
+        icon={<AlertTriangle size={22} />}
+        title="This plane requires its local credential"
+        detail={
+          "Every caller must present this machine's Eyvan development credential, and a browser cannot read the file it lives in. Run `eyvan dashboard` in your terminal: it opens this page with the credential attached, and nothing needs to be typed here."
+        }
+        isError
+      />
+    );
+  }
+
   const configured = isOidcConfigured();
   return (
     <AuthState
