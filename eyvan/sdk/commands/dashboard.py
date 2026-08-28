@@ -71,6 +71,10 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
     endpoint = ControlPlaneEndpoint.parse(session.base_url)
     local_credential = session.identity.local_development_credential if endpoint.is_loopback else None
     if local_credential:
+        # The fragment parameter name is a wire contract with the page that
+        # reads it: ``LOCAL_CREDENTIAL_FRAGMENT_PARAM`` in
+        # ``dashboard/src/auth/oidc.ts``. It is stated once per side and each
+        # side names the other, the same discipline as the refusal detail.
         dashboard_url = f"{dashboard_url}#eyvan-local-credential={quote(local_credential)}"
     # Asked before a browser is opened, because a control plane installed from a
     # wheel may serve no UI at all: the dashboard is a Node build tree that
