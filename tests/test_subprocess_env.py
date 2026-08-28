@@ -10,12 +10,18 @@ process set a checkout-relative ``PYTHONPATH``, the cell agent inherited it,
 and every ``gcloud`` it spawned crashed at import time when macOS TCC refused
 the CLI's embedded Python a directory listing the invoking terminal was
 allowed. Cells that were ACTIVE and billing never reached READY.
+
+The behavioral tests below pin the runners behind the busiest boundaries; a
+source scan pins the invariant itself across every production gcloud spawn, so
+a new boundary cannot land still inheriting the caller's interpreter.
 """
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import typing as tp
+from pathlib import Path
 
 from eyvan._internal.subprocess_env import INTERPRETER_STEERING_ENV_NAMES, provider_cli_env
 
@@ -108,3 +114,147 @@ def test_gcs_artifact_store_default_runner_scrubs_interpreter_steering(monkeypat
     env = captured.get("env")
     assert env is not None
     assert "PYTHONPATH" not in env
+
+
+# Production gcloud spawn sites that still inherit the caller's interpreter
+# steering: places where the outage invariant does not hold yet. Each entry is
+# a live defect needing a production fix (route the spawn through
+# ``provider_cli_env``); the scan below fails as soon as one is fixed -- remove
+# its entry then -- and the moment any other gcloud boundary stops scrubbing.
+# (Empty as of the 2026-08-28 fix sweep: every gcloud boundary in the tree
+# scrubs interpreter steering.)
+PENDING_UNSCRUBBED_GCLOUD_SPAWNS = frozenset()
+
+_SPAWN_CALL_NAMES = frozenset({"run", "Popen", "check_call", "check_output", "call"})
+
+
+def _imports_of(tree: ast.Module, module_path: str, member: str | None = None) -> set[str]:
+    """Return the local names imports bind from ``module_path``.
+
+    With ``member``, only the local name bound to that one imported symbol;
+    without it, every name imported from the module.
+    """
+
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module_path:
+            for alias in node.names:
+                if member is None or alias.name == member:
+                    bound.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import) and member is None:
+            for alias in node.names:
+                if alias.name == module_path:
+                    bound.add(alias.asname or alias.name)
+    return bound
+
+
+def _constructs_gcloud_command(tree: ast.Module) -> bool:
+    """Whether the module builds a gcloud argv: a sequence literal led by ``"gcloud"``."""
+
+    return any(
+        isinstance(node, (ast.List, ast.Tuple))
+        and bool(node.elts)
+        and isinstance(node.elts[0], ast.Constant)
+        and node.elts[0].value == "gcloud"
+        for node in ast.walk(tree)
+    )
+
+
+def _is_subprocess_spawn(call: ast.Call, module_aliases: set[str]) -> bool:
+    """Whether ``call`` invokes ``subprocess.run``/``Popen``/``check_*``/``call``."""
+
+    function = call.func
+    if isinstance(function, ast.Name):
+        return function.id in module_aliases
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr in _SPAWN_CALL_NAMES
+        and isinstance(function.value, ast.Name)
+        and function.value.id in module_aliases
+    )
+
+
+def _subprocess_spawn_calls(tree: ast.Module) -> list[tuple[ast.Call, str]]:
+    """Return every subprocess spawn call paired with its enclosing qualified name."""
+
+    module_aliases = _imports_of(tree, "subprocess")
+    calls: list[tuple[ast.Call, str]] = []
+    enclosure: list[str] = []
+
+    def visit(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                enclosure.append(child.name)
+                visit(child)
+                enclosure.pop()
+            else:
+                if isinstance(child, ast.Call) and _is_subprocess_spawn(child, module_aliases):
+                    calls.append((child, ".".join(enclosure)))
+                visit(child)
+
+    visit(tree)
+    return calls
+
+
+def _routes_through_provider_cli_env(call: ast.Call, env_names: set[str]) -> bool:
+    """Whether the spawn pins an explicit environment built by ``provider_cli_env``."""
+
+    return any(
+        keyword.arg == "env"
+        and isinstance(keyword.value, ast.Call)
+        and isinstance(keyword.value.func, ast.Name)
+        and keyword.value.func.id in env_names
+        for keyword in call.keywords
+    )
+
+
+def test_source_scan_every_gcloud_spawn_scrubs_interpreter_steering() -> None:
+    """Every production gcloud spawn must route through ``provider_cli_env``.
+
+    The behavioral tests pin individual runners; this scan pins the invariant
+    itself, so a new gcloud boundary cannot land still inheriting the caller's
+    interpreter steering (the outage-58 regression class). Sources are parsed,
+    never executed: no network, no subprocesses.
+    """
+
+    import eyvan
+
+    package_root = Path(eyvan.__file__).resolve().parent
+    scrubbed: list[str] = []
+    unscrubbed: dict[tuple[str, str], int] = {}
+    for path in sorted(package_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if not _constructs_gcloud_command(tree):
+            continue
+        relative = path.relative_to(package_root).as_posix()
+        env_names = _imports_of(tree, "eyvan._internal.subprocess_env", "provider_cli_env")
+        for call, qualname in _subprocess_spawn_calls(tree):
+            if _routes_through_provider_cli_env(call, env_names):
+                scrubbed.append(f"{relative}:{call.lineno}")
+            else:
+                unscrubbed[(relative, qualname)] = call.lineno
+
+    unexpected = {
+        f"{relative}:{qualname} at line {line}"
+        for (relative, qualname), line in unscrubbed.items()
+        if (relative, qualname) not in PENDING_UNSCRUBBED_GCLOUD_SPAWNS
+    }
+    assert not unexpected, (
+        "gcloud spawn sites that inherit the caller's interpreter steering "
+        f"(the outage-58 regression class): {sorted(unexpected)}; pass "
+        "env=provider_cli_env() from eyvan._internal.subprocess_env, or add a "
+        "commented entry to PENDING_UNSCRUBBED_GCLOUD_SPAWNS only with a "
+        "tracked production fix"
+    )
+    stale = sorted(PENDING_UNSCRUBBED_GCLOUD_SPAWNS - set(unscrubbed))
+    assert not stale, (
+        "these sites now scrub interpreter steering; remove their pending "
+        f"entries from PENDING_UNSCRUBBED_GCLOUD_SPAWNS: {stale}"
+    )
+    # Blind-spot tripwire: if the scan stops recognizing the population it
+    # guards (renamed imports, a wrapper module around subprocess), it would
+    # pass vacuously. This floor only trips when the scanner went blind.
+    assert len(scrubbed) >= 5, (
+        f"the scan recognized only {len(scrubbed)} scrubbed gcloud boundaries "
+        f"({scrubbed}); extend the scanner before trusting this guard"
+    )

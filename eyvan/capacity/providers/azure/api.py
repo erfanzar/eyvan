@@ -285,13 +285,20 @@ class HttpAzureApi:
         )
         return base if name is None else f"{base}/{name}"
 
-    def _call(self, method: str, url: str, body: JsonObject | None = None) -> JsonObject | None:
+    def _call(
+        self,
+        method: str,
+        url: str,
+        body: JsonObject | None = None,
+        *,
+        params: tp.Mapping[str, str] | None = None,
+    ) -> JsonObject | None:
         client = self.client or httpx.Client(timeout=self.timeout_s)
         try:
             response = client.request(
                 method,
                 url,
-                params={"api-version": API_VERSION},
+                params={"api-version": API_VERSION, **(params or {})},
                 json=body,
                 headers={"Authorization": f"Bearer {self.token()}", "Content-Type": "application/json"},
             )
@@ -316,7 +323,10 @@ class HttpAzureApi:
         return parse_vm(payload or {"name": name, "properties": {"provisioningState": "Creating"}})
 
     def get_vm(self, name: str) -> AzureVirtualMachine | None:
-        payload = self._call("GET", self._path(name))
+        # ARM omits the instance view from a plain GET, and the view is the only
+        # place a Spot eviction is reported: without $expand, _eviction_reason
+        # can never fire on a real subscription no matter what it looks for.
+        payload = self._call("GET", self._path(name), params={"$expand": "instanceView"})
         return None if payload is None else parse_vm(payload)
 
     def list_vms(self) -> list[AzureVirtualMachine]:

@@ -19,6 +19,7 @@ token's idempotency, instance states, and the two ways a call can fail.
 
 from __future__ import annotations
 
+import base64
 import typing as tp
 from contextlib import contextmanager
 
@@ -33,8 +34,9 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
 )
 from eyvan.capacity.fleet_state import FleetStateStore
-from eyvan.capacity.providers.aws.api import Ec2Instance, failure_for, parse_error, parse_instances
+from eyvan.capacity.providers.aws.api import Ec2Instance, HttpEc2Api, failure_for, parse_error, parse_instances
 from eyvan.capacity.providers.aws.instances import CELL_TAG, FENCE_TAG, GENERATION_TAG, client_token
+from eyvan.capacity.providers.aws.signing import AwsCredentials
 
 
 class FakeEc2:
@@ -245,6 +247,18 @@ def test_a_spot_cell_asks_for_a_one_time_request(driver) -> None:
     launch = driver.api.launches[0]
     assert launch["InstanceMarketOptions.MarketType"] == "spot"
     assert launch["InstanceMarketOptions.SpotOptions.SpotInstanceType"] == "one-time"
+
+
+def test_user_data_reaches_ec2_base64_encoded(driver) -> None:
+    """The Query API decodes UserData itself: sent raw, a cloud-init script
+    boots as garbage while the instance still reads running."""
+
+    script = "#!/bin/sh\necho booted > /var/eyvan/booted\n"
+    driver.apply_capacity("cell-a", desired(user_data=script), context("apply-1"))
+
+    wire = driver.api.launches[0]["UserData"]
+    assert wire != script, "raw text on the wire is what EC2 decodes to garbage"
+    assert base64.b64decode(wire, validate=True).decode("utf-8") == script
 
 
 # --------------------------------------------------------------------------- ownership
@@ -481,3 +495,50 @@ def test_spot_request_status_codes_are_parsed_from_the_query_response() -> None:
     </DescribeSpotInstanceRequestsResponse>"""
 
     assert parse_spot_instance_requests(document) == {"i-1": "marked-for-termination", "i-2": "fulfilled"}
+
+
+class _XmlResponse:
+    """The two things the EC2 client reads off a response."""
+
+    def __init__(self, text: str) -> None:
+        self.status_code = 200
+        self.text = text
+
+
+class _RecordingClient:
+    """The httpx seam HttpEc2Api posts through, holding the encoded body."""
+
+    def __init__(self, document: str) -> None:
+        self._document = document
+        self.body: str | None = None
+
+    def post(self, url: str, content: str | None = None, headers: tp.Mapping[str, str] | None = None) -> _XmlResponse:
+        self.body = content
+        return _XmlResponse(self._document)
+
+
+def test_describe_spot_instance_requests_asks_about_the_instances_it_was_given() -> None:
+    """DescribeSpotInstanceRequests has no InstanceId parameter.
+
+    Sent anyway, the ids never reach EC2 and the call degrades to describing
+    every spot request in the region. The action is keyed by spot request id,
+    which this seam does not hold -- callers pass instance ids -- so the ids go
+    as the action's documented ``instance-id`` filter instead.
+    """
+
+    document = """<DescribeSpotInstanceRequestsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+      <spotInstanceRequestSet><item>
+        <instanceId>i-1</instanceId>
+        <status><code>marked-for-termination</code></status>
+      </item></spotInstanceRequestSet>
+    </DescribeSpotInstanceRequestsResponse>"""
+    client = _RecordingClient(document)
+    api = HttpEc2Api(region="us-east-1", credentials=AwsCredentials("AKIDEXAMPLE", "example-secret"), client=client)
+
+    statuses = api.describe_spot_instance_requests(["i-1"])
+
+    assert statuses == {"i-1": "marked-for-termination"}
+    body = client.body
+    assert "Filter.1.Name=instance-id" in body
+    assert "Filter.1.Value.1=i-1" in body
+    assert "InstanceId.1=" not in body, "a bare InstanceId.N is not part of the action and is ignored"

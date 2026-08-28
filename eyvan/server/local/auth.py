@@ -35,9 +35,20 @@ class LocalDevelopmentCredential:
         _validate_credential_value(self.value)
 
     def matches(self, presented: str | None) -> bool:
-        """Return whether an HTTP header value matches this credential in constant time."""
+        """Return whether an HTTP header value matches this credential in constant time.
 
-        return presented is not None and secrets.compare_digest(self.value, presented)
+        The credential is canonical base64url, so a non-ASCII header can never
+        match it -- and ``compare_digest`` answers non-ASCII ``str`` with
+        ``TypeError``. A caller's garbage header must come back as a mismatch
+        (401), never as a server error (500).
+        """
+
+        if presented is None:
+            return False
+        try:
+            return secrets.compare_digest(self.value, presented)
+        except TypeError:
+            return False
 
 
 class LocalDevelopmentCredentialStore:

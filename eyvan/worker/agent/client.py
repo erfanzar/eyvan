@@ -52,6 +52,14 @@ _STAGE_TIMEOUTS: dict[CellStageAction, float] = {
     CellStageAction.EVICT: 300.0,
 }
 
+#: An exec request legitimately holds the connection for as long as the command
+#: itself was budgeted to run, so the per-request HTTP timeout is that budget
+#: plus a margin for spawn and serialization overhead, capped just past the
+#: wire contract's ``le=600``. Deriving it is what keeps a long diagnostic from
+#: being recorded as a rank error while it is still running on the agent.
+_EXEC_HTTP_TIMEOUT_MARGIN_S = 30.0
+_EXEC_HTTP_TIMEOUT_MAX_S = 660.0
+
 
 def _wire(request: tp.Any) -> JsonObject:
     """Serialize a request for an agent that may be older than this head.
@@ -275,9 +283,10 @@ class CellAgentClient:
     def worker_builds(self, cell_id: str) -> list[dict[str, object]] | None:
         """Return each native worker's build for one cell, or ``None`` if unasked.
 
-        ``None`` from an agent that predates the route, an empty list from one
-        whose backend runs the workload in the agent process itself. The two are
-        different facts and the caller reports them differently.
+        ``None`` from an agent that predates the route (404) or whose execution
+        driver cannot be asked at all (200 with a null body), an empty list from
+        one whose backend runs the workload in the agent process itself. The
+        answers are different facts and the caller reports them differently.
         """
 
         try:
@@ -287,6 +296,8 @@ class CellAgentClient:
                 return None
             raise
         payload = response.json()
+        if payload is None:
+            return None
         if not isinstance(payload, list):
             raise ValueError("cell agent worker builds must be a JSON array")
         return payload
@@ -439,12 +450,19 @@ class CellAgentClient:
         *,
         timeout_s: float = 30.0,
     ) -> JsonObject:
-        """Run one diagnostic command beside a live workload on one cell."""
+        """Run one diagnostic command beside a live workload on one cell.
+
+        The agent may hold the answer for the whole ``timeout_s`` while the
+        command runs, so the request carries an HTTP timeout derived from that
+        budget instead of the client default -- which expired mid-command and
+        made the observation record a rank error for a rank still running.
+        """
 
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/exec",
             json={"command": list(command), "timeout_s": timeout_s},
+            timeout=min(timeout_s + _EXEC_HTTP_TIMEOUT_MARGIN_S, _EXEC_HTTP_TIMEOUT_MAX_S),
         )
         payload = response.json()
         if not is_json_object(payload):

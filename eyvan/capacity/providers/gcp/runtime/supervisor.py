@@ -373,6 +373,11 @@ class LocalAgentSupervisor:
             return existing
 
         with owner_only_startup_lock(self.paths.agent_lock_path(target)):
+            # The digest probe above ran without the lock: a concurrent
+            # supervisor running older code can relaunch a stale agent in
+            # exactly the rolling-upgrade window this check exists for, so the
+            # check is repeated before anything is reused or started.
+            self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, target)
             existing = self._existing_result(profile, profile_id, record_path, log_path)
             if existing is not None:
                 return existing
@@ -492,6 +497,31 @@ class LocalAgentSupervisor:
             raise
         return self._wait_for_ready(process, profile, record_path, log_path)
 
+    def _agent_runs_different_code(self, profile: GcpNativeRuntimeProfile) -> bool:
+        """Return True only when the live agent provably runs a different build.
+
+        An unknowable identity (route absent, digest uncomputable on either
+        side) never counts as different, matching the replacement policy below.
+        """
+
+        return self._agent_digest_skew(profile) is not None
+
+    def _agent_digest_skew(self, profile: GcpNativeRuntimeProfile) -> tuple[str, str] | None:
+        """Return ``(running, this-process)`` digests when they provably differ.
+
+        An unknowable identity (route absent, digest uncomputable on either
+        side) returns ``None``: it never counts as different.
+        """
+
+        probe = self.build_probe
+        remote = probe(self.endpoint, profile.agent_shared_secret) if probe is not None else None
+        if remote is None or remote.source_digest is None:
+            return None
+        current = build_identity()
+        if current.source_digest is None or current.source_digest == remote.source_digest:
+            return None
+        return remote.source_digest, current.source_digest
+
     def _replace_agent_running_stale_code(
         self,
         profile: GcpNativeRuntimeProfile,
@@ -502,19 +532,15 @@ class LocalAgentSupervisor:
     ) -> None:
         """Stop a profile-owned agent whose build identity differs from this process.
 
-        An unknowable identity (route absent, digest uncomputable on either
-        side) never triggers replacement. An agent this process does not own
-        is refused loudly instead of stopped, pointing the operator at the
-        restart command that validates ownership the same way.
+        An agent this process does not own is refused loudly instead of stopped,
+        pointing the operator at the restart command that validates ownership
+        the same way.
         """
 
-        probe = self.build_probe
-        remote = probe(self.endpoint, profile.agent_shared_secret) if probe is not None else None
-        if remote is None or remote.source_digest is None:
+        skew = self._agent_digest_skew(profile)
+        if skew is None:
             return
-        current = build_identity()
-        if current.source_digest is None or current.source_digest == remote.source_digest:
-            return
+        remote_digest, current_digest = skew
         record = read_owner_only_record(record_path)
         if (
             record is None
@@ -524,7 +550,7 @@ class LocalAgentSupervisor:
         ):
             raise LocalAgentConfigurationError(
                 f"a cell agent built from different code is listening at {self.endpoint.url} "
-                f"(running digest {remote.source_digest[:12]}, this process {current.source_digest[:12]}); "
+                f"(running digest {remote_digest[:12]}, this process {current_digest[:12]}); "
                 "it is not owned by the selected runtime profile, so it was not replaced automatically -- "
                 "run 'eyvan runtime restart --yes' to replace it explicitly"
             )
@@ -553,7 +579,7 @@ class LocalAgentSupervisor:
                     raise LocalAgentConfigurationError(
                         f"the local Eyvan cell agent at {self.endpoint.url} is running with a different runtime profile"
                     )
-                return self._wait_for_existing_agent(profile, record, log_path)
+                return self._wait_for_existing_agent(profile, profile_id, record, record_path, log_path)
             return None
         self._validate_capabilities(capabilities)
         if record is None or record.endpoint != self.endpoint or not self.process_liveness(record.pid):
@@ -565,6 +591,13 @@ class LocalAgentSupervisor:
             raise LocalAgentConfigurationError(
                 f"the local Eyvan cell agent at {self.endpoint.url} is running with a different runtime profile"
             )
+        if self._agent_runs_different_code(profile):
+            # Re-verify the build identity before handing the agent back: a
+            # supervisor running older code can relaunch a stale agent between
+            # the pre-lock digest probe and this lock, and reusing it would
+            # defeat the rolling-upgrade check entirely.
+            self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, self._target())
+            return None
         return LocalAgentResult(
             endpoint=self.endpoint,
             state=LocalAgentState.REUSED,
@@ -576,16 +609,26 @@ class LocalAgentSupervisor:
     def _wait_for_existing_agent(
         self,
         profile: GcpNativeRuntimeProfile,
+        profile_id: str,
         record: LocalDaemonRecord,
+        record_path: Path,
         log_path: Path,
-    ) -> LocalAgentResult:
-        """Wait for another supervisor's owned matching agent instead of racing a second bind."""
+    ) -> LocalAgentResult | None:
+        """Wait for another supervisor's owned matching agent instead of racing a second bind.
+
+        Returns ``None`` when the agent that became ready turns out to run a
+        different build -- a skew-era relaunch, which is replaced rather than
+        reused -- leaving the caller to start a fresh one.
+        """
 
         deadline = self.clock() + self.startup_timeout_s
         while True:
             capabilities = self.capability_probe(self.endpoint, profile.agent_shared_secret)
             if capabilities is not None:
                 self._validate_capabilities(capabilities)
+                if self._agent_runs_different_code(profile):
+                    self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, self._target())
+                    return None
                 return LocalAgentResult(
                     endpoint=self.endpoint,
                     state=LocalAgentState.REUSED,

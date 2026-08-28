@@ -15,7 +15,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
-from eyvan.capacity.drivers.base import CapacityStatus, CellCapabilities, CellObservation, ExecutionWorkloadStatus
+from eyvan.capacity.drivers.base import (
+    CapacityStatus,
+    CellCapabilities,
+    CellObservation,
+    ExecutionWorkloadStatus,
+    MutationContext,
+)
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.config import EyvanSettings
 from eyvan.worker.agent.app import create_agent_app
@@ -80,6 +86,18 @@ class GangExecutor:
 
     def stop(self, remote_id: str) -> None:
         self.calls.append(("stop", remote_id))
+
+    def checkpoint(
+        self,
+        remote_id: str,
+        *,
+        hook: str,
+        output_uri: str | None,
+        context: MutationContext,
+    ) -> str:
+        self.calls.append(("checkpoint", remote_id))
+        assert hook.strip()
+        return context.idempotency_key
 
     def retire(self, remote_id: str) -> None:
         self.calls.append(("retire", remote_id))
@@ -267,6 +285,60 @@ def test_native_gang_rejects_a_stale_member_fence_without_touching_workers(tmp_p
             "workload-1",
             "workload-1-a7",
             GangWorkloadMutationRequest(members=stale_members),
+        )
+
+    assert [name for name, _ in resolver.calls] == ["submit", "close"]
+
+
+def test_native_gang_checkpoint_fans_out_and_names_the_output_uri(tmp_path) -> None:
+    """The checkpoint reaches the gang driver, not one cell's single worker."""
+
+    service, _state, resolver = _service(tmp_path)
+    request = _request()
+    service.submit_gang("cell-a", request)
+    members = tuple(
+        member.model_copy(
+            update={"mutation": member.mutation.model_copy(update={"idempotency_key": "ckpt-shared"})}
+        )
+        for member in request.members
+    )
+
+    observation = service.checkpoint_gang(
+        "cell-a",
+        "workload-1",
+        "workload-1-a7",
+        members,
+        hook="python checkpoint.py",
+        output_uri="gs://bucket/checkpoints/workload-1",
+        context=MutationContext(idempotency_key="ckpt-shared", generation=7, fencing_token="cell:1"),
+    )
+
+    assert observation.remote_id == "ckpt-shared"
+    assert observation.status is ExecutionWorkloadStatus.CHECKPOINTING
+    assert observation.checkpoint_uri == "gs://bucket/checkpoints/workload-1"
+    assert [name for name, _ in resolver.calls] == ["submit", "close", "checkpoint", "close"]
+
+
+def test_native_gang_checkpoint_refuses_a_stale_member_fence(tmp_path) -> None:
+    service, _state, resolver = _service(tmp_path)
+    request = _request()
+    service.submit_gang("cell-a", request)
+    stale_members = (
+        request.members[0],
+        request.members[1].model_copy(
+            update={"mutation": request.members[1].mutation.model_copy(update={"fencing_token": "wrong"})}
+        ),
+    )
+
+    with pytest.raises(Exception, match="does not own every member fence"):
+        service.checkpoint_gang(
+            "cell-a",
+            "workload-1",
+            "workload-1-a7",
+            stale_members,
+            hook="python checkpoint.py",
+            output_uri="gs://bucket/checkpoints/workload-1",
+            context=MutationContext(idempotency_key="ckpt-shared", generation=7, fencing_token="cell:1"),
         )
 
     assert [name for name, _ in resolver.calls] == ["submit", "close"]

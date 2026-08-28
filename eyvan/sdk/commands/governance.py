@@ -46,14 +46,20 @@ def _put(
     operation: str,
     idempotency_key: str | None,
 ) -> None:
-    """Send one governance PUT through the shared idempotency factory."""
+    """Send one governance PUT through the shared idempotency factory.
+
+    ``exclude_unset`` is load-bearing for quotas: the server infers
+    ``constrained_resources`` from the limits' ``model_fields_set``, so a
+    dimension the caller left unset must also be absent from the wire --
+    serializing the pydantic defaults would constrain it after all.
+    """
 
     service = _service(session)
     service.renderer.emit(
         session.client.request(
             "PUT",
             path,
-            json=model_json(request),
+            json=model_json(request, exclude_unset=True),
             headers={"Idempotency-Key": service.keys.create(operation, idempotency_key)},
         )
     )
@@ -152,10 +158,10 @@ def _emit_effective_quota(payload: JsonValue) -> None:
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
 @click.option("--principal", "principal_id", help="Narrow the quota to one principal.")
-@click.option("--cpu", type=float, default=0.0, show_default=True)
-@click.option("--memory-gib", type=float, default=0.0, show_default=True)
-@click.option("--gpu", type=int, default=0, show_default=True)
-@click.option("--tpu", type=int, default=0, show_default=True)
+@click.option("--cpu", type=float, help="CPU cores the scope may use; omit to leave it unconstrained.")
+@click.option("--memory-gib", type=float, help="GiB of memory the scope may use; omit to leave it unconstrained.")
+@click.option("--gpu", type=int, help="GPUs the scope may use; omit to leave it unconstrained.")
+@click.option("--tpu", type=int, help="TPU chips the scope may use; omit to leave it unconstrained.")
 @click.option("--artifact-bytes", type=int, help="Ceiling on stored artifact bytes; omit for unlimited.")
 @click.option("--weight", type=float, default=1.0, show_default=True, help="Fair-share weight.")
 @click.option("--idempotency-key")
@@ -165,15 +171,20 @@ def set_quota(
     org_id: str | None,
     project_id: str | None,
     principal_id: str | None,
-    cpu: float,
-    memory_gib: float,
-    gpu: int,
-    tpu: int,
+    cpu: float | None,
+    memory_gib: float | None,
+    gpu: int | None,
+    tpu: int | None,
     artifact_bytes: int | None,
     weight: float,
     idempotency_key: str | None,
 ) -> None:
-    """Set the quota for one scope."""
+    """Set the quota for one scope.
+
+    Only the dimensions named on the command line become constraints; an
+    unnamed dimension is left open, not set to zero. ``--cpu 0`` is how a
+    dimension is explicitly closed.
+    """
 
     # The org is resolved from the session; the project is *not*, and must not
     # be -- omitting --project is how an org-wide quota is written, so filling
@@ -184,12 +195,24 @@ def set_quota(
     # is written.
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     _announce_quota_scope(scope.org_id, project_id, principal_id)
+    # Built only from the flags that were passed. The server reads
+    # ``constrained_resources`` off the limits' ``model_fields_set`` -- a
+    # dimension absent there is unconstrained -- so constructing this with the
+    # CLI defaults bound every unnamed dimension to zero and refused every
+    # workload in the scope that asked for any of it.
+    limits = ResourceLimits(
+        **{
+            name: value
+            for name, value in (("cpu", cpu), ("memory_gib", memory_gib), ("gpu", gpu), ("tpu", tpu))
+            if value is not None
+        }
+    )
     try:
         request = QuotaPutRequest(
             org_id=scope.org_id,
             project_id=project_id,
             principal_id=principal_id,
-            limits=ResourceLimits(cpu=cpu, memory_gib=memory_gib, gpu=gpu, tpu=tpu),
+            limits=limits,
             artifact_bytes_limit=artifact_bytes,
             weight=weight,
         )

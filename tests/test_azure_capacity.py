@@ -20,9 +20,11 @@ vanished.
 
 from __future__ import annotations
 
+import base64
 import typing as tp
 from contextlib import contextmanager
 
+import httpx
 import pytest
 
 from eyvan._internal.json_types import JsonObject
@@ -35,7 +37,7 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
 )
 from eyvan.capacity.fleet_state import FleetCellRecord, FleetStateStore
-from eyvan.capacity.providers.azure.api import AzureVirtualMachine, failure_for, parse_vm
+from eyvan.capacity.providers.azure.api import API_VERSION, AzureVirtualMachine, HttpAzureApi, failure_for, parse_vm
 from eyvan.capacity.providers.azure.machines import CELL_TAG, FENCE_TAG, GENERATION_TAG, vm_name
 
 
@@ -183,6 +185,19 @@ def test_a_spot_vm_is_deleted_on_eviction_rather_than_deallocated(driver) -> Non
     _name, body = driver.api.creates[0]
     assert body["properties"]["priority"] == "Spot"
     assert body["properties"]["evictionPolicy"] == "Delete"
+
+
+def test_user_data_reaches_arm_base64_encoded(driver) -> None:
+    """ARM decodes userData itself: sent raw, a cloud-init script boots as
+    garbage while provisioningState still reads Succeeded."""
+
+    script = "#!/bin/sh\necho booted > /var/eyvan/booted\n"
+    driver.apply_capacity("cell-a", desired(user_data=script), context("apply-1"))
+
+    _name, body = driver.api.creates[0]
+    wire = body["properties"]["userData"]
+    assert wire != script, "raw text on the wire is what ARM decodes to garbage"
+    assert base64.b64decode(wire, validate=True).decode("utf-8") == script
 
 
 def test_the_network_interface_is_deleted_with_the_machine(driver) -> None:
@@ -380,6 +395,45 @@ def test_an_endpoint_is_resolved_through_the_nic_when_the_vm_document_has_none(t
     observation = driver.observe("cell-a")
 
     assert observation.execution_endpoint == "10.0.0.7"
+
+
+def test_get_vm_asks_for_the_instance_view_where_evictions_are_reported() -> None:
+    """ARM omits the instance view from a plain GET, so without $expand the
+    eviction reader can never fire against a real subscription."""
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "name": "cell-a",
+                "properties": {
+                    "provisioningState": "Succeeded",
+                    "priority": "Spot",
+                    "instanceView": {
+                        "statuses": [{"code": "PowerState/deallocated", "displayStatus": "VM evicted"}]
+                    },
+                },
+            },
+        )
+
+    api = HttpAzureApi(
+        subscription_id="s",
+        resource_group="g",
+        location="eastus",
+        token=lambda: "token",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    machine = api.get_vm("cell-a")
+
+    params = dict(requests[0].url.params)
+    assert params["$expand"] == "instanceView"
+    assert params["api-version"] == API_VERSION
+    assert machine is not None
+    assert machine.eviction_reason == "VM evicted"
 
 
 def test_parse_nic_private_ip_reads_the_arm_shape() -> None:

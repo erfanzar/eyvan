@@ -300,7 +300,14 @@ def create_native_worker_app(
 
     def authenticate(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {secret}"
-        if authorization is None or not hmac.compare_digest(authorization, expected):
+        # compare_digest raises TypeError for non-ASCII str, and the header is
+        # caller-controlled: unauthenticated garbage must answer 401, never a
+        # 500.
+        try:
+            recognized = authorization is not None and hmac.compare_digest(authorization, expected)
+        except TypeError:
+            recognized = False
+        if not recognized:
             raise HTTPException(status_code=401, detail="invalid native worker credential")
 
     @app.exception_handler(StaleMutationError)

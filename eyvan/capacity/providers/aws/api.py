@@ -297,6 +297,11 @@ class HttpEc2Api:
 
     def _call(self, action: str, params: tp.Mapping[str, str]) -> str:
         body = {**params, "Action": action, "Version": API_VERSION}
+        # One encoding, used for the signature and for the wire. AWS recomputes
+        # the payload digest from the body it receives, so hashing any encoding
+        # other than the bytes sent -- a re-sorted urlencode posted against
+        # httpx's insertion-order one -- is SignatureDoesNotMatch on every call.
+        encoded_body = _encoded_body(body)
         headers = authorization_header(
             self.credentials,
             method="POST",
@@ -306,11 +311,11 @@ class HttpEc2Api:
             region=self.region,
             service="ec2",
             moment=datetime.now(UTC),
-            payload_sha256=_body_digest(body),
+            payload_sha256=_body_digest(encoded_body),
         )
         client = self.client or httpx.Client(timeout=self.timeout_s)
         try:
-            response = client.post(f"https://{self.host}/", data=dict(body), headers=headers)
+            response = client.post(f"https://{self.host}/", content=encoded_body, headers=headers)
         except httpx.HTTPError as error:
             # Inconclusive by construction: the request may have reached EC2 and
             # launched something. Concluding otherwise is how a fleet abandons an
@@ -348,15 +353,38 @@ class HttpEc2Api:
         self._call("CreateTags", params)
 
     def describe_spot_instance_requests(self, instance_ids: tp.Sequence[str]) -> dict[str, str]:
-        params = {f"InstanceId.{index}": value for index, value in enumerate(instance_ids, start=1)}
+        # The action is keyed by SpotInstanceRequestId.N, which this seam does
+        # not hold -- callers pass instance ids -- so the ids go as the action's
+        # documented `instance-id` filter instead. Sent as a bare InstanceId.N
+        # parameter they never reach EC2 at all: the name is not part of the
+        # action, and the call degrades to describing every spot request in the
+        # region, of which the answer is then parsed for the instances asked
+        # about by accident.
+        params: dict[str, str] = {}
+        for index, instance_id in enumerate(instance_ids, start=1):
+            params[f"Filter.{index}.Name"] = "instance-id"
+            params[f"Filter.{index}.Value.1"] = instance_id
         return parse_spot_instance_requests(self._call("DescribeSpotInstanceRequests", params))
 
 
-def _body_digest(body: tp.Mapping[str, str]) -> str:
-    import hashlib
+def _encoded_body(body: tp.Mapping[str, str]) -> str:
+    """Encode the form body exactly as it will be sent.
+
+    Built once so the signed bytes and the wire bytes cannot drift apart: this
+    string is both what the payload digest hashes and what is posted. httpx
+    sends a string body through verbatim, which is what makes that guarantee
+    hold regardless of how httpx itself would have encoded a dict.
+    """
+
     from urllib.parse import urlencode
 
-    return hashlib.sha256(urlencode(sorted(body.items())).encode()).hexdigest()
+    return urlencode(sorted(body.items()))
+
+
+def _body_digest(encoded_body: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(encoded_body.encode("utf-8")).hexdigest()
 
 
 __all__ = (

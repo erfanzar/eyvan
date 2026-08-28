@@ -38,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
 from sqlalchemy.sql.elements import ColumnElement
 
 from eyvan._internal.json_types import JsonObject, model_json
@@ -490,11 +490,29 @@ _PRUNABLE_OUTBOX_STATES = frozenset({OutboxState.SUCCEEDED, OutboxState.DISCARDE
 
 
 def _claimable_outbox_clause(now: datetime) -> ColumnElement[bool]:
-    """Build the shared ready-or-expired-processing predicate for outbox ownership."""
+    """Build the shared ready-or-expired-processing predicate for outbox ownership.
+
+    A row is also excluded while its aggregate has another command PROCESSING
+    under a live claim. Same-aggregate ordering is enforced in-process within
+    one replica, but delivery runs active-active: without this exclusion,
+    replica B could claim and deliver a cell's next command while replica A is
+    minutes inside the current one, letting a drain overtake its apply.
+    """
 
     ready_state = OutboxRow.state.in_((OutboxState.PENDING.value, OutboxState.FAILED.value))
     abandoned = and_(OutboxRow.state == OutboxState.PROCESSING.value, OutboxRow.claimed_until <= now)
-    return and_(OutboxRow.available_at <= now, or_(ready_state, abandoned))
+    in_flight = aliased(OutboxRow)
+    live_same_aggregate = (
+        select(in_flight.id)
+        .where(
+            in_flight.state == OutboxState.PROCESSING.value,
+            in_flight.claimed_until > now,
+            in_flight.data["aggregate_type"].as_string() == OutboxRow.data["aggregate_type"].as_string(),
+            in_flight.data["aggregate_id"].as_string() == OutboxRow.data["aggregate_id"].as_string(),
+        )
+        .exists()
+    )
+    return and_(OutboxRow.available_at <= now, or_(ready_state, abandoned), ~live_same_aggregate)
 
 
 class AuditEventRow(Base):
@@ -1381,11 +1399,16 @@ class SqlAlchemySession:
         return [record for record in records if record.org_id == org_id and record.project_id == project_id]
 
     async def get_idempotency(self, scope: str, operation: str, key: str) -> IdempotencyRecord | None:
-        lock_key = f"{scope}\x1f{operation}\x1f{key}"
-        await self.session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": lock_key},
-        )
+        # Serialize concurrent first-writes per key against the unique constraint
+        # below. The advisory lock is a PostgreSQL function, so every other
+        # dialect -- SQLite backs the development planes this repository also
+        # serves -- skips it rather than crashing on its first request.
+        if self.session.get_bind().dialect.name == "postgresql":
+            lock_key = f"{scope}\x1f{operation}\x1f{key}"
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
         statement = select(IdempotencyRow).where(
             IdempotencyRow.scope == scope,
             IdempotencyRow.operation == operation,
@@ -1744,10 +1767,19 @@ class SqlAlchemyRepository:
 
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[SqlAlchemySession]:
-        body_failure: BaseException | None = None
+        # The yield must happen exactly once, so the retry loop may only wrap
+        # session acquisition: until the caller's body has run, the whole unit
+        # of work can safely begin again. A commit-time failure -- where a
+        # SERIALIZABLE abort actually raises 40001 most often -- cannot be
+        # retried here at all, because retrying means re-yielding and re-running
+        # the caller's body. It is translated to the typed transient error
+        # instead, so callers reach the 503+Retry-After path rather than a
+        # spurious "generator didn't stop" RuntimeError.
         for attempt in range(self.MAX_TRANSACTION_ATTEMPTS):
+            body_started = False
             try:
                 async with self._sessions.begin() as session:
+                    body_started = True
                     try:
                         yield SqlAlchemySession(session)
                     except BaseException as body_exc:
@@ -1757,7 +1789,6 @@ class SqlAlchemyRepository:
                         # single-shot transaction would have, so a conflict
                         # raised by one of its statements still surfaces as the
                         # typed retryable error callers already handle.
-                        body_failure = body_exc
                         raise _TransactionBodyFailure(body_exc) from body_exc
             except _TransactionBodyFailure as wrapper:
                 original = wrapper.__cause__
@@ -1767,22 +1798,23 @@ class SqlAlchemyRepository:
                     raise (original if translated is original else translated) from original
                 raise original from None
             except DBAPIError as exc:
-                sqlstate = _transaction_sqlstate(exc.orig)
-                if sqlstate not in self._RETRYABLE_SQLSTATES:
+                retryable = _transaction_sqlstate(exc.orig) in self._RETRYABLE_SQLSTATES
+                if body_started or not retryable or attempt == self.MAX_TRANSACTION_ATTEMPTS - 1:
+                    # Either the conflict surfaced at COMMIT, after the body had
+                    # run and could not be re-run here, or the same call has no
+                    # attempts left. Both surface translated; the exhausted
+                    # in-service budget is exactly what the 503 answers.
                     translated = self._translated(exc)
                     raise (exc if translated is exc else translated) from exc
-                # A serialization failure or deadlock means PostgreSQL told us
-                # the *same call* would likely succeed now: retrying here keeps
-                # every client from having to implement that loop, and the
-                # 503+Retry-After path becomes what it always should have been
-                # -- the answer after the service itself gave up.
-                if attempt == self.MAX_TRANSACTION_ATTEMPTS - 1:
-                    translated = self._translated(exc)
-                    raise (exc if translated is exc else translated) from exc
+                # A serialization failure or deadlock on the way in means
+                # PostgreSQL told us the *same call* would likely succeed now:
+                # retrying here keeps every client from having to implement that
+                # loop, and the 503+Retry-After path becomes what it always
+                # should have been -- the answer after the service itself gave
+                # up.
                 await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
             else:
                 return
-        assert body_failure is None  # unreachable: body failures re-raise above
 
     async def wait_for_events(
         self,

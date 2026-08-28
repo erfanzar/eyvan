@@ -37,11 +37,13 @@ of the sizes.
 still hold the bytes, so the row stays charged and stays present rather than
 being deleted on the strength of the hosts that did answer.
 
-**Fenced per host.** The agent checks the cell's generation before any host is
-contacted, and the driver re-checks it between hosts for the two actions that
-touch a disk. A fan-out that began under a generation this agent no longer owns
-stops where it is and reports what it cannot prove, rather than continuing to
-write to machines that belong to somebody else's plan.
+**Fenced around the fan-out.** The agent checks the cell's generation before
+any host is contacted, and for the two actions that touch a disk the driver
+reads the fence again before dispatching every host at once and once more after
+they have all answered. A fan-out that begins under a generation this agent no
+longer owns is not dispatched at all, and one whose fence moves mid-flight
+reports the bytes its hosts already wrote as unproven rather than as a hit --
+the machines may belong to somebody else's plan now.
 
 Hosts are asked in parallel, so a wide stage costs its slowest host rather than
 the sum of them. A fetch that outlives the control plane's patience is still
@@ -383,7 +385,9 @@ class _SliceStageFanout:
 
     hosts: int
     answers: tuple[_HostStageAnswer, ...]
-    #: Why the remaining hosts were never contacted. Empty when every one was.
+    #: Why these answers do not stand for the whole cell: hosts that were
+    #: never contacted, or a fence that moved after every host had answered.
+    #: Empty when the answers cover the cell.
     stopped: str = ""
 
     @property
@@ -398,14 +402,23 @@ class _SliceStageFanout:
         return tuple(answer for answer in self.answers if answer.result.verdict is verdict)
 
     def unreached(self) -> AssetStageResult:
-        """Report a fan-out that stopped early as having proved nothing.
+        """Report a fan-out whose answers prove nothing about the cell.
 
         Never a refusal and never a success. The hosts that were asked may hold
         bytes and the ones that were not may hold anything at all, so the only
-        honest aggregate is that presence on this cell is unknown.
+        honest aggregate is that presence on this cell is unknown. A fan-out
+        whose every host answered -- the post-dispatch fence move -- reads the
+        same way: its answers describe a generation the cell has already moved
+        past, not a cell that holds or lacks the asset.
         """
 
-        detail = f"only {len(self.answers)} of {self.hosts} hosts were asked: {self.stopped}"
+        if len(self.answers) == self.hosts:
+            # Every host was asked and answered, and the stop came after. "Only
+            # 4 of 4 hosts were asked" would contradict the record an operator
+            # is reading to decide what happened to their bytes.
+            detail = f"all {self.hosts} hosts answered before the stop: {self.stopped}"
+        else:
+            detail = f"only {len(self.answers)} of {self.hosts} hosts were asked: {self.stopped}"
         summary = _stage_summary(self.answers)
         return AssetStageResult(
             verdict=AssetStageVerdict.INCONCLUSIVE,
@@ -448,8 +461,9 @@ class NativeSliceStageDriver:
             endpoints: The matching endpoints, used only to name a host in a
                 result an operator will read.
             generation: The cell generation this view is allowed to act for.
-            fence: Re-reads the generation that owns the cell now. ``None``
-                disables the between-host re-check, which is what a caller that
+            fence: Re-reads the generation that owns the cell now, once before
+                the hosts are dispatched and once after they have all answered.
+                ``None`` disables the re-check, which is what a caller that
                 cannot cheaply re-read its own record must ask for explicitly.
 
         Raises:
@@ -502,18 +516,20 @@ class NativeSliceStageDriver:
         ``mutating`` separates the two actions that touch a disk from the one
         that only asks, and it decides two things.
 
-        The fence is re-read between hosts for a mutating action, and never
-        before the first: the caller checked it immediately before resolving
-        this view, so a second read there would buy nothing and cost a provider
-        round trip. Measuring skips the re-check entirely, because there is no
-        mutation for a moved fence to protect a machine from.
+        For a mutating action the fence is read once before the hosts are
+        dispatched and re-read once after they have all answered. The caller
+        checked it immediately before resolving this view, and the hosts are
+        asked at once, so there is no between-hosts moment left to re-check at:
+        the two reads bracket the one fan-out. Measuring skips the fence
+        entirely, because there is no mutation for a moved fence to protect a
+        machine from.
 
         A host with no staging route is absence of a capability -- *if nothing
-        has happened yet*. Once a mutating action has reached a disk the same
-        answer is no longer "nothing was attempted", and reporting it that way
-        would put an untouched row back for a cell that has already been partly
-        emptied. So after the first host has acted it stops the fan-out and
-        reads as unproven, exactly as an unreachable host does.
+        has happened yet*. Every host is attempted at once, so once the
+        answers show that a mutating action reached a disk, the same answer is
+        no longer "nothing was attempted" -- reporting it that way would put an
+        untouched row back for a cell that has already been partly emptied --
+        and the fan-out reads as unproven, exactly as an unreachable host does.
 
         Raises:
             UnsupportedCapabilityError: A host has no staging route and nothing
@@ -896,8 +912,9 @@ class NativeSliceExecutor:
         Args:
             generation: The cell generation the caller has already fenced
                 against, and the only one the returned view may act for.
-            fence: Re-reads the generation that owns the cell now, consulted
-                between hosts while an action that touches a disk is in flight.
+            fence: Re-reads the generation that owns the cell now, once before
+                the hosts of an action that touches a disk are dispatched and
+                once after they have all answered.
 
         Returns:
             A driver satisfying

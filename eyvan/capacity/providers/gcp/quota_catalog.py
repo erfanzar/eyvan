@@ -22,10 +22,12 @@ minted. This is the fast path and that is the fallback, not a replacement.
 
 from __future__ import annotations
 
+import threading
 import typing as tp
 from dataclasses import dataclass, field
 
 from eyvan.capacity.providers.gcp.accelerator_catalog import (
+    AUTH_FAILURES,
     AcceleratorCatalogError,
     gcloud_access_token,
 )
@@ -59,6 +61,20 @@ class ApiQuotaCatalog:
     service: str
     token_source: tp.Callable[[], str] = gcloud_access_token
     _token: str | None = field(default=None, init=False, repr=False)
+    _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _refresh_token(self, stale: str | None) -> str:
+        """Re-mint the cached bearer token once, collapsing concurrent refreshes.
+
+        ``stale`` is the token the failed request carried: the first caller to
+        report it re-mints, and every other caller -- whose 401 was caused by
+        the same aged-out credential -- reuses whatever replaced it.
+        """
+
+        with self._token_lock:
+            if self._token is None or self._token == stale:
+                self._token = self.token_source()
+            return self._token
 
     def limits(self, project: str) -> list[dict[str, object]]:
         """Return the raw quota entries, shaped as the gcloud reader returns them.
@@ -74,7 +90,6 @@ class ApiQuotaCatalog:
 
         token = self._token or self.token_source()
         self._token = token
-        headers = {"Authorization": f"Bearer {token}"}
         entries: list[dict[str, object]] = []
         page: str | None = None
         try:
@@ -83,11 +98,24 @@ class ApiQuotaCatalog:
                     params: dict[str, object] = {"pageSize": PAGE_SIZE}
                     if page:
                         params["pageToken"] = page
+                    headers = {"Authorization": f"Bearer {token}"}
                     response = client.get(
                         _ENDPOINT.format(project=project, service=self.service),
                         params=params,
                         headers=headers,
                     )
+                    if response.status_code in AUTH_FAILURES:
+                        # The cached credential aged out (a Google token lasts
+                        # about an hour). Mint a fresh one and retry this page
+                        # once, as GcsRestObject does; a request that still
+                        # refuses falls back to gcloud below.
+                        token = self._refresh_token(token)
+                        headers = {"Authorization": f"Bearer {token}"}
+                        response = client.get(
+                            _ENDPOINT.format(project=project, service=self.service),
+                            params=params,
+                            headers=headers,
+                        )
                     if response.status_code != 200:
                         raise QuotaCatalogError(
                             f"Cloud Quotas API answered {response.status_code} for {project!r}; falling back to gcloud"

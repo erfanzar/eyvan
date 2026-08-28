@@ -698,7 +698,9 @@ def test_agent_supervisor_replaces_an_owned_agent_running_different_code(monkeyp
         paths=paths,
         launcher=launcher,
         capability_probe=CapabilityResponses([None, None, capabilities]),
-        build_probe=BuildResponses([_agent_build("stale-agent-digest")]),
+        # Two build probes: the pre-lock check sees the stale agent and stops
+        # it; the in-lock re-check probes the (now stopped) agent again.
+        build_probe=BuildResponses([_agent_build("stale-agent-digest"), None]),
         process_argument_reader=lambda pid: (
             sys.executable,
             "-m",
@@ -768,7 +770,9 @@ def test_agent_supervisor_reuses_an_owned_agent_running_this_build(monkeypatch, 
         paths=paths,
         launcher=launcher,
         capability_probe=CapabilityResponses([capabilities]),
-        build_probe=BuildResponses([_agent_build("current-build-digest")]),
+        # Two build probes: the pre-lock replacement check, then the reuse
+        # path re-verifying the running agent's digest before returning it.
+        build_probe=BuildResponses([_agent_build("current-build-digest"), _agent_build("current-build-digest")]),
         process_liveness=AgentProcessLiveness([True]),
     )
 
@@ -776,3 +780,79 @@ def test_agent_supervisor_reuses_an_owned_agent_running_this_build(monkeypatch, 
 
     assert result.state is LocalAgentState.REUSED
     assert launcher.commands == []
+
+
+def test_agent_supervisor_replaces_a_stale_agent_relaunched_after_the_prelock_digest_check(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A stale relaunch in the window before the startup lock must not be reused.
+
+    A concurrent supervisor running older code can write a live record for a
+    stale agent between this process's pre-lock digest probe and its lock. The
+    in-lock re-check must stop that agent and start a fresh one instead of
+    handing the stale build back as a REUSED result.
+    """
+
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(
+            endpoint=endpoint,
+            pid=9143,
+            runtime_profile_path=str(profile_path.resolve()),
+        ),
+    )
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("current-build-digest"), raising=False)
+    launcher = FakeAgentLauncher(process=FakeProcess(pid=9144))
+    capabilities = _capabilities()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        # Probes 1-2 (pre-lock reuse check, then one wait iteration): the
+        # stale agent is not answering yet. Probe 3: it came up ready and is
+        # replaced. Probe 4 (in-lock reuse check): it was stopped and cleared.
+        # Probe 5: the freshly started agent is ready.
+        capability_probe=CapabilityResponses([None, None, capabilities, None, capabilities]),
+        # Probe 1 (pre-lock): nothing digest-divergent is running. Probes 2-3
+        # (in-lock re-check, then its replacement stop): the concurrent
+        # relaunch answers with a stale digest. Probe 4: it is gone.
+        build_probe=BuildResponses(
+            [
+                _agent_build("current-build-digest"),
+                _agent_build("stale-agent-digest"),
+                _agent_build("stale-agent-digest"),
+                None,
+            ]
+        ),
+        process_argument_reader=lambda pid: (
+            sys.executable,
+            "-m",
+            "eyvan.worker.agent.cli",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8090",
+            "--runtime-profile",
+            str(profile_path),
+            "--log-level",
+            "info",
+        ),
+        process_liveness=AgentProcessLiveness([True, True, True, True, False]),
+        process_terminator=AgentProcessTerminator(),
+        process_killer=AgentProcessKiller(),
+        clock=AdvancingClock(),
+        sleeper=lambda duration: None,
+    )
+
+    result = supervisor.ensure(profile_path, profile)
+
+    assert result.state is LocalAgentState.STARTED
+    assert result.pid == 9144
+    assert len(launcher.commands) == 1

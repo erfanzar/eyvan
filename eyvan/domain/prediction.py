@@ -117,17 +117,15 @@ def predict_demand(
     """Decide how many cells to warm for one upcoming hour.
 
     Every gate is checked and named, in the order an operator would ask about
-    them: is it on, is it funded, is there enough history, and does the history
-    agree.
+    them: is it on, is there enough history, does the history agree, and is it
+    funded. An unfunded predictor still runs the history gates and reports the
+    pattern it would have acted on, marked unfunded, so what it *would* do is
+    observable before it costs anything.
     """
 
     if not config.enabled:
         return Prediction(0, "predictive scale-up is disabled")
-    if config.hourly_budget_usd <= 0:
-        # The state an operator should sit in first. The prediction is computed
-        # and reported, and nothing is bought, so what it *would* have done is
-        # observable before it costs anything.
-        return Prediction(0, "predictive scale-up has no budget")
+    unfunded = config.hourly_budget_usd <= 0
     matching = [
         observation for observation in observations if observation.weekday == weekday and observation.hour == hour
     ]
@@ -136,6 +134,12 @@ def predict_demand(
     agreement = sum(1 for observation in matching if observation.wanted) / len(matching)
     if agreement < MINIMUM_AGREEMENT:
         return Prediction(0, f"demand appeared in {agreement:.0%} of observations, below {MINIMUM_AGREEMENT:.0%}")
+    pattern = f"demand appeared in {agreement:.0%} of {len(matching)} observations of this hour"
+    if unfunded:
+        # The state an operator should sit in first. The prediction is computed
+        # and reported, and nothing is bought, so what it *would* have done is
+        # observable before it costs anything.
+        return Prediction(0, f"{pattern}, unfunded")
     if cell_hourly_cost <= 0:
         # A free cell is not evidence of a working price; it is evidence of an
         # unpriced pool, and dividing a budget by it would warm the whole fleet.
@@ -144,7 +148,7 @@ def predict_demand(
     cells = min(affordable, max_cells)
     if cells <= 0:
         return Prediction(0, f"the budget affords no cell at {cell_hourly_cost}/h")
-    return Prediction(cells, f"demand appeared in {agreement:.0%} of {len(matching)} observations of this hour")
+    return Prediction(cells, pattern)
 
 
 __all__ = (

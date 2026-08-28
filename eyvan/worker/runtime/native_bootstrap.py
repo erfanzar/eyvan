@@ -22,6 +22,11 @@ from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WORKLOAD_RUNTIME_ENVIRONMENT = "/etc/eyvan-native/workload-runtime.json"
 _WORKLOAD_CONTAINER_RUNTIME = "/etc/eyvan-native/container-runtime.json"
+#: The major.minor head of a declared interpreter, which uv may spell as a full
+#: version ("3.11.9"). The venv guard asks the running interpreter for its
+#: major.minor, so the declaration is reduced to the same two components
+#: before the two are compared.
+_DECLARED_PYTHON_MAJOR_MINOR = re.compile(r"\d+\.\d+")
 
 #: Revision of the rendered startup script's *behavior*. The driver's bootstrap
 #: identity pins the byte sources it stages (wheel, wheelhouse); the script
@@ -36,7 +41,7 @@ _WORKLOAD_CONTAINER_RUNTIME = "/etc/eyvan-native/container-runtime.json"
 #: running cells only when they are recreated. This is deliberate: pushing a
 #: new script under a running cell would re-run provisioning steps with no
 #: fence, and the driver has no way to know what the old script already did.
-NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-23.6"
+NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-23.7"
 
 
 def _required(value: str, name: str) -> str:
@@ -380,6 +385,12 @@ def build_native_worker_startup_script(
     declared_python_lines: tuple[str, ...] = ()
     if runtime_python is not None:
         quoted_python = shlex.quote(runtime_python)
+        # The guard below compares the running interpreter's major.minor, so a
+        # declaration that pins a full version ("3.11.9") is reduced to the
+        # same two components: comparing the declared *text* against that join
+        # never matched, and the venv was torn down and rebuilt on every boot.
+        pinned = _DECLARED_PYTHON_MAJOR_MINOR.match(runtime_python)
+        declared_version = pinned.group(0) if pinned else runtime_python
         declared_python_lines = (
             f"# Eyvan fleet declares Python {runtime_python} for its workers.",
             # Rebuild not only on a version mismatch but also when the existing
@@ -391,7 +402,7 @@ def build_native_worker_startup_script(
             # (`== 3.13`), which never equals the joined version string and so
             # rebuilt the venv on every boot.
             f'if ! {venv_python} -c "import sys; raise SystemExit(0 if '
-            f"'.'.join(map(str, sys.version_info[:2])) == '{runtime_python}' else 1)\" >/dev/null 2>&1 || "
+            f"'.'.join(map(str, sys.version_info[:2])) == '{declared_version}' else 1)\" >/dev/null 2>&1 || "
             f'readlink -f {venv_python} | grep -qE "^/(root|home)/"; then',
             "  if ! command -v uv >/dev/null 2>&1; then",
             "    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh",

@@ -179,6 +179,7 @@ class AutoscaleGenerationService:
 
         skipped_groups = _SkippedCandidateGroups()
         profiles_by_zone: dict[str, list[_EligibleTpuCandidate]] = {}
+        denial_skipped_zones: set[str] = set()
         for row in quota_rows:
             if cache.blocks_queue_admission_denial(
                 project=project,
@@ -187,6 +188,7 @@ class AutoscaleGenerationService:
                 capacity_class=CapacityClass.SPOT,
             ):
                 skipped_groups.add(row, AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL)
+                denial_skipped_zones.add(row.zone)
                 continue
             if documented_tpu_zone_exclusion(zone=row.zone, accelerator_type=row.accelerator_type) is not None:
                 skipped_groups.add(row, AutoscaleSkipReason.DOCUMENTED_UNSUPPORTED_TPU_ZONE)
@@ -253,7 +255,13 @@ class AutoscaleGenerationService:
         emitted_zones = {entry.config.provider.zone for entry in entries if entry.config.provider.zone is not None}
         # A generation-scoped refresh cannot prove that pools from other
         # generations are stale. Preserve them and let the exact denial cache
-        # filter only the provider-rejected type in cached selectors.
+        # filter only the provider-rejected type in cached selectors. A zone
+        # the denial cache filtered stays in scope for the same reason: the
+        # denial expires, but a plain ``up`` only selects from
+        # ``list_eligible`` and never regenerates, so deleting a denied
+        # zone's fleets would leave it unselectable long past the TTL that
+        # was meant to recover it.
+        emitted_zones |= denial_skipped_zones
         if request.persist and not request.generations:
             for zone in _refreshed_zones(request.zones, quota_rows):
                 if zone not in emitted_zones:

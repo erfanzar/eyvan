@@ -753,6 +753,10 @@ async def test_a_host_that_loses_its_staging_route_mid_eviction_leaves_the_row_u
     assert stored.state is CellStageState.UNKNOWN
     assert stored.reserved_bytes == len(payload)
     assert "has no staging executor" in (stored.detail or "")
+    # The two stop shapes stay distinct: here one host of three never answered,
+    # so the row may say hosts were not asked -- which is exactly what the
+    # post-dispatch fence move must never claim about hosts that all answered.
+    assert "only 2 of 3 hosts were asked" in (stored.detail or "")
     assert [host.staged_files() for host in hosts] == [[], [], [payload]]
 
 
@@ -812,6 +816,11 @@ async def test_a_generation_that_moves_mid_fanout_leaves_the_stage_unproven(tmp_
     # Every host was dispatched before the move surfaced on the closing read;
     # none of their bytes can be trusted, so the row stays unproven.
     assert [bool(host.staged_files()) for host in hosts] == [True, True, True, True]
+    # The durable detail says what actually happened: every host answered and
+    # the stop came after. "Only 4 of 4 hosts were asked" would contradict the
+    # answers summarized in the same line an operator is triaging.
+    assert "all 4 hosts answered before the stop" in (stored.detail or "")
+    assert "only 4 of 4 hosts were asked" not in (stored.detail or "")
 
 
 async def test_a_fence_that_cannot_be_read_stops_the_fanout_rather_than_assuming_it_holds(

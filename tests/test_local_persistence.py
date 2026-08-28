@@ -45,6 +45,7 @@ from eyvan.records import (
     RoleGrant,
     RoleGrantRecord,
     UserProgressReport,
+    WebhookRecord,
     WorkloadDefinition,
     WorkloadRecord,
 )
@@ -53,12 +54,14 @@ from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.persistence.local import (
     LOCAL_CONTROL_PLANE_MAX_BYTES,
     LOCAL_CONTROL_PLANE_SCHEMA_VERSION,
+    LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION,
     LocalControlPlaneAmbiguousCommitError,
     LocalControlPlaneDocument,
     LocalControlPlaneError,
     LocalControlPlaneInUseError,
     LocalControlPlaneSchemaError,
     LocalControlPlaneStore,
+    LocalControlPlaneV6Document,
     LocalJsonRepository,
 )
 from eyvan.server.persistence.state import ControlPlaneState
@@ -665,6 +668,68 @@ async def test_v2_repository_reopens_every_aggregate_lifecycle_tombstone_and_ref
     assert not LocalControlPlaneStore(path).v1_backup_path.exists()
 
 
+def _webhook_record() -> WebhookRecord:
+    return WebhookRecord(
+        id="wh-1",
+        org_id="acme",
+        project_id="research",
+        url="https://hooks.example.com/eyvan",
+        secret="s" * 32,
+        entity_types=("workload",),
+        actions=("workload.settled",),
+        delivered_sequence=41,
+        consecutive_failures=2,
+        disabled_reason="receiver kept returning 503",
+        enabled=False,
+        created_by="alice",
+        created_at=_FIXED_TIME,
+        updated_at=_FIXED_TIME,
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_repository_persists_webhook_subscriptions_and_cursors_across_restart(tmp_path: Path) -> None:
+    """A dropped subscription silently stops every push integration a project
+    depends on, and a dropped delivery cursor replays already-delivered audit
+    history into it after one restart."""
+
+    path = tmp_path / "control-plane.json"
+    first = LocalJsonRepository(path)
+    try:
+        await first.open()
+        async with first.transaction() as transaction:
+            await transaction.put_webhook(_webhook_record())
+    finally:
+        await first.close()
+
+    document, _snapshot = LocalControlPlaneStore(path)._read_document()
+    assert isinstance(document, LocalControlPlaneV6Document)
+    assert document.version == LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION == 6
+
+    second = LocalJsonRepository(path)
+    try:
+        await second.open()
+        async with second.transaction() as transaction:
+            restored = await transaction.get_webhook("wh-1")
+    finally:
+        await second.close()
+
+    assert restored == _webhook_record()
+
+
+def test_an_older_document_without_a_webhooks_field_loads_with_an_empty_collection(tmp_path: Path) -> None:
+    """Migration is by absence, not refusal: a v5 document simply has no
+    subscriptions, and the first committed webhook moves the file to v6."""
+
+    path = tmp_path / "control-plane.json"
+    path.write_text(json.dumps({"schema": local_persistence.LOCAL_CONTROL_PLANE_SCHEMA, "version": 5}))
+    path.chmod(0o600)
+
+    state = LocalControlPlaneStore(path).load()
+
+    assert state.webhooks == {}
+
+
 @pytest.mark.asyncio
 async def test_actual_v1_fixture_loads_with_empty_v2_defaults_and_upgrades_without_reusing_sequences(
     tmp_path: Path,
@@ -976,14 +1041,14 @@ def test_local_store_normalizes_pathological_json_decoder_failures(
         b"\xff",
         '{"schema":"eyvan.control-plane","version":2,"revision":0}'.encode("utf-16"),
         b"[]\n",
-        # Versions 3, 4 and 5 each became real schemas when a durable collection
+        # Versions 3, 4, 5 and 6 each became real schemas when a durable collection
         # arrived that the previous one could not carry -- the frozen attempt
         # topologies, then the credential rotation and cell stage ledgers, then
-        # the service replica health and decision logs. The unsupported-version
-        # case moves up each time rather than disappearing: an unknown version
-        # must still be refused by version, not by silently dropping the state it
-        # describes.
-        b'{"schema":"eyvan.control-plane","version":6}\n',
+        # the service replica health and decision logs, then the webhook
+        # subscriptions and delivery cursors. The unsupported-version case moves
+        # up each time rather than disappearing: an unknown version must still be
+        # refused by version, not by silently dropping the state it describes.
+        b'{"schema":"eyvan.control-plane","version":7}\n',
         b'{"version":2}\n',
         b'{"schema":"eyvan.control-plane","version":{},"revision":0}\n',
         b'{"schema":"eyvan.control-plane","version":2,"unexpected":true}\n',

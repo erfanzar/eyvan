@@ -221,6 +221,48 @@ def test_a_control_plane_that_goes_away_mid_preflight_does_not_exit_zero() -> No
     assert check.remedy
 
 
+def test_the_real_cli_client_still_names_an_unreachable_plane(monkeypatch) -> None:
+    """The typed handlers must fire through the client the CLI actually uses.
+
+    ``http.EyvanClient`` used to re-wrap transport failures as a plain
+    ``ClickException`` before they left the adapter, so every
+    ``except EyvanUnavailableError`` branch in this module was dead when the
+    plane went away *between* checks: the diagnosis degraded to
+    "could not ...: ClickException: ...".
+    """
+
+    import eyvan.sdk.client.transport as client_transport
+    import eyvan.sdk.commands.http as cli_http
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200, json={"status": "ok", "controller": "active"})
+        raise httpx.ConnectError("connection refused")
+
+    raw_client = httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(client_transport.httpx, "Client", lambda **_kwargs: raw_client)
+    session = CliSession(
+        client=cli_http.EyvanClient("http://test", headers={}),
+        identity=ClientIdentity(),
+        context_store=_Store(),
+        context_config=EyvanContextConfig(),
+        base_url="http://test",
+        org_id="acme",
+        project_id="research",
+        overrides=ContextOverrides(),
+    )
+
+    report = DoctorCommandService(session).report()
+
+    assert report.ok is False
+    fleet = _by_name(report)["submittable-fleet"]
+    assert fleet is CheckStatus.FAIL
+    check = next(check for check in report.checks if check.name == "submittable-fleet")
+    assert "unreachable" in check.detail
+    budget = next(check for check in report.checks if check.name == "budget-pricing")
+    assert "became unreachable" in budget.detail
+
+
 def test_a_check_that_could_not_run_is_not_a_pass() -> None:
     """The module contract says SKIP is distinct from passing; ``ok`` must agree."""
 

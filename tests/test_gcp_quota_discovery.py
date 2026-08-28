@@ -357,3 +357,133 @@ def test_quota_discovery_preserves_missing_monitoring_usage_as_unknown() -> None
     assert len(records) == 1
     assert records[0].quota_tpus == 2048
     assert records[0].available_tpus is None
+
+
+def _expiry_runner(reads: list[str], value: list[str]):
+    """Return a runner whose quota read reports ``value[0]`` and records reads."""
+
+    def runner(command):
+        if command[:4] == ("beta", "quotas", "info", "list"):
+            reads.append("quota")
+            return _result(
+                [
+                    {
+                        "metric": "tpu.googleapis.com/tpu-v5p-preemptible",
+                        "dimensionsInfos": [
+                            {"dimensions": {"zone": "us-east5-a"}, "details": {"value": value[0]}}
+                        ],
+                    }
+                ]
+            )
+        return _result([{"type": "v5p-16"}])
+
+    return runner
+
+
+def test_quota_response_cache_expires_so_raised_limits_become_visible() -> None:
+    """A discovery held for the life of a server re-reads limits after the TTL.
+
+    The response cache used to live forever, so limits read on first use froze
+    even as the operator raised or lowered the real quotas.
+    """
+
+    reads: list[str] = []
+    value = ["16"]
+    discovery = _offline(
+        runner=_expiry_runner(reads, value),
+        usage_discovery=FakeUsageDiscovery(),
+        quota_response_ttl_s=0.0,
+    )
+    filters = {"project": "project-a", "zones": ("us-east5-a",), "generations": ("v5p",)}
+
+    assert discovery.discover(**filters)[0].quota_tpus == 16
+    value[0] = "32"
+    assert discovery.discover(**filters)[0].quota_tpus == 32
+    assert reads == ["quota", "quota"]
+
+
+def test_quota_response_cache_still_serves_burst_discoveries_within_the_ttl() -> None:
+    reads: list[str] = []
+    discovery = _offline(runner=_expiry_runner(reads, ["16"]), usage_discovery=FakeUsageDiscovery())
+    filters = {"project": "project-a", "zones": ("us-east5-a",), "generations": ("v5p",)}
+
+    discovery.discover(**filters)
+    discovery.discover(**filters)
+
+    assert reads == ["quota"]
+
+
+def _aging_token_transport(monkeypatch, handler) -> list[str]:
+    """Serve catalog reads from ``handler`` and return the Authorization tokens seen."""
+
+    import httpx
+
+    sent: list[str] = []
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers["Authorization"])
+        return handler(request)
+
+    real_client = httpx.Client
+
+    def client_with_transport(*args, **kwargs):
+        return real_client(*args, transport=httpx.MockTransport(recording_handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_with_transport)
+    return sent
+
+
+def test_accelerator_catalog_re_mints_an_aged_token_and_retries_once(monkeypatch) -> None:
+    import httpx
+
+    from eyvan.capacity.providers.gcp.accelerator_catalog import ApiAcceleratorCatalog
+
+    tokens = iter(["stale-token", "fresh-token"])
+    catalog = ApiAcceleratorCatalog(token_source=lambda: next(tokens), concurrency=2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["Authorization"].endswith("stale-token"):
+            return httpx.Response(401)
+        return httpx.Response(200, json={"acceleratorTypes": [{"type": "V5P-16"}]})
+
+    sent = _aging_token_transport(monkeypatch, handler)
+
+    assert catalog.types_for_zones("project-a", ["us-east5-a"]) == {"us-east5-a": ("v5p-16",)}
+    assert sent == ["Bearer stale-token", "Bearer fresh-token"]
+
+
+def test_quota_catalog_re_mints_an_aged_token_and_retries_once(monkeypatch) -> None:
+    import httpx
+
+    from eyvan.capacity.providers.gcp.quota_catalog import ApiQuotaCatalog
+
+    tokens = iter(["stale-token", "fresh-token"])
+    catalog = ApiQuotaCatalog("tpu.googleapis.com", token_source=lambda: next(tokens))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["Authorization"].endswith("stale-token"):
+            return httpx.Response(401)
+        return httpx.Response(200, json={"quotaInfos": [{"metric": "tpu.googleapis.com/tpu-v5p"}]})
+
+    sent = _aging_token_transport(monkeypatch, handler)
+
+    assert catalog.limits("project-a") == [{"metric": "tpu.googleapis.com/tpu-v5p"}]
+    assert sent == ["Bearer stale-token", "Bearer fresh-token"]
+
+
+def test_quota_catalog_still_falls_back_when_a_fresh_token_is_refused(monkeypatch) -> None:
+    import httpx
+
+    from eyvan.capacity.providers.gcp.quota_catalog import ApiQuotaCatalog
+
+    tokens = iter(["stale-token", "fresh-token"])
+    catalog = ApiQuotaCatalog("tpu.googleapis.com", token_source=lambda: next(tokens))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    sent = _aging_token_transport(monkeypatch, handler)
+
+    with pytest.raises(QuotaCatalogError, match="falling back to gcloud"):
+        catalog.limits("project-a")
+    assert sent == ["Bearer stale-token", "Bearer fresh-token"]

@@ -79,6 +79,11 @@ DEFERRED_ROUTES: dict[str, str] = {
         "heterogeneous group submission takes a member matrix no flag set expresses well; "
         "it belongs with the declarative submit-dag file format rather than as options"
     ),
+    "POST /api/v1/secrets/rotate": (
+        "break-glass rotation of the capability-signing credential; an operator drives it "
+        "rarely, from the plane they are standing on, and the response is a ledger row whose "
+        "fence must be kept by whoever may resolve a later inconclusive rotation"
+    ),
 }
 
 

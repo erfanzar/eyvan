@@ -1456,3 +1456,46 @@ def test_the_dag_route_rejects_a_cycle_before_creating_anything() -> None:
     assert "cycle" in response.json()["detail"]
     listed = client.get("/api/v1/workloads", headers=_headers(), params={"org_id": "acme", "project_id": "research"})
     assert listed.json() == []
+
+
+def test_the_secret_rotation_route_drives_the_fenced_ledger_and_the_keyring() -> None:
+    """Rotation is routable: mint in-process, install, commit the ledger row.
+
+    The ledger used to be constructed and parked on ``app.state`` with nothing
+    driving it, so rotating a compromised signing credential still meant a
+    restart that invalidated every outstanding capability token.
+    """
+
+    from eyvan.server.service.credential_rotation import SECRET_CAPABILITY_CREDENTIAL
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True))
+    with TestClient(app) as client:
+        refused = client.post("/api/v1/secrets/rotate", headers=_headers(), json={})
+        response = client.post(
+            "/api/v1/secrets/rotate",
+            headers=_headers("fleet_admin"),
+            json={"overlap_s": 300},
+        )
+
+    assert refused.status_code == 403
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["credential"] == SECRET_CAPABILITY_CREDENTIAL
+    assert body["state"] == "committed"
+    assert body["previous_not_after"] is not None
+    # The keyring advanced with the ledger, and no signing material crossed the
+    # API: the response is the ledger row, which carries generations and fences.
+    credential = app.state.secret_capability_credential
+    assert credential.generation == body["generation"] == 2
+    assert set(body) == {
+        "id",
+        "credential",
+        "generation",
+        "fence",
+        "state",
+        "overlap_s",
+        "started_at",
+        "resolved_at",
+        "previous_not_after",
+        "detail",
+    }

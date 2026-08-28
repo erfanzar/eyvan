@@ -10,8 +10,10 @@ from datetime import timedelta
 
 import pytest
 
+from eyvan.domain.models import InfeasibilityCode
 from eyvan.records import (
     BudgetRecord,
+    CapacityClass,
     CellRecord,
     CellState,
     CommandExecution,
@@ -26,13 +28,14 @@ from eyvan.records import (
     Role,
     RoleGrant,
     WorkloadDefinition,
+    WorkloadRecord,
     WorkloadState,
     utcnow,
 )
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.errors import ConflictError
-from eyvan.server.service.scheduling import to_core_budget
+from eyvan.server.service.scheduling import CoreSchedulingService, rolled_budget, to_core_budget
 
 
 def _principal(role: Role) -> Principal:
@@ -562,3 +565,111 @@ async def test_settlement_rolls_an_elapsed_budget_period_before_charging() -> No
     # The stale 900 is discarded and only this settlement's ~10 remains.
     assert budget.spent == pytest.approx(10, abs=0.05)
     assert budget.accelerator_hours_spent["tpu"] == pytest.approx(3, abs=0.05)
+
+
+# --- admission-time period rolls ---------------------------------------------
+#
+# The roll used to run only where money moves (settlement), where an operator
+# acts (the roll route) or where a status is read. Admission read the raw
+# counter, so a hard budget whose period crossed with no in-flight lease to
+# settle refused every placement forever: BUDGET_EXCEEDED against a fresh
+# limit, priced with spend from a window that had already closed.
+
+
+def _budget_record(**overrides: object) -> BudgetRecord:
+    """An exhausted monthly budget whose window started 40 days ago."""
+
+    defaults: dict[str, object] = {
+        "org_id": "acme",
+        "project_id": "research",
+        "limit": 10.0,
+        "spent": 10.0,
+        "accelerator_hours_spent": {"tpu": 5.0},
+        "period": "monthly",
+        "period_started_at": utcnow() - timedelta(days=40),
+        "updated_by": "operator",
+    }
+    return BudgetRecord(**{**defaults, **overrides})
+
+
+def test_a_crossed_period_resets_spend_at_admission_time() -> None:
+    record = _budget_record()
+
+    core = to_core_budget(record, now=record.period_started_at + timedelta(days=40))
+
+    assert core.spent == 0
+    assert core.accelerator_hours_spent.as_dict() == {}
+    assert core.remaining == core.limit
+
+
+def test_an_open_period_keeps_its_spend() -> None:
+    record = _budget_record(period_started_at=utcnow() - timedelta(days=1))
+
+    core = to_core_budget(record, now=utcnow())
+
+    assert core.spent == 10.0
+
+
+def test_a_never_rolled_period_is_stamped_without_a_reset() -> None:
+    """Control-plane parity: the first stamp begins the window, it does not forgive it."""
+
+    record = _budget_record(period_started_at=None)
+
+    core = to_core_budget(record, now=utcnow())
+
+    assert core.spent == 10.0
+
+
+def test_an_unknown_period_never_rolls() -> None:
+    record = _budget_record(period="lifetime")
+
+    core = to_core_budget(record, now=utcnow())
+
+    assert core.spent == 10.0
+
+
+def test_rolls_advance_by_whole_periods_aligned_to_the_window_origin() -> None:
+    started = utcnow() - timedelta(days=70)
+
+    rolled = rolled_budget(_budget_record(period_started_at=started), now=utcnow())
+
+    assert rolled.spent == 0.0
+    assert rolled.period_started_at == started + timedelta(seconds=2_592_000 * 2)
+
+
+def test_a_crossed_hard_budget_stops_refusing_admission() -> None:
+    """The failure path: every placement failed BUDGET_EXCEEDED against a closed window."""
+
+    now = utcnow()
+    workload = WorkloadRecord(
+        id="wl-1",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="train",
+            execution=CommandExecution(command="python train.py"),
+            gang=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=8.0)),
+        ),
+        state=WorkloadState.PENDING,
+        created_by="alice",
+    )
+    cell = CellRecord(
+        id="cell-a",
+        provider="manual",
+        region="local",
+        state=CellState.READY,
+        capacity=ResourceLimits(cpu=8.0, memory_gib=64.0),
+        allocatable=ResourceLimits(cpu=8.0, memory_gib=64.0),
+        unit_prices={"cpu": 1.0},
+        capacity_class=CapacityClass.ON_DEMAND,
+    )
+
+    crossed = _budget_record(period_started_at=now - timedelta(days=40))
+    admitted = CoreSchedulingService().schedule([workload], [cell], budgets=[crossed], now=now)
+    assert [decision.workload_id for decision in admitted.placements] == ["wl-1"]
+    assert not admitted.infeasibilities
+
+    open_window = _budget_record(period_started_at=now - timedelta(days=1))
+    blocked = CoreSchedulingService().schedule([workload], [cell], budgets=[open_window], now=now)
+    assert not blocked.placements
+    assert any(item.code is InfeasibilityCode.BUDGET_EXCEEDED for item in blocked.infeasibilities)

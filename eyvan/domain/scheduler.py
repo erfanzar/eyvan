@@ -35,7 +35,6 @@ from .models import (
 )
 
 _EMPTY_RESOURCES = ResourceVector()
-_IndexKey = tp.TypeVar("_IndexKey")
 
 
 def _scope_key(scope: IdentityScope) -> tuple[str, str | None, str | None]:
@@ -94,40 +93,6 @@ class _LeaseAccounting:
                 self._resource_hours_by_scope[scope] = (
                     self._resource_hours_by_scope.get(scope, _EMPTY_RESOURCES) + lease.resource_hours_reserved
                 )
-
-    def remove(self, lease_id: str) -> CapacityLease:
-        lease = self._leases_by_id.pop(lease_id)
-        cell_leases = self._leases_by_cell[lease.cell_id]
-        del cell_leases[lease_id]
-        if not cell_leases:
-            del self._leases_by_cell[lease.cell_id]
-        workload_leases = self._leases_by_workload[lease.workload_id]
-        del workload_leases[lease_id]
-        if not workload_leases:
-            del self._leases_by_workload[lease.workload_id]
-        self._subtract_vector(self._usage_by_cell, lease.cell_id, lease.resources)
-        for scope in lease.identity.scopes:
-            self._subtract_vector(self._usage_by_scope, scope, lease.resources)
-            if self._track_budgets:
-                reserved_cost = self._reserved_cost_by_scope[scope] - lease.reserved_cost
-                if reserved_cost:
-                    self._reserved_cost_by_scope[scope] = reserved_cost
-                else:
-                    del self._reserved_cost_by_scope[scope]
-                self._subtract_vector(self._resource_hours_by_scope, scope, lease.resource_hours_reserved)
-        return lease
-
-    @staticmethod
-    def _subtract_vector(
-        index: dict[_IndexKey, ResourceVector],
-        key: _IndexKey,
-        resources: ResourceVector,
-    ) -> None:
-        remaining = index[key] - resources
-        if remaining:
-            index[key] = remaining
-        else:
-            del index[key]
 
     def usage(self, scope: IdentityScope) -> ResourceVector:
         return self._usage_by_scope.get(scope, _EMPTY_RESOURCES)

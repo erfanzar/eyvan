@@ -113,6 +113,7 @@ def _pool(
     namespace: str | None = None,
     backend: str | None = "kubernetes",
     initial_cells: int | None = None,
+    flavor: str | None = None,
 ) -> CapacityPoolRecord:
     options: dict[str, object] = {"worker_count": 1}
     if queue_name is not None:
@@ -123,6 +124,8 @@ def _pool(
         options["resources"] = {_TPU: "4"}
     if namespace is not None:
         options["namespace"] = namespace
+    if flavor is not None:
+        options["resource_flavor"] = flavor
     return CapacityPoolRecord(
         id=pool_id,
         fleet_name="research",
@@ -384,6 +387,60 @@ def test_two_pools_behind_one_queue_are_read_once() -> None:
     assert api.observed == [
         f"{KUEUE_API}/namespaces/eyvan/localqueues/research",
         f"{KUEUE_API}/clusterqueues/research-cq",
+    ]
+    assert advice["research/a"].allowed_cells == 0
+    assert advice["research/b"].allowed_cells == 0
+
+
+def test_two_pools_behind_one_queue_and_one_flavor_are_still_read_once() -> None:
+    """Naming the same flavor twice does not turn one reading into two."""
+
+    api = _ClusterApi(cluster_queue=_cluster_queue(nominal="32", reserved="32"))
+    api.observations[f"{KUEUE_API}/resourceflavors/tpu-v5p"] = ApiObservation(
+        payload={"spec": {"nodeLabels": {"eyvan.io/flavor": "tpu-v5p"}}}, readable=True
+    )
+
+    advice = _pass(api).advise_launches(
+        [(_pool("research/a", flavor="tpu-v5p"), (1,)), (_pool("research/b", flavor="tpu-v5p"), (1,))],
+        now=_NOW,
+    )
+
+    assert [path for path in api.observed if "resourceflavors" in path] == [
+        f"{KUEUE_API}/resourceflavors/tpu-v5p",
+    ]
+    assert [path for path in api.observed if path.startswith("/api/v1/nodes")] == [
+        "/api/v1/nodes?eyvan.io/flavor=tpu-v5p",
+    ]
+    assert advice["research/a"].allowed_cells == 0
+    assert advice["research/b"].allowed_cells == 0
+
+
+def test_two_flavors_behind_one_queue_are_not_answered_with_one_reading() -> None:
+    """A reading is scoped to one ResourceFlavor; a shared queue is not enough.
+
+    Two pools on one ClusterQueue with different flavors would otherwise fit
+    pool B's request against pool A's flavor, so an exact shortage in A's
+    flavor caps B's launches to zero on quota B never asked for.
+    """
+
+    api = _ClusterApi(cluster_queue=_cluster_queue(nominal="32", reserved="32"))
+    for flavor in ("tpu-v5p", "tpu-v6e"):
+        api.observations[f"{KUEUE_API}/resourceflavors/{flavor}"] = ApiObservation(
+            payload={"spec": {"nodeLabels": {"eyvan.io/flavor": flavor}}}, readable=True
+        )
+
+    advice = _pass(api).advise_launches(
+        [(_pool("research/a", flavor="tpu-v5p"), (1,)), (_pool("research/b", flavor="tpu-v6e"), (1,))],
+        now=_NOW,
+    )
+
+    assert [path for path in api.observed if "resourceflavors" in path] == [
+        f"{KUEUE_API}/resourceflavors/tpu-v5p",
+        f"{KUEUE_API}/resourceflavors/tpu-v6e",
+    ]
+    assert [path for path in api.observed if path.startswith("/api/v1/nodes")] == [
+        "/api/v1/nodes?eyvan.io/flavor=tpu-v5p",
+        "/api/v1/nodes?eyvan.io/flavor=tpu-v6e",
     ]
     assert advice["research/a"].allowed_cells == 0
     assert advice["research/b"].allowed_cells == 0

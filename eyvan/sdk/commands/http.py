@@ -29,6 +29,26 @@ class EyvanApiError(click.ClickException):
         super().__init__(f"{status_code}: {detail}")
 
 
+class EyvanCliUnavailableError(EyvanUnavailableError, click.ClickException):
+    """An unreachable control plane, carried in the shape Click commands report.
+
+    Subclasses both on purpose. Commands that give an unreachable plane its own
+    diagnosis -- every ``doctor`` check does -- catch ``EyvanUnavailableError``;
+    Click's top-level handling sees a ``ClickException`` and prints one clean
+    ``Error:`` line instead of a traceback. Wrapping the error as a plain
+    ``ClickException`` here used to break the first half of that: the typed
+    handlers could never fire, because the exception arriving at them was not
+    an ``EyvanUnavailableError`` at all.
+    """
+
+    def __init__(self, endpoint: ControlPlaneEndpoint, method: str) -> None:
+        EyvanUnavailableError.__init__(self, endpoint, method)
+        # ``ClickException.__init__`` sets the state Click's own reporting
+        # reads (``.message``, ``.show_color``) and the cooperative call above
+        # never reaches it; the message text is already in ``args``.
+        click.ClickException.__init__(self, self.args[0])
+
+
 def _name_a_version_skew(status_code: int, detail: object) -> str | None:
     """Say "your CLI is newer than your plane" when that is what happened.
 
@@ -139,7 +159,10 @@ class EyvanClient:
             response = exc.response
             raise EyvanApiError(response.status_code, self._error_detail(response)) from exc
         except EyvanUnavailableError as exc:
-            raise click.ClickException(str(exc)) from None
+            # Re-raised as itself-in-subclass-form, not swallowed: the message
+            # Click prints is unchanged, but a command that distinguishes
+            # "the plane is gone" from any other failure can now catch it.
+            raise EyvanCliUnavailableError(exc.endpoint, exc.method) from exc
 
     def request(
         self,
@@ -220,4 +243,4 @@ class EyvanClient:
             raise click.ClickException(f"event stream failed: {exc}") from exc
 
 
-__all__ = ("EyvanApiError", "EyvanClient")
+__all__ = ("EyvanApiError", "EyvanCliUnavailableError", "EyvanClient")

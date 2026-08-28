@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.worker.runtime import callable_protocol
 from eyvan.worker.runtime.callable_protocol import GcsObjectTransfer, UriArtifactTransfer, execute_callable
 
@@ -38,6 +39,7 @@ class GcloudStorageTransfer(GcsObjectTransfer):
             ["gcloud", "storage", "cat", self._uri(bucket_name, object_name)],
             check=True,
             capture_output=True,
+            env=provider_cli_env(),
         ).stdout
 
     def write_object(self, bucket_name: str, object_name: str, payload: bytes) -> None:
@@ -51,6 +53,7 @@ class GcloudStorageTransfer(GcsObjectTransfer):
                 ["gcloud", "storage", "cp", str(temporary_path), self._uri(bucket_name, object_name)],
                 check=True,
                 capture_output=True,
+                env=provider_cli_env(),
             )
         finally:
             temporary_path.unlink(missing_ok=True)
@@ -66,7 +69,16 @@ class GcsMetadataTransfer(GcsObjectTransfer):
             self._METADATA_TOKEN_URL,
             headers={"Metadata-Flavor": "Google"},
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        # The metadata server is link-local: reach it directly, with none of the
+        # caller's proxy settings in the path. And trust only a reply that
+        # identifies itself as the metadata service -- anything else answering
+        # on that address (an SSRF proxy, a stray local service, a captive
+        # portal) must not be handing this worker a credential. See
+        # ``eyvan.identity.metadata`` for the same rule on the identity path.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=10) as response:
+            if response.headers.get("Metadata-Flavor", "") != "Google":
+                raise RuntimeError("the metadata token reply did not identify itself as the Google metadata service")
             payload = json.loads(response.read().decode())
         return payload["access_token"]
 

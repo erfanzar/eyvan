@@ -1609,6 +1609,8 @@ def workload_logs(
     ``--since`` bounds what is printed, not what is read: a log position is an
     opaque backend cursor and none of the journals Eyvan reads can seek by
     time, so the window is applied here rather than pretended at the source.
+    With ``--since`` but no ``--follow`` the window is printed once and the
+    command returns; it does not wait for the job to stop.
     """
 
     service = WorkloadCommandService(session)
@@ -1619,6 +1621,19 @@ def workload_logs(
         raise click.UsageError(str(exc)) from exc
     if not follow and window is None:
         click.echo(session.client.request_text("GET", f"/api/v1/workloads/{resolved}/logs"))
+        return
+    if not follow:
+        # ``--since`` is documented as a filter on what is printed, so on its
+        # own it must not attach: the follower polls until the workload stops,
+        # and on a queued or running job that is a hang where a dump was asked
+        # for. One drain of the paged log -- windowed exactly the way the
+        # follower windows it -- and done.
+        WorkloadFollower(
+            client=session.client,
+            output=JobTerminalOutput(stream=click.get_text_stream("stderr")),
+            write=lambda line: click.echo(line),
+            since=window,
+        )._drain(resolved)
         return
     exit_code = service.follow(resolved, since=window)
     if exit_code:

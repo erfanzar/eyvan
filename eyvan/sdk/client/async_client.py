@@ -38,7 +38,8 @@ from eyvan.sdk.client.requests import (
     pool_workload_request,
     workload_list_params,
 )
-from eyvan.sdk.client.transport import AsyncApiTransport
+from eyvan.sdk.client.sync import UNREACHABLE_GRACE_S
+from eyvan.sdk.client.transport import AsyncApiTransport, EyvanUnavailableError
 from eyvan.sdk.client.types import HeaderMap, QueryParams
 from eyvan.server.api.schemas import WorkloadEstimateRequest, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
@@ -333,6 +334,11 @@ class AsyncEyvanClient:
     ) -> WorkloadRecord:
         """Wait asynchronously until a workload reaches a terminal durable state.
 
+        A control plane that cannot be reached is forgiven for
+        ``UNREACHABLE_GRACE_S`` -- the same grace the synchronous client
+        grants -- so a restart or a rolling deploy does not end the watching
+        while the durable workload keeps running unwatched.
+
         Args:
             workload_id: Durable workload identifier.
             timeout: Maximum number of seconds to wait, or ``None`` to wait indefinitely.
@@ -345,8 +351,27 @@ class AsyncEyvanClient:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         deadline = None if timeout is None else time.monotonic() + timeout
+        # Mirrors ``EyvanClient.wait_workload``: the workload is durable across
+        # a plane restart, a proxy hiccup, or a rolling deploy, so one dropped
+        # poll must not kill the watch. Only transport failures are forgiven;
+        # a 404 or a 403 is an answer and is raised at once.
+        unreachable_since: float | None = None
         while True:
-            workload = await self.get_workload(workload_id)
+            try:
+                workload = await self.get_workload(workload_id)
+            except EyvanUnavailableError:
+                now = time.monotonic()
+                if unreachable_since is None:
+                    unreachable_since = now
+                elif now - unreachable_since >= UNREACHABLE_GRACE_S:
+                    raise
+                if deadline is not None and now >= deadline:
+                    raise
+                await asyncio.sleep(
+                    min(poll_interval, max((deadline - now) if deadline is not None else poll_interval, 0))
+                )
+                continue
+            unreachable_since = None
             if on_update is not None:
                 await on_update(workload)
             if workload.state in TERMINAL_WORKLOAD_STATES:

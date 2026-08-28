@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import typing as tp
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from eyvan.domain import (
@@ -91,7 +91,7 @@ def _priority(value: PriorityBand) -> CorePriorityBand:
     return CorePriorityBand[value.name]
 
 
-def _checkpoint(record: WorkloadRecord) -> CheckpointPolicy:
+def _checkpoint(record: WorkloadRecord, landed_capacity_class: ApiCapacityClass | None = None) -> CheckpointPolicy:
     spec = record.spec
     return CheckpointPolicy(
         mode=CheckpointMode.ON_PREEMPTION if spec.checkpointable and spec.checkpoint_hook else CheckpointMode.NONE,
@@ -107,7 +107,15 @@ def _checkpoint(record: WorkloadRecord) -> CheckpointPolicy:
         # PREEMPTION_UNSAFE and that capacity was never reclaimed at all.
         # On-demand capacity is deliberately excluded -- it is only preemptible
         # when the workload can checkpoint.
-        allow_forced_termination=spec.capacity_class is ApiCapacityClass.SPOT,
+        #
+        # The class that decides is the one the lease *landed* on -- the same
+        # class ``revocable`` keys on. With a portfolio, a workload that
+        # requested on-demand can land on a spot cell; keying this off the
+        # requested class left that lease revocable but still ineligible, and
+        # the scheduler answered PREEMPTION_UNSAFE for capacity that was
+        # reclaimable by definition. ``None`` falls back to the requested
+        # class, right for a workload that has not landed anywhere yet.
+        allow_forced_termination=(landed_capacity_class or spec.capacity_class) is ApiCapacityClass.SPOT,
     )
 
 
@@ -250,10 +258,15 @@ def to_core_lease(
     """Convert a durable lease, preserving exact budget reservation dimensions.
 
     ``landed_capacity_class`` is the class of the cell the lease actually landed
-    on, and it decides ``revocable``. With a portfolio the *requested* class is no
-    longer the answer: a workload that lists ``spot`` in its portfolio and lands
-    on an **on-demand** cell would otherwise be marked force-terminable -- a
-    silent promise violation, since nothing about that cell is preemptible.
+    on, and it decides ``revocable`` *and* ``allow_forced_termination``. With a
+    portfolio the *requested* class is no longer the answer: a workload that
+    lists ``spot`` in its portfolio and lands on an **on-demand** cell would
+    otherwise be marked force-terminable -- a silent promise violation, since
+    nothing about that cell is preemptible. The reverse matters too: a workload
+    that requested on-demand and landed on a **spot** cell is preemptable
+    whether or not it can checkpoint, and keying the checkpoint policy off the
+    requested class left it revocable but never an eligible victim
+    (PREEMPTION_UNSAFE on capacity reclaimable by definition).
 
     ``None`` falls back to the requested class, which is exactly right for the
     single-class case and is what every pre-portfolio caller means.
@@ -273,7 +286,7 @@ def to_core_lease(
         hourly_cost=record.hourly_cost,
         reserved_cost=record.reserved_cost,
         resource_hours_reserved=_resources(record.resource_hours_reserved),
-        checkpoint_policy=_checkpoint(workload),
+        checkpoint_policy=_checkpoint(workload, landed_capacity_class),
         # Gangs are preemptible as one unit; see to_core_workload.
         revocable=(
             (landed_capacity_class or workload.spec.capacity_class) is ApiCapacityClass.SPOT
@@ -284,9 +297,60 @@ def to_core_lease(
     )
 
 
-def to_core_budget(record: BudgetRecord) -> Budget:
-    """Convert monetary and accelerator-hour hard limits."""
+_PERIOD_SECONDS: tp.Final[dict[str, float]] = {
+    "hourly": 3_600.0,
+    "daily": 86_400.0,
+    "weekly": 604_800.0,
+    "monthly": 2_592_000.0,
+    "quarterly": 7_776_000.0,
+    "yearly": 31_536_000.0,
+}
 
+
+def rolled_budget(record: BudgetRecord, now: datetime) -> BudgetRecord:
+    """Reset a budget whose declared period has elapsed.
+
+    Port of the control plane's ``_rolled_budget`` (``_settle_lease`` rolls only
+    where money moves): ``spent`` is a monotone total over the declared window,
+    so admission reading it raw compares spend from a crossed period against a
+    fresh limit -- a hard budget then refuses every placement forever once the
+    window closes with no in-flight lease to trigger a settlement. Mirrors the
+    control-plane semantics exactly: unknown periods never roll, a missing
+    ``period_started_at`` is stamped without a reset, whole elapsed periods
+    advance at once so the window stays aligned to its origin, and per-period
+    alerts re-arm.
+    """
+
+    length = _PERIOD_SECONDS.get(record.period.strip().lower())
+    if length is None:
+        return record
+    started = record.period_started_at
+    if started is None:
+        return record.model_copy(update={"period_started_at": now})
+    if (now - started).total_seconds() < length:
+        return record
+    elapsed_periods = int((now - started).total_seconds() // length)
+    return record.model_copy(
+        update={
+            "spent": 0.0,
+            "accelerator_hours_spent": {},
+            "alerted_thresholds": (),
+            "period_started_at": started + timedelta(seconds=length * elapsed_periods),
+        }
+    )
+
+
+def to_core_budget(record: BudgetRecord, *, now: datetime | None = None) -> Budget:
+    """Convert monetary and accelerator-hour hard limits.
+
+    The record's ``spent`` is only meaningful inside its declared period, so the
+    window is rolled (:func:`rolled_budget`) before conversion. Callers that
+    already hold a clock should pass it as ``now``; defaulting to the current
+    time keeps the pure read path honest without inventing a second notion of
+    "now" per plane.
+    """
+
+    record = rolled_budget(record, now or utcnow())
     return Budget(
         scope=IdentityScope(record.org_id, record.project_id),
         limit=record.limit,
@@ -364,9 +428,9 @@ def federated_budgets(
         seen.add(key)
         allowance = granted.get(key)
         if allowance is None:
-            budgets.append(to_core_budget(record))
+            budgets.append(to_core_budget(record, now=now))
             continue
-        budgets.append(replace(to_core_budget(record), limit=min(allowance, record.limit), hard_limit=True))
+        budgets.append(replace(to_core_budget(record, now=now), limit=min(allowance, record.limit), hard_limit=True))
     for key, allowance in sorted(granted.items()):
         if key in seen:
             continue

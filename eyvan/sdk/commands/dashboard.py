@@ -22,6 +22,7 @@ from pathlib import Path
 import click
 
 import eyvan
+from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
 
 #: Written by ``eyvan runtime init`` for a loopback control plane in
@@ -67,17 +68,22 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
     # Only a 404 is treated as "no dashboard here". Any other answer, including a
     # transport failure, leaves the old behaviour alone: guessing that a plane
     # hosts nothing because one probe was unhappy would be its own wrong answer.
+    #
+    # ``request`` decodes JSON and reports failures by raising, so a status is
+    # only ever visible on the raised error -- the probe used to read
+    # ``.status_code`` off a decoded document and could never see the 404.
     try:
-        status = getattr(session.client.request("GET", "/"), "status_code", None)
+        session.client.request("GET", "/")
+    except EyvanApiError as error:
+        if error.status_code == 404:
+            raise click.ClickException(
+                f"the control plane at {session.base_url} serves its API but hosts no dashboard. "
+                "A head installed from a wheel carries no UI bundle: re-run `eyvan head up` from a checkout "
+                "that has built one (npm --prefix dashboard run build), or use the container deployment, "
+                "which builds it. `eyvan dashboard-dev` runs the UI locally against this plane."
+            ) from error
     except Exception:
-        status = None
-    if status == 404:
-        raise click.ClickException(
-            f"the control plane at {session.base_url} serves its API but hosts no dashboard. "
-            "A head installed from a wheel carries no UI bundle: re-run `eyvan head up` from a checkout "
-            "that has built one (npm --prefix dashboard run build), or use the container deployment, "
-            "which builds it. `eyvan dashboard-dev` runs the UI locally against this plane."
-        )
+        pass
     click.echo(f"Eyvan dashboard: {dashboard_url}")
     if open_browser:
         click.launch(dashboard_url)

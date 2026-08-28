@@ -222,8 +222,21 @@ class FileAssetSource:
         path = Path(reference.location)
         if not path.is_absolute():
             raise AssetRefusedError(f"asset {reference.raw!r} must name an absolute path")
-        if path.is_symlink():
-            raise AssetRefusedError(f"asset {reference.raw!r} is a symbolic link; only real files can be staged")
+        # The final component is not the only one a hostile name can aim
+        # through. A link dropped on an *intermediate* directory inside the
+        # declared prefix -- ``d -> /etc``, then name ``d/shadow`` -- redirects
+        # the whole lookup, and the stat()/open() below follow it; the final
+        # component would hash as an ordinary file. So every component is
+        # checked, which is the allowlist-as-name-boundary rule applied all the
+        # way down instead of only at its last hop.
+        walked = Path(path.anchor)
+        for part in path.parts[1:]:
+            walked = walked / part
+            if walked.is_symlink():
+                raise AssetRefusedError(
+                    f"asset {reference.raw!r} is reached through the symbolic link {walked}; "
+                    "only real files can be staged"
+                )
         return path
 
     def size(self, reference: AssetReference) -> int:
@@ -654,7 +667,16 @@ class LocalAssetStageExecutor:
             # The source is shorter than what is already on disk, so it is not
             # the same object. Resuming would splice two different assets.
             resume = 0
-        written = self._transfer(reference, paths.partial, offset=resume, max_bytes=max_bytes)
+        if resume == declared and declared:
+            # A crash between the transfer and the publish left a complete
+            # .part. Resuming it would ask the source for ``bytes=declared-``,
+            # which a compliant server (GCS, S3) answers 416 -- a 4xx, and so a
+            # refusal recorded against bytes that are already on this disk and
+            # would verify. The transfer is done; read it back and publish it
+            # below without contacting the source again.
+            written = declared
+        else:
+            written = self._transfer(reference, paths.partial, offset=resume, max_bytes=max_bytes)
         if written > max_bytes:
             paths.partial.unlink(missing_ok=True)
             return AssetStageResult(

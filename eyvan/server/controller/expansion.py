@@ -77,7 +77,15 @@ class _ControllerExpansion:
             children = await transaction.list_child_workloads(current.workload_id)
             candidates = self._wave_release_candidates(children)
             waiting = [child for child in candidates if not child.schedulable and child.state is WorkloadState.PENDING]
-            if not waiting:
+            # Dependents are excluded from ``candidates`` -- their gate is their
+            # predecessors, not this plan -- but they are still children this
+            # ledger owes a bound. Closing while one is still gated would hand
+            # the DAG phase a ``wave_size=None`` and let its next release flood
+            # the queue, so the ledger stays admitting until every child has
+            # been released or finished.
+            if not waiting and not any(
+                not child.schedulable and child.state is WorkloadState.PENDING for child in children
+            ):
                 await self._close_expansion_ledger(transaction, current, reason="every child has been released")
                 return 0
             # Occupancy counts *every* child of the expansion that is competing,
@@ -91,6 +99,10 @@ class _ControllerExpansion:
                 return 0
             now = utcnow()
             releasing = waiting[:openings]
+            if not releasing:
+                # Nothing this plan can release -- the remaining gated children
+                # are dependents the DAG phase owns, bounded by this ledger.
+                return 0
             for child in releasing:
                 await transaction.put_workload(
                     child.model_copy(

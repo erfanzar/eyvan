@@ -44,6 +44,7 @@ from eyvan.server.service.webhooks import (
     SIGNATURE_HEADER,
     WebhookTargetRefused,
     matches,
+    resolve_target_addresses,
     sign,
     validate_target,
 )
@@ -82,6 +83,18 @@ def delivery_body(webhook: WebhookRecord, events: tp.Sequence[AuditEvent]) -> Js
         "delivered_at": utcnow().isoformat(),
         "events": [event.model_dump(mode="json") for event in events],
     }
+
+
+def _host_header(url: httpx.URL) -> str:
+    """Return the Host header a fetch of ``url`` as written would carry.
+
+    A POST sent to a pinned address would otherwise announce the address as
+    its host; the receiver answers for the name it was given, so that is what
+    the header must say.
+    """
+
+    host = f"[{url.host}]" if ":" in url.host else url.host
+    return host if url.port is None else f"{host}:{url.port}"
 
 
 class _ControllerWebhookDelivery:
@@ -141,16 +154,43 @@ class _ControllerWebhookDelivery:
             # Re-checked at delivery, not only at creation: a name that resolved
             # publicly when the subscription was written can resolve to loopback
             # now, and that gap is the whole point of a rebinding attack.
-            validate_target(webhook.url, allow_private=self.settings.webhook_allow_private_targets)
-            async with httpx.AsyncClient(timeout=_DELIVERY_TIMEOUT_S) as client:
-                response = await client.post(
+            #
+            # The check validates the one resolution this delivery pins to, so
+            # the POST cannot re-resolve the name to an address nobody vetted.
+            # Where private targets are allowed at all there is nothing to pin:
+            # the guard has no address policy to enforce.
+            resolved = () if self.settings.webhook_allow_private_targets else resolve_target_addresses(webhook.url)
+            target = httpx.URL(webhook.url)
+            headers = {
+                "Content-Type": "application/json",
+                SIGNATURE_HEADER: sign(webhook.secret, body),
+                SEQUENCE_HEADER: str(highest),
+            }
+            extensions: dict[str, str] = {}
+            if resolved:
+                validate_target(
                     webhook.url,
+                    allow_private=self.settings.webhook_allow_private_targets,
+                    resolve=lambda _host: resolved,
+                )
+                headers["Host"] = _host_header(target)
+                if target.scheme == "https":
+                    # Connect to the vetted address; speak TLS for the name the
+                    # receiver answers as, so its certificate still verifies
+                    # against the hostname it was issued for.
+                    extensions["sni_hostname"] = target.host
+                target = target.copy_with(host=str(resolved[0]))
+            else:
+                # Nothing to pin to: an address literal, or a name that resolved
+                # to nothing this time. Fetch the URL as written, which is what
+                # every delivery did before pinning existed.
+                validate_target(webhook.url, allow_private=self.settings.webhook_allow_private_targets)
+            async with httpx.AsyncClient(timeout=_DELIVERY_TIMEOUT_S, follow_redirects=False) as client:
+                response = await client.post(
+                    str(target),
                     content=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        SIGNATURE_HEADER: sign(webhook.secret, body),
-                        SEQUENCE_HEADER: str(highest),
-                    },
+                    headers=headers,
+                    extensions=extensions,
                 )
             response.raise_for_status()
         except (httpx.HTTPError, WebhookTargetRefused) as error:

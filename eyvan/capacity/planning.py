@@ -91,7 +91,10 @@ def candidate_zone_report(
     way and returned instead of consumed. Sharing the ranking rather than the
     numbers would be a second implementation of the decision; sharing the
     numbers and re-ranking here would be a second implementation of the order.
-    So this calls the ranking function and reports the inputs beside its answer.
+    So this calls the ranking function and reports the inputs beside its answer,
+    counted the way :meth:`CapacitySimulation.build` counts them: enabled pools
+    only, and only cells that still supply their pool -- a disabled pool or a
+    drained cell is not capacity this decision could pick.
 
     Empty for a workload that accepts one pool: there is nothing to choose
     between, and a one-entry list reads as a decision that was never made.
@@ -110,7 +113,10 @@ def candidate_zone_report(
     if len(candidate_ids) < 2:
         return ()
     pools_by_id = {pool.id: pool for pool in pools}
-    candidates = [pools_by_id[pool_id] for pool_id in candidate_ids if pool_id in pools_by_id]
+    # The decision never asks a disabled pool, so neither may the report.
+    candidates = [
+        pool for pool in (pools_by_id.get(pool_id) for pool_id in candidate_ids) if pool is not None and pool.enabled
+    ]
     if len(candidates) < 2:
         return ()
 
@@ -123,19 +129,19 @@ def candidate_zone_report(
     # moment its state stopped being the one this code happened to check.
     leased = {lease.cell_id for lease in leases if lease.state in ACTIVE_LEASE_STATES}
     for cell in cells:
-        pool_id = cell.pool_id or ""
-        if pool_id not in pools_by_id:
+        pool = pools_by_id.get(cell.pool_id or "")
+        if pool is None or not pool.enabled or not cell_provides_pool_supply(cell, pool, now):
             continue
         belief = cell.availability
         if belief.cooldown_until is not None and belief.cooldown_until > now:
-            cooling[pool_id] += 1
-        failures[pool_id] = max(failures[pool_id], int(belief.consecutive_failures))
+            cooling[pool.id] += 1
+        failures[pool.id] = max(failures[pool.id], int(belief.consecutive_failures))
         if cell.id in leased:
             continue
         if cell.autoscale_request_workload_id is None:
-            free_shared[(pool_id, cell.worker_count)] += 1
+            free_shared[(pool.id, cell.worker_count)] += 1
         else:
-            free_owned[(pool_id, cell.worker_count, cell.autoscale_request_workload_id)] += 1
+            free_owned[(pool.id, cell.worker_count, cell.autoscale_request_workload_id)] += 1
 
     preferred = _preferred_candidate(
         candidates,
@@ -545,6 +551,13 @@ class CapacitySimulation:
         # failed", and they are different questions about the same field.
         pool_acquisition_failures: Counter[str] = Counter()
         for cell in cells:
+            if cell.state is CellState.DELETED:
+                # A tombstone is retained forever as id evidence, and its belief
+                # is frozen: only the cell's own SUCCESS resets it, and a
+                # deleted cell has none. Letting it vote here made one cell
+                # that crossed the bound during an outage park every later
+                # workload for that pool permanently.
+                continue
             pool_id = cell.pool_id or ""
             if pool_id in pools_by_id:
                 pool_acquisition_failures[pool_id] = max(
@@ -830,6 +843,8 @@ class PoolScaleIntent:
     #: The shrink-clock movement this intent decided; see ``PoolScalePlan``.
     shrink_since_update: datetime | None = None
     shrink_since_changed: bool = False
+    #: Whether the hysteresis held today's shape on this pass; see ``PoolScalePlan``.
+    shrink_held: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -849,6 +864,10 @@ class PoolScalePlan:
     #: The planner reads the clock; the controller is what persists it.
     shrink_since_update: datetime | None = None
     shrink_since_changed: bool = False
+    #: True when this plan holds today's shape because the shrink window has
+    #: not elapsed. The controller leaves protected cells' idle clocks alone on
+    #: such a pass: they are the clocks the post-window fall drains against.
+    shrink_held: bool = False
 
     def __post_init__(self) -> None:
         """Keep every planned physical cell associated with an optional source workload."""
@@ -940,20 +959,23 @@ class CapacityPlanner:
         matching_units_now = sum(cell.worker_count for cell in matching)
         shrink_since_update: datetime | None = None
         shrink_since_changed = False
+        shrink_held = False
         if pool.enabled and pool.shrink_stabilization_s > 0 and target < matching_units_now:
             since = pool.demand_below_supply_since
             if since is None or (self._now - since).total_seconds() < pool.shrink_stabilization_s:
                 # First sight of the shortfall, or it has not held long enough:
                 # keep today's shape and start (or continue) the clock.
                 target = matching_units_now
+                shrink_held = True
                 if since is None:
                     shrink_since_update = self._now
                     shrink_since_changed = True
-            else:
-                # The shortfall held: let the target fall, and clear the clock
-                # so the next surplus starts fresh.
-                shrink_since_update = None
-                shrink_since_changed = True
+            # Once the window has elapsed the target simply falls, and the clock
+            # keeps running. Clearing it here would re-arm the hold on the next
+            # pass and raise the target straight back, so a pool under a
+            # persistent shortfall would fall for exactly one pass and then
+            # hold forever. Only demand that meets supply again clears it, in
+            # the branch below.
         elif pool.demand_below_supply_since is not None:
             shrink_since_update = None
             shrink_since_changed = True
@@ -988,6 +1010,7 @@ class CapacityPlanner:
             demanded_virtual_worker_counts=demand.virtual_worker_counts,
             shrink_since_update=shrink_since_update,
             shrink_since_changed=shrink_since_changed,
+            shrink_held=shrink_held,
         )
 
     def _allocate_shared_quota(self, intents: dict[str, PoolScaleIntent]) -> QuotaAllocation:
@@ -1242,4 +1265,5 @@ class CapacityPlanner:
             forced_drain_cell_ids=frozenset(forced_drain),
             shrink_since_update=intent.shrink_since_update,
             shrink_since_changed=intent.shrink_since_changed,
+            shrink_held=intent.shrink_held,
         )

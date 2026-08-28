@@ -29,7 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -62,7 +62,12 @@ from eyvan.capacity.providers.gcp.quota_discovery import (
 )
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
-from eyvan.identity.rotation import RotatingCredential
+from eyvan.identity.rotation import (
+    MINIMUM_CREDENTIAL_BYTES,
+    CredentialRotationError,
+    CredentialRotationState,
+    RotatingCredential,
+)
 from eyvan.records import (
     ArtifactInventoryReport,
     ArtifactReferenceRecord,
@@ -77,6 +82,7 @@ from eyvan.records import (
     CellBillingReport,
     CellRecord,
     CoordinationKind,
+    CredentialRotationRecord,
     EffectiveQuota,
     LaunchLatencyReport,
     LeaseRecord,
@@ -195,7 +201,11 @@ from eyvan.server.service.control_plane import (
     ArtifactCollection,
     ControlPlaneService,
 )
-from eyvan.server.service.credential_rotation import CredentialRotationService
+from eyvan.server.service.credential_rotation import (
+    SECRET_CAPABILITY_CREDENTIAL,
+    CredentialRotationService,
+    new_rotation_fence,
+)
 from eyvan.server.service.dag import DagNode
 from eyvan.server.service.errors import (
     AuthorizationError,
@@ -259,6 +269,19 @@ TPU_QUOTA_CACHE_TTL_S = 120.0
 #: with a stated failure, while the read continues in the background and lands
 #: in the cache for the next caller.
 TPU_QUOTA_READ_DEADLINE_S = 25.0
+
+
+class SecretRotationRequest(BaseModel):
+    """Body of the signed-credential rotation route.
+
+    Deliberately materialless, and the only field is the overlap: the replica
+    mints the new signing material itself and installs it in its own keyring, so
+    no key is ever a request field a proxy log could carry.
+    """
+
+    #: Seconds the superseded generation keeps verifying. Unset means one secret
+    #: capability TTL, the lifetime an outstanding token can already have.
+    overlap_s: float | None = Field(default=None, ge=0)
 
 #: Served at "/" by a plane that hosts no dashboard, in place of the framework's
 #: bare 404. Deliberately one self-contained document with no linked asset: the
@@ -712,11 +735,10 @@ def create_app(
     app.state.grant_resolver = service.active_grants_for
     app.state.workload_capability = workload_capability
     app.state.secret_capability = secret_capability
-    # Exposed as state, not as a route. New material never crosses this API:
-    # putting a signing key in a request body would make every proxy log, every
-    # access log and every error path a place it can appear. An operator hands
-    # the material to the process out of band and drives the fenced ledger and
-    # the keyring together.
+    # The signing material itself still never crosses this API: a route would
+    # make every proxy log, every access log and every error path a place a key
+    # can appear. ``POST /api/v1/secrets/rotate`` drives the fenced ledger and
+    # this keyring together while the material is minted here and stays here.
     app.state.secret_capability_credential = secret_capability_credential
     app.state.credential_rotation = credential_rotation
     app.state.metrics = metrics
@@ -1900,6 +1922,80 @@ def create_app(
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
 
+    @app.post("/api/v1/secrets/rotate", response_model=CredentialRotationRecord, tags=["system"])
+    async def rotate_secret_credential(
+        request: SecretRotationRequest,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> CredentialRotationRecord:
+        """Rotate the capability-signing credential without a restart.
+
+        Drives the fenced lifecycle its ledger documents: ``begin`` commits the
+        claim and returns, this replica installs freshly minted material in its
+        own keyring holding no lock, and ``commit`` opens a second short
+        transaction to record the outcome and the instant the superseded
+        generation stops verifying. Material outstanding when the rotation lands
+        keeps verifying for the overlap, so nothing in flight is invalidated --
+        which is what makes rotating survivable at all.
+
+        The material is minted here and never returned. The response is the
+        ledger row, whose ``fence`` is what resolves the rotation if it ever has
+        to be recorded as inconclusive.
+        """
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        overlap_s = request.overlap_s if request.overlap_s is not None else float(settings.secret_token_ttl_s)
+        fence = new_rotation_fence()
+        try:
+            begun = await credential_rotation.begin(
+                credential=SECRET_CAPABILITY_CREDENTIAL,
+                fence=fence,
+                overlap_s=overlap_s,
+            )
+        except CredentialRotationError as exc:
+            raise ConflictError(str(exc)) from exc
+        try:
+            secret_capability_credential.begin(fence)
+            secret_capability_credential.commit(
+                fence,
+                secrets.token_bytes(MINIMUM_CREDENTIAL_BYTES),
+                overlap_s=overlap_s,
+            )
+        except CredentialRotationError as exc:
+            # The keyring refused, so nothing was installed: the established
+            # not-happened ``abandon`` exists for. Its own begin either never ran
+            # or left it untouched, and a begin whose commit failed is closed too,
+            # so neither half is left claiming a rotation in flight.
+            if secret_capability_credential.rotation_state is CredentialRotationState.PENDING:
+                secret_capability_credential.abandon(fence)
+            await credential_rotation.abandon(
+                credential=SECRET_CAPABILITY_CREDENTIAL,
+                generation=begun.generation,
+                fence=fence,
+                detail="the signing keyring refused the new generation",
+            )
+            raise ConflictError(str(exc)) from exc
+        try:
+            return await credential_rotation.commit(
+                credential=SECRET_CAPABILITY_CREDENTIAL,
+                generation=begun.generation,
+                fence=fence,
+            )
+        except Exception:
+            # The material IS installed, but the durable outcome did not land.
+            # Unobserved is recorded as unobserved: the row holds future
+            # rotations until a human resolves it rather than this process
+            # claiming an outcome it could not see.
+            try:
+                await credential_rotation.record_inconclusive(
+                    credential=SECRET_CAPABILITY_CREDENTIAL,
+                    generation=begun.generation,
+                    fence=fence,
+                    detail="the ledger commit failed after the keyring was updated",
+                )
+            except Exception:
+                pass  # The row is not ours to close; surface the commit failure.
+            raise
+
     @app.get("/metrics", include_in_schema=False)
     async def prometheus_metrics(raw_request: Request) -> Response:
         """Serve the Prometheus exposition to an authenticated scraper.
@@ -2757,12 +2853,20 @@ def create_app(
             parent = await transaction.get_workload(workload_id)
         if parent is None:
             raise NotFoundError(f"workload {workload_id!r} was not found")
+        parent_generation = parent.generation
         try:
-            workload_capability.verify(token, workload_id=workload_id, generation=parent.generation)
+            workload_capability.verify(token, workload_id=workload_id, generation=parent_generation)
         except InvalidCapabilityToken as exc:
             raise AuthorizationError("invalid workload capability") from exc
         child, _replayed = await service.submit_child_workload(
-            parent=parent, spec=request.spec, idempotency_key=idempotency_key
+            parent=parent,
+            spec=request.spec,
+            idempotency_key=idempotency_key,
+            # Verified against the parent as this transaction read it; the admit
+            # re-reads the parent in its own transaction and refuses when the
+            # generation has moved, so a token from a superseded attempt cannot
+            # attach a child to the current one.
+            expected_parent_generation=parent_generation,
         )
         return child
 

@@ -54,7 +54,7 @@ from eyvan.server.invariants import Invariant, check_fleet
 from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import AuthorizationError, ConflictError, InputError, NotFoundError
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
-from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, plan_service, service_policy
+from eyvan.server.service.services import CHILD_REVISION, ServicePolicy, child_revision, plan_service, service_policy
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.log_records import (
     LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT,
@@ -104,6 +104,18 @@ _LOG_ARCHIVE_MAX_MANIFEST_RANKS = 10_000
 #: a later typed setting supersedes the variable without touching this module.
 _LOG_ARCHIVE_MANIFEST_V2_SETTING = "log_archive_manifest_v2_enabled"
 _LOG_ARCHIVE_MANIFEST_V2_ENVIRONMENT_VARIABLE = "EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED"
+
+
+def _replica_idempotency_suffix(service_id: str, revision: str, slot: int) -> str:
+    """Return the stable fingerprint one replica submit is minted under.
+
+    A random suffix would give two leaders watching one service two different
+    keys for the same replica -- the duplicate this key exists to prevent --
+    so the key is a hash of exactly the facts that name the replica.
+    """
+
+    material = f"{service_id}:{revision}:{slot}".encode()
+    return hashlib.sha256(material).hexdigest()[:12]
 
 
 class LogArchiveRankStatus(StrEnum):
@@ -1282,11 +1294,17 @@ class _ControllerSettlement:
                 reconciled += 1
                 continue
             if plan.submit > 0:
-                await self._start_service_replica(current, policy)
+                # The slot this submit fills: the next ordinal this revision has
+                # never minted, counted over every child it ever created.
+                # Terminal replicas keep their ordinals, so a replacement mints
+                # a fresh key, while two leaders that read the same children
+                # mint the same one.
+                slot = sum(1 for child in children if child_revision(child) == policy.revision)
+                await self._start_service_replica(current, policy, slot=slot)
                 reconciled += 1
         return reconciled
 
-    async def _start_service_replica(self, service: WorkloadRecord, policy: ServicePolicy) -> None:
+    async def _start_service_replica(self, service: WorkloadRecord, policy: ServicePolicy, *, slot: int) -> None:
         """Submit one replica of a service at its current revision."""
 
         spec = service.spec.model_copy(
@@ -1313,8 +1331,12 @@ class _ControllerSettlement:
                 ),
                 spec=spec,
                 # Deterministic per revision and per slot, so a crash between
-                # the submit and the commit does not start two replicas.
-                idempotency_key=f"replica:{policy.revision}:{uuid.uuid4().hex[:12]}",
+                # the submit and the commit does not start two replicas: two
+                # leaders that read the same children mint the same key, and
+                # the fence turns the second submit into a replay.
+                idempotency_key=(
+                    f"replica:{policy.revision}:{_replica_idempotency_suffix(service.id, policy.revision, slot)}"
+                ),
             )
         except (ConflictError, AuthorizationError):
             logger.warning("could not start a replica for service %s", service.id, exc_info=True)

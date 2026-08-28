@@ -36,6 +36,7 @@ replacement.
 from __future__ import annotations
 
 import subprocess
+import threading
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -54,6 +55,11 @@ REQUEST_TIMEOUT_S = 20.0
 #: A page big enough that no zone Google currently offers needs a second one.
 #: Paging is still handled -- this only avoids the round trips.
 PAGE_SIZE = 500
+
+#: Answer codes that mean the credential, not the zone, is the problem. A
+#: Google access token lasts about an hour, so a catalog held for the life of
+#: the server must re-mint once on these instead of degrading every read.
+AUTH_FAILURES = frozenset({401, 403})
 
 _ENDPOINT = "https://tpu.googleapis.com/v2/projects/{project}/locations/{zone}/acceleratorTypes"
 
@@ -101,10 +107,24 @@ class ApiAcceleratorCatalog:
     token_source: tp.Callable[[], str] = gcloud_access_token
     concurrency: int = DEFAULT_CONCURRENCY
     _token: str | None = field(default=None, init=False, repr=False)
+    _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.concurrency, bool) or not isinstance(self.concurrency, int) or self.concurrency < 1:
             raise ValueError("concurrency must be a positive integer")
+
+    def _refresh_token(self, stale: str | None) -> str:
+        """Re-mint the cached bearer token once, collapsing concurrent refreshes.
+
+        ``stale`` is the token the failed request carried: the first thread to
+        report it re-mints, and every other thread -- whose 401 was caused by
+        the same aged-out credential -- reuses whatever replaced it.
+        """
+
+        with self._token_lock:
+            if self._token is None or self._token == stale:
+                self._token = self.token_source()
+            return self._token
 
     def types_for_zones(self, project: str, zones: tp.Sequence[str]) -> dict[str, tuple[str, ...]]:
         """Return each zone's accelerator types, omitting zones that failed.
@@ -120,10 +140,9 @@ class ApiAcceleratorCatalog:
 
         token = self._token or self.token_source()
         self._token = token
-        headers = {"Authorization": f"Bearer {token}"}
         limits = httpx.Limits(max_connections=self.concurrency, max_keepalive_connections=self.concurrency)
 
-        def read(client: httpx.Client, zone: str) -> tuple[str, tuple[str, ...] | None]:
+        def read(client: httpx.Client, zone: str, token: str) -> tuple[str, tuple[str, ...] | None]:
             found: list[str] = []
             page: str | None = None
             try:
@@ -131,7 +150,17 @@ class ApiAcceleratorCatalog:
                     params: dict[str, object] = {"pageSize": PAGE_SIZE}
                     if page:
                         params["pageToken"] = page
+                    headers = {"Authorization": f"Bearer {token}"}
                     response = client.get(_ENDPOINT.format(project=project, zone=zone), params=params, headers=headers)
+                    if response.status_code in AUTH_FAILURES:
+                        # The cached credential aged out. Mint a fresh one and
+                        # retry this page once, as GcsRestObject does; a zone
+                        # that still refuses is dropped like any other failure.
+                        token = self._refresh_token(token)
+                        headers = {"Authorization": f"Bearer {token}"}
+                        response = client.get(
+                            _ENDPOINT.format(project=project, zone=zone), params=params, headers=headers
+                        )
                     if response.status_code != 200:
                         return zone, None
                     payload = response.json()
@@ -151,7 +180,7 @@ class ApiAcceleratorCatalog:
             httpx.Client(timeout=REQUEST_TIMEOUT_S, limits=limits, trust_env=False) as client,
             ThreadPoolExecutor(max_workers=min(self.concurrency, len(zones))) as pool,
         ):
-            for zone, types in pool.map(lambda zone: read(client, zone), zones):
+            for zone, types in pool.map(lambda zone: read(client, zone, token), zones):
                 if types is not None:
                     results[zone] = types
         if not results:
@@ -162,6 +191,7 @@ class ApiAcceleratorCatalog:
 
 
 __all__ = (
+    "AUTH_FAILURES",
     "DEFAULT_CONCURRENCY",
     "PAGE_SIZE",
     "REQUEST_TIMEOUT_S",

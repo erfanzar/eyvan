@@ -275,7 +275,14 @@ class GcpSecretManagerStore:
 
     @staticmethod
     def _default_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        # Interpreter-steering variables from the calling environment (a foreign
+        # PYTHONPATH above all) crash gcloud's embedded Python; every provider
+        # CLI spawn scrubs them (the 2026-08-22 outage invariant).
+        from eyvan._internal.subprocess_env import provider_cli_env
+
+        return subprocess.run(
+            command, capture_output=True, text=True, timeout=30, check=False, env=provider_cli_env()
+        )
 
     def read(self, reference: str) -> bytes:
         """Resolve ``gcp-secret://project/name[/version]``."""

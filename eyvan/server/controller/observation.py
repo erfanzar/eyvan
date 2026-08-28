@@ -1490,6 +1490,14 @@ class _ControllerObservation:
             current = await transaction.get_cell(cell.id)
             if current is None or current.generation != cell.generation or current.state is not cell.state:
                 return False
+            if current.unavailable_reason in {"agent_fence_conflict", HOST_FAULT_REASON}:
+                # A quarantine written while the agent RPC above was in flight.
+                # Both markers keep the state and generation this observation
+                # snapshotted, so the guard above cannot see them, and the write
+                # below would erase them -- re-admitting a cell the controller
+                # has slated for recreation or host replacement. Only a new
+                # generation returns such a cell to observation.
+                return False
             phase_started_at = _provider_phase_start(current, remote_state, now)
             updated = current.model_copy(
                 update={

@@ -152,6 +152,15 @@ class GangExecutionDriver(tp.Protocol):
 
     def stop(self, remote_id: str) -> None: ...
 
+    def checkpoint(
+        self,
+        remote_id: str,
+        *,
+        hook: str,
+        output_uri: str | None,
+        context: MutationContext,
+    ) -> str: ...
+
     def retire(self, remote_id: str) -> None: ...
 
     def logs(self, remote_id: str) -> str: ...
@@ -701,6 +710,45 @@ class CellAgentService:
         finally:
             self._close_gang_executor(executor)
         return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.STOPPED)
+
+    def checkpoint_gang(
+        self,
+        coordinator_cell_id: str,
+        workload_id: str,
+        remote_id: str,
+        members: tp.Sequence[GangWorkloadMember],
+        *,
+        hook: str,
+        output_uri: str | None,
+        context: MutationContext,
+    ) -> WorkloadObservation:
+        """Launch one checkpoint hook on every rank of a native workload gang.
+
+        The member fences are validated exactly as ``stop_gang`` and
+        ``retire_gang`` validate theirs: a gang holds one lease per cell, so a
+        request that does not own every member fence checkpoints none of them.
+        The hook itself fans out through the gang driver, which addresses each
+        cell with its own fence under the one shared checkpoint ID carried by
+        ``context``, so ``gang_workload`` can poll one logical checkpoint.
+        """
+
+        stored = self._stored_gang_members(coordinator_cell_id, workload_id, remote_id)
+        supplied = self._validate_gang_mutation_members(stored, members)
+        executor = self._gang_executor(supplied)
+        try:
+            checkpoint_id = executor.checkpoint(
+                remote_id,
+                hook=hook,
+                output_uri=output_uri,
+                context=context,
+            )
+        finally:
+            self._close_gang_executor(executor)
+        return WorkloadObservation(
+            remote_id=checkpoint_id,
+            status=ExecutionWorkloadStatus.CHECKPOINTING,
+            checkpoint_uri=output_uri,
+        )
 
     def gang_logs(self, coordinator_cell_id: str, workload_id: str, remote_id: str) -> str:
         """Return rank-prefixed logs from every member of a native workload gang."""

@@ -52,8 +52,12 @@ from eyvan.records import (
 #: Lease states in which a workload is holding the cell right now. Both count:
 #: a lease that has been granted but whose payload has not started still names a
 #: workload that is about to read the asset, and evicting it during dispatch is
-#: the same failed run as evicting it mid-epoch.
-_HOLDING_LEASE_STATES = frozenset({LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING})
+#: the same failed run as evicting it mid-epoch. A quarantined lease is still
+#: holding too: its TTL lapsed, but the work was not killed and observation can
+#: recover the lease to active, so its assets stay protected in the window.
+_HOLDING_LEASE_STATES = frozenset(
+    {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING, LeaseState.QUARANTINED}
+)
 
 #: Workload states in which a declared asset is protected from eviction. A
 #: terminal workload's lease may not have been settled yet, and its assets are

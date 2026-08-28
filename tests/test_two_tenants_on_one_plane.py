@@ -104,6 +104,9 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     # to the rows afterwards could make it project-scoped. Fleet administration
     # is the only role whose scope is also the whole database.
     "POST /api/v1/query": "ad-hoc read-only SQL over the whole control plane",
+    # Replaces the credential every tenant's capability tokens are signed with;
+    # a rotation touches every tenant at once, so it is fleet administration.
+    "POST /api/v1/secrets/rotate": "rotate the shared capability-signing credential",
     # Stacks and allocations of the process serving every tenant; there is no
     # per-tenant view of a shared interpreter to scope them to.
     "GET /api/v1/process/stacks": "thread stacks of the shared control-plane process",

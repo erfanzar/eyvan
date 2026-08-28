@@ -127,9 +127,12 @@ def probe(
                     "the control plane is up but refused this identity; ask whoever runs it for a token "
                     "and pass --token",
                 )
-            # Scoped, because the route requires it. Called without the query
-            # it answers 422 and this reported "0 fleets" beside 27 pools --
-            # the plane was fine and the question was malformed.
+            # The route filters by ``fleet_name`` alone and ignores every
+            # other query parameter, so the scope here is declarative -- the
+            # probe names the org and project it is asking about -- rather
+            # than something the route requires. An earlier comment claimed
+            # the route mandated these and answered 422 without them; neither
+            # was ever true of the server.
             pools = client.get(
                 f"{base}/api/v1/capacity-pools",
                 headers=headers,

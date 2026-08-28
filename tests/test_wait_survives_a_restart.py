@@ -46,6 +46,13 @@ class _Workload:
         self.state = state
 
 
+class _AsyncPlane(_Plane):
+    """The same scripted plane, awaiting like ``AsyncEyvanClient`` does."""
+
+    async def __call__(self, workload_id: str):
+        return super().__call__(workload_id)
+
+
 def _client(plane: _Plane, sleeps: list[float]) -> EyvanClient:
     client = EyvanClient.__new__(EyvanClient)
     client.get_workload = plane  # type: ignore[method-assign]
@@ -99,3 +106,46 @@ def test_the_grace_window_restarts_after_a_successful_poll(monkeypatch) -> None:
     result = EyvanClient.wait_workload(_client(plane, []), "wl-1", poll_interval=0.01)  # type: ignore[arg-type]
 
     assert result.state == "succeeded"
+
+
+# --------------------------------------------------------------------------- the async twin
+
+
+async def _instant_sleep(_seconds: float) -> None:
+    return None
+
+
+async def test_the_async_wait_forgives_a_restart_too(monkeypatch) -> None:
+    """A notebook or service waiter dies exactly as a script does on the first
+    dropped poll; the async client must carry the same grace the sync one does."""
+
+    from eyvan.sdk.client.async_client import AsyncEyvanClient
+
+    plane = _AsyncPlane(outages=3)
+    monkeypatch.setattr("eyvan.sdk.client.async_client.asyncio.sleep", _instant_sleep)
+
+    client = AsyncEyvanClient.__new__(AsyncEyvanClient)
+    client.get_workload = plane  # type: ignore[method-assign]
+
+    result = await AsyncEyvanClient.wait_workload(client, "wl-1", poll_interval=0.01)
+
+    assert result.state == "succeeded"
+    assert plane.polls == 4, "three failed polls were forgiven, the fourth answered"
+
+
+async def test_the_async_wait_still_reports_a_plane_that_is_gone(monkeypatch) -> None:
+    """The grace is bounded, or a dead plane trades a traceback for a hang."""
+
+    from eyvan.sdk.client.async_client import AsyncEyvanClient
+
+    plane = _AsyncPlane(outages=10_000)
+    clock = iter([0.0, 0.0, UNREACHABLE_GRACE_S + 1])
+
+    monkeypatch.setattr("eyvan.sdk.client.async_client.asyncio.sleep", _instant_sleep)
+    monkeypatch.setattr("time.monotonic", lambda: next(clock, UNREACHABLE_GRACE_S * 10))
+
+    client = AsyncEyvanClient.__new__(AsyncEyvanClient)
+    client.get_workload = plane  # type: ignore[method-assign]
+
+    with pytest.raises(EyvanUnavailableError):
+        await AsyncEyvanClient.wait_workload(client, "wl-1", poll_interval=0.01)

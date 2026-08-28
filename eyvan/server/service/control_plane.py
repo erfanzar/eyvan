@@ -1052,14 +1052,19 @@ class ControlPlaneService:
                 return replayed, True
 
             fleet_pools = await self._fleet_pools(tx, fleet_name)
-            matching_pools = [pool for pool in fleet_pools if pool.node_type == node_type]
+            # Enabled up front, as on the callable path: the pools a submission can
+            # match are the pools capacity offers, so a disabled pool neither
+            # creates a spurious ambiguity nor wins the primary slot.
+            matching_pools = [pool for pool in fleet_pools if pool.enabled and pool.node_type == node_type]
             if not matching_pools:
                 # Fall back to the hardware the caller asked for. A pool is
                 # named by its shape unless an operator named it otherwise, so
                 # requiring the pool name meant a user had to learn a naming
                 # scheme to run anything -- while `ray job submit` and
                 # `iris job run --tpu v5litepod-16` ask only for hardware.
-                matching_pools = [pool for pool in fleet_pools if pool.accelerator_type == node_type]
+                matching_pools = [
+                    pool for pool in fleet_pools if pool.enabled and pool.accelerator_type == node_type
+                ]
                 if not matching_pools:
                     raise NotFoundError(f"fleet node type {fleet_name}/{node_type} was not found")
             if zone is not None:
@@ -1094,8 +1099,6 @@ class ControlPlaneService:
                 matching_pools = [primary]
                 alternate_pool_ids = tuple(candidate.id for candidate in interchangeable)
             pool = matching_pools[0]
-            if not pool.enabled:
-                raise ConflictError(f"fleet node type {fleet_name}/{node_type} is disabled")
             if pool.max_cells == 0:
                 raise ConflictError(f"fleet node type {fleet_name}/{node_type} has max_workers set to zero")
             if pool.max_replica_resources is not None and pool.max_replica_resources != pool.allocatable:
@@ -1117,6 +1120,16 @@ class ControlPlaneService:
                 raise ConflictError(
                     f"fleet node type {fleet_name}/{node_type} cannot run --pods {pods}: {unsupported}. "
                     "Several slices allocated together are a TPU multislice shape."
+                )
+            if pods > pool.max_cells:
+                # The same ceiling the callable path enforces: the planner launches
+                # width-``pods`` cells only while ``max_cells`` minus live worker
+                # units allows, so a wider job accepted here would sit PENDING
+                # forever, holding its place in the queue against work that could
+                # actually run.
+                raise ConflictError(
+                    f"fleet node type {fleet_name}/{node_type} is capped at {pool.max_cells} workers, "
+                    f"but the job requested pods={pods}"
                 )
 
             spec = self._pinned_pool_workload_spec(
@@ -1689,6 +1702,7 @@ class ControlPlaneService:
         key: str,
         fingerprint: str,
         parent_workload_id: str | None = None,
+        expected_parent_generation: int | None = None,
         schedulable: bool = True,
         coordination_kind: CoordinationKind | None = None,
         depends_on: tuple[str, ...] = (),
@@ -1719,6 +1733,16 @@ class ControlPlaneService:
                 # be cancelled by it -- a permanent orphan holding capacity.
                 raise ConflictError(
                     f"parent workload {parent_workload_id!r} is {parent.state.value}; it cannot gain new children"
+                )
+            if expected_parent_generation is not None and parent.generation != expected_parent_generation:
+                # The caller verified its capability against the parent as read in
+                # an earlier transaction. A retry or kick that bumped the
+                # generation since means this attempt's token describes a parent
+                # that no longer exists; admitting on it would let a superseded
+                # attempt attach children to the current one.
+                raise ConflictError(
+                    f"parent workload {parent_workload_id!r} is at generation {parent.generation}, not the "
+                    f"{expected_parent_generation} the capability was issued for; resubmit against the current attempt"
                 )
         workload_id = _new_id("wl")
         spec = self.result_spec_for_generation(spec, workload_id=workload_id, generation=1)
@@ -1829,8 +1853,14 @@ class ControlPlaneService:
             raise InputError(f"provider {spec.provider!r} is not allowed by project policy")
         if spec.region and policy.allowed_regions and spec.region not in policy.allowed_regions:
             raise InputError(f"region {spec.region!r} is not allowed by project policy")
-        if policy.allowed_capacity_classes and spec.capacity_class.value not in policy.allowed_capacity_classes:
-            raise InputError(f"capacity class {spec.capacity_class.value!r} is not allowed by project policy")
+        if policy.allowed_capacity_classes:
+            # The whole portfolio, not just the primary: the scheduler ranks every
+            # class a spec accepts and may land the workload on any of them, so a
+            # policy that checked only ``capacity_class`` would gate the door the
+            # workload is least likely to walk through.
+            for capacity_class in spec.capacity_class_portfolio:
+                if capacity_class.value not in policy.allowed_capacity_classes:
+                    raise InputError(f"capacity class {capacity_class.value!r} is not allowed by project policy")
         if spec.accelerator_type and spec.accelerator_type in policy.denied_accelerator_types:
             raise InputError(f"accelerator type {spec.accelerator_type!r} is denied by project policy")
 
@@ -2931,6 +2961,12 @@ class ControlPlaneService:
                 }
             )
             await tx.put_workload(settled)
+            # A terminal write outside ``_transition_workload`` -- kept direct so
+            # the force-finalize audit record stays one scoped event with its
+            # capacity outcomes -- so it releases artifact references itself, or
+            # the CANCELLED workload's active claims would pin its artifacts
+            # against reclamation forever.
+            await self._release_artifact_references(tx, settled, now=moment)
             await self._bind_idempotency(tx, "fleet", "workload.force_finalize", key, fingerprint, settled)
             await self._audit_scoped(
                 tx,
@@ -4150,6 +4186,11 @@ class ControlPlaneService:
                     "enabled": False,
                     "min_cells": 0,
                     "max_cells": 0,
+                    # Same reason as the prune in ``apply_fleet`` and the sweep in
+                    # ``disable_fleet``: the record requires min <= initial <= max,
+                    # so a pool that declared a floor kept ``initial_cells`` above
+                    # the new max of 0 and became invalid on re-read.
+                    "initial_cells": 0,
                     "generation": pool.generation + 1,
                     "updated_at": utcnow(),
                 }
@@ -5924,6 +5965,7 @@ class ControlPlaneService:
         parent: WorkloadRecord,
         spec: WorkloadDefinition,
         idempotency_key: str,
+        expected_parent_generation: int | None = None,
     ) -> tuple[WorkloadRecord, bool]:
         """Admit a workload submitted by a running job on its own authority.
 
@@ -5935,6 +5977,16 @@ class ControlPlaneService:
         Instead the parent *is* the authorization: a child inherits its scope,
         its identity, and its place in the fair-share tree, and can therefore
         reach nothing its parent could not.
+
+        Args:
+            parent: The workload whose capability authorized this submission.
+            spec: The child's definition.
+            idempotency_key: Scoped to the parent, so sibling retries deduplicate.
+            expected_parent_generation: The parent generation the caller's
+                capability was verified against, when it read the parent in its
+                own transaction. Re-checked against the fresh read inside the
+                admitting transaction so a retry or kick that bumped the
+                generation in between cannot admit on a superseded token.
         """
 
         if not parent.spec.can_submit_children:
@@ -5998,6 +6050,7 @@ class ControlPlaneService:
                 key=scoped_key,
                 fingerprint=fingerprint,
                 parent_workload_id=parent.id,
+                expected_parent_generation=expected_parent_generation,
                 created_by=parent.created_by,
             )
 
@@ -6032,7 +6085,11 @@ class ControlPlaneService:
         for pool in pools:
             if not pool.enabled or not self._pool_admits_spec(pool, spec):
                 continue
-            cells = spec.cell_group_count * spec.worker_count
+            # ``cell_group_count`` cells, each of which ``make_cell`` already builds
+            # at the full ``worker_count`` width -- its capacity and therefore its
+            # hourly price scale with the worker count, so multiplying by it again
+            # here priced a pods=8 job at eight times its real hourly.
+            cells = spec.cell_group_count
             template = pool.make_cell(f"estimate-{pool.id}", worker_count=spec.worker_count)
             # Not costing.scale: that drops zero entries by design, because it exists
             # for accelerator-hour vectors where a zero reads as "used no GPU". A
@@ -7024,7 +7081,7 @@ class ControlPlaneService:
         queued_seconds, running_seconds = self._lease_clock(lease, now)
         elapsed_hours = (queued_seconds + running_seconds) / 3_600
         settled_cost = costing.cost_for_hours(lease.hourly_cost, elapsed_hours)
-        hours = self._accelerator_hours(lease, elapsed_hours)
+        hours = self._accelerator_hours(lease, elapsed_hours, workload)
         settled = lease.model_copy(
             update={
                 "state": lease.state if lease.state is LeaseState.EXPIRED else LeaseState.RELEASED,
@@ -7134,18 +7191,31 @@ class ControlPlaneService:
         return max(held - running, 0.0), min(running, held)
 
     @staticmethod
-    def _accelerator_hours(lease: LeaseRecord, elapsed_hours: float) -> dict[str, float]:
+    def _accelerator_hours(
+        lease: LeaseRecord,
+        elapsed_hours: float,
+        workload: WorkloadRecord | None = None,
+    ) -> dict[str, float]:
         """Scale the lease's reserved resource shape by hours actually held.
 
         ``resource_hours_reserved`` is the *shape* multiplied by the submitted
         duration estimate, so dividing it back out recovers the per-hour vector and
-        re-scaling by real elapsed time gives settled accelerator-hours. When the
-        estimate was zero there is no shape to scale and the result is empty.
+        re-scaling by real elapsed time gives settled accelerator-hours. The
+        price-based division needs a priced pool; on an unpriced pool the workload's
+        submitted duration estimate is the same divisor, so the record supplies it.
+        When neither is available there is nothing to divide out and the result is
+        the reserved shape unchanged.
         """
 
         reserved = lease.resource_hours_reserved
         values = {"gpu": float(reserved.gpu), "tpu": float(reserved.tpu), **reserved.custom}
         estimated_hours = lease.reserved_cost / lease.hourly_cost if lease.hourly_cost else 0.0
+        if not estimated_hours and workload is not None:
+            # The same figure the scheduler multiplied the shape by
+            # (``estimated_duration_seconds`` is immutable on a submitted spec), so
+            # this divides out exactly what scheduling multiplied in -- on a
+            # zero-priced pool where ``reserved_cost`` cannot recover it.
+            estimated_hours = workload.spec.estimated_duration_seconds / 3_600
         if not estimated_hours:
             return {name: quantity for name, quantity in values.items() if quantity}
         return costing.scale(values, elapsed_hours / estimated_hours)

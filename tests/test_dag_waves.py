@@ -196,6 +196,65 @@ async def test_a_dependency_release_counts_against_the_next_wave() -> None:
     assert stored is not None and stored.schedulable
 
 
+async def test_gated_dependents_keep_the_wave_ledger_open() -> None:
+    """Closing the plan while a DAG still owes releases is a flood valve.
+
+    The wave phase releases roots only, so a roots-only waiting count reads
+    empty the moment every root is out -- while dependents are still gated. A
+    ledger that closes there hands the DAG phase ``wave_size=None``, and its
+    next release runs every ready stage at once, which is the queue flood the
+    wave exists to bound.
+    """
+
+    service = await _service(wave=1)
+    parent, nodes = await service.submit_dag(
+        _principal(),
+        org_id="acme",
+        project_id="research",
+        nodes=[
+            DagNode(name="prepare", template=_template()),
+            DagNode(name="train", template=_template(), depends_on=("prepare",)),
+            DagNode(name="score", template=_template(), depends_on=("prepare",)),
+        ],
+        idempotency_key="dag-1",
+        name_prefix="fanout",
+    )
+    controller = _controller(service)
+    stages = _by_name(nodes)
+
+    # The root is out; both dependents are still gated, so the plan stays open.
+    assert await controller.release_expansion_waves_once() == 0
+    async with service.repository.transaction() as tx:
+        admission = await tx.get_expansion_admission(parent.id)
+    assert admission is not None and admission.state is ExpansionAdmissionState.ADMITTING
+
+    # Prepare finished and freed the one slot. The DAG phase may release one
+    # dependent under the bound -- not both, which a closed ledger would have
+    # allowed.
+    await _succeed(service, stages["fanout-prepare"].id)
+    assert await controller.release_ready_dag_nodes_once() == 1
+    dependents = [stages["fanout-train"], stages["fanout-score"]]
+    async with service.repository.transaction() as tx:
+        schedulable = [
+            node.spec.name for node in dependents if (await tx.get_workload(node.id)).schedulable
+        ]
+    assert len(schedulable) == 1, "one wave slot opened, so one dependent competes"
+
+    # The second dependent waits for the first to finish, and the ledger
+    # closes only once every child has been released.
+    async with service.repository.transaction() as tx:
+        admission = await tx.get_expansion_admission(parent.id)
+    assert admission is not None and admission.state is ExpansionAdmissionState.ADMITTING
+    async with service.repository.transaction() as tx:
+        done = [node.id for node in dependents if (await tx.get_workload(node.id)).schedulable]
+    await _succeed(service, *done)
+    assert await controller.release_ready_dag_nodes_once() == 1
+    assert await controller.release_expansion_waves_once() == 0
+    async with service.repository.transaction() as tx:
+        admission = await tx.get_expansion_admission(parent.id)
+    assert admission is not None and admission.state is ExpansionAdmissionState.COMPLETE
+
+
 async def test_dag_progress_is_derivable_after_a_control_plane_restart() -> None:
     """Nothing about a half-admitted DAG lives in the leader's memory."""
 

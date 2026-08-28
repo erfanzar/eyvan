@@ -1380,7 +1380,11 @@ class _ControllerWorkloadCommands:
         if prepared is None:
             return
         _workload, _lease, cell, request, reservation = prepared
-        await self._refuse_stale_cell_builds((cell,))
+        try:
+            await self._refuse_stale_cell_builds((cell,))
+        except PermanentDispatchRefusal as exc:
+            await self._settle_unlaunchable_attempt(command, (lease_id,), exc)
+            return
         try:
             remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
         except Exception:
@@ -1400,7 +1404,11 @@ class _ControllerWorkloadCommands:
         if prepared is None:
             return
         _workload, _members, cells, coordinator_lease, coordinator_cell, request, reservation = prepared
-        await self._refuse_stale_cell_builds(cells)
+        try:
+            await self._refuse_stale_cell_builds(cells)
+        except PermanentDispatchRefusal as exc:
+            await self._settle_unlaunchable_attempt(command, lease_ids, exc)
+            return
         try:
             remote = await asyncio.to_thread(
                 self._agent_factory(coordinator_cell).submit_gang,

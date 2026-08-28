@@ -727,6 +727,16 @@ def test_native_container_runtime_uses_typed_settings_and_node_override_is_atomi
     assert resolved.container.mounts[0].target == "/workspace"
 
 
+def test_native_runtime_merge_carries_declared_python_through_node_override() -> None:
+    fleet = NativeRuntimeConfig(python="3.12")
+    node_override = NativeRuntimeConfig(env={"HF_HOME": "/var/lib/hf"}, python="3.13")
+    node_without_python = NativeRuntimeConfig(env={"HF_HOME": "/var/lib/hf"})
+
+    assert fleet.merged(node_override).python == "3.13"
+    assert fleet.merged(node_without_python).python == "3.12"
+    assert fleet.merged(None) is fleet
+
+
 @pytest.mark.parametrize(
     ("container", "message"),
     [

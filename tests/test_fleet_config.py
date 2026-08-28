@@ -934,6 +934,36 @@ def test_an_entirely_unpriced_pool_does_not_warn() -> None:
         EyvanFleetConfig.model_validate(fleet)
 
 
+def test_a_declared_zero_price_counts_as_priced() -> None:
+    """A zero is a price, not an omission.
+
+    The scheduler's ``prices_cover`` is key membership -- declared zeros count as
+    covered -- so a pool that deliberately prices tpu at zero is fully priced and
+    must not be warned that none of its prices cover tpu.
+    """
+
+    fleet = _mixed_fleet()
+    fleet["node_types"]["tpu"]["unit_prices"] = {"tpu": 0, "cpu": 5, "memory_gib": 0.004}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        EyvanFleetConfig.model_validate(fleet)
+
+
+def test_a_zero_price_covers_only_the_resource_it_names() -> None:
+    """Declaring one zero does not make the rest of the pool priced.
+
+    Only the named resource is covered: a zero for gpu leaves cpu and memory_gib
+    exactly as unstated -- and as under-counting -- as they were before.
+    """
+
+    fleet = _mixed_fleet()
+    fleet["node_types"]["gpu"]["unit_prices"] = {"gpu": 0}
+
+    with pytest.warns(UserWarning, match="none for cpu"):
+        EyvanFleetConfig.model_validate(fleet)
+
+
 def _two_zone_fleet() -> JsonObject:
     """One fleet holding the same TPU shape in two zones."""
 

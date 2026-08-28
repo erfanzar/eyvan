@@ -430,6 +430,43 @@ async def test_a_traversal_out_of_a_declared_prefix_is_refused_at_the_worker(tmp
     assert _files(tmp_path / "worker-disk", "*") == []
 
 
+async def test_a_link_on_an_intermediate_directory_is_refused_at_the_worker(tmp_path: Path) -> None:
+    """Every component of the name is checked, because the lookup follows each.
+
+    ``assets/d -> outside`` never presents a symlink at the end of the name:
+    ``d/secret.bin`` reads as an ordinary file, so a guard that tested only the
+    final component would follow the link in the middle and copy a file the
+    workload cannot read into a directory it can.
+    """
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(b"root-only")
+    declared = tmp_path / "assets"
+    declared.mkdir()
+    (declared / "d").symlink_to(outside)
+    repository = InMemoryRepository()
+    await repository.open()
+    _transport, driver = _worker(tmp_path, stager=_worker_stager(tmp_path, allowed=(str(declared),)))
+    _service, _executors, client = _agent(tmp_path, driver)
+    controller = _controller(repository, client)
+    await _seed(
+        repository,
+        cells=[_cell()],
+        workloads=[_workload(str(declared / "d" / "secret.bin"))],
+        leases=[_lease()],
+    )
+
+    counts = await controller.stage_cell_assets_once(now=NOW)
+    stored = (await _stages(repository))[0]
+
+    assert counts == {**_EMPTY_PASS, "blocked": 1}
+    assert stored.state is CellStageState.BLOCKED
+    assert "symbolic link" in (stored.detail or "")
+    # The redirected bytes never reached the disk the workload reads.
+    assert _files(tmp_path / "worker-disk", "*") == []
+
+
 async def test_the_bound_is_still_a_term_of_the_request_after_the_hop(tmp_path: Path) -> None:
     """The byte bound is what makes a cell budget bound anything at all."""
 
@@ -538,6 +575,71 @@ async def test_a_partial_fetch_is_still_inconclusive_and_leaves_its_resume_point
     await controller.stage_cell_assets_once(now=NOW + timedelta(minutes=1))
 
     assert [path.read_bytes() for path in _files(tmp_path / "worker-disk", "*.part")] == [payload[:2048]]
+
+
+async def test_a_complete_partial_copy_is_published_without_asking_the_source_again(tmp_path: Path) -> None:
+    """A crash between the transfer and the publish must not block the asset.
+
+    When every declared byte is already in the ``.part``, a retry that asked
+    the source for ``bytes=<declared>-`` would draw a 416 from a compliant
+    server -- a 4xx, and therefore a terminal refusal, over bytes sitting on
+    this disk that would verify. The complete copy is finished locally instead:
+    read back, and published.
+    """
+
+    payload = b"finished" * 512
+
+    class _FlakyThenWhole:
+        """Declares the full length; delivers half first, and records every ask."""
+
+        def __init__(self) -> None:
+            self.streams = 0
+
+        def size(self, _reference) -> int:
+            return len(payload)
+
+        def stream(self, _reference, *, offset: int):
+            import contextlib
+
+            self.streams += 1
+            body = payload if self.streams > 1 else payload[:1024]
+
+            @contextlib.contextmanager
+            def opened():
+                yield AssetStream(offset=offset, chunks=iter([body[offset:]]))
+
+            return opened()
+
+    source = _FlakyThenWhole()
+    repository = InMemoryRepository()
+    await repository.open()
+    stager = _worker_stager(tmp_path, allowed=("part://",), sources={"part": source})
+    _transport, driver = _worker(tmp_path, stager=stager)
+    _service, _executors, client = _agent(tmp_path, driver)
+    controller = _controller(repository, client)
+    await _seed(repository, cells=[_cell()], workloads=[_workload("part://dataset")], leases=[_lease()])
+
+    first = await controller.stage_cell_assets_once(now=NOW)
+    partial = _files(tmp_path / "worker-disk", "*.part")[0]
+    # The crash state the fix is about: every declared byte on disk, no
+    # publish -- the state a kill between the write and the replace leaves.
+    with partial.open("ab") as handle:
+        handle.write(payload[partial.stat().st_size :])
+    assert partial.stat().st_size == len(payload)
+
+    second = await controller.stage_cell_assets_once(now=NOW + timedelta(minutes=1))
+    stored = (await _stages(repository))[0]
+
+    assert first["inconclusive"] == 1
+    assert second["staged"] == 1
+    assert stored.state is CellStageState.STAGED
+    assert stored.observed_bytes == len(payload)
+    assert stored.digest == _digest(payload)
+    # The source was never asked to resume: a ranged request is exactly the
+    # ask a compliant server answers 416 to once the file is complete.
+    assert source.streams == 1
+    assert [path.read_bytes() for path in _files(tmp_path / "worker-disk", "assets/*")] == [payload]
+    assert _files(tmp_path / "worker-disk", "*.part") == []
 
 
 async def test_an_unreachable_worker_is_unknown_and_never_no_executor(tmp_path: Path) -> None:

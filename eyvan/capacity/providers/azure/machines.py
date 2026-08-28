@@ -25,6 +25,7 @@ release, which is the same reasoning that makes EC2 spot requests one-time here.
 
 from __future__ import annotations
 
+import base64
 import re
 import typing as tp
 
@@ -149,7 +150,10 @@ def vm_body(
 
     user_data = desired.get("user_data")
     if isinstance(user_data, str) and user_data:
-        properties["userData"] = user_data
+        # ARM's userData contract is base-64: sent raw, a cloud-init script is
+        # decoded to garbage by the platform while provisioningState still
+        # reads Succeeded, so the corruption never surfaces as an error.
+        properties["userData"] = base64.b64encode(user_data.encode("utf-8")).decode("ascii")
 
     body: JsonObject = {
         "location": location,

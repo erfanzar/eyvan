@@ -1046,6 +1046,28 @@ def test_a_pool_that_keeps_failing_stops_being_asked_for_new_capacity() -> None:
     assert exhausted.acquisition_exhausted_workload_ids == frozenset({workload.id})
 
 
+def test_a_deleted_cell_frozen_belief_never_exhausts_its_pool() -> None:
+    """A tombstone's failures must not park the pool's future workloads.
+
+    Deleted cells are retained forever and their belief is frozen -- only the
+    cell's own SUCCESS resets it, and a deleted cell has none. Counting them
+    in the acquisition bound meant one cell that crossed the bound during an
+    outage parked every later workload for that pool permanently, and the gate
+    blocked the very acquisitions that could have cured the belief.
+    """
+
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+
+    tombstone = _failing_cell(pool, "cell-1", consecutive_failures=MAX_CONSECUTIVE_ACQUISITION_FAILURES).model_copy(
+        update={"state": CellState.DELETED}
+    )
+    simulation = CapacitySimulation.build((pool,), (tombstone,), (workload,), (), utcnow())
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset()
+    assert len(simulation.cells) == 1, "the pool is still asked for new capacity"
+
+
 def test_one_healthy_alternate_keeps_the_workload_launching() -> None:
     """The bound is per pool, not per workload: another zone is still tried."""
 

@@ -289,3 +289,60 @@ async def test_the_estimate_writes_nothing() -> None:
         assert await tx.list_workloads(org_id="acme", project_id="research") == []
         assert await tx.list_leases(org_id="acme", project_id="research") == []
         assert await tx.list_events(org_id="acme", project_id="research") == []
+
+
+def _multislice_pool() -> CapacityPoolRecord:
+    resources = ResourceLimits(tpu=8)
+    return CapacityPoolRecord(
+        id="research/v5p-8",
+        fleet_name="research",
+        node_type="v5p-8",
+        provider="gcp",
+        capacity_backend="gcp-tpu",
+        provider_project="gcp-project-a",
+        region="us-east5",
+        zone="us-east5-a",
+        capacity=resources,
+        allocatable=resources,
+        unit_prices={"tpu": 2.0},
+        accelerator_type="v5p-8",
+        capacity_class=CapacityClass.ON_DEMAND,
+        executor="eyvan-native",
+        agent_endpoint="http://agent:8080",
+        max_cells=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_multislice_estimate_counts_cells_not_cells_times_workers() -> None:
+    """``make_cell(worker_count=N)`` already builds and prices an N-wide cell.
+
+    The estimate multiplied that worker-scaled hourly by
+    ``cell_group_count * worker_count`` again, so a pods=8 job was priced eight
+    times its real hourly -- and a hard budget then refused affordable multislice
+    work as unaffordable. Placement is one physical cell of width N here, so
+    ``cells`` is the cell group count and nothing else.
+    """
+
+    service = await _service()
+    await _seed(service, _multislice_pool())
+    spec = WorkloadDefinition(
+        name="train",
+        execution=CommandExecution(kind="command", command="python train.py"),
+        gang=ResourceGang(replicas=1, per_replica=ResourceVector(tpu=8)),
+        accelerator_type="v5p-8",
+        capacity_class=CapacityClass.ON_DEMAND,
+        provider="gcp",
+        region="us-east5",
+        required_executor="eyvan-native",
+        worker_count=2,
+    )
+
+    estimate = await service.estimate_workload(_principal(), org_id="acme", project_id="research", spec=spec)
+
+    assert len(estimate.candidates) == 1
+    candidate = estimate.candidates[0]
+    # One 2-worker cell: 16 tpu at 2/unit -- not two of it.
+    assert candidate.cells == 1
+    assert candidate.hourly_cost == pytest.approx(32.0)
+    assert candidate.estimated_cost == pytest.approx(32.0)

@@ -74,6 +74,8 @@ from eyvan.worker.runtime.log_records import (
     merge_pages,
 )
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.native_slice import _RESUME_CHECKPOINT_ENV
+from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
 #: The one definition now lives beside the GPU rendezvous port, because the two
@@ -486,6 +488,11 @@ class NativeGangExecutor:
             if all(declared_gpu)
             else None
         )
+        # Checkpoint destinations this executor has launched, by workload remote
+        # ID. ``status`` reports each rank's derived destination beside its
+        # state; an executor resolved fresh for one request knows of no launch
+        # and reports no destination.
+        self._checkpoint_output_uris: dict[str, str] = {}
 
     def health(self) -> bool:
         """Return whether every native worker accepts its cell-scoped credential."""
@@ -514,6 +521,15 @@ class NativeGangExecutor:
             # reason the JAX topology is: a value the submission chose must not
             # survive into a rank whose devices Eyvan has decided.
             environment = without_gpu_topology_overrides(environment)
+        # The checkpoint hook writes to ``{base}/rank-{n}``, so a resume handed
+        # the bare base URI reads an object that was never written: the workload
+        # sees "no checkpoint" and silently restarts from scratch. The slice
+        # dispatch derives the per-rank address for exactly this reason, and a
+        # gang rank is checkpointed by the same hook, so both paths have to
+        # agree; the name is imported rather than restated so they cannot drift.
+        resume_uri = environment.get(_RESUME_CHECKPOINT_ENV, "")
+        if resume_uri:
+            environment[_RESUME_CHECKPOINT_ENV] = _rank_checkpoint_uri(resume_uri, rank)
         python_path = environment.get("PYTHONPATH", "")
         environment.update(
             {
@@ -594,6 +610,10 @@ class NativeGangExecutor:
         """Aggregate typed rank observations into one durable gang state."""
 
         workers: list[_GangWorkerObservation] = []
+        # Derived exactly as the checkpoint hook derives its write destination,
+        # so a row that names a checkpoint names an object that exists. Unknown
+        # while this executor launched no checkpoint, and never invented.
+        checkpoint_base = self._checkpoint_output_uris.get(remote_id)
         for rank, worker in enumerate(self._workers):
             try:
                 observation = _normalize_worker_observation(
@@ -616,6 +636,7 @@ class NativeGangExecutor:
                     rank=rank,
                     worker=worker,
                     observation=observation,
+                    checkpoint_uri=None if checkpoint_base is None else _rank_checkpoint_uri(checkpoint_base, rank),
                 )
             )
         status = _aggregate_status(workers)
@@ -758,6 +779,10 @@ class NativeGangExecutor:
                     raise RuntimeError(
                         f"native gang worker returned unexpected checkpoint ID {launched!r}; expected {checkpoint_id!r}"
                     )
+            # Recorded only once every rank launched, so a status can never name
+            # a destination for a checkpoint this executor failed to start.
+            if output_uri:
+                self._checkpoint_output_uris[remote_id] = output_uri
             return checkpoint_id
         except BaseException as launch_error:
             retire_failures: list[str] = []

@@ -604,6 +604,29 @@ class _ControllerPreemption:
         checkpoint_uris: dict[str, str | None],
     ) -> None:
         victims = self._preemption_victims(command)
+        # A victim whose execution is observed SUCCEEDED or FAILED is settled
+        # terminal inside the transaction below, and settlement releases its
+        # lease -- which frees the cell for deletion and destroys the journal.
+        # Archive the tail first, the same best-effort step _release_terminal
+        # takes on every ordinary terminal path, and for the same reason: a job
+        # that ran must still be recorded as finished even if its logs could not
+        # be saved. Outside the transaction: the archive opens its own.
+        outcomes = self._preemption_victim_outcomes(command)
+        finished_outcomes = {_PreemptionVictimOutcome.SUCCEEDED, _PreemptionVictimOutcome.FAILED}
+        if any(outcome in finished_outcomes for outcome in outcomes.values()):
+            async with self.repository.transaction() as transaction:
+                finished = [
+                    await transaction.get_workload(victim.workload_id)
+                    for victim in victims
+                    if outcomes.get(victim.lease_id) in finished_outcomes
+                ]
+            for workload in finished:
+                if workload is None:
+                    continue
+                try:
+                    await self._archive_terminal_logs(workload)
+                except Exception:
+                    logger.warning("could not archive logs for %s before release", workload.id, exc_info=True)
         async with self.repository.transaction() as transaction:
             current_command = await transaction.get_outbox(command.id)
             if current_command is None:
@@ -694,6 +717,12 @@ class _ControllerPreemption:
                             generation=next_generation,
                         ),
                         "lease_id": None,
+                        # Same reset the sibling resume path performs: the
+                        # released generation's lease group belongs to that
+                        # generation. Keeping it with no leader lease would
+                        # violate the leader-first shape _current_leases
+                        # enforces and strand the requeued workload.
+                        "lease_ids": (),
                         "dispatch_reservation": None,
                         "remote_id": None,
                         "checkpoint_uri": checkpoint_uri,

@@ -182,31 +182,66 @@ def _dashboard_headers(**overrides: str) -> dict[str, str]:
     return headers
 
 
-def _credential_app(tmp_path: Path) -> FastAPI:
+def _credential_app(tmp_path: Path) -> tuple[FastAPI, LocalDevelopmentCredential]:
     """An app whose loopback auth demands the owner-only credential."""
 
     store = LocalDevelopmentCredentialStore(tmp_path / "credential")
-    return _identity_app(
+    credential = store.load_or_create()
+    app = _identity_app(
         RequestAuthenticator(
             EyvanSettings(dev_auth_enabled=True),
-            local_development_credential=store.load_or_create(),
+            local_development_credential=credential,
         )
     )
+    return app, credential
 
 
-def test_the_dashboard_this_plane_served_is_authenticated_without_the_credential(tmp_path: Path) -> None:
-    """A browser cannot read a 0600 file.
+def test_the_dashboard_is_refused_once_a_credential_exists(tmp_path: Path) -> None:
+    """Sec-Fetch-Site and Host are request headers any local process can send.
 
-    So the dashboard a loopback plane serves at "/" could not authenticate to
-    the plane serving it, and the answer was to run a second web server on the
-    machine already running the first one.
+    curl to 127.0.0.1 already sends Host, and one more forged header made the
+    plane answer as the owner. A check that accepted them *instead of* the 0600
+    credential was a bypass, so once a credential has been issued it is
+    required of every caller -- the plane's own dashboard included. The
+    dashboard presents the credential like any other client (the development
+    launcher hands it the value the 0600 file holds).
     """
 
-    with TestClient(_credential_app(tmp_path)) as client:
+    app, _credential = _credential_app(tmp_path)
+    with TestClient(app) as client:
         response = client.get("/identity", headers=_dashboard_headers())
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "local Eyvan development credential is required"}
+
+
+def test_the_dashboard_presenting_the_credential_gets_the_owners_defaults(tmp_path: Path) -> None:
+    """The page this plane served acts as this machine's owner, like before."""
+
+    app, credential = _credential_app(tmp_path)
+    headers = {**_dashboard_headers(), LOCAL_DEVELOPMENT_CREDENTIAL_HEADER: credential.value}
+    with TestClient(app) as client:
+        response = client.get("/identity", headers=headers)
 
     assert response.status_code == 200
     assert "fleet_admin" in response.json()["roles"]
+
+
+def test_a_non_ascii_credential_header_answers_401_and_never_500(tmp_path: Path) -> None:
+    """``compare_digest`` raises ``TypeError`` for non-ASCII ``str`` arguments.
+
+    The header is caller-controlled, so unauthenticated garbage must come back
+    as a refused credential, not as a server error.
+    """
+
+    app, _credential = _credential_app(tmp_path)
+    # A caller puts raw bytes on the wire and the ASGI server decodes them as
+    # latin-1, so the app sees the str that httpx refuses to send itself.
+    headers = {**_dashboard_headers(), LOCAL_DEVELOPMENT_CREDENTIAL_HEADER: "tök".encode("latin-1")}
+    with TestClient(app) as client:
+        response = client.get("/identity", headers=headers)
+
+    assert response.status_code == 401
 
 
 def test_another_sites_page_reaching_this_plane_is_refused(tmp_path: Path) -> None:
@@ -214,7 +249,7 @@ def test_another_sites_page_reaching_this_plane_is_refused(tmp_path: Path) -> No
     requests to 127.0.0.1. The browser labels those cross-site, and page script
     cannot forge that header -- Sec-Fetch-Site is on the forbidden list."""
 
-    with TestClient(_credential_app(tmp_path)) as client:
+    with TestClient(_credential_app(tmp_path)[0]) as client:
         response = client.get("/identity", headers=_dashboard_headers(**{"Sec-Fetch-Site": "cross-site"}))
 
     assert response.status_code == 401
@@ -227,7 +262,7 @@ def test_a_non_browser_client_on_loopback_still_needs_the_credential(tmp_path: P
     fetch metadata at all. It is refused exactly as before.
     """
 
-    with TestClient(_credential_app(tmp_path)) as client:
+    with TestClient(_credential_app(tmp_path)[0]) as client:
         response = client.get("/identity")
 
     assert response.status_code == 401
@@ -239,7 +274,7 @@ def test_a_rebound_dns_name_is_refused_though_the_browser_calls_it_same_origin(t
     same-origin request. It carries their name in Host, which is why Host must
     be a loopback literal and never a name."""
 
-    with TestClient(_credential_app(tmp_path)) as client:
+    with TestClient(_credential_app(tmp_path)[0]) as client:
         response = client.get("/identity", headers=_dashboard_headers(Host="evil.example.com"))
 
     assert response.status_code == 401
@@ -249,7 +284,7 @@ def test_a_top_level_navigation_to_an_api_url_is_not_the_dashboard(tmp_path: Pat
     """Typing an API URL into the address bar is same-origin too, and there is
     no reason for a navigation to authenticate."""
 
-    with TestClient(_credential_app(tmp_path)) as client:
+    with TestClient(_credential_app(tmp_path)[0]) as client:
         response = client.get("/identity", headers=_dashboard_headers(**{"Sec-Fetch-Mode": "navigate"}))
 
     assert response.status_code == 401
@@ -274,13 +309,15 @@ def test_a_header_the_dashboard_sends_still_wins_over_the_default(tmp_path: Path
     """Otherwise the scope picker would be inert: every request would act in the
     default project however the operator set it."""
 
-    with TestClient(_credential_app(tmp_path)) as client:
-        response = client.get(
-            "/identity",
-            headers=_dashboard_headers(
-                **{"X-Eyvan-User": "someone", "X-Eyvan-Roles": "viewer"},
-            ),
-        )
+    app, credential = _credential_app(tmp_path)
+    headers = {
+        **_dashboard_headers(),
+        LOCAL_DEVELOPMENT_CREDENTIAL_HEADER: credential.value,
+        "X-Eyvan-User": "someone",
+        "X-Eyvan-Roles": "viewer",
+    }
+    with TestClient(app) as client:
+        response = client.get("/identity", headers=headers)
 
     assert response.status_code == 200
     assert response.json() == {"subject": "someone", "roles": ["project_viewer"]}

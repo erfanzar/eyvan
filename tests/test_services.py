@@ -544,6 +544,28 @@ async def test_a_steady_service_takes_no_action() -> None:
     assert await controller.reconcile_services_once() == 0
 
 
+async def test_two_leaders_submitting_one_slot_start_one_replica() -> None:
+    """The replica key is the fence between concurrent leaders.
+
+    Two leaders that read the same children mint the same key for the same
+    slot, so the second submit replays the first one's replica instead of
+    starting a second one next to it.
+    """
+
+    controller, _service, record = await _service_plane(ServicePolicy(replicas=1, revision="v1"))
+    policy = ServicePolicy(replicas=1, revision="v1")
+    async with controller.repository.transaction() as transaction:
+        service = await transaction.get_workload(record.id)
+
+    await controller._start_service_replica(service, policy, slot=0)
+    await controller._start_service_replica(service, policy, slot=0)
+
+    async with controller.repository.transaction() as transaction:
+        children = await transaction.list_child_workloads(record.id)
+
+    assert len(children) == 1
+
+
 async def test_a_replica_never_retries_inside_itself() -> None:
     """The service is the thing that restarts.
 

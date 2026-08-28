@@ -396,6 +396,11 @@ def test_agent_requires_configured_bearer_token(tmp_path) -> None:
 
     assert client.get("/healthz").status_code == 200
     assert client.get("/api/v1/capabilities").status_code == 401
+    # A non-ASCII header must be a refused credential (401), not the 500 the
+    # TypeError inside compare_digest used to raise. Sent as the raw latin-1
+    # bytes a caller puts on the wire, which the ASGI server decodes to str.
+    non_ascii = client.get("/api/v1/capabilities", headers={"Authorization": "Bearer tök".encode("latin-1")})
+    assert non_ascii.status_code == 401
     response = client.get("/api/v1/capabilities", headers={"Authorization": "Bearer secret"})
 
     assert response.status_code == 200
@@ -1073,6 +1078,81 @@ def test_an_agent_predating_the_worker_route_reports_none(tmp_path) -> None:
     )
 
     assert client.worker_builds("cell-a") is None
+
+
+def test_a_null_worker_builds_answer_reports_none_to_the_client() -> None:
+    """200 with a null body is the answer of a driver that cannot be asked.
+
+    The agent answers exactly this when its execution driver has no
+    worker-builds probe, so reading it as a malformed answer put dispatch to
+    every such cell into an unbounded retry.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"null")
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    assert client.worker_builds("cell-a") is None
+
+
+def test_a_non_array_worker_builds_answer_still_raises() -> None:
+    """Only the null body means "cannot be asked"; every other shape stays an error."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json="cell-a")
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(ValueError):
+        client.worker_builds("cell-a")
+
+
+def test_exec_derives_its_http_timeout_from_the_command_budget() -> None:
+    """The agent may hold the exec answer for the whole requested ``timeout_s``.
+
+    With no per-request timeout the client default of 30 seconds fired first on
+    a command budgeted for minutes, and the observation recorded a rank error
+    while the command was still running on the agent.
+    """
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit_code": 0})
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    client.exec_in_workload("cell-a", "wl-1", ["py-spy", "dump"], timeout_s=600.0)
+
+    timeout = requests[0].extensions["timeout"]
+    assert timeout["read"] == 630.0
+
+
+def test_exec_http_timeout_stays_capped_for_out_of_contract_budgets() -> None:
+    """A budget past the wire contract's ``le=600`` cannot pin the connection forever."""
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit_code": 0})
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    client.exec_in_workload("cell-a", "wl-1", ["true"], timeout_s=10_000.0)
+
+    timeout = requests[0].extensions["timeout"]
+    assert timeout["read"] == 660.0
 
 
 def test_an_agent_that_predates_the_route_reports_no_build_rather_than_failing() -> None:

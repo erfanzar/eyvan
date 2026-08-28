@@ -535,7 +535,13 @@ class _ControllerFleets:
                     replacement_reasons[cell.id] = CapacityReplacementReason.SHARED_QUOTA_REBALANCE
                     continue
                 if cell.id in protected:
-                    if cell.idle_since is not None:
+                    # On a held shrink pass the shape is protected by the
+                    # hysteresis alone, and clearing idle clocks here would
+                    # erase the very clocks the post-window fall drains
+                    # against -- with the hold re-arming on every pass, no
+                    # clock ever survived long enough to time out. Cells
+                    # protected because demand wants them still get the reset.
+                    if not plan.shrink_held and cell.idle_since is not None:
                         updates.append((cell.id, cell.generation, None))
                     continue
                 idle_since = cell.idle_since or now
@@ -678,7 +684,7 @@ class _ControllerFleets:
         if not cell_matches_pool(cell, pool):
             raise CapacityApplySuperseded(f"cell {cell.id!r} no longer matches pool {pool.id!r}'s active template")
 
-    async def capacity_orphans(self) -> list[dict[str, str | int | None]]:
+    async def capacity_orphans(self) -> dict[str, object]:
         """Return cells an agent still holds that no control-plane record claims.
 
         A fleet-state document outlives the control plane that wrote it. When a

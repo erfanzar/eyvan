@@ -7,14 +7,65 @@
 
 from __future__ import annotations
 
+import typing as tp
+
 from click.testing import CliRunner
 
+import eyvan.sdk.cli as cli
 import eyvan.sdk.commands.dashboard as dashboard_commands
 from eyvan.sdk.cli import main
+from eyvan.sdk.commands.http import EyvanApiError
 
 
 def _env(output: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.strip().splitlines() if "=" in line)
+
+
+class _RaisingClient:
+    """A client whose GET / answers with one fixed API error."""
+
+    def __init__(self, status_code: int) -> None:
+        self._error = EyvanApiError(status_code, "no such route")
+
+    def request(self, method: str, path: str, **_kwargs: tp.Any) -> tp.Any:
+        del method, path
+        raise self._error
+
+    def replace_identity_headers(self, headers: tp.Mapping[str, str]) -> None:
+        del headers
+
+
+def test_a_404_on_the_probe_names_the_missing_dashboard(monkeypatch) -> None:
+    """The wheel-install answer: the plane is up, its API answers, it hosts no UI.
+
+    The probe used to read ``.status_code`` off a decoded JSON document, so the
+    404 always drowned in the generic handler and the operator got the bare 404
+    in a browser instead of this guidance.
+    """
+
+    opened: list[str] = []
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _RaisingClient(404))
+
+    result = CliRunner().invoke(main, ["--url", "https://eyvan.example.com", "dashboard"])
+
+    assert result.exit_code != 0
+    assert "hosts no dashboard" in result.output
+    assert "dashboard-dev" in result.output
+    assert opened == []
+
+
+def test_any_other_probe_failure_still_opens_the_dashboard(monkeypatch) -> None:
+    """Only a 404 means "no dashboard here"; a 403 is a credential question."""
+
+    opened: list[str] = []
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _RaisingClient(403))
+
+    result = CliRunner().invoke(main, ["--url", "https://eyvan.example.com", "dashboard", "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == []
 
 
 def test_dashboard_opens_the_hosted_control_plane_url(monkeypatch) -> None:

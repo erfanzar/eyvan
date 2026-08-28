@@ -603,6 +603,33 @@ def test_a_declared_python_builds_the_worker_environment_with_uv() -> None:
     assert "Eyvan needs uv to build a Python 3.13 worker environment" in script
 
 
+def test_a_full_declared_python_version_matches_the_interpreter_guard() -> None:
+    """A full version ("3.11.9") is a valid uv declaration and still a 3.11 pin.
+
+    The guard compares the running interpreter's major.minor, so the declared
+    text is reduced to the same two components before the two are compared.
+    Comparing the declared *text* against that join never matched -- "3.11.9"
+    is never "3.11" -- and the venv was torn down and rebuilt on every boot,
+    which is the exact every-boot rebuild the guard exists to prevent.
+    """
+
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/p/secrets/s/versions/1",
+        runtime_python="3.11.9",
+    )
+
+    # uv receives the declaration as spelled: a full version names the exact
+    # interpreter to fetch.
+    assert "uv venv --seed --python 3.11.9 /opt/eyvan-native/venv" in script
+    # The guard compares major.minor to major.minor, as a quoted string, so an
+    # interpreter that already matches keeps its venv across boots.
+    assert "sys.version_info[:2])) == '3.11' else 1)" in script
+    assert "'3.11.9' else 1)" not in script
+
+
 def test_an_undeclared_python_renders_exactly_the_script_it_always_did() -> None:
     """A fleet that declares nothing must boot the way it always booted."""
 

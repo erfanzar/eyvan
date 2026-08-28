@@ -410,9 +410,12 @@ class NodeTypeBase(FleetConfigModel):
         omitted an input it never sees. ``eyvan doctor`` upgrades this to a failure when
         a hard money budget actually applies, which is the only context that makes the
         omission dangerous.
+
+        A declared zero counts as priced, matching ``CapacityCell.prices_cover``:
+        a zero is a statement about cost, not an omission.
         """
 
-        priced = {name for name, price in self.unit_prices.items() if price}
+        priced = set(self.unit_prices)
         unpriced = sorted(
             name
             for name, amount in _resource_values(self.resources).items()

@@ -55,13 +55,21 @@ ON_DEMAND_POOL = {
 }
 
 
-def _lease(cell_id: str, *, settled: float = 0.0, hours: float = 0.0, reserved: float = 0.0) -> dict:
+def _lease(
+    cell_id: str,
+    *,
+    settled: float = 0.0,
+    hours: float = 0.0,
+    reserved: float = 0.0,
+    settled_at: str | None = None,
+) -> dict:
     return {
         "id": f"lease-{cell_id}",
         "cell_id": cell_id,
         "settled_cost": settled,
         "reserved_cost": reserved,
         "accelerator_hours_settled": {"tpu": hours} if hours else {},
+        "settled_at": settled_at,
     }
 
 
@@ -106,6 +114,27 @@ def test_a_workload_that_never_leased_says_so() -> None:
     )
 
     assert any("never held a lease" in line for line in lines)
+
+
+def test_a_settled_lease_stops_counting_as_reserved_money() -> None:
+    """Settlement turned the reservation into the bill, so only it is money held.
+
+    Settlement keeps the original ``reserved_cost`` standing on the record next
+    to the ``settled_cost`` it became; presenting both on a finished run would
+    report an estimate as money the tenant still holds.
+    """
+
+    spend = spend_of(
+        [
+            _lease("cell-a", settled=4.8, hours=4.0, reserved=24.0, settled_at="2026-01-01T00:00:00+00:00"),
+            _lease("cell-b", reserved=12.0),
+        ],
+        priced_cells={"cell-a", "cell-b"},
+    )
+
+    assert spend.reserved == 12.0
+    assert spend.settled == 4.8
+    assert spend.leases == 2
 
 
 # --------------------------------------------------------------------------- what it prints

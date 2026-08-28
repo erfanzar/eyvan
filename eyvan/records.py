@@ -354,6 +354,7 @@ class NativeRuntimeConfig(EyvanModel):
             artifacts=(*self.artifacts, *override.artifacts),
             vm_image=override.vm_image if override.vm_image is not None else self.vm_image,
             container=override.container if override.container is not None else self.container,
+            python=override.python if override.python is not None else self.python,
         )
 
     @model_validator(mode="after")

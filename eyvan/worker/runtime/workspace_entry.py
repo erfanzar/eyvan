@@ -29,12 +29,19 @@ import argparse
 import hashlib
 import hmac
 import os
+import shutil
 import sys
+import tempfile
 import typing as tp
 import urllib.request
 from pathlib import Path
 
 DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
+
+#: Written only after an extraction succeeds, and only ever seen inside a
+#: published directory. A tree without it is a crashed attempt's partial
+#: extraction, which is rebuilt rather than entered.
+COMPLETE_MARKER = ".eyvan-extraction-complete"
 
 
 def _fetch(uri: str, *, token: str | None) -> bytes:
@@ -57,9 +64,17 @@ def materialize(
     sha256: str,
     signature: str | None,
     signing_key: bytes | None,
-    destination: Path,
+    base: Path,
 ) -> Path:
-    """Verify and unpack a bundle, returning the directory it landed in."""
+    """Verify and unpack a bundle under ``base``, returning where it landed.
+
+    Both checks run before anything is written, and the extraction is named by
+    the bundle's digest: a retry, another rank on the host, or the next
+    workload shipping the same tree finds the completed directory and reuses
+    it, where one shared destination would meet the extractor's
+    refuse-non-empty rule and fail forever. Only a directory carrying the
+    completion marker is reused, so a crashed attempt is rebuilt whole.
+    """
 
     digest = hashlib.sha256(payload).hexdigest()
     if not hmac.compare_digest(digest, sha256):
@@ -68,9 +83,41 @@ def materialize(
         expected = hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
         if signature is None or not hmac.compare_digest(expected, signature):
             raise ValueError("workspace bundle signature mismatch")
-    from eyvan._internal.workspace import extract_workspace
+    from eyvan._internal.workspace import create_private_directory, extract_workspace
 
-    extract_workspace(payload, destination)
+    # One directory per bundle digest: a digest's contents are immutable, so a
+    # digest whose extraction exists already holds exactly this bundle's tree.
+    destination = base / digest[:12]
+    if (destination / COMPLETE_MARKER).is_file():
+        return destination
+
+    create_private_directory(base)
+    if destination.exists():
+        # No marker means an earlier attempt died mid-extract. The extractor
+        # refuses non-empty destinations, so a partial tree can only be
+        # replaced, never filled in.
+        shutil.rmtree(destination, ignore_errors=True)
+    # Extract into a private staging directory and publish with one rename.
+    # Two ranks racing on the same host each build a complete tree, and the
+    # loser of the rename reuses the winner's -- nobody enters a
+    # half-populated extraction, because the marker becomes visible together
+    # with the directory it vouches for. mkdtemp names the staging directory
+    # uniquely, so concurrent attempts never collide even within one process.
+    staging = Path(tempfile.mkdtemp(dir=base, prefix=f".{digest[:12]}.staging-"))
+    try:
+        extract_workspace(payload, staging)
+        (staging / COMPLETE_MARKER).write_text(digest, encoding="utf-8")
+        try:
+            os.replace(staging, destination)
+        except OSError:
+            # Lost the rename race to a rank that published first; reuse its
+            # extraction. Any other failure is real.
+            if not (destination / COMPLETE_MARKER).is_file():
+                raise
+    finally:
+        # A no-op after a successful rename; it is what keeps a failed or
+        # redundant attempt from leaving a staging tree behind.
+        shutil.rmtree(staging, ignore_errors=True)
     return destination
 
 
@@ -86,7 +133,13 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args(list(argv) if argv is not None else None)
 
-    command = [item for item in arguments.command if item != "--"]
+    command = list(arguments.command)
+    # argparse hands the wrapper its own end-of-options marker back inside the
+    # remainder; consume exactly that one. Any later `--` belongs to the
+    # workload's command line -- `python tool.py -- --fast` means something --
+    # and must be exec'd verbatim.
+    if command and command[0] == "--":
+        del command[0]
     if not command:
         parser.error("a command to execute is required")
 
@@ -101,14 +154,14 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
 
     signing_key_value = os.environ.get("EYVAN_CALLABLE_SIGNING_KEY")
     signing_key = signing_key_value.encode() if signing_key_value else None
-    destination = Path(os.environ.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / DEFAULT_WORKSPACE_DIRNAME))
+    base = Path(os.environ.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / DEFAULT_WORKSPACE_DIRNAME))
 
     workspace = materialize(
         _fetch(uri, token=token),
         sha256=arguments.workspace_sha256,
         signature=arguments.workspace_signature,
         signing_key=signing_key,
-        destination=destination,
+        base=base,
     )
     os.chdir(workspace)
     # `exec` rather than spawn: the workload must keep the PID systemd started,

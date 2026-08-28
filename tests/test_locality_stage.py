@@ -1109,6 +1109,20 @@ def test_protection_is_read_from_live_leases_not_from_the_stage_row() -> None:
     assert declared_assets_on_cell("cell-a", [running, finished], leases) == frozenset({_DATASET})
 
 
+def test_a_quarantined_lease_still_protects_its_workloads_assets() -> None:
+    """Quarantine fences an expired lease without killing the work.
+
+    Observation can return the lease to active, and the workload is running
+    throughout; the window in between is exactly when eviction must not decide
+    the asset under it is now ordinary cache content.
+    """
+
+    running = _workload("wl-live", _DATASET, state=WorkloadState.RUNNING)
+    leases = [_lease("l-live", workload_id="wl-live", cell_id="cell-a", state=LeaseState.QUARANTINED)]
+
+    assert declared_assets_on_cell("cell-a", [running], leases) == frozenset({_DATASET})
+
+
 def test_protection_does_not_cross_cells() -> None:
     """An asset in use on one host says nothing about a copy on another."""
 

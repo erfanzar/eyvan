@@ -196,17 +196,57 @@ def test_the_wrapper_runs_before_the_workspace_entry() -> None:
     It resolves through PATH, and the packages have to be in place by then --
     including `eyvan` itself, which the entry imports. Installing after would
     put the environment on PATH for nothing, because the command has already
-    been exec'd by then.
+    been exec'd by then. And the workload command is emitted verbatim after
+    the wrapper's own `--`: a `--` inside the job's command is end-of-options
+    to the job, not to this wrapper.
     """
 
     from eyvan.server.controller.workload_commands import _ControllerWorkloadCommands
 
     wrapped = _ControllerWorkloadCommands._dependency_entrypoint(
         ("flax",),
-        "python -m eyvan.worker.runtime.workspace_entry --workspace-uri file:///w -- python train.py",
+        "python -m eyvan.worker.runtime.workspace_entry --workspace-uri file:///w -- python train.py -- --fast",
     )
 
     assert wrapped.index("dependency_entry") < wrapped.index("workspace_entry")
+    assert wrapped.endswith("-- python train.py -- --fast")
+
+
+def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path, monkeypatch) -> None:
+    """`python tool.py -- --fast` must not exec as `python tool.py --fast`.
+
+    The wrapper consumes only its own end-of-options marker; stripping every
+    bare `--` from the remainder silently rewrote the job's command line.
+    """
+
+    environment = tmp_path / "env"
+    environment.mkdir()
+    monkeypatch.setattr(dependency_entry, "prepare", lambda requirements: environment)
+
+    class Executed(BaseException):
+        """What `os.execvp` would have run, instead of replacing the process."""
+
+        def __init__(self, command: list[str]) -> None:
+            self.command = command
+
+    def fake_execvp(program: str, arguments: list[str]) -> None:
+        del program  # execvp(command[0], command): the full line is already in arguments
+        raise Executed(list(arguments))
+
+    monkeypatch.setattr(dependency_entry.os, "execvp", fake_execvp)
+    saved = dict(os.environ)  # activate() rewrites the process environment
+    try:
+        for argv in (
+            ["--require", "flax", "--"],
+            ["--require", "flax"],
+        ):
+            with pytest.raises(Executed) as raised:
+                dependency_entry.main([*argv, "python", "tool.py", "--", "--fast"])
+
+            assert raised.value.command == ["python", "tool.py", "--", "--fast"]
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 # --------------------------------------------------------------------------- what the CLI sends

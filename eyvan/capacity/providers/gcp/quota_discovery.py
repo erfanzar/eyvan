@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -30,6 +31,14 @@ from eyvan.capacity.providers.gcp.tpu_types import accelerator_generation
 
 _TPU_QUOTA_SERVICE = "tpu.googleapis.com"
 _QUOTA_PREFIX = f"{_TPU_QUOTA_SERVICE}/tpu-"
+
+#: How long one Cloud Quota response is reused before it is read again. Matches
+#: the panel's ``TPU_QUOTA_CACHE_TTL_S``: Monitoring usage is minutes behind
+#: reality anyway, so a shorter window buys no accuracy, but a server process
+#: holding one discovery forever must not freeze the limits it read on first
+#: use -- raised or lowered quotas would never become visible.
+_QUOTA_RESPONSE_TTL_S = 120.0
+
 _GENERATION_ALIASES = {
     "v4s-pod": "v4",
     "v5s-litepod": "v5litepod",
@@ -293,9 +302,16 @@ class GcpTpuQuotaDiscovery:
         usage_discovery: TpuQuotaUsageDiscovery | None = None,
         catalog: ApiAcceleratorCatalog | None = None,
         quota_catalog: ApiQuotaCatalog | None = None,
+        quota_response_ttl_s: float = _QUOTA_RESPONSE_TTL_S,
     ):
         if isinstance(lookup_concurrency, bool) or not isinstance(lookup_concurrency, int) or lookup_concurrency < 1:
             raise ValueError("lookup_concurrency must be a positive integer")
+        if (
+            isinstance(quota_response_ttl_s, bool)
+            or not isinstance(quota_response_ttl_s, (int, float))
+            or quota_response_ttl_s < 0
+        ):
+            raise ValueError("quota_response_ttl_s must be a non-negative number")
         self._runner = runner
         self.lookup_concurrency = lookup_concurrency
         # The fast path. One subprocess per zone was 1.4s of Python startup
@@ -307,10 +323,13 @@ class GcpTpuQuotaDiscovery:
         # interpreter startup for a single response; the API answers it in one
         # request. ``None`` builds the default reader, as with the catalogue.
         self._quota_catalog = ApiQuotaCatalog(_TPU_QUOTA_SERVICE) if quota_catalog is None else quota_catalog
-        #: One provider response per project, reused across capacity classes
-        #: within a single discovery. Not a TTL cache: the caller above already
-        #: owns freshness, and holding it longer here would hide a re-read.
-        self._quota_response_cache: dict[str, JsonValue] = {}
+        #: One provider response per project, expiring after
+        #: ``quota_response_ttl_s``. Within a single discovery every capacity
+        #: class shares the read; across a longer interval the response is
+        #: re-read, so a long-lived server process sees raised or lowered
+        #: quotas instead of the limits that held on first use.
+        self._quota_response_cache: dict[str, tuple[float, JsonValue]] = {}
+        self._quota_response_ttl_s = float(quota_response_ttl_s)
         self._usage_discovery: TpuQuotaUsageDiscovery = (
             usage_discovery if usage_discovery is not None else GcpTpuQuotaUsageDiscovery()
         )
@@ -428,11 +447,15 @@ class GcpTpuQuotaDiscovery:
         # The command does not depend on `preemptible` -- that only selects
         # which rows of the same response are read afterwards. Discovery asks
         # for spot and on-demand in turn, so this ran the identical four-second
-        # gcloud call twice per read for one response.
-        raw = self._quota_response_cache.get(project)
+        # gcloud call twice per read for one response. The entry expires after
+        # the TTL so a long-lived server re-reads the limits.
+        cached = self._quota_response_cache.get(project)
+        raw = None
+        if cached is not None and time.monotonic() - cached[0] < self._quota_response_ttl_s:
+            raw = cached[1]
         if raw is None:
             raw = self._read_quota_limits(project, command)
-            self._quota_response_cache[project] = raw
+            self._quota_response_cache[project] = (time.monotonic(), raw)
         if not isinstance(raw, list):
             raise GcloudQuotaError("gcloud quota response was not a list")
         regions: dict[tuple[str, str], _QuotaLimit] = {}

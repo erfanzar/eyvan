@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -613,6 +614,46 @@ def test_release_asset_download_refuses_a_provider_reported_mutable_release() ->
         )
 
 
+def test_release_download_rejects_a_branch_named_target_commitish() -> None:
+    # The release workflow must create the release with --target <dispatch
+    # SHA>: GitHub otherwise records target_commitish as the default branch
+    # name, and the bootstrap download refuses anything but the exact SHA.
+    downloader = _load_script(ASSET_DOWNLOADER, "eyvan_branch_target_downloader_test")
+    repository = "erfanzar/EasyDeL"
+    assets = [
+        {
+            "id": index,
+            "name": f"asset-{index}.json",
+            "size": 1,
+            "state": "uploaded",
+            "url": f"https://api.github.com/repos/{repository}/releases/assets/{index}",
+        }
+        for index in range(1, downloader.MAX_RELEASE_ASSETS + 1)
+    ]
+    release = {
+        "assets": assets,
+        "draft": False,
+        "immutable": True,
+        "prerelease": False,
+        "tag_name": "eyvan-v0.1.0",
+        "target_commitish": "main",
+    }
+    response = _FakeResponse(json.dumps(release).encode())
+
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> _FakeResponse:
+            return response
+
+    with pytest.raises(downloader.DownloadError, match="does not bind the exact tag and source SHA"):
+        downloader._release_metadata(
+            Opener(),
+            repository=repository,
+            tag="eyvan-v0.1.0",
+            token="fixture-token",
+            expected_target=FULL_SHA,
+        )
+
+
 def test_placeholder_action_sha_is_rejected(tmp_path: Path) -> None:
     value = json.loads(LOCK.read_text())
     value["actions"]["checkout"] = "0" * 40
@@ -1113,6 +1154,91 @@ def test_workflow_separates_read_only_pr_and_environment_gated_release_lanes() -
     assert all("--bundle" not in command for command in image_verifications)
     assert "repository_dispatch" not in release_text  # dispatch uses the GitHub API event type
     assert ":latest" not in release_text
+
+
+def _release_step(step_name_prefix: str) -> dict[str, object]:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").read_text())
+    return next(step for step in workflow["jobs"]["release"]["steps"] if step["name"].startswith(step_name_prefix))
+
+
+def test_every_image_build_uses_the_eyvan_package_context() -> None:
+    # Every Dockerfile copies dashboard/, requirements-*.txt, and eyvan/ relative
+    # to libs/eyvan and demands it as the build context; a repo-root context
+    # kills all six builds at the first COPY.
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").read_text())
+    builds = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if str(step.get("uses", "")).startswith("docker/build-push-action")
+    ]
+    assert len(builds) == 6
+    for step in builds:
+        assert step["with"]["context"] == "libs/eyvan", step["name"]
+        assert re.fullmatch(r"libs/eyvan/Dockerfile(\.agent|\.worker)?", step["with"]["file"]), step["name"]
+
+
+def test_digest_overlay_sets_the_chart_read_image_keys(tmp_path: Path) -> None:
+    # The chart helpers read image/agentImage/workerImage (repository plus a
+    # ^sha256:[0-9a-f]{64}$ digest); controlPlane/agent/worker image keys are
+    # never read and leave mutable defaults in the render.
+    step = _release_step("Package chart, hash digest overlay/render")
+    run = step["run"]
+    assert "controlPlane:" not in run
+    lines = run.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.strip() == "{")
+    end = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip().startswith("}") and "eyvan-release-values.yaml" in line
+    )
+    overlay = tmp_path / "eyvan-release-values.yaml"
+    refs = {
+        "CONTROL_PLANE_REF": f"ghcr.io/erfanzar/eyvan-control-plane@sha256:{'1' * 64}",
+        "AGENT_REF": f"ghcr.io/erfanzar/eyvan-agent@sha256:{'2' * 64}",
+        "WORKER_REF": f"ghcr.io/erfanzar/eyvan-native-worker@sha256:{'3' * 64}",
+    }
+    subprocess.run(
+        ["bash", "-c", "{\n" + "\n".join(lines[start + 1 : end]) + "\n} > '" + str(overlay) + "'"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **refs},
+    )
+    assert yaml.safe_load(overlay.read_text()) == {
+        "image": {"repository": "ghcr.io/erfanzar/eyvan-control-plane", "digest": f"sha256:{'1' * 64}"},
+        "agentImage": {"repository": "ghcr.io/erfanzar/eyvan-agent", "digest": f"sha256:{'2' * 64}"},
+        "workerImage": {"repository": "ghcr.io/erfanzar/eyvan-native-worker", "digest": f"sha256:{'3' * 64}"},
+    }
+    # The agent and its Kubernetes-capacity worker image render only when the
+    # cell agent is enabled, so the evidence render must exercise that path.
+    template_command = run[run.index("helm template") : run.index("verify-rendered-digest-refs")]
+    assert "--values evidence/eyvan-release-values.yaml" in template_command
+    assert "--set cellAgent.enabled=true" in template_command
+    assert "--set cellAgent.capacityBackend=kubernetes" in template_command
+
+
+def test_receipt_step_takes_the_version_from_an_explicit_step_env() -> None:
+    # GitHub injects INPUT_* only into composite actions, never run steps; the
+    # receipt builder must read a step env var bound to the workflow input.
+    step = _release_step("Emit and independently verify the closed canonical receipt")
+    assert step["env"]["DISPATCH_VERSION"] == "${{ inputs.version }}"
+    run = step["run"]
+    assert 'os.environ["INPUT_VERSION"]' not in run
+    assert 'os.environ["DISPATCH_VERSION"]' in run
+
+
+def test_release_creation_binds_target_commitish_to_the_qualified_sha() -> None:
+    step = _release_step("Publish the draft-then-final immutable release")
+    lines = step["run"].splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("gh release create"))
+    end = start
+    while lines[end].endswith("\\"):
+        end += 1
+    assert '--target "${GITHUB_SHA}"' in [line.rstrip("\\").strip() for line in lines[start : end + 1]]
+    # The publish lane's bootstrap download demands exactly this SHA back.
+    publish = (ROOT / ".github" / "workflows" / "publish.yaml").read_text()
+    assert publish.count('--expected-target "${DISPATCH_SOURCE_SHA}"') == 2
 
 
 def test_every_workflow_action_is_pinned_to_a_full_commit() -> None:

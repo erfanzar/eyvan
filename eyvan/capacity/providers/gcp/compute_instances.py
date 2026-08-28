@@ -200,6 +200,13 @@ class GcloudDefaultComputeServiceAccountResolver:
     def __init__(self, *, runner: Runner | None = None):
         self._runner = runner or _runner
 
+    def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
+        try:
+            return self._runner(args)
+        except subprocess.TimeoutExpired as exc:
+            raise GcloudError(str(exc), code=CapacityProviderFailureCode.PROVIDER_ERROR) from exc
+
     def resolve(self, *, project: str) -> str:
         """Return the project's default Compute Engine service-account email.
 
@@ -211,7 +218,7 @@ class GcloudDefaultComputeServiceAccountResolver:
 
         if not isinstance(project, str) or not project.strip() or project != project.strip():
             raise ValueError("GCP project must be a non-empty trimmed string")
-        result = self._runner(("projects", "describe", project, "--format=value(projectNumber)"))
+        result = self._run(("projects", "describe", project, "--format=value(projectNumber)"))
         if result.returncode != 0:
             raise GcloudError(
                 (result.stderr or result.stdout).strip()
@@ -519,13 +526,20 @@ class GcloudNativeWorkerSecretStore:
     def __init__(self, *, runner: Runner = _runner):
         self._runner = runner
 
+    def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
+        try:
+            return self._runner(args)
+        except subprocess.TimeoutExpired as exc:
+            raise GcloudError(str(exc), code=CapacityProviderFailureCode.PROVIDER_ERROR) from exc
+
     @staticmethod
     def _not_found(result: subprocess.CompletedProcess[str]) -> bool:
         detail = f"{result.stdout}\n{result.stderr}".lower()
         return result.returncode != 0 and ("not_found" in detail or "not found" in detail or "404" in detail)
 
     def _describe(self, secret_id: str, *, project: str) -> JsonObject | None:
-        result = self._runner(("secrets", "describe", secret_id, "--project", project, "--format=json"))
+        result = self._run(("secrets", "describe", secret_id, "--project", project, "--format=json"))
         if self._not_found(result):
             return None
         if result.returncode != 0:
@@ -555,7 +569,7 @@ class GcloudNativeWorkerSecretStore:
         secret_id = native_worker_secret_id(management_uid)
         existing = self._describe(secret_id, project=project)
         if existing is None:
-            create = self._runner(
+            create = self._run(
                 (
                     "secrets",
                     "create",
@@ -584,7 +598,7 @@ class GcloudNativeWorkerSecretStore:
                 stream.write(value)
                 stream.flush()
                 os.fsync(stream.fileno())
-            version = self._runner(("secrets", "versions", "add", secret_id, "--project", project, "--data-file", path))
+            version = self._run(("secrets", "versions", "add", secret_id, "--project", project, "--data-file", path))
             if version.returncode != 0:
                 raise GcloudError(
                     (version.stderr or version.stdout).strip() or f"could not rotate native worker secret {secret_id!r}"
@@ -592,7 +606,7 @@ class GcloudNativeWorkerSecretStore:
         finally:
             Path(path).unlink(missing_ok=True)
 
-        binding = self._runner(
+        binding = self._run(
             (
                 "secrets",
                 "add-iam-policy-binding",
@@ -621,7 +635,7 @@ class GcloudNativeWorkerSecretStore:
         if existing is None:
             return
         self._validate_ownership(secret_id, existing, management_uid)
-        deleted = self._runner(("secrets", "delete", secret_id, "--project", project, "--quiet"))
+        deleted = self._run(("secrets", "delete", secret_id, "--project", project, "--quiet"))
         if deleted.returncode != 0 and self._describe(secret_id, project=project) is not None:
             raise GcloudError((deleted.stderr or deleted.stdout).strip() or f"could not delete secret {secret_id!r}")
 
@@ -635,7 +649,7 @@ class GcloudNativeWorkerSecretStore:
         identity in a project it shares.
         """
 
-        result = self._runner(
+        result = self._run(
             ("secrets", "list", "--project", project, "--filter=labels.eyvan-managed=true", "--format=json")
         )
         if result.returncode != 0:
@@ -674,6 +688,13 @@ class GcloudNativeWorkerArtifactAccessStore:
     def __init__(self, *, runner: Runner = _runner):
         self._runner = runner
 
+    def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
+        try:
+            return self._runner(args)
+        except subprocess.TimeoutExpired as exc:
+            raise GcloudError(str(exc), code=CapacityProviderFailureCode.PROVIDER_ERROR) from exc
+
     def ensure(
         self,
         *,
@@ -699,7 +720,7 @@ class GcloudNativeWorkerArtifactAccessStore:
 
         member = f"serviceAccount:{reader_service_account}"
         for role in self._ROLES:
-            result = self._runner(
+            result = self._run(
                 (
                     "storage",
                     "buckets",
@@ -727,6 +748,13 @@ class GcloudComputeProvider:
     def __init__(self, *, runner: Runner = _runner, delete_wait_timeout_s: float = 600):
         self._runner = runner
         self.delete_wait_timeout_s = delete_wait_timeout_s
+
+    def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
+        try:
+            return self._runner(args)
+        except subprocess.TimeoutExpired as exc:
+            raise GcloudError(str(exc), code=CapacityProviderFailureCode.PROVIDER_ERROR) from exc
 
     @staticmethod
     def _not_found(result: subprocess.CompletedProcess[str]) -> bool:
@@ -770,7 +798,7 @@ class GcloudComputeProvider:
 
     def describe(self, name: str, *, project: str, zone: str) -> ComputeInstance | None:
         args = ("compute", "instances", "describe", name, "--zone", zone, "--project", project, "--format=json")
-        result = self._runner(args)
+        result = self._run(args)
         if self._not_found(result):
             return None
         if result.returncode != 0:
@@ -826,9 +854,9 @@ class GcloudComputeProvider:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as script:
                 script.write(spec.startup_script)
                 script.flush()
-                result = self._runner(spec.create_args(startup_script_path=script.name))
+                result = self._run(spec.create_args(startup_script_path=script.name))
         else:
-            result = self._runner(spec.create_args())
+            result = self._run(spec.create_args())
         if result.returncode != 0:
             existing = self.describe(spec.name, project=spec.project, zone=spec.zone)
             if existing is not None:
@@ -854,7 +882,7 @@ class GcloudComputeProvider:
         if not isinstance(management_uid, str) or not management_uid or labels.get("eyvan-uid") != management_uid:
             raise GcloudError(f"refusing to delete Compute instance {name!r} without its Eyvan ownership UID")
         args = ("compute", "instances", "delete", name, "--zone", zone, "--project", project, "--quiet")
-        result = self._runner(args)
+        result = self._run(args)
         if result.returncode != 0:
             if self.describe(name, project=project, zone=zone) is not None:
                 raise GcloudError(

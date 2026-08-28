@@ -182,10 +182,12 @@ class _Plane(_ControllerWebhookDelivery):
             webhook_allow_private_targets=allow_private,
         )
         self.sent: list[tuple[str, bytes, dict]] = []
+        self.extensions: list[dict | None] = []
         self._responses = list(responses or [])
 
-    async def _post(self, url, content, headers):
+    async def _post(self, url, content, headers, extensions=None):
         self.sent.append((url, content, dict(headers)))
+        self.extensions.append(extensions)
         if self._responses:
             outcome = self._responses.pop(0)
             if isinstance(outcome, Exception):
@@ -232,6 +234,32 @@ async def test_a_delivery_carries_a_signature_the_receiver_can_check(monkeypatch
         stored = await tx.get_webhook("wh_1")
     assert stored is not None
     assert headers[SEQUENCE_HEADER] == str(stored.delivered_sequence)
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_connects_to_the_address_it_validated(monkeypatch) -> None:
+    """The POST may not re-resolve the name after the guard has checked it.
+
+    A low-TTL name alternating public and private answers passes a check that
+    resolves once and connects after resolving again -- the rebinding a
+    delivery pins itself against the address it validated to make impossible.
+    """
+
+    monkeypatch.setattr(
+        "eyvan.server.service.webhooks._resolved_addresses",
+        lambda _host: [ipaddress.ip_address("93.184.216.34")],
+    )
+    repository = InMemoryRepository()
+    plane = _Plane(repository, allow_private=False)
+    await _seed(repository)
+    _patch_transport(monkeypatch, plane)
+
+    assert await plane.deliver_webhooks_once() == 1
+
+    url, _body, headers = plane.sent[0]
+    assert url == "https://93.184.216.34/eyvan"
+    assert headers["Host"] == "hooks.example.com"
+    assert plane.extensions[0] == {"sni_hostname": "hooks.example.com"}
 
 
 @pytest.mark.asyncio
@@ -331,9 +359,9 @@ def _patch_transport(monkeypatch, plane: _Plane) -> None:
     and body asserted here are the ones the real code builds.
     """
 
-    async def post(self, url, *, content, headers):
+    async def post(self, url, *, content, headers, extensions=None):
         del self
-        return await plane._post(url, content, headers)
+        return await plane._post(url, content, headers, extensions)
 
     monkeypatch.setattr(httpx.AsyncClient, "post", post)
 

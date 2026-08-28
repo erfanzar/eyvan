@@ -73,7 +73,10 @@ def spend_of(leases: tp.Sequence[tp.Mapping[str, object]], *, priced_cells: tp.C
 
     Returns:
         The totals, with prices flagged as trustworthy only when every lease
-        came from a cell known to be priced.
+        came from a cell known to be priced. A settled lease's ``reserved_cost``
+        is not counted: settlement moved its cost into ``settled_cost``, so the
+        reservation it stood for is gone even though the record keeps the
+        estimate.
     """
 
     hours: dict[str, float] = {}
@@ -86,12 +89,17 @@ def spend_of(leases: tp.Sequence[tp.Mapping[str, object]], *, priced_cells: tp.C
             for dimension, value in measured.items():
                 if isinstance(value, int | float) and not isinstance(value, bool):
                     hours[str(dimension)] = hours.get(str(dimension), 0.0) + float(value)
+        # Settlement moves a lease's cost into ``settled_cost`` but leaves the
+        # original ``reserved_cost`` standing on the record. That estimate is no
+        # longer money held, so only leases that have not settled count as
+        # reserved; ``settled_at`` is the boundary the settlement itself uses.
+        has_settled = lease.get("settled_at") is not None
         for key, target in (("settled_cost", "settled"), ("reserved_cost", "reserved")):
             value = lease.get(key)
             if isinstance(value, int | float) and not isinstance(value, bool):
                 if target == "settled":
                     settled += float(value)
-                else:
+                elif not has_settled:
                     reserved += float(value)
         cell_id = lease.get("cell_id")
         if priced_cells is not None and (not isinstance(cell_id, str) or cell_id not in priced_cells):

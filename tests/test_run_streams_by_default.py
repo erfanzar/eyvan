@@ -373,3 +373,26 @@ def test_workload_logs_can_follow_a_running_job(monkeypatch) -> None:
 
     assert result.exit_code == EXIT_SUCCEEDED, result.output
     assert "reattached output" in result.stdout
+
+
+def test_since_without_follow_dumps_the_window_once(monkeypatch) -> None:
+    """``--since`` is an output filter; alone it must not attach to the job.
+
+    It used to imply ``--follow`` and poll until a running workload stopped --
+    a hang where a dump was asked for.
+    """
+
+    stale = _page([(0, "an hour ago")], cursor="c1", age_s=3600)
+    recent = _page([(0, "just now")], cursor="c1")
+    window = {**stale, "records": stale["records"] + recent["records"]}
+    plane = _Plane(states=[_record(WorkloadState.RUNNING)], pages={"": window})
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: plane)
+
+    result = CliRunner().invoke(cli.main, ["--user", "alice", "workload", "logs", "wl-1", "--since", "10m"])
+
+    assert result.exit_code == 0, result.output
+    assert "just now" in result.stdout
+    assert "an hour ago" not in result.stdout
+    # One drain, no state polling: following the workload would read
+    # /api/v1/workloads/wl-1 and wait for it to stop.
+    assert "/api/v1/workloads/wl-1" not in plane.paths

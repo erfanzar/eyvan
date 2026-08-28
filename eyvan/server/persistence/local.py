@@ -45,6 +45,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
     utcnow,
@@ -84,7 +85,14 @@ LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION = 4
 #: reader here refuses. A fleet that has never enabled health checks or
 #: autoscaling keeps writing the version it wrote before.
 LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION = 5
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
+#: Emitted once a webhook subscription exists, for exactly the reason every
+#: version here exists: a subscription is durable evidence a restart must not
+#: lose. A dropped subscription silently stops every push integration a project
+#: depends on, and a dropped delivery cursor replays a week of audit history
+#: into somebody's incident channel after one restart. A document that cannot
+#: carry them refuses them rather than silently omitting them.
+LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION = 6
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -513,17 +521,59 @@ class LocalControlPlaneV5Document(LocalControlPlaneV4Document):
         return state
 
 
+class LocalControlPlaneV6Document(LocalControlPlaneV5Document):
+    """Schema-v6 document: v5 plus webhook subscriptions and delivery cursors.
+
+    Additive again, and again with a version of its own. v5 is already written
+    by deployed builds, so adding a collection inside it would leave one version
+    tag standing for two different schemas -- the exact ambiguity every reader
+    in this module refuses. A fleet that has never registered a subscription
+    keeps emitting v5, which an older build still reads.
+    """
+
+    version: Literal[6] = LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION
+    webhooks: tuple[WebhookRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v6_document(self) -> LocalControlPlaneV6Document:
+        """Reject duplicate webhook identities before restoration merges them."""
+
+        if len({record.id for record in self.webhooks}) != len(self.webhooks):
+            raise ValueError("local control-plane webhooks must have unique IDs")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV6Document:
+        """Encode one snapshot including every subscription and delivery cursor."""
+
+        webhooks = tuple(state.webhooks[key] for key in sorted(state.webhooks))
+        base = LocalControlPlaneV5Document.from_state(replace(state, webhooks={}))
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            webhooks=webhooks,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v5 aggregates plus every webhook subscription and cursor."""
+
+        state = super().to_state()
+        state.webhooks = {record.id: record for record in self.webhooks}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
     A fleet that has never frozen an attempt topology keeps emitting v2, which an
     older build still reads; the first frozen topology moves the file to v3, the
     first managed stage, credential rotation, or bounded fan-out moves it to v4,
-    the first probed or scaled service moves it to v5, and an older build then
-    refuses it by version instead of silently discarding durable state it does
-    not understand.
+    the first probed or scaled service moves it to v5, the first webhook
+    subscription moves it to v6, and an older build then refuses it by version
+    instead of silently discarding durable state it does not understand.
     """
 
+    if state.webhooks:
+        return LocalControlPlaneV6Document.from_state(state)
     if state.service_replica_health or state.service_decisions:
         return LocalControlPlaneV5Document.from_state(state)
     if state.cell_stages or state.credential_rotations or state.expansion_admissions:
@@ -539,6 +589,7 @@ _LocalControlPlaneReadableDocument: tp.TypeAlias = (
     | LocalControlPlaneV3Document
     | LocalControlPlaneV4Document
     | LocalControlPlaneV5Document
+    | LocalControlPlaneV6Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -669,6 +720,7 @@ class LocalControlPlaneStore:
                 LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION: LocalControlPlaneV3Document,
                 LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION: LocalControlPlaneV4Document,
                 LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION: LocalControlPlaneV5Document,
+                LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION: LocalControlPlaneV6Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -1115,6 +1167,7 @@ __all__ = (
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
     "LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION",
     "LocalControlPlaneAmbiguousCommitError",
     "LocalControlPlaneDocument",
     "LocalControlPlaneError",
@@ -1125,6 +1178,7 @@ __all__ = (
     "LocalControlPlaneV3Document",
     "LocalControlPlaneV4Document",
     "LocalControlPlaneV5Document",
+    "LocalControlPlaneV6Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",

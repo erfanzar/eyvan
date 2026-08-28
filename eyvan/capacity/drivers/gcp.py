@@ -311,7 +311,14 @@ class GcpTpuCapacityDriver:
         return tuple(
             incarnation
             for incarnation in incarnations
-            if isinstance(incarnation, str) and incarnation != record.qr_id and incarnation.startswith(prefix)
+            if isinstance(incarnation, str)
+            and incarnation != record.qr_id
+            and incarnation.startswith(prefix)
+            # Anchor the incarnation suffix: ``{cell}-r`` followed by digits
+            # and nothing else. A sibling cell whose own id extends the prefix
+            # (``alpha`` and ``alpha-r1`` are both legal operator-chosen ids)
+            # must never be reported as this cell's disowned incarnation.
+            and incarnation[len(prefix) :].isdigit()
         )
 
     @staticmethod
@@ -1859,12 +1866,8 @@ class GcpCapacityDriver:
             return self.tpu.capabilities()
         if self.mode == "compute":
             return self.compute.capabilities()
-        if self.mode == "tpu":
-            backends: tuple[str, ...] = ("gcp", "gcp-tpu", "tpu")
-        elif self.mode == "compute":
-            backends = ("gcp", "gcp-compute", "compute")
-        else:
-            backends = ("gcp", "gcp-tpu", "gcp-compute", "tpu", "compute")
+        # Only "auto" reaches here: both pinned modes returned above.
+        backends = ("gcp", "gcp-tpu", "gcp-compute", "tpu", "compute")
         return CellCapabilities(
             provider="gcp",
             executor=self.execution_backend,

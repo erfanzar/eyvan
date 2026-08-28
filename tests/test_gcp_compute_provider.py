@@ -12,6 +12,7 @@ from dataclasses import replace
 import pytest
 
 from eyvan.capacity import CapacityStatus
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.fleet_state import FleetCellRecord
 from eyvan.capacity.providers.gcp.compute_instances import (
     ComputeInstanceSpec,
@@ -652,3 +653,51 @@ def test_delete_ambiguous_failure_rechecks_presence(present_after_error: bool) -
             zone="us-central1-a",
             management_uid=UID,
         )
+
+
+def test_compute_gcloud_subprocess_timeout_is_typed_like_the_tpu_path() -> None:
+    """A gcloud hang past the compute timeout raises GcloudError, not TimeoutExpired.
+
+    The TPU boundary wraps ``subprocess.TimeoutExpired`` in a typed
+    ``GcloudError`` so reconcile and release carry a failure code; the compute
+    boundary must not let the raw subprocess exception escape instead.
+    """
+
+    def hanging(_args):
+        raise subprocess.TimeoutExpired(cmd=["gcloud"], timeout=600)
+
+    with pytest.raises(GcloudError) as describe_error:
+        GcloudComputeProvider(runner=hanging).describe("cell-a-2e7d2c03-r1", project="project-a", zone="us-central1-a")
+    assert describe_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR
+
+    with pytest.raises(GcloudError) as resolver_error:
+        GcloudDefaultComputeServiceAccountResolver(runner=hanging).resolve(project="project-a")
+    assert resolver_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR
+
+    with pytest.raises(GcloudError) as secret_error:
+        GcloudNativeWorkerSecretStore(runner=hanging).delete(project="project-a", management_uid=UID)
+    assert secret_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR
+
+
+def test_compute_delete_and_secret_rotation_timeout_as_typed_provider_failures() -> None:
+    """Timeouts on the mutating calls surface typed too, not as bare exceptions."""
+
+    def describe_then_hang(args):
+        if "describe" in args:
+            return result(stdout=json.dumps(instance_payload()))
+        raise subprocess.TimeoutExpired(cmd=["gcloud"], timeout=600)
+
+    with pytest.raises(GcloudError) as delete_error:
+        GcloudComputeProvider(runner=describe_then_hang, delete_wait_timeout_s=0).delete(
+            "cell-a-2e7d2c03-r1", project="project-a", zone="us-central1-a", management_uid=UID
+        )
+    assert delete_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR
+
+    with pytest.raises(GcloudError) as ensure_error:
+        GcloudNativeWorkerSecretStore(runner=describe_then_hang).ensure(
+            project="project-a",
+            management_uid=UID,
+            value="worker-secret",
+            reader_service_account="reader@project-a.iam.gserviceaccount.com",
+        )
+    assert ensure_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR

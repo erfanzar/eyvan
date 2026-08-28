@@ -119,6 +119,35 @@ def validate_target(
             )
 
 
+def resolve_target_addresses(
+    url: str,
+    *,
+    resolve: tp.Callable[[str], list[ipaddress.IPv4Address | ipaddress.IPv6Address]] | None = None,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Return the addresses a delivery for ``url`` may be pinned to.
+
+    A delivery that connects to one of these after validating exactly this
+    answer cannot be rebound: the address the guard vetted and the address the
+    POST opens are the same, which a fetch that re-resolves the name cannot
+    promise. Empty means there is nothing to pin -- ``url`` already names an
+    address literal, or its name resolved to nothing this time and the caller
+    falls back to fetching ``url`` as written.
+
+    Args:
+        url: The address a delivery would be POSTed to.
+        resolve: Injected in tests. Defaults to the system resolver.
+    """
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return []
+    try:
+        ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return (resolve or _resolved_addresses)(parsed.hostname)
+    return []  # an address literal cannot resolve differently later
+
+
 def matches(
     event_entity_type: str,
     event_action: str,
@@ -141,6 +170,7 @@ __all__ = (
     "SIGNATURE_HEADER",
     "WebhookTargetRefused",
     "matches",
+    "resolve_target_addresses",
     "sign",
     "validate_target",
 )

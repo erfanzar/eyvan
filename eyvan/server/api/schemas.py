@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import collections
+import ipaddress
+import socket
 import typing as tp
 from datetime import datetime
 from typing import Annotated
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -702,10 +705,48 @@ class WorkloadExecRequest(ApiModel):
     rank: int | None = Field(default=None, ge=0)
 
 
+#: Networks a workload-registered service endpoint must never resolve to. The
+#: control plane GETs the endpoint itself -- ``HttpServiceHealthProbe`` fetches
+#: ``endpoint + health_path`` from the leader's host -- so these name exactly
+#: the targets a workload must not aim it at: the plane's own loopback, the
+#: link-local range every cloud exposes its metadata service on, and the
+#: unique-local range of the host's own private segments.
+_ENDPOINT_FORBIDDEN_V4_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+_ENDPOINT_FORBIDDEN_V6_NETWORKS = (
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fc00::/7"),
+)
+
+
 class ServiceEndpointRequest(ApiModel):
     """Where a replica says it can be reached."""
 
     endpoint: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> ServiceEndpointRequest:
+        """Refuse a target only the control plane's own host could answer."""
+
+        parsed = urlparse(self.endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("service endpoint must be an http(s) URL with a hostname")
+        try:
+            resolved = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
+        except OSError:
+            # An unresolvable name answers nothing, including the probe; the
+            # address checks below are the boundary, so leave the verdict about
+            # reachability to the probe that runs when a replica is watched.
+            return self
+        for entry in resolved:
+            address = ipaddress.ip_address(entry[4][0])
+            forbidden = _ENDPOINT_FORBIDDEN_V4_NETWORKS if address.version == 4 else _ENDPOINT_FORBIDDEN_V6_NETWORKS
+            if any(address in network for network in forbidden):
+                raise ValueError("service endpoint must not resolve to a loopback, link-local, or unique-local address")
+        return self
 
 
 class ServiceReplicaHealth(ApiModel):

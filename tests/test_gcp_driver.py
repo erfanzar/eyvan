@@ -1206,3 +1206,55 @@ def test_router_routes_a_damaged_compute_record_by_its_backend_marker(tmp_path) 
 
     assert len(compute_provider.deleted) == 1
     assert tpu_provider.deleted == []
+
+
+class IncarnationListingProvider(FakeProvider):
+    """A queued-resource API that can enumerate the ids its zone holds."""
+
+    def __init__(self, incarnations: tuple[str, ...]) -> None:
+        super().__init__()
+        self._incarnations = incarnations
+
+    def list_cell_incarnations(self, *, project: str, zone: str, cell_id: str) -> tuple[str, ...]:
+        del project, zone, cell_id
+        return self._incarnations
+
+
+def test_disowned_incarnations_carry_the_cell_id_then_r_then_digits(tmp_path) -> None:
+    """The disowned check anchors its suffix so sibling cells are never flagged.
+
+    ``{cell}-r`` as a bare prefix also matches ids belonging to *other* cells
+    whose operator-chosen id extends it: cells ``cell-a`` and ``cell-a-r1`` are
+    both legal, and reporting the sibling's queued resource as disowned flapped
+    the healthy cell into recreate churn. Only ids shaped ``{cell}-r<digits>``
+    are this cell's incarnations; everything else belongs to someone else.
+    """
+
+    provider = IncarnationListingProvider(
+        (
+            "cell-a-r9",  # this cell's leaked generation -> disowned
+            "cell-a-r1-r2",  # sibling cell "cell-a-r1", generation 2 -> not ours
+            "cell-ab-r1",  # different cell id that merely shares the prefix
+            "cell-a-r",  # suffix without a generation -> not an incarnation
+        )
+    )
+    state, _, driver = make_driver(tmp_path, provider)
+    driver.apply_capacity("cell-a", desired(), context("create"))
+    record = state.get("cell-a")
+    assert record is not None
+    assert record.qr_id == "cell-a-r1"
+
+    observation = driver.observe("cell-a")
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.metadata["disowned_incarnations"] == ("cell-a-r9",)
+
+
+def test_a_cell_whose_listing_holds_only_sibling_ids_is_not_recreated(tmp_path) -> None:
+    _state, _, driver = make_driver(tmp_path, IncarnationListingProvider(("cell-a-r1-r2", "cell-ab-r1")))
+    driver.apply_capacity("cell-a", desired(), context("create"))
+
+    observation = driver.observe("cell-a")
+
+    assert observation.state is CapacityStatus.WAITING
+    assert "disowned_incarnations" not in observation.metadata

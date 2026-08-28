@@ -75,7 +75,7 @@ from eyvan.capacity.drivers.base import (
 #: Capacity classes the scheduler routes on. A provider that invents a name here
 #: does not fail loudly -- it simply never matches a pool, which is the kind of
 #: bug that looks like "the provider is slow to provision".
-KNOWN_CAPACITY_CLASSES = frozenset({"spot", "on-demand", "reserved", "guaranteed"})
+KNOWN_CAPACITY_CLASSES = frozenset({"spot", "on-demand", "reserved", "guaranteed", "flex_start"})
 
 #: Statuses that assert something conclusive about a cell. An observation that
 #: could not reach the provider must not be one of these.

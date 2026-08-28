@@ -42,6 +42,8 @@ from eyvan.records import (
     CommandExecution,
     LeaseRecord,
     LeaseState,
+    OutboxRecord,
+    OutboxState,
     ResourceGang,
     ResourceVector,
     WorkloadAttemptTopology,
@@ -566,3 +568,70 @@ async def test_a_follower_resumes_the_archive_rather_than_replaying_it(tmp_path:
     assert [record["message"] for record in first["records"]] == ["one", "two"]
     assert [record["message"] for record in second["records"]] == ["three"]
     assert third["records"] == []
+
+
+async def test_a_stale_fence_settlement_archives_before_it_releases(tmp_path: Path) -> None:
+    """The stale-fence recovery must settle the way ``_release_terminal`` does.
+
+    Cancel and checkpoint victims ran, so their journal tail exists only until
+    settlement releases the lease and the cell's journal is destroyed with it.
+    Settling without archiving first threw that output away on every fence
+    conflict, which is exactly when someone next asks what happened.
+    """
+
+    host = _GrowingHost("h0")
+    host.emit("cancelled mid-run")
+    controller, _agent = await _running(tmp_path, [host])
+    now = utcnow()
+    command = OutboxRecord(
+        id="cmd-cancel",
+        topic="workload.cancel",
+        aggregate_type="workload",
+        aggregate_id="wl-1",
+        idempotency_key="cancel:wl-1:1",
+        generation=1,
+        state=OutboxState.PROCESSING,
+        payload={"lease_id": "lease-1"},
+        claimed_by=controller.worker_id,
+        claimed_until=now + timedelta(minutes=5),
+        created_at=now,
+        updated_at=now,
+    )
+    async with controller.repository.transaction() as transaction:
+        workload = await transaction.get_workload("wl-1")
+        assert workload is not None
+        await transaction.put_workload(workload.model_copy(update={"state": WorkloadState.CANCELLING}))
+        await transaction.put_outbox(command)
+
+    order: list[str] = []
+    original_archive = controller._archive_terminal_logs
+    original_settle = controller.service.settle_terminal_workload
+
+    async def archive(workload: WorkloadRecord) -> None:
+        order.append("archive")
+        await original_archive(workload)
+
+    async def settle(*args: tp.Any, **kwargs: tp.Any):
+        order.append("settle")
+        return await original_settle(*args, **kwargs)
+
+    controller._archive_terminal_logs = archive  # type: ignore[method-assign]
+    controller.service.settle_terminal_workload = settle  # type: ignore[method-assign]
+
+    await controller._recover_stale_workload_command(
+        command,
+        expected_state=WorkloadState.CANCELLING,
+        diagnostic="agent fence belongs to a newer workload generation",
+    )
+
+    assert order == ["archive", "settle"]
+    async with controller.repository.transaction() as transaction:
+        settled = await transaction.get_workload("wl-1")
+        retired = await transaction.get_outbox("cmd-cancel")
+    assert settled is not None and settled.state is WorkloadState.FAILED
+    assert retired is not None and retired.state is OutboxState.DISCARDED
+    # The journal survived the settlement that released the lease: archived
+    # while the cell could still be read, stored in managed artifacts after it.
+    payload = await controller.service.read_managed_artifact(org_id=ORG, project_id=PROJECT, uri=log_uri("wl-1", 1, 0))
+    entries = [json.loads(line) for line in payload.decode().splitlines() if line.strip()]
+    assert [entry["message"] for entry in entries if isinstance(entry, dict)] == ["cancelled mid-run"]

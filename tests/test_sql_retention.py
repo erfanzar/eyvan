@@ -26,9 +26,10 @@ locking or advisory-lock leadership.
 Two paths are genuinely PostgreSQL-only and are worked around rather than
 tested here, deliberately and visibly:
 
-- ``put_idempotency`` takes ``pg_advisory_xact_lock(hashtextextended(...))``, so
-  these tests insert ``IdempotencyRow`` directly. The subject under test is the
-  prune query, not the write path.
+- ``put_idempotency`` serializes first-writes with a PostgreSQL-only advisory
+  lock (``get_idempotency`` skips it on other dialects), so these tests insert
+  ``IdempotencyRow`` directly. The subject under test is the prune query, not
+  the write path.
 - ``audit_events.sequence`` is a ``BigInteger`` identity column. SQLite only
   autoincrements a literal ``INTEGER PRIMARY KEY``, so audit appends cannot run
   here at all; audit pruning keeps its in-memory coverage in ``test_retention``,

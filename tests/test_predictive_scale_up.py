@@ -69,7 +69,27 @@ def test_enabling_it_is_not_enough_to_spend() -> None:
     prediction = _predict(_history(wanted=10, total=10), PredictiveConfig(enabled=True))
 
     assert prediction.acts is False
-    assert "no budget" in prediction.reason
+    assert prediction.cells == 0
+    assert "unfunded" in prediction.reason
+    # The history gates ran: the report names the pattern, not the missing budget.
+    assert "100%" in prediction.reason
+
+
+def test_an_unfunded_watcher_still_reports_a_thin_history() -> None:
+    """Watch mode computes the prediction, so its refusals are history's, not the budget's.
+
+    An operator watching before funding needs to see what the predictor thinks of
+    the history it has -- not the same "no budget" line every hour, which would
+    tell them nothing about what funding would buy.
+    """
+
+    prediction = _predict(
+        _history(wanted=MINIMUM_OBSERVATIONS - 1, total=MINIMUM_OBSERVATIONS - 1), PredictiveConfig(enabled=True)
+    )
+
+    assert prediction.acts is False
+    assert f"only {MINIMUM_OBSERVATIONS - 1} of {MINIMUM_OBSERVATIONS}" in prediction.reason
+    assert "budget" not in prediction.reason
 
 
 def test_a_thin_history_predicts_nothing() -> None:

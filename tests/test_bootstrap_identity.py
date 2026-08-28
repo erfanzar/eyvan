@@ -65,6 +65,19 @@ async def test_a_wrong_token_is_refused() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_non_ascii_token_is_refused_and_never_a_server_error() -> None:
+    """``compare_digest`` raises ``TypeError`` for non-ASCII ``str`` arguments.
+
+    The header is caller-controlled, so unauthenticated garbage must come back
+    as a 401 rather than crash the request with an unhandled exception.
+    """
+
+    with pytest.raises(Exception) as caught:
+        await _authenticator(secrets.token_urlsafe(32)).authenticate(_Request(Authorization="Bearer tök"))
+    assert getattr(caught.value, "status_code", None) == 401
+
+
+@pytest.mark.asyncio
 async def test_no_token_configured_means_no_token_authenticates() -> None:
     """The path must be inert unless an operator turned it on."""
 

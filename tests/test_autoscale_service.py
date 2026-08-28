@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -345,6 +345,46 @@ def test_generation_service_invalidates_an_observed_empty_zone_without_removing_
     )
 
     assert [entry.config.name for entry in cache.list()] == ["research-us-east5-b"]
+
+
+def test_a_denial_filtered_zone_keeps_its_cached_fleet_until_the_denial_expires(tmp_path) -> None:
+    """A cached denial expires; a plain ``up`` never regenerates.
+
+    Deleting a zone whose every row the denial skipped would strand it past
+    recovery: ``list_eligible`` -- the only selector a no-regeneration
+    ``up`` reads -- would have no cached fleet left to unhide once the 24h
+    TTL let the shape back in. The denial keeps filtering the exact type at
+    selection time instead.
+    """
+
+    cache = AutoscaleConfigCache(tmp_path / "autoscale")
+    defaults = AutoscaleDefaults(project="project-a", fleet_prefix="research")
+    AutoscaleGenerationService(FakeDiscovery((_row("v5p-16", quota_tpus=64),))).generate(cache=cache, defaults=defaults)
+    cache.record_queue_admission_denial(
+        project="project-a",
+        zone="us-east5-a",
+        accelerator_type="v5p-16",
+        capacity_class=CapacityClass.SPOT,
+        observed_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+
+    result = AutoscaleGenerationService(FakeDiscovery((_row("v5p-16", quota_tpus=64),))).generate(
+        cache=cache, defaults=defaults
+    )
+
+    assert result.has_entries is False
+    assert [candidate.reason for candidate in result.skipped] == [AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL]
+    assert [entry.config.name for entry in cache.list()] == ["research-us-east5-a"]
+
+    cache.record_queue_admission_denial(
+        project="project-a",
+        zone="us-east5-a",
+        accelerator_type="v5p-16",
+        capacity_class=CapacityClass.SPOT,
+        observed_at=datetime.now(UTC) - timedelta(hours=25),
+    )
+
+    assert [entry.config.name for entry in cache.list_eligible()] == ["research-us-east5-a"]
 
 
 def test_generation_scoped_empty_refresh_keeps_other_cached_generation_pools(tmp_path) -> None:

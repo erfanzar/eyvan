@@ -146,9 +146,11 @@ class QueueAdmissionDenialKey:
 class QueueAdmissionDenial:
     """One durable local record of a rejected GCP Spot TPU queue request.
 
-    Entries have no automatic expiry. They filter only quota-based discovery
-    and automatic fleet selection; an explicitly configured workload request
-    is still sent to GCP.
+    Entries expire after ``QueueAdmissionDenialCache.DEFAULT_TTL_S`` (24
+    hours) and are evicted lazily on the next read, so a denied shape becomes
+    selectable again without hand-clearing the cache. They filter only
+    quota-based discovery and automatic fleet selection; an explicitly
+    configured workload request is still sent to GCP.
     """
 
     key: QueueAdmissionDenialKey

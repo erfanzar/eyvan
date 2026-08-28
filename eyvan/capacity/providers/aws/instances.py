@@ -30,6 +30,7 @@ rather than generating it is what makes the retry safe.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import typing as tp
 
@@ -137,7 +138,10 @@ def launch_parameters(
         params[f"SecurityGroupId.{index}"] = group
     user_data = desired.get("user_data")
     if isinstance(user_data, str) and user_data:
-        params["UserData"] = user_data
+        # The EC2 Query API decodes UserData itself, so the bytes go up
+        # base64-encoded: raw text here reaches the instance as decoded garbage
+        # -- a corrupted bootstrap, with no error anywhere naming the cause.
+        params["UserData"] = base64.b64encode(user_data.encode("utf-8")).decode("ascii")
 
     capacity_class = str(desired.get("capacity_class") or "on_demand").replace("-", "_")
     if capacity_class == "spot":

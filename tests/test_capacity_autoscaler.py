@@ -1686,9 +1686,10 @@ async def test_a_demand_shortfall_must_hold_before_the_pool_begins_idling_out_su
 
     With a stabilization window configured, demand that drops below supply
     holds the pool's shape until the shortfall has persisted for the window;
-    only then does the idle clock get its turn. The controller is what makes
-    the clock real: it stamps the pool on first sight and clears it when
-    supply is wanted again.
+    only then does the idle clock get its turn. The fall also has to stick:
+    the held passes must leave the idle clocks running, and the pass that acts
+    on an elapsed window must leave the pool clock standing -- clearing either
+    would re-arm the hold on the next pass and re-raise the target forever.
     """
 
     repository = InMemoryRepository()
@@ -1697,14 +1698,14 @@ async def test_a_demand_shortfall_must_hold_before_the_pool_begins_idling_out_su
     await service.apply_fleet(
         fleet_admin(),
         "research",
-        (cpu_pool(initial_cells=1).model_copy(update={"idle_timeout_s": 60, "shrink_stabilization_s": 3600}),),
+        (cpu_pool(initial_cells=2).model_copy(update={"idle_timeout_s": 60, "shrink_stabilization_s": 3600}),),
         idempotency_key="fleet-v1",
     )
     await controller.reconcile_capacity_pools_once()
 
-    async def set_idle_for(seconds: float) -> None:
+    async def set_idle_for(cell_id: str, seconds: float) -> None:
         async with repository.transaction() as transaction:
-            cell = (await transaction.list_cells())[0]
+            cell = next(c for c in await transaction.list_cells() if c.id == cell_id)
             await transaction.put_cell(
                 cell.model_copy(
                     update={
@@ -1715,39 +1716,56 @@ async def test_a_demand_shortfall_must_hold_before_the_pool_begins_idling_out_su
                 )
             )
 
-    # The cell is long past its idle timeout, but the shortfall was first seen
-    # this pass: the shape holds and the clock starts.
-    await set_idle_for(10_000)
+    async with repository.transaction() as transaction:
+        cell_ids = sorted(cell.id for cell in await transaction.list_cells())
+    assert len(cell_ids) == 2
+    surplus, survivor = cell_ids
+    # Both cells are READY; the surplus one is long past the idle timeout, the
+    # survivor has barely started idling.
+    await set_idle_for(surplus, 10_000)
+    await set_idle_for(survivor, 5)
+
+    # The shortfall was first seen this pass: the shape holds, the clock
+    # starts, and -- the part the held pass decides -- the idle clocks it is
+    # holding alive are left running, not cleared.
     await controller.reconcile_capacity_pools_once()
     async with repository.transaction() as transaction:
-        cell = (await transaction.list_cells())[0]
-        assert cell.state is CellState.READY
+        cells = {cell.id: cell for cell in await transaction.list_cells()}
+        assert all(cell.state is CellState.READY for cell in cells.values())
+        assert cells[surplus].idle_since is not None, "a held pass must not clear the idle clock"
         pool = await transaction.get_capacity_pool("research/cpu")
         assert pool is not None
-        assert pool.demand_below_supply_since is not None
+    stamped = pool.demand_below_supply_since
+    assert stamped is not None
 
-    # The shortfall holds past the window: the target falls, and the idle
-    # timeout drains the surplus.
-    async def age_the_clock() -> None:
-        async with repository.transaction() as transaction:
-            current = await transaction.get_capacity_pool("research/cpu")
-            assert current is not None and current.demand_below_supply_since is not None
-            await transaction.put_capacity_pool(
-                current.model_copy(
-                    update={
-                        "demand_below_supply_since": current.demand_below_supply_since - timedelta(seconds=7200),
-                    }
-                )
-            )
+    # The shortfall holds past the window.
+    async with repository.transaction() as transaction:
+        current = await transaction.get_capacity_pool("research/cpu")
+        assert current is not None and current.demand_below_supply_since is not None
+        aged = current.demand_below_supply_since - timedelta(seconds=7200)
+        await transaction.put_capacity_pool(current.model_copy(update={"demand_below_supply_since": aged}))
 
-    await age_the_clock()
-    # Held passes kept clearing the idle clock; re-age it now that the window
-    # has elapsed, so the idle timeout itself can fire.
-    await set_idle_for(10_000)
+    # The window has elapsed: the target falls, and the idle clock that ran
+    # through the hold drains the surplus. The clock is left standing -- this
+    # pass must not clear what it just acted on.
     await controller.reconcile_capacity_pools_once()
     async with repository.transaction() as transaction:
-        cell = (await transaction.list_cells())[0]
-        assert cell.state is CellState.DRAINING
-        cleared = await transaction.get_capacity_pool("research/cpu")
-        assert cleared is not None
-        assert cleared.demand_below_supply_since is None
+        cells = {cell.id: cell for cell in await transaction.list_cells()}
+        assert cells[surplus].state is CellState.DRAINING
+        assert cells[survivor].state is CellState.READY
+        pool = await transaction.get_capacity_pool("research/cpu")
+        assert pool is not None
+        assert pool.demand_below_supply_since == aged
+
+    # The next pass finds the shortfall still standing and holds the fall: no
+    # replacement is launched, the survivor is not re-protected, and neither
+    # the pool clock nor the survivor's idle clock was disturbed.
+    await controller.reconcile_capacity_pools_once()
+    async with repository.transaction() as transaction:
+        cells = {cell.id: cell for cell in await transaction.list_cells()}
+        assert len(cells) == 2, "a persistent shortfall never buys the capacity back"
+        assert cells[survivor].state is CellState.READY
+        assert cells[survivor].idle_since is not None
+        pool = await transaction.get_capacity_pool("research/cpu")
+        assert pool is not None
+        assert pool.demand_below_supply_since == aged

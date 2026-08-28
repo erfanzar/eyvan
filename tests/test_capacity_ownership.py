@@ -45,7 +45,13 @@ def _service() -> ControlPlaneService:
     return ControlPlaneService(InMemoryRepository(), scheduler=CoreSchedulingService())
 
 
-def _pool(pool_id: str = "v5p-pool", *, owner: str | None = None, max_cells: int = 1) -> CapacityPoolRecord:
+def _pool(
+    pool_id: str = "v5p-pool",
+    *,
+    owner: str | None = None,
+    max_cells: int = 1,
+    initial_cells: int | None = None,
+) -> CapacityPoolRecord:
     return CapacityPoolRecord(
         id=pool_id,
         fleet_name="research-fleet",
@@ -62,6 +68,7 @@ def _pool(pool_id: str = "v5p-pool", *, owner: str | None = None, max_cells: int
         capacity_class="spot",
         executor="eyvan-native",
         agent_endpoint="http://agent:8090",
+        initial_cells=initial_cells,
         min_cells=0,
         max_cells=max_cells,
     )
@@ -99,6 +106,27 @@ async def test_an_org_admin_disables_a_pool_its_organization_owns() -> None:
     stored, _ = await service.disable_capacity_pool(_org_admin("acme"), "v5p-pool", idempotency_key="disable")
 
     assert (stored.enabled, stored.max_cells) == (False, 0)
+
+
+async def test_disabling_a_pool_declared_with_a_floor_keeps_its_record_revalidatable() -> None:
+    """``min <= initial <= max`` has to survive the disable.
+
+    ``apply_fleet`` and ``disable_fleet`` zero ``initial_cells`` beside the floor
+    and the cap for exactly this reason; the single-pool path zeroed only
+    min/max, so a pool declared with ``initial_cells=1`` stored initial 1 > max 0
+    and any later re-validation of the stored record refused it.
+    """
+
+    service = _service()
+    await service.upsert_capacity_pool(
+        FLEET_ADMIN, _pool("floored-pool", initial_cells=1), idempotency_key="seed-floored"
+    )
+
+    stored, _ = await service.disable_capacity_pool(FLEET_ADMIN, "floored-pool", idempotency_key="disable-floored")
+
+    assert (stored.min_cells, stored.max_cells, stored.initial_cells) == (0, 0, 0)
+    # The failure this pins was a 422 naming a field the operator never set.
+    assert CapacityPoolRecord.model_validate(stored.model_dump(mode="json")) == stored
 
 
 # --------------------------------------------------------------------------- the edges

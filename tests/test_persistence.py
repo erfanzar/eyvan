@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import (
@@ -25,6 +25,7 @@ from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
     CommandExecution,
+    IdempotencyRecord,
     LeaseRecord,
     LeaseState,
     OutboxRecord,
@@ -39,7 +40,7 @@ from eyvan.records import (
 )
 from eyvan.server.persistence import SCHEMA_REVISION, Base, InMemoryRepository, SqlAlchemySession
 from eyvan.server.persistence.base import TransientRepositoryError
-from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow, SqlAlchemyRepository
+from eyvan.server.persistence.sqlalchemy import CellRow, OutboxRow, SqlAlchemyRepository, create_schema
 
 
 def _legacy_multislice_cell() -> JsonObject:
@@ -959,3 +960,86 @@ def test_transaction_does_not_retry_a_body_failure() -> None:
     # Exactly one begin: a body failure cannot be retried by re-yielding, but
     # it is still translated so callers see the typed retryable error.
     assert sessions.begins == 1
+
+
+class _FlakyCommitSessions:
+    """A session factory whose commit -- ``begin``'s ``__aexit__`` -- conflicts.
+
+    PostgreSQL SERIALIZABLE raises 40001 at COMMIT most often, so this is the
+    shape the retry path has to answer for.
+    """
+
+    def __init__(self, sqlstate: str = "40001") -> None:
+        self.sqlstate = sqlstate
+        self.begins = 0
+
+    @asynccontextmanager
+    async def begin(self):
+        self.begins += 1
+        yield object()
+
+        class _Orig(OSError):
+            pgcode = self.sqlstate
+
+        raise DBAPIError("COMMIT", {}, _Orig("conflict"))
+
+
+def test_transaction_translates_a_commit_time_conflict_without_a_second_yield() -> None:
+    repository = SqlAlchemyRepository.__new__(SqlAlchemyRepository)
+    sessions = _FlakyCommitSessions()
+    repository._sessions = sessions
+
+    seen: list[object] = []
+
+    async def scenario() -> None:
+        async with repository.transaction() as session:
+            seen.append(session)
+
+    try:
+        asyncio.run(scenario())
+    except TransientRepositoryError:
+        pass
+    except RuntimeError as raw:  # pragma: no cover - contract guard
+        raise AssertionError("a commit-time conflict must surface as the typed transient error") from raw
+    else:
+        raise AssertionError("a commit-time conflict must not be swallowed")
+
+    # The body had already run when the conflict surfaced, so the service
+    # cannot retry it: exactly one begin and exactly one yield. A second yield
+    # is what turned this failure into RuntimeError("generator didn't stop").
+    assert sessions.begins == 1
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_reads_run_on_a_non_postgresql_dialect(tmp_path) -> None:
+    """``pg_advisory_xact_lock`` is a PostgreSQL function, not a portable one.
+
+    ``get_idempotency`` executed the advisory lock unconditionally, so every
+    idempotency-scoped request on a SQLite-backed development plane crashed
+    with "no such function: hashtextextended" -- including ``put_idempotency``,
+    which reads before writing. The lock is taken only where it exists.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'eyvan.db'}")
+    await create_schema(engine)
+    repository = SqlAlchemyRepository(engine)
+    record = IdempotencyRecord(
+        scope="acme/research/alice",
+        operation="workload.submit",
+        key="submit-1",
+        fingerprint="a" * 64,
+        resource_type="workload",
+        resource_id="wl-1",
+        created_at=utcnow(),
+    )
+    try:
+        async with repository.transaction() as transaction:
+            await transaction.put_idempotency(record)
+
+        async with repository.transaction() as transaction:
+            stored = await transaction.get_idempotency("acme/research/alice", "workload.submit", "submit-1")
+            assert await transaction.get_idempotency("acme/research/alice", "workload.submit", "other") is None
+        assert stored == record
+    finally:
+        await engine.dispose()

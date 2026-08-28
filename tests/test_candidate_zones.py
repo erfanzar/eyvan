@@ -73,26 +73,20 @@ def _cell(
     reserved_for: str | None = None,
     cooling: bool = False,
     failures: int = 0,
+    state: CellState = CellState.READY,
 ) -> CellRecord:
-    resources = ResourceVector(cpu=0, memory_gib=0, tpu=8)
-    return CellRecord(
-        id=cell_id,
-        provider="gcp",
-        capacity_backend="gcp-tpu",
-        provider_project="gcp-project-a",
-        region=zone.rsplit("-", 1)[0],
-        zone=zone,
-        state=CellState.READY,
-        capacity=resources,
-        allocatable=resources,
-        accelerator_type="v6e-8",
-        endpoint="http://agent:8090",
-        pool_id=f"pool-{zone}",
-        autoscale_request_workload_id=reserved_for,
-        availability=CapacityBeliefState(
-            cooldown_until=NOW + timedelta(minutes=10) if cooling else None,
-            consecutive_failures=failures,
-        ),
+    # Minted from the pool template, the way real cells are, so the report's
+    # supply gate -- the same one the decision uses -- recognises them.
+    cell = _pool(zone).make_cell(cell_id, worker_count=1)
+    return cell.model_copy(
+        update={
+            "state": state,
+            "autoscale_request_workload_id": reserved_for,
+            "availability": CapacityBeliefState(
+                cooldown_until=NOW + timedelta(minutes=10) if cooling else None,
+                consecutive_failures=failures,
+            ),
+        }
     )
 
 
@@ -216,6 +210,41 @@ def test_a_pool_is_as_cold_as_its_coldest_cell() -> None:
 
     zone = next(entry for entry in report if entry["pool_id"] == f"pool-{ZONES[0]}")
     assert zone["consecutive_failures"] == 5
+
+
+# --------------------------------------------------------------------------- counted like the decision
+
+
+def test_a_disabled_pool_is_not_offered_as_a_candidate_at_all() -> None:
+    """The decision filters a disabled pool out before ranking; so must the report.
+
+    Its cells would otherwise read as free supply and outrank zones the
+    decision could actually pick -- a rationale that contradicts the choice.
+    """
+
+    pools = [_pool(zone) for zone in ZONES]
+    pools[1] = pools[1].model_copy(update={"enabled": False})
+
+    report = candidate_zone_report(_workload(), pools, [_cell("cell-b", ZONES[1])], [], now=NOW)
+
+    assert [entry["pool_id"] for entry in report] == [f"pool-{ZONES[0]}", f"pool-{ZONES[2]}"]
+    assert report[0]["pool_id"] == f"pool-{ZONES[0]}"
+
+
+def test_cells_that_no_longer_supply_do_not_speak_for_their_zone() -> None:
+    """Only cells the decision could still use may colour the ranking.
+
+    A tombstoned cell is retained forever, and counting its frozen belief made
+    a drained zone read as cold rather than as empty -- which argued a workload
+    out of the very zone the decision counts as simply untried.
+    """
+
+    report = _report([_cell("cell-a1", ZONES[0], state=CellState.DELETED, failures=9, cooling=True)])
+
+    primary = next(entry for entry in report if entry["pool_id"] == f"pool-{ZONES[0]}")
+    assert primary["consecutive_failures"] == 0
+    assert primary["cooling_cells"] == 0
+    assert report[0]["pool_id"] == f"pool-{ZONES[0]}", "the tombstone must not hand the choice to another zone"
 
 
 # --------------------------------------------------------------------------- the invariant

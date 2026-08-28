@@ -93,6 +93,17 @@ def test_native_worker_requires_bearer_auth_and_exposes_health(tmp_path: Path) -
             ).status_code
             == 401
         )
+        # A non-ASCII header must be a refused credential (401), not the 500
+        # the TypeError inside compare_digest used to raise. Sent as the raw
+        # latin-1 bytes a caller puts on the wire, which the ASGI server
+        # decodes to str.
+        assert (
+            transport.get(
+                "/api/v1/workloads/missing",
+                headers={"Authorization": "Bearer wörker-secret".encode("latin-1")},
+            ).status_code
+            == 401
+        )
         assert NativeRemoteExecutor("http://testserver", secret="worker-secret", client=transport).health() is True
         assert NativeRemoteExecutor("http://testserver", secret="wrong-secret", client=transport).health() is False
 

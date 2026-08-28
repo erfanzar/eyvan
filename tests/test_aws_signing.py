@@ -21,8 +21,13 @@ disagreed, and diagnosing that against a live account is an afternoon.
 from __future__ import annotations
 
 import hashlib
+import typing as tp
 from datetime import UTC, datetime
+from urllib.parse import urlencode
 
+import httpx
+
+from eyvan.capacity.providers.aws.api import API_VERSION, HttpEc2Api
 from eyvan.capacity.providers.aws.signing import (
     AwsCredentials,
     authorization_header,
@@ -142,3 +147,86 @@ def test_header_values_are_normalized_before_signing() -> None:
     )
 
     assert "x-amz-meta:a b\n" in request
+
+
+# --------------------------------------------------------------------------- signing the bytes that get sent
+
+
+class _XmlResponse:
+    """The two things the EC2 client reads off a response."""
+
+    def __init__(self, text: str) -> None:
+        self.status_code = 200
+        self.text = text
+
+
+class _CapturingClient:
+    """The httpx seam HttpEc2Api posts through, holding the encoded body."""
+
+    def __init__(self) -> None:
+        self.url: str | None = None
+        self.body: str | None = None
+        self.headers: dict[str, str] | None = None
+
+    def post(self, url: str, content: str | None = None, headers: tp.Mapping[str, str] | None = None) -> _XmlResponse:
+        self.url = url
+        self.body = content
+        self.headers = dict(headers or {})
+        return _XmlResponse('<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"/>')
+
+
+def test_the_payload_digest_signs_the_bytes_actually_posted() -> None:
+    """AWS hashes the body it receives; signing a different encoding fails every call.
+
+    The filter names arrive in an insertion order that differs from sorted
+    order on purpose -- that drift is the whole defect -- and the value carries
+    a space, where two urlencoders disagree even at equal order.
+    """
+
+    client = _CapturingClient()
+    api = HttpEc2Api(region="us-east-1", credentials=EXAMPLE, client=client)
+
+    api.describe_instances({"tag:eyvan:cell": "cell a"})
+
+    posted = client.body
+    assert posted == urlencode(
+        sorted(
+            {
+                "Filter.1.Name": "tag:eyvan:cell",
+                "Filter.1.Value.1": "cell a",
+                "Action": "DescribeInstances",
+                "Version": API_VERSION,
+            }.items()
+        )
+    )
+
+    # Re-derive the signature the way AWS does, from the exact bytes received:
+    # a digest computed over any other encoding cannot reproduce it.
+    moment = datetime.strptime(client.headers["x-amz-date"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    recomputed = authorization_header(
+        EXAMPLE,
+        method="POST",
+        path="/",
+        params={},
+        headers={name: client.headers[name] for name in ("host", "content-type")},
+        region="us-east-1",
+        service="ec2",
+        moment=moment,
+        payload_sha256=hashlib.sha256(posted.encode("utf-8")).hexdigest(),
+    )
+    assert client.headers == recomputed, "every header sent is signed, and over the posted bytes"
+
+
+def test_httpx_puts_a_string_body_on_the_wire_byte_for_byte() -> None:
+    """The wire half of the guarantee: httpx forwards a string body unmodified.
+
+    It also adds no content-type of its own -- the signed one is sent
+    explicitly, and a silently different one would be an unsigned header.
+    """
+
+    body = urlencode({"Action": "DescribeInstances", "Version": API_VERSION})
+
+    request = httpx.Request("POST", "https://ec2.us-east-1.amazonaws.com/", content=body)
+
+    assert request.content == body.encode("utf-8")
+    assert request.headers.get("content-type") is None

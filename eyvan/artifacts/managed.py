@@ -31,6 +31,7 @@ from urllib.request import url2pathname
 import httpx
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan._internal.workspace import create_private_directory
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims, verify_signature
 from eyvan.identity.rotation import CapabilityKeyring, StaticCredential
@@ -405,6 +406,23 @@ class CommandRunner(tp.Protocol):
     ) -> subprocess.CompletedProcess[bytes]: ...
 
 
+def _default_gcloud_runner(
+    args: tp.Sequence[str],
+    *,
+    check: bool,
+    capture_output: bool,
+    timeout: float,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``gcloud`` without the caller's Python interpreter steering.
+
+    The default used to be a bare ``subprocess.run``, which leaked a
+    submitting process's ``PYTHONPATH`` into gcloud's own interpreter; see
+    ``eyvan._internal.subprocess_env``.
+    """
+
+    return subprocess.run(args, check=check, capture_output=capture_output, timeout=timeout, env=provider_cli_env())
+
+
 class _GCSInventoryTransport(tp.Protocol):
     """Injectable, read-only HTTP boundary for the GCS JSON inventory API."""
 
@@ -464,6 +482,7 @@ def _gcloud_inventory_access_token() -> str:
             check=False,
             capture_output=True,
             timeout=_GCS_ACCESS_TOKEN_TIMEOUT_SECONDS,
+            env=provider_cli_env(),
         )
     except (OSError, subprocess.SubprocessError):
         raise ManagedArtifactInventoryError("ambient GCS credential lookup failed") from None
@@ -2712,7 +2731,7 @@ class GCSManagedArtifactStore:
         self,
         root_uri: str,
         *,
-        runner: CommandRunner = subprocess.run,
+        runner: CommandRunner = _default_gcloud_runner,
         inventory_transport: _GCSInventoryTransport = _httpx_gcs_inventory_transport,
         access_token_provider: tp.Callable[[], str] = _ambient_gcs_inventory_access_token,
         inventory_timeout_seconds: float = _GCS_INVENTORY_TIMEOUT_SECONDS,
@@ -2764,7 +2783,7 @@ class GCSManagedArtifactStore:
 
         The timeout keyword is omitted only for legacy injected runners whose
         inspected signature predates the additive runner contract. The default
-        ``subprocess.run`` path and all conforming runners always receive it.
+        runner path and all conforming runners always receive it.
         """
 
         arguments: dict[str, tp.Any] = {"check": False, "capture_output": True}
@@ -3441,6 +3460,18 @@ class ArtifactTokenSigner:
         a rotation happened.
         """
 
+        # The shared verifier decodes segments without validating the base64
+        # alphabet, so junk interleaved with a signature would otherwise be
+        # discarded and the remainder verified. Tokens are canonical unpadded
+        # base64url end to end; anything else is not one of ours.
+        parts = token.split(".") if isinstance(token, str) else []
+        if len(parts) != 3 or parts[0] != _TOKEN_VERSION:
+            raise InvalidCapabilityToken("invalid artifact token")
+        try:
+            _b64decode(parts[1])
+            _b64decode(parts[2])
+        except InvalidArtifactToken as exc:
+            raise InvalidCapabilityToken("invalid artifact token") from exc
         materials = self._keyring.verification_materials()
         if not materials:
             raise InvalidCapabilityToken("artifact token signer has no verifiable signing material")

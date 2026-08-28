@@ -165,11 +165,11 @@ def _local_owner() -> str:
 def is_own_dashboard_request(request: Request) -> bool:
     """Return whether this is the browser asking on behalf of the page we served.
 
-    A loopback plane holds an owner-only credential, and a browser cannot read a
-    0600 file -- so the dashboard the plane serves at "/" could not authenticate
-    to the plane serving it. The workaround was to tell people to run a second
-    web server, which is a strange thing to need on the machine already running
-    the first one.
+    This decides defaults, never authentication: the headers it reads are
+    client-settable, so once a loopback plane has issued its 0600 credential
+    every caller must present it. What this check still picks is whose identity
+    defaults an automatic-loopback request acts with -- the page this plane
+    served gets this machine's owner, and anything else is an ordinary viewer.
 
     Three conditions, and each closes a specific hole:
 
@@ -186,7 +186,8 @@ def is_own_dashboard_request(request: Request) -> bool:
     same-origin request. That request carries the attacker's name in ``Host``.
 
     ``Sec-Fetch-Mode`` excludes ``navigate``: a top-level navigation to an API
-    URL is same-origin too, and there is no reason for one to authenticate.
+    URL is same-origin too, and there is no reason to treat one as the
+    dashboard.
     """
 
     if request.headers.get("Sec-Fetch-Site") != "same-origin":
@@ -195,6 +196,20 @@ def is_own_dashboard_request(request: Request) -> bool:
         return False
     host = request.headers.get("Host", "").strip().lower()
     return host.rsplit(":", 1)[0] in _LOOPBACK_HOSTS if host else False
+
+
+def _credential_matches(presented: str, expected: str) -> bool:
+    """Compare a caller-presented credential in constant time without raising.
+
+    ``compare_digest`` raises ``TypeError`` for non-ASCII ``str`` arguments, and
+    a presented credential is request input: an unauthenticated caller's
+    non-ASCII header must come back 401, never crash the plane with a 500.
+    """
+
+    try:
+        return secrets.compare_digest(presented, expected)
+    except TypeError:
+        return False
 
 
 class RequestAuthenticator:
@@ -219,7 +234,7 @@ class RequestAuthenticator:
             if scheme.lower() != "bearer" or not token:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid Authorization header")
             if self.bootstrap_token is not None:
-                if secrets.compare_digest(token, self.bootstrap_token):
+                if _credential_matches(token, self.bootstrap_token):
                     return bootstrap_principal()
                 if self.verifier is None:
                     # A credential was presented and it is wrong. Reporting "no
@@ -245,14 +260,20 @@ class RequestAuthenticator:
         return self._dev_principal(request)
 
     def _require_local_development_credential(self, request: Request) -> None:
-        """Require the owner-only credential when automatic loopback auth is active."""
+        """Require the owner-only credential when automatic loopback auth is active.
+
+        Once a credential has been issued every caller must present it, the
+        plane's own dashboard included: the fetch-metadata and Host headers that
+        identify the dashboard are request headers any local process can set, so
+        accepting them *instead of* the credential authenticated whatever
+        process could reach the port.
+        """
 
         credential = self.local_development_credential
         if credential is None:
+            # No credential has been issued yet, so there is nothing to demand.
             return
         if credential.matches(request.headers.get(LOCAL_DEVELOPMENT_CREDENTIAL_HEADER)):
-            return
-        if is_own_dashboard_request(request):
             return
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

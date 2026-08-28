@@ -420,6 +420,16 @@ class _ControllerOutbox:
                 diagnostic=f"workload {workload.id!r} {command.topic} fence conflict: {diagnostic}",
             )
         failure_reason = f"cell-agent {command.topic.removeprefix('workload.')} fence conflict: {diagnostic}"
+        # Archive before settling, exactly as the ordinary terminal paths do in
+        # ``_release_terminal``: settlement releases the lease, and releasing a
+        # cell destroys its journal -- cancel/checkpoint victims ran, so the
+        # tail of their output exists only right now. Best effort on purpose:
+        # a job that ran must still be recorded as finished even if its logs
+        # could not be saved.
+        try:
+            await self._archive_terminal_logs(workload)
+        except Exception:
+            logger.warning("could not archive logs for %s before release", workload.id, exc_info=True)
         try:
             await self.service.settle_terminal_workload(
                 self._principal,

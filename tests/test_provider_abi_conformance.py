@@ -26,6 +26,7 @@ from eyvan.capacity import CapacityStatus
 from eyvan.capacity.conformance import (
     CONFORMANCE_CHECK_NAMES,
     CONFORMANCE_CHECKS,
+    KNOWN_CAPACITY_CLASSES,
     CapacityProviderConformanceTests,
     ConformanceReport,
     ConformanceResult,
@@ -67,6 +68,16 @@ def test_the_shipped_provider_passes_every_published_check(tmp_path) -> None:
     assert report.failed_checks == (), report.describe()
     assert tuple(result.check for result in report.results) == CONFORMANCE_CHECK_NAMES
     assert report.passed
+
+
+def test_the_routable_vocabulary_includes_flex_start() -> None:
+    """A provider whose cells are wait-then-window capacity can say so honestly.
+
+    ``flex_start`` is routed end to end -- the domain enum, pool records, and the
+    fleet loader all ship it -- so declaring it must not read as an invented name.
+    """
+
+    assert "flex_start" in KNOWN_CAPACITY_CLASSES
 
 
 # --------------------------------------------------------------------------- broken providers

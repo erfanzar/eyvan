@@ -158,6 +158,41 @@ async def test_an_unknown_parent_is_rejected() -> None:
         await _submit(service, "orphan", parent="wl-does-not-exist")
 
 
+async def test_a_child_is_refused_when_the_parent_generation_moved_since_the_capability_was_verified() -> None:
+    """The route verifies the token against the parent it read, then admits later.
+
+    A retry or a kick bumps the parent's generation, so the admitting transaction
+    has to re-check the generation the capability named: without that, a
+    superseded attempt's token could attach children to the current attempt.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    root = await _submit(service, "root")
+    # What the route's first transaction read: generation 1, capable of children.
+    read = root.model_copy(update={"spec": root.spec.model_copy(update={"can_submit_children": True})})
+    async with repository.transaction() as tx:
+        await tx.put_workload(read.model_copy(update={"generation": 2}))
+
+    with pytest.raises(ConflictError, match="generation"):
+        await service.submit_child_workload(
+            parent=read,
+            spec=_spec("child"),
+            idempotency_key="child-1",
+            expected_parent_generation=read.generation,
+        )
+    assert await service.list_child_workloads(_principal(), root.id) == []
+
+    # Opt-in fence: without an expected generation, admission proceeds as before.
+    child, replayed = await service.submit_child_workload(
+        parent=read,
+        spec=_spec("child"),
+        idempotency_key="child-2",
+    )
+    assert replayed is False
+    assert child.parent_workload_id == root.id
+
+
 async def test_a_cross_project_parent_is_rejected() -> None:
     """A child inherits the parent's budget; crossing projects would misattribute spend."""
 

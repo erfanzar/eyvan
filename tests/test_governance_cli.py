@@ -189,6 +189,35 @@ def test_quota_set_carries_an_idempotency_key(monkeypatch) -> None:
     assert payload["limits"]["tpu"] == 8
 
 
+def test_a_tpu_only_quota_set_leaves_every_unnamed_dimension_unconstrained(monkeypatch) -> None:
+    """The server constrains exactly what the wire carries: naming only --tpu
+    used to bind cpu, gpu and memory to zero and refuse every workload in the
+    scope that asked for any of them."""
+
+    fake = FakeClient()
+
+    result = _invoke(fake, monkeypatch, ["quota", "set", "--tpu", "20"])
+
+    assert result.exit_code == 0, result.output
+    payload = _json_argument(fake.calls[0])
+    assert payload["limits"] == {"tpu": 20}
+    assert "cpu" not in payload["limits"]
+    assert "memory_gib" not in payload["limits"]
+    assert "gpu" not in payload["limits"]
+
+
+def test_a_named_zero_is_a_constraint_not_an_omission(monkeypatch) -> None:
+    """``--cpu 0`` closes a dimension deliberately; the unset ones stay open."""
+
+    fake = FakeClient()
+
+    result = _invoke(fake, monkeypatch, ["quota", "set", "--cpu", "0", "--gpu", "2"])
+
+    assert result.exit_code == 0, result.output
+    payload = _json_argument(fake.calls[0])
+    assert payload["limits"] == {"cpu": 0.0, "gpu": 2}
+
+
 def test_quota_set_can_reach_the_artifact_byte_ceiling(monkeypatch) -> None:
     """A setting nobody can set is the same as no setting."""
 

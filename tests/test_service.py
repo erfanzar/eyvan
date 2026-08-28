@@ -358,6 +358,44 @@ async def test_submission_enforces_project_placement_policy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_project_policy_gates_every_capacity_class_in_the_portfolio() -> None:
+    """The scheduler may land a workload on any class its portfolio accepts.
+
+    Checking only the primary class gated the door the workload was least likely
+    to walk through: a spec whose *additional* classes left the allowlist was
+    admitted, then placed on a class the project policy forbids.
+    """
+
+    service = ControlPlaneService(InMemoryRepository())
+    admin = _principal(Role.PROJECT_ADMIN)
+    operator = _principal(Role.PROJECT_OPERATOR)
+    await service.put_policy(
+        admin,
+        PolicyRecord(
+            org_id="acme",
+            project_id="research",
+            allowed_capacity_classes=("spot",),
+            updated_by="admin",
+        ),
+        idempotency_key="policy",
+    )
+
+    with pytest.raises(InputError, match="on_demand"):
+        await service.submit_workload(
+            operator,
+            org_id="acme",
+            project_id="research",
+            spec=_spec().model_copy(
+                update={
+                    "capacity_class": CapacityClass.SPOT,
+                    "additional_capacity_classes": (CapacityClass.ON_DEMAND,),
+                }
+            ),
+            idempotency_key="submit-portfolio",
+        )
+
+
+@pytest.mark.asyncio
 async def test_pool_submission_derives_and_pins_the_complete_capacity_contract() -> None:
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -498,7 +536,6 @@ async def test_submit_fleet_discovery_returns_sorted_runnable_names_for_the_auth
 @pytest.mark.parametrize(
     ("pool", "match"),
     [
-        (_capacity_pool(enabled=False), "disabled"),
         (_capacity_pool(max_cells=0), "max_workers set to zero"),
         (
             _capacity_pool(max_replica_resources=ResourceVector(cpu=0, memory_gib=0, tpu=4)),
@@ -520,6 +557,96 @@ async def test_pool_submission_rejects_unschedulable_simple_run(pool: CapacityPo
             org_id="acme",
             project_id="research",
             command="python train.py",
+            idempotency_key="run",
+        )
+    async with repository.transaction() as transaction:
+        assert await transaction.list_workloads() == []
+
+
+@pytest.mark.asyncio
+async def test_pool_submission_reads_a_disabled_pool_as_absent() -> None:
+    """Only enabled pools are submittable, so only they are matched.
+
+    ``submit_pool_callable`` and ``list_capacity`` offer a submitter enabled
+    pools only; this path matched disabled ones too, so a fleet whose disabled
+    pool differed in shape from its enabled one was refused as ambiguous -- or
+    matched and then told it "is disabled" -- although one pool was submittable.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pool = _capacity_pool(enabled=False)
+    await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key="pool")
+
+    with pytest.raises(NotFoundError, match="was not found"):
+        await service.submit_pool_workload(
+            _principal(Role.PROJECT_OPERATOR),
+            fleet_name=pool.fleet_name,
+            node_type=pool.node_type,
+            org_id="acme",
+            project_id="research",
+            command="python train.py",
+            idempotency_key="run",
+        )
+    async with repository.transaction() as transaction:
+        assert await transaction.list_workloads() == []
+
+
+@pytest.mark.asyncio
+async def test_pool_submission_prefers_the_enabled_pool_beside_a_disabled_twin() -> None:
+    """A disabled pool must not make a submittable fleet look ambiguous."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    enabled = _capacity_pool(pool_id="opaque-provider-id-b").model_copy(
+        update={
+            "capacity": ResourceVector(cpu=4, memory_gib=16, tpu=4),
+            "allocatable": ResourceVector(cpu=4, memory_gib=16, tpu=4),
+        }
+    )
+    await service.upsert_capacity_pool(fleet_admin, _capacity_pool(enabled=False), idempotency_key="pool-disabled")
+    await service.upsert_capacity_pool(fleet_admin, enabled, idempotency_key="pool-enabled")
+
+    workload, replayed = await service.submit_pool_workload(
+        _principal(Role.PROJECT_OPERATOR),
+        fleet_name=enabled.fleet_name,
+        node_type=enabled.node_type,
+        org_id="acme",
+        project_id="research",
+        command="python train.py",
+        idempotency_key="run",
+    )
+
+    assert replayed is False
+    assert workload.spec.required_labels["eyvan_pool"] == enabled.id
+
+
+@pytest.mark.asyncio
+async def test_pool_submission_refuses_pods_wider_than_the_pool_cap() -> None:
+    """Accepting pods beyond ``max_cells`` queued a job that can never place.
+
+    The planner launches width-``pods`` cells only while ``max_cells`` minus live
+    worker units allows, so an accepted pods=64 request against a max_cells=8
+    pool sat PENDING forever. ``submit_pool_callable`` has always refused this.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pool = _capacity_pool(max_cells=4, node_type="v5p-workers").model_copy(update={"executor": "eyvan-native"})
+    await service.upsert_capacity_pool(fleet_admin, pool, idempotency_key="pool")
+
+    with pytest.raises(ConflictError, match="capped at 4 workers"):
+        await service.submit_pool_workload(
+            _principal(Role.PROJECT_OPERATOR),
+            fleet_name=pool.fleet_name,
+            node_type=pool.node_type,
+            org_id="acme",
+            project_id="research",
+            command="python train.py",
+            pods=8,
             idempotency_key="run",
         )
     async with repository.transaction() as transaction:

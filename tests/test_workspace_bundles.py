@@ -19,7 +19,7 @@ import pytest
 
 import eyvan.sdk.client.sync as sync_module
 import eyvan.sdk.execution as execution_module
-from eyvan._internal.workspace import build_workspace
+from eyvan._internal.workspace import WorkspaceArchive, build_workspace
 from eyvan.artifacts import LocalArtifactStore
 from eyvan.records import CallableExecution
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
@@ -266,6 +266,62 @@ def test_decorator_without_a_workspace_sends_no_bundle_fields(tmp_path: Path) ->
     train.remote()
 
     assert submitted[0]["execution"]["workspace_uri"] is None
+    assert not (tmp_path / "artifacts" / "workspaces").exists()
+    raw.close()
+
+
+def test_the_default_decorator_packages_nothing(monkeypatch, tmp_path: Path) -> None:
+    """workspace=None is the documented off-by-default, not "upload Path.cwd()".
+
+    Every bare ``@execute`` submit used to package the caller's working
+    directory and ship it to the artifact store.
+    """
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "secret_module.py").write_text("CREDENTIALS = 'do not ship'\n")
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    submitted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        submitted.append(json.loads(request.content))
+        return httpx.Response(
+            201,
+            json={
+                "id": "wl-default",
+                "org_id": "acme",
+                "project_id": "research",
+                "created_by": "alice",
+                "spec": {
+                    "name": "smoke",
+                    "execution": {
+                        "kind": "callable",
+                        "artifact_uri": "gs://a/b.pkl",
+                        "sha256": "a" * 64,
+                        "python": "3.13",
+                        "result_uri": "eyvan://results/wl-default-g1",
+                    },
+                },
+            },
+        )
+
+    raw = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    context = execution_module.ExecutionContext(
+        fleet="research",
+        org_id="acme",
+        project_id="research",
+        artifact_store=store,
+        submitter=EyvanCallableSubmitter(sync_module.EyvanClient(client=raw), store),
+    )
+
+    @execution_module.execute(execution_module.TpuConfig(type="v5p-16"), context=context)
+    def train() -> int:
+        return 1
+
+    train.remote()
+
+    execution = submitted[0]["execution"]
+    assert execution["workspace_uri"] is None
+    assert execution["workspace_sha256"] is None
     assert not (tmp_path / "artifacts" / "workspaces").exists()
     raw.close()
 
@@ -614,3 +670,169 @@ def test_a_rerun_of_the_same_bundle_reuses_its_extraction(tmp_path, monkeypatch)
     third = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
     assert third == first
     assert not (first / "leftover-shadow.py").exists()
+
+
+# --------------------------------------------------------------------------- the command-path entry
+
+
+class _Execvp(BaseException):
+    """What ``os.execvp`` would have run, instead of running it."""
+
+    def __init__(self, command: list[str]) -> None:
+        self.command = command
+
+
+@pytest.fixture
+def no_execvp(monkeypatch) -> None:
+    """Record the command the entry would exec rather than replacing the process."""
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    def fake_execvp(program: str, arguments: list[str]) -> None:
+        del program  # execvp(command[0], command): the full line is already in arguments
+        raise _Execvp(list(arguments))
+
+    monkeypatch.setattr(workspace_entry.os, "execvp", fake_execvp)
+
+
+def _bundle(root: Path) -> WorkspaceArchive:
+    root.mkdir(parents=True)
+    (root / "helper.py").write_text("VALUE = 1\n")
+    return build_workspace(root)
+
+
+def test_a_second_extraction_into_the_same_base_succeeds(tmp_path: Path) -> None:
+    """The failure this fixes: one shared destination broke every later job.
+
+    ``extract_workspace`` refuses a non-empty destination, so a second
+    workspace run on the same host -- a retry, the next job, another rank --
+    used to die before its command started, forever, until somebody cleaned
+    the directory by hand.
+    """
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    bundle = _bundle(tmp_path / "src")
+    base = tmp_path / "ws"
+
+    first = workspace_entry.materialize(
+        bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
+    )
+    second = workspace_entry.materialize(
+        bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
+    )
+
+    assert first == second
+    assert (first / "helper.py").exists()
+    assert (first / workspace_entry.COMPLETE_MARKER).is_file()
+
+
+def test_an_extraction_lands_under_its_own_digest(tmp_path: Path) -> None:
+    """Iteration -- fix the tree, rerun -- must not meet the old bundle."""
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    base = tmp_path / "ws"
+    first_bundle = _bundle(tmp_path / "src")
+    (tmp_path / "src" / "helper.py").write_text("VALUE = 2\n")
+    second_bundle = build_workspace(tmp_path / "src")
+
+    first = workspace_entry.materialize(
+        first_bundle.payload, sha256=first_bundle.sha256, signature=None, signing_key=None, base=base
+    )
+    second = workspace_entry.materialize(
+        second_bundle.payload, sha256=second_bundle.sha256, signature=None, signing_key=None, base=base
+    )
+
+    assert first != second
+    assert first.name == first_bundle.sha256[:12]
+    assert second.name == second_bundle.sha256[:12]
+    # The old extraction is untouched by the new one.
+    assert (first / "helper.py").read_text() == "VALUE = 1\n"
+
+
+def test_a_torn_extraction_is_rebuilt_rather_than_entered(tmp_path: Path) -> None:
+    """A crashed attempt leaves a partial tree, and only the marker says so."""
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    bundle = _bundle(tmp_path / "src")
+    base = tmp_path / "ws"
+    partial = base / bundle.sha256[:12]
+    partial.mkdir(parents=True)
+    (partial / "leftover-shadow.py").write_text("VALUE = 2\n")
+
+    workspace = workspace_entry.materialize(
+        bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
+    )
+
+    assert workspace == partial
+    assert not (partial / "leftover-shadow.py").exists()
+    assert (partial / "helper.py").exists()
+
+
+def test_two_races_to_extract_the_same_bundle_both_succeed(tmp_path: Path) -> None:
+    """Ranks sharing a host race; both must land on a whole tree.
+
+    Each thread extracts into its own staging directory and the loser of the
+    rename reuses the winner's published extraction, so no interleaving ends
+    with a partial directory or a failure.
+    """
+
+    import threading
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    bundle = _bundle(tmp_path / "src")
+    base = tmp_path / "ws"
+    barrier = threading.Barrier(2)
+    results: list = []
+
+    def rank() -> None:
+        barrier.wait()
+        results.append(
+            workspace_entry.materialize(
+                bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
+            )
+        )
+
+    threads = [threading.Thread(target=rank) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results[0] == results[1]
+    assert (results[0] / "helper.py").exists()
+    assert (results[0] / workspace_entry.COMPLETE_MARKER).is_file()
+    assert not list(base.glob(".*staging*"))
+
+
+def test_the_workload_command_keeps_its_own_end_of_options_marker(
+    tmp_path: Path, monkeypatch, no_execvp
+) -> None:
+    """`python tool.py -- --fast` must not exec as `python tool.py --fast`.
+
+    The wrapper consumes only its own `--`; stripping every bare double dash
+    flips end-of-options semantics inside the job's command line.
+    """
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    bundle = _bundle(tmp_path / "src")
+    (tmp_path / "bundle.tar.gz").write_bytes(bundle.payload)
+    monkeypatch.chdir(tmp_path)  # main() chdirs into the workspace; undo that
+    monkeypatch.setenv("EYVAN_WORKSPACE_DIR", str(tmp_path / "ws"))
+    monkeypatch.delenv("EYVAN_CALLABLE_SIGNING_KEY", raising=False)
+
+    for argv in (
+        ["--workspace-uri", str(tmp_path / "bundle.tar.gz"), "--workspace-sha256", bundle.sha256, "--"],
+        ["--workspace-uri", str(tmp_path / "bundle.tar.gz"), "--workspace-sha256", bundle.sha256],
+    ):
+        with pytest.raises(_Execvp) as raised:
+            workspace_entry.main([*argv, "python", "tool.py", "--", "--fast"])
+
+        assert raised.value.command == ["python", "tool.py", "--", "--fast"]
+
+    # The EYVAN_WORKSPACE_DIR override stayed the base: extraction landed under it.
+    assert (tmp_path / "ws" / bundle.sha256[:12] / "helper.py").exists()

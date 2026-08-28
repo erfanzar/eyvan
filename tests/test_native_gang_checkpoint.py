@@ -185,3 +185,52 @@ def test_an_empty_hook_is_refused_before_any_cell_is_touched(hook: str) -> None:
             client.close()
 
     assert touched == []
+
+
+def test_status_reports_each_ranks_derived_checkpoint_destination() -> None:
+    """A status row may name a checkpoint only at the address its hook writes.
+
+    The resume path derives the same per-rank address (see
+    ``test_checkpoint_resume_addresses_agree``), so a destination that disagreed
+    with the write would silently read as "no checkpoint" on restart.
+    """
+
+    from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/checkpoint"):
+            return httpx.Response(200, json={"remote_id": "ckpt-shared"})
+        return httpx.Response(200, json={"remote_id": "gang-job", "status": "RUNNING"})
+
+    executor, clients = _checkpoint_calls(handler)
+    try:
+        executor.checkpoint(
+            "gang-job",
+            hook="python checkpoint.py",
+            output_uri="gs://bucket/checkpoint",
+            context=CHECKPOINT_CONTEXT,
+        )
+        report = executor.status("gang-job")
+    finally:
+        for client in clients:
+            client.close()
+
+    assert [worker["checkpoint_uri"] for worker in report["workers"]] == [
+        _rank_checkpoint_uri("gs://bucket/checkpoint", rank) for rank in range(len(ENDPOINTS))
+    ]
+
+
+def test_status_leaves_the_checkpoint_destination_unknown_without_a_launch() -> None:
+    """A status must not invent a destination no hook ever received."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"remote_id": "gang-job", "status": "RUNNING"})
+
+    executor, clients = _checkpoint_calls(handler)
+    try:
+        report = executor.status("gang-job")
+    finally:
+        for client in clients:
+            client.close()
+
+    assert all(worker["checkpoint_uri"] is None for worker in report["workers"])

@@ -299,6 +299,10 @@ class ClusterCapacityPass:
     ) -> dict[str, ClusterCapacityReading | None]:
         """Read each target's cluster once, sharing a queue two pools point at.
 
+        Sharing also requires the same ResourceFlavor: a reading is scoped to
+        one flavor, so two pools on one ClusterQueue with different flavors
+        are read separately rather than answered with each other's quota.
+
         Args:
             targets: What to read, one per pool.
             now: Observation time stamped on every reading.
@@ -309,7 +313,7 @@ class ClusterCapacityPass:
 
         api = self._api()
         cluster_queues: dict[tuple[str, str], str | None] = {}
-        by_cluster_queue: dict[str, ClusterCapacityReading | None] = {}
+        by_cluster_queue: dict[tuple[str, str], ClusterCapacityReading | None] = {}
         return {target.pool_id: self._read(api, target, cluster_queues, by_cluster_queue, now=now) for target in targets}
 
     def advise(
@@ -365,11 +369,15 @@ class ClusterCapacityPass:
         api: KubernetesApi | None,
         target: PoolCapacityTarget,
         cluster_queues: dict[tuple[str, str], str | None],
-        by_cluster_queue: dict[str, ClusterCapacityReading | None],
+        by_cluster_queue: dict[tuple[str, str], ClusterCapacityReading | None],
         *,
         now: datetime | None = None,
     ) -> ClusterCapacityReading | None:
-        """Read one pool's cluster, reusing a queue two pools share.
+        """Read one pool's cluster, reusing a reading another pool already took.
+
+        A reading is only shared when both the ClusterQueue and the
+        ResourceFlavor match; anything else would fit this pool's request
+        against another pool's flavor.
 
         Every failure returns ``None``, which
         :func:`~eyvan.capacity.autoscale.cluster_capacity.advise_launch` reads as
@@ -385,11 +393,12 @@ class ClusterCapacityPass:
             cluster_queue = cluster_queues[key]
             if not cluster_queue:
                 return None
-            if cluster_queue not in by_cluster_queue:
-                by_cluster_queue[cluster_queue] = observe_cluster_capacity(
+            reading_key = (cluster_queue, target.flavor)
+            if reading_key not in by_cluster_queue:
+                by_cluster_queue[reading_key] = observe_cluster_capacity(
                     api, cluster_queue, flavor=target.flavor, now=now
                 )
-            return by_cluster_queue[cluster_queue]
+            return by_cluster_queue[reading_key]
         except Exception:  # a plan input that can fail a pass is not a plan input
             logger.debug("cluster capacity could not be read for pool %s", target.pool_id, exc_info=True)
             return None

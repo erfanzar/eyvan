@@ -182,7 +182,13 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args(list(argv) if argv is not None else None)
 
-    command = [item for item in arguments.command if item != "--"]
+    command = list(arguments.command)
+    # argparse hands the wrapper its own end-of-options marker back inside the
+    # remainder; consume exactly that one. Any later `--` belongs to the
+    # workload's command line -- `python tool.py -- --fast` means something --
+    # and must be exec'd verbatim.
+    if command and command[0] == "--":
+        del command[0]
     if not command:
         parser.error("a command to execute is required")
     if not arguments.require:
