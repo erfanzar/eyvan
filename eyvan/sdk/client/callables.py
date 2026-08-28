@@ -135,8 +135,7 @@ class _CallableProgressRenderer:
         if (
             previous is not None
             and update.state == previous.state
-            and update.state
-            not in {JobLifecycleState.SUCCEEDED, JobLifecycleState.FAILED, JobLifecycleState.CANCELLED}
+            and update.state not in {JobLifecycleState.SUCCEEDED, JobLifecycleState.FAILED, JobLifecycleState.CANCELLED}
         ):
             # Same state, new progress: draw only the line under the heading.
             self._output.lifecycle_detail(update)
@@ -167,29 +166,58 @@ class _CallableProgressRenderer:
                 # at a fresh cursor and the retired attempt's pages are gone.
                 self._log_cursor = ""
                 continue
-            for index, (_rank, message, _timestamp) in enumerate(window.lines):
-                # Ray-style: a blocking wait decorates each line with the
-                # worker that produced it -- pid and host when the archive
-                # reports them, nothing invented when it does not.
-                provenance = window.provenance[index]
-                line = message.rstrip("\n")
-                if provenance[0] is None:
-                    self._output.output_line(line)
-                    continue
-                prefix = (
-                    f"(Worker pid={provenance[0]}, {provenance[1]}) "
-                    if provenance[1]
-                    else f"(Worker pid={provenance[0]}) "
-                )
-                from rich.text import Text
-
-                # Attribution recedes next to the job's own words: cyan when a
-                # terminal renders it, plain bytes everywhere else.
-                self._output.output_line(Text(prefix, style="cyan").append(line))
+            self._emit_page(window)
             if not window.cursor or not window.lines:
                 self._log_cursor = window.cursor or self._log_cursor
                 return
             self._log_cursor = window.cursor
+
+    def _emit_page(self, window: _LogWindow) -> None:
+        """Emit one page of job output, collapsing a chorus into one line.
+
+        A gang says its startup lines once per host, because every host says
+        them: a 4x v6e-8 job printed the same EasyDeL banner four times and
+        the blocking wait showed every voice. A *run* of byte-identical
+        messages from distinct ranks now renders once with its headcount --
+        ``(4x Worker)`` -- because which hosts said it is exactly what a
+        chorus erases. Two lines that merely look similar do not collapse:
+        the key is exact equality, so a genuine straggler or a per-rank value
+        stays its own line. A rank repeating *its own* line also stays
+        visible, because a repeat is signal, not chorus -- and a page without
+        rank data cannot prove distinct voices and never collapses.
+        """
+
+        from rich.text import Text
+
+        index = 0
+        lines = window.lines
+        while index < len(lines):
+            rank, message, _timestamp = lines[index]
+            line = message.rstrip("\n")
+            voices = {rank}
+            end = index + 1
+            while end < len(lines) and lines[end][1].rstrip("\n") == line and lines[end][0] not in voices:
+                voices.add(lines[end][0])
+                end += 1
+            if len(voices) == 1:
+                # Ray-style: a blocking wait decorates each line with the
+                # worker that produced it -- pid and host when the archive
+                # reports them, nothing invented when it does not.
+                provenance = window.provenance[index]
+                if provenance[0] is None:
+                    self._output.output_line(line)
+                else:
+                    prefix = (
+                        f"(Worker pid={provenance[0]}, {provenance[1]}) "
+                        if provenance[1]
+                        else f"(Worker pid={provenance[0]}) "
+                    )
+                    # Attribution recedes next to the job's own words: cyan
+                    # when a terminal renders it, plain bytes everywhere else.
+                    self._output.output_line(Text(prefix, style="cyan").append(line))
+            else:
+                self._output.output_line(Text(f"({len(voices)}x Worker) ", style="cyan").append(line))
+            index = end
 
     @staticmethod
     def _required_workers(progress: WorkloadProgress) -> int:
