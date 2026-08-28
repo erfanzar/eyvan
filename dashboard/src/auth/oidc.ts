@@ -24,6 +24,14 @@ const NONCE_KEY = "eyvan.oidc.nonce";
  */
 export const LOCAL_CREDENTIAL_KEY = "eyvan.local.credential";
 export const LOCAL_CREDENTIAL_FRAGMENT_PARAM = "eyvan-local-credential";
+/**
+ * The refusal a loopback plane answers with when the credential it demands
+ * was not presented correctly. Mirrors the server's
+ * ``LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL`` in
+ * ``eyvan/server/local/auth.py`` -- it is a wire contract, so it is stated
+ * once per side and each side names the other.
+ */
+export const LOCAL_CREDENTIAL_REQUIRED_DETAIL = "local Eyvan development credential is required";
 export const AUTH_CHANGED_EVENT = "eyvan:auth-changed";
 
 interface OidcMetadata {
@@ -296,6 +304,31 @@ export function localDevelopmentCredential(): string | undefined {
   if (bridged) return bridged;
   // A declared-but-unset build argument becomes the empty string, not undefined.
   return import.meta.env.VITE_EYVAN_LOCAL_CREDENTIAL || undefined;
+}
+
+/**
+ * Drop a bridged credential the plane has refused, and say so.
+ *
+ * A credential is written once and read forever, but it is not immortal:
+ * deleting the profile's ``.eyvan`` directory, or moving between machines
+ * that share a browser session, leaves this tab holding a value the plane
+ * will never accept again. Every call would then fail with the same 401 the
+ * bare page used to die on -- behind a gate that had already waved it
+ * through, because presence was all the gate checked. So the refusal itself
+ * retires the value and re-opens the gate, and the screen that knows the
+ * one working command replaces a wall of dead panels.
+ *
+ * The build-time ``VITE_EYVAN_LOCAL_CREDENTIAL`` of a source-checkout dev
+ * server cannot be un-baked from here; that flow re-reads the file when the
+ * developer restarts it, which is the loop that value is part of.
+ */
+export function invalidateRefusedLocalCredential(refusalDetail: string): boolean {
+  if (!refusalDetail.includes(LOCAL_CREDENTIAL_REQUIRED_DETAIL)) return false;
+  const store = storage();
+  if (!store?.getItem(LOCAL_CREDENTIAL_KEY)) return false;
+  store.removeItem(LOCAL_CREDENTIAL_KEY);
+  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  return true;
 }
 
 /**

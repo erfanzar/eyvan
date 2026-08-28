@@ -15,6 +15,7 @@ import {
   consumeSessionNotice,
   currentIdentity,
   getAccessToken,
+  invalidateRefusedLocalCredential,
   isOidcConfigured,
   configuredScope,
   loadRuntimeOidcConfig,
@@ -483,5 +484,38 @@ describe("the loopback development credential bridge", () => {
     );
 
     expect(apiAuthHeaders()).toEqual({ Authorization: expect.stringContaining("Bearer ") });
+  });
+});
+
+describe("retiring a refused loopback credential", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("drops a stored credential the plane refused, and announces the change", () => {
+    const store = memoryStorage({ "eyvan.local.credential": "stale-value" });
+    vi.stubGlobal("sessionStorage", store);
+
+    const retired = invalidateRefusedLocalCredential(": local Eyvan development credential is required");
+
+    expect(retired).toBe(true);
+    // The value is gone from storage; the gate re-render it triggers is
+    // covered where a DOM exists, by the AuthGate tests.
+    expect(store.getItem("eyvan.local.credential")).toBeNull();
+  });
+
+  it("keeps the credential for any other refusal", () => {
+    const store = memoryStorage({ "eyvan.local.credential": "stale-value" });
+    vi.stubGlobal("sessionStorage", store);
+
+    expect(invalidateRefusedLocalCredential(": invalid bearer token")).toBe(false);
+    expect(store.getItem("eyvan.local.credential")).toBe("stale-value");
+  });
+
+  it("has nothing to retire when no credential was held", () => {
+    vi.stubGlobal("sessionStorage", memoryStorage());
+
+    expect(invalidateRefusedLocalCredential(": local Eyvan development credential is required")).toBe(false);
   });
 });

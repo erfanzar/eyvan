@@ -1353,3 +1353,51 @@ describe("how long a read is given", () => {
     await expect(settled).resolves.toContain("timed out");
   });
 });
+
+describe("EyvanApiClient loopback credential refusals", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  function memoryStorage(initial: Record<string, string> = {}): Storage {
+    const values = new Map(Object.entries(initial));
+    return {
+      get length() { return values.size; },
+      clear: () => values.clear(),
+      getItem: (key) => values.get(key) ?? null,
+      key: (index) => [...values.keys()][index] ?? null,
+      removeItem: (key) => { values.delete(key); },
+      setItem: (key, value) => { values.set(key, value); },
+    };
+  }
+
+  function refusal(detail: string): Response {
+    return new Response(JSON.stringify({ detail }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  it("retires the held credential when the plane refuses exactly that", async () => {
+    const store = memoryStorage({ "eyvan.local.credential": "stale-value" });
+    vi.stubGlobal("sessionStorage", store);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(refusal("local Eyvan development credential is required")));
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await expect(client.listCells()).rejects.toMatchObject({ status: 401 });
+
+    expect(store.getItem("eyvan.local.credential")).toBeNull();
+  });
+
+  it("keeps the credential when a 401 is about something else", async () => {
+    const store = memoryStorage({ "eyvan.local.credential": "held-value" });
+    vi.stubGlobal("sessionStorage", store);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(refusal("invalid bearer token")));
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await expect(client.listCells()).rejects.toMatchObject({ status: 401 });
+
+    expect(store.getItem("eyvan.local.credential")).toBe("held-value");
+  });
+});

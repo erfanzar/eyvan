@@ -104,3 +104,39 @@ describe("the sign-in screen", () => {
     await waitFor(() => expect(screen.getByText("Sign in to Eyvan")).toBeTruthy());
   });
 });
+
+describe("the gate after the plane refuses a held credential", () => {
+  afterEach(() => {
+    cleanup();
+    __resetRuntimeOidcConfigForTests();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    sessionStorage.removeItem("eyvan.local.credential");
+  });
+
+  it("closes on a fleet that was already rendered, naming the way back in", async () => {
+    // The credential was valid when the page loaded, and the plane has since
+    // refused it -- rotated, reset, or a session carried between machines.
+    // Presence is all the gate checked at render time, so the refusal itself
+    // must retire the value and close the gate; a page of dead panels that
+    // never names the working command is the failure this prevents.
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    sessionStorage.setItem("eyvan.local.credential", "stale-value");
+    planeAnswering({ issuer: null, client_id: null, development_auth: "loopback_default" });
+
+    render(
+      <AuthGate>
+        <p>fleet</p>
+      </AuthGate>,
+    );
+    await waitFor(() => expect(screen.getByText("fleet")).toBeTruthy());
+
+    // What the API client does when the plane refuses the value it held.
+    sessionStorage.removeItem("eyvan.local.credential");
+    globalThis.dispatchEvent(new Event("eyvan:auth-changed"));
+
+    await waitFor(() => expect(screen.getByText("This plane requires its local credential")).toBeTruthy());
+    expect(screen.queryByText("fleet")).toBeNull();
+  });
+});

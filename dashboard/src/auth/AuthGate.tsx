@@ -25,6 +25,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const [checking, setChecking] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [identity, setIdentity] = useState(() => currentIdentity());
+  // The identity object can be identical before and after an auth change -- a
+  // refused loopback credential leaves no identity at all -- so React would
+  // skip the re-render and keep this gate open behind a page whose every call
+  // is now refused. The counter forces the decision below to run again.
+  const [, setAuthRevision] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,6 +60,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onAuthChanged = () => {
       setIdentity(currentIdentity());
+      setAuthRevision((revision) => revision + 1);
       setError(consumeSessionNotice() ?? null);
     };
     globalThis.addEventListener(AUTH_CHANGED_EVENT, onAuthChanged);

@@ -15,7 +15,14 @@ import {
   mockPolicies,
   mockWorkloads,
 } from "./mockData";
-import { apiAuthHeaders, configuredScope, isDemoMode, rejectSession, type AuthScope } from "../auth/oidc";
+import {
+  apiAuthHeaders,
+  configuredScope,
+  invalidateRefusedLocalCredential,
+  isDemoMode,
+  rejectSession,
+  type AuthScope,
+} from "../auth/oidc";
 import { EventStreamHttpError, followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
   AuditEvent,
@@ -594,6 +601,13 @@ export class EyvanApiClient {
         }
         if (response.status === 401) {
           rejectSession();
+          // A refused loopback credential retires itself here: the gate let
+          // this page through on the value it held, and the plane has just
+          // said that value will never be accepted. Without this, a rotated
+          // or reset credential turns every panel into the same 401 wall the
+          // gate exists to prevent -- the working command one terminal line
+          // away and never named.
+          invalidateRefusedLocalCredential(detail);
         }
         throw new ApiError(`Eyvan API request failed with ${response.status}${detail}`, response.status);
       }
