@@ -1362,7 +1362,8 @@ class _ControllerWorkloadCommands:
             if stale:
                 raise PermanentDispatchRefusal(
                     f"cell {cell.id!r} runs {' and '.join(stale)} but this plane stages "
-                    f"{head.source_digest[:12]}; redeploy or recycle the cell before dispatching"
+                    f"{head.source_digest[:12]}; recycle it with 'eyvan cell-drain {cell.id}' then "
+                    f"'eyvan cell-delete {cell.id}', or redeploy the cell's runtime before dispatching"
                 )
 
     async def _dispatch_workload(self, command: OutboxRecord) -> None:

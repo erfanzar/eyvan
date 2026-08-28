@@ -4684,6 +4684,11 @@ async def test_dispatch_refuses_a_cell_running_a_different_build(monkeypatch) ->
         await controller._refuse_stale_cell_builds((cell,))
     message = str(refused.value)
     assert "bbbbbbbbbbbb" in message and "cccccccccccc" in message and "aaaaaaaaaaaa" in message
+    # A refusal that says what to do without naming the commands still sends
+    # the operator hunting through docs mid-incident. Both verbs and the cell
+    # id must ride in the message itself, ready to paste.
+    assert "eyvan cell-drain cell-skewed" in message
+    assert "eyvan cell-delete cell-skewed" in message
     assert fake_agent.submissions == []
 
 
