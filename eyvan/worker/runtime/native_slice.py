@@ -188,16 +188,6 @@ def _indeterminate_observation(remote_id: str, reason: str) -> ExecutionWorkload
     )
 
 
-def _lost_observation(remote_id: str, reason: str) -> ExecutionWorkloadObservation:
-    """Represent a worker proven unreachable by a transport failure."""
-
-    return ExecutionWorkloadObservation(
-        remote_id=remote_id,
-        status=ExecutionWorkloadStatus.LOST,
-        message=reason,
-    )
-
-
 def _invalid_observation_reason(
     error: Exception,
     *,
@@ -1037,7 +1027,13 @@ class NativeSliceExecutor:
                     endpoint=endpoint,
                 )
             except httpx.TransportError as exc:
-                observation = _lost_observation(
+                # Same reasoning as the gang executor: an unreachable endpoint
+                # is a fact about the connection, not the rank. Reading it as
+                # LOST failed whole slices over a closed keep-alive; reading it
+                # as INDETERMINATE lets the next poll say what actually
+                # happened, and sustained unreachability escalates through the
+                # indeterminate grace path instead of killing live peers.
+                observation = _indeterminate_observation(
                     remote_id,
                     f"native worker {endpoint} is unreachable: {type(exc).__name__}: {exc}",
                 )

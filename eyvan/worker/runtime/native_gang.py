@@ -222,16 +222,6 @@ def _indeterminate_observation(remote_id: str, reason: str) -> ExecutionWorkload
     )
 
 
-def _lost_observation(remote_id: str, reason: str) -> ExecutionWorkloadObservation:
-    """Represent a worker proven unreachable by a transport failure."""
-
-    return ExecutionWorkloadObservation(
-        remote_id=remote_id,
-        status=ExecutionWorkloadStatus.LOST,
-        message=reason,
-    )
-
-
 def _invalid_observation_reason(
     error: Exception,
     *,
@@ -622,7 +612,18 @@ class NativeGangExecutor:
                     endpoint=worker.endpoint,
                 )
             except httpx.TransportError as exc:
-                observation = _lost_observation(
+                # An unreachable worker endpoint is a fact about the observer's
+                # connection, not about the rank: a closed keep-alive or a
+                # restarting daemon reads identically to a dead process, and
+                # treating it as LOST killed four healthy v6e-8 hosts whose
+                # ranks had all exited 0 -- the fastest rank's vanishing
+                # endpoint was read as its death, and the failure settled the
+                # workload and tore down its three still-running peers.
+                # INDETERMINATE keeps the plane polling: a blip resolves on the
+                # next read, and a host that stays unreadable escalates through
+                # the indeterminate grace path, which drains the cell rather
+                # than freeing the lease while the workload may still run.
+                observation = _indeterminate_observation(
                     remote_id,
                     f"native worker {worker.endpoint} is unreachable: {type(exc).__name__}: {exc}",
                 )

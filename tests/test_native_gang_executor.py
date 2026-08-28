@@ -16,6 +16,7 @@ import pytest
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
 from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMember
+from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 
 
 def _context(*, key: str, generation: int, token: str) -> MutationContext:
@@ -439,7 +440,18 @@ def test_native_gang_marks_a_malformed_worker_observation_indeterminate() -> Non
             client.close()
 
 
-def test_native_gang_reports_a_transport_loss_as_lost() -> None:
+def test_a_transport_failure_observing_one_rank_is_not_that_ranks_death() -> None:
+    """One unreadable endpoint must not settle a gang whose ranks are alive.
+
+    Observed on a live 4x v6e-8: every rank completed its callable and exited
+    0, and the fastest rank's vanished HTTP endpoint -- a closed keep-alive to
+    the observer -- was read as LOST. The aggregate failed the workload and
+    tore down three still-running peers, discarding a finished job. A rank the
+    observer cannot *ask* is INDETERMINATE: the next poll usually answers, and
+    a host that stays unreadable escalates through the indeterminate grace
+    path instead of by killing its peers.
+    """
+
     def healthy_worker(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"remote_id": "gang-job", "status": "RUNNING"})
 
@@ -461,9 +473,83 @@ def test_native_gang_reports_a_transport_loss_as_lost() -> None:
     try:
         report = NativeGangExecutor(_members(), clients=clients).status("gang-job")
 
-        assert report["status"] is ExecutionWorkloadStatus.LOST
-        assert report["workers"][2]["status"] is ExecutionWorkloadStatus.LOST
+        assert report["status"] is ExecutionWorkloadStatus.INDETERMINATE
+        assert report["workers"][2]["status"] is ExecutionWorkloadStatus.INDETERMINATE
         assert "connection refused" in report["workers"][2]["message"]
     finally:
         for client in clients:
             client.close()
+
+
+def test_a_rank_that_answers_succeeded_after_an_unreadable_poll_converges() -> None:
+    """The incident replay: unreadable, then completed, while peers still run.
+
+    The unreadable poll must not have settled anything; the poll that reaches
+    the rank again finds it exited 0, and a finished rank beside running ranks
+    converges instead of failing.
+    """
+
+    polls: list[str] = []
+
+    def flaky_then_finished(request: httpx.Request) -> httpx.Response:
+        polls.append(request.url.path)
+        if len(polls) == 1:
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(200, json={"remote_id": "gang-job", "status": "SUCCEEDED"})
+
+    def healthy_worker(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"remote_id": "gang-job", "status": "RUNNING"})
+
+    endpoints = (
+        "http://10.12.0.10:8100",
+        "http://10.12.0.11:8100",
+        "http://10.12.0.20:8100",
+        "http://10.12.0.21:8100",
+    )
+    clients = [
+        _client(endpoints[0], healthy_worker),
+        _client(endpoints[1], healthy_worker),
+        _client(endpoints[2], flaky_then_finished),
+        _client(endpoints[3], healthy_worker),
+    ]
+    try:
+        executor = NativeGangExecutor(_members(), clients=clients)
+        first = executor.status("gang-job")
+        assert first["status"] is ExecutionWorkloadStatus.INDETERMINATE
+
+        second = executor.status("gang-job")
+
+        assert second["status"] is ExecutionWorkloadStatus.RUNNING, "a finished rank converges"
+        assert second["workers"][2]["status"] is ExecutionWorkloadStatus.SUCCEEDED
+    finally:
+        for client in clients:
+            client.close()
+
+
+def test_a_closed_keepalive_is_healed_by_one_retry_not_read_as_rank_loss() -> None:
+    """A pooled connection the server closed is the observer's problem.
+
+    The poll interval can outlive the worker's keep-alive idle timeout; the
+    first request on the stale socket dies with ``RemoteProtocolError`` before
+    any byte reaches the server. A read is provably safe to retry once, and
+    transparently healing it is what keeps that race from ever reaching the
+    status mapping.
+    """
+
+    calls: list[str] = []
+
+    def stale_then_healthy(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response", request=request)
+        return httpx.Response(200, json={"remote_id": "wl-retry", "status": "RUNNING"})
+
+    client = _client("http://10.12.0.20:8100", stale_then_healthy)
+    executor = NativeRemoteExecutor("http://10.12.0.20:8100", secret="s", client=client)
+    try:
+        observation = executor.status("wl-retry")
+
+        assert observation.status is ExecutionWorkloadStatus.RUNNING
+        assert len(calls) == 2, "exactly one healing retry"
+    finally:
+        client.close()

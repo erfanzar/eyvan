@@ -153,8 +153,28 @@ class NativeRemoteExecutor:
     ) -> httpx.Response:
         query = dict(params) if params else None
         if timeout is None:
-            return self.client.request(method, path, headers=self._headers, json=json, params=query)
-        return self.client.request(method, path, headers=self._headers, json=json, params=query, timeout=timeout)
+            return self._send(method, path, json=json, params=query)
+        return self._send(method, path, json=json, params=query, timeout=timeout)
+
+    def _send(self, method: str, path: str, **kwargs: tp.Any) -> httpx.Response:
+        """Issue one request, healing the one failure a retry is *provably* safe for.
+
+        A pooled keep-alive the server already closed surfaces as
+        ``RemoteProtocolError`` on the first request that reuses it -- observed
+        live on a v6e-8 gang, where a poll interval longer than the worker's
+        keep-alive idle timeout made every other status read look like the rank
+        had died, and the aggregate failed four healthy hosts. Retrying that
+        one shape, for reads only, is safe by construction: no bytes reached
+        the server, so nothing was executed twice. Mutations are never retried
+        here; their fencing is the caller's to redo.
+        """
+
+        try:
+            return self.client.request(method, path, headers=self._headers, **kwargs)
+        except httpx.RemoteProtocolError:
+            if method != "GET":
+                raise
+            return self.client.request(method, path, headers=self._headers, **kwargs)
 
     def worker_builds(self) -> list[dict[str, object]]:
         """Return this cell's one native worker, in the slice executor's shape.

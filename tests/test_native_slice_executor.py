@@ -408,9 +408,12 @@ def test_native_slice_reports_unreachable_workers_and_preserves_surviving_logs()
 
         report = executor.status("slice-job")
 
-        assert report["status"] is ExecutionWorkloadStatus.LOST
+        # Unreachable is a fact about the observer's connection, not the rank:
+        # the live incident was a finished rank whose closed keep-alive read as
+        # death and settled a slice whose every host had exited 0.
+        assert report["status"] is ExecutionWorkloadStatus.INDETERMINATE
         assert report["workers"][0]["status"] is ExecutionWorkloadStatus.RUNNING
-        assert report["workers"][1]["status"] is ExecutionWorkloadStatus.LOST
+        assert report["workers"][1]["status"] is ExecutionWorkloadStatus.INDETERMINATE
         assert "connection refused" in report["workers"][1]["message"]
         logs = executor.logs("slice-job")
         assert "surviving rank log" in logs
