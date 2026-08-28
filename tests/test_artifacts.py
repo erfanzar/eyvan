@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
+from eyvan.artifacts import GCSArtifactStore, GcsCommandError, LocalArtifactStore
 from eyvan.worker.runtime.callables import dump_callable
 
 
@@ -115,3 +115,67 @@ def test_gcs_put_rejects_a_corrupted_preexisting_object() -> None:
     with pytest.raises(ValueError, match="invalid digest"):
         store.put(artifact)
     assert not any(command[2] == "cp" for command in runner.calls)
+
+
+def test_a_failed_upload_reports_what_gcloud_said() -> None:
+    """A swallowed CLI stderr turned every upload failure into a mystery.
+
+    ``subprocess`` captured gcloud's diagnostic and ``CalledProcessError``
+    buried it, so a user's traceback said "exit status 1" and nothing else --
+    credentials, quota, and network blips all looked identical. The store now
+    refuses to report a CLI failure without the CLI's own words for it.
+    """
+
+    class FailingRunner(FakeGcloudRunner):
+        """Describe says the object is absent; the upload then fails."""
+
+        def __call__(self, args, *, check, capture_output):
+            command = list(args)
+            if command[2] == "cp" and check:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=command,
+                    stderr=b"ERROR: (gcloud.storage.cp) Your credentials are not valid.\n",
+                )
+            return super().__call__(args, check=check, capture_output=capture_output)
+
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=FailingRunner())
+
+    with pytest.raises(GcsCommandError, match="Your credentials are not valid") as caught:
+        store.put(dump_callable(_add))
+
+    message = str(caught.value)
+    assert "gcloud storage cp" in message, "the failing command must be named"
+    assert "exit status 1" in message
+
+
+def test_a_failed_read_reports_what_gcloud_said() -> None:
+    class FailingRunner(FakeGcloudRunner):
+        def __call__(self, args, *, check, capture_output):
+            command = list(args)
+            if command[2] == "cat" and check:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=command,
+                    stderr=b"ERROR: (gcloud.storage.cat) No such object: bucket/x\n",
+                )
+            return super().__call__(args, check=check, capture_output=capture_output)
+
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=FailingRunner())
+
+    with pytest.raises(GcsCommandError, match="No such object"):
+        store.read("gs://artifacts/eyvan/callables/missing.pkl")
+
+
+def test_a_silent_cli_failure_says_it_printed_nothing() -> None:
+    class SilentRunner(FakeGcloudRunner):
+        def __call__(self, args, *, check, capture_output):
+            command = list(args)
+            if command[2] == "cp" and check:
+                raise subprocess.CalledProcessError(returncode=1, cmd=command, stderr=None)
+            return super().__call__(args, check=check, capture_output=capture_output)
+
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=SilentRunner())
+
+    with pytest.raises(GcsCommandError, match="printed nothing to stderr"):
+        store.put(dump_callable(_add))

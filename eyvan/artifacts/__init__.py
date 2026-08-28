@@ -72,6 +72,42 @@ class CommandRunner(tp.Protocol):
     ) -> subprocess.CompletedProcess[bytes]: ...
 
 
+class GcsCommandError(RuntimeError):
+    """A ``gcloud`` invocation failed, reporting what the CLI itself said.
+
+    ``subprocess`` captures the CLI's stderr and then buries it inside
+    ``CalledProcessError``, so a traceback shows an exit status and nothing
+    else. A user submitting a workload has then lost the only sentence that
+    named the fault -- credentials, quota, network, a bucket that is gone --
+    and what was a one-line answer becomes an investigation. The command and
+    its stderr travel with this error instead, so the next failure names
+    itself.
+    """
+
+
+#: How much of a CLI's stderr an error carries. Enough for any gcloud
+#: diagnostic, short enough that a traceback stays readable.
+_COMMAND_ERROR_STDERR_LIMIT = 2000
+
+
+def _gcloud_checked(
+    runner: CommandRunner,
+    args: tp.Sequence[str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one ``gcloud`` command, refusing to swallow its failure reason."""
+
+    try:
+        return runner(args, check=True, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or b"").decode("utf-8", "replace").strip()
+        if len(stderr) > _COMMAND_ERROR_STDERR_LIMIT:
+            stderr = f"{stderr[:_COMMAND_ERROR_STDERR_LIMIT]}… [truncated]"
+        raise GcsCommandError(
+            f"'{' '.join(args)}' failed with exit status {error.returncode}"
+            + (f": {stderr}" if stderr else " and printed nothing to stderr")
+        ) from error
+
+
 def _default_gcloud_runner(
     args: tp.Sequence[str],
     *,
@@ -243,10 +279,9 @@ class GCSArtifactStore:
                     temporary.flush()
                     os.fsync(temporary.fileno())
                     temporary_path = Path(temporary.name)
-                self._runner(
+                _gcloud_checked(
+                    self._runner,
                     ["gcloud", "storage", "cp", "--no-clobber", str(temporary_path), uri],
-                    check=True,
-                    capture_output=True,
                 )
             finally:
                 if temporary_path is not None:
@@ -273,12 +308,7 @@ class GCSArtifactStore:
 
         if not uri.startswith("gs://"):
             raise ValueError("GCSArtifactStore can only read gs:// URIs")
-        completed = self._runner(
-            ["gcloud", "storage", "cat", uri],
-            check=True,
-            capture_output=True,
-        )
-        return completed.stdout
+        return _gcloud_checked(self._runner, ["gcloud", "storage", "cat", uri]).stdout
 
     def allocate_result_uri(self, invocation_id: str) -> str:
         """Return the invocation's unique GCS result-manifest URI."""
