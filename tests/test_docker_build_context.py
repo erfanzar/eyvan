@@ -3,7 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Docker build contexts must work in both the standalone and workspace trees."""
+"""Docker build contexts must work from the standalone repository root.
+
+The repository root is the package root: every COPY source is relative to it,
+and the documented builds pass it as the context.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ def _local_copy_sources(dockerfile: Path) -> tuple[str, ...]:
 
 
 def test_all_release_dockerfiles_use_the_eyvan_package_directory_as_context() -> None:
-    """Every local COPY source exists when the context is ``libs/eyvan``."""
+    """Every local COPY source exists when the context is the repository root."""
 
     for name in ("Dockerfile", "Dockerfile.agent", "Dockerfile.worker"):
         dockerfile = EYVAN_ROOT / name
@@ -87,10 +91,6 @@ def test_documented_build_commands_use_the_context_their_dockerfile_expects() ->
     )
 
     for dockerfile, context in commands:
-        if dockerfile.startswith("libs/eyvan/"):
-            assert context == "libs/eyvan"
-        else:
-            assert context == "."
+        assert context == ".", (dockerfile, context)
     for name in ("Dockerfile", "Dockerfile.agent", "Dockerfile.worker"):
         assert (name, ".") in commands
-        assert (f"libs/eyvan/{name}", "libs/eyvan") in commands

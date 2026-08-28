@@ -213,7 +213,7 @@ two failure kinds you must be able to tell apart.
 
 Run them against a fake of your provider's API, not the real one: the properties
 are about your driver's logic, and a suite that needs an account is a suite
-nobody runs. `libs/eyvan/tests/test_provider_abi_onprem.py` is the worked
+nobody runs. `tests/test_provider_abi_onprem.py` is the worked
 example -- an in-memory rack, ~90 lines, that the shipped `onprem-ssh` driver
 passes.
 

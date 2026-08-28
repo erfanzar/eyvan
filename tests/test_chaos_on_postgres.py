@@ -451,3 +451,47 @@ def test_the_fault_matrix_is_scheduled_and_not_only_affected_only() -> None:
     shell = "\n".join(str(step.get("run", "")) for step in all_steps)
     assert re.search(r"\buv sync(?! --locked)", shell) is None
     assert re.search(r"\buv run(?! --locked)", shell) is None
+
+
+def test_standalone_ci_schedules_the_fault_matrix_itself() -> None:
+    """The standalone repository's own CI carries the schedule.
+
+    Inside a workspace checkout the monorepo workflow owns the scheduled fault
+    matrix (the test above). In this repository -- which is where releases are
+    cut from -- the same guarantee must come from ``ci.yaml``: a weekly run of
+    the full suite against a real PostgreSQL, whether or not anyone touched the
+    package that week.
+    """
+
+    import pathlib
+    import re
+
+    import yaml
+
+    workflow = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yaml"
+    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    # PyYAML parses a bare `on:` key as the boolean True.
+    triggers = document.get("on") or document.get(True) or {}
+    schedule = triggers.get("schedule") or []
+    assert any(entry.get("cron") == "17 4 * * 1" for entry in schedule), (
+        "the standalone fault matrix has no weekly scheduled run"
+    )
+
+    job = document["jobs"]["python"]
+    assert re.fullmatch(r"postgres:17-alpine@sha256:[0-9a-f]{64}", job["services"]["postgres"]["image"])
+    suite = next(step for step in job["steps"] if "Suite" in step.get("name", ""))
+    assert suite["env"]["EYVAN_REQUIRE_POSTGRES"] == "1"
+    # The full suite -- not a selection -- so this file's fault matrix runs on
+    # the schedule too.
+    assert "tests" in suite["run"] and "-k" not in suite["run"]
+    installs = [step["run"] for step in job["steps"] if "Install" in step.get("name", "")]
+    assert installs and all("--require-hashes" in run for run in installs), (
+        "scheduled runs must install from the hashed exports, not a resolution"
+    )
+    # A scheduled run must never be cancelled by a push landing mid-week.
+    assert document["concurrency"]["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+    action_references = [
+        step["uses"] for candidate in document["jobs"].values() for step in candidate.get("steps", []) if "uses" in step
+    ]
+    assert action_references
+    assert all(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", reference) for reference in action_references)

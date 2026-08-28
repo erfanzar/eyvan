@@ -42,6 +42,6 @@ Local identity headers are opt-in and should be paired with
 `EYVAN_DEV_AUTH_ENABLED=1` on the API. From the repository root:
 
 ```bash
-npm --prefix libs/eyvan/dashboard install
+npm --prefix dashboard install
 uv run eyvan dashboard-dev
 ```

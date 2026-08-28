@@ -31,12 +31,12 @@ each Docker build reference intentionally uses the leaf manifest. Re-resolving
 a source tag is evidence for a reviewed lock update; it must never silently
 change a release build.
 
-Run from the EasyDeL root:
+Run from the repository root:
 
 ```bash
 python3 scripts/verify_eyvan_oci_release.py validate-policy \
-  --lock libs/eyvan/oci/release-lock.json \
-  --allowlist libs/eyvan/oci/high-critical-allowlist.json \
+  --lock oci/release-lock.json \
+  --allowlist oci/high-critical-allowlist.json \
   --repository-root .
 ```
 
@@ -95,12 +95,11 @@ The signed receipt cannot recursively hash its own signature bundle. The
 workflow therefore signs the canonical receipt as a blob, strictly verifies it
 against the same issuer and exact workflow identity, then promotes the already
 qualified index digests to immutable version tags without rebuilding or adding a
-`latest` tag. The PyPI workflow uses a contents-read authentication job with no
-OIDC permission, checks the dispatch source is an ancestor of protected
-`origin/main`, proves the exact tag target, and executes only verifier/tool logic
-from the protected workflow commit. A separate minimal publisher receives only
-the authenticated wheel and sdist; a direct `eyvan-v*` tag no longer starts
-PyPI publication.
+`latest` tag. The PyPI workflow is the standalone repository's `publish.yaml`:
+tag-driven on `v*` only, it refuses a tag that disagrees with the version
+declared in `pyproject.toml`, builds with the hash-pinned backend, and publishes
+from the reviewer-gated `pypi` environment with OIDC trusted publishing and
+`persist-credentials: false` -- no PyPI token exists in this repository.
 
 ## Release governance prerequisites
 
@@ -118,9 +117,7 @@ these repository controls outside the workflow:
 Before executing candidate verifier scripts or writing a registry, the workflow
 queries the branch, immutable-release, and run-approval APIs with bounded reads
 and fails closed unless all three controls are proved. It never enables or edits
-those controls. The PyPI bootstrap independently rechecks current `main`
-protection and requires its trusted release/bootstrap surfaces to be unchanged
-between the signed candidate and the protected workflow commit.
+those controls.
 
 ## Qualification boundary
 

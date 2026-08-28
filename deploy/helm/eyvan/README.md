@@ -39,28 +39,29 @@ is initially empty. Validate both and the Dockerfiles before using a value:
 
 ```bash
 python3 scripts/verify_eyvan_oci_release.py validate-policy \
-  --lock libs/eyvan/oci/release-lock.json \
-  --allowlist libs/eyvan/oci/high-critical-allowlist.json \
+  --lock oci/release-lock.json \
+  --allowlist oci/high-critical-allowlist.json \
   --repository-root .
 ```
 
-Every Dockerfile expects the Eyvan package directory as context and has no
-base-image, source, revision, or version default. The examples below are local
-mechanics, **not qualification**: only the protected workflow records the
-registry-reported index/platform digests, scanner and DB snapshot, SBOM
-attestations, keyless signatures/Rekor inclusion, provenance, chart/render,
-wheel/sdist, and signed canonical receipt. Copy base arguments exactly from the
-validated release lock; do not substitute a tag or digest-only reference.
+Every Dockerfile expects the repository root (the package root) as its build
+context and has no base-image, source, revision, or version default. The
+examples below are local mechanics, **not qualification**: only the protected
+workflow records the registry-reported index/platform digests, scanner and DB
+snapshot, SBOM attestations, keyless signatures/Rekor inclusion, provenance,
+chart/render, wheel/sdist, and signed canonical receipt. Copy base arguments
+exactly from the validated release lock; do not substitute a tag or digest-only
+reference.
 
 ```bash
-export EYVAN_SOURCE=https://github.com/erfanzar/EasyDeL
+export EYVAN_SOURCE=https://github.com/erfanzar/eyvan
 export EYVAN_REVISION="$(git rev-parse HEAD)" # must be the full 40-character SHA
-export EYVAN_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' libs/eyvan/pyproject.toml | head -1)"
+export EYVAN_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
 IFS=$'\t' read -r EYVAN_NODE_IMAGE EYVAN_RUNTIME_IMAGE EYVAN_UV_IMAGE EYVAN_WORKER_BASE_IMAGE \
   < <(python3 - <<'PY'
 import json
 
-with open("libs/eyvan/oci/release-lock.json", encoding="utf-8") as handle:
+with open("oci/release-lock.json", encoding="utf-8") as handle:
     images = json.load(handle)["images"]
 values = [
     images["control-plane"]["buildArgs"]["EYVAN_NODE_IMAGE"],
@@ -73,21 +74,7 @@ PY
 )
 export EYVAN_NODE_IMAGE EYVAN_RUNTIME_IMAGE EYVAN_UV_IMAGE EYVAN_WORKER_BASE_IMAGE
 
-# From the EasyDeL workspace root:
-docker build --platform linux/amd64 -f libs/eyvan/Dockerfile \
-  --build-arg EYVAN_NODE_IMAGE --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
-  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
-  -t "$EYVAN_CONTROL_PLANE_REPOSITORY:$BUILD_ID" libs/eyvan
-docker build --platform linux/amd64 -f libs/eyvan/Dockerfile.agent \
-  --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
-  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
-  -t "$EYVAN_AGENT_REPOSITORY:$BUILD_ID" libs/eyvan
-docker build --platform linux/amd64 -f libs/eyvan/Dockerfile.worker \
-  --build-arg EYVAN_WORKER_BASE_IMAGE --build-arg EYVAN_UV_IMAGE \
-  --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \
-  -t "$EYVAN_WORKER_REPOSITORY:$BUILD_ID" libs/eyvan
-
-# From a standalone Eyvan checkout (use the same validated values):
+# From the repository root (use the same validated values):
 docker build --platform linux/amd64 -f Dockerfile \
   --build-arg EYVAN_NODE_IMAGE --build-arg EYVAN_RUNTIME_IMAGE --build-arg EYVAN_UV_IMAGE \
   --build-arg EYVAN_SOURCE --build-arg EYVAN_REVISION --build-arg EYVAN_VERSION \

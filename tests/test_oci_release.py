@@ -3,7 +3,12 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Adversarial fixtures for the immutable Eyvan OCI release gate."""
+"""Adversarial fixtures for the immutable Eyvan OCI release gate.
+
+The standalone repository is its own policy owner: the release workflow, the
+lock, the verifier, and the Dockerfiles all live at this repository root, so
+every contract here is checked against this checkout unconditionally.
+"""
 
 from __future__ import annotations
 
@@ -23,23 +28,12 @@ from types import ModuleType
 import pytest
 import yaml
 
-_MONOREPO_ROOT = Path(__file__).resolve().parents[3]
-# Guarded on the release workflow itself rather than on WORKSPACE.md. The
-# marker file only says "a workspace is above me", which is also true of a
-# standalone eyvan clone that happens to sit inside one -- and then every check
-# below reads a workflow this workspace does not own and fails, reporting a
-# policy violation where there is no policy. The inputs are the honest guard:
-# where they exist the policy is owned here and is checked, and where they do
-# not there is nothing to check.
-if not (_MONOREPO_ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").is_file():
-    pytest.skip("OCI release policy is owned by the workspace that holds its workflow", allow_module_level=True)
-ROOT = _MONOREPO_ROOT
-EYVAN_ROOT = ROOT / "libs" / "eyvan"
+ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "verify_eyvan_oci_release.py"
-LOCK = EYVAN_ROOT / "oci" / "release-lock.json"
-ALLOWLIST = EYVAN_ROOT / "oci" / "high-critical-allowlist.json"
-TOOL_INSTALLER = EYVAN_ROOT / "oci" / "install_locked_tools.py"
-ASSET_DOWNLOADER = EYVAN_ROOT / "oci" / "download_release_assets.py"
+LOCK = ROOT / "oci" / "release-lock.json"
+ALLOWLIST = ROOT / "oci" / "high-critical-allowlist.json"
+TOOL_INSTALLER = ROOT / "oci" / "install_locked_tools.py"
+ASSET_DOWNLOADER = ROOT / "oci" / "download_release_assets.py"
 NOW = "2026-08-08T01:00:00Z"
 ROLES = ("control-plane", "agent", "worker")
 FULL_SHA = "a" * 40
@@ -89,7 +83,7 @@ def _policy(*, lock: Path = LOCK, allowlist: Path = ALLOWLIST, root: bool = Fals
 def _exception(*, expires_at: str = "2026-08-20T00:00:00Z") -> dict[str, str]:
     return {
         "expiresAt": expires_at,
-        "issue": "https://github.com/erfanzar/EasyDeL/issues/1234",
+        "issue": "https://github.com/erfanzar/eyvan/issues/1234",
         "owner": "@eyvan-security-owner",
         "package": "openssl",
         "purl": "pkg:apk/alpine/openssl@3.5.2-r0",
@@ -296,7 +290,7 @@ def _receipt_fixture(tmp_path: Path) -> tuple[dict[str, object], Path]:
             },
             "runDetails": {
                 "builder": {"id": lock["identity"]["provenanceBuilderId"]},
-                "metadata": {"invocationId": "https://github.com/erfanzar/EasyDeL/actions/runs/12345"},
+                "metadata": {"invocationId": "https://github.com/erfanzar/eyvan/actions/runs/12345"},
             },
         }
         predicate = _artifact(root, f"{role}.provenance.json", provenance_value)
@@ -419,6 +413,24 @@ def test_repository_policy_is_canonical_and_dockerfiles_match_it() -> None:
     result = _policy(root=True)
     assert result.returncode == 0, result.stderr
     assert "0 exact High/Critical exception" in result.stdout
+
+
+def test_repository_identity_is_the_standalone_eyvan_repository() -> None:
+    # The workflow identity is what cosign --certificate-identity demands and
+    # what every receipt, attestation, and provenance fact must repeat; a
+    # monorepo leftover here would make every release unverifiable.
+    lock = json.loads(LOCK.read_text())
+    identity = "https://github.com/erfanzar/eyvan/.github/workflows/eyvan-oci-release.yaml@refs/heads/main"
+    assert lock["sourceRepository"] == "https://github.com/erfanzar/eyvan"
+    assert lock["identity"]["workflowIdentity"] == identity
+    assert lock["identity"]["provenanceBuilderId"] == identity
+    assert {spec["dockerfile"] for spec in lock["images"].values()} == {
+        "Dockerfile",
+        "Dockerfile.agent",
+        "Dockerfile.worker",
+    }
+    for role in ROLES:
+        assert (ROOT / lock["images"][role]["dockerfile"]).is_file(), role
 
 
 def test_dockerfile_without_targetplatform_is_rejected(tmp_path: Path) -> None:
@@ -579,7 +591,7 @@ def test_release_asset_download_enforces_api_size_without_content_length(
 
 def test_release_asset_download_refuses_a_provider_reported_mutable_release() -> None:
     downloader = _load_script(ASSET_DOWNLOADER, "eyvan_mutable_release_downloader_test")
-    repository = "erfanzar/EasyDeL"
+    repository = "erfanzar/eyvan"
     assets = [
         {
             "id": index,
@@ -619,7 +631,7 @@ def test_release_download_rejects_a_branch_named_target_commitish() -> None:
     # SHA>: GitHub otherwise records target_commitish as the default branch
     # name, and the bootstrap download refuses anything but the exact SHA.
     downloader = _load_script(ASSET_DOWNLOADER, "eyvan_branch_target_downloader_test")
-    repository = "erfanzar/EasyDeL"
+    repository = "erfanzar/eyvan"
     assets = [
         {
             "id": index,
@@ -1107,11 +1119,16 @@ def test_workflow_separates_read_only_pr_and_environment_gated_release_lanes() -
         if step["name"] == "Build and smoke the exact wheel and sdist before OCI qualification"
     )
     assert "export UV_PYTHON_DOWNLOADS=never" in distribution_step["run"]
-    assert (
-        "uv sync --locked --package eyvan --no-dev --group eyvan-build --no-install-project" in distribution_step["run"]
-    )
-    assert "uv build --no-build-isolation --package eyvan" in distribution_step["run"]
-    assert "--locked-runtime libs/eyvan/requirements-docker.txt" in distribution_step["run"]
+    # The standalone repository has no uv workspace or lockfile: the wheel and
+    # sdist are built from the repo-root pyproject with the hash-pinned
+    # requirements-build.txt backend.
+    assert "--require-hashes -r requirements-build.txt" in distribution_step["run"]
+    assert "uv build --no-build-isolation --wheel --sdist --out-dir dist ." in distribution_step["run"]
+    assert "smoke_distribution dist/eyvan-*.whl" in distribution_step["run"]
+    assert "smoke_distribution dist/eyvan-*.tar.gz" in distribution_step["run"]
+    assert "--require-hashes -r requirements-build.txt -r requirements-docker.txt" in distribution_step["run"]
+    assert "EXPECTED_EYVAN_VERSION" in distribution_step["run"]
+    assert "eyvan-migrate" in distribution_step["run"]
     governance_step = next(
         step
         for step in release["steps"]
@@ -1161,10 +1178,11 @@ def _release_step(step_name_prefix: str) -> dict[str, object]:
     return next(step for step in workflow["jobs"]["release"]["steps"] if step["name"].startswith(step_name_prefix))
 
 
-def test_every_image_build_uses_the_eyvan_package_context() -> None:
-    # Every Dockerfile copies dashboard/, requirements-*.txt, and eyvan/ relative
-    # to libs/eyvan and demands it as the build context; a repo-root context
-    # kills all six builds at the first COPY.
+def test_every_image_build_uses_the_repo_root_package_context() -> None:
+    # The repository root is the package root: every Dockerfile copies
+    # dashboard/, requirements-*.txt, and eyvan/ relative to it and demands it
+    # as the build context; any other context kills all six builds at the
+    # first COPY.
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").read_text())
     builds = [
         step
@@ -1174,8 +1192,30 @@ def test_every_image_build_uses_the_eyvan_package_context() -> None:
     ]
     assert len(builds) == 6
     for step in builds:
-        assert step["with"]["context"] == "libs/eyvan", step["name"]
-        assert re.fullmatch(r"libs/eyvan/Dockerfile(\.agent|\.worker)?", step["with"]["file"]), step["name"]
+        assert step["with"]["context"] == ".", step["name"]
+        assert re.fullmatch(r"Dockerfile(\.agent|\.worker)?", step["with"]["file"]), step["name"]
+
+
+def test_release_workflow_actions_match_the_locked_pins_exactly() -> None:
+    # Every pinned action is addressed at exactly the commit the lock records,
+    # and no other action appears anywhere in the release workflow.
+    lock = json.loads(LOCK.read_text())
+    expected = {
+        "actions/checkout": lock["actions"]["checkout"],
+        "actions/upload-artifact": lock["actions"]["uploadArtifact"],
+        "astral-sh/setup-uv": lock["actions"]["setupUv"],
+        "docker/build-push-action": lock["actions"]["buildPush"],
+        "docker/login-action": lock["actions"]["login"],
+        "docker/setup-buildx-action": lock["actions"]["setupBuildx"],
+    }
+    content = (ROOT / ".github" / "workflows" / "eyvan-oci-release.yaml").read_text()
+    found: dict[str, set[str]] = {}
+    for action, revision in re.findall(r"^\s*-?\s*uses:\s*([^@\s#]+)@([^\s#]+)", content, flags=re.MULTILINE):
+        found.setdefault(action, set()).add(revision)
+    assert found == {action: {revision} for action, revision in expected.items()}
+    # The lock still records downloadArtifact so its pin cannot drift, but no
+    # standalone workflow downloads Actions artifacts.
+    assert "actions/download-artifact" not in content
 
 
 def test_digest_overlay_sets_the_chart_read_image_keys(tmp_path: Path) -> None:
@@ -1185,12 +1225,11 @@ def test_digest_overlay_sets_the_chart_read_image_keys(tmp_path: Path) -> None:
     step = _release_step("Package chart, hash digest overlay/render")
     run = step["run"]
     assert "controlPlane:" not in run
+    assert "deploy/helm/eyvan" in run
     lines = run.splitlines()
     start = next(index for index, line in enumerate(lines) if line.strip() == "{")
     end = next(
-        index
-        for index, line in enumerate(lines)
-        if line.strip().startswith("}") and "eyvan-release-values.yaml" in line
+        index for index, line in enumerate(lines) if line.strip().startswith("}") and "eyvan-release-values.yaml" in line
     )
     overlay = tmp_path / "eyvan-release-values.yaml"
     refs = {
@@ -1226,6 +1265,7 @@ def test_receipt_step_takes_the_version_from_an_explicit_step_env() -> None:
     run = step["run"]
     assert 'os.environ["INPUT_VERSION"]' not in run
     assert 'os.environ["DISPATCH_VERSION"]' in run
+    assert 'open("oci/release-lock.json"' in run
 
 
 def test_release_creation_binds_target_commitish_to_the_qualified_sha() -> None:
@@ -1236,9 +1276,8 @@ def test_release_creation_binds_target_commitish_to_the_qualified_sha() -> None:
     while lines[end].endswith("\\"):
         end += 1
     assert '--target "${GITHUB_SHA}"' in [line.rstrip("\\").strip() for line in lines[start : end + 1]]
-    # The publish lane's bootstrap download demands exactly this SHA back.
-    publish = (ROOT / ".github" / "workflows" / "publish.yaml").read_text()
-    assert publish.count('--expected-target "${DISPATCH_SOURCE_SHA}"') == 2
+    # The tag is derived from the dispatch version, never from a moving ref.
+    assert 'tag="eyvan-v${{ inputs.version }}"' in step["run"]
 
 
 def test_every_workflow_action_is_pinned_to_a_full_commit() -> None:
@@ -1250,76 +1289,45 @@ def test_every_workflow_action_is_pinned_to_a_full_commit() -> None:
             assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", reference), (name, reference)
 
 
-def test_eyvan_publish_authenticates_with_protected_logic_before_any_candidate_surface() -> None:
+def test_eyvan_publish_is_tag_gated_trusted_publishing_without_a_secret() -> None:
+    # The standalone publish workflow is the entire PyPI surface: tag-driven
+    # only, gated by the pypi environment, authenticated with OIDC trusted
+    # publishing, and carrying no long-lived credential to steal.
     path = ROOT / ".github" / "workflows" / "publish.yaml"
     content = path.read_text()
     workflow = yaml.safe_load(content)
     triggers = workflow.get("on", workflow.get(True))
-    assert set(triggers) == {"push", "repository_dispatch"}
-    assert '"eyvan-v*"' not in content
-    assert "uv build --package eyvan" not in content
+    assert set(triggers) == {"push", "workflow_dispatch"}
+    assert triggers["push"]["tags"] == ["v*"]
 
-    jobs = workflow["jobs"]
-    authentication = jobs["authenticate-eyvan-release"]
-    publisher = jobs["publish-authenticated-eyvan"]
-    tagged = jobs["publish-package-tag"]
-    assert authentication["permissions"] == {"contents": "read"}
-    assert publisher["permissions"] == {"actions": "read", "id-token": "write"}
-    assert tagged["permissions"] == {"contents": "read", "id-token": "write"}
-    assert publisher["needs"] == "authenticate-eyvan-release"
+    assert workflow["permissions"] == {"contents": "read"}
+    publish = workflow["jobs"]["publish"]
+    assert publish["environment"] == "pypi"
+    assert publish["permissions"] == {"contents": "read", "id-token": "write"}
 
-    checkout = authentication["steps"][0]
-    assert checkout["with"]["ref"] == "${{ github.sha }}"
-    assert checkout["with"]["path"] == "trusted-release"
+    checkout = publish["steps"][0]
+    assert str(checkout["uses"]).startswith("actions/checkout@")
     assert checkout["with"]["persist-credentials"] is False
-    authentication_text = json.dumps(authentication)
-    authentication_commands = "\n".join(step.get("run", "") for step in authentication["steps"])
-    assert "client_payload.source_sha || github.ref" not in authentication_text
-    assert (
-        'git merge-base --is-ancestor "$DISPATCH_SOURCE_SHA" refs/remotes/origin/protected-main'
-        in authentication_commands
-    )
-    assert 'test "$DISPATCH_TAG" = "eyvan-v${DISPATCH_VERSION}"' in authentication_commands
-    assert "refs/tags/${DISPATCH_TAG}^{commit}" in authentication_commands
-    assert "refs/heads/main" in authentication_commands
-    assert "/trusted-release" in authentication_text
 
-    step_names = [step["name"] for step in authentication["steps"]]
-    signature_index = step_names.index("Authenticate receipt signature before trusting its artifact names")
-    assert signature_index > step_names.index("Download only the fixed receipt and detached bundle within hard limits")
-    assert signature_index < step_names.index(
-        "Download only the signed receipt's closed artifact set within hard limits"
-    )
-    assert signature_index < step_names.index("Replay every receipt check with protected-main verifier logic")
-    assert signature_index < step_names.index("Package only the authenticated wheel and sdist for handoff")
-    assert "smoke_eyvan_distribution" not in authentication_commands
-    assert "uv build" not in authentication_commands
-    assert "/branches/main" in authentication_commands
-    assert 'branch.get("protected") is not True' in authentication_commands
-    assert 'git diff --quiet "$DISPATCH_SOURCE_SHA" "$GITHUB_SHA"' in authentication_commands
-    assert "libs/eyvan/oci/high-critical-allowlist.json" in authentication_commands
-    assert not re.search(r"(?m)\bpython3 (?!-I\b)", authentication_commands)
-    assert "$TRUSTED_ROOT/libs/eyvan/oci/install_locked_tools.py" in authentication_commands
-    assert "$TRUSTED_ROOT/libs/eyvan/oci/download_release_assets.py" in authentication_commands
-    assert "$TRUSTED_ROOT/scripts/verify_eyvan_oci_release.py" in authentication_commands
-    assert "--receipt-sha256" in authentication_commands
-    assert "--manifest" in authentication_commands
-    assert "verify-blob" in authentication_commands
-    assert "--asset-manifest-output" in authentication_commands
+    agreement = next(step for step in publish["steps"] if step.get("name") == "The tag and the source must agree")
+    agreement_commands = agreement["run"]
+    assert "pyproject.toml" in agreement_commands
+    assert "GITHUB_REF_NAME" in agreement_commands
+    assert "github.event.inputs.version" in agreement_commands
+    assert "but pyproject declares" in agreement_commands
+
+    assert "uv publish --trusted-publishing always" in content
+    assert "secrets." not in content
+    assert "gh release download" not in content
+    assert "--require-hashes -r requirements-build.txt" in content
+    assert "eyvan-migrate" in content
 
 
-def test_eyvan_publish_never_uses_broad_or_unbounded_release_downloads() -> None:
-    publish = (ROOT / ".github" / "workflows" / "publish.yaml").read_text()
+def test_eyvan_release_downloader_stays_bounded_and_name_closed() -> None:
     downloader = ASSET_DOWNLOADER.read_text()
-    assert "gh release download" not in publish
-    assert "release download" not in publish
     assert "MAX_RELEASE_ASSETS = 36" in downloader
     assert "MAX_RELEASE_BYTES = 1024 * 1024 * 1024" in downloader
     assert "MAX_ARTIFACT_BYTES = 256 * 1024 * 1024" in downloader
     assert "Content-Length" in downloader
     assert "expected_names = {*records, RECEIPT_NAME, RECEIPT_BUNDLE_NAME}" in downloader
     assert "set(assets) != expected_names" in downloader
-
-    publish_script = (ROOT / "scripts" / "publish.sh").read_text()
-    assert "Eyvan cannot be published by creating a package tag first" in publish_script
-    assert "eyvan-oci-release workflow" in publish_script
