@@ -20,38 +20,51 @@ eyvan status
 detaches without cancelling; `--no-wait` prints the submission document and
 returns instead.
 
-## Status, as of this commit
+## What is proven
 
-Honest about the line between what runs and what is proven, because the
-difference costs money:
+The line between *runs* and *is proven* costs money, so it is drawn in one
+place: [docs/proofs.md](docs/proofs.md) is the ledger. Every claim below is a
+receipt there, tied to the build digest that earned it; a historical receipt
+never qualifies a later commit, and `eyvan proof verify <receipt>` re-checks
+any of them against the build in front of you.
 
-- **Works, verified against real GCP:** `eyvan head up` provisions a control
-  plane end to end — VM, VPC-only firewall, generated secrets, PostgreSQL,
-  migrations, systemd — and `eyvan head down` removes it. It installs the wheel
-  it is running; no package index is involved.
-- **Runs work, verified against real GCP:** a `pods=2` callable submitted with
-  the `@execute` decorator acquired one Cloud TPU Multislice queued resource in
-  `us-east5-a`, provisioned two spot `v5p-16` slices, dispatched to all four
-  ranks, and printed `jax.device_count() == 16`. Nothing was configured by hand:
-  the head published its own worker wheel, named the fleet-state document its
-  agents share, and provisioned JAX through the fleet's declarative runtime.
-- **Reachable without an identity provider:** a head with no `--oidc-issuer`
-  authenticates with a generated bootstrap token, and on the head itself the CLI
-  and the Python SDK discover the plane's address and credential from the node,
-  so `eyvan up` and `@execute` need no environment at all.
-- **Not published:** Eyvan is not on PyPI. Install from source, or let
-  `eyvan head up` carry its own wheel.
-- **Partly qualified:** the execution path above has a receipt; the numbered
-  proofs -- structured multi-host logs, in-job submission, per-attempt secrets,
-  spot-reclamation accounting, and the soak -- do not. See
-  [docs/proofs.md](docs/proofs.md), which keeps those apart on purpose.
-- **Two things a first run still needs to know:** this command terminates no
-  TLS, so a callable's artifact token would travel in clear text and is refused
-  unless you pass `--allow-insecure-artifact-http` (defensible only because
-  ingress is VPC-only); and a serialized callable cannot load on an interpreter
-  other than the one that pickled it, so a pool that declares `runtime.python`
-  will refuse a mismatch at submission rather than after the accelerator is
-  built.
+- **Provisioning and teardown** — `eyvan head up` provisions a control plane
+  end to end (VM, VPC-only firewall, generated secrets, PostgreSQL,
+  migrations, systemd) and `eyvan head down` removes it. The head installs
+  the wheel it is running; no package index is involved.
+- **A callable runs on a multislice allocation** (P0) — one Cloud TPU
+  Multislice queued resource, spot `v5p-16 × 2` in `us-east5-a`, all four
+  ranks dispatched, `jax.device_count() == 16`, submitted with a bare
+  `@execute` and no environment set: on a head, the SDK discovers the plane's
+  address and credential from the node itself.
+- **Multi-host logs keep their ranks** (P2) — every record attributed per
+  rank; a rank killed mid-stream is reported *in place* as unavailable, not
+  omitted.
+- **In-job submission and exec** (P3) — children submitted under the parent's
+  identity, the live-children ceiling refusing the 257th with 409, and `exec`
+  beside a running trainer on both hosts of a slice.
+- **Secret delivery** (P4) — the value reaches the job and appears in no
+  workload record, log line, or audit payload; one issuance, one read, the
+  capability dead once the attempt ends.
+- **Spot reclamation accounting** (P5) — a reclaimed slice is `PREEMPTED`,
+  not a stockout; it consumes the preemption budget, not the failure budget;
+  the workload resumes from its checkpoint on the replacement cell.
+- **Warm windows held and released** (P6) and **the Kubernetes driver against
+  a real API server** (P7).
+- **Not proven** — the 72-hour soak (P8) has no qualifying receipt. AWS and
+  Azure pass the conformance suite against faked APIs and have never run
+  against a real account. GPU cells have run callables (a T4 cleanly; a P100
+  exposed a driver-generation hazard, recorded with its diagnosis).
+
+Eyvan is not on PyPI. Install from source, or let `eyvan head up` carry its
+own wheel.
+
+Two things a first run still needs to know. `eyvan head up` terminates no
+TLS, so a callable's artifact token would travel in clear text and is refused
+unless you pass `--allow-insecure-artifact-http` — defensible only because
+ingress is VPC-only. And a serialized callable cannot load on an interpreter
+other than the one that pickled it, so a pool declaring `runtime.python`
+refuses a mismatch at submission rather than after the accelerator is built.
 
 ## Where it runs
 
@@ -59,17 +72,17 @@ difference costs money:
 |---|---|---|
 | `local` | processes on this machine | host-tested; used by `--local-daemon` |
 | `manual` | cells you register yourself | host-tested |
-| `gcp`, `gcp-compute`, `gcp-tpu` | Compute Engine VMs and Cloud TPU, provisioned and reclaimed by Eyvan | one live TPU fleet; see [docs/proofs.md](docs/proofs.md) |
-| `k8s`, `kubernetes` | any conformant cluster, via Jobs and optionally Kueue | one GKE run; not re-qualified for the current candidate |
-| `aws`, `aws-ec2` | EC2 instances, on-demand or spot, fenced by instance tags | passes the conformance suite against a fake EC2; **no run against a real AWS account** |
-| `azure`, `azure-vm` | Azure virtual machines, on-demand or Spot, fenced by resource tags | passes the conformance suite against a fake ARM; **no run against a real subscription** |
+| `gcp`, `gcp-compute`, `gcp-tpu` | Compute Engine VMs and Cloud TPU, provisioned and reclaimed by Eyvan | receipts P0–P6 on live fleets; [docs/proofs.md](docs/proofs.md) |
+| `k8s`, `kubernetes` | any conformant cluster, via Jobs and optionally Kueue | driver↔API-server receipt (P7); full pod lifecycle unproven |
+| `aws`, `aws-ec2` | EC2 instances, on-demand or spot, fenced by instance tags | conformance suite against a fake EC2; **no run against a real AWS account** |
+| `azure`, `azure-vm` | Azure virtual machines, on-demand or Spot, fenced by resource tags | conformance suite against a fake ARM; **no run against a real subscription** |
 | `onprem-ssh` | hosts you already own, reached over SSH | code-complete, **no run against a real SSH host** |
 | your own | the `eyvan.capacity_providers` entry point, with a conformance suite | ABI published; no external provider written yet |
 
 Breadth and evidence are different axes and this table keeps them apart on
-purpose. "Runs on Kubernetes" is a property of the code; "was proven on GKE" is a
-property of one receipt. [docs/proofs.md](docs/proofs.md) lists which is which,
-and what is still unproven.
+purpose. "Runs on Kubernetes" is a property of the code; "was proven on GKE"
+is a property of one receipt. [docs/proofs.md](docs/proofs.md) lists which is
+which, and what is still unproven.
 
 ## The ideas everything else follows from
 
@@ -96,6 +109,13 @@ control plane whose tail latency is a cloud API's tail latency.
 **A gang is placed atomically or not at all.** Partial placement of a
 multi-host job is worse than no placement: it bills for capacity that cannot
 make progress.
+
+**"I could not find out" is never recorded as "I found out it is broken."** An
+agent that cannot answer, a conditional write that times out, and a provider
+that reports a failure are three different facts. Conflating the first two with
+the third destroys healthy capacity and poisons placement beliefs against
+regions that did nothing wrong — each of those was a live incident, not a
+hypothetical.
 
 ## Concepts
 
@@ -155,6 +175,34 @@ eyvan workload logs WORKLOAD_ID --follow     # reattach to a running job
 Batch, arrays, and small DAGs are normal durable workloads with bounded fan-out
 and backpressure, not a second execution system.
 
+### Your code travels with the job
+
+`@execute` ships a *workspace* beside the callable, so application modules
+arrive with the job instead of being baked into an image or staged by hand:
+
+```python
+@execute(TpuConfig(type="v6e-8", pods=4))
+def train():
+    import my_training_code      # resolved from your checkout, not the image
+```
+
+The default workspace is the directory the decorated function's own file lives
+in — what a submitter means by "my code". The bundle carries that tree's
+git-tracked and untracked-but-not-ignored files, and on the worker it is
+extracted to the job's cwd and put on `sys.path` ahead of anything else, so
+relative layout survives the jump. It is signed under the same key as the
+callable: the bundle is entered *before* the pickle is loaded, so an unsigned
+workspace could otherwise shadow any module the signed callable resolves by
+reference.
+
+Three contracts share one switch, and each is someone's explicit decision. An
+explicit `workspace=path` names a different root and fails loudly when it
+cannot be packaged — the caller asked for these files by name, so degrading to
+shipping none would hide the loss. `workspace=False` is the explicit refusal.
+The derived default degrades rather than fails — a callable that needs nothing
+local must not die at submission because its directory happens to be
+unpackageable — but the loss is named in a warning, never silent.
+
 ## What happens when you submit
 
 1. **Admission** — quota, budget, and policy are checked. Refusal here is cheap;
@@ -180,7 +228,19 @@ eyvan events                 # the audit trail
 eyvan service health ID      # replicas, with unknown kept distinct
 ```
 
-98 leaf commands across 34 groups; `eyvan --help` is the index.
+**One source, verified.** A plane refuses to dispatch to a cell whose agent or
+worker build digest is not the one it staged, and the refusal names the two
+commands that recycle the stale cell. `eyvan runtime deploy` restarts the plane
+and its agents from the source in front of you and verifies the sweep;
+`eyvan capacity builds` reports the digest of every reachable agent and worker
+beside the plane's own, and exits non-zero on skew *and* on being unable to
+show agreement — an agent that did not answer is not an agent that agreed.
+
+Errors name their exits: a refusal says what to do next, not only what went
+wrong. [docs/troubleshoot.md](docs/troubleshoot.md) collects the operational
+consequences.
+
+123 leaf commands; `eyvan --help` is the index.
 
 ## Deployment
 
@@ -223,11 +283,31 @@ a browser-decoded claim.
 
 Not guaranteed: that any of it has been proven on hardware for the current
 commit. Eyvan distinguishes code-complete, host-tested, PostgreSQL-tested,
-provider-tested, and hardware-qualified, and the current candidate holds host
-and PostgreSQL evidence only. CPU and mock tests are not provider qualification,
-and a historical receipt never qualifies a later commit.
-[docs/proofs.md](docs/proofs.md) is the ledger; [ROADMAP.md](ROADMAP.md) is the
-remaining work.
+provider-tested, and hardware-qualified, and a receipt qualifies only the build
+that earned it. [docs/proofs.md](docs/proofs.md) is the ledger and the only
+place a qualification claim may live; everything else you read — including this
+README — is prose.
+
+## Non-goals
+
+- **Not a distributed runtime.** No process model, no collectives, no framework
+  opinions: a fenced lease and your code.
+- **No Ray.** The control plane depends on neither Ray nor eray; what replaced
+  the transitional Ray adapter is the native runtime, and it is not a
+  dependency path back.
+- **No platform-driven profiling.** On a TPU host the only useful profile is
+  `jax.profiler`/libtpu tracing, which must start *inside* the training
+  process — there is no ptrace equivalent for TPU device state, and libtpu
+  holds an exclusive per-host lock. Eyvan instead injects a per-rank
+  `EYVAN_PROFILE_URI` that a callable can pass to
+  `jax.profiler.start_trace(...)`, and documents `py-spy dump` against
+  `process_status.main_pid` for the stuck-process case.
+- **No traffic routing or load balancing.** The endpoint registry is discovery
+  only. Eyvan is not a proxy.
+- **No carbon-aware placement.** Ships as a contract that returns
+  `CarbonUnavailable` with a reason code and is structurally excluded from
+  placement: a wrong carbon number silently influencing placement is worse
+  than no number.
 
 ## Architecture
 
@@ -247,7 +327,7 @@ contracts in CI, not by convention.
 
 ```bash
 uv sync
-uv run pytest tests                    # 4737 tests
+uv run pytest tests                    # 5853 tests
 EYVAN_REQUIRE_POSTGRES=1 uv run pytest tests   # against the real backend
 uv run ruff check eyvan tests
 npm --prefix dashboard test
@@ -266,6 +346,8 @@ built wheel to exercise every entry point.
 - [docs/artifact-safety.md](docs/artifact-safety.md) — artifact lifecycle
 - [docs/troubleshoot.md](docs/troubleshoot.md) — when something is wrong
 - [docs/proofs.md](docs/proofs.md) — what is proven, and what is not
+- [docs/env-surface.md](docs/env-surface.md) — every `EYVAN_*` variable, generated
+- [docs/design/](docs/design) — numbered design records
 
 ## License
 

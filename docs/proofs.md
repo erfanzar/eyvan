@@ -496,8 +496,9 @@ gcloud compute tpus tpu-vm describe <node> --zone europe-west4-a \
 Each row proves something a CPU cannot: Pallas lowering, real provider
 semantics, multi-host behaviour, or the passage of wall-clock time. These
 hardware runs do not substitute for CPU-establishable software gates: remaining
-host gaps, including the strict cursor/topology/archive contracts tracked in the
-roadmap, must close independently before a hardware receipt can qualify them.
+host gaps, including the strict cursor/topology/archive contracts still open on
+the host side, must close independently before a hardware receipt can qualify
+them.
 
 ---
 

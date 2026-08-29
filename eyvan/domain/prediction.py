@@ -6,7 +6,7 @@
 """Warming capacity before it is asked for, and the four gates that stop it.
 
 **This ships disabled, at a zero budget, and that is the design rather than a
-staging decision.** The roadmap's own analysis is that predictive scale-up is
+staging decision.** The analysis that kept it off is that predictive scale-up is
 economically strictly worse than ``CapacityBelief.should_probe``: a probe spends
 to *learn* something the fleet does not know and can act on, while a prediction
 spends on a guess about demand that has not arrived. When the guess is right it

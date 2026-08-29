@@ -5,7 +5,7 @@
 
 """A predictor that cannot spend until an operator funds it.
 
-The roadmap's own analysis is that predictive scale-up is economically strictly
+The design's own analysis is that predictive scale-up is economically strictly
 worse than ``should_probe``: a probe spends to learn something the fleet can act
 on, while a prediction spends on a guess about demand that has not arrived. Right,
 it saves one provisioning latency. Wrong, it buys an accelerator nobody asked for

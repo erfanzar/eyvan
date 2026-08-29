@@ -438,7 +438,7 @@ async def test_a_job_that_outruns_its_estimate_is_charged_for_the_overrun() -> N
 
 @pytest.mark.asyncio
 async def test_queued_and_running_time_are_settled_separately() -> None:
-    """The roadmap asks to attribute queued and running cost, which one number cannot."""
+    """Queued and running cost must be attributed separately; one number cannot carry both."""
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
