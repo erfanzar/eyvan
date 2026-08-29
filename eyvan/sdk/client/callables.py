@@ -11,6 +11,7 @@ import typing as tp
 from dataclasses import replace
 
 from pydantic import ValidationError
+from rich.text import Text
 
 from eyvan.artifacts import ArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
@@ -47,6 +48,38 @@ from eyvan.sdk.lifecycle import (
 )
 from eyvan.server.api.schemas import NoMatchingCapacityPoolErrorResponse
 from eyvan.worker.runtime.results import load_result
+
+
+def _job_words(line: str) -> Text:
+    """The job's own words, keeping whatever colours it printed itself.
+
+    A training script that colours its own output sent those bytes through
+    journald to arrive here; reading them back as styles is what lets them
+    survive a terminal, and stripping them is what keeps redirected output
+    clean -- escape codes in a log file are corruption, not decoration. A
+    line with no escapes is returned untouched, because most lines have none
+    and the check is one comparison.
+    """
+
+    return Text.from_ansi(line) if "\x1b" in line else Text(line)
+
+
+def _attributed(prefix: str, line: str) -> Text:
+    """One job line with its attribution tinted and its words left alone.
+
+    The tint rides on a span over the prefix only. ``Text``'s own style
+    argument tints everything appended after it, so ``Text(prefix,
+    style="cyan").append(line)`` painted the job's words cyan too -- and a
+    user reading their own banner in Eyvan's colour is being told, wrongly,
+    that the job said it that way. The words are the job's; the prefix is
+    ours; only ours gets our colour.
+    """
+
+    attributed = Text()
+    attributed.append(prefix, style="cyan")
+    attributed.append_text(_job_words(line))
+    return attributed
+
 
 R = tp.TypeVar("R")
 _ATOMIC_ALLOCATION = "atomic allocation"
@@ -187,8 +220,6 @@ class _CallableProgressRenderer:
         rank data cannot prove distinct voices and never collapses.
         """
 
-        from rich.text import Text
-
         index = 0
         lines = window.lines
         while index < len(lines):
@@ -205,7 +236,7 @@ class _CallableProgressRenderer:
                 # reports them, nothing invented when it does not.
                 provenance = window.provenance[index]
                 if provenance[0] is None:
-                    self._output.output_line(line)
+                    self._output.output_line(_job_words(line))
                 else:
                     prefix = (
                         f"(Worker pid={provenance[0]}, {provenance[1]}) "
@@ -214,9 +245,9 @@ class _CallableProgressRenderer:
                     )
                     # Attribution recedes next to the job's own words: cyan
                     # when a terminal renders it, plain bytes everywhere else.
-                    self._output.output_line(Text(prefix, style="cyan").append(line))
+                    self._output.output_line(_attributed(prefix, line))
             else:
-                self._output.output_line(Text(f"({len(voices)}x Worker) ", style="cyan").append(line))
+                self._output.output_line(_attributed(f"({len(voices)}x Worker) ", line))
             index = end
 
     @staticmethod

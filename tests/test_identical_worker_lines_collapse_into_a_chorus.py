@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import typing as tp
 
 from eyvan.sdk.client.callables import _CallableProgressRenderer
@@ -29,6 +30,20 @@ def _render(records: tuple[dict[str, tp.Any], ...]) -> list[str]:
     renderer = _CallableProgressRenderer(client=_OnePageClient(records), output=output, queue_admission_recorder=None)
     renderer._drain_output("wl-1")
     return [line for line in emitted if line.strip()]
+
+
+def _render_ansi(records: tuple[dict[str, tp.Any], ...]) -> str:
+    """Drain one canned page into a recording terminal, escapes and all."""
+
+    buffer = io.StringIO()
+    output = JobTerminalOutput(
+        stream=buffer,
+        force_terminal=True,
+        environment={"TERM": "xterm-256color", "COLUMNS": "200"},
+    )
+    renderer = _CallableProgressRenderer(client=_OnePageClient(records), output=output, queue_admission_recorder=None)
+    renderer._drain_output("wl-1")
+    return buffer.getvalue()
 
 
 BANNER = "(20:21:39 EasyDeL) please install `torch` (cpu) if you want to use `AutoEasyDeLModel*.from_torch_pretrained`"
@@ -131,3 +146,64 @@ def test_a_chorus_split_by_a_straggler_renders_as_two_honest_runs() -> None:
         "(Worker pid=103, 10.0.0.4) compiling",
         "(2x Worker) " + BANNER,
     ]
+
+
+def test_only_the_attribution_is_tinted_not_the_jobs_words() -> None:
+    """The prefix is ours to colour; the line after it is the job's.
+
+    ``Text(prefix, style="cyan").append(line)`` tints the whole construct,
+    because Text's own style argument covers everything appended after it --
+    so every worker line read as if the job had printed it in Eyvan's cyan.
+    The tint has to ride on a span that ends where the prefix does.
+    """
+
+    rendered = _render_ansi(
+        (
+            {
+                "rank": 1,
+                "pid": 100,
+                "host": "10.0.0.1",
+                "message": "8 local devices | 32 total | rank 1 / 4",
+            },
+        )
+    )
+
+    assert "\x1b[36m(Worker pid=100, 10.0.0.1) \x1b[0m8 local devices | 32 total | rank 1 / 4" in rendered
+    # The bug's shape, pinned so it cannot return unnoticed: one tint that
+    # closes only at the end of the line has swallowed the job's words.
+    assert "\x1b[36m(Worker pid=100, 10.0.0.1) 8 local devices" not in rendered
+
+
+def test_the_chorus_headcount_tints_alone() -> None:
+    """The headcount is Eyvan's summary; the line it counts is still the job's."""
+
+    rendered = _render_ansi(
+        (
+            {"rank": 0, "pid": 100, "host": "10.0.0.1", "message": BANNER},
+            {"rank": 1, "pid": 101, "host": "10.0.0.2", "message": BANNER},
+        )
+    )
+
+    assert f"\x1b[36m(2x Worker) \x1b[0m{BANNER}" in rendered
+    assert f"\x1b[36m(2x Worker) {BANNER}" not in rendered
+
+
+def test_the_colours_the_job_printed_survive_the_trip() -> None:
+    """A script that colours its own output is not decoration Eyvan may drop.
+
+    The bytes came through journald like any other stdout; reading them back
+    as styles is what keeps a red error red on the way to the terminal, while
+    the redirected path still gets clean text rather than raw escapes.
+    """
+
+    rendered = _render_ansi(
+        (
+            {"rank": 0, "pid": 100, "host": "10.0.0.1", "message": "\x1b[31mred\x1b[0m result"},
+            {"rank": 1, "pid": 101, "host": "10.0.0.2", "message": "\x1b[31mred\x1b[0m result"},
+        )
+    )
+
+    assert "\x1b[36m(2x Worker) \x1b[0m\x1b[31mred\x1b[0m result" in rendered
+
+    redirected = _render(({"rank": 0, "pid": 100, "host": "10.0.0.1", "message": "\x1b[31mred\x1b[0m result"},))
+    assert redirected == ["(Worker pid=100, 10.0.0.1) red result"]
