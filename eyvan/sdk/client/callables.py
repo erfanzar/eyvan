@@ -373,10 +373,23 @@ class _CallableProgressRenderer:
                 diagnostic,
             )
         if phase is WorkloadProgressPhase.PROVIDER_FAILURE:
+            # A rejected capacity attempt on a pending workload is not the
+            # job's death. This branch once rendered FAILED -- the same
+            # receipt a dead job gets -- so a shape the provider kept
+            # refusing printed one death notice per attempt while the
+            # workload sat pending and the plane kept working, and an
+            # operator reading those notices cancelled a job that was still
+            # being fought for. BLOCKED carries the truth: capacity is
+            # refused for now, the plane is trying again, and the attempt is
+            # counted. When the acquisition budget runs out the workload
+            # settles on its own terminal verdict, and that is the receipt
+            # that means it.
+            retry = progress.retry
+            attempt = f" (attempt {retry.attempts})" if retry is not None and retry.attempts else ""
             return JobLifecycleUpdate(
-                JobLifecycleState.FAILED,
+                JobLifecycleState.BLOCKED,
                 scope,
-                "provider rejected capacity request",
+                f"capacity request rejected; the plane is retrying{attempt}",
                 diagnostic,
             )
         if phase is WorkloadProgressPhase.QUEUE_ADMISSION_DENIED:

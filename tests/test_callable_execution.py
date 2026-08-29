@@ -22,8 +22,16 @@ import eyvan
 from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
 from eyvan.records import (
     CapacityClass,
+    CapacityRetryProgress,
     CommandExecution,
+    OutboxState,
+    ResourceVector,
+    WorkloadCapacityRequest,
+    WorkloadCapacitySummary,
     WorkloadDefinition,
+    WorkloadPoolProgress,
+    WorkloadProgress,
+    WorkloadProgressPhase,
     WorkloadRecord,
     WorkloadState,
 )
@@ -658,6 +666,115 @@ def test_a_worker_count_change_never_reprints_the_state_heading() -> None:
     headings = [lines for lines in rendered if lines and lines[0].startswith("Eyvan")]
     assert len(headings) == 1
     assert rendered[-1] == ("  0/1 workers ready",)
+
+
+def test_a_rejected_capacity_attempt_is_not_the_jobs_death() -> None:
+    """A refused capacity request on a pending workload is retrying, not dead.
+
+    PROVIDER_FAILURE once rendered as ``Eyvan FAILED`` -- the same receipt a
+    dead job gets -- so an atomic shape the provider kept refusing printed a
+    death notice per attempt while the workload sat pending and the plane kept
+    requesting capacity. An operator reading repeated deaths cancels a job
+    that was still being fought for. The attempt renders BLOCKED, retry named
+    and counted; FAILED stays reserved for the workload's own terminal
+    verdict, which the acquisition-exhaustion budget delivers when retries
+    truly run out.
+    """
+
+    progress = WorkloadProgress(
+        workload_id="wl-retry",
+        workload_state=WorkloadState.PENDING,
+        phase=WorkloadProgressPhase.PROVIDER_FAILURE,
+        scheduling_reason="hard_constraint: no cell satisfies all hard workload constraints",
+        failure_reason=None,
+        request=WorkloadCapacityRequest(
+            cells=1,
+            workers_per_cell=4,
+            resources_per_cell=ResourceVector(tpu=16),
+            total_resources=ResourceVector(tpu=64),
+        ),
+        pool=WorkloadPoolProgress(
+            id="pool-1",
+            fleet_name="research-us-central2-b-v6e-16",
+            node_type="v6e-16",
+            provider="gcp-tpu",
+            region="us-central2",
+            zone="us-central2-b",
+            accelerator_type="v6e-16",
+            capacity_class=CapacityClass.SPOT,
+        ),
+        capacity=WorkloadCapacitySummary(
+            active_cells=0,
+            active_workers=0,
+            ready_cells=0,
+            ready_workers=0,
+            waiting_cells=0,
+            waiting_workers=0,
+            provisioning_cells=0,
+            provisioning_workers=0,
+            lost_cells=0,
+            lost_workers=0,
+        ),
+        retry=CapacityRetryProgress(
+            state=OutboxState.PROCESSING,
+            attempts=5,
+            next_attempt_at=None,
+            diagnostic="the provider refused the queued resource",
+        ),
+    )
+    renderer = _CallableProgressRenderer(
+        client=None,  # type: ignore[arg-type]
+        output=JobTerminalOutput(writer=lambda line: None),
+        queue_admission_recorder=None,
+    )
+
+    update = renderer._progress_update(progress)
+
+    assert update.state is JobLifecycleState.BLOCKED, "a refused attempt is not a terminal verdict"
+    assert update.summary == "capacity request rejected; the plane is retrying (attempt 5)"
+    assert update.diagnostic == "the provider refused the queued resource"
+
+
+def test_a_rejected_capacity_attempt_without_a_count_still_names_the_retry() -> None:
+    """A progress snapshot can predate the first counted retry; the wording holds."""
+
+    progress = WorkloadProgress(
+        workload_id="wl-retry",
+        workload_state=WorkloadState.PENDING,
+        phase=WorkloadProgressPhase.PROVIDER_FAILURE,
+        scheduling_reason=None,
+        failure_reason=None,
+        request=WorkloadCapacityRequest(
+            cells=1,
+            workers_per_cell=1,
+            resources_per_cell=ResourceVector(tpu=8),
+            total_resources=ResourceVector(tpu=8),
+        ),
+        pool=None,
+        capacity=WorkloadCapacitySummary(
+            active_cells=0,
+            active_workers=0,
+            ready_cells=0,
+            ready_workers=0,
+            waiting_cells=0,
+            waiting_workers=0,
+            provisioning_cells=0,
+            provisioning_workers=0,
+            lost_cells=0,
+            lost_workers=0,
+        ),
+        retry=None,
+    )
+    renderer = _CallableProgressRenderer(
+        client=None,  # type: ignore[arg-type]
+        output=JobTerminalOutput(writer=lambda line: None),
+        queue_admission_recorder=None,
+    )
+
+    update = renderer._progress_update(progress)
+
+    assert update.state is JobLifecycleState.BLOCKED
+    assert update.summary == "capacity request rejected; the plane is retrying"
 
 
 def test_a_local_pythonpath_warns_that_it_does_not_travel(tmp_path, monkeypatch) -> None:
