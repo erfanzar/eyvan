@@ -32,29 +32,39 @@ any of them against the build in front of you.
   end to end (VM, VPC-only firewall, generated secrets, PostgreSQL,
   migrations, systemd) and `eyvan head down` removes it. The head installs
   the wheel it is running; no package index is involved.
-- **A callable runs on a multislice allocation** (P0) — one Cloud TPU
-  Multislice queued resource, spot `v5p-16 × 2` in `us-east5-a`, all four
-  ranks dispatched, `jax.device_count() == 16`, submitted with a bare
-  `@execute` and no environment set: on a head, the SDK discovers the plane's
-  address and credential from the node itself.
-- **Multi-host logs keep their ranks** (P2) — every record attributed per
-  rank; a rank killed mid-stream is reported *in place* as unavailable, not
+- **A callable runs on a multislice allocation** — one Cloud TPU Multislice
+  queued resource, spot `v5p-16 × 2` in `us-east5-a`, all four ranks
+  dispatched, `jax.device_count() == 16`. Submitted with a bare `@execute`
+  and no environment set: on a head, the SDK discovers the plane's address
+  and credential from the node itself.
+- **The hardware catalog is authoritative for hosts per slice** — pool
+  resources come from the shape catalog rather than hand-written fleet YAML,
+  and the observed host count must equal the catalog's. A provider that
+  returns one of two hosts would otherwise build a silently half-sized JAX
+  cluster.
+- **Multi-host logs keep their ranks** — every record is attributed per rank,
+  and a rank killed mid-stream is reported *in place* as unavailable, not
   omitted.
-- **In-job submission and exec** (P3) — children submitted under the parent's
-  identity, the live-children ceiling refusing the 257th with 409, and `exec`
-  beside a running trainer on both hosts of a slice.
-- **Secret delivery** (P4) — the value reaches the job and appears in no
-  workload record, log line, or audit payload; one issuance, one read, the
-  capability dead once the attempt ends.
-- **Spot reclamation accounting** (P5) — a reclaimed slice is `PREEMPTED`,
-  not a stockout; it consumes the preemption budget, not the failure budget;
-  the workload resumes from its checkpoint on the replacement cell.
-- **Warm windows held and released** (P6) and **the Kubernetes driver against
-  a real API server** (P7).
-- **Not proven** — the 72-hour soak (P8) has no qualifying receipt. AWS and
+- **In-job submission and exec** — a running job can submit children under
+  its own identity; the live-children ceiling refuses the 257th; `exec` runs
+  a command beside a running trainer on both hosts of a slice.
+- **Secret delivery** — the value reaches the job and appears in no workload
+  record, log line, or audit payload; one issuance, one read, the capability
+  dead once the attempt ends.
+- **Spot reclamation accounting** — a reclaimed slice is `PREEMPTED`, not a
+  stockout; it consumes the preemption budget, not the failure budget; the
+  workload resumes from its checkpoint on the replacement cell.
+- **Warm windows held and released** — a window configured in fleet YAML
+  holds a cell warm through its hours and releases after, and the billing
+  clock accrues idle cost for exactly that period.
+- **The Kubernetes driver against a real API server** — 409 `AlreadyExists`
+  replay, a leaked previous incarnation deleted rather than adopted, pods
+  Pending past `provisioning_timeout_s`, and a Kueue `Inadmissible` verdict
+  mapped to a retryable denial rather than terminal failure.
+- **Not proven** — the 72-hour soak has no qualifying receipt. AWS and
   Azure pass the conformance suite against faked APIs and have never run
-  against a real account. GPU cells have run callables (a T4 cleanly; a P100
-  exposed a driver-generation hazard, recorded with its diagnosis).
+  against a real account. GPU cells have run callables (a T4 cleanly; a
+  P100 exposed a driver-generation hazard, recorded with its diagnosis).
 
 Eyvan is not on PyPI. Install from source, or let `eyvan head up` carry its
 own wheel.
