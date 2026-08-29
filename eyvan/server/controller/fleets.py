@@ -168,6 +168,61 @@ class _ControllerFleets:
         async with self._capacity_operation(cell):
             return await self.service.delete_cell(principal, cell_id, idempotency_key=idempotency_key)
 
+    async def recycle_stale_build_cells_once(self) -> int:
+        """Drain every schedulable cell whose agent runs a different build.
+
+        The dispatch guard catches these one submission at a time, which left
+        the recycling to whoever submitted next -- and an idle stale cell
+        billed until someone did, because a cell the current build cannot use
+        is still a cell the pool counts and pays for. This sweep is the same
+        check without the submission: each stale cell is drained, the
+        autoscaler deletes it once its leases are gone, and the replacement is
+        provisioned from the wheel the plane stages now.
+
+        Returns the number of cells drained, so the phase's effect is visible
+        without reading the audit trail -- and so a fleet that recycles on
+        every pass is noticeable as a number, not as churn.
+        """
+
+        from eyvan._internal.build_identity import build_identity
+
+        head_digest = build_identity().source_digest
+        if not head_digest:
+            return 0  # a source tree with no identity cannot judge anyone
+        async with self.repository.transaction() as transaction:
+            cells = [cell for cell in await transaction.list_cells() if cell.state is CellState.READY]
+        drained = 0
+        for cell in cells:
+            # One cell at a time, with an unreadable agent skipped rather than
+            # raised: the dispatch guard must refuse what it cannot prove, but
+            # a sweep that aborted on one unreachable endpoint would hold the
+            # *other* stale cells billing for a full interval. Unreadable is a
+            # third state, not a mismatch, and the next pass asks again.
+            try:
+                stale = await self._stale_build_report((cell,), head_digest)
+            except Exception as exc:
+                logger.info("cell %s build could not be read; left for the next pass: %s", cell.id, exc)
+                continue
+            if not stale:
+                continue
+            _cell, description = stale[0]
+            try:
+                await self.drain_cell(
+                    self._principal,
+                    cell.id,
+                    idempotency_key=f"stale-build:{cell.id}:g{cell.generation}",
+                )
+            except ConflictError:
+                continue  # already draining or deleting; the cause is leaving either way
+            drained += 1
+            logger.info(
+                "cell %s runs %s but this plane stages %s; drained for replacement",
+                cell.id,
+                description,
+                head_digest[:12],
+            )
+        return drained
+
     async def _autoscale_upsert_cell(
         self,
         pool: CapacityPoolRecord,

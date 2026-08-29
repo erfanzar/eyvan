@@ -39,6 +39,7 @@ from eyvan.records import (
 from eyvan.server.controller._support import (
     StaleOutboxCommand,
 )
+from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 from eyvan.worker.agent.models import (
     CheckpointRequest,
@@ -75,6 +76,14 @@ _SECRET_MATERIALIZING_EXECUTORS = frozenset({"eyvan-native"})
 #: aggregate *and* of the exact at-least-once delivery that contacted the agent.
 _DISPATCH_RESERVATION_KEY = "dispatch_reservation"
 _RETRIABLE_DISPATCH_OUTBOX_STATES = frozenset({OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED})
+
+#: How many times one workload may be requeued because a cell turned out to
+#: run a stale build. Each such requeue follows a drain of a cell that answered
+#: with a wrong digest, so the honest causes are finite; the limit exists for
+#: the dishonest world where a broken staging path keeps producing stale
+#: replacements, where a workload that requeued forever would look like a queue
+#: rather than read as the deployment fault it is.
+_STALE_BUILD_REQUEUE_ATTEMPT_LIMIT = 32
 
 
 class PermanentDispatchRefusal(RuntimeError):
@@ -117,6 +126,27 @@ class AttemptRankSpaceTooLarge(PermanentDispatchRefusal):
     Permanent by construction: the width comes from the leased cells, so retrying
     the same dispatch produces the same refusal.
     """
+
+
+class StaleBuildDispatchRefusal(PermanentDispatchRefusal):
+    """A dispatch refusal whose cause the plane itself can remove.
+
+    The named cells answered with build digests that are not the one this plane
+    stages. Unlike every other member of this family, that fact is not a
+    property of the workload or of a placement the scheduler is configured
+    never to make: the plane stages the wheel, so it can also retire the cell
+    that refuses to run it. Draining the cell hands it to the autoscaler --
+    which deletes it once its leases are gone and provisions a replacement
+    from the wheel staged now -- so a retry after the drain is not the same
+    dispatch and can succeed.
+
+    Carries the offending cells so the handler does not have to re-derive
+    them from a message string.
+    """
+
+    def __init__(self, message: str, cells: tp.Sequence[CellRecord]):
+        super().__init__(message)
+        self.cells = tuple(cells)
 
 
 class GangRendezvousCollision(PermanentDispatchRefusal):
@@ -1318,21 +1348,23 @@ class _ControllerWorkloadCommands:
             failure_reason=str(refusal),
         )
 
-    async def _refuse_stale_cell_builds(self, cells: tp.Sequence[CellRecord]) -> None:
-        """Refuse dispatch onto any cell running a different build than this plane.
+    async def _stale_build_report(
+        self,
+        cells: tp.Sequence[CellRecord],
+        head_digest: str,
+    ) -> list[tuple[CellRecord, str]]:
+        """Read every cell's agent and worker digests; return the stale ones.
 
-        A cell outlives the head that staged its wheel, and a workload handed to
-        stale worker code fails in ways that look like the job's fault -- wrong
-        extraction rules, absent log fields, old protocol shapes. Asking each
-        agent (and its workers) what they run costs two reads per cell and
-        converts that silence into a refusal naming both digests.
+        A cell outlives the head that staged its wheel, and a workload handed
+        to stale worker code fails in ways that look like the job's fault --
+        wrong extraction rules, absent log fields, old protocol shapes. Asking
+        each agent (and its workers) what they run costs two reads per cell
+        and converts that silence into a report naming both digests. A cell
+        whose agent cannot answer is not stale: unreadable is a third state,
+        not a mismatch, and draining on it would recycle healthy capacity.
         """
 
-        from eyvan._internal.build_identity import build_identity
-
-        head = build_identity()
-        if not head.source_digest:
-            return  # a source tree with no identity cannot judge anyone
+        stale: list[tuple[CellRecord, str]] = []
         for cell in cells:
             bound_agent = self._agent_factory(cell)
             bound_cell_id = cell.id
@@ -1353,19 +1385,99 @@ class _ControllerWorkloadCommands:
                 return (build.source_digest if build is not None else None), workers
 
             reported, workers = await asyncio.to_thread(_read)
-            stale: list[str] = []
-            if reported is not None and reported != head.source_digest:
-                stale.append(f"agent {reported[:12]}")
+            parts: list[str] = []
+            if reported is not None and reported != head_digest:
+                parts.append(f"agent {reported[:12]}")
             for worker in workers or ():
                 digest = worker.get("source_digest") if isinstance(worker, dict) else None
-                if isinstance(digest, str) and digest != head.source_digest:
-                    stale.append(f"worker {digest[:12]}")
-            if stale:
-                raise PermanentDispatchRefusal(
-                    f"cell {cell.id!r} runs {' and '.join(stale)} but this plane stages "
-                    f"{head.source_digest[:12]}; recycle it with 'eyvan cell-drain {cell.id}' then "
-                    f"'eyvan cell-delete {cell.id}', or redeploy the cell's runtime before dispatching"
+                if isinstance(digest, str) and digest != head_digest:
+                    parts.append(f"worker {digest[:12]}")
+            if parts:
+                stale.append((cell, " and ".join(parts)))
+        return stale
+
+    async def _refuse_stale_cell_builds(self, cells: tp.Sequence[CellRecord]) -> None:
+        """Refuse dispatch onto any cell running a different build than this plane.
+
+        Raises :class:`StaleBuildDispatchRefusal`, which the dispatch paths
+        answer by recycling the named cells and requeueing the workload
+        rather than by settling it: the plane caused the skew by restaging,
+        so the plane can also remove it.
+        """
+
+        from eyvan._internal.build_identity import build_identity
+
+        head = build_identity()
+        if not head.source_digest:
+            return  # a source tree with no identity cannot judge anyone
+        stale = await self._stale_build_report(cells, head.source_digest)
+        if not stale:
+            return
+        cell, parts = stale[0]
+        raise StaleBuildDispatchRefusal(
+            f"cell {cell.id!r} runs {parts} but this plane stages "
+            f"{head.source_digest[:12]}; recycle it with 'eyvan cell-drain {cell.id}' then "
+            f"'eyvan cell-delete {cell.id}', or redeploy the cell's runtime before dispatching",
+            cells=[offending for offending, _ in stale],
+        )
+
+    async def _recycle_stale_builds_and_requeue(
+        self,
+        command: OutboxRecord,
+        lease_ids: tp.Sequence[str],
+        refusal: StaleBuildDispatchRefusal,
+        reservation: WorkloadDispatchReservation,
+    ) -> None:
+        """Answer a stale-build refusal by removing its cause, then requeueing.
+
+        Settling this refusal as a failure charges the user for the plane's
+        own restage: the cell is stale because the head moved, the workload
+        did nothing wrong, and the operator's remediation is two commands the
+        plane can run itself. So the drain is committed first -- it is durable
+        and idempotent, so a crash between these steps replays into an
+        already-draining cell and a requeue that has not happened yet -- and
+        the workload returns to PENDING to meet the replacement capacity.
+
+        The requeue deliberately charges neither retry budget: both default to
+        zero, and a recycle is fleet maintenance rather than a loss the
+        workload should pay for. The bound is the attempt counter instead,
+        because each refusal here has drained a cell that answered with a
+        wrong digest -- finite causes, finite recycles -- and a deployment
+        whose replacements keep arriving stale is a broken staging path that
+        no amount of retrying hides.
+        """
+
+        for cell in refusal.cells:
+            try:
+                await self.drain_cell(
+                    self._principal,
+                    cell.id,
+                    idempotency_key=f"stale-build:{cell.id}:g{cell.generation}",
                 )
+            except ConflictError:
+                continue  # already draining or deleting; the cause is leaving either way
+        if not await self._release_dispatch_reservation(command, reservation):
+            raise StaleOutboxCommand("stale-build recycle lost ownership of the dispatch")
+        async with self.repository.transaction() as transaction:
+            workload = await transaction.get_workload(str(command.payload["workload_id"]))
+        if workload is None or workload.generation != command.generation:
+            raise StaleOutboxCommand("stale-build recycle references a moved workload")
+        if workload.attempt >= _STALE_BUILD_REQUEUE_ATTEMPT_LIMIT:
+            await self._settle_unlaunchable_attempt(command, tuple(lease_ids), refusal)
+            return
+        await self.service.settle_preempted_workload(
+            self._principal,
+            workload.id,
+            scheduling_reason=(
+                f"cell {' '.join(cell.id for cell in refusal.cells)} ran a stale build and was "
+                "drained; waiting for replacement capacity"
+            ),
+            action="workload.stale_build_recycled",
+            expected_generation=workload.generation,
+            expected_lease_id=workload.lease_id,
+            expected_state=workload.state,
+            recycle=True,
+        )
 
     async def _dispatch_workload(self, command: OutboxRecord) -> None:
         lease_ids = tuple(str(value) for value in command.payload.get("lease_ids") or ())
@@ -1384,6 +1496,9 @@ class _ControllerWorkloadCommands:
         _workload, _lease, cell, request, reservation = prepared
         try:
             await self._refuse_stale_cell_builds((cell,))
+        except StaleBuildDispatchRefusal as exc:
+            await self._recycle_stale_builds_and_requeue(command, (lease_id,), exc, reservation)
+            return
         except PermanentDispatchRefusal as exc:
             await self._settle_unlaunchable_attempt(command, (lease_id,), exc)
             return
@@ -1408,6 +1523,9 @@ class _ControllerWorkloadCommands:
         _workload, _members, cells, coordinator_lease, coordinator_cell, request, reservation = prepared
         try:
             await self._refuse_stale_cell_builds(cells)
+        except StaleBuildDispatchRefusal as exc:
+            await self._recycle_stale_builds_and_requeue(command, lease_ids, exc, reservation)
+            return
         except PermanentDispatchRefusal as exc:
             await self._settle_unlaunchable_attempt(command, lease_ids, exc)
             return

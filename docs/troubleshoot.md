@@ -127,6 +127,19 @@ an unreachable agent, a rank reporting no digest, or an agent predating the
 route -- because none of those agreed with anything. Only endpoints holding a
 cell are scanned; a pool with no cell is named rather than passed over.
 
+The plane recycles proven skew itself. A leader sweep asks every schedulable
+cell's agent what it runs -- on the same cadence cells are reconciled -- and
+drains any that name a different build than the plane stages; the autoscaler
+deletes a drained cell once its leases are gone and provisions the replacement
+from the wheel staged now. A dispatch that meets a stale cell before the sweep
+reaches it drains it the same way and returns the workload to PENDING rather
+than failing it, charging neither retry budget, because a recycle is
+maintenance the workload did not cause. The failure message with the two
+paste-ready commands is still reachable, for a workload that has recycled past
+its attempt bound -- a fleet where that happens is one whose replacements keep
+arriving stale, and `eyvan runtime deploy` is the command for that, not more
+recycling.
+
 ## A provider keeps failing
 
 `eyvan cells` shows `provider_failure_code` and `unavailable_detail`. The codes

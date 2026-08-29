@@ -3,13 +3,17 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""A permanent dispatch refusal settles the workload instead of retrying.
+"""A permanent dispatch refusal the plane cannot fix settles the workload.
 
-``_refuse_stale_cell_builds`` raises a ``PermanentDispatchRefusal`` after the
-dispatch reservation exists. Raised outside the handler that settles the
-family, it falls to the outbox's bare retry handler: the command fails and is
-retried forever, the workload stays LEASED, and its PENDING lease holds the
-cell -- which is how a permanent error blocks ``eyvan down``.
+``_refuse_stale_cell_builds`` now raises a refusal the plane answers by
+recycling the cell (see ``test_stale_build_cells_recycle_themselves.py``);
+this file pins the other half of the family contract. A refusal raised as the
+base class -- the shape of the rank-width and rendezvous refusions, whose
+causes retrying and recycling both leave in place -- must settle rather than
+retry: raised outside the handler that settles the family, it falls to the
+outbox's bare retry handler, the command fails and is retried forever, the
+workload stays LEASED, and its PENDING lease holds the cell -- which is how a
+permanent error blocks ``eyvan down``.
 """
 
 from __future__ import annotations
@@ -45,11 +49,11 @@ LEASE_ID = "lease-1"
 COMMAND_ID = "cmd-1"
 
 
-class _StaleBuildRefusing(EyvanController):
-    """A controller whose stale-build guard always refuses."""
+class _UnfixablyRefusing(EyvanController):
+    """A controller whose stale-build hook refuses without a fix attached."""
 
     async def _refuse_stale_cell_builds(self, cells) -> None:
-        raise PermanentDispatchRefusal("cell 'cell-a' runs a stale build")
+        raise PermanentDispatchRefusal("cell 'cell-a' runs a build this plane cannot recycle")
 
     async def _prepare_single_dispatch(self, command, *, recovered_cells):
         async with self.repository.transaction() as tx:
@@ -113,11 +117,11 @@ async def _seeded_command(controller: EyvanController) -> OutboxRecord:
 
 
 @pytest.mark.asyncio
-async def test_a_stale_build_refusal_settles_the_workload_instead_of_retrying() -> None:
+async def test_an_unfixable_refusal_settles_the_workload_instead_of_retrying() -> None:
     repository = InMemoryRepository()
     await repository.open()
     agent = FakeAgent()
-    controller = _StaleBuildRefusing(
+    controller = _UnfixablyRefusing(
         repository,
         ControlPlaneService(repository),
         settings=EyvanSettings(),
@@ -132,6 +136,6 @@ async def test_a_stale_build_refusal_settles_the_workload_instead_of_retrying() 
         lease = await tx.get_lease(LEASE_ID)
     assert workload is not None
     assert workload.state is WorkloadState.FAILED, "a permanent refusal must not be retried"
-    assert workload.failure_reason is not None and "stale build" in workload.failure_reason
+    assert workload.failure_reason is not None and "cannot recycle" in workload.failure_reason
     assert lease is not None and lease.state is LeaseState.RELEASED, "the settled attempt frees its cell"
     assert agent.submissions == []

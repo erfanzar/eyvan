@@ -50,6 +50,17 @@ class _ControllerLoops:
 
         return (
             LeaderPhase("unmanaged-capacity-recovery", self.reconcile_unmanaged_capacity_recoveries_once),
+            # Before the pools phase on purpose: a cell drained here is deleted
+            # and replaced in the same cycle, because the pools phase already
+            # reaps drained cells whose leases are gone and launches
+            # replacements from the wheel the plane stages now. The sweep asks
+            # each agent two questions, like the dispatch guard does, and a
+            # wrong answer costs one wasted drain that the next pass corrects.
+            LeaderPhase(
+                "recycle-stale-builds",
+                self.recycle_stale_build_cells_once,
+                interval_s=self.settings.cell_reconcile_interval_s,
+            ),
             # Plans capacity that does not exist yet, and depends on no
             # observation to do it: a plan made against a stale inventory is
             # corrected by the next pass, where a placement is not. This phase

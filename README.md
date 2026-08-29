@@ -327,7 +327,7 @@ contracts in CI, not by convention.
 
 ```bash
 uv sync
-uv run pytest tests                    # 5853 tests
+uv run pytest tests                    # 5857 tests
 EYVAN_REQUIRE_POSTGRES=1 uv run pytest tests   # against the real backend
 uv run ruff check eyvan tests
 npm --prefix dashboard test

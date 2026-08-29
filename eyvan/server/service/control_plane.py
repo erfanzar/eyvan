@@ -1062,9 +1062,7 @@ class ControlPlaneService:
                 # requiring the pool name meant a user had to learn a naming
                 # scheme to run anything -- while `ray job submit` and
                 # `iris job run --tpu v5litepod-16` ask only for hardware.
-                matching_pools = [
-                    pool for pool in fleet_pools if pool.enabled and pool.accelerator_type == node_type
-                ]
+                matching_pools = [pool for pool in fleet_pools if pool.enabled and pool.accelerator_type == node_type]
                 if not matching_pools:
                     raise NotFoundError(f"fleet node type {fleet_name}/{node_type} was not found")
             if zone is not None:
@@ -3204,6 +3202,7 @@ class ControlPlaneService:
         expected_cell_state: CellState | None = None,
         expected_unavailable_reason: str | None = None,
         expected_cell_id: str | None = None,
+        recycle: bool = False,
     ) -> tuple[WorkloadRecord, LeaseRecord | None, BudgetRecord | None]:
         """Atomically settle a preempted lease and requeue its workload.
 
@@ -3212,6 +3211,14 @@ class ControlPlaneService:
         ``require_preemption_owner``, which is about *Eyvan's own* priority
         preemption -- one is the fleet taking capacity back from a lower-priority
         job, the other is the cloud taking it back from the fleet.
+
+        ``recycle`` charges neither budget. It is the plane retiring a cell
+        that runs a stale build -- maintenance the workload did not cause and
+        must not pay for, and charging it would be worse than unfair: both
+        budgets default to zero, so the recycling would never run at all for
+        a submission that did not opt into retries. The bound lives with the
+        caller, which only reaches this path after draining the cell that
+        made the requeue necessary.
         """
 
         self.authorizer.require(principal, Permission.MANAGE_FLEET)
@@ -3263,9 +3270,13 @@ class ControlPlaneService:
                     "state": WorkloadState.PENDING,
                     "attempt": workload.attempt + 1,
                     **(
-                        {"preemption_count": workload.preemption_count + 1}
-                        if provider_preempted
-                        else {"capacity_loss_count": workload.capacity_loss_count + 1}
+                        {}
+                        if recycle
+                        else (
+                            {"preemption_count": workload.preemption_count + 1}
+                            if provider_preempted
+                            else {"capacity_loss_count": workload.capacity_loss_count + 1}
+                        )
                     ),
                     "generation": next_generation,
                     "spec": self.result_spec_for_generation(
