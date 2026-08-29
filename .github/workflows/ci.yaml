@@ -1,9 +1,11 @@
 name: CI
 
-# The standalone Eyvan repository has no uv.lock -- it is a subtree of a uv
-# workspace whose lock lives at the monorepo root. Every install here therefore
-# comes from the hash-pinned exports that ship with the package, which is
-# stricter than a lock anyway: --require-hashes refuses a substituted artifact.
+# Two reproducibility mechanisms ship together and check each other. The
+# uv.lock is what a standalone clone gets from `uv sync`; the hash-pinned
+# exports are what the Dockerfiles, the head bootstrap, and the installs
+# below use, stricter than a lock on its own: --require-hashes refuses a
+# substituted artifact. A dependency bumped without relocking fails the
+# lock check; bumped without regenerating the exports fails the install.
 
 on:
   push:
@@ -43,6 +45,20 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.9.21"
+
+      - name: The lock matches the manifest
+        run: uv lock --check
+
+      # The suite asserts a checkout serves its dashboard at "/", so the
+      # bundle the dashboard job builds for its own tests has to exist here
+      # too: a fresh clone has no dashboard/dist until this step makes one.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm --prefix dashboard ci
+      - run: npm --prefix dashboard run build
 
       - name: Install from the hashed exports
         run: |

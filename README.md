@@ -261,17 +261,20 @@ refuses to start against a database it does not recognise rather than guessing.
 
 ## Installing
 
-Not yet on PyPI. From source, in a checkout:
+Not yet on PyPI. From source, in a checkout — the lock is the short path:
+
+```bash
+uv sync --extra dev        # adds pytest; plain `uv sync` installs without it
+```
+
+The deployment-grade path uses the hash-pinned exports that ship with the
+package — the same files CI, the Dockerfiles, and `eyvan head up` install —
+and `--require-hashes` refuses a substituted artifact:
 
 ```bash
 uv venv --python 3.13 && uv pip install --require-hashes -r requirements-docker.txt
 uv pip install --no-build-isolation --no-deps -e .
 ```
-
-Every install path uses the hash-pinned exports that ship with the package;
-`--require-hashes` refuses a substituted artifact. See
-[docs/install.md](docs/install.md), which states the real number of separately
-configured prerequisites rather than implying there is one.
 
 ## What is guaranteed, and what is not
 

@@ -8,6 +8,16 @@ change; a rejected 2,000-line branch helps nobody.
 
 ## Running the tests
 
+From a standalone clone, the lock is enough:
+
+```bash
+uv sync --extra dev
+uv run pytest tests
+```
+
+The deployment-grade path installs the hash-pinned exports instead — what
+CI, the Dockerfiles, and `eyvan head up` use:
+
 ```bash
 uv venv --python 3.13 && uv pip install --require-hashes -r requirements-docker.txt
 uv pip install --require-hashes -r requirements-dev.txt
