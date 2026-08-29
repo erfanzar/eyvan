@@ -90,6 +90,21 @@ class GcsCommandError(RuntimeError):
 _COMMAND_ERROR_STDERR_LIMIT = 2000
 
 
+def _gcs_command_error(
+    args: tp.Sequence[str],
+    returncode: int,
+    stderr: str,
+) -> GcsCommandError:
+    """Build the error that names the command and its own failure reason."""
+
+    if len(stderr) > _COMMAND_ERROR_STDERR_LIMIT:
+        stderr = f"{stderr[:_COMMAND_ERROR_STDERR_LIMIT]}… [truncated]"
+    return GcsCommandError(
+        f"'{' '.join(args)}' failed with exit status {returncode}"
+        + (f": {stderr}" if stderr else " and printed nothing to stderr")
+    )
+
+
 def _gcloud_checked(
     runner: CommandRunner,
     args: tp.Sequence[str],
@@ -100,12 +115,7 @@ def _gcloud_checked(
         return runner(args, check=True, capture_output=True)
     except subprocess.CalledProcessError as error:
         stderr = (error.stderr or b"").decode("utf-8", "replace").strip()
-        if len(stderr) > _COMMAND_ERROR_STDERR_LIMIT:
-            stderr = f"{stderr[:_COMMAND_ERROR_STDERR_LIMIT]}… [truncated]"
-        raise GcsCommandError(
-            f"'{' '.join(args)}' failed with exit status {error.returncode}"
-            + (f": {stderr}" if stderr else " and printed nothing to stderr")
-        ) from error
+        raise _gcs_command_error(args, error.returncode, stderr) from error
 
 
 def _default_gcloud_runner(
@@ -258,11 +268,22 @@ class GCSArtifactStore:
         self.root_uri = root_uri
         self._runner = _default_gcloud_runner if runner is None else runner
 
+    def _verify_stored_digest(self, uri: str, sha256: str, *, kind: str) -> None:
+        """Re-hash a stored digest-named object; a foreign one is rejected."""
+
+        if hashlib.sha256(self.read(uri)).hexdigest() != sha256:
+            raise ValueError(f"stored {kind} artifact at {uri} has an invalid digest")
+
     def _put_digest_object(self, payload: bytes, sha256: str, *, kind: str, extension: str) -> str:
         """Upload one immutable digest-named object only when it is absent.
 
         A pre-existing object under the digest name is fetched and re-hashed; a
-        corrupted or foreign object is rejected instead of trusted.
+        corrupted or foreign object is rejected instead of trusted. A
+        concurrent submitter landing the same digest between our check and our
+        upload is that case arriving late, not a failure: ``--no-clobber``
+        answers 412, the losing upload verifies what the winner wrote, and
+        submission continues -- identical callables submitted side by side are
+        one object, and none of their submitters crashes.
         """
 
         uri = f"{self.root_uri}/{kind}/{sha256}{extension}"
@@ -271,23 +292,33 @@ class GCSArtifactStore:
             check=False,
             capture_output=True,
         )
-        if described.returncode != 0:
-            temporary_path: Path | None = None
+        if described.returncode == 0:
+            self._verify_stored_digest(uri, sha256, kind=kind)
+            return uri
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as temporary:
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
             try:
-                with tempfile.NamedTemporaryFile(delete=False) as temporary:
-                    temporary.write(payload)
-                    temporary.flush()
-                    os.fsync(temporary.fileno())
-                    temporary_path = Path(temporary.name)
                 _gcloud_checked(
                     self._runner,
                     ["gcloud", "storage", "cp", "--no-clobber", str(temporary_path), uri],
                 )
-            finally:
-                if temporary_path is not None:
-                    temporary_path.unlink(missing_ok=True)
-        elif hashlib.sha256(self.read(uri)).hexdigest() != sha256:
-            raise ValueError(f"stored {kind} artifact at {uri} has an invalid digest")
+            except GcsCommandError as error:
+                if "HTTPError 412" not in str(error):
+                    raise
+                # The object appeared between the describe and this upload:
+                # a concurrent submitter landed the same digest first. The
+                # name is the content's digest, so what they wrote is what
+                # we were uploading -- verify it and continue, exactly as if
+                # it had been there all along.
+                self._verify_stored_digest(uri, sha256, kind=kind)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return uri
 
     def put(self, artifact: CallableArtifact) -> StoredCallableArtifact:

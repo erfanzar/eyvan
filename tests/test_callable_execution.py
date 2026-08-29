@@ -19,7 +19,7 @@ import pytest
 from conftest import stop_local_daemons_recorded_under
 
 import eyvan
-from eyvan.artifacts import GCSArtifactStore, LocalArtifactStore
+from eyvan.artifacts import GCSArtifactStore, GcsCommandError, LocalArtifactStore
 from eyvan.records import (
     CapacityClass,
     CapacityRetryProgress,
@@ -534,6 +534,90 @@ def test_gcs_store_uploads_each_digest_once_and_can_read_results() -> None:
     assert sum(command[2] == "cp" for command in runner.calls) == 1
     assert "--no-clobber" in next(command for command in runner.calls if command[2] == "cp")
     assert store.allocate_result_uri("call-one") == "gs://artifacts/eyvan/results/call-one.result"
+
+
+class _ConcurrentWinnerRunner:
+    """A gcloud stand-in where another submitter lands the object mid-race.
+
+    The describe answers absent, the ``--no-clobber`` upload answers 412
+    because a concurrent submission of the identical callable created the
+    digest-named object a moment earlier, and the object reads back as that
+    submitter wrote it.
+    """
+
+    def __init__(self, stored: bytes):
+        self.stored = stored
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args, *, check, capture_output):
+        command = list(args)
+        self.calls.append(command)
+        if command[2:4] == ["objects", "describe"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[2] == "cp":
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=command,
+                stderr=b"ERROR: HTTPError 412: At least one of the pre-conditions you specified did not hold.",
+            )
+        if command[2] == "cat":
+            return subprocess.CompletedProcess(command, 0, stdout=self.stored, stderr=b"")
+        raise AssertionError(command)
+
+
+def test_a_concurrent_upload_of_the_same_digest_wins_instead_of_crashing() -> None:
+    """Two submitters, one identical callable, one object -- nobody crashes.
+
+    ``--no-clobber`` answers 412 when the digest-named object appears between
+    the absence check and the upload. Three zones raced the same probe and two
+    of them died in submission with a precondition error, because the store
+    treated "the object I was uploading now exists" -- the desired end state
+    for a content-addressed name -- as a failure. The losing upload now
+    verifies what the winner wrote and continues.
+    """
+
+    artifact = dump_callable(_add)
+    runner = _ConcurrentWinnerRunner(artifact.payload)
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=runner)
+
+    stored = store.put(artifact)
+
+    assert stored.uri == f"gs://artifacts/eyvan/callables/{artifact.sha256}.pkl"
+
+
+def test_a_precondition_loss_still_rejects_a_foreign_object() -> None:
+    """Falling back to verify only helps when the winner wrote our digest."""
+
+    artifact = dump_callable(_add)
+    runner = _ConcurrentWinnerRunner(b"a different submitter's bytes")
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=runner)
+
+    with pytest.raises(ValueError, match="invalid digest"):
+        store.put(artifact)
+
+
+def test_any_other_upload_failure_still_names_itself() -> None:
+    """Only the lost race is benign; a real failure keeps its reason."""
+
+    artifact = dump_callable(_add)
+
+    class _Refused:
+        def __call__(self, args, *, check, capture_output):
+            command = list(args)
+            if command[2:4] == ["objects", "describe"]:
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+            if command[2] == "cp":
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=command,
+                    stderr=b"ERROR: HTTPError 403: forbidden",
+                )
+            raise AssertionError(command)
+
+    store = GCSArtifactStore("gs://artifacts/eyvan", runner=_Refused())
+
+    with pytest.raises(GcsCommandError, match="403: forbidden"):
+        store.put(artifact)
 
 
 # --------------------------------------------------------------------------- connecting, explicitly
