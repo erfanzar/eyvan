@@ -49,7 +49,7 @@ it. A `PreToolUse` hook denies raw TPU provisioning for exactly this reason;
 `list`, `describe`, `ssh` and `delete` remain available for diagnosis and for
 reaping strays after a crash.
 
-Shape guidance, measured 2026-08-15 in `example-project`: request **2x v6e-8**
+Shape guidance, measured 2026-08-15 on a live GCP project: request **2x v6e-8**
 (16 chips, a real multislice) rather than 2x v6e-16. The 32-chip shape was
 accepted in all four zones holding v6e spot quota and reclaimed before a host
 finished booting, three separate times; 16 chips were granted in about two
@@ -382,8 +382,8 @@ the workers it provisions next. Delete on that evidence, not on age.
 gcloud compute firewall-rules delete <name> --project <p>
 ```
 
-Observed 2026-08-13: two rules dated 2026-07-13 and 2026-08-10 in
-`example-project`, both orphaned, after a `head down` that correctly removed
+Observed 2026-08-13: two rules dated 2026-07-13 and 2026-08-10 in the project,
+both orphaned, after a `head down` that correctly removed
 the two rules it did own.
 
 ## Several GPU ranks on one host

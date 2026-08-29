@@ -1315,7 +1315,7 @@ After the control-plane hardening landed (signer rotation keyrings, shrink
 stabilization, lease TTL, gang-init fatality, admission-denial TTL,
 transaction retry, parallel stage fanout, quota-group validation, provider
 substrate consultation), the provider read path was re-verified live against
-`example-project`, read-only and within bounded spend:
+the project that owns the fleet, read-only and within bounded spend:
 
 - `eyvan capacity quota --fits v6e-8:1` returned per-zone spot/on-demand
   balances with fresh usage ages through the current tree.

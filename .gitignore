@@ -16,3 +16,6 @@ build/
 # Where a `--with` job caches its packages when /var/lib/eyvan is not writable,
 # which is every laptop. Submitting from a checkout otherwise dirties the tree.
 .eyvan-runtime-envs/
+# Session-to-session engineering handoffs are working notes, not product; they
+# name real incidents, hosts, and accounts, and have no business in a release.
+.handoff/
