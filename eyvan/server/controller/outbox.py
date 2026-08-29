@@ -38,6 +38,7 @@ from eyvan.worker.agent.client import (
     CellAgentCapacityProviderError,
     CellAgentInvalidConfigurationError,
     CellAgentStaleMutationError,
+    CellAgentUnavailableError,
     CellAgentUnsupportedCapabilityError,
 )
 
@@ -137,6 +138,16 @@ class _ControllerOutbox:
             else:
                 await self._discard_outbox(command, provider_diagnostic=diagnostic)
         except CellAgentBusyError as exc:
+            await self._finish_outbox(command, error=str(exc), transient=True)
+        except CellAgentUnavailableError as exc:
+            # Transient, and specifically *not* a provider verdict. An agent that
+            # cannot be reached has told us nothing about the provider, and this
+            # fell into the bare handler below -- which spends an attempt and, for
+            # ``capacity.apply``, records a PROVIDER_ERROR against the cell. A
+            # restarting agent or a network blip therefore became durable evidence
+            # that GCP had failed, which is how a healthy pool acquires a failure
+            # it never had. Unknown is a third answer here, exactly as it is
+            # everywhere else in this package.
             await self._finish_outbox(command, error=str(exc), transient=True)
         except CellAgentUnsupportedCapabilityError as exc:
             # The backend does not implement this operation; retrying cannot

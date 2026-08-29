@@ -13,13 +13,22 @@ from fastapi.testclient import TestClient
 from eyvan.capacity.drivers.base import CapacityStatus, CellCapabilities, CellObservation
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.config import EyvanSettings
-from eyvan.records import CellRecord, CellState, OutboxState, Principal, ResourceVector, Role, RoleGrant
+from eyvan.records import (
+    CapacityPoolRecord,
+    CellRecord,
+    CellState,
+    OutboxState,
+    Principal,
+    ResourceVector,
+    Role,
+    RoleGrant,
+)
 from eyvan.server.controller import EyvanController
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.worker.agent.app import create_agent_app
-from eyvan.worker.agent.client import CellAgentClient
+from eyvan.worker.agent.client import CellAgentClient, CellAgentUnavailableError
 from eyvan.worker.agent.service import CellAgentService
 
 
@@ -164,3 +173,71 @@ async def test_outbox_delivery_continues_while_leader_reconciliation_is_blocked(
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_agent_is_not_recorded_as_a_provider_failure(tmp_path) -> None:
+    """Unreachable tells you nothing about the provider.
+
+    `CellAgentUnavailableError` -- the agent could not be reached at all -- fell
+    into the outbox's bare exception handler, which spends an attempt and, for
+    `capacity.apply`, records a PROVIDER_ERROR against the cell. A restarting
+    agent or a momentary network fault therefore became durable evidence that GCP
+    had failed, which is how a healthy pool acquires a failure it never had.
+
+    Asserted on the durable record rather than on which handler ran: what matters
+    is that no provider verdict is invented and the attempt is not spent.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+
+    class _UnreachableAgent:
+        def apply_capacity(self, *_args, **_kwargs):
+            raise CellAgentUnavailableError("the cell agent could not be reached: connection refused")
+
+        def __getattr__(self, _name):
+            def _unreachable(*_args, **_kwargs):
+                raise CellAgentUnavailableError("the cell agent could not be reached: connection refused")
+
+            return _unreachable
+
+    controller = EyvanController(
+        repository,
+        service,
+        agent_factory=lambda _cell: _UnreachableAgent(),  # type: ignore[arg-type]
+    )
+    fleet_admin = Principal(subject="system", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pool = CapacityPoolRecord(
+        id="research/cpu",
+        fleet_name="research",
+        node_type="cpu",
+        provider="gcp",
+        capacity_backend="gcp-compute",
+        provider_project="project-a",
+        region="us-central1",
+        zone="us-central1-a",
+        capacity={"cpu": 4, "memory_gib": 16},
+        allocatable={"cpu": 4, "memory_gib": 16},
+        executor="native-local",
+        agent_endpoint="http://agent:8090",
+        provider_options={"kind": "cpu", "machine_type": "n2-standard-4"},
+        min_cells=1,
+        initial_cells=1,
+        max_cells=1,
+    )
+    await service.apply_fleet(fleet_admin, "research", (pool,), idempotency_key="fleet-v1")
+
+    await controller.reconcile_capacity_pools_once()
+    await controller.dispatch_outbox_once()
+
+    async with repository.transaction() as transaction:
+        cells = await transaction.list_cells()
+        outbox = await transaction.list_outbox()
+
+    applies = [record for record in outbox if record.topic == "capacity.apply"]
+    assert applies, "the test needs a capacity.apply command to have been created"
+    # Retried without spending an attempt, exactly like a busy agent.
+    assert applies[0].attempts == 0
+    # And no provider verdict was invented from a transport failure.
+    assert all(cell.provider_failure_code is None for cell in cells)
