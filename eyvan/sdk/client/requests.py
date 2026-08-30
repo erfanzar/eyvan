@@ -107,6 +107,7 @@ def pool_callable_request(
     estimated_duration_seconds: int = 3600,
     named_assets: tuple[str, ...] = (),
     dependencies: tuple[str, ...] = (),
+    atomic: bool = False,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload."""
 
@@ -117,6 +118,7 @@ def pool_callable_request(
         project_id=project_id,
         accelerator_type=accelerator_type,
         pods=pods,
+        atomic=atomic,
         capacity_class=capacity_class,
         execution=execution,
         name=name,

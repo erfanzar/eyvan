@@ -19,6 +19,27 @@ The interpreter contract is checked **before provisioning** when
 `major.minor` is refused at submission, not on the accelerator — a live
 multislice run paid for that lesson once (see [proofs](proofs.md)).
 
+## Two allocation modes
+
+Independent of the runtime: **how a job's `pods` workers are allocated**.
+
+- **elastic (default)** — `pods` is a worker count, satisfied from any
+  combination of same-type cells: warm slices are packed first (biggest
+  first, so the fewest hardware worlds) and only the deficit is
+  provisioned. Resizing `pods` 2→4 keeps the two warm slices and asks for
+  two more. The job runs as one lease group, one hardware world per cell —
+  framework-level parallelism across worlds.
+- **atomic** — `TpuConfig(..., atomic=True)`: one exact-shape provider
+  resource, one hardware world spanning every pod. Required when the job's
+  math needs the whole allocation in one JAX world (single-mesh training,
+  an all-reduce across every chip). Resizing rebuilds from zero — a
+  provider topology cannot grow — and the plane drains now-unusable
+  smaller leftovers instead of billing them to the idle timeout.
+
+All-or-nothing holds in both: nothing is leased unless the full worker
+count is covered, so a deficit that never grants holds no warm cell
+hostage.
+
 ## The defaults profile
 
 `~/.eyvan/autoscale/defaults.yaml` is the one place an operator pins what

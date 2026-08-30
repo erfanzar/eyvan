@@ -28,6 +28,7 @@ from eyvan.capacity.planning import (
     pool_cell_id,
 )
 from eyvan.domain import (
+    PlacementMode,
     SchedulingResult,
 )
 from eyvan.records import (
@@ -35,6 +36,7 @@ from eyvan.records import (
     CellRecord,
     CellState,
     Principal,
+    WorkloadDefinition,
     WorkloadState,
     utcnow,
 )
@@ -52,6 +54,24 @@ from eyvan.server.service.state import ACTIVE_LEASE_STATES
 #: window in which a reservation on a freshly requested cell is the only thing
 #: stopping another workload from taking it.
 _WAITING_FOR_CAPACITY = frozenset({WorkloadState.PENDING, WorkloadState.ADMITTED})
+
+
+def _still_demanded(cell: CellRecord, pending_specs: tp.Sequence[WorkloadDefinition]) -> bool:
+    """Return whether any pending workload could still lease this cell.
+
+    Conservative on purpose -- draining less is always safe. An atomic
+    workload demands its exact worker count; an elastic one can pack any
+    cell up to its request. Pool pinning is ignored here so a cell another
+    fleet's workload might want is left alone.
+    """
+
+    for spec in pending_specs:
+        if spec.placement is PlacementMode.ELASTIC:
+            if spec.worker_count >= cell.worker_count:
+                return True
+        elif spec.worker_count == cell.worker_count:
+            return True
+    return False
 
 
 class _ControllerFleets:
@@ -530,6 +550,49 @@ class _ControllerFleets:
                 cell_ids.add(cell_id)
                 next_index += 1
                 launched += 1
+
+            # The resize leftover: an atomic launch of W workers can never use a
+            # smaller idle cell in this pool, so one that nothing else demands is
+            # known-unusable now -- draining it now, rather than at the idle
+            # timeout, is the difference between paying for the old shape for the
+            # whole provisioning window or not. Warm cells a pending workload
+            # could still lease (exact shape, or any size an elastic one can
+            # pack), leased cells, and in-flight acquisitions are untouched.
+            workload_by_id = {workload.id: workload for workload in workloads}
+            pending_specs = [workload.spec for workload in workloads if workload.state is WorkloadState.PENDING]
+            for worker_count, owner_id in zip(
+                plan.launch_worker_counts[:allowed],
+                plan.launch_workload_ids[:allowed],
+                strict=True,
+            ):
+                owner = workload_by_id.get(owner_id)
+                if owner is None or owner.spec.placement is PlacementMode.ELASTIC:
+                    continue
+                for cell in matching_supply:
+                    if (
+                        cell.state is CellState.READY
+                        and cell.worker_count < worker_count
+                        and cell.id not in active_lease_cells
+                        and cell.autoscale_request_workload_id is None
+                        and cell.id not in plan.protected_cell_ids
+                        and not _still_demanded(cell, pending_specs)
+                    ):
+                        try:
+                            await self.drain_cell(
+                                self._principal,
+                                cell.id,
+                                idempotency_key=f"superseded-shape:{cell.id}:g{cell.generation}",
+                            )
+                        except ConflictError:
+                            continue  # already draining or deleting; either way it is leaving
+                        drained += 1
+                        logger.info(
+                            "cell %s (%d workers) drained: superseded by an atomic %d-worker launch in pool %s",
+                            cell.id,
+                            cell.worker_count,
+                            worker_count,
+                            pool.id,
+                        )
 
             if (
                 pool.enabled

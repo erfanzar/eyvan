@@ -25,7 +25,7 @@ from eyvan.capacity.planning import (
     cell_provides_pool_supply,
     cell_requires_replacement,
 )
-from eyvan.domain.models import PriorityBand
+from eyvan.domain.models import PlacementMode, PriorityBand
 from eyvan.records import (
     CapacityPoolRecord,
     CapacityStatus,
@@ -134,6 +134,31 @@ def generic_multislice_workload(workload_id: str = "workload-multislice", worker
     )
 
 
+def elastic_multislice_workload(
+    workload_id: str = "workload-elastic",
+    worker_count: int = 4,
+    *,
+    pool_id: str = "research/v5p-16",
+) -> WorkloadRecord:
+    return WorkloadRecord(
+        id=workload_id,
+        org_id="acme",
+        project_id="research",
+        created_by="operator",
+        spec=WorkloadDefinition(
+            name="elastic-train",
+            execution=CommandExecution(command="python train.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 32, "memory_gib": 0, "tpu": 8}},
+            provider="gcp",
+            required_executor="eyvan-native",
+            required_labels={"eyvan_pool": pool_id},
+            worker_count=worker_count,
+            worker_resource_scope=WorkerResourceScope.PER_WORKER,
+            placement=PlacementMode.ELASTIC,
+        ),
+    )
+
+
 def generic_cpu_workload(workload_id: str = "workload-cpu") -> WorkloadRecord:
     return WorkloadRecord(
         id=workload_id,
@@ -183,6 +208,64 @@ def test_generic_multislice_workload_gets_shape_exact_virtual_capacity_and_scale
     assert plan.launch_worker_counts == (2,)
     assert plan.launch_workload_ids == (workload.id,)
     assert plan.target_worker_units == 2
+
+
+def test_elastic_workload_provisions_only_the_deficit_beyond_warm_cells() -> None:
+    """The pods 2 -> 4 resize: two warm slices are reused, two are asked for."""
+
+    pool = multislice_tpu_pool()
+    warm = _idle_cell(pool, 1, worker_count=2)
+    workload = elastic_multislice_workload("workload-grow", worker_count=4)
+    now = utcnow()
+
+    simulation = CapacitySimulation.build((pool,), (warm,), (workload,), (), now)
+
+    virtual_counts = sorted(simulation.virtual_worker_count_by_cell_id.values())
+    assert virtual_counts == [2]  # the deficit, not the whole allocation
+    warm_in_snapshot = any(cell.id == warm.id for cell in simulation.cells)
+    assert warm_in_snapshot
+
+    result = CoreSchedulingService().schedule((workload,), simulation.cells)
+    assert [placement.workload_id for placement in result.placements] == [workload.id]
+    placement = result.placements[0]
+    assert len(placement.all_leases) == 2
+    leased_ids = {lease.cell_id for lease in placement.all_leases}
+    assert warm.id in leased_ids
+
+    demand = simulation.demand((pool,), (), result)
+    assert demand[pool.id].virtual_worker_counts == (2,)
+    assert demand[pool.id].real_cell_ids == {warm.id}
+
+    planner = CapacityPlanner((pool,), {pool.id: [warm]}, now)
+    plan = planner.plan(demand)[pool.id]
+    assert plan.launch_worker_counts == (2,)
+
+
+def test_elastic_workload_covered_entirely_by_warm_cells_launches_nothing() -> None:
+    pool = multislice_tpu_pool()
+    warm = (
+        _idle_cell(pool, 1, worker_count=2),
+        _idle_cell(pool, 2, worker_count=2),
+    )
+    workload = elastic_multislice_workload("workload-warm", worker_count=4)
+
+    simulation = CapacitySimulation.build((pool,), warm, (workload,), (), utcnow())
+
+    assert simulation.virtual_worker_count_by_cell_id == {}
+    result = CoreSchedulingService().schedule((workload,), simulation.cells)
+    assert [placement.workload_id for placement in result.placements] == [workload.id]
+    assert len(result.placements[0].all_leases) == 2
+    demand = simulation.demand((pool,), (), result)
+    assert demand[pool.id].virtual_worker_counts == ()
+
+
+def test_elastic_workload_with_no_warm_supply_provisions_the_whole_shape() -> None:
+    pool = multislice_tpu_pool()
+    workload = elastic_multislice_workload("workload-cold", worker_count=4)
+
+    simulation = CapacitySimulation.build((pool,), (), (workload,), (), utcnow())
+
+    assert sorted(simulation.virtual_worker_count_by_cell_id.values()) == [4]
 
 
 def test_generic_multislice_workload_skips_pools_without_a_multiworker_backend() -> None:
@@ -282,18 +365,8 @@ def test_quota_group_pool_missing_units_fails_with_value_error_during_reclaim() 
 def _idle_cell(pool: CapacityPoolRecord, index: int, *, worker_count: int = 1) -> CellRecord:
     from eyvan.capacity.planning import pool_cell_id
 
-    return CellRecord(
-        id=pool_cell_id(pool, index),
-        provider="gcp",
-        provider_project="project-a",
-        region="us-east5",
-        zone="us-east5-a",
-        state=CellState.READY,
-        capacity=pool.capacity,
-        allocatable=pool.allocatable,
-        pool_id=pool.id,
-        worker_count=worker_count,
-    )
+    cell_id = pool_cell_id(pool, index)
+    return pool.make_cell(cell_id, worker_count=worker_count).model_copy(update={"state": CellState.READY})
 
 
 def _defrag_group() -> tuple[CapacityPoolRecord, CapacityPoolRecord]:

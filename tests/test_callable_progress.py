@@ -173,7 +173,7 @@ def test_callable_submission_prints_durable_job_controls(tmp_path, capsys, tpu: 
     assert capsys.readouterr().err.splitlines() == [
         "Eyvan: job wl-v6e-16 submitted to fleet research-us-central1-c.",
         f"  request  {request_shape}",
-        "  allocation  atomic",
+        "  allocation  elastic",
         "  this job keeps running if this client exits.",
         "  status  eyvan workload status wl-v6e-16",
         "  logs    eyvan workload logs wl-v6e-16",

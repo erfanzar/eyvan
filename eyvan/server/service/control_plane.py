@@ -53,7 +53,7 @@ from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.domain import costing
 from eyvan.domain.availability import p95_latency
 from eyvan.domain.carbon import CarbonSource, CarbonUnavailable, NoCarbonSource, fresh_reading
-from eyvan.domain.models import SchedulingResult
+from eyvan.domain.models import PlacementMode, SchedulingResult
 from eyvan.domain.spend import spend_of
 from eyvan.records import (
     BILLABLE_CELL_STATES,
@@ -1200,9 +1200,16 @@ class ControlPlaneService:
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
+        atomic: bool = False,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
-        """Queue one callable on an atomic ``pods``-worker TPU cell."""
+        """Queue one callable on ``pods`` workers, packed or atomic.
+
+        ``atomic`` selects the exact-shape contract: one cell of exactly
+        ``pods`` workers, one provider resource, one hardware world. The
+        default packs warm cells of the same accelerator type and provisions
+        only the deficit, which spans one hardware world per cell instead.
+        """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
         self._require_trusted_callable_project(org_id, project_id)
@@ -1406,6 +1413,7 @@ class ControlPlaneService:
                 max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 worker_count=pods,
+                placement=PlacementMode.ATOMIC if atomic else PlacementMode.ELASTIC,
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
@@ -1609,6 +1617,7 @@ class ControlPlaneService:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         alternate_pool_ids: tuple[str, ...] = (),
+        placement: PlacementMode = PlacementMode.ATOMIC,
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
 
@@ -1656,6 +1665,7 @@ class ControlPlaneService:
             cell_group_count=cell_group_count,
             worker_count=worker_count,
             worker_resource_scope=WorkerResourceScope.PER_WORKER,
+            placement=placement,
             checkpointable=checkpointable,
             checkpoint_hook=checkpoint_hook,
             checkpoint_output_uri=checkpoint_output_uri,
@@ -4621,7 +4631,7 @@ class ControlPlaneService:
                 raise ConflictError(f"workload {workload.id!r} is {workload.state.value}, not pending")
             if workload.preemption_id is not None:
                 raise ConflictError("workload is reserved by an executing preemption plan")
-            if workload.spec.cell_group_count != len(members):
+            if workload.spec.placement is not PlacementMode.ELASTIC and workload.spec.cell_group_count != len(members):
                 raise ConflictError(f"workload requires {workload.spec.cell_group_count} cells, not {len(members)}")
             if any(member.generation != workload.generation for member in members):
                 raise ConflictError("lease group generation does not match the workload generation")
@@ -4640,6 +4650,16 @@ class ControlPlaneService:
                     )
                 self._require_autoscale_request_ownership(cell, workload.id)
                 cells[cell.id] = cell
+
+            if workload.spec.placement is PlacementMode.ELASTIC:
+                # An elastic pack spans however many cells its warm supply
+                # dictated; the invariant is the worker total, not a member
+                # count fixed at submission time.
+                packed = sum(cell.worker_count for cell in cells.values())
+                if packed != workload.spec.worker_count:
+                    raise ConflictError(
+                        f"elastic workload requires {workload.spec.worker_count} workers across its cells, not {packed}"
+                    )
 
             if self.scheduler is not None:
                 policy = await tx.get_policy(workload.org_id, workload.project_id)

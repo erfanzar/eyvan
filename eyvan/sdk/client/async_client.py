@@ -249,6 +249,7 @@ class AsyncEyvanClient:
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
+        atomic: bool = False,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -258,6 +259,7 @@ class AsyncEyvanClient:
             project_id=project_id,
             accelerator_type=accelerator_type,
             pods=pods,
+            atomic=atomic,
             capacity_class=capacity_class,
             execution=execution,
             name=name,

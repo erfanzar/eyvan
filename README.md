@@ -60,7 +60,8 @@ TPU config's full surface (`eyvan/sdk/client/jobs.py`):
 | field | default | meaning |
 |---|---|---|
 | `type` | — | accelerator type, e.g. `"v5p-16"`, `"v6e-8"` |
-| `pods` | `1` | workers; `>1` requests one **atomic** multi-host allocation |
+| `pods` | `1` | workers — how many slices of `type` the job asks for |
+| `atomic` | `False` | `False` (**elastic**, node-pool style): pack warm cells of the same type and provision only the deficit — going `pods` 2→4 keeps the two warm slices and asks for two more, one lease group, one hardware world per cell. `True`: one exact-shape provider resource, one hardware world spanning every pod — what single-mesh training needs |
 | `capacity_class` | `SPOT` | `SPOT` or `ON_DEMAND` |
 | `max_retries` | `DEFAULT` | retries for **lost capacity** attempts |
 | `max_preemption_retries` | `10` | restarts after the provider reclaims spot — deliberately generous; reclamation is the cheap failure |

@@ -20,6 +20,7 @@ from eyvan.domain import (
     CheckpointMode,
     CheckpointPolicy,
     IdentityScope,
+    PlacementMode,
     Quota,
     ResourceGang,
     ResourceVector,
@@ -125,11 +126,18 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
     spec = record.spec
     required_labels = {
         **spec.required_labels,
-        WORKER_COUNT_LABEL: str(spec.worker_count),
         **({"provider": spec.provider} if spec.provider else {}),
         **({"region": spec.region} if spec.region else {}),
         **({"accelerator_type": spec.accelerator_type} if spec.accelerator_type else {}),
     }
+    if spec.placement is PlacementMode.ELASTIC:
+        # The exact-shape pin, dropped: elastic workloads pack cells of any
+        # worker count up to the request, and the pin lives in the elastic path
+        # itself (``_schedule_elastic`` skips cells larger than the remaining
+        # need) instead of rejecting every warm cell on a label.
+        required_labels.pop(WORKER_COUNT_LABEL, None)
+    else:
+        required_labels[WORKER_COUNT_LABEL] = str(spec.worker_count)
     portfolio = tuple(CapacityClass.parse(entry.value) for entry in spec.capacity_class_portfolio)
     allowed_label_values: list[tuple[str, tuple[str, ...]]] = []
     # The workload's own lists come first and are narrower than any policy list
@@ -192,6 +200,7 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         cell_group_count=spec.cell_group_count,
         worker_count=spec.worker_count,
         worker_resource_scope=spec.worker_resource_scope,
+        placement=spec.placement,
     )
 
 

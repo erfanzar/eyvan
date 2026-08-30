@@ -233,6 +233,23 @@ class WorkerResourceScope(StrEnum):
     ATOMIC_CELL = "atomic_cell"
 
 
+class PlacementMode(StrEnum):
+    """How a workload's workers may be distributed over capacity cells.
+
+    ATOMIC is the exact-shape contract: one cell whose worker count equals the
+    workload's, one provider resource, one hardware world. ELASTIC is the
+    node-pool contract: workers are packed from any combination of cells of the
+    right accelerator type -- warm cells first, provisioning only the deficit --
+    and the workload runs as one lease group with one hardware world per cell.
+
+    ELASTIC requires ``WorkerResourceScope.PER_WORKER``; a legacy gang that
+    encodes a whole atomic cell has no per-worker shape to pack from.
+    """
+
+    ATOMIC = "atomic"
+    ELASTIC = "elastic"
+
+
 class CheckpointMode(StrEnum):
     """Checkpoint behavior available to a workload."""
 
@@ -451,11 +468,13 @@ class WorkloadSpec:
     cell_group_count: int = 1
     worker_count: int = 1
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL
+    placement: PlacementMode = PlacementMode.ATOMIC
 
     def __post_init__(self) -> None:
         _non_empty(self.workload_id, field_name="workload_id")
         if self.runtime is not None:
             _non_empty(self.runtime, field_name="runtime")
+        object.__setattr__(self, "placement", PlacementMode(self.placement))
         if not self.gangs:
             raise ValueError("workload must contain at least one resource gang")
         gang_ids = [gang.gang_id for gang in self.gangs]

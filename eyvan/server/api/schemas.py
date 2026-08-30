@@ -280,6 +280,10 @@ class PoolCallableSubmitRequest(ApiModel):
     project_id: str = Field(min_length=1, max_length=128)
     accelerator_type: str = Field(min_length=1, max_length=128)
     pods: int = Field(default=1, ge=1)
+    #: Require one exact-shape allocation (one hardware world spanning every
+    #: pod) instead of the default elastic packing across warm same-type cells
+    #: with only the deficit provisioned.
+    atomic: bool = False
     capacity_class: CanonicalCapacityClass = CapacityClass.SPOT
     execution: CallableExecution
     name: str | None = Field(default=None, min_length=1, max_length=200)

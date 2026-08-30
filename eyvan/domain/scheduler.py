@@ -22,6 +22,7 @@ from .models import (
     Infeasibility,
     InfeasibilityCode,
     PlacementDecision,
+    PlacementMode,
     PlacementScore,
     PreemptionActionKind,
     PreemptionPlan,
@@ -30,6 +31,7 @@ from .models import (
     Quota,
     ResourceVector,
     SchedulingResult,
+    WorkerResourceScope,
     WorkloadIdentity,
     WorkloadSpec,
 )
@@ -412,6 +414,8 @@ class Scheduler:
     ) -> PlacementDecision | PreemptionPlan | Infeasibility:
         if workload.cell_group_count > 1:
             return self._schedule_cell_group(workload, cells, accounting, quotas, budgets)
+        if workload.placement is PlacementMode.ELASTIC:
+            return self._schedule_elastic(workload, cells, accounting, quotas, budgets)
         if not cells:
             return Infeasibility(
                 workload_id=workload.workload_id,
@@ -541,6 +545,167 @@ class Scheduler:
             code=code,
             message=message,
             cells=tuple(sorted(dynamic_failures, key=lambda failure: failure.cell_id)),
+        )
+
+    def _schedule_elastic(
+        self,
+        workload: WorkloadSpec,
+        cells: dict[str, CapacityCell],
+        accounting: _LeaseAccounting,
+        quotas: dict[IdentityScope, Quota],
+        budgets: dict[IdentityScope, Budget],
+    ) -> PlacementDecision | Infeasibility:
+        """Pack one workload's workers from cells of any matching size.
+
+        The elastic answer to "pods 2 -> 4": the two warm slices are leased as
+        they are and only the deficit is provisioned, instead of rebuilding the
+        whole allocation at the new shape. Cells are taken biggest-first so a
+        packed placement spans as few hardware worlds as the warm supply
+        allows. All-or-nothing is preserved exactly as in the atomic group
+        path: nothing is leased unless the full worker count is covered, so a
+        deficit that never grants holds no warm cell hostage.
+        """
+
+        if workload.worker_resource_scope is not WorkerResourceScope.PER_WORKER:
+            return Infeasibility(
+                workload_id=workload.workload_id,
+                code=InfeasibilityCode.HARD_CONSTRAINT,
+                message=(
+                    "elastic placement requires a per-worker resource scope; "
+                    "a gang that encodes a whole atomic cell has no per-worker shape to pack"
+                ),
+            )
+        if not cells:
+            return Infeasibility(
+                workload_id=workload.workload_id,
+                code=InfeasibilityCode.NO_CELLS,
+                message="no capacity cells are registered",
+            )
+
+        per_worker = workload.total_resources
+        need = workload.worker_count
+        requested_total = per_worker.scale(need)
+        quota_failure = self._quota_infeasibility(workload, requested_total, accounting, quotas)
+        static_failures: list[CellInfeasibility] = []
+        dynamic_failures: list[CellInfeasibility] = []
+        candidates: list[tuple[CapacityCell, Decimal, Decimal, ResourceVector, PlacementScore]] = []
+
+        for cell in sorted(cells.values(), key=lambda candidate: candidate.cell_id):
+            failure = self._static_cell_failure(workload, per_worker.scale(cell.worker_count), cell,
+                                                require_worker_count_equality=False)
+            if failure is not None:
+                static_failures.append(failure)
+                continue
+            if cell.worker_count > need:
+                # A cell larger than the remaining need is not elastic supply;
+                # leasing it would bill for workers nobody asked for. It stays
+                # warm for a workload of its own shape.
+                continue
+            per_cell = per_worker.scale(cell.worker_count)
+            remaining = accounting.remaining(cell)
+            exclusive_busy = cell.exclusive_workloads and any(accounting.leases_for_cell(cell.cell_id))
+            if exclusive_busy or not per_cell.fits_within(remaining):
+                dynamic_failures.append(
+                    CellInfeasibility(
+                        cell_id=cell.cell_id,
+                        code=InfeasibilityCode.INSUFFICIENT_CAPACITY,
+                        message=(
+                            "cell permits exactly one active workload"
+                            if exclusive_busy
+                            else f"packed workers require {per_cell.as_dict()}, available {remaining.as_dict()}"
+                        ),
+                    )
+                )
+                continue
+            hourly_cost, reserved_cost, resource_hours = self._cost(workload, per_cell, cell)
+            if self._unpriced_under_hard_budget(workload, cell, budgets):
+                dynamic_failures.append(
+                    CellInfeasibility(
+                        cell_id=cell.cell_id,
+                        code=InfeasibilityCode.UNPRICED_CELL,
+                        message="cell declares no unit prices at all, so its cost is unknown",
+                    )
+                )
+                continue
+            candidates.append(
+                (
+                    cell,
+                    hourly_cost,
+                    reserved_cost,
+                    resource_hours,
+                    self._placement_score(workload, per_cell, cell, remaining, reserved_cost),
+                )
+            )
+
+        if quota_failure is not None:
+            return quota_failure
+
+        selected: list[tuple[CapacityCell, Decimal, Decimal, ResourceVector, PlacementScore]] = []
+        packed = 0
+        for candidate in sorted(candidates, key=lambda item: (-item[0].worker_count, item[4], item[0].cell_id)):
+            if candidate[0].worker_count > need - packed:
+                continue
+            selected.append(candidate)
+            packed += candidate[0].worker_count
+            if packed == need:
+                break
+
+        if packed < need:
+            if not candidates and static_failures:
+                return self._summarize_static_failures(workload, static_failures)
+            return Infeasibility(
+                workload_id=workload.workload_id,
+                code=InfeasibilityCode.INSUFFICIENT_CAPACITY,
+                message=(
+                    f"elastic placement requires {need} workers; "
+                    f"warm cells cover {packed} and no cell fits the remaining {need - packed}"
+                ),
+                cells=tuple(sorted((*static_failures, *dynamic_failures), key=lambda failure: failure.cell_id)),
+            )
+
+        total_reserved_cost = sum((candidate[2] for candidate in selected), Decimal(0))
+        total_resource_hours = ResourceVector.total(candidate[3] for candidate in selected)
+        if budgets and not self._budget_allows(
+            workload.identity,
+            total_reserved_cost,
+            total_resource_hours,
+            accounting,
+            budgets,
+        ):
+            return Infeasibility(
+                workload_id=workload.workload_id,
+                code=InfeasibilityCode.BUDGET_EXCEEDED,
+                message=f"elastic reservation cost {total_reserved_cost} exceeds an ancestor budget",
+            )
+
+        leases = tuple(
+            self._make_lease(
+                workload,
+                per_worker.scale(cell.worker_count),
+                cell,
+                hourly_cost,
+                reserved_cost,
+                resource_hours,
+            )
+            for cell, hourly_cost, reserved_cost, resource_hours, _score in selected
+        )
+        leader_score = selected[0][4]
+        score = PlacementScore(
+            preferred_cell_rank=leader_score.preferred_cell_rank,
+            preferred_label_misses=leader_score.preferred_label_misses,
+            route_priority=leader_score.route_priority,
+            capacity_class_rank=leader_score.capacity_class_rank,
+            startup_latency_seconds=leader_score.startup_latency_seconds,
+            cost_unknown=any(candidate[4].cost_unknown for candidate in selected),
+            estimated_cost=total_reserved_cost,
+            fractional_waste=sum((candidate[4].fractional_waste for candidate in selected), Decimal(0)),
+            cell_id=leader_score.cell_id,
+        )
+        return PlacementDecision(
+            workload_id=workload.workload_id,
+            lease=leases[0],
+            score=score,
+            member_leases=leases[1:],
         )
 
     def _schedule_cell_group(
@@ -689,10 +854,12 @@ class Scheduler:
         workload: WorkloadSpec,
         requested: ResourceVector,
         cell: CapacityCell,
+        *,
+        require_worker_count_equality: bool = True,
     ) -> CellInfeasibility | None:
         if not cell.enabled:
             return CellInfeasibility(cell.cell_id, InfeasibilityCode.HARD_CONSTRAINT, "cell is disabled")
-        if workload.worker_count != cell.worker_count:
+        if require_worker_count_equality and workload.worker_count != cell.worker_count:
             return CellInfeasibility(
                 cell.cell_id,
                 InfeasibilityCode.HARD_CONSTRAINT,

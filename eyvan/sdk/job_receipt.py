@@ -100,7 +100,7 @@ class JobSubmissionReceipt:
 
         destination = f" to fleet {self.fleet}" if self.fleet else ""
         resource = (f"  request  {self.resource_shape}",) if self.resource_shape else ()
-        allocation = ("  allocation  atomic",) if self.atomic else ()
+        allocation = ("  allocation  atomic",) if self.atomic else ("  allocation  elastic",)
         return (
             f"Eyvan: job {self.workload_id} submitted{destination}.",
             *resource,
@@ -198,6 +198,8 @@ class JobTerminalOutput:
             table.add_row("Request", Text(receipt.resource_shape, style="bold white"))
         if receipt.atomic:
             table.add_row("Allocation", Text("atomic", style="bold white"))
+        else:
+            table.add_row("Allocation", Text("elastic (packed, one world per cell)", style="bold white"))
         table.add_row("", Text(""))
         table.add_row("Check", Text(f"eyvan workload status {receipt.workload_id}", style="cyan"))
         table.add_row("Logs", Text(f"eyvan workload logs {receipt.workload_id}", style="cyan"))

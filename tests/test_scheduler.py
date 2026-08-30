@@ -18,6 +18,7 @@ from eyvan.domain import (
     CheckpointPolicy,
     IdentityScope,
     InfeasibilityCode,
+    PlacementMode,
     PreemptionActionKind,
     PriorityBand,
     Quota,
@@ -52,6 +53,7 @@ class _WorkloadOptions(TypedDict, total=False):
     cell_group_count: int
     worker_count: int
     worker_resource_scope: WorkerResourceScope
+    placement: PlacementMode
 
 
 class _CellOptions(TypedDict, total=False):
@@ -260,6 +262,142 @@ def test_scheduler_does_not_emit_a_partial_pod_group() -> None:
     assert result.infeasibilities[0].workload_id == "needs-three"
     assert result.infeasibilities[0].code is InfeasibilityCode.INSUFFICIENT_CAPACITY
     assert "requires 3 distinct cells" in result.infeasibilities[0].message
+
+
+def test_elastic_placement_packs_warm_cells_of_any_size() -> None:
+    """Two warm slices are leased as they are; the pods 2 -> 4 resize case."""
+
+    workload = _workload(
+        "grow",
+        resources=ResourceVector(tpu=8),
+        worker_count=4,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        placement=PlacementMode.ELASTIC,
+    )
+    cells = (
+        _cell("warm-2a", capacity=ResourceVector(tpu=16), worker_count=2),
+        _cell("warm-2b", capacity=ResourceVector(tpu=16), worker_count=2),
+    )
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.infeasibilities
+    assert len(result.placements) == 1
+    placement = result.placements[0]
+    assert [lease.cell_id for lease in placement.all_leases] == ["warm-2a", "warm-2b"]
+    assert all(lease.resources == ResourceVector(tpu=16) for lease in placement.all_leases)
+
+
+def test_elastic_placement_prefers_the_fewest_hardware_worlds() -> None:
+    workload = _workload(
+        "fewest",
+        resources=ResourceVector(tpu=8),
+        worker_count=4,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        placement=PlacementMode.ELASTIC,
+    )
+    cells = (
+        _cell("warm-2a", capacity=ResourceVector(tpu=16), worker_count=2),
+        _cell("warm-4", capacity=ResourceVector(tpu=32), worker_count=4),
+        _cell("warm-2b", capacity=ResourceVector(tpu=16), worker_count=2),
+    )
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.infeasibilities
+    placement = result.placements[0]
+    assert [lease.cell_id for lease in placement.all_leases] == ["warm-4"]
+
+
+def test_elastic_placement_never_leases_a_partial_pack() -> None:
+    workload = _workload(
+        "needs-four",
+        resources=ResourceVector(tpu=8),
+        worker_count=4,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        placement=PlacementMode.ELASTIC,
+    )
+    cells = (_cell("warm-2", capacity=ResourceVector(tpu=16), worker_count=2),)
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.placements
+    failure = result.infeasibilities[0]
+    assert failure.code is InfeasibilityCode.INSUFFICIENT_CAPACITY
+    assert "warm cells cover 2" in failure.message
+
+
+def test_elastic_placement_skips_cells_larger_than_the_need() -> None:
+    """A warm cell bigger than the request is not elastic supply."""
+
+    workload = _workload(
+        "needs-two",
+        resources=ResourceVector(tpu=8),
+        worker_count=2,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        placement=PlacementMode.ELASTIC,
+    )
+    cells = (
+        _cell("warm-4", capacity=ResourceVector(tpu=32), worker_count=4),
+        _cell("warm-2", capacity=ResourceVector(tpu=16), worker_count=2),
+    )
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.infeasibilities
+    placement = result.placements[0]
+    assert [lease.cell_id for lease in placement.all_leases] == ["warm-2"]
+
+
+def test_elastic_placement_requires_a_per_worker_resource_scope() -> None:
+    workload = _workload(
+        "legacy-gang",
+        resources=ResourceVector(tpu=32),
+        worker_count=4,
+        worker_resource_scope=WorkerResourceScope.ATOMIC_CELL,
+        placement=PlacementMode.ELASTIC,
+    )
+    cells = (_cell("warm-4", capacity=ResourceVector(tpu=32), worker_count=4),)
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.placements
+    assert result.infeasibilities[0].code is InfeasibilityCode.HARD_CONSTRAINT
+
+
+def test_elastic_placement_still_enforces_runtime_constraints() -> None:
+    workload = _workload(
+        "runtime-pinned",
+        resources=ResourceVector(tpu=8),
+        worker_count=2,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+        placement=PlacementMode.ELASTIC,
+        runtime="native",
+    )
+    cells = (_cell("warm-2", capacity=ResourceVector(tpu=16), worker_count=2),)
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.placements
+    assert result.infeasibilities[0].code is InfeasibilityCode.RUNTIME_UNSUPPORTED
+
+
+def test_atomic_placement_still_requires_an_exact_worker_count_match() -> None:
+    workload = _workload(
+        "atomic-four",
+        resources=ResourceVector(tpu=32),
+        worker_count=4,
+        worker_resource_scope=WorkerResourceScope.PER_WORKER,
+    )
+    cells = (
+        _cell("warm-2a", capacity=ResourceVector(tpu=16), worker_count=2),
+        _cell("warm-2b", capacity=ResourceVector(tpu=16), worker_count=2),
+    )
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert not result.placements
+    assert result.infeasibilities[0].code is InfeasibilityCode.HARD_CONSTRAINT
 
 
 def test_scheduler_fences_capacity_reserved_for_another_autoscale_request() -> None:

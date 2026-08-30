@@ -24,6 +24,7 @@ from eyvan.records import (
     RoleGrant,
     WorkerResourceScope,
     WorkloadDefinition,
+    WorkloadState,
 )
 from eyvan.server.controller import EyvanController
 from eyvan.server.persistence import InMemoryRepository
@@ -686,6 +687,9 @@ async def test_multislice_demand_drains_warm_singletons_before_atomic_replacemen
         project_id="research",
         accelerator_type="v5p-16",
         pods=2,
+        # This suite pins the exact-shape (atomic) drain and reclaim paths;
+        # the elastic default would pack the warm cells instead.
+        atomic=True,
         execution=CallableExecution(
             artifact_uri="gs://artifacts/callables/train.pkl",
             sha256="a" * 64,
@@ -708,6 +712,108 @@ async def test_multislice_demand_drains_warm_singletons_before_atomic_replacemen
     live = [cell for cell in cells if cell.state is not CellState.DELETED]
     assert sorted(cell.worker_count for cell in live) == [1, 1, 2]
     assert sum(cell.worker_count for cell in live) == pool.max_cells
+
+
+@pytest.mark.asyncio
+async def test_elastic_resize_reuses_warm_slices_and_provisions_only_the_deficit() -> None:
+    """The pods 2 -> 4 resize, end to end: keep the two, ask for two more."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    controller = EyvanController(repository, service)
+    pool = multislice_tpu_pool(max_workers=8)
+    await service.apply_fleet(fleet_admin(), "research", (pool,), idempotency_key="fleet-v1")
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            pool.make_cell("warm-v5p-group", worker_count=2).model_copy(update={"state": CellState.READY})
+        )
+    workload, _ = await service.submit_pool_callable(
+        operator(),
+        fleet_name="research",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-16",
+        pods=4,
+        execution=CallableExecution(
+            artifact_uri="gs://artifacts/callables/train.pkl",
+            sha256="a" * 64,
+            python="3.13",
+        ),
+        idempotency_key="grow-two-to-four",
+    )
+
+    assert await controller.reconcile_capacity_pools_once() == {"launched": 1, "drained": 0, "deleted": 0}
+    async with repository.transaction() as transaction:
+        cells = await transaction.list_cells()
+    assert sorted(cell.worker_count for cell in cells) == [2, 2]
+    assert any(cell.id == "warm-v5p-group" and cell.state is CellState.READY for cell in cells)
+
+    # All-or-nothing: while the deficit is still provisioning, the warm cell
+    # is not leased hostage to an allocation that does not exist yet.
+    await controller.reconcile_once()
+    async with repository.transaction() as transaction:
+        record = await transaction.get_workload(workload.id)
+        assert record is not None and record.state is WorkloadState.PENDING
+
+    async with repository.transaction() as transaction:
+        for cell in await transaction.list_cells():
+            if cell.state is not CellState.READY:
+                await transaction.put_cell(cell.model_copy(update={"state": CellState.READY}))
+
+    await controller.reconcile_once()
+    async with repository.transaction() as transaction:
+        record = await transaction.get_workload(workload.id)
+        assert record is not None
+        assert record.state is WorkloadState.LEASED
+        leases = [lease for lease in await transaction.list_leases() if lease.workload_id == workload.id]
+    assert len(leases) == 2
+    assert {lease.cell_id for lease in leases} == {cell.id for cell in cells}
+
+
+@pytest.mark.asyncio
+async def test_an_atomic_launch_drains_a_leftover_smaller_cell_nothing_else_demands() -> None:
+    """The other half of the resize: atomic mode rebuilds, so the old shape leaves now."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    controller = EyvanController(repository, service)
+    pool = multislice_tpu_pool(max_workers=8)
+    await service.apply_fleet(fleet_admin(), "research", (pool,), idempotency_key="fleet-v1")
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            pool.make_cell("leftover-v5p-group", worker_count=2).model_copy(update={"state": CellState.READY})
+        )
+    await service.submit_pool_callable(
+        operator(),
+        fleet_name="research",
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v5p-16",
+        pods=4,
+        atomic=True,
+        execution=CallableExecution(
+            artifact_uri="gs://artifacts/callables/train.pkl",
+            sha256="a" * 64,
+            python="3.13",
+        ),
+        idempotency_key="atomic-four",
+    )
+
+    assert await controller.reconcile_capacity_pools_once() == {"launched": 1, "drained": 1, "deleted": 0}
+    async with repository.transaction() as transaction:
+        cells = await transaction.list_cells()
+    leftover = next(cell for cell in cells if cell.id == "leftover-v5p-group")
+    assert leftover.state is CellState.DRAINING
+    launched = next(cell for cell in cells if cell.id != "leftover-v5p-group")
+    assert launched.worker_count == 4
 
 
 @pytest.mark.asyncio
@@ -842,6 +948,8 @@ async def test_quota_full_warm_floor_is_reclaimed_for_exact_multislice_shape() -
         project_id="research",
         accelerator_type="v5p-16",
         pods=2,
+        # Pins the exact-shape reclaim path this test exists for.
+        atomic=True,
         execution=CallableExecution(
             artifact_uri="gs://artifacts/callables/train.pkl",
             sha256="a" * 64,

@@ -21,7 +21,7 @@ from eyvan.capacity import (
     QUEUED_CAPACITY_STATUSES,
 )
 from eyvan.domain import SchedulingResult
-from eyvan.domain.models import PriorityBand
+from eyvan.domain.models import PlacementMode, PriorityBand
 from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
@@ -639,6 +639,31 @@ class CapacitySimulation:
                 pool_cooling=pool_cooling,
                 pool_consecutive_failures=pool_consecutive_failures,
             )
+            if workload.spec.placement is PlacementMode.ELASTIC:
+                # Pack warm free cells of any worker count first -- the same
+                # biggest-first order ``Scheduler._schedule_elastic`` packs with,
+                # so what the simulation counts as covered is what the scheduler
+                # can actually lease -- and ask for only the deficit as one new
+                # cell. The resize case this answers: a pods-4 workload with two
+                # warm slices provisioned two, not four.
+                packed = cls._consume_elastic_warm_supply(
+                    workload,
+                    candidates,
+                    free_owned_exact_supply=free_owned_exact_supply,
+                    free_shared_exact_supply=free_shared_exact_supply,
+                )
+                deficit = workload.spec.worker_count - packed
+                if deficit == 0:
+                    continue
+                if deficit > 1 and not exact_pool.hosts_multi_worker_cells:
+                    continue
+                cell_id = stable_id("virtual_cell", exact_pool.id, workload.id, "elastic")
+                pool_by_cell_id[cell_id] = exact_pool.id
+                virtual_worker_count_by_cell_id[cell_id] = deficit
+                scheduler_cells.append(
+                    exact_pool.make_cell(cell_id, worker_count=deficit).model_copy(update={"state": CellState.READY})
+                )
+                continue
             if workload.spec.worker_count > 1 and not exact_pool.hosts_multi_worker_cells:
                 # The same guard the generic branch below has always had, and for a
                 # stronger reason here: this branch calls ``make_cell`` on a pool the
@@ -694,6 +719,49 @@ class CapacitySimulation:
             virtual_worker_count_by_cell_id=virtual_worker_count_by_cell_id,
             acquisition_exhausted_workload_ids=frozenset(acquisition_exhausted_workload_ids),
         )
+
+    @staticmethod
+    def _consume_elastic_warm_supply(
+        workload: WorkloadRecord,
+        candidate_pools: list[CapacityPoolRecord],
+        *,
+        free_owned_exact_supply: Counter[tuple[str, int, str]],
+        free_shared_exact_supply: Counter[tuple[str, int]],
+    ) -> int:
+        """Reserve warm free cells toward the workload's worker count.
+
+        Own-owned supply is preferred over shared at the same size: a cell this
+        workload's earlier attempt already provisioned is the cheapest warm
+        capacity it will ever see. Mirrors ``Scheduler._schedule_elastic``'s
+        biggest-first order so the two never disagree about what is covered.
+        """
+
+        need = workload.spec.worker_count
+        pool_ids = {pool.id for pool in candidate_pools}
+        entries: list[tuple[int, int, str, int]] = []
+        for (pool_id, worker_count), count in free_shared_exact_supply.items():
+            if pool_id in pool_ids:
+                entries.extend((-worker_count, 1, pool_id, worker_count) for _ in range(count))
+        for (pool_id, worker_count, owner), count in free_owned_exact_supply.items():
+            if pool_id in pool_ids and owner == workload.id:
+                entries.extend((-worker_count, 0, pool_id, worker_count) for _ in range(count))
+        entries.sort()
+        packed = 0
+        for _negated, ownership, pool_id, worker_count in entries:
+            if packed >= need or need - packed < worker_count:
+                continue
+            if ownership == 0:
+                key = (pool_id, worker_count, workload.id)
+                if not free_owned_exact_supply[key]:
+                    continue
+                free_owned_exact_supply[key] -= 1
+            else:
+                key = (pool_id, worker_count)
+                if not free_shared_exact_supply[key]:
+                    continue
+                free_shared_exact_supply[key] -= 1
+            packed += worker_count
+        return packed
 
     def demand(
         self,

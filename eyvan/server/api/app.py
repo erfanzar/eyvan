@@ -2544,6 +2544,7 @@ def create_app(
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
             dependencies=request.dependencies,
+            atomic=request.atomic,
             idempotency_key=idempotency_key,
         )
         if replayed:

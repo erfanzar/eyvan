@@ -173,6 +173,7 @@ def test_sync_sdk_submits_callable_by_accelerator_type() -> None:
         "project_id": "research",
         "accelerator_type": "v5p-512",
         "pods": 1,
+        "atomic": False,
         "capacity_class": "spot",
         "execution": execution.model_dump(mode="json"),
         "name": None,

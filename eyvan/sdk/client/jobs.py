@@ -151,6 +151,15 @@ class TpuConfig:
     #: pickled function's imports resolve against them -- which is the point:
     #: adding one library should not mean rebuilding an image.
     dependencies: tuple[str, ...] = ()
+    #: Require one exact-shape allocation -- one provider resource, one hardware
+    #: world spanning every pod -- instead of the default elastic packing. The
+    #: default reuses warm slices of the same accelerator type and provisions
+    #: only the deficit, which is the node-pool behaviour; a job whose math
+    #: needs the whole allocation in one JAX world (single-mesh training, an
+    #: all-reduce across every chip) must say ``atomic=True``. Elastic workloads
+    #: run as one lease group with one hardware world per cell, and the job's
+    #: receipt states the packing it got.
+    atomic: bool = False
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)

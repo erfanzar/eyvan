@@ -287,7 +287,7 @@ def test_decorator_lazily_uses_active_context_and_managed_artifacts(tmp_path, mo
     assert capsys.readouterr().err.splitlines() == [
         "Eyvan: job wl-managed-sdk submitted to fleet research.",
         "  request  v5p-512 x 1 worker",
-        "  allocation  atomic",
+        "  allocation  elastic",
         "  this job keeps running if this client exits.",
         "  status  eyvan workload status wl-managed-sdk",
         "  logs    eyvan workload logs wl-managed-sdk",

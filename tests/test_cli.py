@@ -2166,6 +2166,7 @@ def test_run_prints_durable_job_controls_without_changing_json_stdout(monkeypatc
     assert json.loads(result.stdout)["id"] == "wl-cli-run"
     assert result.stderr.splitlines() == [
         "Eyvan: job wl-cli-run submitted to fleet dev-fleet.",
+        "  allocation  elastic",
         "  this job keeps running if this client exits.",
         "  status  eyvan workload status wl-cli-run",
         "  logs    eyvan workload logs wl-cli-run",

@@ -581,10 +581,14 @@ def test_the_pool_schemas_carry_every_field_a_submitter_owns() -> None:
     from eyvan.server.api.schemas import PoolCallableSubmitRequest, PoolWorkloadSubmitRequest
 
     owned = set(WorkloadDefinition.model_fields) - _PLANE_OWNED - _POOL_DERIVED
-    assert not owned - set(PoolWorkloadSubmitRequest.model_fields)
+    # `placement` is the spec's spelling of what both submit paths expose as
+    # `atomic` (bool): elastic packing by default, exact-shape when true. The
+    # names differ so the SDK surface stays one boolean; this exemption is the
+    # claim that they are the same knob.
+    assert not owned - set(PoolWorkloadSubmitRequest.model_fields) - {"placement"}
     # A callable ships its working tree inside CallableExecution rather than as a
     # separate ref, so `workspace` is the one field this path legitimately lacks.
-    assert not owned - set(PoolCallableSubmitRequest.model_fields) - {"workspace"}
+    assert not owned - set(PoolCallableSubmitRequest.model_fields) - {"workspace", "placement"}
 
 
 def test_the_run_command_reaches_every_pool_field_the_schema_gained(monkeypatch: pytest.MonkeyPatch) -> None:

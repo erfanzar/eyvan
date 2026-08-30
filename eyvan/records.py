@@ -29,7 +29,7 @@ from eyvan.capacity.drivers.base import (
     providers_hosting_multi_worker_cells,
 )
 from eyvan.domain import costing
-from eyvan.domain.models import InfeasibilityCode, WorkerResourceScope
+from eyvan.domain.models import InfeasibilityCode, PlacementMode, WorkerResourceScope
 from eyvan.identity.rotation import CredentialRotationState
 from eyvan.secrets import validate_secret_reference
 from eyvan.worker.distributed_environment import (
@@ -1027,6 +1027,19 @@ class WorkloadDefinition(EyvanModel):
     cell_group_count: int = Field(default=1, ge=1, le=10_000)
     worker_count: int = Field(default=1, ge=1, le=10_000, strict=True)
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL
+    #: How the workers may be distributed: one exact-shape cell (atomic) or
+    #: packed from any combination of same-type cells, warm first, provisioning
+    #: only the deficit (elastic). Elastic workloads run as one lease group with
+    #: one hardware world per cell, and require ``per_worker`` scope.
+    placement: PlacementMode = PlacementMode.ATOMIC
+
+    @model_validator(mode="after")
+    def validate_placement(self) -> WorkloadDefinition:
+        if self.placement is PlacementMode.ELASTIC and self.worker_resource_scope is not WorkerResourceScope.PER_WORKER:
+            raise ValueError("elastic placement requires worker_resource_scope=per_worker")
+        if self.placement is PlacementMode.ELASTIC and self.cell_group_count != 1:
+            raise ValueError("elastic placement and explicit cell groups are mutually exclusive")
+        return self
 
     @model_validator(mode="after")
     def validate_checkpoint(self) -> WorkloadDefinition:
