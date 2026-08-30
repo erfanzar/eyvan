@@ -196,6 +196,17 @@ class AutoscaleDefaults:
     #: not ship cannot use the image's preinstalled JAX and libtpu, so the fleet
     #: brings its own.
     runtime_init_commands: tuple[str, ...] = ()
+    #: A default OCI image reference, ideally an immutable digest, emitted as
+    #: the ``container`` block of every generated fleet. One line here is how an
+    #: organisation pins one blessed runtime image for every zone anyone will
+    #: ever generate -- "the A1 image" -- instead of hand-authoring OCI fleet
+    #: YAML per zone. Pair it with ``runtime_init_commands`` that make the host
+    #: container-ready (docker installed, ``gcloud auth configure-docker`` for
+    #: the image's registry host); the generator states the image, not the host
+    #: preparation, because pretending to derive shell that depends on the
+    #: image's registry would hide the one command an operator must own. Left
+    #: unset, generated fleets keep the venv model exactly as before.
+    runtime_container_image: str | None = None
     min_workers: int = 0
     max_workers: int = 0
 
@@ -204,6 +215,9 @@ class AutoscaleDefaults:
         fleet_prefix = _optional_trimmed(self.fleet_prefix, "fleet_prefix")
         bootstrap_egress = _optional_trimmed(self.bootstrap_egress, "bootstrap_egress")
         object.__setattr__(self, "runtime_python", _optional_trimmed(self.runtime_python, "runtime_python"))
+        object.__setattr__(
+            self, "runtime_container_image", _optional_trimmed(self.runtime_container_image, "runtime_container_image")
+        )
         if fleet_prefix is None:
             raise ValueError("fleet_prefix must be a non-empty trimmed string")
         if bootstrap_egress is None:
@@ -259,6 +273,11 @@ class AutoscaleDefaults:
             "max_workers": self.max_workers,
             **({} if self.runtime_python is None else {"runtime_python": self.runtime_python}),
             **({} if not self.runtime_init_commands else {"runtime_init_commands": list(self.runtime_init_commands)}),
+            **(
+                {}
+                if self.runtime_container_image is None
+                else {"runtime_container_image": self.runtime_container_image}
+            ),
         }
 
     @classmethod
@@ -280,6 +299,7 @@ class AutoscaleDefaults:
             "max_workers",
             "runtime_python",
             "runtime_init_commands",
+            "runtime_container_image",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -295,6 +315,9 @@ class AutoscaleDefaults:
         min_workers = _document_integer(value.get("min_workers", 0), "min_workers")
         max_workers = _document_integer(value.get("max_workers", 0), "max_workers")
         runtime_python = _document_optional_string(value.get("runtime_python"), "runtime_python")
+        runtime_container_image = _document_optional_string(
+            value.get("runtime_container_image"), "runtime_container_image"
+        )
         raw_commands = value.get("runtime_init_commands", [])
         if not isinstance(raw_commands, list) or any(not isinstance(item, str) for item in raw_commands):
             raise ValueError("runtime_init_commands must be a list of shell strings")
@@ -306,6 +329,7 @@ class AutoscaleDefaults:
             max_workers=max_workers,
             runtime_python=runtime_python,
             runtime_init_commands=tuple(raw_commands),
+            runtime_container_image=runtime_container_image,
         )
 
 
@@ -467,6 +491,11 @@ class AutoscaleRequest:
     #: behaviour is unchanged and the mismatch is discovered on the accelerator.
     runtime_python: str | None = None
     runtime_init_commands: tuple[str, ...] = ()
+    #: Default OCI image for the generated fleet's ``container`` block, when the
+    #: operator's profile pins one blessed runtime image for every zone. The
+    #: host-side preparation (docker, registry auth) stays in
+    #: ``runtime_init_commands`` where the operator owns it.
+    runtime_container_image: str | None = None
 
     def __post_init__(self) -> None:
         validate_gcp_project_id(self.project)
@@ -512,6 +541,11 @@ class AutoscaleZoneRequest:
     #: behaviour is unchanged and the mismatch is discovered on the accelerator.
     runtime_python: str | None = None
     runtime_init_commands: tuple[str, ...] = ()
+    #: Default OCI image for the generated fleet's ``container`` block, when the
+    #: operator's profile pins one blessed runtime image for every zone. The
+    #: host-side preparation (docker, registry auth) stays in
+    #: ``runtime_init_commands`` where the operator owns it.
+    runtime_container_image: str | None = None
 
     def __post_init__(self) -> None:
         validate_gcp_project_id(self.project)

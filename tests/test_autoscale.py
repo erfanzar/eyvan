@@ -401,6 +401,59 @@ def test_defaults_round_trip_as_owner_only_yaml(tmp_path) -> None:
     assert "agent_endpoint:" not in path.read_text(encoding="utf-8")
 
 
+def test_a_default_container_image_round_trips_and_reaches_every_generated_fleet() -> None:
+    """One blessed image in the operator profile becomes every fleet's container.
+
+    An organisation pins its runtime image once -- ``runtime_container_image``
+    in the defaults YAML -- and any zone anyone generates afterwards declares
+    it as the fleet container, with the launch requirements native OCI TPU
+    workloads actually need (privileged, workload working dir, digest-style
+    pull policy). A profile that pins no image keeps the venv model: the
+    generated document carries no container block at all, so the fleet behaves
+    exactly as it did before the field existed.
+    """
+
+    defaults = AutoscaleDefaults(
+        project="project-a",
+        fleet_prefix="research",
+        runtime_python="3.13",
+        runtime_container_image="us-east5-docker.pkg.dev/project-a/eyvan/runtime@sha256:" + "0" * 64,
+    )
+    document = defaults.as_document()
+    assert document["runtime_container_image"] == defaults.runtime_container_image
+    assert AutoscaleDefaults.from_document(document) == defaults
+
+    request = AutoscaleRequest(
+        project="project-a",
+        zone="us-east5-a",
+        profile=DEFAULT_TPU_PROFILES[0],
+        fleet_prefix="research",
+        runtime_python="3.13",
+        runtime_container_image=defaults.runtime_container_image,
+    )
+    generated = generate_autoscale_config(request)
+    runtime = _json_object(generated.document["runtime"])
+    assert runtime["container"] == {
+        "image": defaults.runtime_container_image,
+        "pull_policy": "if-not-present",
+        "working_dir": "/var/lib/eyvan/workload",
+        "privileged": True,
+    }
+    assert generated.config.runtime.container is not None
+    assert generated.config.runtime.container.privileged is True
+
+    without_image = generate_autoscale_config(
+        AutoscaleRequest(
+            project="project-a",
+            zone="us-east5-a",
+            profile=DEFAULT_TPU_PROFILES[0],
+            fleet_prefix="research",
+            runtime_python="3.13",
+        )
+    )
+    assert "container" not in _json_object(without_image.document.get("runtime", {}))
+
+
 def test_defaults_accepts_and_drops_legacy_control_plane_fields(tmp_path) -> None:
     cache = AutoscaleConfigCache(tmp_path / "autoscale")
     cache.defaults_path.parent.mkdir(parents=True)

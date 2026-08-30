@@ -26,19 +26,22 @@ the config surface.
 | `EYVAN_CAPACITY_BACKEND` / `EYVAN_EXECUTION_BACKEND` | which capacity/execution implementations the plane runs |
 | `EYVAN_FLEET_STATE_URI` | where fleet state lives (e.g. the GCS fleet-state object) |
 | `EYVAN_ARTIFACT_STORE_URI` | artifact store root |
-| `EYVAN_AWS_*`, `EYVAN_AZURE_*` | provider credentials, scoped to the process talking to that cloud |
+| `EYVAN_AWS_ACCESS_KEY_ID`, `EYVAN_AWS_REGION`, `EYVAN_AWS_SECRET_ACCESS_KEY`, `EYVAN_AWS_SESSION_TOKEN` | AWS provider credentials |
+| `EYVAN_AZURE_ACCESS_TOKEN`, `EYVAN_AZURE_LOCATION`, `EYVAN_AZURE_RESOURCE_GROUP`, `EYVAN_AZURE_SUBSCRIPTION_ID` | Azure provider credentials |
 
 ## Capacity, cells, and dispatch
 
 `EYVAN_CAPACITY_RACE_WIDTH`, `EYVAN_CAPACITY_SUPPORTS_EXEC`,
 `EYVAN_CELL_RECONCILE_INTERVAL_S`, `EYVAN_CELL_RECONCILE_CONCURRENCY`,
-`EYVAN_CELL_BILLING_INTERVAL_S`, `EYVAN_CELL_STAGE_*` (dir, budget bytes,
-eviction policy/enablement, interval, max attempts/bytes, sources),
-`EYVAN_MAX_EXPANSION_CHILDREN`, `EYVAN_EXPANSION_WAVE_SIZE`,
-`EYVAN_ATOMIC_GROUP_PLACEMENT`, `EYVAN_HOST_REPLACEMENT_*`,
-`EYVAN_PREEMPTION_*`-adjacent controller knobs — reconcile cadence, staging
-limits, and how aggressively the planner fans out. Defaults in
-`eyvan/config.py`.
+`EYVAN_CELL_BILLING_INTERVAL_S`, `EYVAN_CELL_STAGE_BUDGET_BYTES`,
+`EYVAN_CELL_STAGE_DIR`, `EYVAN_CELL_STAGE_EVICTION_ENABLED`,
+`EYVAN_CELL_STAGE_EVICTION_POLICY`, `EYVAN_CELL_STAGE_INTERVAL_S`,
+`EYVAN_CELL_STAGE_MAX_ATTEMPTS`, `EYVAN_CELL_STAGE_MAX_BYTES`,
+`EYVAN_CELL_STAGE_SOURCES`, `EYVAN_MAX_EXPANSION_CHILDREN`,
+`EYVAN_EXPANSION_WAVE_SIZE`, `EYVAN_ATOMIC_GROUP_PLACEMENT`,
+`EYVAN_HOST_REPLACEMENT_BUDGET`, `EYVAN_HOST_REPLACEMENT_WINDOW_S`,
+`EYVAN_PREEMPTION_STOP_GRACE_S` — reconcile cadence, staging limits, and how
+aggressively the planner fans out. Defaults in `eyvan/config.py`.
 
 ## Gang (multi-host) initialization
 
@@ -48,20 +51,27 @@ one allocation across several hosts.
 
 ## Artifacts and retention
 
-`EYVAN_ARTIFACT_*` (`COLLECTION_INTERVAL_S`,
-`DESTRUCTIVE_COLLECTION_ENABLED`, `MAX_CALLABLE/RESULT/WORKSPACE_BYTES`,
-`RECOVERY_GRACE_S`, `RETENTION_S`, `TOKEN_TTL_S`), plus
-`EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP` — size caps, retention windows, the
-insecure-HTTP escape hatch (development), and the destructive-collection
-kill switch (off by default; see [artifact-safety](artifact-safety.md)).
+`EYVAN_ARTIFACT_COLLECTION_INTERVAL_S`,
+`EYVAN_ARTIFACT_DESTRUCTIVE_COLLECTION_ENABLED`,
+`EYVAN_ARTIFACT_MAX_CALLABLE_BYTES`, `EYVAN_ARTIFACT_MAX_RESULT_BYTES`,
+`EYVAN_ARTIFACT_MAX_WORKSPACE_BYTES`, `EYVAN_ARTIFACT_RECOVERY_GRACE_S`,
+`EYVAN_ARTIFACT_RETENTION_S`, `EYVAN_ARTIFACT_TOKEN_TTL_S`,
+`EYVAN_ARTIFACT_URI`, and `EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP` — size caps,
+retention windows, the insecure-HTTP escape hatch (development), and the
+destructive-collection kill switch (off by default; see
+[artifact-safety](artifact-safety.md)).
 
 ## Controller and service
 
 `EYVAN_CONTROLLER_ENABLED`, `EYVAN_AUTO_CREATE_SCHEMA`,
 `EYVAN_AUDIT_RETENTION_S`, `EYVAN_IDEMPOTENCY_RETENTION_S`,
 `EYVAN_GRANT_EXPIRY_INTERVAL_S`, `EYVAN_CHECKPOINT_GRACE_S`,
-`EYVAN_CREDENTIAL_ROTATION_OVERLAP_S`, `EYVAN_PROVIDER_METADATA_*`,
-`EYVAN_MUTUAL_TLS_*` (mode, client enablement, trust bundle, cert, key).
+`EYVAN_CREDENTIAL_ROTATION_OVERLAP_S`,
+`EYVAN_PROVIDER_METADATA_IDENTITY_ENABLED`,
+`EYVAN_PROVIDER_METADATA_IDENTITY_TIMEOUT_S`,
+`EYVAN_MUTUAL_TLS_MODE`, `EYVAN_MUTUAL_TLS_CLIENT_ENABLED`,
+`EYVAN_MUTUAL_TLS_TRUST_BUNDLE`, `EYVAN_MUTUAL_TLS_CERTIFICATE`,
+`EYVAN_MUTUAL_TLS_PRIVATE_KEY`.
 
 ## Reading it in code
 

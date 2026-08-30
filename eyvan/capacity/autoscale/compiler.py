@@ -56,6 +56,7 @@ def _fleet_document(
     pools: JsonObject,
     runtime_python: str | None = None,
     runtime_init_commands: tuple[str, ...] = (),
+    runtime_container_image: str | None = None,
 ) -> JsonObject:
     """Return the common public fleet envelope shared by profile and zone forms.
 
@@ -64,6 +65,14 @@ def _fleet_document(
     check reads this field -- omitting it entirely keeps a fleet that declares
     nothing behaving exactly as it did, discovering the mismatch on the
     accelerator instead.
+
+    ``runtime_container_image`` is likewise emitted only when declared: one
+    image pinned in the operator profile becomes every generated fleet's
+    container, and an unset profile keeps the venv model. The generator states
+    the image but never the host preparation around it -- docker and registry
+    auth belong to the operator's ``runtime_init_commands``, where the one
+    command that must match the image's registry stays visible instead of
+    derived.
     """
 
     provider: JsonObject = {
@@ -84,6 +93,15 @@ def _fleet_document(
         runtime["python"] = runtime_python
     if runtime_init_commands:
         runtime["init_commands"] = list(runtime_init_commands)
+    if runtime_container_image is not None:
+        runtime["container"] = {
+            "image": runtime_container_image,
+            "pull_policy": "if-not-present",
+            "working_dir": "/var/lib/eyvan/workload",
+            # Native OCI TPU jobs reject launch unprivileged, and a default
+            # image exists to run real work: the generated fleet states it.
+            "privileged": True,
+        }
     if runtime:
         document["runtime"] = runtime
     return document
@@ -145,6 +163,7 @@ def generate_autoscale_config(
         pools=pools,
         runtime_python=request.runtime_python,
         runtime_init_commands=request.runtime_init_commands,
+        runtime_container_image=request.runtime_container_image,
     )
     return GeneratedAutoscaleConfig(
         config=validate_generated_fleet(document),
@@ -259,6 +278,7 @@ def generate_zone_autoscale_config(
                     bootstrap_egress=request.bootstrap_egress,
                     runtime_python=request.runtime_python,
                     runtime_init_commands=request.runtime_init_commands,
+                    runtime_container_image=request.runtime_container_image,
                 ),
                 quota=profile_quota,
             )
@@ -285,6 +305,7 @@ def generate_zone_autoscale_config(
         pools=pools,
         runtime_python=request.runtime_python,
         runtime_init_commands=request.runtime_init_commands,
+        runtime_container_image=request.runtime_container_image,
     )
     return GeneratedZoneAutoscaleConfig(
         config=validate_generated_fleet(document),

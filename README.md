@@ -44,10 +44,13 @@ init(address=None, /, *, fleet=None, org_id=None, project_id=None,
 ```
 
 With no arguments the SDK discovers the plane the CLI uses (`eyvan start`
-shows you what exists: a local plane, or heads in your project). `fleet=`
-sets the default fleet for submissions; everything else is scope
-(`org_id`, `project_id`) and where artifacts go (a `gs://`/`s3://` root or
-your own `ArtifactStore` implementation).
+shows you what exists: a local plane, or heads in your project). Point it at
+an explicit plane by address — `eyvan.init("http://10.0.0.5:8080")` — or
+bind a default fleet with `eyvan.init(fleet="research-us-central1-a")`.
+Everything else is scope (`org_id`, `project_id`), where artifacts go (a
+`gs://`/`s3://` root or your own `ArtifactStore` implementation), and
+fleet-state location (`EYVAN_FLEET_STATE_URI`) when agents own distinct
+capacity boundaries.
 
 ### The shape: `TpuConfig`, `GpuConfig`, `CpuConfig`
 
@@ -101,6 +104,10 @@ imports resolve on the cell (image packages + `dependencies` + whatever
 by content digest — resubmitting the same function is cheap, and concurrent
 identical submissions are safe (the 2026-08-29 zone race pinned this; see
 [artifact-safety](docs/artifact-safety.md)).
+
+One more client-side knob worth knowing: the returned job exposes its
+transport (`.base_url`) so tooling built on the SDK can follow the same
+plane the SDK followed, without re-deriving discovery.
 
 Failure narration is part of the API contract: a refused capacity attempt
 renders as `blocked | … | the plane is retrying (attempt N)` with the
@@ -180,10 +187,18 @@ memory:
 
 ## Where it runs
 
-- **Laptop:** `eyvan up` on the loopback path, a `laptop-cpu` fleet, no cloud.
-- **GCP:** generated per-zone fleets (`research-<zone>`) driving TPU queued
-  resources, spot or on-demand, under `~/.eyvan/autoscale/configs/`.
-- Other clouds exist as capacity providers; see [providers](docs/providers.md).
+Registered capacity backends: `local` (loopback laptop fleets), `gcp-tpu`
+(generated zone fleets driving TPU queued resources, spot or on-demand),
+`gcp-compute`, the `gcp` umbrella, `aws-ec2` (the worked provider example)
+and the `aws` umbrella, `azure-vm` and the `azure` umbrella, `kubernetes`
+(`k8s`) against a real API server, `manual`, and `onprem-ssh`.
+
+Breadth and qualification are different axes. Kubernetes runs on any
+conformant cluster but its evidence is one GKE run (P7); the on-premises
+path is code with no run against a real SSH host yet; GCP TPU is the
+substrate with the deepest receipts. A reader deciding where to deploy
+needs both facts per backend, not the flattering one — see
+[proofs](docs/proofs.md) for what is actually established where.
 
 ## The docs map
 
@@ -192,6 +207,7 @@ memory:
 | [eyvan-explained](docs/eyvan-explained.md) | the mental model, one workload's full journey |
 | [install](docs/install.md) | laptop path, the fifteen, GCP head, secrets |
 | [operate](docs/operate.md) | the runbook: fleets, workloads, capacity, zone racing |
+| [runtimes](docs/runtimes.md) | the two provisioning models, the defaults profile, custom images |
 | [proofs](docs/proofs.md) | what is proven, with receipts; known rough edges |
 | [providers](docs/providers.md) | writing a capacity provider; the conformance contract |
 | [security](docs/security.md) | trust boundaries, tokens, what jobs can do |

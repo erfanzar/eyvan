@@ -75,6 +75,11 @@ secrets; binding wider is refused at startup until
 `EYVAN_REPOSITORY_BACKEND=postgres`, `EYVAN_METRICS_TOKEN`, and
 `EYVAN_ARTIFACT_TOKEN_KEY` are set (`eyvan doctor --server-host 0.0.0.0`
 enumerates the refusals before you start). Mutual-TLS modes exist for the
-service boundary (`EYVAN_MUTUAL_TLS_*`); provider credentials
-(`EYVAN_AWS_*`, `EYVAN_AZURE_*`, gcloud's own) stay scoped to the agent or
-plane process that talks to that cloud.
+service boundary (`EYVAN_MUTUAL_TLS_MODE`,
+`EYVAN_MUTUAL_TLS_CLIENT_ENABLED`, `EYVAN_MUTUAL_TLS_TRUST_BUNDLE`,
+`EYVAN_MUTUAL_TLS_CERTIFICATE`, `EYVAN_MUTUAL_TLS_PRIVATE_KEY`); provider
+credentials (`EYVAN_AWS_ACCESS_KEY_ID`, `EYVAN_AWS_SECRET_ACCESS_KEY`,
+`EYVAN_AWS_SESSION_TOKEN`, `EYVAN_AWS_REGION`, `EYVAN_AZURE_ACCESS_TOKEN`,
+`EYVAN_AZURE_SUBSCRIPTION_ID`, `EYVAN_AZURE_RESOURCE_GROUP`,
+`EYVAN_AZURE_LOCATION`, and gcloud's own) stay scoped to the agent or plane
+process that talks to that cloud.
