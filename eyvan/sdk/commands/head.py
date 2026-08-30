@@ -1402,7 +1402,13 @@ class HeadProvisioner:
         # different distributions serving one fleet is a class of failure nobody
         # would think to look for.
         wheel = (self._wheel_source or _local_wheel_bytes)() if (spec.stages_wheel or write_environment) else None
-        worker_package = self._stage_worker_package(wheel) if wheel is not None and write_environment else None
+        # Published on every run, not only when the environment is rewritten. An
+        # adopting re-run upgrades the head's own wheel, so leaving the worker
+        # package alone made the two diverge silently: the control plane ran new
+        # code while every worker kept booting the build named by the environment
+        # written when the head was created. The object is content-addressed, so
+        # republishing an unchanged wheel converges on the object already there.
+        worker_package = self._stage_worker_package(wheel) if wheel is not None else None
         dashboard = (self._dashboard_source or _local_dashboard_bundle)()
         if dashboard is not None:
             # Before the environment that names the directory, for the same
@@ -1426,6 +1432,8 @@ class HeadProvisioner:
                     serves_dashboard=dashboard is not None,
                 ),
             )
+        if worker_package is not None and not write_environment:
+            self._execute(self._refresh_worker_package_action(worker_package))
         if spec.stages_wheel:
             assert wheel is not None
             observed = self._execute(
@@ -1859,6 +1867,33 @@ class HeadProvisioner:
                 "required, because it is what pins the package URI to the exact bytes a worker will verify",
             )
         return WorkerPackage(uri=generation.args[3], sha256=wheel.digest, generation=staged)
+
+    def _refresh_worker_package_action(self, package: WorkerPackage) -> HeadAction:
+        """Point an existing head's environment at the worker wheel just published.
+
+        Three lines rather than the whole file, because the file holds generated
+        credentials this command no longer has: an adopting run never learns the
+        secrets it wrote the first time, so rewriting it wholesale would either
+        rotate them or lose them.
+        """
+
+        assignments = "\n".join(
+            (
+                f"EYVAN_NATIVE_WORKER_PACKAGE={package.uri}",
+                f"EYVAN_NATIVE_WORKER_PACKAGE_SHA256={package.sha256}",
+                f"EYVAN_NATIVE_WORKER_PACKAGE_GENERATION={package.generation}",
+            )
+        )
+        return self._ssh_action(
+            HeadStep.STAGE_WORKER_PACKAGE,
+            "point this head's environment at the worker wheel just published",
+            "sudo /bin/sh -ec "
+            + shlex.quote(
+                f"sed -i '/^EYVAN_NATIVE_WORKER_PACKAGE/d' {HEAD_ENVIRONMENT_PATH}; "
+                f"printf '%s\\n' {shlex.quote(assignments)} >> {HEAD_ENVIRONMENT_PATH}"
+            ),
+            mutates=True,
+        )
 
     def _stage_dashboard_action(self) -> HeadAction:
         """Build the delivery of the operations UI this head will serve.

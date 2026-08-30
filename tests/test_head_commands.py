@@ -1604,3 +1604,51 @@ def test_a_head_built_without_a_dashboard_says_so_instead_of_promising_one() -> 
     assert result.serves_dashboard is False
     assert result.dashboard_url is None
     assert result.as_document()["dashboard_url"] is None
+
+
+def test_an_adopting_run_republishes_the_worker_wheel_and_repoints_the_head_at_it() -> None:
+    """Otherwise the control plane upgrades and every worker stays behind.
+
+    `head up` force-reinstalls the head's own wheel on a re-run. The worker
+    package was published only when the environment was rewritten -- that is, on
+    a fresh head or `--rotate-secrets` -- so an ordinary re-run after a code
+    change left `EYVAN_NATIVE_WORKER_PACKAGE` naming the previous build. The head
+    would run new code while every TPU it provisioned booted the old one, with
+    nothing reporting the split.
+
+    The environment is patched rather than rewritten because an adopting run
+    never learns the credentials it wrote the first time; rewriting the file
+    wholesale would rotate or lose them.
+    """
+
+    spec = _spec(artifact_store_uri="gs://fleet-bucket/artifacts")
+    gcloud = FakeGcloud(spec=spec, instance=_owned_instance(spec), environment_present=True)
+
+    result = HeadProvisioner(
+        spec,
+        runner=gcloud,
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+    ).up()
+
+    # Adopting: the environment file was not rewritten.
+    assert result.adopted_instance is True
+    assert result.wrote_environment is False
+
+    # The wheel was still published...
+    uploads = gcloud.issued_matching("storage", "cp")
+    assert len(uploads) == 1
+    expected_uri = f"gs://fleet-bucket/artifacts/native-worker/{_FAKE_WHEEL_DIGEST}/{staged_wheel_filename()}"
+    assert uploads[0][3] == expected_uri
+
+    # ...and the existing environment was repointed at it, without touching the
+    # generated credentials this run does not have.
+    repoint = [
+        call.remote_command
+        for call in gcloud.calls
+        if call.remote_command and "EYVAN_NATIVE_WORKER_PACKAGE" in call.remote_command
+    ]
+    assert len(repoint) == 1
+    assert expected_uri in repoint[0]
+    assert _FAKE_WHEEL_DIGEST in repoint[0]
+    assert not any(value in repoint[0] for value in STUB_SECRETS.values())
