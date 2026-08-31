@@ -1137,6 +1137,10 @@ class _ControllerWorkloadCommands:
                 "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
                 "environment": environment,
                 "backend_options": reserved.spec.backend_options,
+                # One gang-wide JAX world unless this is an elastic pack, whose
+                # member cells are separate provider islands and must each run
+                # their own world.
+                "placement": reserved.spec.placement.value,
                 "gang": {
                     **reserved.spec.gang.model_dump(mode="json"),
                     "placement_strategy": "PACK",

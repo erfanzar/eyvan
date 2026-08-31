@@ -489,6 +489,31 @@ class NativeGangExecutor:
 
         return all(worker.executor.health() for worker in self._workers)
 
+    def _cell_world(self, worker: _GangWorker, rank: int) -> tuple[str, str, int, int]:
+        """Return one worker's per-cell JAX world: host, address, count, local id.
+
+        An elastic pack is one provider allocation per cell -- islands with no
+        interconnect between them, so twelve processes told to rendezvous as one
+        world deadline-exceed on every host. Elastic placement therefore runs
+        one JAX world per cell: coordinator, process count, and process id
+        local to the cell, while the ``EYVAN_*`` variables keep describing the
+        whole gang.
+        """
+
+        first_cell_rank = next(
+            index for index, candidate in enumerate(self._workers) if candidate.cell_id == worker.cell_id
+        )
+        cell_width = sum(1 for candidate in self._workers if candidate.cell_id == worker.cell_id)
+        coordinator = urlparse(self._workers[first_cell_rank].endpoint)
+        if coordinator.scheme not in {"http", "https"} or not coordinator.hostname:
+            raise ValueError("native gang cell coordinator endpoint must be an HTTP URL with a host")
+        return (
+            coordinator.hostname,
+            f"{coordinator.hostname}:{_COORDINATOR_PORT}",
+            cell_width,
+            rank - first_cell_rank,
+        )
+
     def _ranked_spec(self, spec: tp.Mapping[str, JsonValue], rank: int, worker: _GangWorker) -> JsonObject:
         """Copy one JSON workload spec and add its rank-local environment."""
 
@@ -521,6 +546,14 @@ class NativeGangExecutor:
         if resume_uri:
             environment[_RESUME_CHECKPOINT_ENV] = _rank_checkpoint_uri(resume_uri, rank)
         python_path = environment.get("PYTHONPATH", "")
+        one_world_per_cell = payload.get("placement") == "elastic"
+        if one_world_per_cell:
+            coordinator_host, coordinator_address, process_count, process_id = self._cell_world(worker, rank)
+        else:
+            coordinator_address = self._coordinator_address
+            coordinator_host = self._coordinator_address.rsplit(":", 1)[0]
+            process_count = len(self._workers)
+            process_id = rank
         environment.update(
             {
                 "EYVAN_DISTRIBUTED_PROCESS_COUNT": str(len(self._workers)),
@@ -530,12 +563,12 @@ class NativeGangExecutor:
                 "EYVAN_JAX_MULTIHOST": "1",
                 "EYVAN_REPLICA_COUNT": str(len(self._workers)),
                 "EYVAN_REPLICA_INDEX": str(rank),
-                "JAX_COORDINATOR_ADDRESS": self._coordinator_address,
+                "JAX_COORDINATOR_ADDRESS": coordinator_address,
                 "JAX_COORDINATOR_PORT": str(_COORDINATOR_PORT),
                 "JAX_PARTITION_INDEX": str(worker.cell_index),
-                "JAX_PROCESS_COUNT": str(len(self._workers)),
-                "JAX_PROCESS_ID": str(rank),
-                "JAX_PROCESS_INDEX": str(rank),
+                "JAX_PROCESS_COUNT": str(process_count),
+                "JAX_PROCESS_ID": str(process_id),
+                "JAX_PROCESS_INDEX": str(process_id),
                 "PYTHONPATH": f"{_MULTIHOST_SITE_PATH}:{python_path}" if python_path else _MULTIHOST_SITE_PATH,
             }
         )
@@ -549,7 +582,7 @@ class NativeGangExecutor:
             environment.update(
                 self.gpu_plan.rank_environment(
                     rank,
-                    rendezvous_host=self._coordinator_host,
+                    rendezvous_host=coordinator_host,
                     gpu_model=worker.gpu_model,
                     layout=self.gpu_rank_layout,
                 )
