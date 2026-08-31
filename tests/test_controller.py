@@ -4256,3 +4256,101 @@ async def test_an_operator_who_accepts_the_risk_can_run_callables_on_a_private_p
 
     request = fake_agent.submissions[0][1]
     assert request.spec["environment"]["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_multi_cell_gang_can_actually_be_preempted() -> None:
+    """The pure scheduler named every sibling; the controller threw the plan away.
+
+    A workload holding a lease *group* records the group in `lease_ids` and only
+    the leader in `lease_id`. The commit guard tested `workload.lease_id !=
+    lease.id`, so the first sibling failed it and the whole plan was abandoned
+    before anything was written -- no outbox command, no revocation, the victim
+    still LEASED and the high-priority workload waiting forever. Metrics counted
+    a preemption on every cycle; none ever happened.
+
+    `test_gang_preemption_is_atomic` covers the scheduler, which emits the
+    siblings correctly, so it stayed green throughout. The gap was between the
+    plan and its commit, and only a controller-level test can see it.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    fake_agent = FakeAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(checkpoint_grace_s=2),
+        agent_factory=lambda _cell: fake_agent,  # type: ignore[arg-type]
+    )
+    admin = principal(Role.FLEET_ADMIN)
+    operator = principal(Role.PROJECT_OPERATOR)
+    for name in ("cell-a", "cell-b"):
+        await service.upsert_cell(
+            admin,
+            CellRecord(
+                id=name,
+                provider="gcp",
+                provider_project="gcp-project-a",
+                region="us-central2",
+                zone="us-central2-b",
+                capacity=ResourceVector(tpu=8),
+                allocatable=ResourceVector(tpu=8),
+                accelerator_type="v5p-8",
+                endpoint="http://agent:8090",
+            ),
+            idempotency_key=name,
+        )
+    await controller.dispatch_outbox_once()
+
+    # A gang spanning both cells: this is the shape that could never be preempted.
+    low, _ = await service.submit_workload(
+        operator,
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="batch-gang",
+            execution=CommandExecution(command="python batch.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+            cell_group_count=2,
+            priority_band=PriorityBand.BATCH,
+            checkpointable=True,
+            checkpoint_hook="python checkpoint.py",
+            checkpoint_output_uri="gs://checkpoints/batch",
+        ),
+        idempotency_key="low-gang",
+    )
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+    await controller.observe_workloads_once()
+
+    async with repository.transaction() as transaction:
+        held = await transaction.get_workload(low.id)
+        leases = await transaction.list_leases()
+    # The premise: it really is holding two leases, with one of them the leader.
+    assert len(held.lease_ids) == 2, f"expected a two-cell gang, got {held.lease_ids}"
+    assert held.lease_id in held.lease_ids
+    assert len(leases) == 2
+
+    high, _ = await service.submit_workload(
+        operator,
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="production",
+            execution=CommandExecution(command="python production.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+            priority_band=PriorityBand.PRODUCTION,
+        ),
+        idempotency_key="high-gang",
+    )
+
+    result = await controller.reconcile_once()
+
+    assert [plan.workload_id for plan in result.preemptions] == [high.id]
+    async with repository.transaction() as transaction:
+        target = await transaction.get_workload(high.id)
+        revoking = await transaction.list_leases()
+    # Committed, not discarded: the plan is durable and every sibling is revoking.
+    assert target.preemption_id is not None
+    assert {lease.state for lease in revoking} == {LeaseState.REVOKING}

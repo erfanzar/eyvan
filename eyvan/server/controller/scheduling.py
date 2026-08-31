@@ -227,9 +227,19 @@ class _ControllerScheduling:
             by_lease = {lease.id: (lease, workload) for lease, workload in victims}
             for proposed in plan.victims:
                 lease, workload = by_lease[proposed.lease_id]
+                # Membership, not equality with the leader. A workload holding a
+                # lease *group* records the group in ``lease_ids`` and only the
+                # leader in ``lease_id``, and the scheduler deliberately names
+                # every sibling as a victim -- preempting half a gang bills for
+                # capacity that cannot make progress. Testing ``lease_id`` meant
+                # the first sibling failed and the whole plan was abandoned, so a
+                # multi-cell gang could never be preempted at all: the
+                # high-priority workload waited forever while the metrics counted
+                # a preemption that never happened.
+                held = set(workload.lease_ids) or ({workload.lease_id} if workload.lease_id else set())
                 if (
                     lease.state not in {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.QUARANTINED}
-                    or workload.lease_id != lease.id
+                    or lease.id not in held
                     or workload.generation != lease.generation
                     or workload.state not in {WorkloadState.LEASED, WorkloadState.DISPATCHING, WorkloadState.RUNNING}
                 ):
