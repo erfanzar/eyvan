@@ -210,7 +210,19 @@ class _ControllerFleets:
         if not head_digest:
             return 0  # a source tree with no identity cannot judge anyone
         async with self.repository.transaction() as transaction:
-            cells = [cell for cell in await transaction.list_cells() if cell.state is CellState.READY]
+            # A cell hosting an active lease is mid-flight, not stale inventory:
+            # draining it strands the workload between a dead agent and a lease
+            # nothing will requeue, because the dispatch guard only judges
+            # builds at dispatch time. The sweep catches the cell on a later
+            # pass, once the lease releases.
+            leased_ids = {
+                lease.cell_id for lease in await transaction.list_leases() if lease.state in ACTIVE_LEASE_STATES
+            }
+            cells = [
+                cell
+                for cell in await transaction.list_cells()
+                if cell.state is CellState.READY and cell.id not in leased_ids
+            ]
         drained = 0
         for cell in cells:
             # One cell at a time, with an unreadable agent skipped rather than

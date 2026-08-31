@@ -36,9 +36,11 @@ from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
+    LeaseRecord,
     LeaseState,
     OutboxRecord,
     OutboxState,
+    ResourceGang,
     ResourceVector,
     Role,
     WorkloadDefinition,
@@ -247,6 +249,57 @@ async def test_the_sweep_drains_stale_cells_and_leaves_matching_ones_alone(monke
     assert honest is not None and honest.state is CellState.READY
     assert list(await _cell_outbox(repository, "cell-skewed", "capacity.drain")) == ["cell-skewed"]
     assert list(await _cell_outbox(repository, "cell-honest", "capacity.drain")) == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_leaves_a_stale_cell_hosting_an_active_lease_for_a_later_pass(monkeypatch) -> None:
+    """Draining a leased cell strands its workload between a dead agent and a lease
+    nothing requeues -- the dispatch guard only judges builds at dispatch time, so a
+    running job on a stale build must finish on it and be recycled after."""
+
+    _plane_digest(monkeypatch, "a" * 64)
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda cell: _BuildReportingAgent("b" * 64),
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-leased",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(cpu=1, memory_gib=1),
+                allocatable=ResourceVector(cpu=1, memory_gib=1),
+            )
+        )
+        await transaction.put_lease(
+            LeaseRecord(
+                id="lease-live",
+                workload_id="wl-live",
+                cell_id="cell-leased",
+                org_id="acme",
+                project_id="research",
+                state=LeaseState.ACTIVE,
+                resources=ResourceGang(per_replica=ResourceVector(cpu=1)),
+                generation=1,
+                cell_generation=1,
+                fencing_token="token-live",
+                expires_at=utcnow() + timedelta(hours=24),
+            )
+        )
+
+    drained = await controller.recycle_stale_build_cells_once()
+
+    assert drained == 0
+    async with repository.transaction() as transaction:
+        cell = await transaction.get_cell("cell-leased")
+    assert cell is not None and cell.state is CellState.READY
+    assert list(await _cell_outbox(repository, "cell-leased", "capacity.drain")) == []
 
 
 @pytest.mark.asyncio
