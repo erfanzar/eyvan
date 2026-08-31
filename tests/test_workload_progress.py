@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.config import EyvanSettings
+from eyvan.domain.models import PlacementMode, WorkerResourceScope
 from eyvan.records import (
     WORKER_COUNT_LABEL,
     AutoscaleBlockReason,
@@ -24,6 +26,8 @@ from eyvan.records import (
     CellState,
     CommandExecution,
     GcpQueueAdmissionDenialTarget,
+    LeaseRecord,
+    LeaseState,
     OutboxRecord,
     OutboxState,
     Principal,
@@ -36,6 +40,7 @@ from eyvan.records import (
     WorkloadProgressPhase,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.server.api.app import create_app
 from eyvan.server.persistence import InMemoryRepository
@@ -469,3 +474,133 @@ async def test_a_workload_that_was_denied_and_then_ran_reports_that_it_is_runnin
 
     assert progress.workload_state is WorkloadState.RUNNING
     assert progress.phase is WorkloadProgressPhase.RUNNING
+
+
+def _elastic_workload(pool: CapacityPoolRecord, worker_count: int = 6) -> WorkloadRecord:
+    return WorkloadRecord(
+        id="wl-v6e-16-elastic",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="tests.train",
+            execution=CommandExecution(command="python train.py"),
+            gang=ResourceGang(per_replica=ResourceVector(cpu=64, tpu=32)),
+            worker_resource_scope=WorkerResourceScope.PER_WORKER,
+            placement=PlacementMode.ELASTIC,
+            provider="gcp",
+            region="us-central1",
+            accelerator_type="v6e-16",
+            capacity_class=CapacityClass.SPOT,
+            required_executor="eyvan-native",
+            required_labels={
+                "eyvan_pool": pool.id,
+                "eyvan_pool_template": pool.template_fingerprint,
+            },
+            cell_group_count=1,
+            worker_count=worker_count,
+        ),
+        created_by="alice",
+    )
+
+
+@pytest.mark.asyncio
+async def test_workload_progress_counts_warm_cells_an_elastic_pack_would_use() -> None:
+    """A pending pods=6 pack over a warm 4-slice plus a 2-slice deficit reads 4/6, not 0/6."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _elastic_workload(pool)
+    warm = pool.make_cell("research-us-central1-c-v6e-16-warm", worker_count=4).model_copy(
+        update={"state": CellState.READY, "provider_phase": CapacityStatus.HEALTHY}
+    )
+    deficit = pool.make_cell(
+        "research-us-central1-c-v6e-16-deficit",
+        worker_count=2,
+        autoscale_request_workload_id=workload.id,
+    ).model_copy(update={"provider_phase": CapacityStatus.WAITING})
+    await _seed(repository, pool, workload, cells=(warm, deficit))
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.WAITING_FOR_CAPACITY
+    assert progress.capacity.ready_workers == 4
+    assert progress.capacity.waiting_workers == 2
+    assert progress.capacity.active_workers == 6
+
+
+@pytest.mark.asyncio
+async def test_workload_progress_does_not_count_warm_cells_a_rival_already_leased() -> None:
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _elastic_workload(pool)
+    warm = pool.make_cell("research-us-central1-c-v6e-16-warm", worker_count=4).model_copy(
+        update={"state": CellState.READY, "provider_phase": CapacityStatus.HEALTHY}
+    )
+    deficit = pool.make_cell(
+        "research-us-central1-c-v6e-16-deficit",
+        worker_count=2,
+        autoscale_request_workload_id=workload.id,
+    ).model_copy(update={"provider_phase": CapacityStatus.WAITING})
+    await _seed(repository, pool, workload, cells=(warm, deficit))
+    async with repository.transaction() as transaction:
+        await transaction.put_lease(
+            LeaseRecord(
+                id="lease-rival",
+                workload_id="wl-rival",
+                cell_id=warm.id,
+                org_id="acme",
+                project_id="research",
+                state=LeaseState.ACTIVE,
+                resources=ResourceGang(per_replica=ResourceVector(cpu=1.0)),
+                generation=1,
+                cell_generation=warm.generation,
+                fencing_token="token-rival",
+                expires_at=utcnow() + timedelta(hours=24),
+            )
+        )
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.capacity.ready_workers == 0
+    assert progress.capacity.active_workers == 2
+
+
+@pytest.mark.asyncio
+async def test_workload_progress_counts_every_cell_of_a_running_elastic_pack() -> None:
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _elastic_workload(pool).model_copy(update={"state": WorkloadState.RUNNING})
+    members = []
+    for index, workers in enumerate((4, 2)):
+        members.append(
+            pool.make_cell(f"research-us-central1-c-v6e-16-pack-{index}", worker_count=workers).model_copy(
+                update={"state": CellState.READY, "provider_phase": CapacityStatus.HEALTHY}
+            )
+        )
+    await _seed(repository, pool, workload, cells=tuple(members))
+    async with repository.transaction() as transaction:
+        for index, cell in enumerate(members):
+            await transaction.put_lease(
+                LeaseRecord(
+                    id=f"lease-pack-{index}",
+                    workload_id=workload.id,
+                    cell_id=cell.id,
+                    org_id="acme",
+                    project_id="research",
+                    state=LeaseState.ACTIVE,
+                    resources=ResourceGang(per_replica=ResourceVector(cpu=1.0)),
+                    generation=1,
+                    cell_generation=cell.generation,
+                    fencing_token=f"token-{index}",
+                    expires_at=utcnow() + timedelta(hours=24),
+                )
+            )
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.RUNNING
+    assert progress.capacity.ready_workers == 6
+    assert progress.capacity.active_cells == 2

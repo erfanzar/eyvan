@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from eyvan.capacity import PENDING_CAPACITY_STATUSES, QUEUED_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+from eyvan.domain.models import PlacementMode
 from eyvan.records import (
     AutoscaleBlockReason,
     CapacityRetryProgress,
@@ -65,11 +66,35 @@ class WorkloadProgressResolver:
             cells_by_id = {cell.id: cell for cell in request_cells}
             for cell in leased_cells:
                 cells_by_id[cell.id] = cell
-            matching_cells = tuple(
-                cell
-                for cell in sorted(cells_by_id.values(), key=lambda candidate: candidate.id)
-                if _matches_workload_capacity(cell, workload, pool_id)
-            )
+            if workload.spec.placement is PlacementMode.ELASTIC:
+                # Elastic packs same-type cells of any size, so the exact-shape
+                # filter above would report a pending pack as 0/N even while
+                # warm cells cover most of it. Count what the scheduler would
+                # actually pack: this workload's own cells plus free warm ones.
+                fleet_cells = await transaction.list_cells()
+                fleet_leases = await transaction.list_leases()
+                leased_by_anyone = frozenset(
+                    lease.cell_id for lease in fleet_leases if lease.state in ACTIVE_LEASE_STATES
+                )
+                leased_by_workload = frozenset(
+                    lease.cell_id
+                    for lease in fleet_leases
+                    if lease.state in ACTIVE_LEASE_STATES and lease.workload_id == workload.id
+                )
+                matching_cells = tuple(
+                    sorted(
+                        _elastic_pack_candidates(
+                            workload, pool_id, fleet_cells, leased_by_anyone, leased_by_workload
+                        ),
+                        key=lambda candidate: candidate.id,
+                    )
+                )
+            else:
+                matching_cells = tuple(
+                    cell
+                    for cell in sorted(cells_by_id.values(), key=lambda candidate: candidate.id)
+                    if _matches_workload_capacity(cell, workload, pool_id)
+                )
             commands = await transaction.list_outbox_for_aggregates(
                 "cell",
                 {cell.id: cell.generation for cell in matching_cells},
@@ -125,6 +150,50 @@ def _matches_workload_capacity(cell: CellRecord, workload: WorkloadRecord, pool_
         return False
     template = workload.spec.required_labels.get(_POOL_TEMPLATE_LABEL)
     return template is None or cell.labels.get(_POOL_TEMPLATE_LABEL) == template
+
+
+def _elastic_pack_candidates(
+    workload: WorkloadRecord,
+    pool_id: str | None,
+    cells: tuple[CellRecord, ...] | list[CellRecord],
+    leased_by_anyone: frozenset[str],
+    leased_by_workload: frozenset[str],
+) -> tuple[CellRecord, ...]:
+    """Return the cells an elastic placement would pack right now.
+
+    Mirrors the scheduler's greedy: cells this workload already owns or leases
+    always count, then free warm cells fill the remaining workers biggest-first
+    so the pack spans as few hardware worlds as the supply allows. A snapshot,
+    not a reservation: a warm cell stolen by another workload before the commit
+    simply stops counting on the next poll.
+    """
+
+    if pool_id is None:
+        return ()
+    need = workload.spec.worker_count
+    template = workload.spec.required_labels.get(_POOL_TEMPLATE_LABEL)
+    own: list[CellRecord] = []
+    warm: list[CellRecord] = []
+    for cell in cells:
+        if cell.pool_id != pool_id or cell.state is CellState.DELETED or cell.worker_count > need:
+            continue
+        if template is not None and cell.labels.get(_POOL_TEMPLATE_LABEL) != template:
+            continue
+        if cell.id in leased_by_workload:
+            own.append(cell)
+        elif cell.id not in leased_by_anyone:
+            if cell.autoscale_request_workload_id == workload.id:
+                own.append(cell)
+            elif cell.state is CellState.READY and cell.autoscale_request_workload_id is None:
+                warm.append(cell)
+    remaining = need - sum(cell.worker_count for cell in own)
+    packed = list(own)
+    for cell in sorted(warm, key=lambda candidate: (-candidate.worker_count, candidate.id)):
+        if remaining <= 0:
+            break
+        packed.append(cell)
+        remaining -= cell.worker_count
+    return tuple(packed)
 
 
 def _capacity_summary(cells: tuple[CellRecord, ...]) -> WorkloadCapacitySummary:
