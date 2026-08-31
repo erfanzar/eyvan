@@ -1421,3 +1421,82 @@ async def test_a_healthy_cell_drained_for_idleness_records_no_failure() -> None:
     assert drained.state is CellState.DRAINING
     assert drained.availability == served.availability
     assert drained.availability.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_the_idle_sweep_does_not_clobber_capacity_that_arrived_concurrently(monkeypatch) -> None:
+    """Provisioned capacity was being put back to REGISTERING and never used.
+
+    The idle sweep read its candidates in one transaction and wrote whole-cell
+    snapshots back in another, guarded only on the generation. A `capacity.apply`
+    result moves a cell REGISTERING -> READY *without* bumping the generation, so
+    a result landing between those two transactions passed the guard and was
+    overwritten by the stale snapshot: the capacity arrived, the sweep un-arrived
+    it, and the fleet held a cell it would never schedule onto.
+
+    The race is modelled where it actually happens -- the apply lands just before
+    the sweep re-reads the cell -- because a test that changes the state before
+    the candidates are read proves nothing: the snapshot is fresh then, and both
+    the correct and the broken implementation agree.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    admin = Principal(subject="admin", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pool = multislice_tpu_pool()
+    await service.apply_fleet(admin, "research", (pool,), idempotency_key="fleet-v1")
+
+    cell = pool.make_cell("research-v5p-16-aaa-0001", worker_count=1).model_copy(
+        update={"state": CellState.REGISTERING, "idle_since": None}
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(cell)
+
+    original_transaction = repository.transaction
+    landed = {"done": False}
+
+    class _ApplyLandsMidSweep:
+        """Wrap one transaction so a capacity result lands on the sweep's re-read.
+
+        A class rather than assigning ``__aenter__`` on the context object:
+        Python resolves special methods on the type, so an instance attribute is
+        simply ignored -- which is why the first attempt at this test silently
+        never fired its hook.
+        """
+
+        def __init__(self, context):
+            self._context = context
+
+        async def __aenter__(self):
+            transaction = await self._context.__aenter__()
+            original_get_cell = transaction.get_cell
+
+            async def _get_cell(cell_id: str):
+                record = await original_get_cell(cell_id)
+                # The apply result lands the first time the sweep re-reads this
+                # cell: state advances, generation does not.
+                if not landed["done"] and record is not None and record.id == cell.id:
+                    landed["done"] = True
+                    record = record.model_copy(update={"state": CellState.READY})
+                    await transaction.put_cell(record)
+                return record
+
+            transaction.get_cell = _get_cell  # type: ignore[method-assign]
+            return transaction
+
+        async def __aexit__(self, *exc_info):
+            return await self._context.__aexit__(*exc_info)
+
+    def _transaction_with_a_concurrent_apply(*args, **kwargs):
+        return _ApplyLandsMidSweep(original_transaction(*args, **kwargs))
+
+    monkeypatch.setattr(repository, "transaction", _transaction_with_a_concurrent_apply)
+
+    await controller.reconcile_capacity_pools_once()
+
+    async with original_transaction() as transaction:
+        settled = await transaction.get_cell(cell.id)
+
+    assert landed["done"], "the test needs the sweep to have re-read the cell"
+    assert settled.state is CellState.READY, "the idle sweep discarded a concurrent capacity result"

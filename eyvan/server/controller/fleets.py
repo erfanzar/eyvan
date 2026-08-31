@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 import typing as tp
+from datetime import datetime
 
 from eyvan.capacity import (
     CapacityStatus,
@@ -477,7 +478,7 @@ class _ControllerFleets:
             ]
             protected = set(plan.protected_cell_ids)
 
-            updates: list[CellRecord] = []
+            updates: list[tuple[str, int, datetime | None]] = []
             stale_candidates = [
                 cell
                 for cell in live
@@ -509,19 +510,30 @@ class _ControllerFleets:
                     continue
                 if cell.id in protected:
                     if cell.idle_since is not None:
-                        updates.append(cell.model_copy(update={"idle_since": None, "updated_at": now}))
+                        updates.append((cell.id, cell.generation, None))
                     continue
                 idle_since = cell.idle_since or now
                 if cell.idle_since is None:
-                    updates.append(cell.model_copy(update={"idle_since": idle_since, "updated_at": now}))
+                    updates.append((cell.id, cell.generation, idle_since))
                 if (now - idle_since).total_seconds() >= idle_timeout_s:
                     to_drain.append(cell)
             if updates:
                 async with self.repository.transaction() as transaction:
-                    for update in updates:
-                        current = await transaction.get_cell(update.id)
-                        if current is not None and current.generation == update.generation:
-                            await transaction.put_cell(update)
+                    for cell_id, generation, idle_since in updates:
+                        current = await transaction.get_cell(cell_id)
+                        if current is None or current.generation != generation:
+                            continue
+                        # Only the two fields this loop decided, applied to the
+                        # record as it is *now*. Writing back the whole snapshot
+                        # read before the transaction discarded anything that had
+                        # changed since without bumping the generation -- which is
+                        # exactly what a concurrent `capacity.apply` result does
+                        # when it moves a cell REGISTERING -> READY. The capacity
+                        # arrived, and the idle sweep put it back to registering,
+                        # so a fleet could hold provisioned cells it never used.
+                        await transaction.put_cell(
+                            current.model_copy(update={"idle_since": idle_since, "updated_at": now})
+                        )
             for cell in {candidate.id: candidate for candidate in to_drain}.values():
                 draining_cell, replayed = await self.drain_cell(
                     self._principal,
