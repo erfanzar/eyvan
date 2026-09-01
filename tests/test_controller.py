@@ -4354,3 +4354,60 @@ async def test_a_multi_cell_gang_can_actually_be_preempted() -> None:
     # Committed, not discarded: the plan is durable and every sibling is revoking.
     assert target.preemption_id is not None
     assert {lease.state for lease in revoking} == {LeaseState.REVOKING}
+
+
+@pytest.mark.asyncio
+async def test_workload_logs_answer_when_the_capacity_is_gone_instead_of_500ing() -> None:
+    """The orphan sweep settles a workload whose leases are already gone.
+
+    `workload_logs` then indexed an empty member list and raised, so the route
+    answered HTTP 500 on exactly the records an operator reads logs for -- the
+    ones something went wrong with. `/log-page` handled the same state cleanly,
+    so the two surfaces disagreed about the same workload.
+
+    Also pins the two answers that used to be an identical empty string: logs
+    suppressed because the workload mounts secrets, and a workload that was never
+    dispatched at all. "Suppressed", "never ran" and "produced nothing" are three
+    different facts.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    operator = principal(Role.PROJECT_OPERATOR)
+
+    undispatched, _ = await service.submit_workload(
+        operator,
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="never-ran", execution=CommandExecution(command="python x.py")),
+        idempotency_key="never-ran",
+    )
+    text = await controller.workload_logs(undispatched.id)
+    assert "not been dispatched" in text
+
+    # Written directly: a secret mount needs a project policy allowing its
+    # scheme, and this test is about what `workload_logs` answers, not about
+    # secret admission.
+    async with repository.transaction() as transaction:
+        base = await transaction.get_workload(undispatched.id)
+        secretive = base.model_copy(
+            update={
+                "id": "wl_secretive",
+                "spec": base.spec.model_copy(update={"secret_mounts": {"TOKEN": "gcp-secret://project/token"}}),
+            }
+        )
+        await transaction.put_workload(secretive)
+
+    text = await controller.workload_logs(secretive.id)
+    assert "suppressed" in text
+    assert "secrets" in text
+
+    # A workload that ran and whose capacity has since been released: remote_id
+    # set, no leases left. This is the shape the orphan sweep produces.
+    async with repository.transaction() as transaction:
+        record = await transaction.get_workload(undispatched.id)
+        await transaction.put_workload(record.model_copy(update={"remote_id": "remote-1"}))
+
+    text = await controller.workload_logs(undispatched.id)
+    assert "released" in text

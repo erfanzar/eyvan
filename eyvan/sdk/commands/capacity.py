@@ -60,16 +60,39 @@ def capacity_orphans(session: CliSession, as_json: bool) -> None:
     if as_json:
         click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return
-    if not payload:
-        click.echo("no orphaned cell records")
-        return
-    for entry in payload if isinstance(payload, list) else []:
+    document = (
+        payload if isinstance(payload, dict) else {"orphans": payload or [], "scanned_endpoints": [], "unreachable": []}
+    )
+    orphans = document.get("orphans") or []
+    scanned = document.get("scanned_endpoints") or []
+    unreachable = document.get("unreachable") or []
+
+    for entry in orphans if isinstance(orphans, list) else []:
         if not isinstance(entry, dict):
             continue
         click.echo(
             f"{entry.get('name')}  state={entry.get('state')}  desired={entry.get('desired_state')}  "
             f"qr={entry.get('qr_id')}  agent={entry.get('endpoint')}"
         )
+
+    # "None found" and "nothing was looked at" are different answers, and this
+    # command is most often run to confirm a teardown left nothing behind --
+    # exactly when reporting the second as the first is worst.
+    if unreachable:
+        for entry in unreachable if isinstance(unreachable, list) else []:
+            click.echo(f"could not reach cell agent {entry.get('endpoint')}: {entry.get('detail')}", err=True)
+        raise click.ClickException(
+            f"{len(unreachable)} of {len(scanned)} cell agent(s) could not be reached; "
+            "this is not a report that nothing is orphaned"
+        )
+    if not scanned:
+        raise click.ClickException(
+            "this control plane knows no cell agents, so nothing was scanned. That is expected when its "
+            "database has been replaced -- which is also when orphans are most likely -- so point a client at "
+            "the agent directly rather than reading this as a clean result."
+        )
+    if not orphans:
+        click.echo(f"no orphaned cell records ({len(scanned)} agent(s) scanned)")
 
 
 @capacity.command("list")

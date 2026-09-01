@@ -1446,7 +1446,21 @@ class SqlAlchemySession:
         statement = select(AuditEventRow).order_by(AuditEventRow.sequence).limit(limit)
         removed = 0
         for row in (await self.session.scalars(statement)).all():
-            if AuditEvent.model_validate(row.data).timestamp < before:
+            try:
+                timestamp = AuditEvent.model_validate(row.data).timestamp
+            except ValidationError:
+                # Skipped rather than fatal, for the reason ``_decode_rows``
+                # already gives: one unreadable row must not stop the whole call.
+                # It is worse here than anywhere else, because this page is
+                # ordered oldest-first -- so an unparseable row sits permanently
+                # at the front and every event behind it becomes unprunable.
+                # Retention then stops silently, and the table grows forever.
+                logger.exception(
+                    "skipping unreadable audit_events row %r during retention; it will not be pruned until repaired",
+                    getattr(row, "sequence", None),
+                )
+                continue
+            if timestamp < before:
                 await self.session.delete(row)
                 removed += 1
         return removed

@@ -809,7 +809,13 @@ def _unpriced_pool_names(payload: JsonValue) -> set[str]:
         wanted = {
             name for name, amount in resources.items() if name != "custom" and isinstance(amount, int | float) and amount
         }
-        if wanted and not (wanted & priced):
+        # Every resource the pool advertises must be priced, not merely one of
+        # them. `ResourceVector.dot` contributes zero for any resource with no
+        # price, so a TPU pool priced on `cpu` alone bills its accelerators at
+        # nothing -- and an any-match test called that healthy. The expensive
+        # resource is exactly the one most likely to be missing, because it is
+        # the one nobody thinks to price by hand.
+        if wanted - priced:
             name = pool.get("id") or pool.get("node_type")
             unpriced.add(name if isinstance(name, str) else "<unnamed pool>")
     return unpriced

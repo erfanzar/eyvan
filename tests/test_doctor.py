@@ -454,3 +454,30 @@ def test_the_fleet_check_reads_the_shape_the_route_actually_returns() -> None:
     detail = next(c for c in mixed.checks if c.name == "submittable-fleet")
     assert detail.status is CheckStatus.WARN
     assert "research" in detail.detail and "serving" in detail.detail
+
+
+def test_an_unpriced_accelerator_is_reported_even_when_cpu_has_a_price() -> None:
+    """A TPU pool priced on cpu alone bills its accelerators at nothing.
+
+    `ResourceVector.dot` contributes zero for any resource with no price, so an
+    unpriced accelerator costs exactly nothing -- and the check accepted a pool
+    if *any* one of its resources was priced. The expensive resource is the one
+    most likely to be missing, because it is the one nobody prices by hand, so
+    the any-match test passed on precisely the pools that matter.
+    """
+
+    from eyvan.sdk.commands.doctor import _unpriced_pool_names
+
+    partly_priced = {
+        "id": "research/v5p-16",
+        "capacity": {"cpu": 208, "memory_gib": 448, "tpu": 8},
+        "unit_prices": {"cpu": 0.03, "memory_gib": 0.004},
+    }
+    fully_priced = {
+        "id": "research/priced",
+        "capacity": {"cpu": 208, "tpu": 8},
+        "unit_prices": {"cpu": 0.03, "tpu": 4.2},
+    }
+
+    assert _unpriced_pool_names([partly_priced]) == {"research/v5p-16"}
+    assert _unpriced_pool_names([fully_priced]) == set()

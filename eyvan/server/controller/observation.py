@@ -1675,9 +1675,30 @@ class _ControllerObservation:
             workload = await transaction.get_workload(workload_id)
         if workload is None:
             raise LookupError(f"workload {workload_id!r} does not exist")
-        if workload.spec.secret_mounts or workload.remote_id is None:
-            return ""
-        members = await self._load_workload_members(workload)
+        # Three different answers that were all the empty string, which read to a
+        # caller as "this workload produced no output".
+        if workload.spec.secret_mounts:
+            return (
+                "[eyvan] logs are suppressed for this workload because it mounts secrets; "
+                "its output may contain their values."
+            )
+        if workload.remote_id is None:
+            return f"[eyvan] this workload has not been dispatched to a cell yet (state: {workload.state.value})."
+        try:
+            members = await self._load_workload_members(workload)
+        except StaleOutboxCommand:
+            members = []
+        if not members:
+            # Exactly what the orphan sweep leaves behind: it settles a workload
+            # whose leases are already gone. Reading logs then either indexed an
+            # empty list or raised StaleOutboxCommand, and both answered HTTP 500
+            # -- on precisely the records an operator reads logs for, because
+            # something went wrong with them. `/log-page` handled the same state
+            # cleanly, so the two surfaces disagreed about one workload.
+            return (
+                "[eyvan] the capacity this workload ran on has been released, so its logs are no longer "
+                "readable from the cell. Archived output, where a fleet retains it, is the remaining source."
+            )
         if len(members) > 1:
             coordinator_lease, coordinator_cell = self._ordered_gang_member_pairs(members)[0]
             return await asyncio.to_thread(

@@ -638,14 +638,26 @@ class _ControllerFleets:
             if cell.endpoint and cell.state is not CellState.DELETED:
                 endpoints.setdefault(cell.endpoint, cell)
         orphans: list[dict[str, str | int | None]] = []
+        unreachable: list[dict[str, str]] = []
         for endpoint, sample in sorted(endpoints.items()):
             try:
                 inventory = await asyncio.to_thread(self._agent_factory(sample).inventory)
             except Exception as exc:
                 logger.warning("cell agent %s inventory is unavailable: %s", endpoint, exc)
+                unreachable.append({"endpoint": endpoint, "detail": str(exc)})
                 continue
             for entry in inventory:
                 name = entry.get("name")
                 if isinstance(name, str) and name not in known:
                     orphans.append({**entry, "endpoint": endpoint})
-        return orphans
+        # An agent that could not be reached has reported nothing, which is not
+        # the same as reporting nothing to report. Returning a bare list made the
+        # two identical, so `eyvan capacity orphans` printed "no orphaned cell
+        # records" after contacting no agent at all -- including in the case this
+        # command exists for, where the control plane's database was replaced and
+        # therefore knows no cells, no endpoints, and scans nobody.
+        return {
+            "orphans": orphans,
+            "scanned_endpoints": sorted(endpoints),
+            "unreachable": unreachable,
+        }
