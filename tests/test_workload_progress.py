@@ -437,3 +437,35 @@ async def test_workload_progress_does_not_report_another_workloads_same_pool_cap
     assert progress.capacity.active_cells == 0
     assert progress.capacity.ready_workers == 0
     assert progress.retry is None
+
+
+@pytest.mark.asyncio
+async def test_a_workload_that_was_denied_and_then_ran_reports_that_it_is_running() -> None:
+    """The advisory outlived the condition and nothing ever cleared it.
+
+    `autoscale_block_reason` is set when GCP refuses queue admission and is never
+    unset while the workload stays pending. `_phase` short-circuited on it ahead
+    of every state, so a workload that was denied once, later acquired capacity
+    and started running reported "queue admission denied" the whole time it ran.
+
+    The sibling test above pins the other half: a workload that *died* of the
+    denial keeps it as the explanation of its failure rather than a bare
+    TERMINAL. The denial explains waiting and dying, never running.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool).model_copy(
+        update={
+            "state": WorkloadState.RUNNING,
+            # Still set from an earlier cycle, because nothing clears it.
+            "autoscale_block_reason": AutoscaleBlockReason.QUEUE_ADMISSION_DENIED,
+        }
+    )
+    await _seed(repository, pool, workload)
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.workload_state is WorkloadState.RUNNING
+    assert progress.phase is WorkloadProgressPhase.RUNNING

@@ -761,7 +761,18 @@ def secret_proof(
                 session.client.request(
                     "GET",
                     "/api/v1/events",
-                    params={"org_id": scope.org_id, "project_id": scope.project_id, "limit": "1000"},
+                    # Filtered to this workload rather than reading the project's
+                    # first thousand events. `/api/v1/events` pages oldest-first
+                    # from `after_sequence`, so on any project with prior history
+                    # the window never reaches the run the proof was pointed at --
+                    # and the evaluator then judged a run it could not see.
+                    params={
+                        "org_id": scope.org_id,
+                        "project_id": scope.project_id,
+                        "entity_type": "workload",
+                        "entity_id": workload_id,
+                        "limit": "1000",
+                    },
                 ),
                 session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
                 str(session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs")),

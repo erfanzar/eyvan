@@ -248,7 +248,15 @@ def _phase(
 ) -> WorkloadProgressPhase:
     """Map durable workload and capacity state to one user-facing phase."""
 
-    if workload.autoscale_block_reason is AutoscaleBlockReason.QUEUE_ADMISSION_DENIED:
+    # A queue-admission denial explains two situations and no others: a workload
+    # still waiting because of it, and a terminal workload that died of it.
+    #
+    # It used to short-circuit ahead of every state, and nothing ever clears the
+    # field -- so a workload that was denied once, then acquired capacity and ran,
+    # reported "queue admission denied" while it was running and after it
+    # succeeded. The advisory outlived the condition it described.
+    denied = workload.autoscale_block_reason is AutoscaleBlockReason.QUEUE_ADMISSION_DENIED
+    if denied and workload.state in TERMINAL_WORKLOAD_STATES:
         return WorkloadProgressPhase.QUEUE_ADMISSION_DENIED
     if workload.state in TERMINAL_WORKLOAD_STATES:
         return WorkloadProgressPhase.TERMINAL
@@ -260,6 +268,8 @@ def _phase(
         return WorkloadProgressPhase.RUNNING
     if workload.state is WorkloadState.DISPATCHING:
         return WorkloadProgressPhase.DISPATCHING
+    if denied:
+        return WorkloadProgressPhase.QUEUE_ADMISSION_DENIED
     if workload.preemption_id is not None:
         return WorkloadProgressPhase.PREEMPTED
     if workload.state is WorkloadState.LEASED:

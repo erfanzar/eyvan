@@ -702,7 +702,14 @@ class _ControllerPreemption:
                         "updated_at": now,
                     }
                 )
-                await transaction.put_workload(resumed)
+                # ``_put_workload_keeping_references``, not ``put_workload``: this
+                # path bumps the generation, and ``result_spec_for_generation``
+                # mints a *new* managed result URI for the resumed attempt. Its
+                # helper documents itself as used by every path that bumps the
+                # generation, and this one did not -- so the resumed attempt owned
+                # an artifact address nothing referenced, and a collector could
+                # reclaim the object the attempt was about to write.
+                await self.service._put_workload_keeping_references(transaction, resumed)
                 await self.service._audit(
                     transaction,
                     self._principal,

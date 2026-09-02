@@ -2155,7 +2155,13 @@ class ControlPlaneService:
                 principal, Permission.OPERATE, org_id=workload.org_id, project_id=workload.project_id
             )
             scope = _scope(workload.org_id, workload.project_id)
-            fingerprint = _fingerprint({"workload_id": workload_id})
+            # ``cascade`` is part of what was asked for, so it is part of what a
+            # replay must match. Omitting it made a full cancel replayed over an
+            # earlier ``cascade=False`` call return the first call's handle and do
+            # nothing: the caller is told the cancel succeeded while every
+            # descendant keeps running, holding the capacity the cancel was meant
+            # to release.
+            fingerprint = _fingerprint({"workload_id": workload_id, "cascade": cascade})
             existing = await self._idempotent_resource(tx, scope, "workload.cancel", key, fingerprint)
             if existing is not None:
                 return workload, True
