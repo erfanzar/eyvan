@@ -1,5 +1,5 @@
-# Copyright (C) 2026 Erfan Zare Chavoldi
-# This file is part of EasyDeL.
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -67,9 +67,7 @@ def _submit(spec: dict) -> list[dict[str, str]]:
 
 
 def test_an_elastic_pack_runs_one_jax_world_per_cell() -> None:
-    environments = _submit(
-        {"submission_id": "gang-job", "entrypoint": "python train.py", "placement": "elastic"}
-    )
+    environments = _submit({"submission_id": "gang-job", "entrypoint": "python train.py", "placement": "elastic"})
 
     assert len(environments) == 3
     by_coordinator: dict[str, list[dict[str, str]]] = {}

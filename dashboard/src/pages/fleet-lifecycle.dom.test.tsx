@@ -1,19 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * Seeing what is applied, and stopping it, without leaving the browser.
- *
- * The fleet page could only ever show cells -- capacity provisioned right now
- * -- so a fleet with twenty pools and nothing running was indistinguishable
- * from no fleet at all. And the route that stops a fleet has existed since
- * fleets did, with nothing in the dashboard calling it: applying and tearing
- * down were the two steps a team had to leave the UI for.
- */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

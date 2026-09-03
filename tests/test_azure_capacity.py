@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -412,9 +412,7 @@ def test_get_vm_asks_for_the_instance_view_where_evictions_are_reported() -> Non
                 "properties": {
                     "provisioningState": "Succeeded",
                     "priority": "Spot",
-                    "instanceView": {
-                        "statuses": [{"code": "PowerState/deallocated", "displayStatus": "VM evicted"}]
-                    },
+                    "instanceView": {"statuses": [{"code": "PowerState/deallocated", "displayStatus": "VM evicted"}]},
                 },
             },
         )

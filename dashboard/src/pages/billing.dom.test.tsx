@@ -1,20 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * What the fleet has run, and what anybody can honestly say it cost.
- *
- * The dashboard reported nothing about spend, and the reason is worth stating:
- * Eyvan multiplies measured usage by a unit price somebody declares, and with
- * none declared every total is structurally zero. A fleet held under a research
- * grant and a fleet nobody has costed produce identical output -- so the page
- * has to separate "free" from "not costed" or it teaches the wrong lesson in
- * both directions.
- */
 
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";

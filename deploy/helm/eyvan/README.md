@@ -95,7 +95,19 @@ identity and GitHub OIDC issuer, then copies that same index digest to the
 one-use `v$VERSION` tag. It never rebuilds during promotion and never creates
 `latest`. The Helm overlay preserves three independent values:
 `image`, `agentImage`, and `workerImage`; the rendered release must contain the
-three corresponding `repository@sha256:...` references.
+three corresponding `repository@sha256:...` references. Consume a release only
+after verifying its signed receipt, signature/Rekor inclusion, and all image,
+chart, render, package, and attestation digests. Copy those exact references;
+do not rebuild, retag, resolve a version tag at deploy time, or use `latest`.
+
+The chart has no `imagePullSecrets` value and does not create registry
+credentials. For a private registry, pre-create a pull Secret in the release
+namespace and arrange an approved image-pull credential on each workload's
+ServiceAccount (or apply an equivalent reviewed admission policy) before
+installing; otherwise pods may remain Pending with image-pull errors. Repeat
+this for the separately configured worker namespace and worker ServiceAccount
+when Kubernetes capacity mode is used. Validate pullability in the target
+cluster; local render success does not test registry authorization.
 
 A receipt deliberately records `deploymentApplied=false`, hardware evidence as
 `not-run`, and `linux/arm64`, `linux/ppc64le`, and `linux/s390x` as unverified.
@@ -248,6 +260,28 @@ release namespace needs `eyvan.dev/metrics-scraper=true` on its pod; a
 cross-namespace scraper needs that label on both namespace and pod. `/metrics`
 and the API share TCP 8080, so NetworkPolicy cannot distinguish their paths;
 the metrics bearer and API authentication remain the authorization boundary.
+
+## Post-deployment checks
+
+After `helm upgrade --install` (and after any migration), do not treat
+`--wait` as the complete qualification. Verify the control-plane rollout and,
+when enabled, the single-owner cell-agent rollout:
+
+```bash
+kubectl -n eyvan-system rollout status deployment/eyvan-control-plane
+kubectl -n eyvan-system rollout status deployment/eyvan-cell-agent
+kubectl -n eyvan-system get pods -o wide
+```
+
+Through the production ingress, check `/healthz` and `/readyz`; the latter
+must be ready against the intended database. Make an authenticated API request
+through the configured OIDC path, confirm an unauthenticated request is
+rejected, and scrape `/metrics` with the `metrics-token` bearer. Confirm the
+scrape is accepted and current, and inspect control-plane and agent logs for
+401s, database errors, image-pull failures, and registration/heartbeat errors.
+Finally confirm the agent registers and execute a harmless capacity/agent
+operation. In Kubernetes mode, verify a worker Job and pod start with the
+expected worker digest. Record these checks alongside the signed receipt.
 
 ## Mandatory local render/schema validation
 

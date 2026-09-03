@@ -1,18 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * The coalescing half of live refresh.
- *
- * A single admission commits several audit events and a fan-out commits one per
- * child, so the interesting property is not "an event refreshes the page" -- it
- * is that a hundred events do not refresh it a hundred times. Without that this
- * change would be strictly worse than the eight-second poll it replaces.
- */
 
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

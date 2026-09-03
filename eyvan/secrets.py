@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -280,9 +280,7 @@ class GcpSecretManagerStore:
         # CLI spawn scrubs them (the 2026-08-22 outage invariant).
         from eyvan._internal.subprocess_env import provider_cli_env
 
-        return subprocess.run(
-            command, capture_output=True, text=True, timeout=30, check=False, env=provider_cli_env()
-        )
+        return subprocess.run(command, capture_output=True, text=True, timeout=30, check=False, env=provider_cli_env())
 
     def read(self, reference: str) -> bytes:
         """Resolve ``gcp-secret://project/name[/version]``."""

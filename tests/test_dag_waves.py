@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -235,9 +235,7 @@ async def test_gated_dependents_keep_the_wave_ledger_open() -> None:
     assert await controller.release_ready_dag_nodes_once() == 1
     dependents = [stages["fanout-train"], stages["fanout-score"]]
     async with service.repository.transaction() as tx:
-        schedulable = [
-            node.spec.name for node in dependents if (await tx.get_workload(node.id)).schedulable
-        ]
+        schedulable = [node.spec.name for node in dependents if (await tx.get_workload(node.id)).schedulable]
     assert len(schedulable) == 1, "one wave slot opened, so one dependent competes"
 
     # The second dependent waits for the first to finish, and the ledger

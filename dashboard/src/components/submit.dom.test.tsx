@@ -1,24 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * The run form, against a fleet that says what it has.
- *
- * This form used to invent the parts of a submission a pool owns: CPU and
- * memory per replica, accelerator count, topology, and provider. Two of those
- * were wrong in ways the browser could not see -- `provider: "gcp"` pinned
- * every dashboard job to one cloud, and a topology of `slice: "single-slice"`
- * matched no pool any fleet declares, so the default submission was refused for
- * a mismatch against a value nobody typed.
- *
- * What is asserted here is that the form asks only what the fleet cannot
- * supply, offers only hardware this scope can really run on, and never reports
- * a failed read as an empty fleet.
- */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

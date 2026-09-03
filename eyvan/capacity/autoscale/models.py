@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -274,9 +274,7 @@ class AutoscaleDefaults:
             **({} if self.runtime_python is None else {"runtime_python": self.runtime_python}),
             **({} if not self.runtime_init_commands else {"runtime_init_commands": list(self.runtime_init_commands)}),
             **(
-                {}
-                if self.runtime_container_image is None
-                else {"runtime_container_image": self.runtime_container_image}
+                {} if self.runtime_container_image is None else {"runtime_container_image": self.runtime_container_image}
             ),
         }
 

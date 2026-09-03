@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of Eyvan.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Enumerate Eyvan's ``EYVAN_*`` environment-variable surface into one document.
 
 The codebase configures its host daemons through environment variables, and

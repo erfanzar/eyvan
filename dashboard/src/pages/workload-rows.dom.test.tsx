@@ -1,18 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * Clicking a workload row.
- *
- * The rows already lit up on hover, so the full width read as clickable -- and
- * only the 250px name cell was. A click anywhere else did nothing at all, which
- * is the kind of dead affordance that makes a page feel broken before anybody
- * can say which part is.
- */
 
 import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";

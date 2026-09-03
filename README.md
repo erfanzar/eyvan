@@ -10,10 +10,13 @@ refused, and how long the handover actually took.
 ## The sixty-second version
 
 ```bash
-uv sync                                  # workspace install
-eyvan start                              # find or point at a control plane
-eyvan doctor                             # what is missing, named together
+uv sync --extra dev                      # workspace install + development dependencies
+uv run eyvan up                          # start the local loopback fleet before SDK init
+uv run eyvan start                       # find or point at a control plane
+uv run eyvan doctor                      # what is missing, named together
 ```
+
+Eyvan supports Python `>=3.10,<3.14` (the range declared in `pyproject.toml`).
 
 ```python
 from eyvan import TpuConfig, execute, init
@@ -48,9 +51,9 @@ shows you what exists: a local plane, or heads in your project). Point it at
 an explicit plane by address — `eyvan.init("http://10.0.0.5:8080")` — or
 bind a default fleet with `eyvan.init(fleet="research-us-central1-a")`.
 Everything else is scope (`org_id`, `project_id`), where artifacts go (a
-`gs://`/`s3://` root or your own `ArtifactStore` implementation), and
-fleet-state location (`EYVAN_FLEET_STATE_URI`) when agents own distinct
-capacity boundaries.
+`gs://` root or your own `ArtifactStore` implementation), and fleet-state
+location (`EYVAN_FLEET_STATE_URI`) when agents own distinct capacity
+boundaries.
 
 ### The shape: `TpuConfig`, `GpuConfig`, `CpuConfig`
 
@@ -141,11 +144,20 @@ Four seams, in order of how often you need them:
 
 ```bash
 git clone <this repo> && cd eyvan
-uv sync                          # editable install, dev deps included
+uv sync --extra dev                # editable install + dev deps (pytest, pytest-asyncio)
 uv run pytest tests -q           # full suite (~7 min; host + disposable Postgres)
-uv run ruff check eyvan tests    # lint (line 121, py3.11)
+uv run ruff check eyvan tests    # lint (line 121, py3.10)
 uv run eyvan-server --log-level info   # run the plane from source
 uv run eyvan-agent --port 8090 --log-level info   # and an agent
+```
+
+Verify the dashboard from a fresh checkout with the commands in
+[Contributing — Dashboard](CONTRIBUTING.md#running-the-tests):
+
+```bash
+npm --prefix dashboard ci
+npm --prefix dashboard test
+npm --prefix dashboard run build
 ```
 
 The rules that keep the package honest — enforce them in review, not in
@@ -203,8 +215,13 @@ needs both facts per backend, not the flattering one — see
 
 ## The docs map
 
+New to the project? Start with the [tutorial](docs/tutorial/README.md) —
+sixteen verified parts that walk from "what is Eyvan" through the SDK, the
+control plane, providers, operations, and deployment.
+
 | page | what it answers |
 |---|---|
+| [tutorial](docs/tutorial/README.md) | a part-per-subsystem tutorial, grounded in the source |
 | [eyvan-explained](docs/eyvan-explained.md) | the mental model, one workload's full journey |
 | [install](docs/install.md) | laptop path, the fifteen, GCP head, secrets |
 | [operate](docs/operate.md) | the runbook: fleets, workloads, capacity, zone racing |

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of Eyvan.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Download selected release-lock tools after verifying their exact SHA-256."""
 
 from __future__ import annotations

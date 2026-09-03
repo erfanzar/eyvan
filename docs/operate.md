@@ -26,6 +26,18 @@ installation lives in [install](install.md).
   fleet's idle timeout. If you tear the plane down for the night, drain its
   fleets first: `eyvan down <config> -y`.
 
+## Consume a release immutably
+
+Before changing a production plane, select one candidate full source SHA and
+one signed release receipt. Download only the receipt, its signature/bundle,
+and the receipt-named assets; verify the receipt's canonical bytes, keyless
+signature and Rekor inclusion, then verify every referenced image, package,
+chart, render, and attestation digest. Confirm the receipt binds the candidate
+source SHA and the exact workflow identity. Deploy the three image references
+from the receipt (`control-plane`, `agent`, and, for Kubernetes capacity,
+`worker`) as `repository@sha256:...`; do not resolve a tag, rebuild locally, or
+substitute `latest`. Keep the verified receipt with the deployment record.
+
 ## Every day
 
 ```bash
@@ -100,6 +112,40 @@ eyvan down ~/.eyvan/autoscale/configs/research-us-central1-a.yaml -y   # drain i
 from live quota. `down` takes the **config path**, not a fleet name, and
 drains every cell the fleet manages. An empty fleet holds no cell and costs
 nothing, but drains restore the state you found.
+
+## Release, migration, and rollback sequence
+
+1. Freeze new submissions and database writers, and take a verified backup
+   (including an isolated restore rehearsal) before a schema-changing release.
+2. Verify the immutable receipt and render, create/update the release with the
+   exact digest references, and run `eyvan-migrate --check` from that candidate.
+3. If the schema is changing, acknowledge maintenance for this release only,
+   run the migration while writers remain quiesced, and wait for the migration
+   job and control-plane rollout to complete. Reset the acknowledgement before
+   reopening writes.
+4. Perform the post-deployment checks below, then resume submissions and
+   writers. Record the receipt, migration revision, and check results.
+
+A Helm rollback can restore workloads to an older image, but cannot undo a
+committed database migration. If the candidate fails after migration, keep
+writers stopped and repair forward; restore a backup only as a deliberate
+disaster-recovery action. Never use an Alembic downgrade as release rollback.
+
+## Post-deployment checks
+
+- `kubectl rollout status` succeeds for the control-plane and (if enabled) the
+  single-owner cell-agent Deployment, and `kubectl get pods` shows all pods
+  ready; confirm the rendered pods still use the three verified digests.
+- Query `/healthz` and `/readyz` through the production ingress. The latter
+  proves database readiness; authenticate an API request with the production
+  OIDC path (not development auth) and verify an unauthorized request is
+  rejected.
+- Scrape `/metrics` with the configured bearer, confirm the scrape is
+  accepted and contains current control-plane/service metrics, and check logs
+  for authentication or database errors.
+- Confirm the cell agent registers and remains healthy, then run a harmless
+  capacity/agent operation and inspect its status/logs. In Kubernetes capacity
+  mode, verify worker Jobs and their pods start from the expected digest.
 
 ## One agent, one backend
 

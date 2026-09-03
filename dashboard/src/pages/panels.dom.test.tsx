@@ -1,24 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * The two panels, rendered.
- *
- * The dashboard had zero component tests: 38 assertions, all at the data layer.
- * That layer proves the request shape and the error type, and proves nothing
- * about what a person sees -- so the claim these panels were added for, that a
- * failure is *reported* rather than rendered as an empty section, was untested
- * at the only layer where it is true or false.
- *
- * An empty explain panel reads as "nothing to report", which is the one thing it
- * must not say when the request failed. An empty cost panel reads as "nothing is
- * being spent", which is the most expensive thing it could say incorrectly.
- * Both are asserted here against a real DOM.
- */
 
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

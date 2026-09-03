@@ -1,24 +1,7 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-/**
- * Submitting a job from the browser, asking only what the fleet cannot supply.
- *
- * This form used to build a workload spec by hand: CPU and memory per replica,
- * accelerator count, a gang topology, and a provider. All four are properties
- * of the pool a job lands on, so the browser was inventing them -- and getting
- * two of them wrong in ways nobody could see. It sent `provider: "gcp"` on
- * every submission, a hard constraint that makes a job unplaceable on any other
- * cloud, and a topology of `slice: "single-slice"`, a value no pool declares,
- * so the *default* submission was refused for a mismatch against a string the
- * user never typed.
- *
- * It now asks what `eyvan run` asks: which shape, how many, and what command.
- * The pool supplies the rest, and the shapes on offer are the ones this scope
- * may actually submit to rather than a list of hardware some other fleet had.
- */
 
 import { AlertCircle, LoaderCircle, Plus, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";

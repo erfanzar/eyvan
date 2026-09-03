@@ -2,7 +2,8 @@
 
 A network-bound deployment needs fifteen separately configured things. Local
 `eyvan up` needs none of them: it is a loopback development path, not a remote
-installation recipe. This page covers both.
+installation recipe. This page covers both. Eyvan requires Python `>=3.10,<3.14`,
+as declared in `pyproject.toml`.
 
 ## Ask before you start
 
@@ -11,7 +12,7 @@ used to be discovered one restart at a time. They are now reported together,
 and the same list can be asked for before anything is running:
 
 ```bash
-eyvan doctor --server-host 0.0.0.0     # the address eyvan-server will bind
+uv run eyvan doctor --server-host 0.0.0.0     # the address eyvan-server will bind
 ```
 
 The check reads this machine's `EYVAN_*` environment and reports every
@@ -108,19 +109,20 @@ head keeps the control plane's durable state on its own disk.
 ## The laptop path
 
 ```bash
-uv sync
-eyvan start        # discovers: local plane reachable? heads in the project?
-eyvan up           # loopback fleet (laptop-cpu), no cloud, no secrets
+uv sync --extra dev
+uv run eyvan up                         # loopback fleet (laptop-cpu), no cloud, no secrets
+uv run eyvan start                      # discovers: local plane reachable? heads in the project?
 ```
 
-State lands under `~/.eyvan/`: `control-plane.json` (the loopback plane's
+Run `eyvan up` before calling the SDK's `init()` for the local fleet. State
+lands under `~/.eyvan/`: `control-plane.json` (the loopback plane's
 durable world), `autoscale/defaults.yaml` plus `autoscale/configs/` (generated
 zone fleets), and `cell-agent-*` records. Run the plane and agent as separate
 processes when you use accelerators:
 
 ```bash
-eyvan-server --log-level info              # the plane
-eyvan-agent --port 8090 --log-level info   # a cell agent
+uv run eyvan-server --log-level info       # the plane
+uv run eyvan-agent --port 8090 --log-level info  # a cell agent
 ```
 
 The agent requires `EYVAN_AGENT_SHARED_SECRET` (and, for native workers,
@@ -128,7 +130,20 @@ The agent requires `EYVAN_AGENT_SHARED_SECRET` (and, for native workers,
 in `~/.eyvan/gcp-native-runtime.json` -- and a plane restarted **without** that
 profile's secrets 401-loops against a still-running agent (receipt:
 2026-08-29). Local components rebuild from source with
-`eyvan runtime deploy`.
+`uv run eyvan runtime deploy`.
+
+### Dashboard verification
+
+From the repository root, install and verify the dashboard with:
+
+```bash
+npm --prefix dashboard ci
+npm --prefix dashboard test
+npm --prefix dashboard run build
+```
+
+See [Contributing — Dashboard](../CONTRIBUTING.md#running-the-tests) for the
+same checks and their purpose.
 
 ## Raw manifest order
 

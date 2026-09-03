@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -282,6 +282,7 @@ class SecretRotationRequest(BaseModel):
     #: Seconds the superseded generation keeps verifying. Unset means one secret
     #: capability TTL, the lifetime an outstanding token can already have.
     overlap_s: float | None = Field(default=None, ge=0)
+
 
 #: Served at "/" by a plane that hosts no dashboard, in place of the framework's
 #: bare 404. Deliberately one self-contained document with no linked asset: the

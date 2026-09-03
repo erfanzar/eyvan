@@ -1,25 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * Following a running workload's output, rendered.
- *
- * The page could only ever show the snapshot fetched when it loaded, so
- * watching a job meant reloading the page -- and reloading a page to see
- * whether a training run is still printing is how people end up in a terminal
- * instead. The stream behind this existed for a release before anything in the
- * browser read it.
- *
- * What is asserted here is what a reader concludes, which is the only place
- * these behaviours are true or false: that a retry visibly resets the output
- * rather than appending to it, that a dropped stream is named rather than
- * looking like a quiet job, and that scrolling back to read something is not
- * undone by the next line to arrive.
- */
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";

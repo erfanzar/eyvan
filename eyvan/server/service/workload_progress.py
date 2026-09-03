@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -83,9 +83,7 @@ class WorkloadProgressResolver:
                 )
                 matching_cells = tuple(
                     sorted(
-                        _elastic_pack_candidates(
-                            workload, pool_id, fleet_cells, leased_by_anyone, leased_by_workload
-                        ),
+                        _elastic_pack_candidates(workload, pool_id, fleet_cells, leased_by_anyone, leased_by_workload),
                         key=lambda candidate: candidate.id,
                     )
                 )

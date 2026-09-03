@@ -1,25 +1,8 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/**
- * A server-sent event reader built on `fetch`, not `EventSource`.
- *
- * The browser's `EventSource` cannot set request headers, and this dashboard
- * authenticates with `Authorization: Bearer` (or the development identity
- * headers). The two ways to use `EventSource` anyway are to put the access
- * token in the query string -- where it lands in server logs, proxy logs and
- * browser history -- or to introduce cookie authentication, which is a second
- * auth path for one feature. Reading the stream with `fetch` keeps the token in
- * a header at the cost of parsing frames here.
- *
- * What is reimplemented, because `EventSource` would have provided it:
- * reconnection with backoff, and resuming from the last delivered id via the
- * `Last-Event-ID` header the server already honours.
- */
-
-/** A terminal authenticated stream response that requires session reconciliation. */
 export class EventStreamHttpError extends Error {
   constructor(
     message: string,

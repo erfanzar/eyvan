@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -591,8 +591,9 @@ class Scheduler:
         candidates: list[tuple[CapacityCell, Decimal, Decimal, ResourceVector, PlacementScore]] = []
 
         for cell in sorted(cells.values(), key=lambda candidate: candidate.cell_id):
-            failure = self._static_cell_failure(workload, per_worker.scale(cell.worker_count), cell,
-                                                require_worker_count_equality=False)
+            failure = self._static_cell_failure(
+                workload, per_worker.scale(cell.worker_count), cell, require_worker_count_equality=False
+            )
             if failure is not None:
                 static_failures.append(failure)
                 continue

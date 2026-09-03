@@ -1,9 +1,9 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Apply the EasyDeL AGPL-3.0 SPDX header to every Eyvan source file.
+"""Apply the Eyvan AGPL-3.0 SPDX header to every Eyvan source file.
 
 Matches the header spectrax uses, so every file in the stack carries the same
 notice. Runs as a pre-commit hook so a new file cannot ship without one, and is
@@ -18,7 +18,7 @@ import sys
 
 HEADER_LINES = (
     "Copyright (C) 2026 Erfan Zare Chavoshi",
-    "This file is part of EasyDeL.",
+    "This file is part of Eyvan.",
     "",
     "SPDX-License-Identifier: AGPL-3.0-or-later",
 )

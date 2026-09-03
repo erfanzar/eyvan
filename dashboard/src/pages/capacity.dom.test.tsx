@@ -1,26 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * The quota page, rendered.
- *
- * The behaviour every assertion here defends is the same one: a quota limit is
- * not free capacity. Cloud Quotas reports a ceiling for a zone whether or not
- * Cloud Monitoring has a usage series for it, so a page that renders a missing
- * usage as `0 in use` advertises a full zone as entirely available -- and
- * unlike an empty page, that mistake is confidently wrong and expensive to act
- * on.
- *
- * So: an unmeasured zone never enters the sorted table, is never filtered away
- * by a fit question it cannot answer, and never prints a zero. And every
- * measured balance is shown with the age of the observation behind it, because
- * a cached number presented as a live one is the quietest way this page could
- * mislead.
- */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

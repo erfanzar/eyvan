@@ -101,6 +101,36 @@ declared in `pyproject.toml`, builds with the hash-pinned backend, and publishes
 from the reviewer-gated `pypi` environment with OIDC trusted publishing and
 `persist-credentials: false` -- no PyPI token exists in this repository.
 
+## Consume a release
+
+A version tag is only a locator, not release evidence. Treat the signed receipt
+and its detached Cosign bundle as the trust root: download the fixed, named
+release assets, verify the canonical receipt and its bundle with the locked
+workflow identity and OIDC issuer, and verify Rekor inclusion. Then verify the
+receipt's three image index/platform digests, package/chart/render digests, and
+attestation hashes before copying the exact `repository@sha256:...` references
+to deployment configuration. For example, the verifier step is:
+
+```bash
+python3 scripts/verify_eyvan_oci_release.py verify-receipt \
+  --lock oci/release-lock.json \
+  --receipt evidence/eyvan-oci-release-receipt-v1.json
+cosign verify-blob --new-bundle-format \
+  --bundle evidence/eyvan-oci-release-receipt-v1.bundle.json \
+  --certificate-identity \
+  'https://github.com/erfanzar/eyvan/.github/workflows/eyvan-oci-release.yaml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  evidence/eyvan-oci-release-receipt-v1.json
+```
+
+Use `verify-rendered-digest-refs` against the target Helm render and verify each
+image signature against the same identity; do not rebuild, resolve a tag during
+installation, or substitute `latest`. If any receipt, signature, Rekor,
+attestation, or digest check fails, stop rather than treating the artifact as a
+release candidate. The receipt's `deploymentApplied=false` and hardware
+`not-run` fields are intentional: deployment and accelerator qualification
+remain operator checks in the exact target environment.
+
 ## Release governance prerequisites
 
 The release job is intentionally unusable until an operator configures all of

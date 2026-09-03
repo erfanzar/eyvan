@@ -1,16 +1,7 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-/**
- * How a request is described, and the multiplication it must not invent.
- *
- * A TPU slice type states its own size: `v5p-16` is one slice of 8 chips. The
- * page paired that chip count with the slice name as `8x v5p-16`, which reads
- * as eight slices -- 64 chips -- for a request that asked for one. Every shape
- * on the page was inflated by its own chip count.
- */
 
 import { describe, expect, it } from "vitest";
 

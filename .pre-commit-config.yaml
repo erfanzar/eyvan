@@ -2,8 +2,8 @@ repos:
   - repo: local
     hooks:
       - id: eyvan-license-headers
-        name: Apache-2.0 header on Eyvan sources
-        description: Every Eyvan source file carries the Apache-2.0 header
+        name: AGPL-3.0 header on Eyvan sources
+        description: Every Eyvan source file carries the AGPL-3.0 header
         entry: python scripts/license_headers.py
         language: system
         files: \.(py|ts|tsx)$

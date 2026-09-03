@@ -1,23 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * Taking a machine out of service from the browser.
- *
- * The dashboard could see a bad host and do nothing about it, so every fleet
- * action began by leaving the page. Drain is the one that matters during an
- * incident -- "stop putting work here" -- and it is also the one that reaches
- * furthest: the cell may be holding somebody else's gang.
- *
- * So what is asserted here is mostly about the confirmation. The dialog has to
- * say what happens to the work already on the cell, has to not open with the
- * destructive button under the return key, and has to keep a failure on screen
- * rather than closing over a fleet that did not change.
- */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";

@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -297,9 +297,7 @@ def test_native_gang_checkpoint_fans_out_and_names_the_output_uri(tmp_path) -> N
     request = _request()
     service.submit_gang("cell-a", request)
     members = tuple(
-        member.model_copy(
-            update={"mutation": member.mutation.model_copy(update={"idempotency_key": "ckpt-shared"})}
-        )
+        member.model_copy(update={"mutation": member.mutation.model_copy(update={"idempotency_key": "ckpt-shared"})})
         for member in request.members
     )
 

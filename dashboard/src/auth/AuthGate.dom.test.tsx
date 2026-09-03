@@ -1,18 +1,9 @@
 // Copyright (C) 2026 Erfan Zare Chavoshi
-// This file is part of EasyDeL.
+// This file is part of Eyvan.
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-
-/**
- * The first screen of the dashboard, for a plane that has no OIDC.
- *
- * A laptop plane has none by design, and the screen used to greet it as
- * "Authentication is not configured", naming VITE_EYVAN_OIDC_ISSUER and
- * VITE_EYVAN_OIDC_CLIENT_ID -- build arguments of a bundle whoever is reading
- * the screen did not build, on a plane where OIDC was never the answer.
- */
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

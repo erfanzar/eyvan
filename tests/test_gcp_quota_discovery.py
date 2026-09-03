@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -369,9 +369,7 @@ def _expiry_runner(reads: list[str], value: list[str]):
                 [
                     {
                         "metric": "tpu.googleapis.com/tpu-v5p-preemptible",
-                        "dimensionsInfos": [
-                            {"dimensions": {"zone": "us-east5-a"}, "details": {"value": value[0]}}
-                        ],
+                        "dimensionsInfos": [{"dimensions": {"zone": "us-east5-a"}, "details": {"value": value[0]}}],
                     }
                 ]
             )

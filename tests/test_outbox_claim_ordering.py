@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -103,9 +103,7 @@ async def test_a_settled_command_releases_its_hold_on_the_aggregate(repository: 
         current = await transaction.get_outbox("cmd-apply")
         assert current is not None
         await transaction.put_outbox(
-            current.model_copy(
-                update={"state": OutboxState.SUCCEEDED, "claimed_by": None, "claimed_until": None}
-            )
+            current.model_copy(update={"state": OutboxState.SUCCEEDED, "claimed_by": None, "claimed_until": None})
         )
 
     replica_b = await repository.claim_outbox(worker_id="replica-b", limit=10)

@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Erfan Zare Chavoshi
+// This file is part of Eyvan.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { CircleCheck, CircleDashed, CircleX, Loader2 } from "lucide-react";
 import type { TimelineEvent } from "../types";
 

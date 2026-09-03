@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Erfan Zare Chavoshi
-# This file is part of EasyDeL.
+# This file is part of Eyvan.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -55,9 +55,7 @@ from eyvan.records import (
 #: the same failed run as evicting it mid-epoch. A quarantined lease is still
 #: holding too: its TTL lapsed, but the work was not killed and observation can
 #: recover the lease to active, so its assets stay protected in the window.
-_HOLDING_LEASE_STATES = frozenset(
-    {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING, LeaseState.QUARANTINED}
-)
+_HOLDING_LEASE_STATES = frozenset({LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.REVOKING, LeaseState.QUARANTINED})
 
 #: Workload states in which a declared asset is protected from eviction. A
 #: terminal workload's lease may not have been settled yet, and its assets are
