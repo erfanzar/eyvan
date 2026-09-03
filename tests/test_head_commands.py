@@ -1652,3 +1652,44 @@ def test_an_adopting_run_republishes_the_worker_wheel_and_repoints_the_head_at_i
     assert expected_uri in repoint[0]
     assert _FAKE_WHEEL_DIGEST in repoint[0]
     assert not any(value in repoint[0] for value in STUB_SECRETS.values())
+
+
+def test_a_head_grants_its_workers_read_access_to_the_bucket_holding_their_wheel() -> None:
+    """Otherwise a worker cannot download the Eyvan it was told to install.
+
+    The GCP capacity factory reads EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI to grant
+    each worker's service account read access to that bucket, and returns without
+    granting anything when it is unset. A worker in a project whose default
+    service account cannot already read the bucket then fails at bootstrap -- on
+    the accelerator, after it has been provisioned and billed.
+    """
+
+    spec = _spec(artifact_store_uri="gs://fleet-bucket/artifacts")
+    gcloud = FakeGcloud(spec=spec)
+
+    result = HeadProvisioner(spec, runner=gcloud, secret_factory=lambda: STUB_SECRETS, wheel_source=_fake_wheel).up()
+
+    environment = _environment(gcloud.stdin_for(HEAD_ENVIRONMENT_PATH))
+
+    assert environment["EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI"] == "gs://fleet-bucket/artifacts"
+    assert result.artifact_store_warning is None
+
+
+def test_a_head_without_an_artifact_store_says_its_capacity_requests_will_be_refused() -> None:
+    """The head reported itself active and failed on the first submission instead.
+
+    With no artifact store there is nowhere to publish the worker wheel, so no
+    EYVAN_NATIVE_WORKER_PACKAGE is written -- and the capacity driver refuses
+    every eyvan-native request without it. The refusal then arrived at the point
+    furthest from the omission that caused it.
+    """
+
+    gcloud = FakeGcloud(spec=_spec())
+
+    result = HeadProvisioner(_spec(), runner=gcloud, secret_factory=lambda: STUB_SECRETS, wheel_source=_fake_wheel).up()
+
+    warning = result.artifact_store_warning
+    assert warning is not None
+    assert "--artifact-store-uri" in warning
+    assert "EYVAN_NATIVE_WORKER_PACKAGE" in warning
+    assert result.as_document()["artifact_store_warning"] == warning

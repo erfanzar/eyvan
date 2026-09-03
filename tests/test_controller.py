@@ -1031,7 +1031,11 @@ async def test_long_capacity_apply_renews_claim_before_another_controller_can_re
 async def test_outbox_batch_dispatch_never_starts_a_later_command_after_another_controller_claims_it() -> None:
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
-    settings = EyvanSettings(outbox_claim_ttl_s=1)
+    # Concurrency pinned to one: this test is about claim fencing and hand-off
+    # after a TTL expires, and it was written when delivery happened to be serial.
+    # With the default concurrency both cells are claimed and delivered at once,
+    # which is the point of that change and not the subject of this test.
+    settings = EyvanSettings(outbox_claim_ttl_s=1, outbox_dispatch_concurrency=1)
     first_agent = BlockingProvisioningAgent()
     second_agent = BlockingProvisioningAgent()
     controller_a = EyvanController(repository, service, settings=settings, agent_factory=lambda _cell: first_agent)
@@ -4411,3 +4415,60 @@ async def test_workload_logs_answer_when_the_capacity_is_gone_instead_of_500ing(
 
     text = await controller.workload_logs(undispatched.id)
     assert "released" in text
+
+
+@pytest.mark.asyncio
+async def test_a_slow_command_does_not_block_delivery_for_unrelated_cells() -> None:
+    """One preemption's checkpoint used to stall every mutation on the replica.
+
+    Delivery was strictly serial, and a command can legitimately take minutes: a
+    preemption checkpoints a real training step and waits for it. Everything
+    behind it queued -- capacity applies, dispatches, cancellations -- so one slow
+    victim stalled a whole fleet's mutations. Nothing caught it because
+    correctness was never in question; only throughput was.
+
+    Ordering is still required *within* an aggregate, so this asserts the
+    property that actually matters: two different cells make progress at the same
+    time.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    blocking = BlockingProvisioningAgent()
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(outbox_dispatch_concurrency=4),
+        agent_factory=lambda _cell: blocking,
+    )
+    admin = principal(Role.FLEET_ADMIN)
+    for cell_id in ("cell-a", "cell-b"):
+        await service.upsert_cell(
+            admin,
+            CellRecord(
+                id=cell_id,
+                provider="gcp",
+                provider_project="gcp-project-a",
+                region="us-central2",
+                zone="us-central2-b",
+                capacity=ResourceVector(tpu=8),
+                allocatable=ResourceVector(tpu=8),
+                accelerator_type="v5p-8",
+                endpoint="http://agent:8090",
+            ),
+            idempotency_key=f"{cell_id}-create",
+        )
+
+    delivery = asyncio.create_task(controller.dispatch_outbox_once(limit=2))
+    try:
+        # The first apply blocks. Serially, the second cell would not be touched
+        # until it returns; both should now be in flight.
+        assert await asyncio.to_thread(blocking.apply_entered.wait, 2)
+        for _ in range(50):
+            if len(blocking.applied_cell_ids) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert sorted(blocking.applied_cell_ids) == ["cell-a", "cell-b"]
+    finally:
+        blocking.allow_apply.set()
+        await delivery

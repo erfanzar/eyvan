@@ -109,6 +109,13 @@ class EyvanSettings:
     checkpoint_grace_s: int = 300
     preemption_stop_grace_s: int = 300
     outbox_claim_ttl_s: int = 90
+    #: How many durable commands one replica may deliver at once. Delivery used
+    #: to be strictly serial, so a single preemption's checkpoint-and-stop --
+    #: minutes, by design, because it waits for a real training step to finish --
+    #: blocked every other mutation on that replica: capacity applies, dispatches,
+    #: cancellations. Ordering is preserved per aggregate, so raising this
+    #: parallelises unrelated cells and workloads and never reorders one.
+    outbox_dispatch_concurrency: int = 8
     # Retention windows. 0 disables pruning for that table, which is the
     # historical behaviour: nothing was ever deleted and idempotency keys were
     # therefore honored forever.
@@ -354,6 +361,8 @@ class EyvanSettings:
     def __post_init__(self) -> None:
         """Validate settings that participate in durable controller ownership."""
 
+        if self.outbox_dispatch_concurrency <= 0:
+            raise ValueError("outbox_dispatch_concurrency must be positive")
         if self.outbox_claim_ttl_s <= 0:
             raise ValueError("outbox_claim_ttl_s must be positive")
         for name in ("outbox_retention_s", "audit_retention_s", "idempotency_retention_s"):
@@ -535,6 +544,9 @@ class EyvanSettings:
             checkpoint_grace_s=int(os.getenv("EYVAN_CHECKPOINT_GRACE_S", defaults.checkpoint_grace_s)),
             preemption_stop_grace_s=int(os.getenv("EYVAN_PREEMPTION_STOP_GRACE_S", defaults.preemption_stop_grace_s)),
             outbox_claim_ttl_s=int(os.getenv("EYVAN_OUTBOX_CLAIM_TTL_S", defaults.outbox_claim_ttl_s)),
+            outbox_dispatch_concurrency=int(
+                os.getenv("EYVAN_OUTBOX_DISPATCH_CONCURRENCY", defaults.outbox_dispatch_concurrency)
+            ),
             outbox_retention_s=int(os.getenv("EYVAN_OUTBOX_RETENTION_S", defaults.outbox_retention_s)),
             audit_retention_s=int(os.getenv("EYVAN_AUDIT_RETENTION_S", defaults.audit_retention_s)),
             idempotency_retention_s=int(os.getenv("EYVAN_IDEMPOTENCY_RETENTION_S", defaults.idempotency_retention_s)),

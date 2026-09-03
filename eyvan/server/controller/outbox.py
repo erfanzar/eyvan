@@ -53,21 +53,68 @@ class _ControllerOutbox:
     """
 
     async def dispatch_outbox_once(self, *, limit: int = 20) -> int:
+        """Deliver claimable commands, overlapping aggregates and ordering within one.
+
+        Delivery was strictly serial, and one command can legitimately take
+        minutes: a preemption checkpoints a real training step and waits for it.
+        Everything else on the replica queued behind it -- capacity applies,
+        dispatches, cancellations -- so one slow victim stalled a whole fleet's
+        mutations. No test saw it, because correctness was never in question and
+        only throughput suffered.
+
+        Two properties constrain how this may be parallelised, and both are kept.
+
+        A command is claimed only by a worker about to run it, never in a batch up
+        front. A controller that claims work it has not started is hoarding: if it
+        dies, those commands wait out the claim TTL before anyone else may take
+        them, and a peer that could have delivered them immediately sees nothing
+        available.
+
+        Commands for one aggregate are delivered one at a time, because a cell's
+        drain must not overtake its apply. Ordering was never required *between*
+        aggregates, which is where all the available parallelism is. Ids are
+        consumed in sequence order, so the earlier command of an aggregate is the
+        one claimed first.
+        """
+
         if limit <= 0:
             return 0
-        command_ids = await self.repository.snapshot_claimable_outbox_ids(limit=limit)
-        dispatched = 0
-        for command_id in command_ids:
-            command = await self.repository.claim_outbox_id(
-                worker_id=self.worker_id,
-                command_id=command_id,
-                lease_seconds=self.settings.outbox_claim_ttl_s,
-            )
-            if command is None:
-                continue
-            await self._dispatch_claimed_outbox(command)
-            dispatched += 1
-        return dispatched
+        command_ids = list(await self.repository.snapshot_claimable_outbox_ids(limit=limit))
+        if not command_ids:
+            return 0
+
+        pending = iter(command_ids)
+        aggregate_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        delivered = 0
+
+        async def _worker() -> None:
+            nonlocal delivered
+            while True:
+                command_id = next(pending, None)
+                if command_id is None:
+                    return
+                command = await self.repository.claim_outbox_id(
+                    worker_id=self.worker_id,
+                    command_id=command_id,
+                    lease_seconds=self.settings.outbox_claim_ttl_s,
+                )
+                if command is None:
+                    continue
+                key = (command.aggregate_type, command.aggregate_id)
+                lock = aggregate_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    await self._dispatch_claimed_outbox(command)
+                delivered += 1
+
+        workers = min(max(1, self.settings.outbox_dispatch_concurrency), len(command_ids))
+        # ``gather`` rather than a task group: one worker raising past the
+        # handlers in ``_dispatch_claimed_outbox`` must not cancel the others,
+        # whose commands are unrelated and already claimed.
+        outcomes = await asyncio.gather(*(_worker() for _ in range(workers)), return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                logger.exception("outbox delivery worker failed", exc_info=outcome)
+        return delivered
 
     async def _dispatch_claimed_outbox(self, command: OutboxRecord) -> None:
         """Deliver and settle one command that this controller has just claimed."""

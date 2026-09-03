@@ -625,6 +625,13 @@ class HeadSecrets:
             # forever for an address nobody wrote down. Observed on a live v5p-16
             # whose worker was up and serving the whole time.
             environment["EYVAN_FLEET_STATE_URI"] = fleet_state_uri(spec.artifact_store_uri, spec.fleet)
+            # Read by the GCP capacity factory to grant each worker's service
+            # account read access to the bucket holding its own wheel. Unset, the
+            # driver returns before granting anything, so a worker in a project
+            # whose default service account cannot already read that bucket fails
+            # to download the Eyvan it was told to install -- at bootstrap, on the
+            # accelerator, after it has been provisioned and billed.
+            environment["EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI"] = spec.artifact_store_uri
         if spec.allow_insecure_artifact_http:
             environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
         if serves_dashboard:
@@ -1195,6 +1202,26 @@ class HeadUpResult:
         )
 
     @property
+    def artifact_store_warning(self) -> str | None:
+        """Warn when this head cannot provision the workers it will create.
+
+        Without an artifact store there is nowhere to publish the worker wheel,
+        so no `EYVAN_NATIVE_WORKER_PACKAGE` is written -- and the GCP capacity
+        driver refuses every eyvan-native request without it. The head reported
+        itself active anyway, and the refusal arrived on the first submission,
+        which is the point furthest from the omission that caused it.
+        """
+
+        if self.spec.artifact_store_uri is not None:
+            return None
+        return (
+            "This head has no --artifact-store-uri, so it published no native-worker wheel and named no shared "
+            "fleet-state document. Every eyvan-native capacity request will be refused with "
+            "'requires EYVAN_NATIVE_WORKER_PACKAGE', on the first submission rather than now. Re-run with "
+            "`eyvan head up --artifact-store-uri gs://<bucket>/<prefix>`."
+        )
+
+    @property
     def callable_trust_warning(self) -> str | None:
         """Warn when this head will refuse every ``@execute`` submission.
 
@@ -1221,6 +1248,7 @@ class HeadUpResult:
             "address": self.address,
             "adopted_instance": self.adopted_instance,
             "authentication_warning": self.authentication_warning,
+            "artifact_store_warning": self.artifact_store_warning,
             "callable_trust_warning": self.callable_trust_warning,
             "created_firewall_rules": list(self.created_firewall_rules),
             "dashboard_url": self.dashboard_url,
@@ -2465,6 +2493,9 @@ def head_up(
     trust_warning = result.callable_trust_warning
     if trust_warning is not None:
         click.echo(trust_warning, err=True)
+    store_warning = result.artifact_store_warning
+    if store_warning is not None:
+        click.echo(store_warning, err=True)
     click.echo(f"Next: {result.next_command}")
 
 
