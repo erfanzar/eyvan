@@ -1290,3 +1290,60 @@ def test_a_callable_config_carries_its_mounts_to_the_submission(tmp_path) -> Non
 
     assert json.loads(requests[0].content)["secret_mounts"] == {"HF_TOKEN": "gcp-secret://my-project/training-hf-token"}
     client.close()
+
+
+def test_a_secret_is_not_delivered_in_clear_text_without_explicit_consent(tmp_path) -> None:
+    """A secret value is worse to expose than the capability that fetches it.
+
+    The managed-artifact path already refuses a plain-HTTP public URL unless an
+    operator accepts the risk. Secret delivery used the same URL and had no such
+    gate, so on a `head up` plane -- which terminates no TLS -- the capability and
+    the secret it redeems both travelled unencrypted.
+
+    Refused as a permanent dispatch refusal, not a bare error, so the attempt
+    settles and returns its accelerator instead of retrying forever against a
+    scheme that will not change.
+    """
+
+    from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
+    from eyvan.artifacts.transfers import ManagedArtifactAccess
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CommandExecution, WorkloadDefinition, WorkloadRecord
+    from eyvan.server.controller import EyvanController
+    from eyvan.server.controller.workload_commands import InsecureManagedArtifactTransport
+    from eyvan.server.persistence import InMemoryRepository
+    from eyvan.server.service import ControlPlaneService
+
+    def _controller(*, allow_insecure: bool) -> EyvanController:
+        repository = InMemoryRepository()
+        return EyvanController(
+            repository,
+            ControlPlaneService(repository),
+            settings=EyvanSettings(dev_auth_enabled=False, allow_insecure_artifact_http=allow_insecure),
+            artifact_access=ManagedArtifactAccess(
+                store=LocalManagedArtifactStore(tmp_path / f"artifacts-{allow_insecure}"),
+                signer=ArtifactTokenSigner(b"k" * 32, default_ttl_seconds=3600, max_ttl_seconds=3600),
+                # What `eyvan head up` actually writes: internal address, no TLS.
+                public_url="http://10.128.0.11:8080",
+                token_ttl_seconds=3600,
+            ),
+        )
+
+    workload = WorkloadRecord(
+        id="wl_secret",
+        org_id="acme",
+        project_id="research",
+        created_by="operator",
+        spec=WorkloadDefinition(
+            name="needs-a-secret",
+            execution=CommandExecution(command="python train.py"),
+            secret_mounts={"TOKEN": "gcp-secret://project/token"},
+        ),
+    )
+
+    with pytest.raises(InsecureManagedArtifactTransport, match="clear text"):
+        _controller(allow_insecure=False)._secret_url(workload, "TOKEN")
+
+    # Explicit consent is what makes a VPC-only plane usable at all; the point is
+    # that it is typed, not inferred.
+    assert _controller(allow_insecure=True)._secret_url(workload, "TOKEN").startswith("http://10.128.0.11:8080")

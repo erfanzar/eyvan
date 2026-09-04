@@ -542,6 +542,20 @@ class _ControllerWorkloadCommands:
         if self.artifact_access is None:
             raise RuntimeError("secret delivery is not configured on this control-plane replica")
         base = self.artifact_access.public_url
+        if base.startswith("http://") and not (
+            self.settings.dev_auth_enabled or self.settings.allow_insecure_artifact_http
+        ):
+            # The same gate the managed-artifact path has, and it matters more
+            # here: that one exposes a scoped, short-lived capability, while this
+            # exposes the capability *and* the secret value it redeems. Raised as
+            # a permanent refusal so the attempt settles and gives its accelerator
+            # back, rather than retrying forever against a scheme that will not
+            # change.
+            raise InsecureManagedArtifactTransport(
+                f"delivering secret {name!r} would send its capability, and the value it redeems, to {base} in "
+                "clear text; put the control plane behind TLS and set EYVAN_PUBLIC_URL to its https:// address, "
+                "or accept the risk explicitly with EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP=1"
+            )
         query = urlencode(
             {
                 "org_id": workload.org_id,
