@@ -450,8 +450,10 @@ def test_up_creates_one_labelled_head_and_returns_its_internal_address() -> None
     # Two audiences, two commands. On the head the installer recorded the plane,
     # so nothing is passed; from a laptop the address is private and needs both a
     # tunnel and explicit flags.
+    # This spec declares no worker interpreter, so the head provisions no second
+    # Python and the submit command is the plain one.
     assert result.next_command == (
-        "on the head: eyvan up <fleet.yaml>   |   "
+        "on the head: eyvan up <fleet.yaml> && python train.py   |   "
         "elsewhere: eyvan --url http://10.128.0.7:8080 --token <token> up <fleet.yaml>"
     )
     assert result.service_state == "active"
@@ -1693,3 +1695,73 @@ def test_a_head_without_an_artifact_store_says_its_capacity_requests_will_be_ref
     assert "--artifact-store-uri" in warning
     assert "EYVAN_NATIVE_WORKER_PACKAGE" in warning
     assert result.as_document()["artifact_store_warning"] == warning
+
+
+def test_a_head_provisions_the_interpreter_its_own_workers_run() -> None:
+    """Without it a head cannot submit to the TPUs it provisions.
+
+    A serialized callable is pinned to the interpreter that pickled it. The head
+    image ships Python 3.12 and the Cloud TPU image ships 3.10, so `@execute` on
+    a head produced a callable no worker could load -- and the check runs on the
+    worker, so the mismatch surfaced only after the accelerator was built. A live
+    multislice v5p-16 provisioned two slices and killed all four ranks proving it.
+
+    The fleet already states which interpreter its workers run, so the head
+    installs that one alongside its own and points the operator at it.
+    """
+
+    config = EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10"))
+    spec = HeadSpec.from_fleet_config(config)
+
+    assert spec.submitter_python == "3.10"
+
+    script = render_head_bootstrap_script(spec)
+
+    assert "uv venv --python 3.10 /opt/eyvan/submit" in script
+    assert "/opt/eyvan/submit/bin/python" in script
+    # The head's own environment is still built with the image's interpreter, so
+    # a uv that cannot be fetched costs the submitter and nothing else.
+    assert "python3 -m venv /opt/eyvan/venv" in script
+    assert "uv unavailable" in script
+
+
+def test_a_fleet_that_declares_no_interpreter_provisions_no_submitter() -> None:
+    """Silence is not a request: a command-only fleet needs no second Python."""
+
+    spec = _spec()
+
+    assert spec.submitter_python is None
+    script = render_head_bootstrap_script(spec)
+    assert "uv venv" not in script
+
+
+def _fleet_file_declaring_python(version: str) -> str:
+    """Write a minimal fleet whose pools state the interpreter their workers run."""
+
+    import tempfile
+
+    directory = tempfile.mkdtemp()
+    path = Path(directory) / "fleet.yaml"
+    path.write_text(
+        f"""
+version: 1
+name: research
+provider:
+  type: gcp
+  project: example-project-1
+  region: us-east5
+  zone: us-east5-a
+executor: eyvan-native
+runtime:
+  python: "{version}"
+pools:
+  v5p-16:
+    capacity_class: spot
+    min_workers: 0
+    max_workers: 2
+    provider_options:
+      bootstrap_egress: public-internet
+""",
+        encoding="utf-8",
+    )
+    return str(path)

@@ -107,6 +107,9 @@ HEAD_VENV_PATH = "/opt/eyvan/venv"
 #: The server mounts this only when the directory exists, so a head built
 #: without a bundle simply serves the API and says so.
 HEAD_DASHBOARD_DIR = "/opt/eyvan/dashboard"
+#: Where a head installs the interpreter its workers run, so that submitting from
+#: the head works without the operator building a matching environment by hand.
+HEAD_SUBMITTER_DIR = "/opt/eyvan/submit"
 HEAD_SERVICE_NAME = "eyvan-head.service"
 #: A cell agent on the head. Every capacity pool needs an agent endpoint, and a
 #: loopback development plane quietly supplies one -- so a fleet that applied on
@@ -312,6 +315,13 @@ class HeadSpec:
     #: because the plane is unreachable from outside that network, which is why
     #: it is a flag an operator types rather than an inference.
     allow_insecure_artifact_http: bool = False
+    #: The interpreter this head provisions for *submitting* work, matching the
+    #: one its workers run. A pickled callable cannot load on another version, so
+    #: a head running 3.12 against a Cloud TPU image shipping 3.10 can submit
+    #: nothing at all -- which cost two provisioned slices and four dead ranks to
+    #: discover. ``None`` when the fleet declares no interpreter, or when its
+    #: pools disagree and there is no single one to provide.
+    submitter_python: str | None = None
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
 
@@ -391,12 +401,15 @@ class HeadSpec:
             raise ValueError("fleet configuration has no provider.zone and none was supplied")
         region = overrides.pop("region", None) or config.provider.region
         egress = overrides.pop("egress", None) or _fleet_bootstrap_egress(config)
+        submitter_python = overrides.pop("submitter_python", None) or _fleet_runtime_python(config)
         if egress is None:
             legal = ", ".join(BOOTSTRAP_EGRESS_MODES)
             raise ValueError(
                 f"fleet pools declare no single provider_options.bootstrap_egress; pass --egress with one of: {legal}"
             )
         supplied = {key: value for key, value in overrides.items() if value is not None}
+        if submitter_python is not None:
+            supplied["submitter_python"] = submitter_python
         return cls(
             fleet=config.name,
             project=project,
@@ -506,6 +519,26 @@ def _fleet_bootstrap_egress(config: EyvanFleetConfig) -> str | None:
     if len(legal) == 1 and len(declared) == 1:
         return legal.pop()
     return None
+
+
+def _fleet_runtime_python(config: EyvanFleetConfig) -> str | None:
+    """Return the interpreter every pool agrees its workers run, or ``None``.
+
+    Same reasoning as the egress mode above, and the same consequence for getting
+    it wrong: a serialized callable cannot load on an interpreter other than the
+    one that pickled it, so a head whose Python differs from its workers' can
+    submit nothing. Pools that disagree get ``None`` -- there is no single answer
+    to provision, and guessing one would make some of the fleet unusable while
+    looking configured.
+    """
+
+    declared: set[str] = set()
+    for payload in config.pool_payloads():
+        runtime = payload.get("runtime")
+        python = runtime.get("python") if isinstance(runtime, dict) else None
+        if isinstance(python, str) and python:
+            declared.add(python)
+    return declared.pop() if len(declared) == 1 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1036,6 +1069,36 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         f"chmod -R a+rX {HEAD_VENV_PATH}",
         "",
     ]
+    if spec.submitter_python:
+        lines.extend(
+            (
+                "# An interpreter matching the one this fleet's workers run.",
+                "#",
+                "# A serialized callable cannot load on any other version, so a head",
+                "# whose Python differs from its workers' can submit nothing at all:",
+                "# every rank dies on the version check *after* the accelerator has",
+                "# been provisioned. Observed on a live multislice v5p-16 -- two slices",
+                "# built, four ranks started, all four dead on 'callable requires",
+                "# Python 3.12; current runtime is 3.10'.",
+                "#",
+                "# uv is used only here, and only to fetch a standalone interpreter the",
+                "# base image does not carry. The head's own venv is still built with",
+                "# the image's python3, so a uv that cannot be fetched costs the",
+                "# submitter environment and nothing else.",
+                "if ! command -v uv >/dev/null 2>&1; then",
+                "  curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh || true",
+                "fi",
+                "if command -v uv >/dev/null 2>&1; then",
+                f"  rm -rf {HEAD_SUBMITTER_DIR}",
+                f"  uv venv --python {shlex.quote(spec.submitter_python)} {HEAD_SUBMITTER_DIR}",
+                f"  uv pip install --python {HEAD_SUBMITTER_DIR}/bin/python --quiet {HEAD_WHEEL_DIR}/*.whl",
+                f"  chmod -R a+rX {HEAD_SUBMITTER_DIR}",
+                "else",
+                f"  echo 'eyvan: uv unavailable; no Python {spec.submitter_python} submitter was installed' >&2",
+                "fi",
+                "",
+            )
+        )
     if spec.database_url is None:
         lines.extend(
             (
@@ -1178,8 +1241,13 @@ class HeadUpResult:
         # node serves, so the CLI and the SDK discover the URL and the credential.
         # From anywhere else the address is a private VPC one, so it needs a
         # tunnel and an explicit flag.
+        # Naming the submitter matters as much as naming the URL: a callable
+        # pickled by the wrong interpreter is refused on the accelerator, and the
+        # head's own python is not the one its workers run.
+        submit = f"{HEAD_SUBMITTER_DIR}/bin/python train.py" if self.spec.submitter_python else "python train.py"
         return (
-            f"on the head: eyvan up <fleet.yaml>   |   elsewhere: eyvan --url {self.url} --token <token> up <fleet.yaml>"
+            f"on the head: eyvan up <fleet.yaml> && {submit}   |   "
+            f"elsewhere: eyvan --url {self.url} --token <token> up <fleet.yaml>"
         )
 
     @property
@@ -1249,6 +1317,7 @@ class HeadUpResult:
             "adopted_instance": self.adopted_instance,
             "authentication_warning": self.authentication_warning,
             "artifact_store_warning": self.artifact_store_warning,
+            "submitter_python_path": (f"{HEAD_SUBMITTER_DIR}/bin/python" if self.spec.submitter_python else None),
             "callable_trust_warning": self.callable_trust_warning,
             "created_firewall_rules": list(self.created_firewall_rules),
             "dashboard_url": self.dashboard_url,
