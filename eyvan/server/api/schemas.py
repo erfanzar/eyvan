@@ -882,6 +882,28 @@ class HealthResponse(ApiModel):
     controller: ServerControllerMode
 
 
+class BuildResponse(ApiModel):
+    """What code this control plane is made of.
+
+    Every component of this system reports one version string, so a caller
+    cannot tell from it whether the plane it is talking to is the build a
+    receipt was minted against. ``source_digest`` distinguishes them; it is
+    ``None``, with ``digest_detail`` saying why, when it could not be computed
+    in full -- never a digest over the part of the tree that happened to be
+    readable.
+    """
+
+    version: str
+    origin: str
+    origin_detail: str = ""
+    source_digest: str | None = None
+    digest_detail: str = ""
+    file_count: int = 0
+    python: str
+    platform: str
+    controller: ServerControllerMode
+
+
 class ErrorResponse(ApiModel):
     detail: str
 

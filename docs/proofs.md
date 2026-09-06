@@ -20,7 +20,36 @@ reclaimed, a pool that never got a cell, an observation taken outside the warm
 window -- each produces a clean-looking run that establishes nothing, and reading
 it off a screen at the end of a spend is exactly when nobody is inclined to
 notice. The judgement lives in `eyvan/sdk/commands/proof.py` and is tested
-without hardware; the commands only fetch.
+without hardware; the commands only fetch. A refusal -- a mistyped option, a
+receipt path already taken -- exits **3**, because a run that never happened
+must not wear a verdict's exit code.
+
+**The attribution is executable too.** Every proof command takes `--receipt
+PATH`, which writes the verdict together with the things prose cannot carry: the
+sha256 of the evaluator function that decided it, the build digest of the client
+that ran it, the build digest the plane reported for itself, and a computed list
+of the dimensions the run left unestablished. Two builds of this package report
+the same version string, so the digest is the only thing that distinguishes
+them; `GET /api/v1/build` is what a plane answers with. `--evidence PATH` writes
+the documents the verdict was read from, owner-only and redacted of any secret
+value the run was given.
+
+```bash
+eyvan proof preemption <workload-id> --receipt ~/receipts/p5.json --evidence ~/receipts/p5-evidence.json
+eyvan proof verify ~/receipts/p5.json     # 0 only if it qualifies the build in front of it
+```
+
+`eyvan proof verify` is the sentence at the top of this page as a command: it
+refuses a receipt whose criterion has changed since the run, whose candidate
+build is not the one running, or whose recorded verdict was not a pass. It never
+upgrades an outcome. A receipt is written once -- an existing path is refused
+before the plane is polled, while the run is still free -- and its `receipt_digest`
+detects editing, not forgery: there is no signing key here, and the receipt says
+so in its own `unverified` list rather than implying one.
+
+What a receipt still cannot say: which build the cell agent and the worker were
+running. Only the client and the control plane identify themselves today, and
+every receipt records that gap explicitly.
 
 P2 and P3 stay procedural on purpose: they need a host killed mid-stream and a
 job that submits its own children, and an "automated" verdict over a run whose

@@ -520,6 +520,9 @@ def test_every_proof_evaluator_has_a_command() -> None:
         "kubernetes",
         "children",
         "logs",
+        # Not a criterion and not a spend: it reads a receipt an earlier run
+        # wrote and decides whether that run qualifies the build in front of it.
+        "verify",
     }
 
 

@@ -27,6 +27,7 @@ import click
 
 from eyvan._internal.workspace import create_private_directory
 from eyvan.sdk.commands.common import JsonRenderer
+from eyvan.sdk.commands.receipts import write_receipt_atomic
 from eyvan.sdk.commands.state import CliSession
 from eyvan.soak_contract import (
     AVAILABILITY_BUDGET_CATEGORIES,
@@ -1728,32 +1729,6 @@ def build_preflight_receipt(reason_codes: tp.Iterable[str]) -> dict[str, object]
         "inconclusive_reason_codes": reasons,
         "reasons": reasons,
     }
-
-
-def write_receipt_atomic(path: Path, receipt: tp.Mapping[str, object]) -> None:
-    """Fsync and atomically replace ``path`` with one finite JSON receipt."""
-
-    target = Path(path)
-    parent = target.parent
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(receipt, handle, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        try:
-            directory = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except OSError:
-            pass
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def execute_soak(

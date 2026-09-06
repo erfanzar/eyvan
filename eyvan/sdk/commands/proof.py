@@ -26,13 +26,24 @@ created, so nothing contradicted the claim" is not a pass.
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 
 import click
 
 from eyvan._internal.compat import StrEnum
 from eyvan.sdk.commands.common import JsonRenderer
+from eyvan.sdk.commands.receipts import (
+    build_proof_receipt,
+    criterion_identity,
+    file_evidence,
+    write_receipt_atomic,
+)
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.service.subjobs import MAX_LIVE_CHILDREN
 
@@ -50,6 +61,12 @@ class Verdict(StrEnum):
 
 #: Exit codes, so a scheduled run can tell the two non-passes apart.
 EXIT_CODES = {Verdict.PASS: 0, Verdict.FAIL: 1, Verdict.INCONCLUSIVE: 2}
+
+#: The proof was refused before it ran, so it has no verdict at all. Distinct
+#: from all three of them: a caller that read a refused run as INCONCLUSIVE
+#: would retry the spend, and one that read it as FAIL would report a defect
+#: nothing observed.
+EXIT_NOT_RUN = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,18 +633,169 @@ def evaluate_structured_logs(page: dict, *, expected_ranks: int) -> ProofResult:
 # --------------------------------------------------------------------------- the command
 
 
-@click.group("proof")
+class _ProofGroup(click.Group):
+    """A group whose refusals never wear a verdict's exit code.
+
+    Click answers a mistyped option with exit 2, which is this group's code for
+    INCONCLUSIVE. A scheduled run would then record "the behaviour was not
+    exercised, repeat the spend" for a command that can never work as typed.
+    Refusals exit :data:`EXIT_NOT_RUN` instead, and only an evaluated criterion
+    produces 0, 1, or 2.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except click.UsageError as error:
+            error.show()
+            raise SystemExit(EXIT_NOT_RUN) from error
+
+
+@click.group("proof", cls=_ProofGroup)
 def proof() -> None:
     """Decide a hardware proof's stated criterion against the live plane.
 
     Every criterion in ``docs/proofs.md`` is evaluated here rather than read off
-    a screen at the end of a spend. Exits 0 on pass, 1 on failure, and 2 when the
+    a screen at the end of a spend. Exits 0 on pass, 1 on failure, 2 when the
     run did not exercise the behaviour -- because "nothing contradicted it" is
-    not evidence, and it is the answer most likely to be mistaken for one.
+    not evidence, and it is the answer most likely to be mistaken for one -- and
+    3 when the proof was refused before it ran and so has no verdict.
+
+    ``--receipt`` writes what a later reader needs to tell whether the run
+    qualifies the build in front of them: the verdict, the digest of the
+    criterion that decided it, the builds of the client and the plane, and the
+    dimensions the run left unestablished. ``eyvan proof verify`` reads one back.
     """
 
 
-def _emit(result: ProofResult) -> None:
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _refuse(message: str) -> tp.NoReturn:
+    """Stop before the proof runs, without minting a verdict for it."""
+
+    click.echo(f"eyvan proof: {message}", err=True)
+    raise SystemExit(EXIT_NOT_RUN)
+
+
+@dataclass
+class _ProofRun:
+    """One invocation: what it is judging, and what it observed judging it.
+
+    Exists so a receipt can name the criterion that produced the verdict and the
+    plane it was produced against. Both are known at the call site and nowhere
+    else -- the evaluator is a plain function, and the observations are whatever
+    that command happened to fetch.
+    """
+
+    proof: str
+    evaluator: tp.Callable[..., ProofResult]
+    session: CliSession | None = None
+    receipt: str | None = None
+    evidence: str | None = None
+    #: Values that must not be written to the evidence file even though the run
+    #: read them. The verdict records whether a secret leaked; copying the leaked
+    #: value into a second durable file would widen the leak to report it.
+    secrets: tuple[str, ...] = ()
+    started_at: str = field(default_factory=_utc_now)
+    observations: dict[str, object] = field(default_factory=dict)
+
+    def seen(self, name: str, value: tp.Any) -> tp.Any:
+        """Record one fetched document and return it unchanged."""
+
+        self.observations[name] = value
+        return value
+
+    def preflight(self) -> None:
+        """Refuse an output path that already holds a receipt.
+
+        Checked before the plane is polled, so a run that cannot record its
+        result is stopped while it is still free rather than after the spend.
+        """
+
+        for label, path in (("receipt", self.receipt), ("evidence", self.evidence)):
+            if path is not None and Path(path).exists():
+                _refuse(f"{label} path {path} already exists; a receipt is written once, never over another run")
+
+    def _plane_build(self) -> tuple[dict[str, object] | None, str]:
+        """Ask the plane what code it is running.
+
+        A plane that predates the route answers 404, which is recorded as an
+        unknown build rather than treated as an error: the proof still ran, and
+        the receipt says exactly which dimension it could not establish.
+        """
+
+        if self.session is None:
+            return None, "this proof does not poll a control plane"
+        try:
+            document = self.session.client.request("GET", "/api/v1/build")
+        except click.ClickException as error:
+            return None, f"the plane did not report a build: {error.message}"
+        except OSError as error:
+            return None, f"the plane could not be reached for its build: {error}"
+        return (document, "") if isinstance(document, dict) else (None, "the plane returned a malformed build document")
+
+    def _write_evidence(self) -> dict[str, object] | None:
+        if self.evidence is None or not self.observations:
+            return None
+        from eyvan.secrets import redact_secret_material
+
+        payload = json.dumps(self.observations, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+        # Opened owner-only rather than narrowed afterwards: a plane document
+        # carries fields this run has no way to exhaustively redact, and the
+        # window between creating it under the umask and chmod-ing it is exactly
+        # long enough for another process on a shared host to read it.
+        descriptor = os.open(self.evidence, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(redact_secret_material(payload, secrets=self.secrets))
+        return file_evidence(self.evidence)
+
+    def record(self, result: ProofResult) -> None:
+        """Write this run's evidence and receipt, if either was asked for."""
+
+        evidence = self._write_evidence()
+        if self.receipt is None:
+            return
+        plane_build, plane_detail = self._plane_build()
+        write_receipt_atomic(
+            self.receipt,
+            build_proof_receipt(
+                proof=result.proof,
+                verdict=result.verdict.value,
+                exit_status=EXIT_CODES[result.verdict],
+                checks=[check.as_dict() for check in result.checks],
+                criterion=criterion_identity(self.evaluator),
+                plane_url=None if self.session is None else self.session.base_url,
+                plane_build=plane_build,
+                plane_build_detail=plane_detail,
+                started_at=self.started_at,
+                completed_at=_utc_now(),
+                command=sys.argv,
+                evidence=evidence,
+            ),
+        )
+
+
+def _receipt_options(command: tp.Callable[..., None]) -> tp.Callable[..., None]:
+    """Attach the two output options every proof shares."""
+
+    command = click.option(
+        "--evidence",
+        type=click.Path(dir_okay=False, writable=True),
+        help="Write the raw documents this proof read, redacted of secret material, to this path.",
+    )(command)
+    return click.option(
+        "--receipt",
+        type=click.Path(dir_okay=False, writable=True),
+        help="Write an immutable receipt naming the verdict, the criterion that decided it, and what it left "
+        "unestablished. Refuses to overwrite an existing file.",
+    )(command)
+
+
+def _emit(result: ProofResult, run: _ProofRun | None = None) -> None:
+    if run is not None:
+        run.record(result)
     JsonRenderer().emit(result.as_dict())
     raise SystemExit(EXIT_CODES[result.verdict])
 
@@ -655,41 +823,49 @@ def _gather(proof_name: str, fetch: tp.Callable[[], ProofResult]) -> ProofResult
 
 @proof.command("catalog")
 @click.option("--accelerator-type", required=True, help="The shape the fleet declares, e.g. v5p-16.")
+@_receipt_options
 @click.pass_obj
-def catalog_proof(session: CliSession, accelerator_type: str) -> None:
+def catalog_proof(session: CliSession, accelerator_type: str, receipt: str | None, evidence: str | None) -> None:
     """P1 -- pool resources and host count come from the catalog."""
 
     from eyvan.capacity.hardware_catalog import shape_for
 
+    run = _ProofRun("P1", evaluate_catalog_authority, session=session, receipt=receipt, evidence=evidence)
+    run.preflight()
     shape = shape_for(accelerator_type)
     _emit(
         _gather(
             "P1",
             lambda: evaluate_catalog_authority(
-                session.client.request("GET", "/api/v1/capacity-pools"),
-                session.client.request("GET", "/api/v1/cells"),
+                run.seen("capacity-pools", session.client.request("GET", "/api/v1/capacity-pools")),
+                run.seen("cells", session.client.request("GET", "/api/v1/cells")),
                 accelerator_type=accelerator_type,
                 catalog_hosts=None if shape is None else shape.hosts,
             ),
-        )
+        ),
+        run,
     )
 
 
 @proof.command("preemption")
 @click.argument("workload_id")
+@_receipt_options
 @click.pass_obj
-def preemption_proof(session: CliSession, workload_id: str) -> None:
+def preemption_proof(session: CliSession, workload_id: str, receipt: str | None, evidence: str | None) -> None:
     """P5 -- a reclaimed Spot slice is charged to the preemption budget."""
 
+    run = _ProofRun("P5", evaluate_spot_preemption, session=session, receipt=receipt, evidence=evidence)
+    run.preflight()
     _emit(
         _gather(
             "P5",
             lambda: evaluate_spot_preemption(
-                session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
-                session.client.request("GET", "/api/v1/cells"),
-                session.client.request("GET", "/api/v1/capacity-pools"),
+                run.seen("workload", session.client.request("GET", f"/api/v1/workloads/{workload_id}")),
+                run.seen("cells", session.client.request("GET", "/api/v1/cells")),
+                run.seen("capacity-pools", session.client.request("GET", "/api/v1/capacity-pools")),
             ),
-        )
+        ),
+        run,
     )
 
 
@@ -698,8 +874,9 @@ def preemption_proof(session: CliSession, workload_id: str) -> None:
 @click.option(
     "--inside", type=click.Path(exists=True, dir_okay=False), required=True, help="Warmth JSON from inside the window."
 )
+@_receipt_options
 @click.pass_obj
-def warm_window_proof(session: CliSession, pool_id: str, inside: str) -> None:
+def warm_window_proof(session: CliSession, pool_id: str, inside: str, receipt: str | None, evidence: str | None) -> None:
     """P6 -- a warm window held its floor and released it.
 
     ``--inside`` is a warmth report captured earlier, because one observation
@@ -707,25 +884,30 @@ def warm_window_proof(session: CliSession, pool_id: str, inside: str) -> None:
     Capture it with ``eyvan capacity warmth --json`` during the window.
     """
 
-    import json
-
+    run = _ProofRun("P6", evaluate_warm_window, session=session, receipt=receipt, evidence=evidence)
+    run.preflight()
     with open(inside, encoding="utf-8") as handle:
         captured = json.load(handle)
+    run.seen("warmth-inside-window", captured)
     _emit(
         _gather(
             "P6",
             lambda: evaluate_warm_window(
                 captured,
-                session.client.request("GET", "/api/v1/capacity/warmth"),
+                run.seen("warmth-now", session.client.request("GET", "/api/v1/capacity/warmth")),
                 # Scoped to this pool. The fleet-wide report counts every cell
                 # the plane has ever held, and a long-lived fleet's historical
                 # unpriced cells would make the cost half inconclusive on every
                 # run regardless of how the pool under test is priced -- found
                 # by running P6 against a plane with 33 of them.
-                session.client.request("GET", "/api/v1/capacity/billing", params={"pool_id": pool_id}),
+                run.seen(
+                    "billing",
+                    session.client.request("GET", "/api/v1/capacity/billing", params={"pool_id": pool_id}),
+                ),
                 pool_id=pool_id,
             ),
-        )
+        ),
+        run,
     )
 
 
@@ -740,9 +922,16 @@ def warm_window_proof(session: CliSession, pool_id: str, inside: str) -> None:
 )
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
+@_receipt_options
 @click.pass_obj
 def secret_proof(
-    session: CliSession, workload_id: str, value_file: str, org_id: str | None, project_id: str | None
+    session: CliSession,
+    workload_id: str,
+    value_file: str,
+    org_id: str | None,
+    project_id: str | None,
+    receipt: str | None,
+    evidence: str | None,
 ) -> None:
     """P4 -- the secret is delivered, used, and recorded nowhere.
 
@@ -753,32 +942,48 @@ def secret_proof(
 
     with open(value_file, encoding="utf-8") as handle:
         value = handle.read().strip()
+    run = _ProofRun(
+        "P4",
+        evaluate_secret_delivery,
+        session=session,
+        receipt=receipt,
+        evidence=evidence,
+        # The evidence file is the one place a leaked secret would be copied to
+        # by the very run that exists to find the leak. The checks record whether
+        # it leaked; the evidence does not have to carry it to prove that.
+        secrets=(value,),
+    )
+    run.preflight()
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     _emit(
         _gather(
             "P4",
             lambda: evaluate_secret_delivery(
-                session.client.request(
-                    "GET",
-                    "/api/v1/events",
-                    # Filtered to this workload rather than reading the project's
-                    # first thousand events. `/api/v1/events` pages oldest-first
-                    # from `after_sequence`, so on any project with prior history
-                    # the window never reaches the run the proof was pointed at --
-                    # and the evaluator then judged a run it could not see.
-                    params={
-                        "org_id": scope.org_id,
-                        "project_id": scope.project_id,
-                        "entity_type": "workload",
-                        "entity_id": workload_id,
-                        "limit": "1000",
-                    },
+                run.seen(
+                    "events",
+                    session.client.request(
+                        "GET",
+                        "/api/v1/events",
+                        # Filtered to this workload rather than reading the project's
+                        # first thousand events. `/api/v1/events` pages oldest-first
+                        # from `after_sequence`, so on any project with prior history
+                        # the window never reaches the run the proof was pointed at --
+                        # and the evaluator then judged a run it could not see.
+                        params={
+                            "org_id": scope.org_id,
+                            "project_id": scope.project_id,
+                            "entity_type": "workload",
+                            "entity_id": workload_id,
+                            "limit": "1000",
+                        },
+                    ),
                 ),
-                session.client.request("GET", f"/api/v1/workloads/{workload_id}"),
-                str(session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs")),
+                run.seen("workload", session.client.request("GET", f"/api/v1/workloads/{workload_id}")),
+                str(run.seen("logs", session.client.request("GET", f"/api/v1/workloads/{workload_id}/logs"))),
                 secret_value=value,
             ),
-        )
+        ),
+        run,
     )
 
 
@@ -789,6 +994,7 @@ def secret_proof(
 @click.option("--safe-queue", default="eyvan-safe", show_default=True)
 @click.option("--unsafe-queue", default="eyvan-unsafe", show_default=True)
 @click.option("--namespace", default="eyvan", show_default=True)
+@_receipt_options
 def kubernetes_proof(
     api_server: str,
     token_file: str,
@@ -796,6 +1002,8 @@ def kubernetes_proof(
     safe_queue: str,
     unsafe_queue: str,
     namespace: str,
+    receipt: str | None,
+    evidence: str | None,
 ) -> None:
     """P7 -- drive the real Kubernetes transport against a real API server.
 
@@ -815,6 +1023,8 @@ def kubernetes_proof(
     from eyvan.capacity.drivers.kubernetes import KubernetesCapacityDriver
     from eyvan.capacity.providers.kubernetes.api import KubernetesApi
 
+    run = _ProofRun("P7", evaluate_kubernetes_preconditions, receipt=receipt, evidence=evidence)
+    run.preflight()
     driver = KubernetesCapacityDriver(api=KubernetesApi(base_url=api_server, token_path=token_file, ca_path=ca_file))
 
     def probe(queue: str | None) -> str | None:
@@ -828,14 +1038,18 @@ def kubernetes_proof(
         _gather(
             "P7",
             lambda: evaluate_kubernetes_preconditions(
-                {
-                    "no-queue": probe(None),
-                    "safe-queue": probe(safe_queue),
-                    "unsafe-queue": probe(unsafe_queue),
-                    "missing-queue": probe("eyvan-proof-absent-queue"),
-                }
+                run.seen(
+                    "queue-probes",
+                    {
+                        "no-queue": probe(None),
+                        "safe-queue": probe(safe_queue),
+                        "unsafe-queue": probe(unsafe_queue),
+                        "missing-queue": probe("eyvan-proof-absent-queue"),
+                    },
+                )
             ),
-        )
+        ),
+        run,
     )
 
 
@@ -848,6 +1062,7 @@ def kubernetes_proof(
     help="HTTP status from reusing the capability after the parent terminated. Omit if not attempted.",
 )
 @click.option("--ceiling-status", type=int, help="HTTP status from exceeding the live-children ceiling.")
+@_receipt_options
 @click.pass_obj
 def children_proof(
     session: CliSession,
@@ -855,6 +1070,8 @@ def children_proof(
     expected: int,
     late_submit_status: int | None,
     ceiling_status: int | None,
+    receipt: str | None,
+    evidence: str | None,
 ) -> None:
     """P3 -- a running job submits children under its owner's identity.
 
@@ -865,17 +1082,20 @@ def children_proof(
     report inconclusive when omitted.
     """
 
+    run = _ProofRun("P3", evaluate_in_job_submission, session=session, receipt=receipt, evidence=evidence)
+    run.preflight()
     _emit(
         _gather(
             "P3",
             lambda: evaluate_in_job_submission(
-                session.client.request("GET", f"/api/v1/workloads/{parent_id}"),
-                session.client.request("GET", f"/api/v1/workloads/{parent_id}/children"),
+                run.seen("parent", session.client.request("GET", f"/api/v1/workloads/{parent_id}")),
+                run.seen("children", session.client.request("GET", f"/api/v1/workloads/{parent_id}/children")),
                 expected_children=expected,
                 late_submit_status=late_submit_status,
                 ceiling_status=ceiling_status,
             ),
-        )
+        ),
+        run,
     )
 
 
@@ -883,8 +1103,11 @@ def children_proof(
 @click.argument("workload_id")
 @click.option("--ranks", type=int, default=1, show_default=True, help="How many hosts the workload actually spans.")
 @click.option("--limit", type=int, default=50, show_default=True)
+@_receipt_options
 @click.pass_obj
-def logs_proof(session: CliSession, workload_id: str, ranks: int, limit: int) -> None:
+def logs_proof(
+    session: CliSession, workload_id: str, ranks: int, limit: int, receipt: str | None, evidence: str | None
+) -> None:
     """P2 -- per-rank structured logs, with an unreachable rank visible.
 
     ``--ranks`` is supplied rather than inferred, because inferring it from the
@@ -892,13 +1115,148 @@ def logs_proof(session: CliSession, workload_id: str, ranks: int, limit: int) ->
     the exact confusion this proof is about.
     """
 
+    run = _ProofRun("P2", evaluate_structured_logs, session=session, receipt=receipt, evidence=evidence)
+    run.preflight()
     _emit(
         _gather(
             "P2",
             lambda: evaluate_structured_logs(
-                session.client.request("GET", f"/api/v1/workloads/{workload_id}/log-page", params={"limit": limit}),
+                run.seen(
+                    "log-page",
+                    session.client.request("GET", f"/api/v1/workloads/{workload_id}/log-page", params={"limit": limit}),
+                ),
                 expected_ranks=ranks,
             ),
+        ),
+        run,
+    )
+
+
+# --------------------------------------------------------------------------- reading one back
+
+
+#: The evaluators a receipt may name, so verification can find the criterion a
+#: run recorded and hash the version this build carries.
+_EVALUATORS: dict[str, tp.Callable[..., ProofResult]] = {
+    "P1": evaluate_catalog_authority,
+    "P2": evaluate_structured_logs,
+    "P3": evaluate_in_job_submission,
+    "P4": evaluate_secret_delivery,
+    "P5": evaluate_spot_preemption,
+    "P6": evaluate_warm_window,
+    "P7": evaluate_kubernetes_preconditions,
+}
+
+
+def evaluate_receipt(
+    document: tp.Mapping[str, object],
+    *,
+    digest_intact: bool | None,
+    criterion_now: tp.Mapping[str, object] | None,
+    build_now: tp.Mapping[str, object],
+) -> ProofResult:
+    """Decide whether a receipt qualifies the build in front of it.
+
+    Three separate questions, kept separate because their answers differ:
+    whether the receipt still says what it said (``digest_intact``), whether the
+    criterion that produced the verdict is the criterion this build carries
+    (``criterion_now``), and whether the code judged is the code running
+    (``build_now``). A receipt can be perfectly intact and still fail to qualify
+    anything, which is precisely the case ``docs/proofs.md`` warns about.
+
+    A verdict that was not PASS stays not-PASS here. Verification never upgrades
+    an outcome; the most it can do is refuse one.
+    """
+
+    checks: list[Check] = []
+
+    if digest_intact is False:
+        checks.append(_failed("receipt-intact", "this receipt no longer digests to the value it records"))
+    elif digest_intact is None:
+        checks.append(_unknown("receipt-intact", "this receipt records no digest, so editing cannot be ruled out"))
+    else:
+        checks.append(_passed("receipt-intact", "the receipt digests to the value it records"))
+
+    verdict = document.get("verdict")
+    if verdict == Verdict.PASS.value:
+        checks.append(_passed("verdict", "the run passed its criterion"))
+    elif verdict in {Verdict.FAIL.value, Verdict.INCONCLUSIVE.value}:
+        checks.append(_failed("verdict", f"the run recorded {verdict}, which qualifies nothing"))
+    else:
+        checks.append(_unknown("verdict", f"the receipt records no verdict this build understands: {verdict!r}"))
+
+    recorded = document.get("criterion")
+    recorded_digest = recorded.get("source_digest") if isinstance(recorded, dict) else None
+    if criterion_now is None:
+        checks.append(
+            _unknown(
+                "criterion-current",
+                f"this build has no evaluator for {document.get('proof')!r}, so the criterion cannot be compared",
+            )
+        )
+    elif not isinstance(recorded_digest, str) or not recorded_digest:
+        checks.append(_unknown("criterion-current", "the receipt records no criterion digest to compare"))
+    elif recorded_digest == criterion_now.get("source_digest"):
+        checks.append(_passed("criterion-current", "the criterion that decided this verdict is the one running here"))
+    else:
+        checks.append(
+            _failed(
+                "criterion-current",
+                "the criterion changed since this run: the recorded verdict was decided by different code",
+            )
+        )
+
+    recorded_candidate = document.get("candidate")
+    recorded_build = recorded_candidate.get("build") if isinstance(recorded_candidate, dict) else None
+    recorded_source = recorded_build.get("source_digest") if isinstance(recorded_build, dict) else None
+    running = build_now.get("source_digest")
+    if not isinstance(recorded_source, str) or not recorded_source or not isinstance(running, str) or not running:
+        checks.append(
+            _unknown("candidate-current", "one of the two builds has no source digest, so they cannot be compared")
+        )
+    elif recorded_source == running:
+        checks.append(_passed("candidate-current", "the build that ran this proof is the build running here"))
+    else:
+        checks.append(
+            _failed(
+                "candidate-current",
+                f"this receipt qualifies {recorded_source}, and this build is {running}",
+            )
+        )
+
+    return ProofResult(f"verify:{document.get('proof')}", tuple(checks))
+
+
+@proof.command("verify")
+@click.argument("receipt_path", type=click.Path(exists=True, dir_okay=False))
+def verify_proof(receipt_path: str) -> None:
+    """Decide whether a receipt qualifies *this* build.
+
+    ``docs/proofs.md`` says no historical run qualifies the current candidate
+    without an exact-candidate receipt. This is that sentence as a command: it
+    compares the build and the criterion the receipt names against the ones in
+    front of it, and refuses rather than assuming the intervening changes were
+    irrelevant.
+
+    Exits with the usual proof codes, so it can gate a release the same way a
+    proof gates a spend.
+    """
+
+    from eyvan._internal.build_identity import build_identity
+    from eyvan.sdk.commands.receipts import read_receipt, receipt_digest_matches
+
+    try:
+        document = read_receipt(receipt_path)
+    except (ValueError, OSError) as error:
+        _refuse(f"{receipt_path} is not a receipt this build can read: {error}")
+
+    evaluator = _EVALUATORS.get(str(document.get("proof")))
+    _emit(
+        evaluate_receipt(
+            document,
+            digest_intact=receipt_digest_matches(document),
+            criterion_now=None if evaluator is None else criterion_identity(evaluator),
+            build_now=build_identity().as_dict(),
         )
     )
 
@@ -911,12 +1269,14 @@ def register_proof_commands(main: click.Group) -> None:
 
 __all__ = (
     "EXIT_CODES",
+    "EXIT_NOT_RUN",
     "Check",
     "ProofResult",
     "Verdict",
     "evaluate_catalog_authority",
     "evaluate_in_job_submission",
     "evaluate_kubernetes_preconditions",
+    "evaluate_receipt",
     "evaluate_secret_delivery",
     "evaluate_spot_preemption",
     "evaluate_structured_logs",

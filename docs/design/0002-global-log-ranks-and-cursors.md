@@ -18,11 +18,16 @@ Deliberately still off by default: the bound v2 cursor envelope
 only safe once every serving and rollback image carries the decoder and the
 manifest-driven reader. The readers ship enabled; the writers do not.
 
+Closed since that record was written: the live-to-archive handover. A live
+cursor's leaf positions are now placed inside each rank's archived object by
+finding the line carrying that exact backend cursor, so a follower crossing the
+boundary continues instead of replaying the archive from its first line on every
+poll. A position matching no line, or more than one, is an explicit gap rather
+than a silent duplicate or skip.
+
 Still pending: a retained legacy multi-rank cursor is answered with a reset
-rather than resumed, because nothing can prove which rank space it names; the
-live-to-archive cursor handover does not translate live positions into archive
-offsets, so an archived read replays from the start; and none of this is
-qualified on real multi-host hardware -- P2 remains at exit 2.
+rather than resumed, because nothing can prove which rank space it names; and
+none of this is qualified on real multi-host hardware -- P2 remains at exit 2.
 
 **Scope:** Live structured logs, multi-worker cells, multi-cell gangs, resume
 cursors, terminal archives, and legacy readers. The context below records the

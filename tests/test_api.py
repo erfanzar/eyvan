@@ -410,6 +410,32 @@ def test_default_server_lifespan_runs_the_controller(monkeypatch) -> None:
     assert stopped.wait(timeout=1)
 
 
+def test_the_plane_states_what_code_it_is_running() -> None:
+    """Version is the same string in every component; the digest is not.
+
+    An operator upgrading a fleet, or a proof recording what it polled, needs to
+    tell one build from another. A stale agent has already carried a proof to a
+    verdict that read as evidence.
+    """
+
+    client = TestClient(create_app(settings=EyvanSettings(dev_auth_enabled=True)))
+
+    document = client.get("/api/v1/build", headers=_headers()).json()
+
+    assert document["source_digest"].startswith("sha256:"), document["digest_detail"]
+    assert document["file_count"] > 100
+    assert document["origin"] in {"wheel", "editable", "source"}
+    assert document["controller"] == "active"
+
+
+def test_the_build_route_is_not_public() -> None:
+    """A build digest and an interpreter version are a fingerprint."""
+
+    client = TestClient(create_app(settings=EyvanSettings(dev_auth_enabled=True)))
+
+    assert client.get("/api/v1/build").status_code == 401
+
+
 def test_batch_route_creates_an_array_and_replays_it_identically() -> None:
     """One request, N tasks, one coordinator that is never scheduled."""
 

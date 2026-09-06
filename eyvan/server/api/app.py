@@ -32,6 +32,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_l
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from eyvan._internal.build_identity import build_identity
 from eyvan._internal.client_version import CLIENT_VERSION_HEADER, is_client_supported, stale_client_message
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan._internal.observability import EyvanMetrics
@@ -108,6 +109,7 @@ from eyvan.server.api.schemas import (
     BatchSubmitResponse,
     BudgetGrantIssueRequest,
     BudgetPutRequest,
+    BuildResponse,
     CapacityPoolResponse,
     CapacityPoolUpsertRequest,
     CapacityResponse,
@@ -801,6 +803,35 @@ def create_app(
         """
 
         return HealthResponse(controller=startup.controller_mode)
+
+    @app.get("/api/v1/build", response_model=BuildResponse, tags=["system"])
+    async def build(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> BuildResponse:
+        """Report the code this plane is running, not only its version string.
+
+        Every component of this system ships one version, so an operator cannot
+        use it to answer the question an upgrade actually raises: is the plane
+        this proof polled the build the receipt claims? A hardware proof has
+        already been run against a stale agent and read as evidence.
+
+        Authenticated, because a build digest and an interpreter version are a
+        fingerprint. It costs one cached tree walk per process.
+        """
+
+        del principal
+        identity = build_identity()
+        return BuildResponse(
+            version=identity.version,
+            origin=identity.origin,
+            origin_detail=identity.origin_detail,
+            source_digest=identity.source_digest,
+            digest_detail=identity.digest_detail,
+            file_count=identity.file_count,
+            python=identity.python,
+            platform=identity.platform,
+            controller=startup.controller_mode,
+        )
 
     @app.get("/api/v1/session", response_model=SessionResponse, tags=["system"])
     async def session_authority(
