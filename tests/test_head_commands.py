@@ -1582,6 +1582,65 @@ def test_a_head_built_with_a_dashboard_serves_it_at_its_own_url() -> None:
     assert staged < configured
 
 
+def test_the_operator_is_told_where_the_dashboard_is() -> None:
+    """The address printed *is* the UI, which is exactly why nobody finds it.
+
+    An operator reads "Head research-head is active at http://10.128.0.22:8080"
+    as an API base URL and does not think to open it in a browser -- the question
+    "where's the dashboard URL?" has been asked of a head that was already
+    serving one. Ingress is VPC-only, so the way in from a laptop is named too.
+    """
+
+    spec = _spec()
+
+    result = HeadProvisioner(
+        spec,
+        runner=FakeGcloud(spec=spec),
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+        dashboard_source=_dashboard_bundle,
+    ).up()
+
+    note = result.dashboard_note
+
+    assert note is not None
+    assert result.url in note
+    assert "start-iap-tunnel" in note
+    assert spec.instance_name in note
+
+
+def test_no_dashboard_note_is_printed_when_none_was_staged() -> None:
+    """A wheel-built head serves no UI, and must not point at one."""
+
+    spec = _spec()
+
+    result = HeadProvisioner(
+        spec,
+        runner=FakeGcloud(spec=spec),
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+        dashboard_source=lambda: None,
+    ).up()
+
+    assert result.dashboard_note is None
+
+
+def test_the_cli_is_on_path_after_a_head_comes_up() -> None:
+    """The head prints `eyvan up <fleet.yaml>`; that has to be runnable.
+
+    Observed on a live head: the instruction it had just printed answered
+    `command not found`, because the CLI lives in a venv under /opt. A path an
+    operator has to be told is a path the head should have linked.
+    """
+
+    script = render_head_bootstrap_script(_spec())
+
+    assert "ln -sfn /opt/eyvan/venv/bin/eyvan /usr/local/bin/eyvan" in script
+    # Somebody else's install is left alone: this script owns /opt, not
+    # /usr/local, and clobbering a real file there is not its business.
+    assert "[ -L /usr/local/bin/eyvan ]" in script
+
+
 def test_a_head_built_without_a_dashboard_says_so_instead_of_promising_one() -> None:
     """A wheel carries no Node build tree, and the head must not claim otherwise.
 

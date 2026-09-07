@@ -1074,6 +1074,18 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         ),
         f"chmod -R a+rX {HEAD_VENV_PATH}",
         "",
+        "# Put the CLI on PATH. A head that has just told an operator to run",
+        "# `eyvan up <fleet.yaml>` and then answers `command not found` has",
+        "# undone its own instruction, and the venv path is not something anyone",
+        "# should have to be told. An existing regular file is left alone: it is",
+        "# somebody else's install, and this script owns /opt, not /usr/local.",
+        "install -d -m 0755 /usr/local/bin",
+        "if [ ! -e /usr/local/bin/eyvan ] || [ -L /usr/local/bin/eyvan ]; then",
+        f"  ln -sfn {HEAD_VENV_PATH}/bin/eyvan /usr/local/bin/eyvan",
+        "else",
+        "  echo 'eyvan: /usr/local/bin/eyvan is not a symlink; leaving it as it is' >&2",
+        "fi",
+        "",
     ]
     if spec.submitter_python:
         lines.extend(
@@ -1277,6 +1289,24 @@ class HeadUpResult:
         return (
             f"on the head: eyvan up <fleet.yaml> && {submit}   |   "
             f"elsewhere: eyvan --url {self.url} --token <token> up <fleet.yaml>"
+        )
+
+    @property
+    def dashboard_note(self) -> str | None:
+        """Say where the operations UI is, because nothing else does.
+
+        The bundle is staged and served from this head's root, so the address
+        already printed *is* the dashboard -- which is precisely why nobody
+        finds it: an operator reads an API base URL and does not think to open
+        it. Ingress is VPC-only, so a laptop needs the tunnel named here too.
+        """
+
+        if self.dashboard_url is None:
+            return None
+        return (
+            f"Operations UI: open {self.url} in a browser. From outside the VPC, forward it first: "
+            f"gcloud compute start-iap-tunnel {self.spec.instance_name} {self.spec.port} "
+            f"--local-host-port=localhost:{self.spec.port} --zone {self.spec.zone} --project {self.spec.project}"
         )
 
     @property
@@ -2585,6 +2615,9 @@ def head_up(
         return
     click.echo(f"Head {spec.instance_name} is {result.service_state} at {result.url}")
     click.echo(f"Control-plane ingress is restricted to {', '.join(result.source_ranges)}.")
+    dashboard = result.dashboard_note
+    if dashboard is not None:
+        click.echo(dashboard)
     warning = result.authentication_warning
     if warning is not None:
         click.echo(warning, err=True)
