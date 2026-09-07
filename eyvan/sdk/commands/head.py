@@ -2466,11 +2466,15 @@ def _head_overrides(**values: tp.Any) -> dict[str, tp.Any]:
 def head_group() -> None:
     """Stand up and operate one Eyvan control-plane head on GCP.
 
-    UNQUALIFIED AGAINST REAL GCP: these commands are covered against an injected
-    command boundary -- sequencing, ownership refusals, idempotence, ingress
-    scope and failure handling are all tested -- but no run against a real GCP
-    project has been performed, so provider acceptance of the exact gcloud
-    invocations is not established. Use --dry-run first and read the plan.
+    Sequencing, ownership refusals, idempotence, ingress scope and failure
+    handling are covered against an injected command boundary, and the create
+    path has run against a real GCP project: a head has been provisioned,
+    adopted on a re-run, and used to dispatch a multislice workload.
+
+    What that does not cover is every option this group accepts. A flag no live
+    run has passed -- another egress mode, an external database, an OIDC issuer
+    -- is tested only against the injected boundary. ``--dry-run`` prints the
+    exact gcloud invocations, and reading it first costs nothing.
     """
 
 
@@ -2560,8 +2564,9 @@ def head_up(
     enables the unit. Running it twice adopts the head it created and keeps that
     head's credentials; it refuses a same-named VM it does not own.
 
-    UNQUALIFIED AGAINST REAL GCP: no run against a real project has been
-    performed. Start with --dry-run.
+    This path has run against a real GCP project. Options no live run has
+    passed are not qualified by that; ``--dry-run`` prints the exact gcloud
+    invocations for those, and reading it first costs nothing.
     """
 
     spec = _spec_from_options(

@@ -220,11 +220,18 @@ wheel.
 
 Rank width is represented separately from allocation width. ``worker_count`` is
 the number of TPU slices in a cell; ``runtime_process_count`` records an
-observed native-worker/JAX endpoint count. The current M1.3 archive embeds a v1
-sparse-rank index for observed, truncated, and unavailable ranks, and a per-rank
-line ceiling uses one sentinel line. It is **not** the full DR-0002 manifest:
-attempt-frozen topology plus every-rank status, object digest, and size remain
-pending, and reconciliation must not be described as proving a stable topology.
+observed native-worker/JAX endpoint count.
+
+The DR-0002 manifest is now written: schema 2 carries the topology frozen at
+dispatch with its digest, and every expected rank's status, object URI, sha256
+and size -- expected ranks coming from the declared width rather than from
+whichever ranks answered, because a rank that was never reachable leaves no
+trace anywhere else. **Its writer is off by default**
+(``EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED``): DR-0002 rolls the reader out first,
+so a replica that could not read a manifest never has to meet one. A P2 run
+that means to exercise it has to turn it on, and a run that does not is
+evidence about the v1 sparse-rank index instead. Neither reconciliation proves a
+stable topology on its own.
 
 Two defects were found by reading one real page, both invisible to the unit
 tests: the decoder fed an already-decoded stream name back through the *priority*

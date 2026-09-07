@@ -1288,7 +1288,10 @@ def test_the_head_commands_are_reachable_from_the_root_cli(monkeypatch, tmp_path
 
     assert invoked.exit_code == 0, invoked.output
     assert "--dry-run" in invoked.output
-    assert "UNQUALIFIED AGAINST REAL GCP" in invoked.output
+    # The help still states the limit of what has been qualified, now that the
+    # create path has run for real: options no live run passed are covered only
+    # against the injected boundary.
+    assert "not qualified" in invoked.output
     for mode in head_commands.BOOTSTRAP_EGRESS_MODES:
         assert mode in invoked.output
 
