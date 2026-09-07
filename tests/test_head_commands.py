@@ -25,6 +25,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import typing as tp
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1722,7 +1723,6 @@ def test_a_head_provisions_the_interpreter_its_own_workers_run() -> None:
     # The head's own environment is still built with the image's interpreter, so
     # a uv that cannot be fetched costs the submitter and nothing else.
     assert "python3 -m venv /opt/eyvan/venv" in script
-    assert "uv unavailable" in script
 
 
 def test_a_fleet_that_declares_no_interpreter_provisions_no_submitter() -> None:
@@ -1733,6 +1733,103 @@ def test_a_fleet_that_declares_no_interpreter_provisions_no_submitter() -> None:
     assert spec.submitter_python is None
     script = render_head_bootstrap_script(spec)
     assert "uv venv" not in script
+
+
+def _submitter_block(script: str, root: Path) -> str:
+    """Return the submitter section, rewritten to install under ``root``."""
+
+    start = script.index("# An interpreter matching")
+    end = script.index("\nfi\n\n", start) + len("\nfi\n")
+    block = script[start:end]
+    return block.replace("/opt/eyvan/submit", f"{root}/submit").replace("/opt/eyvan/wheels", f"{root}/wheels")
+
+
+def _run_submitter_block(block: str, root: Path, uv: str) -> subprocess.CompletedProcess[str]:
+    """Run one rendered submitter section against a stub ``uv``."""
+
+    import os
+    import stat
+
+    binaries = root / "bin"
+    binaries.mkdir()
+    for name, body in (("uv", uv), ("curl", "#!/bin/sh\nexit 1\n")):
+        path = binaries / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    (root / "wheels").mkdir()
+    (root / "wheels" / "eyvan-0.0.1-py3-none-any.whl").write_text("", encoding="utf-8")
+    return subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{block}\necho the-rest-of-the-bootstrap"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}"},
+        check=False,
+    )
+
+
+def test_a_submitter_that_cannot_be_built_does_not_stop_the_head() -> None:
+    """The bootstrap runs under ``set -e``, and this section is optional.
+
+    An interpreter download that fails -- no route to the CDN, a version with no
+    build for this platform -- must cost the submitter environment and nothing
+    else. Aborting here would leave the head with no PostgreSQL and no unit: a
+    convenience turning into a control plane that does not come up.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        block = _submitter_block(render_head_bootstrap_script(spec), root)
+
+        completed = _run_submitter_block(block, root, "#!/bin/sh\nexit 1\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "the-rest-of-the-bootstrap" in completed.stdout
+    assert "refuse to submit" in completed.stderr
+
+
+def test_a_half_built_submitter_is_removed_rather_than_left() -> None:
+    """The command this head prints names that path.
+
+    An interpreter that exists but cannot import ``eyvan`` is worse than none:
+    the operator runs it, and the failure arrives with no explanation of which
+    of the two Pythons was wrong.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        block = _submitter_block(render_head_bootstrap_script(spec), root)
+
+        # Creates the environment, then fails installing into it -- the shape a
+        # partial network failure produces.
+        completed = _run_submitter_block(
+            block,
+            root,
+            f'#!/bin/sh\ncase "$1" in venv) mkdir -p {root}/submit/bin; exit 0;; *) exit 1;; esac\n',
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert not (root / "submit").exists()
+
+
+def test_a_submitter_that_builds_is_reported_and_kept() -> None:
+    """The other half of the same property: success leaves the interpreter."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        block = _submitter_block(render_head_bootstrap_script(spec), root)
+
+        completed = _run_submitter_block(
+            block,
+            root,
+            f'#!/bin/sh\ncase "$1" in venv) mkdir -p {root}/submit/bin; touch {root}/submit/bin/python;; esac\nexit 0\n',
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert (root / "submit" / "bin" / "python").exists()
+        assert "submitter interpreter ready" in completed.stdout
 
 
 def _fleet_file_declaring_python(version: str) -> str:
