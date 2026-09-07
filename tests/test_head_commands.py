@@ -1741,7 +1741,33 @@ def _submitter_block(script: str, root: Path) -> str:
     start = script.index("# An interpreter matching")
     end = script.index("\nfi\n\n", start) + len("\nfi\n")
     block = script[start:end]
-    return block.replace("/opt/eyvan/submit", f"{root}/submit").replace("/opt/eyvan/wheels", f"{root}/wheels")
+    for absolute, relative in (
+        ("/opt/eyvan/submit", "submit"),
+        ("/opt/eyvan/wheels", "wheels"),
+        ("/opt/eyvan/python", "python"),
+    ):
+        block = block.replace(absolute, f"{root}/{relative}")
+    return block
+
+
+#: A stub that installs the way uv does: the interpreter lands in the install
+#: directory, owner-only, and the venv holds a symlink to it. The mode is what
+#: makes this a reproduction rather than a mock -- a real head's submitter was
+#: unusable by every account except root for exactly this reason.
+_UV_LIKE_INSTALLER = """#!/bin/sh
+set -e
+target="${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.10/bin"
+case "$1" in
+  venv)
+    mkdir -p "$target" SUBMIT_DIR/bin
+    printf '#!/bin/sh\\nexit 0\\n' > "$target/python3.10"
+    chmod 0700 "$target/python3.10"
+    chmod 0700 "$(dirname "$target")"
+    ln -sf "$target/python3.10" SUBMIT_DIR/bin/python
+    ;;
+esac
+exit 0
+"""
 
 
 def _run_submitter_block(block: str, root: Path, uv: str) -> subprocess.CompletedProcess[str]:
@@ -1762,7 +1788,9 @@ def _run_submitter_block(block: str, root: Path, uv: str) -> subprocess.Complete
         ["bash", "-c", f"set -euo pipefail\n{block}\necho the-rest-of-the-bootstrap"],
         capture_output=True,
         text=True,
-        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}"},
+        # HOME points into the sandbox so a regression that stops directing the
+        # interpreter install writes there instead of the developer's own home.
+        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}", "HOME": str(root / "home")},
         check=False,
     )
 
@@ -1811,6 +1839,31 @@ def test_a_half_built_submitter_is_removed_rather_than_left() -> None:
 
         assert completed.returncode == 0, completed.stderr
         assert not (root / "submit").exists()
+
+
+def test_the_installed_interpreter_is_executable_by_someone_who_is_not_root() -> None:
+    """The head runs this as root, and prints the path to a human who is not.
+
+    uv installs a standalone interpreter under the installing user's home by
+    default, so the venv's ``python`` is a symlink into a 0700 directory: every
+    operator who follows the printed command gets ``Permission denied``. A real
+    head did exactly that. Directing the install into /opt and widening it is the
+    fix, and this is the property that says whether it worked.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        block = _submitter_block(render_head_bootstrap_script(spec), root)
+
+        completed = _run_submitter_block(block, root, _UV_LIKE_INSTALLER.replace("SUBMIT_DIR", f"{root}/submit"))
+
+        assert completed.returncode == 0, completed.stderr
+        interpreter = (root / "submit" / "bin" / "python").resolve()
+        assert interpreter.exists(), "the venv points at no interpreter"
+        assert interpreter.stat().st_mode & 0o005 == 0o005, oct(interpreter.stat().st_mode)
+        for parent in (interpreter.parent, interpreter.parent.parent):
+            assert parent.stat().st_mode & 0o005 == 0o005, f"{parent} is not traversable: {oct(parent.stat().st_mode)}"
 
 
 def test_a_submitter_that_builds_is_reported_and_kept() -> None:

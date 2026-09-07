@@ -110,6 +110,12 @@ HEAD_DASHBOARD_DIR = "/opt/eyvan/dashboard"
 #: Where a head installs the interpreter its workers run, so that submitting from
 #: the head works without the operator building a matching environment by hand.
 HEAD_SUBMITTER_DIR = "/opt/eyvan/submit"
+
+#: Where uv puts the standalone interpreter the submitter venv points at. Named
+#: explicitly because uv's default lives in the installing user's home, and this
+#: script installs as root -- leaving every other account with a venv whose
+#: ``python`` symlink they cannot execute.
+HEAD_PYTHON_DIR = "/opt/eyvan/python"
 HEAD_SERVICE_NAME = "eyvan-head.service"
 #: A cell agent on the head. Every capacity pool needs an agent endpoint, and a
 #: loopback development plane quietly supplies one -- so a fleet that applied on
@@ -1095,11 +1101,24 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
                 "if ! command -v uv >/dev/null 2>&1; then",
                 "  curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh || true",
                 "fi",
+                "#",
+                "# The interpreter is installed under /opt rather than root's home.",
+                "# uv's default is ~/.local/share/uv/python, and this script runs as",
+                "# root: the venv's `python` is a symlink into a 0700 directory, so",
+                "# every operator who is not root gets `Permission denied` from the",
+                "# path this head just told them to use. Found by running it.",
                 "if command -v uv >/dev/null 2>&1 && \\",
                 f"   rm -rf {HEAD_SUBMITTER_DIR} && \\",
+                f"   export UV_PYTHON_INSTALL_DIR={HEAD_PYTHON_DIR} && \\",
+                # Created rather than assumed: uv only makes this directory when
+                # it downloads, and a version the image already carries -- 3.12
+                # on this base image -- is used in place. The chmod below would
+                # then fail on a directory that never appeared and discard a
+                # perfectly good environment.
+                f"   install -d -m 0755 {HEAD_PYTHON_DIR} && \\",
                 f"   uv venv --python {shlex.quote(spec.submitter_python)} {HEAD_SUBMITTER_DIR} && \\",
                 f"   uv pip install --python {HEAD_SUBMITTER_DIR}/bin/python --quiet {HEAD_WHEEL_DIR}/*.whl && \\",
-                f"   chmod -R a+rX {HEAD_SUBMITTER_DIR}; then",
+                f"   chmod -R a+rX {HEAD_PYTHON_DIR} {HEAD_SUBMITTER_DIR}; then",
                 f"  echo 'eyvan: submitter interpreter ready at {HEAD_SUBMITTER_DIR}/bin/python'",
                 "else",
                 f"  rm -rf {HEAD_SUBMITTER_DIR}",
