@@ -182,10 +182,23 @@ per-VM CPU and memory and the fleet/autoscale compilers persist both. The run
 above remains evidence for host-count authority, not evidence for the corrected
 resource vector; re-run P1 after reapplying the fleet to qualify that change.
 `eyvan doctor` reports old durable pools that still advertise zero memory. A cell
-that never reported `observed_tpu_vms`, or a catalog shape with no recorded host
-count, is **inconclusive** rather than passing -- the check that matters would
-otherwise be skipped silently.
-**Shape** v5p-16, one slice. **~35 minutes.**
+that never reported `observed_tpu_vms`, a catalog shape with no recorded host
+count, or a cell with no usable slice count is **inconclusive** rather than
+passing -- the check that matters would otherwise be skipped silently.
+
+**Run 2026-08-12, exit 1 -- and the failure was the criterion's, not the
+fleet's.** Pointed at a live multislice `v5p-16 x 2`, P1 reported
+`expected 2 host(s) per slice; observed {'research-...-0001': 4}`. Nothing was
+wrong: the catalog states hosts per *slice*, a multislice cell holds
+`worker_count` of them under one allocation, and four VMs across two slices is
+the right answer. The criterion was comparing a total against a per-slice number,
+so it would have failed every correct multislice fleet -- at the end of a spend,
+where the natural response is to stop believing it. Re-evaluating the same
+recorded observations with the corrected criterion returns
+`every cell reports 2 host(s) per slice across 2 slice(s)`, exit 0. A live
+re-run against a freshly staged head is what turns that into a receipt.
+**Shape** v5p-16, one slice; the multislice case is now covered too.
+**~35 minutes.**
 
 ## P2 — multi-host structured logs, with a rank lost mid-stream
 
@@ -205,6 +218,26 @@ eyvan down CONFIG --yes
 **Passes when** the second page reports the killed rank as unavailable while
 still returning the surviving rank's records, and the archived blob exists after
 terminality so the cell can be released without losing logs.
+
+**Run 2026-08-12, exit 2 (inconclusive) -- and the half that needed hardware
+now holds.** On a live multislice `v5p-16 x 2` in `us-east5-a`, four ranks of
+one workload were read through `eyvan proof logs --ranks 4`: 240 records, every
+one timestamped, stdout and stderr preserved, backend cursors present, and
+**four ranks accounted for**. That is per-rank attribution across real hosts,
+which is exactly what the 2026-08-07 run could not show and what the criterion
+had never been exercised against.
+
+Still inconclusive on one check, and the verdict says which:
+*"no rank was unreachable during this run, so the reporting path was not
+exercised"*. Taking a host out from under a running job is an operator action --
+`gcloud alpha compute tpus tpu-vm ssh <node> --worker 1 --command 'sudo
+systemctl stop eyvan-native-worker.service'`, then re-run the command above --
+and it was not taken here.
+
+The receipt is machine-readable: `eyvan proof verify` on it reports the receipt
+intact, the criterion current, and the candidate build current, and still refuses
+to let it qualify anything, because an inconclusive run qualifies nothing. That
+refusal is the whole point of writing receipts.
 
 **Run 2026-08-07, exit 2 (inconclusive).** Runnable now: the worker exposes
 `/log-page`, `NativeWorkerClient` fetches it, and `NativeSliceExecutor` fans out
