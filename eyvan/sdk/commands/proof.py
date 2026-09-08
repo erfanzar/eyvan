@@ -172,6 +172,7 @@ def evaluate_catalog_authority(
     checks.append(_passed("cells-exist", f"{len(members)} live cell(s)"))
 
     unobserved = [cell["id"] for cell in members if cell.get("observed_tpu_vms") is None]
+    unsized = [cell["id"] for cell in members if not _is_positive_int(cell.get("worker_count"))]
     if unobserved:
         checks.append(
             _unknown(
@@ -179,8 +180,28 @@ def evaluate_catalog_authority(
                 f"{len(unobserved)} cell(s) never reported observed_tpu_vms: {', '.join(sorted(unobserved)[:3])}",
             )
         )
+    elif unsized:
+        # Without the slice count the observation cannot be interpreted at all:
+        # four VMs is right for two slices and wrong for one, and guessing which
+        # would turn this criterion into a coin toss dressed as a verdict.
+        checks.append(
+            _unknown(
+                "hosts-observed",
+                f"{len(unsized)} cell(s) report no usable worker_count, so hosts per slice cannot be derived: "
+                + ", ".join(sorted(unsized)[:3]),
+            )
+        )
     elif catalog_hosts is not None:
-        wrong = {cell["id"]: cell["observed_tpu_vms"] for cell in members if cell["observed_tpu_vms"] != catalog_hosts}
+        # The catalog states hosts per *slice*; a multislice cell holds
+        # ``worker_count`` of them under one allocation. Comparing the total
+        # against the per-slice number reported a live 2x v5p-16 as a defect --
+        # four VMs where the catalog says two -- which is the shape of failure
+        # this file exists to keep out of a spend's final screen.
+        wrong = {
+            cell["id"]: f"{cell['observed_tpu_vms']} VM(s) across {cell['worker_count']} slice(s)"
+            for cell in members
+            if cell["observed_tpu_vms"] != catalog_hosts * cell["worker_count"]
+        }
         if wrong:
             checks.append(
                 _failed(
@@ -189,8 +210,20 @@ def evaluate_catalog_authority(
                 )
             )
         else:
-            checks.append(_passed("hosts-match-catalog", f"every cell reports {catalog_hosts} host(s)"))
+            slices = sum(cell["worker_count"] for cell in members)
+            checks.append(
+                _passed(
+                    "hosts-match-catalog",
+                    f"every cell reports {catalog_hosts} host(s) per slice across {slices} slice(s)",
+                )
+            )
     return ProofResult("P1", tuple(checks))
+
+
+def _is_positive_int(value: object) -> bool:
+    """Return whether ``value`` is a slice count this criterion can divide by."""
+
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 # --------------------------------------------------------------------------- P5

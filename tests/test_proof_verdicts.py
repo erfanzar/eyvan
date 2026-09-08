@@ -37,6 +37,10 @@ def _check(result, name: str) -> Verdict:
     return next(check.verdict for check in result.checks if check.name == name)
 
 
+def _detail(result, name: str) -> str:
+    return next(check.detail for check in result.checks if check.name == name)
+
+
 # --------------------------------------------------------------------------- the verdict algebra
 
 
@@ -82,8 +86,28 @@ def _pool(pool_id: str = "research/v5p", accelerator: str = "v5p-16") -> dict:
     return {"id": pool_id, "accelerator_type": accelerator}
 
 
-def _cell(cell_id: str, *, hosts: int | None = 2, pool: str = "research/v5p", state: str = "ready") -> dict:
-    return {"id": cell_id, "pool_id": pool, "state": state, "observed_tpu_vms": hosts}
+def _cell(
+    cell_id: str,
+    *,
+    hosts: int | None = 2,
+    pool: str = "research/v5p",
+    state: str = "ready",
+    slices: object = 1,
+) -> dict:
+    """One cell as the plane reports it.
+
+    ``observed_tpu_vms`` counts every VM in the cell and ``worker_count`` counts
+    the slices they are divided into, so the two coincide only on a single-slice
+    cell.
+    """
+
+    return {
+        "id": cell_id,
+        "pool_id": pool,
+        "state": state,
+        "observed_tpu_vms": hosts,
+        "worker_count": slices,
+    }
 
 
 def test_a_slice_with_the_catalog_host_count_passes() -> None:
@@ -107,6 +131,50 @@ def test_a_half_sized_slice_fails() -> None:
 
     assert result.verdict is Verdict.FAIL
     assert "expected 2 host(s)" in next(check.detail for check in result.checks if check.verdict is Verdict.FAIL)
+
+
+def test_a_multislice_cell_is_measured_per_slice_rather_than_in_total() -> None:
+    """Found by running P1 against a live 2x v5p-16.
+
+    The catalog states hosts per *slice*. A multislice cell holds several under
+    one allocation, so its four VMs were compared against the catalog's two and
+    reported as a defect -- on an allocation that was exactly right. A criterion
+    that fails a correct fleet is worse than no criterion: it arrives at the end
+    of a spend, and the next person turns it off.
+    """
+
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a", hosts=4, slices=2)], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert "2 slice(s)" in _detail(result, "hosts-match-catalog")
+
+
+def test_a_multislice_cell_missing_a_whole_slice_still_fails() -> None:
+    """The per-slice rule must not become a way to pass with half the hardware."""
+
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a", hosts=2, slices=2)], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert "2 VM(s) across 2 slice(s)" in _detail(result, "hosts-match-catalog")
+
+
+def test_a_cell_that_reports_no_slice_count_is_inconclusive() -> None:
+    """Four VMs is right for two slices and wrong for one.
+
+    Without the count there is nothing to divide by, and assuming one would make
+    every multislice cell on an older plane read as a failure.
+    """
+
+    result = evaluate_catalog_authority(
+        [_pool()], [_cell("cell-a", hosts=4, slices=None)], accelerator_type="v5p-16", catalog_hosts=2
+    )
+
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert _check(result, "hosts-observed") is Verdict.INCONCLUSIVE
 
 
 def test_a_fleet_that_never_applied_is_inconclusive() -> None:
