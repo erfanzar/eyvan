@@ -43,7 +43,15 @@ class _ControllerLoops:
 
         return (
             LeaderPhase("unmanaged-capacity-recovery", self.reconcile_unmanaged_capacity_recoveries_once),
-            LeaderPhase("capacity-pools", self.reconcile_capacity_pools_once),
+            # Isolated, unlike the phases it precedes. This one plans future
+            # capacity; the ones after it observe, settle, and release the
+            # capacity that already exists and is already being paid for. A
+            # planner that raises has cost nothing yet, and stopping the cycle
+            # over it strands a running accelerator -- which is what happened on
+            # a live fleet, for eight minutes of v5p-16, before the simulation
+            # defect underneath was found. The failure is still logged with its
+            # traceback; it just no longer takes settlement down with it.
+            LeaderPhase("capacity-pools", self.reconcile_capacity_pools_once, isolate_failures=True),
             LeaderPhase(
                 "observe-cells",
                 self._observe_cells_once,

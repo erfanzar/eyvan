@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 
 import pytest
 
@@ -23,13 +24,17 @@ from eyvan.records import (
     CellRecord,
     CellState,
     CommandExecution,
+    LeaseRecord,
     Principal,
+    ResourceGang,
     ResourceLimits,
+    ResourceVector,
     Role,
     RoleGrant,
     WorkerResourceScope,
     WorkloadDefinition,
     WorkloadRecord,
+    WorkloadState,
     utcnow,
 )
 from eyvan.server.controller import EyvanController
@@ -538,3 +543,150 @@ def test_a_pool_edit_that_orphans_a_cell_shape_does_not_stop_the_leader() -> Non
 
     assert cell_matches_pool(wide, narrowed) is False
     assert cell_requires_replacement(wide, narrowed) is True
+
+
+# --------------------------------------------------------------------------- a leased cell in a stopped pool
+
+
+def _live_workload() -> WorkloadRecord:
+    """Return the workload whose lease holds the cell below."""
+
+    return WorkloadRecord(
+        id="wl-live",
+        # Running, as anything holding a live lease is. A pending workload with
+        # an active lease is itself a snapshot the scheduler refuses, and for a
+        # different reason than the one under test here.
+        state=WorkloadState.RUNNING,
+        org_id="acme",
+        project_id="research",
+        created_by="operator",
+        spec=WorkloadDefinition(
+            name="live",
+            execution=CommandExecution(command="python train.py"),
+            gang={"replicas": 1, "per_replica": {"cpu": 32, "memory_gib": 0, "tpu": 8}},
+            provider="gcp",
+            required_executor="eyvan-native",
+        ),
+    )
+
+
+def _leased_cell_and_lease(
+    pool: CapacityPoolRecord, workload: WorkloadRecord | None = None
+) -> tuple[CellRecord, LeaseRecord]:
+    """Return one ready cell of ``pool`` and the live lease holding it."""
+
+    holder = workload if workload is not None else _live_workload()
+    cell = pool.make_cell(f"{pool.id}-0001", worker_count=1).model_copy(update={"state": CellState.READY})
+    lease = LeaseRecord(
+        id="lease-live",
+        workload_id=holder.id,
+        cell_id=cell.id,
+        org_id="acme",
+        project_id="research",
+        # Memory named explicitly at zero: this pool template declares none, and
+        # the gang's own default would put a gigabyte on a cell that has no
+        # memory to give -- an overcommit the scheduler refuses before it ever
+        # reaches the property under test.
+        resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0, memory_gib=0.0)),
+        fencing_token=f"{cell.id}:1",
+        hourly_cost=1.0,
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+    return cell, lease
+
+
+def test_a_disabled_pool_does_not_take_its_leased_cell_out_of_the_snapshot() -> None:
+    """The scheduler is handed the cells and the live leases in one call.
+
+    It rejects a snapshot whose lease names a cell the list does not hold, and it
+    is right to: there is no capacity to check that lease against. So a cell that
+    is no longer supply cannot simply be dropped while something still runs on
+    it.
+
+    Observed on a live fleet: `eyvan down` disabled a pool whose v5p-16
+    multislice still held a lease, and the plane spent every two seconds raising
+    out of this phase -- which carries the phases that observe, settle and
+    release -- while the accelerator went on billing.
+    """
+
+    pool = multislice_tpu_pool()
+    cell, lease = _leased_cell_and_lease(pool)
+    disabled = pool.model_copy(update={"enabled": False})
+
+    simulation = CapacitySimulation.build((disabled,), (cell,), (), (lease,), utcnow())
+
+    assert [held.id for held in simulation.cells] == [cell.id]
+
+
+def test_a_leased_cell_in_a_disabled_pool_attracts_no_new_work() -> None:
+    """Keeping it in the snapshot must not put it back into supply.
+
+    The cell is reported as draining, which is what it is: it carries work and
+    must accept none. ``to_core_cell`` reads that as ``enabled=False``.
+    """
+
+    pool = multislice_tpu_pool()
+    cell, lease = _leased_cell_and_lease(pool)
+    disabled = pool.model_copy(update={"enabled": False})
+
+    simulation = CapacitySimulation.build((disabled,), (cell,), (), (lease,), utcnow())
+
+    assert simulation.cells[0].state is CellState.DRAINING
+
+
+def test_an_unleased_cell_in_a_disabled_pool_stays_out_of_the_snapshot() -> None:
+    """The fix must not resurrect a disabled pool's free capacity."""
+
+    pool = multislice_tpu_pool()
+    cell, _lease = _leased_cell_and_lease(pool)
+    disabled = pool.model_copy(update={"enabled": False})
+
+    simulation = CapacitySimulation.build((disabled,), (cell,), (), (), utcnow())
+
+    assert simulation.cells == ()
+
+
+def test_the_scheduler_accepts_the_snapshot_a_disabled_pool_produces() -> None:
+    """The property the crash was: this call must not raise.
+
+    Asserted against the real adapter rather than by inspecting the list, because
+    what broke was the pair -- cells and leases -- reaching the scheduler
+    together.
+    """
+
+    pool = multislice_tpu_pool()
+    workload = _live_workload()
+    cell, lease = _leased_cell_and_lease(pool, workload)
+    disabled = pool.model_copy(update={"enabled": False})
+
+    simulation = CapacitySimulation.build((disabled,), (cell,), (workload,), (lease,), utcnow())
+
+    CoreSchedulingService().schedule([workload], simulation.cells, leases=[lease])
+
+
+@pytest.mark.asyncio
+async def test_disabling_a_pool_under_a_live_lease_does_not_stop_the_leader_cycle() -> None:
+    """What `eyvan down` does, with something still running.
+
+    The phase must complete. Everything that releases capacity and settles
+    billing runs after it, so a raise here is not one phase lost -- it is an
+    accelerator nobody stops paying for.
+    """
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service)
+    pool = multislice_tpu_pool()
+    await service.apply_fleet(fleet_admin(), "research", (pool,), idempotency_key="fleet-v1")
+    workload = _live_workload()
+    cell, lease = _leased_cell_and_lease(pool, workload)
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(workload)
+        await transaction.put_cell(cell)
+        await transaction.put_lease(lease)
+    # The route `eyvan down` calls, rather than a hand-disabled pool: it is what
+    # sets enabled=False with min and max at zero, and that combination is the
+    # one the live plane wedged on.
+    await service.disable_fleet(fleet_admin(), "research", idempotency_key="fleet-down")
+
+    assert await controller.reconcile_capacity_pools_once() == {"launched": 0, "drained": 0, "deleted": 0}

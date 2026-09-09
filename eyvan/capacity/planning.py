@@ -270,12 +270,30 @@ class CapacitySimulation:
                 scheduler_cells.append(cell)
                 continue
             pool_by_cell_id[cell.id] = pool.id
-            if not pool.enabled or not cell_provides_pool_supply(cell, pool, now):
-                continue
-            if cell.state is CellState.READY:
+            supplies = pool.enabled and cell_provides_pool_supply(cell, pool, now)
+            if supplies and cell.state is CellState.READY:
                 scheduler_cells.append(cell)
-            elif cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE}:
+            elif supplies and cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE}:
                 scheduler_cells.append(cell.model_copy(update={"state": CellState.READY}))
+            elif cell.id in active_lease_cells:
+                # Not supply, and not omissible either. The scheduler is handed
+                # these cells *and* the live leases in one call, and it rejects a
+                # snapshot whose lease names a cell the list does not hold --
+                # correctly, since it cannot check that lease against any
+                # capacity. Dropping a leased cell therefore does not skip one
+                # cell, it raises out of a leader phase that has no failure
+                # isolation, so nothing later in the cycle runs: no observation,
+                # no settlement, no release. Seen on a live fleet, where
+                # `eyvan down` disabled a pool whose v5p-16 multislice still held
+                # a lease and the plane then spent every two seconds raising
+                # while the accelerator went on billing.
+                #
+                # DRAINING rather than the cell's own state because that is what
+                # it now is: it carries work and must attract none. ``to_core_cell``
+                # reads exactly that as ``enabled=False``.
+                scheduler_cells.append(cell.model_copy(update={"state": CellState.DRAINING}))
+            if not supplies:
+                continue
             if cell.id not in active_lease_cells:
                 if cell.autoscale_request_workload_id is None:
                     free_shared_exact_supply[(pool.id, cell.worker_count)] += 1
