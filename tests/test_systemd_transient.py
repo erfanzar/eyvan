@@ -55,6 +55,9 @@ class FakeSystemd:
         self.journal: dict[str, str] = {}
         self.fail_launch = False
         self.fail_journal = False
+        #: Make `systemctl show` fail without saying the unit is absent -- an
+        #: unreachable manager, which is not evidence that anything stopped.
+        self.fail_show = False
 
     @staticmethod
     def _unit_from_run(command: tuple[str, ...]) -> str:
@@ -94,6 +97,8 @@ class FakeSystemd:
             return SystemdCommandResult(returncode=0)
         if command[:2] == ("systemctl", "show"):
             unit_name = command[-1]
+            if self.fail_show:
+                return SystemdCommandResult(returncode=1, stderr="Failed to connect to bus")
             properties = self.units.get(unit_name)
             if properties is None:
                 return SystemdCommandResult(returncode=4, stdout="LoadState=not-found\n")
@@ -960,6 +965,58 @@ def test_missing_service_before_a_terminal_observation_is_indeterminate_and_pers
     assert _record(executor, remote_id)["status"] == ExecutionWorkloadStatus.INDETERMINATE.value
     with pytest.raises(RuntimeError, match="cannot safely retire ambiguous"):
         executor.retire(remote_id, _context())
+
+
+def test_stopping_an_execution_whose_unit_is_already_gone_succeeds(tmp_path: Path) -> None:
+    """A unit systemd does not hold is not running, and stop asks nothing else.
+
+    This is what a live v5p-16 multislice cost. The cancel stopped the unit, the
+    unit disappeared before its exit was recorded, and every retry re-derived
+    the same unknown and refused to confirm the stop -- so the workload stayed
+    `cancelling`, its lease was never released, and four TPU VMs went on billing
+    with nothing able to end them.
+
+    The outcome stays INDETERMINATE, which is honest: nobody knows whether that
+    process succeeded. What it must not do is block the release.
+    """
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=systemd,
+        boot_id_reader=lambda: "boot-a",
+        use_exit_type_cgroup=True,
+    )
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.remove(unit_name)
+    assert executor.status(remote_id).status is ExecutionWorkloadStatus.INDETERMINATE
+
+    executor.stop(remote_id, _context())
+
+    assert executor.status(remote_id).status is ExecutionWorkloadStatus.INDETERMINATE
+
+
+def test_a_stop_that_cannot_see_systemd_at_all_still_refuses(tmp_path: Path) -> None:
+    """An unreachable manager is not evidence of absence.
+
+    The relaxation above is narrow on purpose: "systemd says there is no such
+    unit" and "systemd did not answer" are different facts, and only the first
+    proves nothing is running.
+    """
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(
+        tmp_path,
+        command_runner=systemd,
+        boot_id_reader=lambda: "boot-a",
+        use_exit_type_cgroup=True,
+    )
+    remote_id = executor.submit(_spec(), _context())
+    systemd.fail_show = True
+
+    with pytest.raises(RuntimeError, match="cannot safely verify"):
+        executor.stop(remote_id, _context())
 
 
 def test_malformed_durable_status_is_indeterminate_with_an_explicit_reason(tmp_path: Path) -> None:

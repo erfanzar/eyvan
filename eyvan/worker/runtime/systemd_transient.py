@@ -1703,15 +1703,43 @@ class SystemdTransientServiceExecutor:
                 _atomic_write_json(record_path, current)
 
         observed = self.status(remote_id)
-        if observed.status is ExecutionWorkloadStatus.INDETERMINATE:
+        # Asked once and used twice: both refusals below are about whether
+        # something might still be running, and a unit systemd does not hold is
+        # not running -- including when ``systemctl stop`` reported a failure
+        # because there was nothing there to stop.
+        runtime_gone = self._runtime_is_gone(unit_name)
+        if observed.status is ExecutionWorkloadStatus.INDETERMINATE and not runtime_gone:
             raise RuntimeError(f"cannot safely verify that systemd execution {remote_id!r} stopped")
-        if result.returncode != 0 and observed.status not in _TERMINAL_STATES:
+        if result.returncode != 0 and observed.status not in _TERMINAL_STATES and not runtime_gone:
             detail = (
                 _OUTPUT_SUPPRESSED
                 if _record_secret_bearing(record)
                 else redact_secret_material(result.stderr.strip()) or "unknown systemd error"
             )
             raise RuntimeError(f"systemctl stop failed for {remote_id!r}: {detail}")
+
+    def _runtime_is_gone(self, unit_name: str) -> bool:
+        """Return whether systemd holds no such unit at all.
+
+        The two questions ``stop`` and ``status`` ask are not the same one.
+        ``status`` reports what the workload *did*, and a transient unit that
+        vanished before recording a terminal state leaves that genuinely unknown
+        -- INDETERMINATE is the right answer and must stay. ``stop`` asks only
+        whether anything is still running, and a unit systemd does not have is
+        not running: a transient unit that does not exist cannot execute.
+
+        Conflating the two cost a live v5p-16 multislice. The cancel stopped the
+        unit, the unit disappeared before its exit was recorded, and every retry
+        then re-derived the same unknown and refused to confirm the stop. The
+        workload stayed ``cancelling``, its lease was never released, and four
+        TPU VMs went on billing with nothing able to end them.
+
+        A probe that cannot answer returns ``False`` -- an unreachable systemd is
+        not evidence of absence, and the refusal above is correct there.
+        """
+
+        outcome, _properties, _detail = self._show_unit(unit_name)
+        return outcome == "missing"
 
     def retire(self, remote_id: str, context: MutationContext) -> None:
         """Stop a superseded cgroup and wait for a verified terminal record."""
