@@ -6,6 +6,71 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Hosted-CI regression follow-up (2026-09-11; local verification)
+
+The first pushed suite exposed a nonportable stale-PID fixture on Linux and
+an unintended PostgreSQL serialization race in the accelerated renewal-loss
+test. Fixtures now explicitly cover the existing endpoint/profile reuse policy
+and order renewal after the injected expiry; runtime behavior is unchanged.
+The OCI workflow's job-level runner-context references moved to step-level
+environment declarations, and actionlint 1.7.7 accepts all workflows.
+
+Fresh Python 3.11/required-PostgreSQL verification: **6,773 passed, 17
+monorepo-only skips**, 188 warnings, exit 0 in 331.90 seconds. Receipt stem:
+`.pytest_cache/python311-postgres-after-hosted-ci-doc-fix`. Dashboard: **291
+passed**, 82.7% line coverage, build/lint/format checks passed. Ruff, mypy,
+import contracts, locked exports and generated-reference checks also passed.
+These local receipts do not certify the subsequent hosted workflow rerun.
+
+## Live four-device checkpoint retry and cancellation (2026-09-11)
+
+Campaign `c814dc37e004` used Eyvan to provision another Spot `v5p-8` cell in
+`example-spot-project`, `us-east5-a`, with Python 3.11 and JAX 0.6.2:
+
+- Workload `wl_4af929a916274dffadbff0cdbcc3a9a8` ran `jax.pmap` across four
+  devices, averaging gradients with `lax.pmean`. At step 20 it wrote model
+  weights to an immutable-generation GCS object and deliberately exited 17.
+- Eyvan retried it automatically: the observed attempt changed from 1 to 2,
+  with `failure_count=1`. Attempt 2 downloaded the checkpoint and completed
+  step 40. Its weights matched a separately calculated uninterrupted 40-step
+  control (`rtol=1e-5`, `atol=1e-6`). The observed losses were approximately
+  **31.1358 → 0.00983065 → 0.00000822232**.
+- The checkpoint and restoration instance names were identical. This proves
+  durable-object restoration after process failure on a real Spot TPU, **not
+  node replacement or physical Spot-preemption recovery**.
+- A second workload reached its readiness marker, was cancelled through
+  Eyvan, and a third workload subsequently succeeded on the same capacity.
+- Fleet teardown returned HTTP 200; a subsequent independent provider listing
+  returned no matching VMs. Local receipt:
+  `.pytest_cache/spot-validation/training-retry-c814dc37e004.json`.
+
+## Live Spot JAX computation (2026-09-11)
+
+After pushing the 16-commit series ending at `6cb0d97`, Eyvan acquired a
+`v5p-8` Compute VM in `example-spot-project`, `us-east5-a`. The provider independently
+reported `provisioningModel: SPOT`; the workload also checked the project and
+preemptible metadata from inside the VM.
+
+- Workload `wl_50e647e82d0e47d2bcdb788e43706c8e` progressed through provisioning,
+  native-worker readiness, running and **succeeded** through Eyvan's API.
+- The declared Python 3.11 bootstrap succeeded: the worker reported Python
+  **3.11.16**, JAX **0.6.2**, `jaxlib` **0.6.2**, and `libtpu` **0.0.17.1**.
+- JAX selected the **TPU** backend and enumerated **four TPU devices**. A
+  1,024-square float32 matrix product returned the expected **1,024.0** entry;
+  25 subsequent synchronized iterations completed. This is a computation
+  smoke test, not a distributed-throughput benchmark or proof of using all
+  four devices simultaneously.
+- Eyvan returned the payload's success marker in its workload logs.
+  Fleet teardown returned HTTP 200, and an independent provider listing
+  subsequently returned no matching VMs.
+- Private local receipts: `.pytest_cache/spot-validation/jax-93d9a677a715.json`
+  and `jax-93d9a677a715-serial.log`. Raw serial output is not a public artifact.
+
+This establishes actual Spot TPU computation and the explicitly declared
+interpreter path, superseding the failed attempt below for those narrow claims.
+It does not establish physical preemption recovery, fleet mTLS, sustained load,
+or release provenance. The follow-up training/retry campaign is separate.
+
 ## Spot attempt and Python example (2026-09-11)
 
 Authorized validation used `example-spot-project`, an isolated loopback control plane
