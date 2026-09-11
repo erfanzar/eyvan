@@ -1811,6 +1811,13 @@ def test_a_head_whose_workers_can_reach_pypi_is_not_warned() -> None:
         assert result.wheelhouse_warning is None, egress
 
 
+@pytest.mark.parametrize("version", ["3.9", "3.10", "3.14"])
+def test_a_head_refuses_an_unsupported_submitter_interpreter_before_provisioning(version) -> None:
+    config = EyvanFleetConfig.from_yaml(_fleet_file_declaring_python(version))
+    with pytest.raises(ValueError, match=r"Python 3\.11"):
+        HeadSpec.from_fleet_config(config)
+
+
 def test_a_head_provisions_the_interpreter_its_own_workers_run() -> None:
     """Without it a head cannot submit to the TPUs it provisions.
 
@@ -1824,14 +1831,14 @@ def test_a_head_provisions_the_interpreter_its_own_workers_run() -> None:
     installs that one alongside its own and points the operator at it.
     """
 
-    config = EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10"))
+    config = EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.11"))
     spec = HeadSpec.from_fleet_config(config)
 
-    assert spec.submitter_python == "3.10"
+    assert spec.submitter_python == "3.11"
 
     script = render_head_bootstrap_script(spec)
 
-    assert "uv venv --python 3.10 /opt/eyvan/submit" in script
+    assert "uv venv --python 3.11 /opt/eyvan/submit" in script
     assert "/opt/eyvan/submit/bin/python" in script
     # The head's own environment is still built with the image's interpreter, so
     # a uv that cannot be fetched costs the submitter and nothing else.
@@ -1869,14 +1876,14 @@ def _submitter_block(script: str, root: Path) -> str:
 #: unusable by every account except root for exactly this reason.
 _UV_LIKE_INSTALLER = """#!/bin/sh
 set -e
-target="${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.10/bin"
+target="${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.11/bin"
 case "$1" in
   venv)
     mkdir -p "$target" SUBMIT_DIR/bin
-    printf '#!/bin/sh\\nexit 0\\n' > "$target/python3.10"
-    chmod 0700 "$target/python3.10"
+    printf '#!/bin/sh\\nexit 0\\n' > "$target/python3.11"
+    chmod 0700 "$target/python3.11"
     chmod 0700 "$(dirname "$target")"
-    ln -sf "$target/python3.10" SUBMIT_DIR/bin/python
+    ln -sf "$target/python3.11" SUBMIT_DIR/bin/python
     ;;
 esac
 exit 0
@@ -1919,7 +1926,7 @@ def test_a_submitter_that_cannot_be_built_does_not_stop_the_head() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.11")))
         block = _submitter_block(render_head_bootstrap_script(spec), root)
 
         completed = _run_submitter_block(block, root, "#!/bin/sh\nexit 1\n")
@@ -1939,7 +1946,7 @@ def test_a_half_built_submitter_is_removed_rather_than_left() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.11")))
         block = _submitter_block(render_head_bootstrap_script(spec), root)
 
         # Creates the environment, then fails installing into it -- the shape a
@@ -1966,7 +1973,7 @@ def test_the_installed_interpreter_is_executable_by_someone_who_is_not_root() ->
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.11")))
         block = _submitter_block(render_head_bootstrap_script(spec), root)
 
         completed = _run_submitter_block(block, root, _UV_LIKE_INSTALLER.replace("SUBMIT_DIR", f"{root}/submit"))
@@ -1984,7 +1991,7 @@ def test_a_submitter_that_builds_is_reported_and_kept() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.10")))
+        spec = HeadSpec.from_fleet_config(EyvanFleetConfig.from_yaml(_fleet_file_declaring_python("3.11")))
         block = _submitter_block(render_head_bootstrap_script(spec), root)
 
         completed = _run_submitter_block(
@@ -2130,3 +2137,8 @@ def test_rollback_says_so_when_no_wheel_was_retained() -> None:
 
     with pytest.raises(head_commands.HeadError, match="no superseded wheel"):
         HeadProvisioner(_spec(), runner=runner).rollback(confirmed=True)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

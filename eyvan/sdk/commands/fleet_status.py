@@ -352,12 +352,23 @@ class FleetStatusRenderer:
         table.add_column("State", no_wrap=True)
         table.add_column("Reason", overflow="fold")
         for cell in attention[:_ATTENTION_CELL_LIMIT]:
+            # The reason code is a closed vocabulary other paths compare; the
+            # detail is the provider's own word for what happened. Both: the
+            # code says what class of problem it is, and without the detail
+            # the operator is back to reading agent storage by hand — which
+            # is the log-diving this table exists to prevent.
+            reason = cell.unavailable_reason or "-"
+            if cell.unavailable_detail:
+                detail = cell.unavailable_detail
+                if len(detail) > 160:
+                    detail = detail[:157] + "..."
+                reason = f"{reason}: {detail}"
             table.add_row(
                 Text(cell.id),
                 Text(pool_types.get(cell.pool_id, "-") if cell.pool_id is not None else "-"),
                 Text(str(cell.worker_count)),
                 Text(cell.state.value, style=_cell_state_style(cell.state)),
-                Text(cell.unavailable_reason or "-"),
+                Text(reason),
             )
         print_block(self.console, table)
         remaining = len(attention) - _ATTENTION_CELL_LIMIT

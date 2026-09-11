@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import typing as tp
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -858,7 +858,7 @@ def _evaluate(evidence: dict[str, tp.Any] | None) -> dict[str, object]:
         max_database_growth_bytes=0,
         max_artifact_net_growth_bytes=0,
     )
-    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    started = datetime(2026, 1, 1, tzinfo=UTC)
     return build_soak_receipt(
         state,
         inputs,

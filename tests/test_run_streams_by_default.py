@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import typing as tp
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from click.testing import CliRunner
 
@@ -54,7 +54,7 @@ def _page(
     attempt_changed: bool = False,
     age_s: float = 0.0,
 ) -> dict:
-    stamped = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+    stamped = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
     return {
         "attempt": 1,
         "attempt_changed": attempt_changed,

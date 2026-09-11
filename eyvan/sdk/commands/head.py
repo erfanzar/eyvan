@@ -357,6 +357,11 @@ class HeadSpec:
     def __post_init__(self) -> None:
         """Reject a spec that could not be provisioned before any command runs."""
 
+        if self.submitter_python is not None and (
+            not isinstance(self.submitter_python, str)
+            or re.fullmatch(r"3\.(?:11|12|13)(?:\.[0-9]+)?", self.submitter_python) is None
+        ):
+            raise ValueError("Eyvan submitters require Python 3.11 through 3.13")
         _validate(self.fleet, _RESOURCE_NAME_PATTERN, field_name="fleet name")
         _validate(self.project, _PROJECT_ID_PATTERN, field_name="project")
         _validate(self.region, _REGION_PATTERN, field_name="region")

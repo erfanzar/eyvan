@@ -19,7 +19,7 @@ import tempfile
 import time
 import typing as tp
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -1121,7 +1121,7 @@ def _parse_timestamp(value: object) -> datetime | None:
         raise ValueError("a budget period timestamp is invalid") from error
     if parsed.tzinfo is None or not 2000 <= parsed.year <= 9999:
         raise ValueError("a budget period timestamp must be bounded and timezone-aware")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _parse_budget_spend(value: object) -> tuple[dict[str, _BudgetCounter], bool]:
@@ -1453,8 +1453,8 @@ def _format_timestamp(value: datetime) -> str:
     if not isinstance(value, datetime):
         raise ValueError("receipt timestamps must be datetime values")
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build_soak_receipt(
@@ -1747,7 +1747,7 @@ def execute_soak(
     """Run, checkpoint and finalize without polling mutable config endpoints."""
 
     del config_is_unchanged, preflight_reasons
-    wall_clock = now or (lambda: datetime.now(timezone.utc))
+    wall_clock = now or (lambda: datetime.now(UTC))
     state = SoakState()
     closed_preflight = list(preflight_reason_codes)
     try:

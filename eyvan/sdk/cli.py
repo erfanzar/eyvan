@@ -25,6 +25,7 @@ from eyvan.sdk.commands.capacity import register_capacity_commands
 from eyvan.sdk.commands.connect import register_connect_commands
 from eyvan.sdk.commands.contexts import register_context_commands
 from eyvan.sdk.commands.dashboard import register_dashboard_commands
+from eyvan.sdk.commands.demo import register_demo_commands
 from eyvan.sdk.commands.doctor import register_doctor_commands
 from eyvan.sdk.commands.federation import register_federation_commands
 from eyvan.sdk.commands.fleets import register_fleet_commands
@@ -69,6 +70,10 @@ def main(
 ) -> None:
     """Operate workloads and fleet governance through Eyvan."""
 
+    if ctx.invoked_subcommand == "demo":
+        # The demo owns a private disposable runtime. A saved context, remote
+        # URL or node credential must never redirect it to an existing fleet.
+        return
     context_store = FileContextStore()
     try:
         context_config = context_store.load()
@@ -132,6 +137,7 @@ for register_commands in (
     register_start_commands,
     register_connect_commands,
     register_context_commands,
+    register_demo_commands,
     register_doctor_commands,
     register_fleet_commands,
     register_head_commands,

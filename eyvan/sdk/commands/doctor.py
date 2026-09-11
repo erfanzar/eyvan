@@ -42,6 +42,13 @@ from eyvan.records import CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.deployment import newest_source_mtime, stale_components
+from eyvan.sdk.commands.doctor_preflights import (
+    check_artifact_store,
+    check_control_plane_port,
+    check_gcloud_authentication,
+    check_runtime_profile,
+    check_secret_manager_bind,
+)
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.api.server_bind import ServerBindPolicy
@@ -98,7 +105,7 @@ def _pool_advertises_accelerator(pool: dict[str, JsonValue]) -> bool:
     return False
 
 
-class CheckStatus(str, Enum):
+class CheckStatus(str, Enum):  # noqa: UP042 -- preserve existing Enum string rendering
     """Outcome of one preflight check."""
 
     PASS = "pass"
@@ -756,6 +763,43 @@ class DoctorCommandService:
             remedy="eyvan runtime deploy --yes",
         )
 
+    def _local_preflight_checks(self) -> tuple[CheckResult, ...]:
+        """Map the local-machine preflights onto doctor check results.
+
+        These ask about this machine — credentials, permissions, stores,
+        profile, port — not about a running control plane, so they run before
+        the endpoint check and still answer when nothing has been started.
+        Each preflight returns (name, status, detail, remedy); the mapping
+        keeps the status vocabulary in one place.
+        """
+
+        try:
+            settings = EyvanSettings.from_env()
+        except ValueError as error:
+            # The startup check above reports the malformed environment in
+            # full; these checks read the same variables and would only
+            # re-crash on it.
+            return (
+                CheckResult(
+                    "local-preflight",
+                    CheckStatus.SKIP,
+                    f"the EYVAN_* environment does not parse: {error}",
+                    "",
+                ),
+            )
+        outcomes = (
+            check_gcloud_authentication(),
+            check_secret_manager_bind(),
+            check_artifact_store(settings),
+            check_runtime_profile(),
+            check_control_plane_port(self.session.base_url),
+        )
+        status_by_name = {status.value: status for status in CheckStatus}
+        results = []
+        for name, status, detail, remedy in outcomes:
+            results.append(CheckResult(name, status_by_name[status], detail, remedy))
+        return tuple(results)
+
     def report(self) -> DoctorReport:
         """Run every check in dependency order and collect the outcomes."""
 
@@ -769,6 +813,7 @@ class DoctorCommandService:
         # check so an unreachable plane cannot skip it, and after the startup
         # check so ``checks[0]`` stays the refusal list.
         report.checks.append(self._callable_trust_check())
+        report.checks.extend(self._local_preflight_checks())
         endpoint = self._endpoint_check()
         report.checks.append(endpoint)
         if endpoint.status is CheckStatus.FAIL:

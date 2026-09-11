@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, Inexact, Overflow, Rounded, Underflow, localcontext
 from pathlib import Path
 
@@ -269,7 +269,7 @@ def _build_receipt(
 ) -> dict[str, object]:
     run_inputs = inputs or _inputs()
     actual = run_inputs.requested_duration_s if actual_s is None else actual_s
-    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    started = datetime(2026, 1, 1, tzinfo=UTC)
     return build_soak_receipt(
         state,
         run_inputs,
@@ -674,7 +674,7 @@ class _FakeClock:
     def __init__(self, *, interrupt: bool = False):
         self.elapsed = 0.0
         self.interrupt = interrupt
-        self.epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.epoch = datetime(2026, 1, 1, tzinfo=UTC)
 
     def monotonic(self) -> float:
         return self.elapsed

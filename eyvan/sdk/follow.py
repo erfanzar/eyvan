@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import typing as tp
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.records import WorkloadRecord, WorkloadState
@@ -140,7 +140,7 @@ def _timestamp(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 class _Transport(tp.Protocol):
@@ -284,7 +284,7 @@ class WorkloadFollower:
                 self._rank_prefixes = True
             if not self._rank_prefixes and any(rank for rank, _message, _at in window.lines):
                 self._rank_prefixes = True
-            cutoff = None if self.since is None else datetime.now(timezone.utc) - self.since
+            cutoff = None if self.since is None else datetime.now(UTC) - self.since
             for index, (rank, message, at) in enumerate(window.lines):
                 if cutoff is not None and at is not None and at < cutoff:
                     continue

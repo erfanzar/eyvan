@@ -565,7 +565,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 checkpoint_output_uri=request.tpu.checkpoint_output_uri,
                 can_submit_children=request.tpu.can_submit_children,
                 dependencies=tuple(request.tpu.dependencies),
-                atomic=request.tpu.atomic,
+                atomic=getattr(request.tpu, "atomic", False),
                 idempotency_key=request.invocation_id,
             )
         except EyvanHTTPError as error:
@@ -579,7 +579,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 workload_id=workload.id,
                 fleet=request.fleet,
                 resource_shape=worker_request(request.tpu.type, request.tpu.pods),
-                atomic=request.tpu.atomic,
+                atomic=getattr(request.tpu, "atomic", False),
             )
         )
 

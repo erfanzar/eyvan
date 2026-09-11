@@ -101,6 +101,16 @@ def _isolated_runtime_profile(tmp_path, monkeypatch) -> None:
     # Whether *this* machine happens to be running a stale control plane must
     # not decide a test's outcome either.
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
+    # The local-preflight family (gcloud auth, secret-manager bind, artifact
+    # store, runtime profile, port ownership) reads this machine's tooling
+    # and home directory; without this, the expectations below would be a
+    # description of whatever machine the suite happens to run on. No gcloud
+    # and no profile is the deterministic baseline.
+    monkeypatch.setattr("eyvan.sdk.commands.doctor_preflights.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "eyvan.sdk.commands.doctor_preflights.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
+        tmp_path / "no-runtime-profile.json",
+    )
 
 
 def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
@@ -116,6 +126,14 @@ def test_healthy_control_plane_with_one_fleet_passes_everything() -> None:
         # default bind this suite uses passes rather than warning. The network
         # bind it exists for is covered below.
         "callable-trust": CheckStatus.PASS,
+        # The local preflight family, all in their not-applicable state under
+        # this fixture: no gcloud and no runtime profile staged. Each check's
+        # real verdicts live in tests/test_doctor_local_preflights.py.
+        "gcloud-authentication": CheckStatus.PASS,
+        "secret-manager-bind-permission": CheckStatus.PASS,
+        "artifact-store": CheckStatus.PASS,
+        "runtime-profile": CheckStatus.PASS,
+        "control-plane-port": CheckStatus.PASS,
         "control-plane-url": CheckStatus.PASS,
         "control-plane-reachable": CheckStatus.PASS,
         "controller-mode": CheckStatus.PASS,
