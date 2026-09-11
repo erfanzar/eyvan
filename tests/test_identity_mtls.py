@@ -450,3 +450,8 @@ def _leaf(
 
 def _write(path: Path, certificate: x509.Certificate) -> None:
     path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

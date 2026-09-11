@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from eyvan._internal.build_identity import build_identity
 from eyvan._internal.json_types import JsonObject
+from eyvan._internal.trace_context import remote_trace_parent
 from eyvan.capacity.drivers.base import (
     CapacityProviderError,
     DriverBusyError,
@@ -94,7 +95,7 @@ def create_agent_app(
         lifespan=lifespan,
     )
 
-    def authenticate(authorization: str | None = Header(default=None)) -> None:
+    def authenticate_credentials(authorization: str | None = Header(default=None)) -> None:
         secret = settings.agent_shared_secret
         if secret is None:
             return
@@ -108,6 +109,14 @@ def create_agent_app(
             recognized = False
         if not recognized:
             raise HTTPException(status_code=401, detail="invalid cell-agent credential")
+
+    async def authenticate(
+        request: Request, _authenticated: None = Depends(authenticate_credentials)
+    ) -> tp.AsyncIterator[None]:
+        # Async dependency scope reaches sync handlers via their thread-pool
+        # context copy, and unwinds after errors as well as successful responses.
+        with remote_trace_parent(request.headers.get("traceparent"), enabled=settings.correlation_enabled):
+            yield
 
     @app.exception_handler(StaleMutationError)
     async def stale_mutation_handler(_request: Request, exc: StaleMutationError) -> JSONResponse:

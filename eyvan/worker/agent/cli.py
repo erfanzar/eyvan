@@ -18,6 +18,18 @@ from eyvan.identity.mtls import server_ssl_options
 from eyvan.worker.agent.app import create_agent_app
 from eyvan.worker.identity import agent_workload_identity, describe_agent_workload_identity
 
+_AGENT_LOOPBACK_BINDS = frozenset({"127.0.0.1", "::1"})
+
+
+def _validate_unauthenticated_bind(host: str, allow_unauthenticated: bool) -> None:
+    """Reject unauthenticated agents unless they listen on literal loopback."""
+
+    if allow_unauthenticated and host not in _AGENT_LOOPBACK_BINDS:
+        raise ValueError(
+            "--allow-unauthenticated and EYVAN_AGENT_ALLOW_UNAUTHENTICATED are only "
+            "permitted with --host 127.0.0.1 or --host ::1"
+        )
+
 
 def _settings_for_runtime_profile(profile_path: Path | None) -> EyvanSettings:
     """Resolve explicit owner-only native settings or the ordinary environment-backed settings."""
@@ -49,6 +61,7 @@ def main() -> None:
         "also enabled via EYVAN_AGENT_ALLOW_UNAUTHENTICATED=1",
     )
     args = parser.parse_args()
+    _validate_unauthenticated_bind(args.host, args.allow_unauthenticated)
 
     import uvicorn
 

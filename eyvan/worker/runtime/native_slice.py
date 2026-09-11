@@ -57,6 +57,7 @@ import copy
 import logging
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 
@@ -72,6 +73,7 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     UnsupportedCapabilityError,
 )
+from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime._multihost_site import (
     DEFAULT_GANG_INITIALIZATION,
@@ -546,7 +548,7 @@ class NativeSliceStageDriver:
         capability_failures: list[tuple[int, str, UnsupportedCapabilityError]] = []
         with ThreadPoolExecutor(max_workers=len(pairs), thread_name_prefix=f"eyvan-{action}") as pool:
             futures = {
-                pool.submit(self._act, worker, action, cell_id, asset, max_bytes=max_bytes): (
+                pool.submit(copy_context().run, self._act, worker, action, cell_id, asset, max_bytes=max_bytes): (
                     rank,
                     endpoint,
                 )
@@ -834,6 +836,7 @@ class NativeSliceExecutor:
         clients: tp.Sequence[httpx.Client] | None = None,
         jax_cluster_detection: JaxClusterDetectionMode = JaxClusterDetectionMode.EXPLICIT,
         initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
+        mtls: MutualTlsFiles | None = None,
     ) -> None:
         normalized = tuple(endpoint.rstrip("/") for endpoint in endpoints)
         if not normalized or any(not endpoint or endpoint != endpoint.strip() for endpoint in normalized):
@@ -849,12 +852,26 @@ class NativeSliceExecutor:
             raise TypeError("native slice JAX cluster detection must be a JaxClusterDetectionMode")
         if not isinstance(initialization, GangInitializationPolicy):
             raise TypeError("native slice initialization must be a GangInitializationPolicy")
+        owned_endpoints = (
+            normalized
+            if clients is None
+            else tuple(endpoint for endpoint, client in zip(normalized, clients, strict=True) if client is None)
+        )
+        if mtls is not None and owned_endpoints:
+            if any(urlparse(endpoint).scheme != "https" for endpoint in owned_endpoints):
+                raise ValueError("mutual TLS requires HTTPS native-worker endpoints")
+            client_ssl_context(mtls)
         self.endpoints = normalized
         self.jax_cluster_detection = jax_cluster_detection
         self.initialization = initialization
         self._coordinator_address = f"{coordinator.hostname}:{_COORDINATOR_PORT}"
         self._workers = tuple(
-            NativeRemoteExecutor(endpoint, secret=secret, client=client)
+            NativeRemoteExecutor(
+                endpoint,
+                secret=secret,
+                client=client,
+                **({"mtls": mtls} if mtls is not None else {}),
+            )
             for endpoint, client in zip(normalized, clients or (None,) * len(normalized), strict=True)
         )
 

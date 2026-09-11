@@ -30,6 +30,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from eyvan._internal.correlation import traced_operation
 from eyvan._internal.json_types import JsonObject, JsonValue, model_json
 from eyvan.capacity import DEFINITIVE_CAPACITY_LOSS_STATUSES, READY_CAPACITY_STATUSES, CapacityStatus
 from eyvan.capacity.drivers.base import (
@@ -48,6 +49,7 @@ from eyvan.capacity.drivers.base import (
 from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS
 from eyvan.capacity.fleet_state import FleetStateStore, StaleFenceError
 from eyvan.config import EyvanSettings
+from eyvan.identity.mtls import MutualTlsFiles
 from eyvan.worker.agent.models import (
     AgentCapabilities,
     AgentObservation,
@@ -60,6 +62,7 @@ from eyvan.worker.agent.models import (
     GangWorkloadMember,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
+    MutationModel,
     WorkloadMutationRequest,
     WorkloadObservation,
     WorkloadRequest,
@@ -202,6 +205,7 @@ def _context(request: MutationRequest) -> MutationContext:
         idempotency_key=mutation.idempotency_key,
         generation=mutation.generation,
         fencing_token=mutation.fencing_token,
+        correlation_id=mutation.correlation_id,
     )
 
 
@@ -249,18 +253,25 @@ class CellAgentService:
                 state=self.state,
                 settings=settings,
             )
+        execution_backend = canonical_execution_backend(capacity.capabilities().executor)
         if executors is None:
             from eyvan.worker.runtime.registry import ExecutionDriverResolver as ConfiguredExecutionResolver
 
-            executors = ConfiguredExecutionResolver(
-                capacity.capabilities().executor,
-                state_dir=settings.agent_state_dir,
-                native_worker_port=settings.native_worker_port,
-                native_worker_token=settings.native_worker_root_secret,
-                gang_initialization=settings.gang_initialization_policy(),
-            )
+            resolver_kwargs: dict[str, tp.Any] = {
+                "state_dir": settings.agent_state_dir,
+                "native_worker_port": settings.native_worker_port,
+                "native_worker_token": settings.native_worker_root_secret,
+                "gang_initialization": settings.gang_initialization_policy(),
+            }
+            if settings.mutual_tls_client_enabled and execution_backend == "eyvan-native":
+                resolver_kwargs["mtls"] = MutualTlsFiles(
+                    trust_bundle=settings.mutual_tls_trust_bundle,
+                    certificate=settings.mutual_tls_certificate,
+                    private_key=settings.mutual_tls_private_key,
+                )
+            executors = ConfiguredExecutionResolver(capacity.capabilities().executor, **resolver_kwargs)
         self.capacity = capacity
-        self.execution_backend = canonical_execution_backend(capacity.capabilities().executor)
+        self.execution_backend = execution_backend
         self.executors = executors
         self._remote_retire = remote_retire or self._retire_on_source_agent
         if stager is None and self.execution_backend in _HOST_LOCAL_EXECUTION_BACKENDS:
@@ -370,20 +381,28 @@ class CellAgentService:
         return self._observation(self._with_execution_readiness(self.capacity.observe(cell_id)))
 
     def reconcile(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
-        value = self.capacity.reconcile(cell_id, _context(request))
-        return self._observation(self._with_execution_readiness(value))
+        context = _context(request)
+        with traced_operation("provider.reconcile", context.correlation_id):
+            value = self.capacity.reconcile(cell_id, context)
+            return self._observation(self._with_execution_readiness(value))
 
     def apply_capacity(self, cell_id: str, request: CapacityRequest) -> AgentObservation:
-        value = self.capacity.apply_capacity(cell_id, request.desired, _context(request))
-        return self._observation(self._with_execution_readiness(value))
+        context = _context(request)
+        with traced_operation("provider.apply_capacity", context.correlation_id):
+            value = self.capacity.apply_capacity(cell_id, request.desired, context)
+            return self._observation(self._with_execution_readiness(value))
 
     def drain(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
-        return self._observation(self.capacity.drain(cell_id, _context(request)))
+        context = _context(request)
+        with traced_operation("provider.drain", context.correlation_id):
+            return self._observation(self.capacity.drain(cell_id, context))
 
     def release(self, cell_id: str, request: WorkloadMutationRequest) -> AgentObservation:
-        value = self.capacity.release(cell_id, _context(request))
-        self._close_execution_cell(cell_id)
-        return self._observation(value)
+        context = _context(request)
+        with traced_operation("provider.release", context.correlation_id):
+            value = self.capacity.release(cell_id, context)
+            self._close_execution_cell(cell_id)
+            return self._observation(value)
 
     def worker_builds(self, cell_id: str) -> list[dict[str, object]] | None:
         """Return what code each native worker of one cell is running.
@@ -566,6 +585,7 @@ class CellAgentService:
         coordinator_cell_id: str,
         generation: int,
         predecessor: JsonObject,
+        correlation_id: str | None = None,
     ) -> None:
         """Fence a predecessor gang before launching a successor generation."""
 
@@ -574,6 +594,7 @@ class CellAgentService:
                 idempotency_key=f"supersede:{workload_id}:{generation}",
                 generation=generation,
                 fencing_token=f"gang:{coordinator_cell_id}:{generation}",
+                correlation_id=correlation_id,
             )
             self._retire_predecessor(workload_id, coordinator_cell_id, mutation, predecessor)
             return
@@ -590,7 +611,10 @@ class CellAgentService:
             member.model_copy(
                 update={
                     "mutation": member.mutation.model_copy(
-                        update={"idempotency_key": f"supersede:{workload_id}:{generation}:{member.cell_id}"}
+                        update={
+                            "idempotency_key": f"supersede:{workload_id}:{generation}:{member.cell_id}",
+                            "correlation_id": correlation_id,
+                        }
                     )
                 }
             )
@@ -627,7 +651,13 @@ class CellAgentService:
             ) as predecessors:
                 generation = members[0].mutation.generation
                 for predecessor in predecessors:
-                    self._retire_gang_predecessor(workload_id, coordinator_cell_id, generation, predecessor)
+                    self._retire_gang_predecessor(
+                        workload_id,
+                        coordinator_cell_id,
+                        generation,
+                        predecessor,
+                        correlation_id=members[0].mutation.correlation_id,
+                    )
                     self.state.require_lease()
                 self.state.clear_gang_workload_predecessors(workload_id, members=member_payload)
                 self.state.require_lease()
@@ -909,17 +939,19 @@ class CellAgentService:
             idempotency_key=f"supersede:{workload_id}:{context.generation}",
             generation=generation,
             fencing_token=fencing_token,
+            correlation_id=context.correlation_id,
         )
         if cell_id != target_cell_id:
             self._remote_retire(
                 cell_id,
                 remote_id,
                 WorkloadMutationRequest(
-                    mutation={
-                        "idempotency_key": predecessor_context.idempotency_key,
-                        "generation": predecessor_context.generation,
-                        "fencing_token": predecessor_context.fencing_token,
-                    }
+                    mutation=MutationModel(
+                        idempotency_key=predecessor_context.idempotency_key,
+                        generation=predecessor_context.generation,
+                        fencing_token=predecessor_context.fencing_token,
+                        correlation_id=predecessor_context.correlation_id,
+                    )
                 ),
             )
             return

@@ -82,6 +82,15 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
         environment = record.get("environment") or {}
         if not isinstance(entrypoint, str) or not isinstance(environment, dict):
             raise RuntimeError("native-local execution record has an invalid command or environment")
+        if entrypoint.startswith("python "):
+            # The controller's managed-callable commands use a bare `python`.
+            # Bind that default to the interpreter running this local executor,
+            # not shell activation or an unrelated system interpreter. Explicit
+            # interpreter paths and other shell commands remain untouched.
+            import shlex
+            import sys
+
+            entrypoint = shlex.quote(sys.executable) + entrypoint[len("python") :]
 
         def running(current: JsonObject) -> None:
             current["status"] = ExecutionWorkloadStatus.RUNNING.value

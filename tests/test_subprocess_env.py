@@ -23,6 +23,8 @@ import subprocess
 import typing as tp
 from pathlib import Path
 
+import pytest
+
 from eyvan._internal.subprocess_env import INTERPRETER_STEERING_ENV_NAMES, provider_cli_env
 
 
@@ -258,3 +260,8 @@ def test_source_scan_every_gcloud_spawn_scrubs_interpreter_steering() -> None:
         f"the scan recognized only {len(scrubbed)} scrubbed gcloud boundaries "
         f"({scrubbed}); extend the scanner before trusting this guard"
     )
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

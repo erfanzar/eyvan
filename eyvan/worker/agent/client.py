@@ -13,6 +13,7 @@ import httpx
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.trace_context import outgoing_trace_headers
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
@@ -223,6 +224,8 @@ class CellAgentClient:
         if client is not None:
             self.client = client
             return
+        if mtls is not None and httpx.URL(base_url).scheme != "https":
+            raise ValueError("mutual TLS requires an HTTPS cell-agent endpoint")
         context = client_ssl_context(mtls) if mtls is not None else None
         if context is None:
             self.client = httpx.Client(base_url=base_url, headers=headers, timeout=30.0)
@@ -248,6 +251,11 @@ class CellAgentClient:
         of twelve `except` clauses that will drift.
         """
 
+        trace_headers = outgoing_trace_headers()
+        if trace_headers:
+            headers = httpx.Headers(kwargs.get("headers"))
+            headers.update(trace_headers)
+            kwargs["headers"] = headers
         try:
             response = self.client.request(method, url, **kwargs)
         except httpx.TransportError as exc:

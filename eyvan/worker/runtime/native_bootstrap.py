@@ -282,6 +282,7 @@ def build_native_worker_startup_script(
     port: int,
     state_dir: str,
     worker_secret_resource: str,
+    worker_tls_secret_resource: str | None = None,
     package_sha256: str | None = None,
     package_generation: str | None = None,
     wheelhouse: str | None = None,
@@ -323,6 +324,11 @@ def build_native_worker_startup_script(
     package = _required(package, "package")
     state_dir = _required(state_dir, "state directory")
     worker_secret_resource = _required(worker_secret_resource, "secret resource")
+    if runtime_python is not None:
+        match = _DECLARED_PYTHON_MAJOR_MINOR.match(runtime_python)
+        if match is not None and not (3, 11) <= tuple(map(int, match.group(0).split("."))) < (3, 14):
+            raise ValueError("Eyvan workers require Python 3.11 through 3.13; choose a supported runtime.python")
+    supported_python = shlex.quote("import sys; raise SystemExit(not ((3, 11) <= sys.version_info[:2] < (3, 14)))")
     if wheelhouse is not None:
         wheelhouse = _required(wheelhouse, "wheelhouse")
     if port <= 0 or port > 65535:
@@ -445,6 +451,24 @@ def build_native_worker_startup_script(
         f"--state-dir {shlex.quote(state_dir)}",
         f"--secret-file {shlex.quote(secret_path)}",
     ]
+    tls_pre_start: tuple[str, ...] = ()
+    if worker_tls_secret_resource is not None:
+        from eyvan.worker.runtime.native_tls_bootstrap import validate_tls_secret_resource
+
+        validate_tls_secret_resource(worker_tls_secret_resource)
+        tls_directory = f"{runtime_dir}/tls"
+        tls_pre_start = (
+            f"ExecStartPre={venv_python} -m eyvan.worker.runtime.native_tls_bootstrap "
+            f"--resource {worker_tls_secret_resource} --directory {tls_directory}",
+        )
+        command_parts.extend(
+            (
+                "--mtls-mode required",
+                f"--mtls-trust-bundle {tls_directory}/trust_bundle.pem",
+                f"--mtls-certificate {tls_directory}/certificate.pem",
+                f"--mtls-private-key {tls_directory}/private_key.pem",
+            )
+        )
     if runtime_env:
         command_parts.extend(("--runtime-env-file", shlex.quote(_WORKLOAD_RUNTIME_ENVIRONMENT)))
     if container_payload is not None:
@@ -472,6 +496,7 @@ def build_native_worker_startup_script(
             "RuntimeDirectory=eyvan-native",
             "RuntimeDirectoryMode=0700",
             *environment,
+            *tls_pre_start,
             f"ExecStartPre=/bin/sh -ec {shlex.quote(fetch_secret)}",
             f"ExecStart={command}",
             "KillMode=control-group",
@@ -524,6 +549,9 @@ def build_native_worker_startup_script(
             *runtime_environment_lines,
             *runtime_container_lines,
             *declared_python_lines,
+            f"if ! {venv_python} -c {supported_python} >/dev/null 2>&1; then",
+            f"  rm -rf {venv_dir}",
+            "fi",
             f"if ! {venv_python} -m pip --version >/dev/null 2>&1; then",
             f"  rm -rf {venv_dir}",
             # Ask every interpreter on the host before asking apt for one. The
@@ -534,19 +562,25 @@ def build_native_worker_startup_script(
             # v5p-16 that had taken six attempts to obtain. Nothing here needs
             # the network or a package manager.
             "  eyvan_python=python3",
-            "  if ! python3 -m ensurepip --version >/dev/null 2>&1; then",
+            f"  if ! python3 -c {supported_python} >/dev/null 2>&1 || "
+            "! python3 -m ensurepip --version >/dev/null 2>&1; then",
             "    for eyvan_dir in $(printf '%s' \"${PATH}\" | tr ':' ' ') /usr/local/bin /usr/bin; do",
             '     for candidate in "${eyvan_dir}"/python3.*; do',
             '      [ -x "${candidate}" ] || continue',
-            '      if "${candidate}" -m ensurepip --version >/dev/null 2>&1; then',
+            f'      if "${{candidate}}" -c {supported_python} >/dev/null 2>&1 && '
+            '"${candidate}" -m ensurepip --version >/dev/null 2>&1; then',
             '        eyvan_python="${candidate}"',
             '        echo "Eyvan native worker is using ${candidate} for its virtual environment; "\\',
-            '             "python3 has no ensurepip" >&2',
+            '             "python3 has no ensurepip or is outside supported Python 3.11 through 3.13" >&2',
             "        break",
             "      fi",
             "     done",
             '     if [ "${eyvan_python}" != python3 ]; then break; fi',
             "    done",
+            "  fi",
+            f'  if ! "${{eyvan_python}}" -c {supported_python} >/dev/null 2>&1; then',
+            "    echo 'Eyvan requires Python 3.11 through 3.13; set runtime.python to a supported version' >&2",
+            "    exit 1",
             "  fi",
             '  if ! "${eyvan_python}" -m ensurepip --version >/dev/null 2>&1; then',
             "    if ! command -v apt-get >/dev/null 2>&1; then",

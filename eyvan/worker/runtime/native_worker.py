@@ -49,6 +49,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from eyvan._internal.build_identity import build_identity
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
+from eyvan._internal.observability import trace_span
+from eyvan._internal.trace_context import remote_trace_parent
 from eyvan.capacity.drivers.base import ExecutionDriver, ExecutionWorkloadReport, MutationContext, StaleMutationError
 from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 from eyvan.worker.agent.models import (
@@ -201,6 +203,7 @@ def create_native_worker_app(
     *,
     state_dir: str | os.PathLike[str] | None = None,
     secret: str | None = None,
+    correlation_enabled: bool = False,
     systemd_transient: bool = False,
     systemd_exit_type_cgroup: bool = False,
     runtime_env: tp.Mapping[str, str] | None = None,
@@ -218,6 +221,9 @@ def create_native_worker_app(
             executor. It cannot be combined with an explicit ``executor``.
         secret: Bearer credential required by every execution API. The
             liveness endpoint remains unauthenticated.
+        correlation_enabled: Join bounded trace parents after authentication
+            and emit request spans when an OpenTelemetry SDK is configured.
+            Disabled by default; never changes authorization or fencing.
         systemd_transient: Run workloads as cgroup-contained transient systemd
             services. Compute VM bootstrap always enables this mode; the local
             executor remains available for development and in-process tests.
@@ -257,6 +263,8 @@ def create_native_worker_app(
         raise ValueError("default native worker options cannot be combined with an explicit executor")
     if not isinstance(secret, str) or not secret.strip():
         raise ValueError("native worker requires a non-empty bearer secret")
+    if not isinstance(correlation_enabled, bool):
+        raise ValueError("native worker correlation setting must be a boolean")
     if not isinstance(systemd_exit_type_cgroup, bool):
         raise ValueError("systemd ExitType cgroup setting must be a boolean")
     runtime_env = _runtime_environment(runtime_env)
@@ -298,7 +306,7 @@ def create_native_worker_app(
     app.state.executor = executor
     app.state.stager = stager
 
-    def authenticate(authorization: str | None = Header(default=None)) -> None:
+    def authenticate_credentials(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {secret}"
         # compare_digest raises TypeError for non-ASCII str, and the header is
         # caller-controlled: unauthenticated garbage must answer 401, never a
@@ -309,6 +317,21 @@ def create_native_worker_app(
             recognized = False
         if not recognized:
             raise HTTPException(status_code=401, detail="invalid native worker credential")
+
+    async def authenticate(
+        request: Request, _authenticated: None = Depends(authenticate_credentials)
+    ) -> tp.AsyncIterator[None]:
+        if not correlation_enabled:
+            yield
+            return
+        with (
+            remote_trace_parent(request.headers.get("traceparent"), enabled=True),
+            trace_span(
+                "eyvan.native_worker_request",
+                **{"http.request.method": request.method, "http.route": request.scope["route"].path},
+            ),
+        ):
+            yield
 
     @app.exception_handler(StaleMutationError)
     async def stale_mutation_handler(_request: Request, exc: StaleMutationError) -> JSONResponse:
@@ -534,6 +557,10 @@ class NativeWorkerArguments(argparse.Namespace):
     runtime_env_file: Path | None
     container_runtime_file: Path | None
     systemd_transient: bool
+    mtls_mode: str
+    mtls_trust_bundle: str
+    mtls_certificate: str
+    mtls_private_key: str
 
 
 def main(argv: tp.Sequence[str] | None = None) -> int:
@@ -547,6 +574,10 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser.add_argument("--secret-file", type=Path)
     parser.add_argument("--runtime-env-file", type=Path)
     parser.add_argument("--container-runtime-file", type=Path)
+    parser.add_argument("--mtls-mode", default=os.getenv("EYVAN_MUTUAL_TLS_MODE", "off"))
+    parser.add_argument("--mtls-trust-bundle", default=os.getenv("EYVAN_MUTUAL_TLS_TRUST_BUNDLE", ""))
+    parser.add_argument("--mtls-certificate", default=os.getenv("EYVAN_MUTUAL_TLS_CERTIFICATE", ""))
+    parser.add_argument("--mtls-private-key", default=os.getenv("EYVAN_MUTUAL_TLS_PRIVATE_KEY", ""))
     parser.add_argument(
         "--systemd-transient",
         action="store_true",
@@ -557,9 +588,17 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         parser.error("--port must be between 1 and 65535")
     if args.secret is not None and args.secret_file is not None:
         parser.error("set only one of --secret or --secret-file")
+    from eyvan.identity.mtls import MutualTlsFiles, parse_mutual_tls_mode, server_ssl_context, server_ssl_options
+
     try:
+        mode = parse_mutual_tls_mode(args.mtls_mode)
+        files = MutualTlsFiles(args.mtls_trust_bundle, args.mtls_certificate, args.mtls_private_key)
+        # Validate before reading/deleting a one-use bearer-secret file.
+        server_ssl_context(mode, files)
+        ssl_options = server_ssl_options(mode, files)
         systemd_exit_type_cgroup = _environment_bool("EYVAN_SYSTEMD_EXIT_TYPE_CGROUP", default=False)
-    except ValueError as exc:
+        correlation_enabled = _environment_bool("EYVAN_CORRELATION_ENABLED", default=False)
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
     secret = args.secret
     # The secret must not be inherited by workload child processes.
@@ -612,12 +651,14 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
             runtime_env=runtime_env if args.runtime_env_file is not None else None,
             runtime_container=runtime_container,
             container_artifact_mounts=container_artifact_mounts,
+            **({"correlation_enabled": True} if correlation_enabled else {}),
         ),
         host=args.host,
         port=args.port,
         # Uvicorn's own graph, with the access formatter that keeps a log-page
         # request's ``?after=`` cursor out of this host's access log.
         log_config=uvicorn_log_config(),
+        **ssl_options,
     )
     return 0
 

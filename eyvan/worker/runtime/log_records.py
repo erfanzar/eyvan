@@ -41,7 +41,7 @@ import re
 import socket
 import typing as tp
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 #: Which stream a line came from. ``"unknown"`` is a real value, not a default:
 #: a missing or unexpected ``PRIORITY`` must not be silently reported as stdout,
@@ -1365,7 +1365,7 @@ def merge_pages(pages: tp.Mapping[int, LogPage]) -> LogPage:
     )
 
 
-_EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
+_EPOCH = datetime.fromtimestamp(0, tz=UTC)
 
 
 def _microseconds_to_datetime(value: object) -> datetime | None:
@@ -1373,7 +1373,7 @@ def _microseconds_to_datetime(value: object) -> datetime | None:
         micros = int(str(value))
     except (TypeError, ValueError):
         return None
-    return datetime.fromtimestamp(micros / 1_000_000, tz=timezone.utc)
+    return datetime.fromtimestamp(micros / 1_000_000, tz=UTC)
 
 
 def _optional_int(value: object) -> int | None:

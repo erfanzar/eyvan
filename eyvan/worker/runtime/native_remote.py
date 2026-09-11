@@ -25,6 +25,7 @@ import httpx
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
+from eyvan._internal.trace_context import outgoing_trace_headers
 from eyvan.capacity.drivers.base import (
     ExecutionWorkloadObservation,
     MutationContext,
@@ -108,6 +109,8 @@ class NativeRemoteExecutor:
         self.endpoint = endpoint.rstrip("/")
         self._headers = {"Authorization": f"Bearer {secret}"}
         self._owns_client = client is None
+        if client is None and mtls is not None and httpx.URL(self.endpoint).scheme != "https":
+            raise ValueError("mutual TLS requires an HTTPS native-worker endpoint")
         context = client_ssl_context(mtls) if (client is None and mtls is not None) else None
         if client is not None:
             self.client = client
@@ -127,6 +130,7 @@ class NativeRemoteExecutor:
             idempotency_key=context.idempotency_key,
             generation=context.generation,
             fencing_token=context.fencing_token,
+            correlation_id=context.correlation_id,
         )
 
     @staticmethod
@@ -169,12 +173,14 @@ class NativeRemoteExecutor:
         here; their fencing is the caller's to redo.
         """
 
+        trace_headers = outgoing_trace_headers()
+        headers = {**self._headers, **trace_headers} if trace_headers else self._headers
         try:
-            return self.client.request(method, path, headers=self._headers, **kwargs)
+            return self.client.request(method, path, headers=headers, **kwargs)
         except httpx.RemoteProtocolError:
             if method != "GET":
                 raise
-            return self.client.request(method, path, headers=self._headers, **kwargs)
+            return self.client.request(method, path, headers=headers, **kwargs)
 
     def worker_builds(self) -> list[dict[str, object]]:
         """Return this cell's one native worker, in the slice executor's shape.

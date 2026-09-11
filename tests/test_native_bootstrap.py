@@ -544,6 +544,43 @@ def test_the_default_interpreter_is_kept_when_it_already_works(tmp_path: Path) -
     assert "SELECTED=python3" in result.stdout
 
 
+def test_an_unsupported_default_python_is_skipped_even_when_it_has_ensurepip(tmp_path: Path) -> None:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    (stub_dir / "python3").write_text('#!/bin/sh\nif [ "$1" = "-c" ]; then exit 1; fi\nexit 0\n')
+    (stub_dir / "python3.11").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("python3", "python3.11"):
+        (stub_dir / name).chmod(0o755)
+    script = build_native_worker_startup_script(
+        package="eyvan==0.1.0",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/p/secrets/s/versions/1",
+    )
+    selection = _interpreter_selection(script)
+    result = subprocess.run(
+        [shutil.which("bash")],
+        input=f'PATH="{stub_dir}:$PATH"\n{selection}\necho "SELECTED=${{eyvan_python}}"\n',
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"SELECTED={stub_dir}/python3.11" in result.stdout
+
+
+@pytest.mark.parametrize("version", ["3.10", "3.10.19", "3.9", "3.14"])
+def test_an_unsupported_declared_worker_python_is_refused_before_bootstrap(version) -> None:
+    with pytest.raises(ValueError, match=r"Python 3\.11"):
+        build_native_worker_startup_script(
+            package="eyvan==0.1.0",
+            port=8123,
+            state_dir="/var/lib/eyvan/worker",
+            worker_secret_resource="projects/p/secrets/s/versions/1",
+            runtime_python=version,
+        )
+
+
 def _interpreter_selection(script: str) -> str:
     """Return the interpreter-selection block, ending where the apt guard begins.
 
@@ -643,3 +680,8 @@ def test_an_undeclared_python_renders_exactly_the_script_it_always_did() -> None
     assert "uv venv" not in plain
     # Still the image's own interpreter, still inheriting its JAX and libtpu.
     assert "-m venv --system-site-packages /opt/eyvan-native/venv" in plain
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

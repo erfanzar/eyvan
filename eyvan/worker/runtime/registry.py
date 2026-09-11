@@ -27,6 +27,7 @@ from eyvan.capacity.drivers.base import (
     canonical_execution_backend,
     read_cell_accelerator,
 )
+from eyvan.identity.mtls import MutualTlsConfigurationError, MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import (
     DEFAULT_GPU_RANK_LAYOUT,
     GpuRankLayout,
@@ -244,6 +245,7 @@ def _eyvan_native_factory(
     endpoint: str | None = None,
     state_dir: str | os.PathLike[str] | None = None,
     token: str | None = None,
+    mtls: MutualTlsFiles | None = None,
 ) -> ExecutionDriver:
     del state_dir
     if endpoint is None or not endpoint.strip():
@@ -252,7 +254,10 @@ def _eyvan_native_factory(
         raise ValueError("eyvan-native execution requires a native worker bearer secret")
     from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
 
-    return NativeRemoteExecutor(endpoint, secret=token)
+    kwargs: dict[str, tp.Any] = {"secret": token}
+    if mtls is not None:
+        kwargs["mtls"] = mtls
+    return NativeRemoteExecutor(endpoint, **kwargs)
 
 
 def _retired_ray_jobs_factory(
@@ -301,6 +306,7 @@ class ExecutionRuntimeRegistry:
         endpoint: str | None = None,
         state_dir: str | os.PathLike[str] | None = None,
         token: str | None = None,
+        mtls: MutualTlsFiles | None = None,
     ) -> ExecutionDriver:
         """Construct the selected execution driver without importing others."""
 
@@ -310,9 +316,15 @@ class ExecutionRuntimeRegistry:
         if factory is None:
             choices = ", ".join(self.names())
             raise ValueError(f"unknown execution backend {name!r}; available backends: {choices}")
-        if token is None:
-            return factory(endpoint=endpoint, state_dir=state_dir)
-        return factory(endpoint=endpoint, state_dir=state_dir, token=token)
+        kwargs: dict[str, tp.Any] = {"endpoint": endpoint, "state_dir": state_dir}
+        if token is not None:
+            kwargs["token"] = token
+        # The public factory ABI is deliberately unchanged for registered
+        # extensions. Only the shipped native factory receives the optional
+        # transport configuration.
+        if factory is _eyvan_native_factory and mtls is not None:
+            kwargs["mtls"] = mtls
+        return factory(**kwargs)
 
     def names(self) -> tuple[str, ...]:
         """Return registered canonical backend names."""
@@ -340,6 +352,7 @@ class ExecutionDriverResolver:
         native_worker_token: str | None = None,
         gang_initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
         gpu_rank_layout: GpuRankLayout | None = None,
+        mtls: MutualTlsFiles | None = None,
     ) -> None:
         if native_worker_port <= 0 or native_worker_port > 65535:
             raise ValueError("native worker port must be between 1 and 65535")
@@ -350,6 +363,15 @@ class ExecutionDriverResolver:
         if not isinstance(gpu_rank_layout, GpuRankLayout):
             raise TypeError("gpu rank layout must be a GpuRankLayout")
         self.backend = _normalize_name(backend)
+        # Transport configuration belongs only to the shipped native backend.
+        # Custom registries retain their historical factory ABI and must not
+        # load certificate files merely because the agent has mTLS enabled.
+        if mtls is not None and self.backend == "eyvan-native":
+            if not mtls.has_trust_anchor:
+                raise MutualTlsConfigurationError("a mutual TLS client requires a trust bundle to verify its server")
+            if not mtls.has_identity:
+                raise MutualTlsConfigurationError("a mutual TLS client requires a certificate and private key")
+            client_ssl_context(mtls)
         if self.backend == "eyvan-native" and (
             not isinstance(native_worker_token, str) or not native_worker_token.strip()
         ):
@@ -361,6 +383,7 @@ class ExecutionDriverResolver:
         self.state_dir = Path(state_dir).expanduser() if state_dir is not None else None
         self.native_worker_port = native_worker_port
         self.native_worker_token = native_worker_token
+        self.mtls = mtls
         self.gang_initialization = gang_initialization
         self.gpu_rank_layout = gpu_rank_layout
         self._drivers: dict[tuple[str, ...], ExecutionDriver] = {}
@@ -436,6 +459,9 @@ class ExecutionDriverResolver:
                     from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode, NativeSliceExecutor
 
                     assert token is not None
+                    slice_kwargs: dict[str, tp.Any] = {}
+                    if self.mtls is not None:
+                        slice_kwargs["mtls"] = self.mtls
                     driver = NativeSliceExecutor(
                         native_endpoints,
                         secret=token,
@@ -443,9 +469,17 @@ class ExecutionDriverResolver:
                             JaxClusterDetectionMode.GCE_TPU if gce_tpu_cluster else JaxClusterDetectionMode.EXPLICIT
                         ),
                         initialization=self.gang_initialization,
+                        **slice_kwargs,
                     )
                 else:
-                    driver = self.registry.create(self.backend, endpoint=endpoint, state_dir=state_dir, token=token)
+                    create_kwargs: dict[str, tp.Any] = {
+                        "endpoint": endpoint,
+                        "state_dir": state_dir,
+                        "token": token,
+                    }
+                    if self.mtls is not None:
+                        create_kwargs["mtls"] = self.mtls
+                    driver = self.registry.create(self.backend, **create_kwargs)
                 self._drivers[key] = driver
             stale_keys = [driver_key for driver_key in self._drivers if driver_key[1] == cell_id and driver_key != key]
             stale_drivers = [self._drivers.pop(driver_key) for driver_key in stale_keys]
@@ -507,11 +541,13 @@ class ExecutionDriverResolver:
             )
             for cell in ordered
         ]
-        return NativeGangExecutor(
-            members,
-            initialization=self.gang_initialization,
-            gpu_rank_layout=self.gpu_rank_layout,
-        )
+        gang_kwargs: dict[str, tp.Any] = {
+            "initialization": self.gang_initialization,
+            "gpu_rank_layout": self.gpu_rank_layout,
+        }
+        if self.mtls is not None:
+            gang_kwargs["mtls"] = self.mtls
+        return NativeGangExecutor(members, **gang_kwargs)
 
     @staticmethod
     def _gang_gpu_accelerators(

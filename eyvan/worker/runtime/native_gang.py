@@ -47,6 +47,7 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadStatus,
     MutationContext,
 )
+from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import (
     DEFAULT_GPU_RANK_LAYOUT,
     DEFAULT_NATIVE_COORDINATOR_PORT,
@@ -401,6 +402,7 @@ class NativeGangExecutor:
         clients: tp.Sequence[httpx.Client | None] | None = None,
         initialization: GangInitializationPolicy = DEFAULT_GANG_INITIALIZATION,
         gpu_rank_layout: GpuRankLayout = DEFAULT_GPU_RANK_LAYOUT,
+        mtls: MutualTlsFiles | None = None,
     ) -> None:
         if not isinstance(initialization, GangInitializationPolicy):
             raise TypeError("native gang initialization must be a GangInitializationPolicy")
@@ -425,6 +427,16 @@ class NativeGangExecutor:
         coordinator = urlparse(endpoints[0])
         if coordinator.scheme not in {"http", "https"} or not coordinator.hostname:
             raise ValueError("native gang coordinator endpoint must be an HTTP URL with a host")
+        effective_mtls = mtls
+        owned_endpoints = (
+            endpoints
+            if clients is None
+            else tuple(endpoint for endpoint, client in zip(endpoints, clients, strict=True) if client is None)
+        )
+        if effective_mtls is not None and owned_endpoints:
+            if any(urlparse(endpoint).scheme != "https" for endpoint in owned_endpoints):
+                raise ValueError("mutual TLS requires HTTPS native-worker endpoints")
+            client_ssl_context(effective_mtls)
 
         declared_gpu = [member.gpu_devices_per_host is not None for member in ordered_members]
         if any(declared_gpu) and not all(declared_gpu):
@@ -459,7 +471,12 @@ class NativeGangExecutor:
                 cell_index=cell_index,
                 endpoint=endpoint,
                 context=member.context,
-                executor=NativeRemoteExecutor(endpoint, secret=member.secret, client=client),
+                executor=NativeRemoteExecutor(
+                    endpoint,
+                    secret=member.secret,
+                    client=client,
+                    **({"mtls": effective_mtls} if effective_mtls is not None else {}),
+                ),
                 gpu_devices=member.gpu_devices_per_host,
                 gpu_model=member.gpu_model,
             )

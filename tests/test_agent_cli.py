@@ -90,7 +90,7 @@ def test_agent_cli_defaults_to_authenticated(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_agent_cli_allow_unauthenticated_flag_starts_without_a_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_agent_auth_env(monkeypatch)
-    monkeypatch.setattr("sys.argv", ["eyvan-agent", "--allow-unauthenticated"])
+    monkeypatch.setattr("sys.argv", ["eyvan-agent", "--host", "127.0.0.1", "--allow-unauthenticated"])
     allowed = _stub_agent_factory(monkeypatch)
     served: list[FastAPI] = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **_: served.append(app))
@@ -104,7 +104,7 @@ def test_agent_cli_allow_unauthenticated_flag_starts_without_a_secret(monkeypatc
 def test_agent_cli_allow_unauthenticated_env_starts_without_a_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_agent_auth_env(monkeypatch)
     monkeypatch.setenv("EYVAN_AGENT_ALLOW_UNAUTHENTICATED", "1")
-    monkeypatch.setattr("sys.argv", ["eyvan-agent"])
+    monkeypatch.setattr("sys.argv", ["eyvan-agent", "--host", "127.0.0.1"])
     allowed = _stub_agent_factory(monkeypatch)
     served: list[FastAPI] = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **_: served.append(app))
