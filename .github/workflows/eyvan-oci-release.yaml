@@ -56,7 +56,6 @@ jobs:
       LOCK: oci/release-lock.json
       ALLOWLIST: oci/high-critical-allowlist.json
       VERIFIER: scripts/verify_eyvan_oci_release.py
-      TOOL_DIR: ${{ runner.temp }}/eyvan-pr-tools
       PR_TAG: pr-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out the pull request merge commit
@@ -92,8 +91,11 @@ jobs:
           PY
 
       - name: Install the locked host tools
+        env:
+          TOOL_DIR: ${{ runner.temp }}/eyvan-pr-tools
         run: |
           set -euo pipefail
+          echo "TOOL_DIR=${TOOL_DIR}" >> "${GITHUB_ENV}"
           python3 oci/install_locked_tools.py \
             --lock "${LOCK}" \
             --destination "${TOOL_DIR}" \
@@ -215,7 +217,6 @@ jobs:
       LOCK: oci/release-lock.json
       ALLOWLIST: oci/high-critical-allowlist.json
       VERIFIER: scripts/verify_eyvan_oci_release.py
-      TOOL_DIR: ${{ runner.temp }}/eyvan-release-tools
       ISSUER: https://token.actions.githubusercontent.com
       WORKFLOW_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/eyvan-oci-release.yaml@refs/heads/main
     steps:
@@ -313,8 +314,11 @@ jobs:
             --repository-root .
 
       - name: Install the locked host tools
+        env:
+          TOOL_DIR: ${{ runner.temp }}/eyvan-release-tools
         run: |
           set -euo pipefail
+          echo "TOOL_DIR=${TOOL_DIR}" >> "${GITHUB_ENV}"
           python3 oci/install_locked_tools.py \
             --lock "${LOCK}" \
             --destination "${TOOL_DIR}" \
