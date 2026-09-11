@@ -333,5 +333,5 @@ class _ControllerLoops:
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=self.settings.scheduler_interval_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

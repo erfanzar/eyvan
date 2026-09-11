@@ -22,6 +22,7 @@ from eyvan.artifacts.transfers import ManagedArtifactAccess
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.audit import CapacityLifecycleLogger
 from eyvan.config import EyvanSettings
+from eyvan.identity.mtls import MutualTlsConfigurationError
 from eyvan.records import (
     CellRecord,
     OutboxRecord,
@@ -139,7 +140,19 @@ class _ControllerLifecycle:
             raise RuntimeError(f"cell {cell.id!r} has no cell-agent endpoint")
         key = f"{cell.endpoint}\0{self.settings.agent_shared_secret or ''}"
         if key not in self._agent_clients:
-            self._agent_clients[key] = CellAgentClient(cell.endpoint, token=self.settings.agent_shared_secret)
+            if self.settings.mutual_tls_client_enabled:
+                mtls = self.settings.mutual_tls_files()
+                if not mtls.has_trust_anchor or not mtls.has_identity:
+                    raise MutualTlsConfigurationError(
+                        "an enabled mutual TLS client requires a trust bundle, certificate and private key"
+                    )
+                self._agent_clients[key] = CellAgentClient(
+                    cell.endpoint,
+                    token=self.settings.agent_shared_secret,
+                    mtls=mtls,
+                )
+            else:
+                self._agent_clients[key] = CellAgentClient(cell.endpoint, token=self.settings.agent_shared_secret)
         return self._agent_clients[key]
 
     def _fleet_capacity_gate(self, fleet_name: str) -> _FleetCapacityGate:
@@ -189,6 +202,7 @@ class _ControllerLifecycle:
             idempotency_key=command.idempotency_key,
             generation=command.generation,
             fencing_token=fencing_token,
+            correlation_id=command.correlation_id,
         )
 
     async def _load_cell(self, command: OutboxRecord) -> CellRecord:

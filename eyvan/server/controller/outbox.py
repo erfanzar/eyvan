@@ -14,6 +14,7 @@ from datetime import timedelta
 
 from pydantic import ValidationError
 
+from eyvan._internal.correlation import traced_operation
 from eyvan._internal.observability import trace_span
 from eyvan.capacity.audit import CapacityLifecycleEvent
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
@@ -163,6 +164,7 @@ class _ControllerOutbox:
             # neither a slow provider nor a slow agent produced any signal.
             with (
                 self._measure_reconcile(command.topic),
+                traced_operation("outbox." + command.topic, command.correlation_id),
                 trace_span(
                     "eyvan.outbox_dispatch",
                     topic=command.topic,

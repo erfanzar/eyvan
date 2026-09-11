@@ -91,6 +91,7 @@ class _ControllerPreemption:
                             idempotency_key=f"{prepared.idempotency_key}:{lease.id}",
                             generation=victim.generation,
                             fencing_token=lease.fencing_token,
+                            correlation_id=prepared.correlation_id,
                         )
                         request = CheckpointRequest(
                             mutation=mutation,
@@ -164,6 +165,7 @@ class _ControllerPreemption:
                                     idempotency_key=f"{prepared.idempotency_key}:{lease.id}",
                                     generation=victim.generation,
                                     fencing_token=lease.fencing_token,
+                                    correlation_id=prepared.correlation_id,
                                 )
                             )
                             await asyncio.to_thread(agent.stop, cell.id, workload.remote_id, request)
@@ -280,7 +282,7 @@ class _ControllerPreemption:
                     workload is None
                     or lease is None
                     or workload.generation != victim.generation
-                    or workload.lease_id != victim.lease_id
+                    or victim.lease_id not in self._workload_lease_ids(workload)
                     or workload.preemption_id != current.id
                     or lease.generation != victim.generation
                     or lease.cell_id != victim.cell_id
@@ -293,10 +295,18 @@ class _ControllerPreemption:
                 cell = await transaction.get_cell(str(current.payload["cell_id"]))
                 stale = cell is None or cell.state is not CellState.READY
                 if not stale:
-                    stale = any(
-                        lease is None or lease.cell_id != cell.id or lease.cell_generation != cell.generation
-                        for lease in leases.values()
-                    )
+                    # A gang's siblings occupy different cells. Fence each
+                    # allocation against its own generation, not the target's.
+                    for lease in leases.values():
+                        member_cell = None if lease is None else await transaction.get_cell(lease.cell_id)
+                        if (
+                            lease is None
+                            or member_cell is None
+                            or member_cell.state is not CellState.READY
+                            or lease.cell_generation != member_cell.generation
+                        ):
+                            stale = True
+                            break
                 policy = await transaction.get_policy(target.org_id, target.project_id)
                 if not stale and policy is not None:
                     try:
@@ -451,7 +461,7 @@ class _ControllerPreemption:
                 workload is None
                 or lease is None
                 or workload.generation != victim.generation
-                or workload.lease_id != lease.id
+                or lease.id not in self._workload_lease_ids(workload)
                 or workload.preemption_id != command.id
                 or lease.revocation_reason != "preemption"
                 or workload.state not in {WorkloadState.CHECKPOINTING, WorkloadState.CANCELLING}
@@ -466,7 +476,11 @@ class _ControllerPreemption:
             )
             await transaction.put_workload(restored_workload)
             await transaction.put_lease(restored_lease)
-            if victim.workload_state is WorkloadState.LEASED and workload.remote_id is None:
+            if (
+                victim.workload_state is WorkloadState.LEASED
+                and workload.remote_id is None
+                and lease.id == workload.lease_id
+            ):
                 await self.service._outbox(
                     transaction,
                     topic="workload.dispatch",
@@ -509,6 +523,7 @@ class _ControllerPreemption:
                     idempotency_key=f"{command.idempotency_key}:{hook.lease_id}:hook-retire",
                     generation=hook.generation,
                     fencing_token=hook.fencing_token,
+                    correlation_id=command.correlation_id,
                 )
             )
             try:
@@ -579,7 +594,7 @@ class _ControllerPreemption:
                 and lease is not None
                 and lease.state is LeaseState.RELEASED
                 and workload.generation > victim.generation
-                and workload.lease_id != lease.id
+                and lease.id not in self._workload_lease_ids(workload)
             ):
                 return None
             cell = await transaction.get_cell(victim.cell_id)
@@ -587,7 +602,7 @@ class _ControllerPreemption:
                 raise RuntimeError("started preemption plan references a missing workload, lease, or cell")
             if (
                 workload.generation != victim.generation
-                or workload.lease_id != lease.id
+                or lease.id not in self._workload_lease_ids(workload)
                 or workload.preemption_id != command.id
                 or lease.generation != workload.generation
                 or lease.cell_id != victim.cell_id
@@ -604,6 +619,9 @@ class _ControllerPreemption:
         checkpoint_uris: dict[str, str | None],
     ) -> None:
         victims = self._preemption_victims(command)
+        members_by_workload: dict[str, list[_PreemptionVictim]] = {}
+        for victim in victims:
+            members_by_workload.setdefault(victim.workload_id, []).append(victim)
         # A victim whose execution is observed SUCCEEDED or FAILED is settled
         # terminal inside the transaction below, and settlement releases its
         # lease -- which frees the cell for deletion and destroys the journal.
@@ -616,9 +634,9 @@ class _ControllerPreemption:
         if any(outcome in finished_outcomes for outcome in outcomes.values()):
             async with self.repository.transaction() as transaction:
                 finished = [
-                    await transaction.get_workload(victim.workload_id)
-                    for victim in victims
-                    if outcomes.get(victim.lease_id) in finished_outcomes
+                    await transaction.get_workload(workload_id)
+                    for workload_id, members in members_by_workload.items()
+                    if any(outcomes.get(member.lease_id) in finished_outcomes for member in members)
                 ]
             for workload in finished:
                 if workload is None:
@@ -658,21 +676,41 @@ class _ControllerPreemption:
                     and lease is not None
                     and lease.state is LeaseState.RELEASED
                     and workload.generation > victim.generation
-                    and workload.lease_id != lease.id
+                    and lease.id not in self._workload_lease_ids(workload)
                 ):
                     continue
                 if (
                     workload is None
                     or lease is None
                     or workload.generation != victim.generation
-                    or workload.lease_id != lease.id
+                    or lease.id not in self._workload_lease_ids(workload)
                     or workload.preemption_id != command.id
                     or lease.revocation_reason != "preemption"
                     or workload.state not in {WorkloadState.CHECKPOINTING, WorkloadState.CANCELLING}
                     or lease.state not in {LeaseState.REVOKING, LeaseState.QUARANTINED}
                 ):
                     raise RuntimeError("started preemption plan cannot settle a victim it no longer owns")
-                outcome = outcomes[lease.id]
+                members = members_by_workload[workload.id]
+                member_outcomes = {outcomes[member.lease_id] for member in members}
+                # A gang succeeds only when every member succeeded. One failed
+                # member fails the gang; otherwise lost members require a retry.
+                if _PreemptionVictimOutcome.FAILED in member_outcomes:
+                    outcome = _PreemptionVictimOutcome.FAILED
+                elif member_outcomes == {_PreemptionVictimOutcome.SUCCEEDED}:
+                    outcome = _PreemptionVictimOutcome.SUCCEEDED
+                else:
+                    outcome = _PreemptionVictimOutcome.PREEMPTED
+                settled, _, _ = await self.service._settle_lease(
+                    transaction,
+                    self._principal,
+                    workload,
+                    lease,
+                    reason=outcome.value,
+                )
+                # Settle each reservation, but change the workload/generation
+                # only after its last member. Replaying remains one transaction.
+                if victim.lease_id != members[-1].lease_id:
+                    continue
                 if outcome in {_PreemptionVictimOutcome.SUCCEEDED, _PreemptionVictimOutcome.FAILED}:
                     target_state = (
                         WorkloadState.SUCCEEDED
@@ -688,21 +726,7 @@ class _ControllerPreemption:
                     )
                     terminal = terminal.model_copy(update={"preemption_id": None, "updated_at": utcnow()})
                     await transaction.put_workload(terminal)
-                    await self.service._settle_lease(
-                        transaction,
-                        self._principal,
-                        terminal,
-                        lease,
-                        reason=outcome.value,
-                    )
                     continue
-                settled, _, _ = await self.service._settle_lease(
-                    transaction,
-                    self._principal,
-                    workload,
-                    lease,
-                    reason="preempted",
-                )
                 now = utcnow()
                 checkpoint_uri = checkpoint_uris.get(workload.id) or workload.checkpoint_uri
                 next_generation = workload.generation + 1

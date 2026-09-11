@@ -11,6 +11,7 @@ import secrets
 import uuid
 from datetime import timedelta
 
+from eyvan._internal.correlation import canonical_correlation_id
 from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.domain import (
@@ -315,6 +316,7 @@ class _ControllerScheduling:
                 OutboxRecord(
                     id=command_id,
                     topic="workload.preempt",
+                    correlation_id=canonical_correlation_id(target.id) if self.service.correlation_enabled else None,
                     aggregate_type="workload",
                     aggregate_id=target.id,
                     idempotency_key=command_id,

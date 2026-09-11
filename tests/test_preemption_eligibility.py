@@ -190,7 +190,6 @@ def test_a_lease_landed_on_on_demand_is_never_force_terminable() -> None:
 
 
 def test_without_a_landed_class_the_requested_class_decides() -> None:
-
     workload = _record("wl", _spec(capacity_class=CapacityClass.SPOT), WorkloadState.RUNNING)
     lease = to_core_lease(_lease(workload), workload)
 

@@ -210,6 +210,7 @@ class _ControllerWorkloadCommands:
         members: tp.Sequence[tuple[LeaseRecord, CellRecord]],
         *,
         idempotency_prefix: str,
+        correlation_id: str | None = None,
     ) -> tuple[GangWorkloadMember, ...]:
         """Build per-cell fenced mutations for one native workload group."""
 
@@ -221,6 +222,7 @@ class _ControllerWorkloadCommands:
                     idempotency_key=f"{idempotency_prefix}:{lease.id}",
                     generation=lease.generation,
                     fencing_token=lease.fencing_token,
+                    correlation_id=correlation_id,
                 ),
             )
             for lease, cell in cls._ordered_gang_member_pairs(members)
@@ -1163,6 +1165,7 @@ class _ControllerWorkloadCommands:
                             idempotency_key=f"{command.idempotency_key}:{lease.id}",
                             generation=lease.generation,
                             fencing_token=lease.fencing_token,
+                            correlation_id=command.correlation_id,
                         ),
                     )
                     for lease, cell in paired
@@ -1669,7 +1672,11 @@ class _ControllerWorkloadCommands:
         if remote_id:
             ordered = self._ordered_gang_member_pairs(pairs)
             request = GangWorkloadMutationRequest(
-                members=self._gang_members(ordered, idempotency_prefix=command.idempotency_key)
+                members=self._gang_members(
+                    ordered,
+                    idempotency_prefix=command.idempotency_key,
+                    correlation_id=command.correlation_id,
+                )
             )
             coordinator_lease, coordinator_cell = ordered[0]
             await asyncio.to_thread(

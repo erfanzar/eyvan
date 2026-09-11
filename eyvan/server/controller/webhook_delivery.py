@@ -31,6 +31,7 @@ slower every day the fleet is used.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import typing as tp
 
@@ -180,11 +181,21 @@ class _ControllerWebhookDelivery:
                     # against the hostname it was issued for.
                     extensions["sni_hostname"] = target.host
                 target = target.copy_with(host=str(resolved[0]))
+            elif self.settings.webhook_allow_private_targets:
+                # Private targets intentionally retain the normal hostname
+                # lookup behavior: the operator has opted out of this guard.
+                validate_target(webhook.url, allow_private=True)
             else:
-                # Nothing to pin to: an address literal, or a name that resolved
-                # to nothing this time. Fetch the URL as written, which is what
-                # every delivery did before pinning existed.
-                validate_target(webhook.url, allow_private=self.settings.webhook_allow_private_targets)
+                try:
+                    ipaddress.ip_address(target.host)
+                except ValueError:
+                    # An empty answer is not safe to fetch as a hostname. A
+                    # second lookup during the POST could return a private
+                    # address that this delivery never validated.
+                    raise WebhookTargetRefused("webhook hostname did not resolve to an address") from None
+                # Address literals do not undergo DNS rebinding; validate the
+                # literal itself and send it as written.
+                validate_target(webhook.url, allow_private=False)
             async with httpx.AsyncClient(timeout=_DELIVERY_TIMEOUT_S, follow_redirects=False) as client:
                 response = await client.post(
                     str(target),

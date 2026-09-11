@@ -4740,3 +4740,8 @@ async def test_a_matching_cell_build_dispatches(monkeypatch) -> None:
         allocatable=ResourceVector(tpu=8),
     )
     await controller._refuse_stale_cell_builds((cell,))
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow
