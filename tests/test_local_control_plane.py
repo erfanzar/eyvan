@@ -6,6 +6,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 
 def test_a_slow_start_leaves_the_server_running_instead_of_killing_it(tmp_path) -> None:
     """The failure that left a fleet with no control plane.
@@ -318,3 +320,8 @@ def test_identity_resolved_before_the_plane_picks_up_the_credential_it_mints(tmp
         assert response.status_code != 401, "the re-resolved identity must satisfy the plane it just started"
     finally:
         supervisor.stop(endpoint)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

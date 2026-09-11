@@ -17,7 +17,11 @@ from alembic import command, context
 from alembic.config import Config
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
-INI_DATABASE_URL = "postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan"
+#: The loopback-development default is password-less on purpose: a shipped
+#: static credential would be a credential every installation shares, and the
+#: local default relies on the host's trust/peer auth instead. Production
+#: URLs always come from EYVAN_DATABASE_URL or a secret reference.
+INI_DATABASE_URL = "postgresql+asyncpg://eyvan@127.0.0.1:5432/eyvan"
 
 EXPECTED_TABLES = (
     "schema_revisions",

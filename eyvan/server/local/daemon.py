@@ -506,9 +506,16 @@ def process_is_alive(pid: int) -> bool:
             text=True,
         )
     except (OSError, subprocess.SubprocessError):
-        # Signal 0 said the PID exists and no state is readable; assume live.
-        return True
-    if completed.returncode != 0:
+        completed = None
+    if completed is None or completed.returncode != 0:
+        # The process can exit between signal zero and ps. Recheck before
+        # reporting a survivor; an unreadable but existing PID remains live.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
         return True
     return not completed.stdout.strip().startswith(("Z", "z"))
 

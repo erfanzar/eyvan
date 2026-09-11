@@ -140,7 +140,10 @@ rotation, expansion admissions, service operations, and webhooks.
 
 Use the packaged `eyvan-migrate` entry point (or `persistence/migrate.py`), which
 uses `EYVAN_DATABASE_URL` or the documented local-development default
-`postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan`.  Online upgrades target
+`postgresql+asyncpg://eyvan@127.0.0.1:5432/eyvan`.  The default carries no
+password on purpose — it only works against a loopback Postgres configured for
+trust/peer auth — and every real deployment sets `EYVAN_DATABASE_URL` (or a
+secret reference) with its own credentials.  Online upgrades target
 `head`; the migration tool classifies the database against the packaged graph
 and fails closed for unknown, diverged, ahead, multiple-head, or multiple-current
 revision states.  A known-behind schema may be upgraded only during explicitly

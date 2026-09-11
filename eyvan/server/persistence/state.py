@@ -825,7 +825,7 @@ class StateRepository:
                         ),
                         timeout=remaining,
                     )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return []
 
     async def claim_outbox(

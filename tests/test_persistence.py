@@ -918,7 +918,6 @@ def test_transaction_retries_a_serialization_failure_in_service(tmp_path) -> Non
 
 
 def test_transaction_gives_up_after_its_attempt_budget(tmp_path) -> None:
-
     repository = SqlAlchemyRepository.__new__(SqlAlchemyRepository)
     repository._sessions = _FlakyBeginSessions(failures=99)
 
@@ -1043,3 +1042,8 @@ async def test_idempotency_reads_run_on_a_non_postgresql_dialect(tmp_path) -> No
         assert stored == record
     finally:
         await engine.dispose()
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

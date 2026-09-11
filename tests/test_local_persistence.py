@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,7 @@ def _headers() -> dict[str, str]:
     }
 
 
-_FIXED_TIME = datetime(2026, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
+_FIXED_TIME = datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
 _ARTIFACT_PAYLOAD = b"artifact-payload-that-must-remain-outside-control-plane-json"
 _ARTIFACT_DIGEST = hashlib.sha256(_ARTIFACT_PAYLOAD).hexdigest()
 _V1_FIXTURE = Path(__file__).parent / "fixtures" / "local_control_plane_v1.json"
@@ -468,14 +469,33 @@ async def test_local_repository_reclaims_processing_outbox_after_restart(tmp_pat
 async def test_local_repository_rejects_a_second_process_owner(tmp_path: Path) -> None:
     path = tmp_path / "control-plane.json"
     owner = LocalJsonRepository(path)
-    contender = LocalJsonRepository(path)
+    contender = LocalJsonRepository(path, lease_timeout_s=0)
     await owner.open()
     try:
-        with pytest.raises(LocalControlPlaneInUseError, match="already owned"):
+        with pytest.raises(LocalControlPlaneInUseError, match=rf"already owned by another server \(pid {os.getpid()}\)"):
             await contender.open()
     finally:
         await contender.close()
         await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_local_repository_waits_out_a_previous_owners_shutdown(tmp_path: Path) -> None:
+    path = tmp_path / "control-plane.json"
+    owner = LocalJsonRepository(path)
+    await owner.open()
+
+    async def stop_owner() -> None:
+        await asyncio.sleep(0.2)
+        await owner.close()
+
+    stopping = asyncio.create_task(stop_owner())
+    try:
+        replacement = LocalJsonRepository(path, lease_timeout_s=10)
+        await replacement.open()
+        await replacement.close()
+    finally:
+        await stopping
 
 
 @pytest.mark.asyncio

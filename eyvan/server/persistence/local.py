@@ -13,6 +13,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import typing as tp
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -97,6 +98,15 @@ LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
 _LOCAL_CONTROL_PLANE_MAX_JSON_DEPTH = 100
+
+#: How long a starting server waits for a previous owner to finish its graceful
+#: shutdown and release the local-state lease before reporting the state as
+#: owned. A stopping plane holds its flock until the process exits, so a
+#: replacement spawned in that window used to crash in startup; waiting turns
+#: the race into a slower boot, and a still-live owner after the deadline is
+#: named by pid in the error.
+LOCAL_CONTROL_PLANE_LEASE_TIMEOUT_S = 30.0
+LOCAL_CONTROL_PLANE_LEASE_POLL_INTERVAL_S = 0.1
 
 
 class LocalControlPlaneError(RuntimeError):
@@ -1047,13 +1057,46 @@ class LocalControlPlaneLease:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            holder = self._recorded_holder(handle)
             handle.close()
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                raise LocalControlPlaneInUseError(
-                    f"local Eyvan control-plane state {self.path.with_suffix('')} is already owned by another server"
-                ) from None
+                owned = f"local Eyvan control-plane state {self.path.with_suffix('')} is already owned by another server"
+                if holder is not None:
+                    owned = f"{owned} (pid {holder})"
+                raise LocalControlPlaneInUseError(owned) from None
             raise LocalControlPlaneError(f"could not lock local Eyvan control-plane state {self.path}: {exc}") from exc
+        self._record_self(handle)
         self._handle = handle
+
+    def _record_self(self, handle: tp.TextIO) -> None:
+        """Stamp the owning pid into the lock so a contender can name this server.
+
+        The flock itself cannot say who holds it; the stamp is only read while
+        the lock is actively contended, so a stale pid left by a process that
+        died without releasing is never presented as a live owner.
+        """
+
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n")
+            handle.flush()
+        except OSError:
+            pass
+
+    def _recorded_holder(self, handle: tp.TextIO) -> int | None:
+        """Read the pid the current lock holder stamped, if it stamped one."""
+
+        try:
+            handle.seek(0)
+            content = handle.read().strip()
+        except OSError:
+            return None
+        try:
+            pid = int(content)
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
 
     def release(self) -> None:
         """Release the server process's local-state ownership lock."""
@@ -1079,10 +1122,18 @@ class LocalJsonRepository(StateRepository):
 
     session_type = LocalJsonSession
 
-    def __init__(self, path: Path | str = DEFAULT_LOCAL_CONTROL_PLANE_PATH):
+    def __init__(
+        self,
+        path: Path | str = DEFAULT_LOCAL_CONTROL_PLANE_PATH,
+        *,
+        lease_timeout_s: float = LOCAL_CONTROL_PLANE_LEASE_TIMEOUT_S,
+    ):
+        if lease_timeout_s < 0:
+            raise ValueError("lease_timeout_s must not be negative")
         super().__init__()
         self.store = LocalControlPlaneStore(path)
         self._lease = LocalControlPlaneLease(self.store.path)
+        self._lease_timeout_s = lease_timeout_s
         self._opened = False
         self._lifecycle_lock = asyncio.Lock()
 
@@ -1093,7 +1144,7 @@ class LocalJsonRepository(StateRepository):
             if self._opened:
                 self.store._raise_if_ambiguous_commit()
                 return
-            self._lease.acquire()
+            await self._acquire_lease()
             try:
                 self._state = self.store.load()
                 if self._recover_interrupted_outbox_claims():
@@ -1102,6 +1153,28 @@ class LocalJsonRepository(StateRepository):
             except BaseException:
                 self._lease.release()
                 raise
+
+    async def _acquire_lease(self) -> None:
+        """Wait out a previous owner's graceful shutdown before reporting the state as owned.
+
+        A control plane that is stopping keeps its flock until the process
+        exits, so a replacement spawned in that window -- the ordinary
+        ``eyvan up`` right after a slow shutdown -- crashed in startup with
+        the state "already owned", against a plane that was gone seconds
+        later. Waiting a bounded time turns that race into a slower boot; an
+        owner still alive after the deadline raises with its pid named by the
+        lease itself.
+        """
+
+        deadline = time.monotonic() + self._lease_timeout_s
+        while True:
+            try:
+                self._lease.acquire()
+                return
+            except LocalControlPlaneInUseError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(LOCAL_CONTROL_PLANE_LEASE_POLL_INTERVAL_S)
 
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[LocalJsonSession]:

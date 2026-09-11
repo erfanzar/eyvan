@@ -33,7 +33,11 @@ from sqlalchemy.pool import NullPool
 from eyvan._internal.compat import StrEnum
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-DEFAULT_DATABASE_URL = "postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan"
+#: Loopback-development default, password-less on purpose: a static shipped
+#: credential would be one every installation shares. Local development relies
+#: on the host's trust/peer auth; any real deployment sets EYVAN_DATABASE_URL
+#: (or a secret reference) with its own credentials.
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://eyvan@127.0.0.1:5432/eyvan"
 
 
 class MigrationConnectionError(RuntimeError):
