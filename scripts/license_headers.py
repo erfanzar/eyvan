@@ -69,6 +69,12 @@ def apply(path: pathlib.Path) -> bool:
         line, _, rest = original.partition("\n")
         shebang, body = f"{line}\n", rest
 
+    # An already licensed file must be byte-stable. The following comment
+    # may be executable tooling metadata (for example Vitest's DOM directive),
+    # not part of the copyright notice.
+    if body.startswith(header_for(path)):
+        return False
+
     prefix = _comment_prefix(path)
     block, remainder = _leading_comment_block(body, prefix)
     if any(marker in block for marker in _SUPERSEDED_MARKERS) or SPDX_MARKER in block:
@@ -81,17 +87,26 @@ def apply(path: pathlib.Path) -> bool:
     return True
 
 
+def default_targets(root: pathlib.Path) -> list[pathlib.Path]:
+    """Limit automatic maintenance to first-party sources, never scratch environments."""
+
+    return sorted(
+        path
+        for source in ("eyvan", "tests", "scripts", "examples", "dashboard/src")
+        for path in (root / source).rglob("*")
+        if path.suffix in {".py", ".ts", ".tsx"}
+        and path.is_file()
+        and not path.is_symlink()
+        and not any(part.startswith(".") or part in {"node_modules", "dist"} for part in path.relative_to(root).parts)
+    )
+
+
 def main(argv: list[str]) -> int:
     root = pathlib.Path(__file__).resolve().parent.parent
     if argv:
         targets = [pathlib.Path(argument) for argument in argv]
     else:
-        targets = [
-            path
-            for suffix in ("*.py", "*.ts", "*.tsx")
-            for path in root.rglob(suffix)
-            if not {"node_modules", "dist", ".venv"} & set(path.parts)
-        ]
+        targets = default_targets(root)
     changed = [path for path in targets if path.is_file() and apply(path)]
     for path in changed:
         print(f"licensed: {path}")

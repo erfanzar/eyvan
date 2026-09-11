@@ -9,3 +9,15 @@ repos:
         files: \.(py|ts|tsx)$
         exclude: node_modules|dist
         stages: [pre-commit]
+      - id: ruff-check
+        name: ruff check (pinned in requirements-dev.txt)
+        entry: uv run --no-sync --extra dev ruff check --force-exclude
+        language: system
+        types: [python]
+        stages: [pre-commit]
+      - id: ruff-format
+        name: ruff format --check (pinned in requirements-dev.txt)
+        entry: uv run --no-sync --extra dev ruff format --check --force-exclude
+        language: system
+        types: [python]
+        stages: [pre-commit]

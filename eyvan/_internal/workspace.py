@@ -24,7 +24,7 @@ never trusts a member. Absolute paths, ``..`` traversal, symlinks, hardlinks,
 device nodes, FIFOs, and post-resolution escapes are all rejected rather than
 sanitized, and both the member count and the total uncompressed size are
 capped so a small archive cannot exhaust the host. ``tarfile``'s own ``data``
-filter is not used: it requires Python 3.12 while this package supports 3.10,
+filter is not used: it requires Python 3.12 while this package supports 3.11,
 and explicit rejection gives actionable errors.
 
 Two of those defences are easy to lose to a refactor and worth naming. Files are
