@@ -61,6 +61,18 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: metrics-token
+            # The server refuses a network bind without TLS material or an
+            # explicit opt-in. Neither default is set: the rendered Deployment
+            # then refuses to start, which is the chart's fail-closed posture.
+            {{- if .Values.controlPlane.tls.existingSecret }}
+            - name: EYVAN_TLS_CERT_FILE
+              value: /etc/eyvan/tls/tls.crt
+            - name: EYVAN_TLS_KEY_FILE
+              value: /etc/eyvan/tls/tls.key
+            {{- else if .Values.controlPlane.insecurePlaintextBind }}
+            - name: EYVAN_INSECURE_PLAINTEXT_BIND
+              value: "1"
+            {{- end }}
             - name: EYVAN_REPOSITORY_BACKEND
               value: {{ .Values.controlPlane.repositoryBackend | quote }}
             - name: EYVAN_AUTO_CREATE_SCHEMA
@@ -84,6 +96,11 @@ spec:
               readOnly: true
             # readOnlyRootFilesystem leaves no writable /tmp, and a volume that
             # vanishes with the pod keeps a compromise from persisting.
+            {{- if .Values.controlPlane.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/eyvan/tls
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
           # Readiness asks "can this replica serve", so it checks the database.
@@ -95,12 +112,14 @@ spec:
             httpGet:
               path: /readyz
               port: http
+              scheme: {{ ternary "HTTPS" "HTTP" (ne .Values.controlPlane.tls.existingSecret "") }}
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
+              scheme: {{ ternary "HTTPS" "HTTP" (ne .Values.controlPlane.tls.existingSecret "") }}
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
@@ -109,6 +128,11 @@ spec:
         - name: platform-config
           configMap:
             name: eyvan-platform
+        {{- if .Values.controlPlane.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.controlPlane.tls.existingSecret }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
 ---

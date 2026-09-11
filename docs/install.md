@@ -2,8 +2,12 @@
 
 A network-bound deployment needs fifteen separately configured things. Local
 `eyvan up` needs none of them: it is a loopback development path, not a remote
-installation recipe. This page covers both. Eyvan requires Python `>=3.10,<3.14`,
-as declared in `pyproject.toml`.
+installation recipe. This page covers both. Eyvan requires Python `>=3.11,<3.14`,
+as declared in `pyproject.toml`. Python 3.10 is no longer supported. Upgrade
+existing worker/submitter environments before deploying this version; explicit
+unsupported interpreter declarations are refused. Native bootstrap selects a
+supported host interpreter, or reports that `runtime.python` must be set when
+none is available.
 
 ## Ask before you start
 

@@ -54,6 +54,17 @@ controlPlane:
   # arbitrary code on your accelerators. That is the correct default.
   trustedCallableProjects: ""
   artifactStoreUri: ""
+  tls:
+    # Secret (in the release namespace) holding tls.crt and tls.key for the API
+    # listener. The server refuses a network bind without TLS material or an
+    # explicit plaintext opt-in, so with neither this set nor
+    # insecurePlaintextBind accepted below, the rendered Deployment refuses to
+    # start -- the same fail-closed posture as the rest of these defaults.
+    existingSecret: ""
+  # Reviewed exception equivalent to EYVAN_INSECURE_PLAINTEXT_BIND=1. Accept
+  # only when something in front of the Service terminates TLS. The chart does
+  # not default this on; if both are set, TLS material wins.
+  insecurePlaintextBind: false
   oidc:
     issuer: ""
     audience: eyvan

@@ -53,6 +53,14 @@ spec:
             - name: tmp
               mountPath: /tmp
           env:
+            # The server refuses a network bind without TLS material or this
+            # explicit opt-in. This manifest predates that policy and terminates
+            # nothing today, so the opt-in keeps it startable -- as a reviewed
+            # decision rather than an accident. To serve TLS instead: add
+            # EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE from a mounted secret and
+            # delete this variable.
+            - name: EYVAN_INSECURE_PLAINTEXT_BIND
+              value: "1"
             - name: EYVAN_DATABASE_URL
               valueFrom:
                 secretKeyRef:

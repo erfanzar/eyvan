@@ -60,4 +60,7 @@ RUN uv pip install --no-build-isolation --no-deps . && \
 COPY --from=dashboard /dashboard/dist /app/dashboard/dist
 EXPOSE 8080
 ENTRYPOINT ["eyvan-server"]
+# A network bind refuses to start without TLS material (EYVAN_TLS_CERT_FILE /
+# EYVAN_TLS_KEY_FILE) or the explicit EYVAN_INSECURE_PLAINTEXT_BIND=1 opt-in;
+# see docs/security.md "Exposure".
 CMD ["--host", "0.0.0.0", "--port", "8080"]

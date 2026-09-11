@@ -73,6 +73,20 @@ max_workers: 0
 `eyvan autoscale init` edits this profile interactively; the file is
 owner-only (`0600`) and machine round-trippable.
 
+The native worker host requires **Python 3.11 through 3.13**, including when
+workloads run in an OCI container. Declare `runtime_python` in the defaults
+profile, or `runtime.python` in a hand-written fleet, when the VM image does
+not supply a supported interpreter. Built-in Ubuntu 22 TPU images can expose
+Python 3.10 as `python3`; leaving the declaration unset can therefore fail
+bootstrap before any workload starts. `examples/fleet.yaml` explicitly selects
+`runtime.python: "3.11"`; node-level declarations can override it.
+
+An explicit declaration builds a managed interpreter environment rather than
+inheriting the image's system-site packages. Install matching host accelerator
+libraries through `runtime_init_commands`, or supply workload dependencies in
+your OCI image. Undeclared custom-image behavior and global generator defaults
+remain unchanged; do not assume Eyvan silently upgrades an image's Python.
+
 ## A zone fleet from scratch
 
 ```bash
