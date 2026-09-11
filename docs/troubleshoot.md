@@ -53,6 +53,47 @@ from, or retried away from used to be reachable by nothing; `settle-orphan-lease
 now reclaims it, and I5 catches the accounting half -- a budget disagreeing with
 the sum of its settled leases.
 
+## A workload will not leave CANCELLING, and its cell will not release
+
+Check the head's log for `cannot safely verify that systemd execution ...
+stopped`, repeating with the same outbox command id. The worker stopped the
+process, its transient unit disappeared before recording a terminal state, and
+older builds then re-derived that unknown on every retry and refused to confirm
+the stop -- so the lease was never released and the accelerator went on billing.
+Builds after that fix treat "systemd holds no such unit" as proof nothing is
+running; an unreachable systemd still refuses, which is the case the refusal is
+for.
+
+If the plane in front of you is older, or systemd genuinely cannot be reached:
+
+```bash
+eyvan workload-force-finalize <id> --reason "<what you checked>"
+```
+
+Break glass. It settles the workload and **gives up the cell rather than
+returning it**: the process may still be running on a host nobody could stop, so
+scheduling onto that cell again would be worse than the deadlock it escapes.
+Delete the cell afterwards with `eyvan cell-delete`, and confirm at the provider
+that the capacity is gone -- a released cell is not a deleted VM.
+
+## The whole leader loop is failing every cycle
+
+`global scheduling reconciliation failed` in the head's log, repeating on the
+scheduler interval, means one leader phase raised and everything after it in
+that cycle did not run: no observation, no settlement, no release. The workloads
+look frozen because they are.
+
+The message names the phase in its traceback. Historic cause worth recognizing:
+`lease references unknown cell` from `reconcile_capacity_pools_once`, which
+happened when a pool stopped supplying capacity -- `eyvan down`, or a cell
+entering `draining` -- while one of its cells still held a live lease. Fixed by
+keeping a leased cell in the snapshot as draining, and by isolating that phase
+so a planner can no longer stop the phases that release capacity.
+
+If you meet it on an older build, re-enabling the pool (`eyvan up <fleet.yaml>`)
+clears it immediately, which is also how to confirm you are looking at this and
+not something else.
+
 ## A provider keeps failing
 
 `eyvan cells` shows `provider_failure_code` and `unavailable_detail`. The codes
