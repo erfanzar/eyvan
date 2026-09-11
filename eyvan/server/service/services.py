@@ -346,21 +346,18 @@ def plan_service(
         return ServicePlan(detail="stopped")
 
     if stale:
-        # A roll. The bound is on *availability*, and a stale replica is still
-        # serving -- so what may be stopped is measured against every live
-        # replica, not against the new ones alone.
-        #
-        # Measuring against ``current`` instead deadlocks at the start of every
-        # roll: with no new replicas yet, it concludes the service is already
-        # maximally unavailable and never stops the first old one, so the deploy
-        # hangs with no error anywhere.
+        # Occupancy bounds surge; only running replicas contribute availability.
+        # A pending replacement cannot justify stopping the old serving process,
+        # and a cancellation already in flight has spent its allowance.
         floor = policy.replicas - policy.max_unavailable
-        allowed_down = max(0, len(live) - floor)
-        if allowed_down:
-            return ServicePlan(
-                cancel=tuple(child.id for child in stale[:allowed_down]),
-                detail=f"rolling to {policy.revision}",
-            )
+        serving = [child for child in live if child.state is WorkloadState.RUNNING]
+        allowed_down = max(0, len(serving) - floor)
+        retiring = [child.id for child in stale if child.state not in {WorkloadState.RUNNING, WorkloadState.CANCELLING}]
+        retiring.extend(child.id for child in stale if child.state is WorkloadState.RUNNING)
+        nonserving = sum(child.state not in {WorkloadState.RUNNING, WorkloadState.CANCELLING} for child in stale)
+        retiring = retiring[: nonserving + allowed_down]
+        if retiring:
+            return ServicePlan(cancel=tuple(retiring), detail=f"rolling to {policy.revision}")
         if len(current) + len(stale) < policy.replicas + policy.max_surge:
             return ServicePlan(submit=1, detail=f"surging to {policy.revision}")
         return ServicePlan(detail=f"waiting for a replica to stop before rolling to {policy.revision}")

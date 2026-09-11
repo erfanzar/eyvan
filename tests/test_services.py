@@ -238,6 +238,27 @@ def test_a_surge_starts_before_stopping_when_permitted() -> None:
     assert plan.cancel == ()
 
 
+@pytest.mark.parametrize("replacement_state", [WorkloadState.PENDING, WorkloadState.LEASED, WorkloadState.DISPATCHING])
+def test_a_surge_does_not_retire_the_serving_replica_before_its_replacement_runs(replacement_state) -> None:
+    children = [
+        _replica("old", revision="v1"),
+        _replica("new", revision="v2", state=replacement_state),
+    ]
+    policy = ServicePolicy(replicas=1, revision="v2", max_unavailable=0, max_surge=1)
+
+    assert plan_service(policy, children, now=NOW).cancel == ()
+
+
+def test_a_roll_does_not_spend_its_unavailability_allowance_twice() -> None:
+    children = [
+        _replica("stopping", revision="v1", state=WorkloadState.CANCELLING),
+        _replica("serving", revision="v1"),
+    ]
+    policy = ServicePolicy(replicas=2, revision="v2", max_unavailable=1)
+
+    assert plan_service(policy, children, now=NOW).cancel == ()
+
+
 def test_a_completed_roll_settles_to_steady() -> None:
     """A roll that never finishes is indistinguishable from one that failed."""
 

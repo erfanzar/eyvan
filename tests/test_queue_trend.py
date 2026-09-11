@@ -308,3 +308,8 @@ async def test_mature_ledgers_keep_current_events_and_refuse_incomplete_windows(
 
     with pytest.raises(InputError, match=r"incomplete.*shorter window"):
         await service.queue_trend(_principal(), org_id="acme", project_id="research", window_s=3_600, buckets=2, now=now)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

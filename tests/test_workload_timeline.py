@@ -13,7 +13,7 @@ obvious in one column and invisible across three commands.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from click.testing import CliRunner
@@ -23,7 +23,7 @@ from eyvan.sdk import cli
 from eyvan.sdk.follow import parse_duration
 from eyvan.sdk.timeline import render, timeline
 
-START = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+START = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
 
 
 def _event(sequence: int, action: str, *, after: int = 0, new_state: str | None = None, payload=None) -> AuditEvent:

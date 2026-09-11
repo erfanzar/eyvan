@@ -263,6 +263,7 @@ def to_core_lease(
     workload: WorkloadRecord,
     policy: PolicyRecord | None = None,
     landed_capacity_class: ApiCapacityClass | None = None,
+    landed_worker_count: int | None = None,
 ) -> CapacityLease:
     """Convert a durable lease, preserving exact budget reservation dimensions.
 
@@ -283,7 +284,12 @@ def to_core_lease(
 
     resources = _resources(record.resources.per_replica).scale(record.resources.replicas)
     if workload.spec.worker_resource_scope is WorkerResourceScope.PER_WORKER:
-        resources = resources.scale(workload.spec.worker_count)
+        # Persisted member leases retain the per-worker gang. An elastic
+        # member holds only its cell's workers, not the entire pack's width.
+        worker_count = workload.spec.worker_count
+        if workload.spec.placement is PlacementMode.ELASTIC and landed_worker_count is not None:
+            worker_count = landed_worker_count
+        resources = resources.scale(worker_count)
     return CapacityLease(
         lease_id=record.id,
         workload_id=record.workload_id,
@@ -564,6 +570,7 @@ class CoreSchedulingService:
         # class is available at conversion time.
         cell_records = list(cells)
         class_by_cell = landed_capacity_classes(cell_records)
+        workers_by_cell = {cell.id: cell.worker_count for cell in cell_records}
         orphans = [lease.id for lease in active_leases if lease.workload_id not in workload_by_id]
         if orphans:
             raise ValueError(f"active lease {orphans[0]!r} references a missing workload")
@@ -580,6 +587,7 @@ class CoreSchedulingService:
                     workload_by_id[lease.workload_id],
                     policy_by_scope.get((lease.org_id, lease.project_id)),
                     class_by_cell.get(lease.cell_id),
+                    workers_by_cell.get(lease.cell_id),
                 )
                 for lease in active_leases
             ),

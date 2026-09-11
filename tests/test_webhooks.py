@@ -263,6 +263,47 @@ async def test_a_delivery_connects_to_the_address_it_validated(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_an_unresolved_delivery_is_retried_without_a_second_dns_lookup(monkeypatch) -> None:
+    """An empty first answer must not fall back to an unpinned hostname fetch.
+
+    A second lookup could return a private address after the first lookup had
+    no answer, allowing a rebinding attack to reach an internal service.
+    """
+
+    answers = iter(
+        [
+            [],
+            [ipaddress.ip_address("93.184.216.34")],
+            [ipaddress.ip_address("127.0.0.1")],
+        ]
+    )
+    calls = 0
+
+    def resolve(_host):
+        nonlocal calls
+        calls += 1
+        return next(answers)
+
+    monkeypatch.setattr("eyvan.server.service.webhooks._resolved_addresses", resolve)
+    repository = InMemoryRepository()
+    plane = _Plane(repository, allow_private=False)
+    await _seed(repository)
+    _patch_transport(monkeypatch, plane)
+
+    assert await plane.deliver_webhooks_once() == 0
+    assert plane.sent == []
+    async with repository.transaction() as tx:
+        stored = await tx.get_webhook("wh_1")
+    assert stored is not None
+    assert stored.consecutive_failures == 1
+    assert calls == 1
+
+    assert await plane.deliver_webhooks_once() == 1
+    assert plane.sent[0][0] == "https://93.184.216.34/eyvan"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_a_successful_delivery_is_not_sent_twice(monkeypatch) -> None:
     """The cursor advances on success, which is what makes this at-least-once."""
 

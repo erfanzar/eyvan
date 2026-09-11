@@ -130,8 +130,8 @@ def resolve_target_addresses(
     answer cannot be rebound: the address the guard vetted and the address the
     POST opens are the same, which a fetch that re-resolves the name cannot
     promise. Empty means there is nothing to pin -- ``url`` already names an
-    address literal, or its name resolved to nothing this time and the caller
-    falls back to fetching ``url`` as written.
+    address literal, or its name resolved to nothing this time. Callers must
+    not fetch an unresolved hostname as written; they must retry the delivery.
 
     Args:
         url: The address a delivery would be POSTed to.
