@@ -5,9 +5,7 @@
 
 export type Section = "overview" | "workloads" | "fleet" | "capacity" | "billing" | "budgets" | "audit";
 
-export type Route =
-  | { section: Section }
-  | { section: "workloads"; workloadId: string };
+export type Route = { section: Section } | { section: "workloads"; workloadId: string };
 
 export type SectionAvailability = Partial<Record<Section, boolean>>;
 

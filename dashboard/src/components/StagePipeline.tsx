@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { CircleCheck, CircleDashed, CircleX, Loader2 } from "lucide-react";
-import type { TimelineEvent } from "../types";
+import type { TimelineEvent, WorkloadStatus } from "../types";
 
 /**
  * The eight macro-stages every Eyvan job walks through, in order. One place
@@ -51,12 +51,19 @@ const PHASE_TO_STAGE: Record<string, string> = {
   provider_failure: "capacity",
 };
 
-const STATE_TO_STAGE: Record<string, string> = {
+// Require every dashboard status, while retaining the raw-state aliases used
+// by callers that have not passed through the API adapter.
+const STATE_TO_STAGE: Record<WorkloadStatus, string> & Record<string, string> = {
   pending: "admitted",
   queued: "admitted",
+  planning: "admitted",
+  provisioning: "provision",
   leased: "capacity",
   dispatching: "dispatch",
   running: "running",
+  checkpointing: "running",
+  preempting: "running",
+  completed: "settled",
   succeeded: "settled",
   failed: "settled",
   cancelled: "settled",
@@ -144,7 +151,7 @@ interface StageReading {
 
 /** One pass over the eight stages, shared by all three treatments. */
 function readStages(status: string, phase: string | undefined, timeline: TimelineEvent[]): StageReading[] {
-  const terminal = status === "succeeded" || status === "failed" || status === "cancelled";
+  const terminal = STATE_TO_STAGE[status] === "settled";
   const bad = status === "failed" || status === "lost_agent";
   const { active } = pipelinePosition(status, phase);
   const durations = stageDurations(timeline);
@@ -226,9 +233,7 @@ function StageBar({ stages }: { stages: StageReading[] }) {
       </div>
     );
   }
-  const heaviest = measured.reduce((worst, stage) =>
-    (stage.duration ?? 0) > (worst.duration ?? 0) ? stage : worst,
-  );
+  const heaviest = measured.reduce((worst, stage) => ((stage.duration ?? 0) > (worst.duration ?? 0) ? stage : worst));
   const rest = total - (heaviest.duration ?? 0);
   return (
     <div className="stage-bar-wrap">
@@ -262,7 +267,9 @@ function StageBar({ stages }: { stages: StageReading[] }) {
                   background: stage.failed ? "var(--red)" : heavy ? "var(--amber)" : "var(--accent)",
                 }}
               />
-              <span className={`${stage.done ? "stage-seg-reached" : "stage-seg-pending"}${heavy ? " stage-seg-heavy" : ""}`}>
+              <span
+                className={`${stage.done ? "stage-seg-reached" : "stage-seg-pending"}${heavy ? " stage-seg-heavy" : ""}`}
+              >
                 {stage.label}
               </span>
               <span className="stage-bar-duration">
@@ -361,7 +368,7 @@ export function StagePipeline({
 
 /** The one-line summary the pipeline panel header carries. */
 export function pipelineCaption(status: string, phase?: string): string {
-  const terminal = status === "succeeded" || status === "failed" || status === "cancelled" || status === "completed";
+  const terminal = STATE_TO_STAGE[status] === "settled";
   if (terminal) return `Terminal · ${PIPELINE_STAGES.length} stages recorded`;
   const { active, activeLabel } = pipelinePosition(status, phase);
   return `Stage ${active + 1} of ${PIPELINE_STAGES.length} · ${activeLabel}`;

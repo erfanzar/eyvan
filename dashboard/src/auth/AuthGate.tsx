@@ -10,7 +10,6 @@ import {
   AUTH_CHANGED_EVENT,
   absorbLocalCredentialFromLocation,
   beginLogin,
-  completeLogin,
   consumeSessionNotice,
   currentIdentity,
   isDevelopmentAuthEnabled,
@@ -19,6 +18,7 @@ import {
   loadRuntimeOidcConfig,
   localDevelopmentCredential,
   planeRequiresLocalCredential,
+  serverIdentity,
 } from "./oidc";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -33,6 +33,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    // A failed sign-in round-trips through the identity provider and comes
+    // back as an auth_error parameter the server's callback put on the
+    // redirect. It is shown once, then stripped so a refresh cannot resurrect
+    // it.
+    const query = new URLSearchParams(globalThis.location?.search ?? "");
+    const authError = query.get("auth_error");
+    if (authError) {
+      query.delete("auth_error");
+      const remaining = query.toString();
+      globalThis.history?.replaceState(
+        null,
+        "",
+        `${globalThis.location.pathname}${remaining ? `?${remaining}` : ""}${globalThis.location.hash}`,
+      );
+      if (!cancelled) setError(authError);
+    }
     // First, before anything reads the OIDC configuration or issues an API
     // call: a credential may have arrived in this URL's fragment, and it must
     // be in session storage -- with the address bar cleaned -- before the
@@ -41,10 +57,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // Before anything reads the OIDC configuration. Build-time values still
     // win; this only fills the gap they leave, which is what lets one image
     // serve two identity providers.
+    //
+    // Then ask the server whether a dashboard session already exists. The
+    // cookie is unreadable from here by design, so the authority endpoint is
+    // the only witness; a 401 simply means "show the sign-in screen".
     loadRuntimeOidcConfig()
-      .then(() => completeLogin())
-      .then(() => {
-        if (!cancelled) setIdentity(currentIdentity());
+      .then(() => serverIdentity())
+      .then((server) => {
+        if (!cancelled) setIdentity((current) => current ?? server);
       })
       .catch((authError) => {
         if (!cancelled) setError(authError instanceof Error ? authError.message : "Unable to complete sign-in");
@@ -123,9 +143,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
             type="button"
             onClick={() => {
               setError(null);
-              void beginLogin().catch((authError) =>
-                setError(authError instanceof Error ? authError.message : "Unable to begin sign-in"),
-              );
+              try {
+                beginLogin();
+              } catch (authError) {
+                setError(authError instanceof Error ? authError.message : "Unable to begin sign-in");
+              }
             }}
           >
             <LogIn size={17} /> Sign in with OIDC

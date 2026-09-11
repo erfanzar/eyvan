@@ -37,7 +37,6 @@ const fleetLoaders = {
   loadLaunchLatency: (signal: AbortSignal) => apiClient.getLaunchLatency(apiClient.getScope(), signal),
 };
 
-
 describe("the placement verdict panel", () => {
   it("shows the per-cell detail behind the flat reason", async () => {
     vi.spyOn(apiClient, "explainWorkload").mockResolvedValue({
@@ -53,14 +52,16 @@ describe("the placement verdict panel", () => {
       scheduling_reason: "waiting for capacity",
     });
 
-    render(<WorkloadDetailPage
+    render(
+      <WorkloadDetailPage
         workload={workload()}
         onBack={() => {}}
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
         loadCost={() => new Promise(() => {})}
-      />);
+      />,
+    );
 
     await waitFor(() => expect(screen.getByText("Placement verdict")).toBeDefined());
     expect(screen.getByText("no cell satisfies all hard workload constraints")).toBeDefined();
@@ -74,14 +75,16 @@ describe("the placement verdict panel", () => {
     // The claim the panel was added for, asserted where it is true or false.
     vi.spyOn(apiClient, "explainWorkload").mockRejectedValue(new Error("Eyvan API request timed out"));
 
-    render(<WorkloadDetailPage
+    render(
+      <WorkloadDetailPage
         workload={workload()}
         onBack={() => {}}
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
         loadCost={() => new Promise(() => {})}
-      />);
+      />,
+    );
 
     await waitFor(() => expect(screen.getByText("Eyvan API request timed out")).toBeDefined());
   });
@@ -97,14 +100,16 @@ describe("why a workload is on the attempt it is on", () => {
     // by eye -- which cannot distinguish them at all.
     const reclaimed = { ...workload(), attempt: 3, preemptionCount: 2, capacityLossCount: 0 };
 
-    render(<WorkloadDetailPage
+    render(
+      <WorkloadDetailPage
         workload={reclaimed}
         onBack={() => {}}
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
         loadCost={() => new Promise(() => {})}
-      />);
+      />,
+    );
 
     const runtime = screen.getByText("Reclaimed").closest("dl");
     expect(runtime).not.toBeNull();
@@ -118,14 +123,16 @@ describe("why a workload is on the attempt it is on", () => {
     // never been touched. No answer is the honest one.
     const older = { ...workload(), attempt: undefined, preemptionCount: undefined, capacityLossCount: undefined };
 
-    render(<WorkloadDetailPage
+    render(
+      <WorkloadDetailPage
         workload={older}
         onBack={() => {}}
         onAction={async () => {}}
         canOperate
         loadExplanation={loadExplanation}
         loadCost={() => new Promise(() => {})}
-      />);
+      />,
+    );
 
     const runtime = screen.getByText("Reclaimed").closest("dl") as HTMLElement;
     expect(within(runtime).getByText("Reclaimed").nextElementSibling?.textContent).toBe("Unknown");

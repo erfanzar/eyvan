@@ -158,15 +158,18 @@ describe("followEventStream", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it.each([401, 403])("surfaces terminal authorization status %s instead of retrying a forbidden read", async (status) => {
-    const controller = new AbortController();
-    const fetchImpl = vi.fn(async () => streaming([], status));
+  it.each([401, 403])(
+    "surfaces terminal authorization status %s instead of retrying a forbidden read",
+    async (status) => {
+      const controller = new AbortController();
+      const fetchImpl = vi.fn(async () => streaming([], status));
 
-    await expect(
-      followEventStream(options(fetchImpl as unknown as typeof fetch, () => {}, controller.signal)),
-    ).rejects.toMatchObject({ status, name: "EventStreamHttpError" });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-  });
+      await expect(
+        followEventStream(options(fetchImpl as unknown as typeof fetch, () => {}, controller.signal)),
+      ).rejects.toMatchObject({ status, name: "EventStreamHttpError" });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("reports the connection dropping and coming back", async () => {
     // The indicator exists because a dead stream and an idle fleet look the

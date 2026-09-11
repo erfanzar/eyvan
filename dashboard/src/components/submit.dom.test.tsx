@@ -31,9 +31,7 @@ const cpu: AvailableShape = {
   zone: "us-east5-a",
 };
 
-function renderForm(
-  options: { shapes?: AvailableShape[]; loading?: boolean; error?: string | null } = {},
-) {
+function renderForm(options: { shapes?: AvailableShape[]; loading?: boolean; error?: string | null } = {}) {
   const submitted: SubmitWorkloadInput[] = [];
   const onSubmit = vi.fn(async (input: SubmitWorkloadInput) => {
     submitted.push(input);
@@ -61,7 +59,9 @@ describe("choosing what to run on", () => {
   it("offers the shapes the fleet has, not a list of hardware", async () => {
     renderForm();
 
-    const options = within(field("Shape")).getAllByRole("option").map((option) => option.textContent);
+    const options = within(field("Shape"))
+      .getAllByRole("option")
+      .map((option) => option.textContent);
 
     // Two zones of one shape are one choice: they are alternates, and picking
     // between them is the scheduler's job.
@@ -82,7 +82,9 @@ describe("choosing what to run on", () => {
     fireEvent.change(field("Shape"), { target: { value: "research/v6e-8" } });
 
     expect(field("Zone").value).toBe("");
-    const zones = within(field("Zone")).getAllByRole("option").map((option) => option.textContent);
+    const zones = within(field("Zone"))
+      .getAllByRole("option")
+      .map((option) => option.textContent);
     expect(zones).toEqual(["Wherever there is capacity", "Pin to us-east5-a", "Pin to us-east5-b"]);
   });
 
@@ -101,7 +103,9 @@ describe("choosing what to run on", () => {
   it("says nothing is applied only when the read succeeded and found nothing", async () => {
     renderForm({ error: "Eyvan API request failed with 503" });
 
-    const alerts = within(dialog()).getAllByRole("alert").map((alert) => alert.textContent);
+    const alerts = within(dialog())
+      .getAllByRole("alert")
+      .map((alert) => alert.textContent);
     expect(alerts.join(" ")).toContain("503");
     // An empty fleet and a failed read look identical on screen unless one of
     // them is named, and only one of them is fixed by running `eyvan up`.

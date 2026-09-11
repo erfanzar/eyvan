@@ -202,7 +202,13 @@ export function SubmitWorkloadModal({
             <h2 id="submit-workload-title">Run a job</h2>
             <p>The pool supplies CPU, memory, accelerators and topology. Name the hardware and the command.</p>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog" title="Close dialog">
+          <button
+            className="icon-button"
+            type="button"
+            onClick={onClose}
+            aria-label="Close dialog"
+            title="Close dialog"
+          >
             <X size={19} />
           </button>
         </div>

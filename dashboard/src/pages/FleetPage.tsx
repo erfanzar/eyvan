@@ -3,18 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {
-  AlertTriangle,
-  Cpu,
-  Gauge,
-  Layers,
-  MapPin,
-  MinusCircle,
-  Network,
-  RefreshCw,
-  Server,
-  Timer,
-} from "lucide-react";
+import { AlertTriangle, Cpu, Gauge, Layers, MapPin, MinusCircle, Network, RefreshCw, Timer } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -87,7 +76,9 @@ export function FleetPage({
   const activeLeases = leases.filter((lease) => ["active", "activating"].includes(lease.state));
   const totalSpend = activeLeases.reduce((sum, lease) => sum + lease.spendPerHour, 0);
   const healthyCount = cells.filter((cell) => cell.status === "healthy").length;
-  const averageUtilization = Math.round(cells.reduce((sum, cell) => sum + cell.utilization, 0) / Math.max(cells.length, 1));
+  const averageUtilization = Math.round(
+    cells.reduce((sum, cell) => sum + cell.utilization, 0) / Math.max(cells.length, 1),
+  );
 
   const drainConfirmed = async () => {
     if (!draining || !onDrainCell) return;
@@ -178,7 +169,8 @@ export function FleetPage({
         disabled: 0,
       };
       existing.pools.push(pool);
-      if (pool.acceleratorType && !existing.shapes.includes(pool.acceleratorType)) existing.shapes.push(pool.acceleratorType);
+      if (pool.acceleratorType && !existing.shapes.includes(pool.acceleratorType))
+        existing.shapes.push(pool.acceleratorType);
       if (pool.zone && !existing.zones.includes(pool.zone)) existing.zones.push(pool.zone);
       if (!pool.enabled) existing.disabled += 1;
       grouped.set(pool.fleetName, existing);
@@ -191,10 +183,30 @@ export function FleetPage({
   return (
     <div className="page-stack">
       <section className="metric-grid metric-grid-four" aria-label="Fleet metrics">
-        <MetricCard label="Cells online" value={`${healthyCount}/${cells.length}`} detail={`${cells.length - healthyCount} not ready`} tone={healthyCount === cells.length ? "positive" : "warning"} />
-        <MetricCard label="Mean scoped utilization" value={`${averageUtilization}%`} detail="active leases in the configured project" tone={averageUtilization > 85 ? "warning" : "positive"} />
-        <MetricCard label="Active leases" value={activeLeases.length.toString()} detail={`${leases.filter((lease) => lease.class === "spot").length} on preemptible capacity`} tone="accent" />
-        <MetricCard label="Lease spend" value={`${formatMoney(totalSpend)}/h`} detail="active and activating leases" tone="accent" />
+        <MetricCard
+          label="Cells online"
+          value={`${healthyCount}/${cells.length}`}
+          detail={`${cells.length - healthyCount} not ready`}
+          tone={healthyCount === cells.length ? "positive" : "warning"}
+        />
+        <MetricCard
+          label="Mean scoped utilization"
+          value={`${averageUtilization}%`}
+          detail="active leases in the configured project"
+          tone={averageUtilization > 85 ? "warning" : "positive"}
+        />
+        <MetricCard
+          label="Active leases"
+          value={activeLeases.length.toString()}
+          detail={`${leases.filter((lease) => lease.class === "spot").length} on preemptible capacity`}
+          tone="accent"
+        />
+        <MetricCard
+          label="Lease spend"
+          value={`${formatMoney(totalSpend)}/h`}
+          detail="active and activating leases"
+          tone="accent"
+        />
       </section>
 
       {/* Warmth and billing are reported together on purpose. Warm capacity is
@@ -203,11 +215,22 @@ export function FleetPage({
           floor, undoing the fix that put it there. */}
       <section className="panel data-panel" aria-label="Warm capacity and cost">
         <div className="panel-header">
-          <div><h2>Warm capacity and cost</h2><p>Which idle cost you asked for, and which you did not</p></div>
+          <div>
+            <h2>Warm capacity and cost</h2>
+            <p>Which idle cost you asked for, and which you did not</p>
+          </div>
           <Gauge size={15} />
         </div>
-        {costError && <div className="resource-row-detail"><span>{costError}</span></div>}
-        {!costError && !billing && <div className="resource-row-detail"><span>Reading the billing clock…</span></div>}
+        {costError && (
+          <div className="resource-row-detail">
+            <span>{costError}</span>
+          </div>
+        )}
+        {!costError && !billing && (
+          <div className="resource-row-detail">
+            <span>Reading the billing clock…</span>
+          </div>
+        )}
         {billing && (
           <div className="resource-row-detail">
             <span>{formatMoney(billing.accrued_cost)} accrued</span>
@@ -229,7 +252,9 @@ export function FleetPage({
           </dl>
         )}
         {warmth && warmth.pools.length === 0 && (
-          <div className="resource-row-detail"><span>No pool declares a warm floor.</span></div>
+          <div className="resource-row-detail">
+            <span>No pool declares a warm floor.</span>
+          </div>
         )}
       </section>
 
@@ -240,13 +265,26 @@ export function FleetPage({
           the fastest thing available. */}
       <section className="panel data-panel" aria-label="Launch latency">
         <div className="panel-header">
-          <div><h2>Launch latency</h2><p>How long each pool takes to hand over usable capacity</p></div>
+          <div>
+            <h2>Launch latency</h2>
+            <p>How long each pool takes to hand over usable capacity</p>
+          </div>
           <Timer size={15} />
         </div>
-        {latencyError && <div className="resource-row-detail"><span>{latencyError}</span></div>}
-        {!latencyError && !latency && <div className="resource-row-detail"><span>Reading provisioning history…</span></div>}
+        {latencyError && (
+          <div className="resource-row-detail">
+            <span>{latencyError}</span>
+          </div>
+        )}
+        {!latencyError && !latency && (
+          <div className="resource-row-detail">
+            <span>Reading provisioning history…</span>
+          </div>
+        )}
         {latency && latency.pools.length === 0 && (
-          <div className="resource-row-detail"><span>No capacity pool is configured.</span></div>
+          <div className="resource-row-detail">
+            <span>No capacity pool is configured.</span>
+          </div>
         )}
         {latency && latency.pools.length > 0 && (
           <dl className="definition-grid">
@@ -354,25 +392,59 @@ export function FleetPage({
 
       <section className="panel topology-panel">
         <div className="panel-header">
-          <div><h2>Fleet topology</h2><p>Scheduling cells grouped by failure region</p></div>
-          <button className="button button-ghost" type="button" disabled={refreshing} onClick={() => void refreshInventory()}>
+          <div>
+            <h2>Fleet topology</h2>
+            <p>Scheduling cells grouped by failure region</p>
+          </div>
+          <button
+            className="button button-ghost"
+            type="button"
+            disabled={refreshing}
+            onClick={() => void refreshInventory()}
+          >
             <RefreshCw className={refreshing ? "spin" : undefined} size={16} aria-hidden="true" />
             {refreshing ? "Refreshing" : "Refresh inventory"}
           </button>
         </div>
-        {refreshError && <div className="inline-error" role="alert"><AlertTriangle size={16} />{refreshError}</div>}
-        {refreshed && <div className="inline-status" role="status">Fleet inventory reloaded from Eyvan.</div>}
+        {refreshError && (
+          <div className="inline-error" role="alert">
+            <AlertTriangle size={16} />
+            {refreshError}
+          </div>
+        )}
+        {refreshed && (
+          <div className="inline-status" role="status">
+            Fleet inventory reloaded from Eyvan.
+          </div>
+        )}
         <div className="topology-regions">
           {regions.map((regionName) => {
             const regionCells = cells.filter((cell) => cell.region === regionName);
             return (
               <div className="topology-region" key={regionName}>
-                <div className="topology-region-label"><MapPin size={15} aria-hidden="true" /><strong>{regionName}</strong><span>{regionCells.length} cells</span></div>
+                <div className="topology-region-label">
+                  <MapPin size={15} aria-hidden="true" />
+                  <strong>{regionName}</strong>
+                  <span>{regionCells.length} cells</span>
+                </div>
                 <div className="topology-cell-row">
                   {regionCells.map((cell) => (
-                    <button className="topology-node" type="button" key={cell.id} onClick={() => { setRegion(regionName); setTab("cells"); }}>
+                    <button
+                      className="topology-node"
+                      type="button"
+                      key={cell.id}
+                      onClick={() => {
+                        setRegion(regionName);
+                        setTab("cells");
+                      }}
+                    >
                       <span className={`topology-node-state topology-${cell.status}`} aria-hidden="true" />
-                      <span><strong>{cell.name}</strong><small>{cell.backend} · {cell.utilization}%</small></span>
+                      <span>
+                        <strong>{cell.name}</strong>
+                        <small>
+                          {cell.backend} · {cell.utilization}%
+                        </small>
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -383,19 +455,42 @@ export function FleetPage({
       </section>
 
       <div className="tabs fleet-tabs" role="tablist" aria-label="Fleet views">
-        <button type="button" role="tab" aria-selected={tab === "cells"} className={tab === "cells" ? "tab-active" : ""} onClick={() => setTab("cells")}>Cells ({cells.length})</button>
-        <button type="button" role="tab" aria-selected={tab === "leases"} className={tab === "leases" ? "tab-active" : ""} onClick={() => setTab("leases")}>Capacity leases ({leases.length})</button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "cells"}
+          className={tab === "cells" ? "tab-active" : ""}
+          onClick={() => setTab("cells")}
+        >
+          Cells ({cells.length})
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "leases"}
+          className={tab === "leases" ? "tab-active" : ""}
+          onClick={() => setTab("leases")}
+        >
+          Capacity leases ({leases.length})
+        </button>
       </div>
 
       {tab === "cells" && (
         <section className="panel fleet-cells-section">
           <div className="section-toolbar">
-            <div><h2>Scheduling cells</h2><p>Backend inventory, topology, and committed resources</p></div>
+            <div>
+              <h2>Scheduling cells</h2>
+              <p>Backend inventory, topology, and committed resources</p>
+            </div>
             <label className="select-field">
               <span className="sr-only">Filter by region</span>
               <select value={region} onChange={(event) => setRegion(event.target.value)}>
                 <option value="all">All regions</option>
-                {regions.map((item) => <option value={item} key={item}>{item}</option>)}
+                {regions.map((item) => (
+                  <option value={item} key={item}>
+                    {item}
+                  </option>
+                ))}
               </select>
             </label>
           </div>
@@ -403,25 +498,66 @@ export function FleetPage({
             {visibleCells.map((cell) => (
               <article className="cell-card" key={cell.id}>
                 <div className="cell-card-heading">
-                                    <div><h3>{cell.name}</h3><p>{cell.backend} · {cell.zone}</p></div>
+                  <div>
+                    <h3>{cell.name}</h3>
+                    <p>
+                      {cell.backend} · {cell.zone}
+                    </p>
+                  </div>
                   <StatusBadge value={cell.status} tone={cell.status} />
                 </div>
                 <div className="cell-stat-row">
-                  <span><Network size={15} /><small>Topology</small><strong>{cell.topology}</strong></span>
-                  <span><Cpu size={15} /><small>Workloads</small><strong>{cell.activeWorkloads} active</strong></span>
+                  <span>
+                    <Network size={15} />
+                    <small>Topology</small>
+                    <strong>{cell.topology}</strong>
+                  </span>
+                  <span>
+                    <Cpu size={15} />
+                    <small>Workloads</small>
+                    <strong>{cell.activeWorkloads} active</strong>
+                  </span>
                 </div>
                 <div className="cell-resource-list">
                   {cell.resources.map((resource) => {
                     const utilization = percent(resource.used, resource.total);
                     return (
                       <div key={resource.name}>
-                        <div className="resource-row-heading"><span>{resource.name}</span><strong>{resource.used} / {resource.total}</strong></div>
-                        <ProgressBar value={utilization} label={`${cell.name} ${resource.name} utilization`} tone={utilization > 85 ? "amber" : "accent"} />
+                        <div className="resource-row-heading">
+                          <span>{resource.name}</span>
+                          <strong>
+                            {resource.used} / {resource.total}
+                          </strong>
+                        </div>
+                        <ProgressBar
+                          value={utilization}
+                          label={`${cell.name} ${resource.name} utilization`}
+                          tone={utilization > 85 ? "amber" : "accent"}
+                        />
                       </div>
                     );
                   })}
                 </div>
-                <div className="cell-card-footer"><span>Scoped utilization <strong>{cell.utilization}%</strong></span><span>Heartbeat {formatDateTime(cell.lastHeartbeat)}</span></div>
+                {(cell.unavailableReason || cell.unavailableDetail) && (
+                  // The provider's own word for why this cell is not ready.
+                  // Code plus detail, so the card says "provider_error" and
+                  // also the quota message — not one without the other, and
+                  // never a bare spinner where an explanation exists.
+                  <p className="cell-card-error" role="alert">
+                    <AlertTriangle size={14} aria-hidden="true" />
+                    <span>
+                      {cell.unavailableReason && <strong>{cell.unavailableReason}</strong>}
+                      {cell.unavailableReason && cell.unavailableDetail ? ": " : ""}
+                      {cell.unavailableDetail}
+                    </span>
+                  </p>
+                )}
+                <div className="cell-card-footer">
+                  <span>
+                    Scoped utilization <strong>{cell.utilization}%</strong>
+                  </span>
+                  <span>Heartbeat {formatDateTime(cell.lastHeartbeat)}</span>
+                </div>
                 {onDrainCell && (
                   <div className="cell-card-actions">
                     <button
@@ -439,11 +575,7 @@ export function FleetPage({
                       }}
                     >
                       <MinusCircle size={15} aria-hidden="true" />
-                      {cell.status !== "maintenance"
-                        ? "Drain"
-                        : cell.state === "deleting"
-                          ? "Releasing"
-                          : "Draining"}
+                      {cell.status !== "maintenance" ? "Drain" : cell.state === "deleting" ? "Releasing" : "Draining"}
                     </button>
                   </div>
                 )}
@@ -455,19 +587,53 @@ export function FleetPage({
 
       {tab === "leases" && (
         <section className="panel data-panel">
-          <div className="panel-header"><div><h2>Capacity leases</h2><p>Fenced workload and warm-pool allocations</p></div></div>
+          <div className="panel-header">
+            <div>
+              <h2>Capacity leases</h2>
+              <p>Fenced workload and warm-pool allocations</p>
+            </div>
+          </div>
           <div className="table-scroll">
             <table className="data-table">
-              <thead><tr><th>Lease</th><th>Owner</th><th>Cell</th><th>Capacity</th><th>Class</th><th>State</th><th>Spend</th><th>Expires</th></tr></thead>
+              <thead>
+                <tr>
+                  <th>Lease</th>
+                  <th>Owner</th>
+                  <th>Cell</th>
+                  <th>Capacity</th>
+                  <th>Class</th>
+                  <th>State</th>
+                  <th>Spend</th>
+                  <th>Expires</th>
+                </tr>
+              </thead>
               <tbody>
                 {leases.map((lease) => (
                   <tr key={lease.id}>
-                    <td><span className="resource-cell"><strong className="monospace">{lease.id}</strong><small>{lease.workloadId ?? "fleet warm pool"}</small></span></td>
+                    <td>
+                      <span className="resource-cell">
+                        <strong className="monospace">{lease.id}</strong>
+                        <small>{lease.workloadId ?? "fleet warm pool"}</small>
+                      </span>
+                    </td>
                     <td>{lease.owner}</td>
                     <td>{lease.cell}</td>
-                    <td><span className="resource-cell"><strong>{lease.resource}</strong><small>{lease.amount}</small></span></td>
-                    <td>{lease.class ? <StatusBadge value={lease.class} tone={lease.class} dot={false} /> : <span className="muted">—</span>}</td>
-                    <td><StatusBadge value={lease.state} tone={lease.state} /></td>
+                    <td>
+                      <span className="resource-cell">
+                        <strong>{lease.resource}</strong>
+                        <small>{lease.amount}</small>
+                      </span>
+                    </td>
+                    <td>
+                      {lease.class ? (
+                        <StatusBadge value={lease.class} tone={lease.class} dot={false} />
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td>
+                      <StatusBadge value={lease.state} tone={lease.state} />
+                    </td>
                     <td>{formatMoney(lease.spendPerHour)}/h</td>
                     <td>{formatDateTime(lease.expiresAt)}</td>
                   </tr>

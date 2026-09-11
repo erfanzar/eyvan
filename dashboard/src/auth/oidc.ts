@@ -5,12 +5,6 @@
 
 import type { SessionPermission } from "../types";
 
-const ACCESS_TOKEN_KEY = "eyvan.oidc.access_token";
-const ID_TOKEN_KEY = "eyvan.oidc.id_token";
-const EXPIRES_AT_KEY = "eyvan.oidc.expires_at";
-const STATE_KEY = "eyvan.oidc.state";
-const VERIFIER_KEY = "eyvan.oidc.verifier";
-const NONCE_KEY = "eyvan.oidc.nonce";
 /**
  * The loopback development credential this browser was handed, if it was.
  *
@@ -21,6 +15,14 @@ const NONCE_KEY = "eyvan.oidc.nonce";
  * owner's terminal can, which is why `eyvan dashboard` opens this page with
  * the value in the URL fragment and {@link absorbLocalCredentialFromLocation}
  * moves it here before anything else runs.
+ *
+ * This is the one credential that still lives in this tab. The OIDC session
+ * used to live here too, in the same storage any cross-site script can read;
+ * it moved server-side behind an HttpOnly cookie (see the backend-for-frontend
+ * endpoints in ``eyvan/server/api/dashboard_sessions.py``). The local
+ * credential stays because its whole model is this-machine-only: it is handed
+ * through a URL fragment precisely so no server ever sees it, and on loopback
+ * there is no transport to protect it from.
  */
 export const LOCAL_CREDENTIAL_KEY = "eyvan.local.credential";
 export const LOCAL_CREDENTIAL_FRAGMENT_PARAM = "eyvan-local-credential";
@@ -34,18 +36,21 @@ export const LOCAL_CREDENTIAL_FRAGMENT_PARAM = "eyvan-local-credential";
 export const LOCAL_CREDENTIAL_REQUIRED_DETAIL = "local Eyvan development credential is required";
 export const AUTH_CHANGED_EVENT = "eyvan:auth-changed";
 
-interface OidcMetadata {
-  authorization_endpoint: string;
-  token_endpoint: string;
-  end_session_endpoint?: string;
-}
-
-interface TokenResponse {
-  access_token: string;
-  id_token?: string;
-  expires_in?: number;
-  token_type: string;
-}
+/**
+ * The server-side sign-in surface. The browser never sees an authorization
+ * code, a PKCE verifier, or a token: ``beginLogin`` navigates to the login
+ * endpoint, the identity provider redirects back to the server's callback,
+ * and the server opens the session this page's cookies then carry.
+ */
+export const LOGIN_PATH = "/api/v1/dashboard/auth/login";
+export const LOGOUT_PATH = "/api/v1/dashboard/auth/logout";
+/**
+ * The callback the identity provider redirects back to. No dashboard code
+ * requests it — the server completes the code exchange there and redirects
+ * to "/" — but the path is stated here, next to the flow it completes, so
+ * the browser-routed surface is written down in the client that lives it.
+ */
+export const CALLBACK_PATH = "/api/v1/dashboard/auth/callback";
 
 export interface AuthCapabilities {
   submitWorkloads: boolean;
@@ -152,24 +157,6 @@ function storage(): Storage | undefined {
   }
 }
 
-function base64Url(bytes: Uint8Array): string {
-  let binary = "";
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function randomValue(): string {
-  const bytes = new Uint8Array(32);
-  globalThis.crypto.getRandomValues(bytes);
-  return base64Url(bytes);
-}
-
-function redirectUri(): string {
-  return import.meta.env.VITE_EYVAN_OIDC_REDIRECT_URI ?? `${globalThis.location.origin}${globalThis.location.pathname}`;
-}
-
 /**
  * Identity configuration served by the control plane at runtime.
  *
@@ -237,43 +224,18 @@ function bakedAudience(): string | undefined {
   return import.meta.env.VITE_EYVAN_OIDC_AUDIENCE || undefined;
 }
 
-function audience(): string | undefined {
-  return bakedAudience() ?? runtimeConfig?.audience ?? undefined;
-}
-
 function issuer(): string | undefined {
   return (bakedIssuer() ?? runtimeConfig?.issuer ?? undefined)?.replace(/\/$/, "");
-}
-
-function clientId(): string {
-  const configuredClientId = bakedClientId() ?? runtimeConfig?.client_id;
-  if (!configuredClientId) throw new Error("VITE_EYVAN_OIDC_CLIENT_ID is not configured");
-  return configuredClientId;
 }
 
 export function isOidcConfigured(): boolean {
   return Boolean(issuer() && (bakedClientId() ?? runtimeConfig?.client_id));
 }
 
-async function metadata(): Promise<OidcMetadata> {
-  const configuredIssuer = issuer();
-  if (!configuredIssuer) throw new Error("VITE_EYVAN_OIDC_ISSUER is not configured");
-  const response = await fetch(`${configuredIssuer}/.well-known/openid-configuration`, {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) throw new Error(`OIDC discovery failed with ${response.status}`);
-  const document = (await response.json()) as Partial<OidcMetadata>;
-  if (!document.authorization_endpoint || !document.token_endpoint) {
-    throw new Error("OIDC discovery response is missing authorization or token endpoints");
-  }
-  return document as OidcMetadata;
-}
-
 let sessionNotice: string | undefined;
 
 function endSession(notice: string): void {
   sessionNotice = notice;
-  clearTokens();
   if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
 }
 
@@ -285,17 +247,6 @@ export function consumeSessionNotice(): string | undefined {
 
 export function rejectSession(): void {
   endSession("The control plane rejected your session. Sign in again to continue.");
-}
-
-export function getAccessToken(): string | undefined {
-  const session = storage();
-  const token = session?.getItem(ACCESS_TOKEN_KEY) ?? undefined;
-  const expiresAt = Number(session?.getItem(EXPIRES_AT_KEY) ?? 0);
-  if (token && expiresAt && Date.now() >= expiresAt) {
-    endSession("Your sign-in session expired. Sign in again to continue.");
-    return undefined;
-  }
-  return token;
 }
 
 /** The credential this browser holds for its loopback plane, if any. */
@@ -360,8 +311,11 @@ export function absorbLocalCredentialFromLocation(
 }
 
 export function apiAuthHeaders(): Record<string, string> {
-  const token = getAccessToken();
-  if (token) return { Authorization: `Bearer ${token}` };
+  // OIDC adds nothing here on purpose: the session is the `eyvan_session`
+  // cookie the browser sends on same-origin requests, and the token itself
+  // never leaves the server (see `eyvan/server/api/dashboard_sessions.py`).
+  // No Authorization header is ever built from something readable by
+  // JavaScript -- that was the vulnerability this flow replaced.
   const localCredential = localDevelopmentCredential();
   if (!isDevelopmentAuthEnabled() && !localCredential) return {};
   const headers: Record<string, string> = {};
@@ -384,91 +338,44 @@ export function apiAuthHeaders(): Record<string, string> {
   return headers;
 }
 
-export async function beginLogin(): Promise<void> {
+/**
+ * Begin sign-in by handing the browser to the server-side login endpoint.
+ *
+ * The PKCE challenge, the state, and the nonce are minted and remembered on
+ * the server; this page never holds them, so nothing here can be tricked
+ * into leaking them. The identity provider brings the browser back to the
+ * server's callback, which opens the session and redirects here again.
+ */
+export function beginLogin(): void {
   if (!isOidcConfigured()) throw new Error("OIDC client configuration is incomplete");
-  const session = storage();
-  if (!session) throw new Error("Session storage is unavailable");
-  const verifier = randomValue();
-  const state = randomValue();
-  const nonce = randomValue();
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  session.setItem(VERIFIER_KEY, verifier);
-  session.setItem(STATE_KEY, state);
-  session.setItem(NONCE_KEY, nonce);
-
-  const oidcMetadata = await metadata();
-  const parameters = new URLSearchParams({
-    response_type: "code",
-    client_id: clientId(),
-    redirect_uri: redirectUri(),
-    scope: import.meta.env.VITE_EYVAN_OIDC_SCOPE ?? "openid profile email",
-    state,
-    nonce,
-    code_challenge: base64Url(new Uint8Array(digest)),
-    code_challenge_method: "S256",
-  });
-  const configuredAudience = audience();
-  if (configuredAudience) parameters.set("audience", configuredAudience);
-  globalThis.location.assign(`${oidcMetadata.authorization_endpoint}?${parameters.toString()}`);
+  globalThis.location.assign(LOGIN_PATH);
 }
 
-export async function completeLogin(parameters = new URLSearchParams(globalThis.location.search)): Promise<boolean> {
-  const code = parameters.get("code");
-  const returnedState = parameters.get("state");
-  const oidcError = parameters.get("error");
-  if (oidcError) {
-    throw new Error(parameters.get("error_description") ?? `Identity provider returned ${oidcError}`);
-  }
-  if (!code) return false;
-
-  const session = storage();
-  const verifier = session?.getItem(VERIFIER_KEY);
-  const expectedState = session?.getItem(STATE_KEY);
-  const expectedNonce = session?.getItem(NONCE_KEY);
-  if (!session || !verifier || !returnedState || returnedState !== expectedState) {
-    throw new Error("OIDC callback state could not be verified");
-  }
-
-  const oidcMetadata = await metadata();
-  const response = await fetch(oidcMetadata.token_endpoint, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: clientId(),
-      code,
-      redirect_uri: redirectUri(),
-      code_verifier: verifier,
-    }),
-  });
-  if (!response.ok) throw new Error(`OIDC token exchange failed with ${response.status}`);
-  const token = (await response.json()) as Partial<TokenResponse>;
-  if (!token.access_token || token.token_type?.toLowerCase() !== "bearer") {
-    throw new Error("OIDC token response did not contain a bearer access token");
-  }
-  if (token.id_token && expectedNonce && decodeClaims(token.id_token).nonce !== expectedNonce) {
-    throw new Error("OIDC ID token nonce could not be verified");
-  }
-  session.setItem(ACCESS_TOKEN_KEY, token.access_token);
-  if (token.id_token) session.setItem(ID_TOKEN_KEY, token.id_token);
-  if (token.expires_in) session.setItem(EXPIRES_AT_KEY, String(Date.now() + token.expires_in * 1000 - 30_000));
-  session.removeItem(STATE_KEY);
-  session.removeItem(VERIFIER_KEY);
-  session.removeItem(NONCE_KEY);
-
-  const cleanUrl = `${globalThis.location.pathname}${globalThis.location.hash}`;
-  globalThis.history.replaceState({}, globalThis.document.title, cleanUrl);
-  return true;
-}
-
-function decodeClaims(token: string | null): Record<string, unknown> {
-  if (!token) return {};
+/**
+ * Ask the server whether this browser already holds a live dashboard session.
+ *
+ * The gate cannot read the session cookie -- that is the point of it -- so
+ * the only way to know a signed-in user is sitting here is to ask the
+ * authority endpoint and let the cookie speak. A 401 means "no session"; it
+ * is not an error and it is never narrated to the user.
+ */
+export async function serverIdentity(fetchImpl: typeof fetch = fetch): Promise<AuthIdentity | undefined> {
+  if (!isOidcConfigured()) return undefined;
   try {
-    const payload = token.split(".")[1]?.replaceAll("-", "+").replaceAll("_", "/");
-    if (!payload) return {};
-    return JSON.parse(atob(payload)) as Record<string, unknown>;
+    const response = await fetchImpl("/api/v1/session", { headers: apiAuthHeaders() });
+    if (!response.ok) return undefined;
+    const authority = (await response.json()) as { subject?: string; display_name?: string | null };
+    if (!authority.subject) return undefined;
+    return {
+      displayName: authority.display_name ?? authority.subject,
+      detail: "OIDC session",
+      mode: "oidc",
+      roles: [],
+      scope: configuredScope(),
+      capabilities: NO_AUTH_CAPABILITIES,
+    };
   } catch {
-    return {};
+    return undefined;
   }
 }
 
@@ -493,41 +400,6 @@ export function currentIdentity(): AuthIdentity | undefined {
     };
   }
 
-  // Claims are decoded only for display. Role grants and action authority come
-  // exclusively from GET /api/v1/session after server authentication and
-  // durable-grant unioning.
-  const accessToken = getAccessToken();
-  if (accessToken) {
-    const accessClaims = decodeClaims(accessToken);
-    const idClaims = decodeClaims(storage()?.getItem(ID_TOKEN_KEY) ?? null);
-    const displayName = String(
-      idClaims.name ??
-      idClaims.preferred_username ??
-      idClaims.email ??
-      idClaims.sub ??
-      accessClaims.name ??
-      accessClaims.preferred_username ??
-      accessClaims.email ??
-      accessClaims.sub ??
-      "Signed-in user",
-    );
-    const detail = String(
-      idClaims.email ??
-      idClaims.preferred_username ??
-      accessClaims.email ??
-      accessClaims.preferred_username ??
-      "OIDC session",
-    );
-    return {
-      displayName,
-      detail,
-      mode: "oidc",
-      roles: [],
-      scope,
-      capabilities: NO_AUTH_CAPABILITIES,
-    };
-  }
-
   if (isDevelopmentAuthEnabled()) {
     return {
       displayName: import.meta.env.VITE_EYVAN_DEV_USER ?? "dashboard-dev",
@@ -538,35 +410,38 @@ export function currentIdentity(): AuthIdentity | undefined {
       capabilities: NO_AUTH_CAPABILITIES,
     };
   }
+  // OIDC is intentionally absent: the tab holds no token and no claims, so
+  // there is nothing local identity can truthfully report. The gate asks
+  // {@link serverIdentity} instead, and what the user sees comes from the
+  // server's own authority response.
   return undefined;
 }
 
-export function clearTokens(): void {
-  const session = storage();
-  [ACCESS_TOKEN_KEY, ID_TOKEN_KEY, EXPIRES_AT_KEY, STATE_KEY, VERIFIER_KEY, NONCE_KEY].forEach((key) => session?.removeItem(key));
-}
-
-export async function logout(): Promise<void> {
-  const idToken = storage()?.getItem(ID_TOKEN_KEY) ?? undefined;
-  clearTokens();
-  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+/**
+ * Sign out: drop the server-side session, then land back on the sign-in
+ * screen. Idempotent -- a session that is already gone is not an error.
+ */
+export async function logout(fetchImpl: typeof fetch = fetch): Promise<void> {
   if (isDemoMode()) {
     const url = new URL(globalThis.location.href);
     url.searchParams.delete("demo");
     globalThis.location.assign(`${url.pathname}${url.search}${url.hash}`);
     return;
   }
-  if (!isOidcConfigured()) return;
-  try {
-    const oidcMetadata = await metadata();
-    if (oidcMetadata.end_session_endpoint) {
-      const parameters = new URLSearchParams({ post_logout_redirect_uri: redirectUri() });
-      if (idToken) parameters.set("id_token_hint", idToken);
-      globalThis.location.assign(`${oidcMetadata.end_session_endpoint}?${parameters.toString()}`);
+  if (isOidcConfigured()) {
+    try {
+      const response = await fetchImpl(LOGOUT_PATH, { method: "POST" });
+      if (!response.ok) throw new Error(`Sign-out returned ${response.status}`);
+    } catch {
+      // JavaScript cannot delete an HttpOnly cookie. Without a confirmed
+      // server response, neither the session nor its cookie is known to be gone.
+      endSession(
+        "Could not confirm sign-out. Your session may still be active; retry when the control plane is reachable.",
+      );
       return;
     }
-  } catch {
-    // Local logout is complete even when provider discovery is unavailable.
+    endSession("You have been signed out.");
   }
-  globalThis.location.assign(redirectUri());
+  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  globalThis.location.assign("/");
 }

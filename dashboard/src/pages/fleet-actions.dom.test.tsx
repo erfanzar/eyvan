@@ -71,7 +71,9 @@ describe("draining a cell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Drain" }));
 
-    expect(within(await screen.findByRole("dialog")).getByText(/No workload currently holds capacity here/)).toBeTruthy();
+    expect(
+      within(await screen.findByRole("dialog")).getByText(/No workload currently holds capacity here/),
+    ).toBeTruthy();
   });
 
   it("cannot be reached by a mis-click, because a drain cannot be undone", async () => {

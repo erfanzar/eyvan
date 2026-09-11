@@ -9,12 +9,43 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FleetPage } from "./FleetPage";
+import { mockCells } from "../api/mockData";
 import type { CapacityPoolSummary } from "../types";
 
 const POOLS: CapacityPoolSummary[] = [
-  { id: "research-v6e-8", fleetName: "research", acceleratorType: "v6e-8", capacityClass: "spot", zone: "asia-east1-c", region: "asia-east1", maxCells: 10000, minCells: 0, enabled: true },
-  { id: "research-v6e-64", fleetName: "research", acceleratorType: "v6e-64", capacityClass: "spot", zone: "asia-east1-c", region: "asia-east1", maxCells: 10000, minCells: 0, enabled: true },
-  { id: "laptop-cpu", fleetName: "laptop", acceleratorType: null, capacityClass: "on_demand", zone: null, region: "local", maxCells: 2, minCells: 1, enabled: true },
+  {
+    id: "research-v6e-8",
+    fleetName: "research",
+    acceleratorType: "v6e-8",
+    capacityClass: "spot",
+    zone: "asia-east1-c",
+    region: "asia-east1",
+    maxCells: 10000,
+    minCells: 0,
+    enabled: true,
+  },
+  {
+    id: "research-v6e-64",
+    fleetName: "research",
+    acceleratorType: "v6e-64",
+    capacityClass: "spot",
+    zone: "asia-east1-c",
+    region: "asia-east1",
+    maxCells: 10000,
+    minCells: 0,
+    enabled: true,
+  },
+  {
+    id: "laptop-cpu",
+    fleetName: "laptop",
+    acceleratorType: null,
+    capacityClass: "on_demand",
+    zone: null,
+    region: "local",
+    maxCells: 2,
+    minCells: 1,
+    enabled: true,
+  },
 ];
 
 function renderPage(overrides: Partial<Parameters<typeof FleetPage>[0]> = {}) {
@@ -107,4 +138,22 @@ describe("applied fleets", () => {
 
     await waitFor(() => expect(screen.getByText(/may not manage fleet capacity/)).toBeTruthy());
   });
+
+  it.each(["provider_error", undefined])(
+    "shows a provider diagnostic even without a reason code (%s)",
+    async (reason) => {
+      renderPage({
+        cells: [
+          {
+            ...mockCells[0],
+            status: "degraded",
+            unavailableReason: reason,
+            unavailableDetail: "Quota refused <script>alert(1)</script>",
+          },
+        ],
+      });
+      await waitFor(() => expect(screen.getByText(/Quota refused/)).toBeTruthy());
+      expect(document.querySelector(".cell-card-error script")).toBeNull();
+    },
+  );
 });

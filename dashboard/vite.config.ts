@@ -36,6 +36,24 @@ export default defineConfig(({ mode }) => {
     // one look like a pure test of the data layer.
     test: {
       environment: "node",
+      coverage: {
+        provider: "v8",
+        // Text only: the default reporter set writes an HTML tree into the
+        // working directory, and the repo's route-coverage test scans every
+        // *.ts* file it finds there.
+        reporter: ["text"],
+        include: ["src/**/*.{ts,tsx}"],
+        exclude: ["src/**/*.test.*", "src/**/mockData.ts"],
+        // Ratchet, not target: measured 2026-09-07 at 82.8% lines / 79.6%
+        // statements / 79.4% functions / 65.4% branches. Raise these when
+        // coverage improves; never lower them without a reviewed exception.
+        thresholds: {
+          lines: 80,
+          statements: 78,
+          functions: 78,
+          branches: 60,
+        },
+      },
     },
   };
 });

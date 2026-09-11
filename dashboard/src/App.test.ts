@@ -7,14 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { loadDashboardData } from "./App";
 import { ApiError } from "./api/client";
-import {
-  mockAuditEvents,
-  mockBudgets,
-  mockCells,
-  mockLeases,
-  mockPolicies,
-  mockWorkloads,
-} from "./api/mockData";
+import { mockAuditEvents, mockBudgets, mockCells, mockLeases, mockPolicies, mockWorkloads } from "./api/mockData";
 
 function dashboardClient() {
   return {
@@ -45,10 +38,7 @@ describe("loadDashboardData", () => {
     expect(data.cells).toEqual([]);
     expect(data.access).toEqual({ fleetInventory: false, fleetAudit: true });
     expect(client.listCells).not.toHaveBeenCalled();
-    expect(client.listAuditEvents).toHaveBeenCalledWith(
-      { orgId: "acme", projectId: "research" },
-      undefined,
-    );
+    expect(client.listAuditEvents).toHaveBeenCalledWith({ orgId: "acme", projectId: "research" }, undefined);
   });
 
   it("loads fleet inventory only when server authority includes fleet management", async () => {
@@ -70,11 +60,7 @@ describe("loadDashboardData", () => {
     client.listAuditEvents.mockRejectedValue(new ApiError("authority changed", 403));
 
     await expect(
-      loadDashboardData(
-        client,
-        { canRead: true, canManageFleet: false },
-        { orgId: "acme", projectId: "research" },
-      ),
+      loadDashboardData(client, { canRead: true, canManageFleet: false }, { orgId: "acme", projectId: "research" }),
     ).rejects.toMatchObject({ status: 403 });
   });
 

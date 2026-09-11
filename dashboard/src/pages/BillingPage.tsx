@@ -110,9 +110,9 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
           </div>
           <p className="panel-note">
             The hours above are measured and real. The money is not: Eyvan multiplies usage by a price somebody
-            declares, and with none declared every total is structurally zero — which reads exactly like a free
-            fleet. Declare <code>unit_prices</code> on a pool to cost it, including <code>0</code> for capacity
-            you hold under a grant, so this page can say <em>free</em> rather than <em>unknown</em>.
+            declares, and with none declared every total is structurally zero — which reads exactly like a free fleet.
+            Declare <code>unit_prices</code> on a pool to cost it, including <code>0</code> for capacity you hold under
+            a grant, so this page can say <em>free</em> rather than <em>unknown</em>.
           </p>
         </section>
       )}

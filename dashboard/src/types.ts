@@ -208,6 +208,17 @@ export interface Cell {
   state?: string;
   /** The capacity class the cell was provisioned as; absent on older records. */
   capacityClass?: "reserved" | "on_demand" | "spot";
+  /**
+   * Why the cell is not ready, in the plane's own words.
+   *
+   * `unavailableReason` is a closed code other paths compare on;
+   * `unavailableDetail` is the provider's own diagnostic — the difference
+   * between "provider_error" and the quota message that says which quota.
+   * Present only when the plane has reported a cause; both absent on a
+   * healthy or merely provisioning cell.
+   */
+  unavailableReason?: string;
+  unavailableDetail?: string;
   utilization: number;
   activeWorkloads: number;
   /** The control plane does not report a per-cell queue depth; only demo data sets this. */

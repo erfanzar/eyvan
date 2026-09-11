@@ -100,7 +100,9 @@ describe("the quota page", () => {
     expect(rows).toHaveLength(2);
     // Sorted by free capacity, and Spot is kept apart from on-demand because
     // they are different provider quotas that cannot be spent interchangeably.
-    const cells = within(rows[0]).getAllByRole("cell").map((cell) => cell.textContent);
+    const cells = within(rows[0])
+      .getAllByRole("cell")
+      .map((cell) => cell.textContent);
     expect(cells).toEqual(["us-central2-bus-central2", "v6e-8", "Spot", "32", "16", "16", "2 x v6e-8", "5m ago"]);
     expect(within(rows[1]).getAllByRole("cell")[2].textContent).toBe("On Demand");
   });
@@ -135,7 +137,9 @@ describe("the quota page", () => {
     expect(measuredZones).toEqual(["us-central2-bus-central2"]);
 
     const unknownRow = within(unknownTable()).getAllByRole("row")[1];
-    const unknownCells = within(unknownRow).getAllByRole("cell").map((cell) => cell.textContent);
+    const unknownCells = within(unknownRow)
+      .getAllByRole("cell")
+      .map((cell) => cell.textContent);
     expect(unknownCells[0]).toContain("europe-west4-a");
     // The limit is still worth knowing; the balance is not invented.
     expect(unknownCells[3]).toBe("64");
@@ -308,12 +312,17 @@ describe("the quota page", () => {
 
   it("separates an unconfigured fleet from a fleet with no quota", async () => {
     renderPage(
-      snapshot({ status: "unconfigured", project: null, available_projects: [], entries: [], refreshed_at: null, age_s: null }),
+      snapshot({
+        status: "unconfigured",
+        project: null,
+        available_projects: [],
+        entries: [],
+        refreshed_at: null,
+        age_s: null,
+      }),
     );
 
-    await waitFor(() =>
-      expect(screen.getByText(/No GCP capacity pool declares a provider project/)).toBeDefined(),
-    );
+    await waitFor(() => expect(screen.getByText(/No GCP capacity pool declares a provider project/)).toBeDefined());
     expect(screen.getByText("The provider has not been read")).toBeDefined();
     // No table and no summary tile, rather than an empty one that reads as
     // "this fleet has no capacity anywhere".
@@ -400,9 +409,7 @@ describe("the page and the client method agree", () => {
     const spy = vi.spyOn(apiClient, "getTpuQuota").mockResolvedValue(snapshot());
 
     render(
-      <CapacityPage
-        loadQuota={(signal, options) => apiClient.getTpuQuota(apiClient.getScope(), signal, options)}
-      />,
+      <CapacityPage loadQuota={(signal, options) => apiClient.getTpuQuota(apiClient.getScope(), signal, options)} />,
     );
 
     await waitFor(() => expect(screen.getByText("Provider quota")).toBeDefined());
@@ -436,9 +443,7 @@ describe("what each zone has been doing", () => {
       <CapacityPage
         loadQuota={async () => snapshot({ status: "unconfigured", entries: [] })}
         cells={cells}
-        loadCapacityEvents={async () =>
-          events instanceof Error ? Promise.reject(events) : events
-        }
+        loadCapacityEvents={async () => (events instanceof Error ? Promise.reject(events) : events)}
       />,
     );
 

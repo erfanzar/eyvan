@@ -43,10 +43,7 @@ export function OverviewPage({
     .filter((workload) => ["running", "provisioning", "checkpointing"].includes(workload.status))
     .slice(0, 5);
   const hasQueueActivity = overview.queueTrend.some((point) => point.submitted > 0 || point.admitted > 0);
-  const maxQueueActivity = Math.max(
-    ...overview.queueTrend.flatMap((point) => [point.submitted, point.admitted]),
-    1,
-  );
+  const maxQueueActivity = Math.max(...overview.queueTrend.flatMap((point) => [point.submitted, point.admitted]), 1);
   const budgetUsed = percent(overview.monthlySpend, overview.monthlyBudget);
   const recent = auditEvents.slice(0, 8);
   // Depth alone does not say whether anything is stuck. The band holding the
@@ -78,7 +75,9 @@ export function OverviewPage({
         <MetricCard
           label="Scoped utilization"
           value={fleetAvailable ? `${overview.fleetUtilization}%` : "Restricted"}
-          detail={fleetAvailable ? "active leases in the configured project" : "fleet inventory requires fleet administration"}
+          detail={
+            fleetAvailable ? "active leases in the configured project" : "fleet inventory requires fleet administration"
+          }
           tone="accent"
         />
         <MetricCard
@@ -147,7 +146,10 @@ export function OverviewPage({
               </div>
             </div>
             {overview.priorityQueue.length === 0 ? (
-              <EmptyState title="Nothing is queued" detail="Every submitted workload in this scope has been admitted." />
+              <EmptyState
+                title="Nothing is queued"
+                detail="Every submitted workload in this scope has been admitted."
+              />
             ) : (
               <div className="priority-queue">
                 {overview.priorityQueue.map((band) => (
@@ -160,7 +162,9 @@ export function OverviewPage({
                     <ProgressBar
                       value={(band.oldestMinutes / longestWait) * 100}
                       label={`${band.priority} oldest wait`}
-                      tone={band.priority === "production" ? "red" : band.priority === "interactive" ? "blue" : "accent"}
+                      tone={
+                        band.priority === "production" ? "red" : band.priority === "interactive" ? "blue" : "accent"
+                      }
                     />
                   </div>
                 ))}
@@ -178,7 +182,10 @@ export function OverviewPage({
               )}
             </div>
             {overview.alerts.length === 0 ? (
-              <EmptyState title="Nothing needs attention" detail="No capacity or policy condition is currently raised." />
+              <EmptyState
+                title="Nothing needs attention"
+                detail="No capacity or policy condition is currently raised."
+              />
             ) : (
               <div className="alert-list">
                 {overview.alerts.map((alert) => (
@@ -211,31 +218,48 @@ export function OverviewPage({
               <ArrowRight size={14} aria-hidden="true" />
             </button>
           </div>
-          {hasQueueActivity ? <div className="queue-chart" aria-label="Submission and admission activity chart">
-            <div className="chart-legend">
-              <span><i className="legend-box legend-queued" />Submitted</span>
-              <span><i className="legend-box legend-admitted" />Admitted</span>
-            </div>
-            <div className="bar-chart">
-              {overview.queueTrend.map((point) => (
-                <div className="bar-group" key={point.label}>
-                  <div className="bar-values">
-                    <span
-                      className="bar bar-queued"
-                      style={{ height: `${point.submitted > 0 ? Math.max(8, (point.submitted / maxQueueActivity) * 100) : 0}%` }}
-                      title={`${point.submitted} submitted at ${point.label}`}
-                    />
-                    <span
-                      className="bar bar-admitted"
-                      style={{ height: `${point.admitted > 0 ? Math.max(8, (point.admitted / maxQueueActivity) * 100) : 0}%` }}
-                      title={`${point.admitted} admitted at ${point.label}`}
-                    />
+          {hasQueueActivity ? (
+            <div className="queue-chart" aria-label="Submission and admission activity chart">
+              <div className="chart-legend">
+                <span>
+                  <i className="legend-box legend-queued" />
+                  Submitted
+                </span>
+                <span>
+                  <i className="legend-box legend-admitted" />
+                  Admitted
+                </span>
+              </div>
+              <div className="bar-chart">
+                {overview.queueTrend.map((point) => (
+                  <div className="bar-group" key={point.label}>
+                    <div className="bar-values">
+                      <span
+                        className="bar bar-queued"
+                        style={{
+                          height: `${point.submitted > 0 ? Math.max(8, (point.submitted / maxQueueActivity) * 100) : 0}%`,
+                        }}
+                        title={`${point.submitted} submitted at ${point.label}`}
+                      />
+                      <span
+                        className="bar bar-admitted"
+                        style={{
+                          height: `${point.admitted > 0 ? Math.max(8, (point.admitted / maxQueueActivity) * 100) : 0}%`,
+                        }}
+                        title={`${point.admitted} admitted at ${point.label}`}
+                      />
+                    </div>
+                    <span>{point.label}</span>
                   </div>
-                  <span>{point.label}</span>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-          </div> : <EmptyState title="No submission or admission activity" detail="No workload submission or admission event occurred in this scope during the selected window." />}
+          ) : (
+            <EmptyState
+              title="No submission or admission activity"
+              detail="No workload submission or admission event occurred in this scope during the selected window."
+            />
+          )}
         </div>
 
         <div className="panel fleet-panel">
@@ -254,7 +278,9 @@ export function OverviewPage({
                   <div className="resource-row" key={resource.resource}>
                     <div className="resource-row-heading">
                       <span>{resource.resource}</span>
-                      <strong>{resource.used.toLocaleString()} / {resource.total.toLocaleString()}</strong>
+                      <strong>
+                        {resource.used.toLocaleString()} / {resource.total.toLocaleString()}
+                      </strong>
                     </div>
                     <ProgressBar
                       value={utilization}
@@ -278,9 +304,15 @@ export function OverviewPage({
           <div className="budget-inline">
             <div>
               <span>Monthly budget</span>
-              <strong>{formatMoney(overview.monthlySpend)} / {formatMoney(overview.monthlyBudget)}</strong>
+              <strong>
+                {formatMoney(overview.monthlySpend)} / {formatMoney(overview.monthlyBudget)}
+              </strong>
             </div>
-            <ProgressBar value={budgetUsed} label="Monthly budget utilization" tone={budgetUsed > 85 ? "red" : "accent"} />
+            <ProgressBar
+              value={budgetUsed}
+              label="Monthly budget utilization"
+              tone={budgetUsed > 85 ? "red" : "accent"}
+            />
           </div>
         </div>
       </section>
@@ -305,7 +337,9 @@ export function OverviewPage({
               >
                 <span className="workload-primary">
                   <strong>{workload.name}</strong>
-                  <small>{workload.project} · {workload.cell ?? "placement pending"}</small>
+                  <small>
+                    {workload.project} · {workload.cell ?? "placement pending"}
+                  </small>
                 </span>
                 <StatusBadge value={workload.status} tone={workload.status} />
                 <span className="mini-progress">

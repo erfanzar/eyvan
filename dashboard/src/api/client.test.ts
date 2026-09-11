@@ -32,12 +32,14 @@ describe("EyvanApiClient", () => {
   it("reports server failures instead of substituting demo data", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockImplementation(() => Promise.resolve(
-        new Response(JSON.stringify({ detail: "database unavailable" }), {
-          status: 503,
-          headers: { "content-type": "application/json" },
-        }),
-      )),
+      vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ detail: "database unavailable" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      ),
     );
     const client = new EyvanApiClient("/api/v1", false);
 
@@ -159,9 +161,7 @@ describe("EyvanApiClient", () => {
 
     await client.listAuditEvents({ orgId: "other", projectId: "research" });
 
-    expect(fetch.mock.calls[0][0]).toBe(
-      "/api/v1/events?limit=1000&org_id=other&project_id=research",
-    );
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/events?limit=1000&org_id=other&project_id=research");
     expect(fetch.mock.calls.some(([url]) => String(url).includes("/fleet/events"))).toBe(false);
   });
 
@@ -171,10 +171,10 @@ describe("EyvanApiClient", () => {
       urls.push(String(url));
       if (String(url).endsWith("/workloads/wl-1")) {
         return Promise.resolve(
-          new Response(
-            JSON.stringify({ ...rawWorkload, org_id: "other", project_id: "training" }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          ),
+          new Response(JSON.stringify({ ...rawWorkload, org_id: "other", project_id: "training" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
         );
       }
       if (String(url).endsWith("/logs")) return Promise.resolve(new Response("", { status: 200 }));
@@ -220,10 +220,10 @@ describe("EyvanApiClient", () => {
     // client used to declare `attempt` on the wire and then drop it along with
     // both counts, so the operations UI could show neither.
     const fetch = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify([{ ...rawWorkload, attempt: 3, preemption_count: 2, capacity_loss_count: 0 }]),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
+      new Response(JSON.stringify([{ ...rawWorkload, attempt: 3, preemption_count: 2, capacity_loss_count: 0 }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
     );
     vi.stubGlobal("fetch", fetch);
 
@@ -368,7 +368,9 @@ describe("EyvanApiClient", () => {
         new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
       if (url === `/api/v1/budgets/${SCOPE.orgId}/${SCOPE.projectId}`) return Promise.resolve(response(rawBudget));
       if (url === `/api/v1/budgets/${SCOPE.orgId}/${SCOPE.projectId}/status`) {
-        return Promise.resolve(response({ org_id: SCOPE.orgId, project_id: SCOPE.projectId, limit: 1000, spent: 100, forecast: 250 }));
+        return Promise.resolve(
+          response({ org_id: SCOPE.orgId, project_id: SCOPE.projectId, limit: 1000, spent: 100, forecast: 250 }),
+        );
       }
       if (url === `/api/v1/policies/${SCOPE.orgId}/${SCOPE.projectId}`) return Promise.resolve(response(rawPolicy));
       return Promise.resolve(new Response("not found", { status: 404 }));
@@ -496,9 +498,19 @@ describe("EyvanApiClient", () => {
 
     const detail = await client.getWorkload("wl-1");
 
-    expect(detail.logs[0]).toMatchObject({ timestamp: "2026-01-01T00:00:10.123Z", level: "INFO", source: "trainer", message: "step=10 loss=2.1" });
+    expect(detail.logs[0]).toMatchObject({
+      timestamp: "2026-01-01T00:00:10.123Z",
+      level: "INFO",
+      source: "trainer",
+      message: "step=10 loss=2.1",
+    });
     expect(detail.logs[1]).toMatchObject({ timestamp: "2026-01-01T00:00:11Z", level: "WARN", source: undefined });
-    expect(detail.logs[2]).toMatchObject({ timestamp: undefined, level: undefined, source: undefined, message: "plain executor line without metadata" });
+    expect(detail.logs[2]).toMatchObject({
+      timestamp: undefined,
+      level: undefined,
+      source: undefined,
+      message: "plain executor line without metadata",
+    });
   });
 
   it("sets a re-login notice when the control plane rejects the session", async () => {
@@ -513,9 +525,7 @@ describe("EyvanApiClient", () => {
     );
     const client = new EyvanApiClient("/api/v1", false);
 
-    await expect(client.listWorkloads()).rejects.toEqual(
-      expect.objectContaining({ status: 401 }),
-    );
+    await expect(client.listWorkloads()).rejects.toEqual(expect.objectContaining({ status: 401 }));
 
     expect(consumeSessionNotice()).toMatch(/rejected/i);
   });
@@ -570,11 +580,8 @@ describe("EyvanApiClient", () => {
 
     const detail = await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
 
-    expect(detail.allocation).toEqual([
-      { host: "cell-1", rack: "active", resource: "8 TPU, 8 CPU", state: "ready" },
-    ]);
+    expect(detail.allocation).toEqual([{ host: "cell-1", rack: "active", resource: "8 TPU, 8 CPU", state: "ready" }]);
   });
-
 });
 
 const rawWorkload = {
@@ -733,11 +740,13 @@ describe("dead field revival", () => {
   it("does not recurse between listLeases and listCells", async () => {
     // listCells resolves leases to compute utilization, so a naive join in
     // listLeases would loop forever. Bounded call count is the assertion.
-    const fetch = vi.fn().mockImplementation(() =>
-      Promise.resolve(
-        new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
-      ),
-    );
+    const fetch = vi
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }),
+        ),
+      );
     vi.stubGlobal("fetch", fetch);
     const client = new EyvanApiClient("/api/v1", false);
 
@@ -840,7 +849,9 @@ describe("the panels the dashboard never had", () => {
     // to an unexplained idle figure is to delete the warm floor.
     const fetchMock = jsonFetch({
       observed_at: "2026-07-29T12:00:00Z",
-      pools: [{ pool_id: "research/v5p", floor: 2, window_active: true, warm_cells: 2, warm_idle_cells: 1, hourly_cost: 8 }],
+      pools: [
+        { pool_id: "research/v5p", floor: 2, window_active: true, warm_cells: 2, warm_idle_cells: 1, hourly_cost: 8 },
+      ],
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -908,7 +919,14 @@ describe("the workload detail page under a slow worker", () => {
       if (url.includes("/leases")) return json([]);
       if (url.includes("/events")) return json([]);
       if (url.includes("/logs")) return new Response("log text", { status: 200 });
-      if (url.includes("/progress")) return json({ workload_id: "wl-1", workload_state: "running", phase: "running", request: { cells: 1, workers_per_cell: 1 }, capacity: { ready_workers: 1 } });
+      if (url.includes("/progress"))
+        return json({
+          workload_id: "wl-1",
+          workload_state: "running",
+          phase: "running",
+          request: { cells: 1, workers_per_cell: 1 },
+          capacity: { ready_workers: 1 },
+        });
       return json(raw);
     });
   }
@@ -919,10 +937,7 @@ describe("the workload detail page under a slow worker", () => {
     // in the same `Promise.all` as the workload, its events and its progress --
     // all of which answered in under half a second -- with no fallback, so the
     // page rendered "Unable to load Eyvan state" for a workload that existed.
-    vi.stubGlobal(
-      "fetch",
-      route({ "/logs": () => Promise.reject(new Error("Eyvan API request timed out")) }),
-    );
+    vi.stubGlobal("fetch", route({ "/logs": () => Promise.reject(new Error("Eyvan API request timed out")) }));
 
     const detail = await new EyvanApiClient("/api/v1", false).getWorkload("wl-1");
 
@@ -984,7 +999,11 @@ describe("workload ordering", () => {
       spec: {
         name: id,
         execution: { kind: "command" as const, command: "x" },
-        gang: { replicas: 1, per_replica: { cpu: 1, memory_gib: 1, gpu: 0, tpu: 0, custom: {} }, required_topology: {} },
+        gang: {
+          replicas: 1,
+          per_replica: { cpu: 1, memory_gib: 1, gpu: 0, tpu: 0, custom: {} },
+          required_topology: {},
+        },
         metadata: {},
         priority_band: "interactive" as const,
       },
@@ -994,11 +1013,22 @@ describe("workload ordering", () => {
   it("lists the newest job first", async () => {
     // The control plane returns insertion order, so the job you just submitted
     // was buried under every job you had ever submitted.
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(listOf(
-      ["oldest", "2026-08-01T00:00:00Z"],
-      ["newest", "2026-08-07T00:00:00Z"],
-      ["middle", "2026-08-04T00:00:00Z"],
-    )), { status: 200, headers: { "Content-Type": "application/json" } })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify(
+              listOf(
+                ["oldest", "2026-08-01T00:00:00Z"],
+                ["newest", "2026-08-07T00:00:00Z"],
+                ["middle", "2026-08-04T00:00:00Z"],
+              ),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
 
     const list = await new EyvanApiClient("/api/v1", false).listWorkloads();
 
@@ -1008,11 +1038,22 @@ describe("workload ordering", () => {
   it("orders identical timestamps deterministically", async () => {
     // Otherwise the rows shuffle on every poll and the page is unreadable while
     // a burst of jobs lands in the same second -- which is what a fan-out is.
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(listOf(
-      ["wl-a", "2026-08-07T00:00:00Z"],
-      ["wl-c", "2026-08-07T00:00:00Z"],
-      ["wl-b", "2026-08-07T00:00:00Z"],
-    )), { status: 200, headers: { "Content-Type": "application/json" } })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify(
+              listOf(
+                ["wl-a", "2026-08-07T00:00:00Z"],
+                ["wl-c", "2026-08-07T00:00:00Z"],
+                ["wl-b", "2026-08-07T00:00:00Z"],
+              ),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
 
     const client = new EyvanApiClient("/api/v1", false);
     const first = (await client.listWorkloads()).map((w) => w.id);
@@ -1150,7 +1191,7 @@ describe("provider TPU quota", () => {
     await expect(new EyvanApiClient("/api/v1", false).getTpuQuota()).rejects.toEqual(
       expect.objectContaining({ name: "ApiError", status: 403 }),
     );
-  });  // ------------------------------------------------------------------ following one workload's output
+  }); // ------------------------------------------------------------------ following one workload's output
 
   /** A response whose body streams the given SSE text, then ends. */
   function streamingResponse(text: string): Response {
@@ -1319,10 +1360,12 @@ describe("how long a read is given", () => {
 
     // Well past the control-plane budget, and the request is still alive.
     await vi.advanceTimersByTimeAsync(20_000);
-    settle(new Response(JSON.stringify({ entries: [], status: "ok" }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }));
+    settle(
+      new Response(JSON.stringify({ entries: [], status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
 
     await expect(pending).resolves.toMatchObject({ status: "ok" });
   });
@@ -1363,12 +1406,18 @@ describe("EyvanApiClient loopback credential refusals", () => {
   function memoryStorage(initial: Record<string, string> = {}): Storage {
     const values = new Map(Object.entries(initial));
     return {
-      get length() { return values.size; },
+      get length() {
+        return values.size;
+      },
       clear: () => values.clear(),
       getItem: (key) => values.get(key) ?? null,
       key: (index) => [...values.keys()][index] ?? null,
-      removeItem: (key) => { values.delete(key); },
-      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => {
+        values.delete(key);
+      },
+      setItem: (key, value) => {
+        values.set(key, value);
+      },
     };
   }
 

@@ -16,7 +16,11 @@ export const COALESCE_MS = 400;
 
 export interface LiveRefreshOptions {
   /** Subscribes to change notifications; resolves when `signal` aborts. */
-  subscribe: (onEvent: () => void, signal: AbortSignal, onConnectionChange: (connected: boolean) => void) => Promise<void>;
+  subscribe: (
+    onEvent: () => void,
+    signal: AbortSignal,
+    onConnectionChange: (connected: boolean) => void,
+  ) => Promise<void>;
   /** Called at most once per `COALESCE_MS` while events arrive. */
   onChange: () => void;
   active?: boolean;

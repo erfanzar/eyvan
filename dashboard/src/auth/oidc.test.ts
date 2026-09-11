@@ -6,120 +6,153 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  LOGIN_PATH,
+  LOGOUT_PATH,
   __resetRuntimeOidcConfigForTests,
   absorbLocalCredentialFromLocation,
   apiAuthHeaders,
   beginLogin,
   capabilitiesForPermissions,
-  completeLogin,
   consumeSessionNotice,
   currentIdentity,
-  getAccessToken,
   invalidateRefusedLocalCredential,
   isOidcConfigured,
   configuredScope,
   loadRuntimeOidcConfig,
+  logout,
   planeDevelopmentAuthMode,
   planeRequiresLocalCredential,
+  serverIdentity,
 } from "./oidc";
 
 function memoryStorage(initial: Record<string, string> = {}): Storage {
   const values = new Map(Object.entries(initial));
   return {
-    get length() { return values.size; },
+    get length() {
+      return values.size;
+    },
     clear: () => values.clear(),
     getItem: (key) => values.get(key) ?? null,
     key: (index) => [...values.keys()][index] ?? null,
-    removeItem: (key) => { values.delete(key); },
-    setItem: (key, value) => { values.set(key, value); },
+    removeItem: (key) => {
+      values.delete(key);
+    },
+    setItem: (key, value) => {
+      values.set(key, value);
+    },
   };
 }
 
 function unsignedToken(claims: Record<string, unknown>): string {
-  const encode = (value: unknown) => btoa(JSON.stringify(value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  const encode = (value: unknown) =>
+    btoa(JSON.stringify(value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
   return `${encode({ alg: "none" })}.${encode(claims)}.`;
 }
 
-describe("OIDC browser authentication", () => {
+describe("OIDC sign-in is server-side", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
 
-  it("exchanges an authorization code with its PKCE verifier and keeps the bearer token in session storage", async () => {
+  it("hands the browser to the server login endpoint instead of building an authorize URL", () => {
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://identity.example.test");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "eyvan-dashboard");
-    vi.stubGlobal("sessionStorage", memoryStorage({
-      "eyvan.oidc.state": "expected-state",
-      "eyvan.oidc.verifier": "pkce-verifier",
-    }));
-    vi.stubGlobal("location", {
-      search: "?code=authorization-code&state=expected-state",
-      origin: "https://eyvan.example.test",
-      pathname: "/",
-      hash: "#overview",
-    });
-    const replaceState = vi.fn();
-    vi.stubGlobal("history", { replaceState });
-    vi.stubGlobal("document", { title: "Eyvan" });
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        authorization_endpoint: "https://identity.example.test/authorize",
-        token_endpoint: "https://identity.example.test/token",
-      }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        access_token: "session-access-token",
-        token_type: "Bearer",
-        expires_in: 3600,
-      }), { status: 200 }));
-    vi.stubGlobal("fetch", fetch);
+    const assign = vi.fn();
+    vi.stubGlobal("location", { assign });
+    const fetchImpl = vi.fn();
+    vi.stubGlobal("fetch", fetchImpl);
 
-    await expect(completeLogin()).resolves.toBe(true);
+    beginLogin();
 
-    expect(fetch.mock.calls[1][0]).toBe("https://identity.example.test/token");
-    expect(String(fetch.mock.calls[1][1].body)).toContain("code_verifier=pkce-verifier");
-    expect(apiAuthHeaders()).toEqual({ Authorization: "Bearer session-access-token" });
-    expect(currentIdentity()).toMatchObject({ mode: "oidc" });
-    expect(replaceState).toHaveBeenCalledWith({}, "Eyvan", "/#overview");
+    // No discovery round trip, no PKCE material in this tab: the challenge is
+    // minted where the tokens will live, on the server.
+    expect(assign).toHaveBeenCalledWith(LOGIN_PATH);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("rejects a callback whose state does not match the initiating browser session", async () => {
-    vi.stubGlobal("sessionStorage", memoryStorage({
-      "eyvan.oidc.state": "expected-state",
-      "eyvan.oidc.verifier": "pkce-verifier",
-    }));
+  it("refuses to begin sign-in when OIDC is not configured", () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
 
-    await expect(completeLogin(new URLSearchParams("code=authorization-code&state=other-state"))).rejects.toThrow(
-      "OIDC callback state could not be verified",
+    expect(() => beginLogin()).toThrow("OIDC client configuration is incomplete");
+  });
+
+  it("never builds an Authorization header from something JavaScript can read", () => {
+    // The regression this pins: tokens lived in sessionStorage and were copied
+    // into a bearer header on every request, readable by any cross-site script.
+    vi.stubGlobal(
+      "sessionStorage",
+      memoryStorage({
+        "eyvan.oidc.access_token": "stolen-token",
+        "eyvan.oidc.id_token": unsignedToken({ sub: "alice" }),
+        "eyvan.oidc.expires_at": String(Date.now() + 60_000),
+      }),
     );
+
+    expect(apiAuthHeaders()).toEqual({});
   });
 
-  it("returns the stored token while it is still valid", () => {
-    const session = memoryStorage({
-      "eyvan.oidc.access_token": "valid-token",
-      "eyvan.oidc.expires_at": String(Date.now() + 60_000),
-    });
-    vi.stubGlobal("sessionStorage", session);
+  it("asks the server whether a session cookie already authenticates this browser", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://identity.example.test");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "eyvan-dashboard");
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ subject: "alice", display_name: "Alice Example" }), { status: 200 }),
+    );
 
-    expect(getAccessToken()).toBe("valid-token");
-    expect(consumeSessionNotice()).toBeUndefined();
-    expect(session.getItem("eyvan.oidc.access_token")).toBe("valid-token");
+    const identity = await serverIdentity(fetchImpl as unknown as typeof fetch);
+
+    expect(fetchImpl).toHaveBeenCalledWith("/api/v1/session", expect.objectContaining({ headers: {} }));
+    expect(identity).toMatchObject({ mode: "oidc", displayName: "Alice Example" });
   });
 
-  it("expires stored sessions with an explicit re-login notice instead of silently clearing", () => {
-    const dispatch = vi.fn();
-    const session = memoryStorage({
-      "eyvan.oidc.access_token": "expired-token",
-      "eyvan.oidc.expires_at": String(Date.now() - 1000),
-    });
-    vi.stubGlobal("sessionStorage", session);
-    vi.stubGlobal("dispatchEvent", dispatch);
+  it("treats a 401 session probe as signed out, not as an error", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://identity.example.test");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "eyvan-dashboard");
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ detail: "authentication required" }), { status: 401 }),
+    );
 
-    expect(getAccessToken()).toBeUndefined();
-    expect(session.getItem("eyvan.oidc.access_token")).toBeNull();
-    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "eyvan:auth-changed" }));
-    expect(consumeSessionNotice()).toMatch(/expired/i);
-    expect(consumeSessionNotice()).toBeUndefined();
+    await expect(serverIdentity(fetchImpl as unknown as typeof fetch)).resolves.toBeUndefined();
+  });
+
+  it("skips the session probe entirely when OIDC is not configured", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
+    const fetchImpl = vi.fn();
+
+    await expect(serverIdentity(fetchImpl as unknown as typeof fetch)).resolves.toBeUndefined();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("signs out through the server and lands back on the sign-in screen", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://identity.example.test");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "eyvan-dashboard");
+    const assign = vi.fn();
+    vi.stubGlobal("location", { assign });
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }));
+
+    await logout(fetchImpl as unknown as typeof fetch);
+
+    expect(fetchImpl).toHaveBeenCalledWith(LOGOUT_PATH, { method: "POST" });
+    expect(assign).toHaveBeenCalledWith("/");
+    expect(consumeSessionNotice()).toMatch(/signed out/i);
+  });
+
+  it.each(["network", "http"])("reports an unconfirmed logout instead of claiming success (%s)", async (failure) => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://identity.example.test");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "eyvan-dashboard");
+    const assign = vi.fn();
+    vi.stubGlobal("location", { assign });
+    const fetchImpl = vi.fn(async () => {
+      if (failure === "network") throw new Error("network down");
+      return new Response(null, { status: 503 });
+    });
+
+    await logout(fetchImpl as unknown as typeof fetch);
+
+    expect(assign).not.toHaveBeenCalled();
+    expect(consumeSessionNotice()).toMatch(/could not confirm sign-out.*may still be active/i);
   });
 });
 
@@ -146,49 +179,43 @@ describe("dashboard permission capabilities", () => {
       ["read", "submit", "operate"],
       { submitWorkloads: true, operateWorkloads: true, manageProject: false, manageFleet: false },
     ],
-    [
-      ["submit"],
-      { submitWorkloads: true, operateWorkloads: false, manageProject: false, manageFleet: false },
-    ],
-    [
-      ["read"],
-      { submitWorkloads: false, operateWorkloads: false, manageProject: false, manageFleet: false },
-    ],
+    [["submit"], { submitWorkloads: true, operateWorkloads: false, manageProject: false, manageFleet: false }],
+    [["read"], { submitWorkloads: false, operateWorkloads: false, manageProject: false, manageFleet: false }],
   ] as const)("maps server permissions to presentation controls", (permissions, expected) => {
     expect(capabilitiesForPermissions(permissions)).toEqual(expected);
   });
 
-  it("never treats access-token grants as effective browser authority", () => {
+  it("reports no local OIDC identity: the tab holds no token and no claims", () => {
+    // Claims used to be decoded here for display. The session is a cookie the
+    // page cannot read, so identity display comes from the server's authority
+    // response -- never from something in this tab's storage.
     vi.stubEnv("VITE_EYVAN_ORG", "acme");
     vi.stubEnv("VITE_EYVAN_PROJECT", "research");
-    vi.stubGlobal("sessionStorage", memoryStorage({
-      "eyvan.oidc.access_token": unsignedToken({
-        sub: "alice",
-        eyvan_grants: [{ role: "fleet_admin" }],
+    vi.stubGlobal(
+      "sessionStorage",
+      memoryStorage({
+        "eyvan.oidc.access_token": unsignedToken({
+          sub: "alice",
+          eyvan_grants: [{ role: "fleet_admin" }],
+        }),
       }),
-    }));
+    );
 
-    expect(currentIdentity()).toMatchObject({
-      mode: "oidc",
-      roles: [],
-      capabilities: {
-        submitWorkloads: false,
-        operateWorkloads: false,
-        manageProject: false,
-        manageFleet: false,
-      },
-    });
+    expect(currentIdentity()).toBeUndefined();
   });
 
-  it("does not use a development admin role when requests use a bearer session", () => {
+  it("does not elevate a development role when a session exists only in legacy storage", () => {
     vi.stubEnv("VITE_EYVAN_DEV_AUTH", "true");
     vi.stubEnv("VITE_EYVAN_DEV_ROLE", "fleet_admin");
-    vi.stubGlobal("sessionStorage", memoryStorage({
-      "eyvan.oidc.access_token": unsignedToken({ sub: "alice" }),
-    }));
+    vi.stubGlobal(
+      "sessionStorage",
+      memoryStorage({
+        "eyvan.oidc.access_token": unsignedToken({ sub: "alice" }),
+      }),
+    );
 
     expect(currentIdentity()).toMatchObject({
-      mode: "oidc",
+      mode: "development",
       roles: [],
       capabilities: {
         submitWorkloads: false,
@@ -211,10 +238,11 @@ describe("runtime OIDC configuration", () => {
     // build arguments, so one image served exactly one identity provider.
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ issuer: "https://idp.example.com", client_id: "eyvan-dashboard" }), {
-        status: 200,
-      }),
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ issuer: "https://idp.example.com", client_id: "eyvan-dashboard" }), {
+          status: 200,
+        }),
     );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
@@ -237,53 +265,6 @@ describe("runtime OIDC configuration", () => {
     expect(isOidcConfigured()).toBe(true);
   });
 
-  it("requests the runtime API audience during authorization", async () => {
-    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
-    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    vi.stubEnv("VITE_EYVAN_OIDC_AUDIENCE", "");
-    vi.stubGlobal("sessionStorage", memoryStorage());
-    const assign = vi.fn();
-    vi.stubGlobal("location", {
-      search: "",
-      origin: "https://eyvan.example.test",
-      pathname: "/",
-      hash: "",
-      assign,
-    });
-    vi.stubGlobal("crypto", {
-      getRandomValues: (bytes: Uint8Array) => bytes.fill(7),
-      subtle: { digest: async () => new Uint8Array(32).buffer },
-    });
-    const fetchImpl = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          issuer: "https://idp.example.test",
-          client_id: "eyvan-dashboard",
-          audience: "eyvan-api",
-        }),
-        { status: 200 },
-      ),
-    );
-    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            authorization_endpoint: "https://idp.example.test/authorize",
-            token_endpoint: "https://idp.example.test/token",
-          }),
-          { status: 200 },
-        ),
-      ),
-    );
-
-    await beginLogin();
-
-    expect(assign).toHaveBeenCalledOnce();
-    expect(String(assign.mock.calls[0][0])).toContain("audience=eyvan-api");
-  });
-
   it("treats an unreachable control plane as unconfigured rather than as an auth error", async () => {
     // An unreachable control plane is not an auth misconfiguration. The failure
     // belongs at the first API call, not as "OIDC is not configured".
@@ -303,8 +284,8 @@ describe("runtime OIDC configuration", () => {
     // dashboard can tell "not configured" from "too old to answer".
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }),
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }),
     );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
@@ -325,10 +306,11 @@ describe("what the plane says about its own auth", () => {
     // who never built the bundle.
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "loopback_default" }), {
-        status: 200,
-      }),
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "loopback_default" }), {
+          status: 200,
+        }),
     );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
@@ -343,8 +325,9 @@ describe("what the plane says about its own auth", () => {
     // operator to run a development command against production.
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "disabled" }), { status: 200 }),
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ issuer: null, client_id: null, development_auth: "disabled" }), { status: 200 }),
     );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
@@ -355,7 +338,9 @@ describe("what the plane says about its own auth", () => {
   it("treats a plane too old to answer as not local", async () => {
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }));
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ issuer: null, client_id: null }), { status: 200 }),
+    );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
 
@@ -378,8 +363,7 @@ describe("which project the dashboard asks about", () => {
     vi.stubEnv("VITE_EYVAN_ORG", "");
     vi.stubEnv("VITE_EYVAN_PROJECT", "");
     const fetchImpl = vi.fn(
-      async () =>
-        new Response(JSON.stringify({ default_org: "default", default_project: "default" }), { status: 200 }),
+      async () => new Response(JSON.stringify({ default_org: "default", default_project: "default" }), { status: 200 }),
     );
 
     await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
@@ -448,8 +432,12 @@ describe("the loopback development credential bridge", () => {
     vi.stubGlobal("sessionStorage", store);
     const replaceState = vi.fn();
 
-    expect(absorbLocalCredentialFromLocation({ hash: "", pathname: "/", search: "" }, { replaceState })).toBeUndefined();
-    expect(absorbLocalCredentialFromLocation({ hash: "#panel=cells", pathname: "/", search: "" }, { replaceState })).toBeUndefined();
+    expect(
+      absorbLocalCredentialFromLocation({ hash: "", pathname: "/", search: "" }, { replaceState }),
+    ).toBeUndefined();
+    expect(
+      absorbLocalCredentialFromLocation({ hash: "#panel=cells", pathname: "/", search: "" }, { replaceState }),
+    ).toBeUndefined();
     expect(replaceState).not.toHaveBeenCalled();
     expect(store.length).toBe(0);
   });
@@ -473,7 +461,9 @@ describe("the loopback development credential bridge", () => {
     });
   });
 
-  it("never lets a bridged credential outrank a signed-in session", () => {
+  it("adds no bearer header when a legacy token shares the tab with the credential", () => {
+    // The cookie session replaces what the legacy key used to mean; the local
+    // credential header still travels because the loopback plane demands it.
     vi.stubGlobal(
       "sessionStorage",
       memoryStorage({
@@ -483,7 +473,7 @@ describe("the loopback development credential bridge", () => {
       }),
     );
 
-    expect(apiAuthHeaders()).toEqual({ Authorization: expect.stringContaining("Bearer ") });
+    expect(apiAuthHeaders()).toEqual({ "X-Eyvan-Local-Credential": "owner-secret" });
   });
 });
 

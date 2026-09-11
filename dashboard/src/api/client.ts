@@ -92,9 +92,9 @@ interface RawWorkload {
     metadata: Record<string, string>;
     accelerator_type?: string;
     priority_band: PriorityBand;
-  /** Slices allocated together (pods=N). Absent on planes predating multislice. */
-  cell_group_count?: number;
-  worker_count?: number;
+    /** Slices allocated together (pods=N). Absent on planes predating multislice. */
+    cell_group_count?: number;
+    worker_count?: number;
   };
 }
 
@@ -109,6 +109,10 @@ interface RawCell {
   allocatable: RawResources;
   accelerator_type?: string;
   capacity_class?: string;
+  /** Closed code naming why the cell is unavailable; present only then. */
+  unavailable_reason?: string | null;
+  /** The provider's own diagnostic behind `unavailable_reason`. */
+  unavailable_detail?: string | null;
   labels: Record<string, string>;
   topology?: Record<string, string>;
   last_heartbeat_at?: string;
@@ -243,7 +247,10 @@ export interface WorkloadFilters {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly status?: number) {
+  constructor(
+    message: string,
+    public readonly status?: number,
+  ) {
     super(message);
     this.name = "ApiError";
   }
@@ -270,7 +277,7 @@ export function workloadStatus(value: string): WorkloadStatus {
 
 function mapWorkload(raw: RawWorkload): WorkloadDetail {
   const resources = raw.spec.gang.per_replica;
-  const accelerator = resources.tpu ? raw.spec.accelerator_type ?? "TPU" : undefined;
+  const accelerator = resources.tpu ? (raw.spec.accelerator_type ?? "TPU") : undefined;
   return {
     id: raw.id,
     name: raw.spec.name,
@@ -445,8 +452,7 @@ function mapLogRecord(record: RawLogRecord, id: string): LogEntry {
   const parsed = parseLogLine(record.message);
   const rank = typeof record.rank === "number" ? `rank ${record.rank}` : undefined;
   const source = [rank, parsed.source].filter(Boolean).join(" · ") || undefined;
-  const stream =
-    record.stream === "stdout" || record.stream === "stderr" ? record.stream : ("unknown" as const);
+  const stream = record.stream === "stdout" || record.stream === "stderr" ? record.stream : ("unknown" as const);
   return {
     id,
     timestamp: parsed.timestamp ?? record.timestamp ?? undefined,
@@ -481,24 +487,28 @@ export function computeOverview(
   const running = workloads.filter((item) => item.status === "running").length;
   const terminal = workloads.filter((item) => ["completed", "failed", "cancelled"].includes(item.status));
   const resourceBreakdown = new Map<string, { used: number; total: number; pending: number }>();
-  cells.flatMap((cell) => cell.resources).forEach((resource) => {
-    const current = resourceBreakdown.get(resource.name) ?? { used: 0, total: 0, pending: 0 };
-    current.used += resource.used;
-    current.total += resource.total;
-    resourceBreakdown.set(resource.name, current);
-  });
-  workloads.filter((workload) => ["queued", "planning"].includes(workload.status)).forEach((workload) => {
-    const pendingResources: Array<[string, number]> = [
-      ["CPU", workload.resources.cpu * workload.resources.replicas],
-      ["Memory GiB", workload.resources.memoryGb * workload.resources.replicas],
-      ["TPU", (workload.resources.acceleratorCount ?? 0) * workload.resources.replicas],
-    ];
-    pendingResources.forEach(([name, pending]) => {
-      const current = resourceBreakdown.get(name) ?? { used: 0, total: 0, pending: 0 };
-      current.pending += pending;
-      resourceBreakdown.set(name, current);
+  cells
+    .flatMap((cell) => cell.resources)
+    .forEach((resource) => {
+      const current = resourceBreakdown.get(resource.name) ?? { used: 0, total: 0, pending: 0 };
+      current.used += resource.used;
+      current.total += resource.total;
+      resourceBreakdown.set(resource.name, current);
     });
-  });
+  workloads
+    .filter((workload) => ["queued", "planning"].includes(workload.status))
+    .forEach((workload) => {
+      const pendingResources: Array<[string, number]> = [
+        ["CPU", workload.resources.cpu * workload.resources.replicas],
+        ["Memory GiB", workload.resources.memoryGb * workload.resources.replicas],
+        ["TPU", (workload.resources.acceleratorCount ?? 0) * workload.resources.replicas],
+      ];
+      pendingResources.forEach(([name, pending]) => {
+        const current = resourceBreakdown.get(name) ?? { used: 0, total: 0, pending: 0 };
+        current.pending += pending;
+        resourceBreakdown.set(name, current);
+      });
+    });
   const priorityQueue = (["production", "interactive", "batch"] as PriorityBand[]).map((priority) => {
     const queuedInBand = workloads.filter((item) => item.status === "queued" && item.priority === priority);
     const oldestSubmittedAt = queuedInBand.reduce(
@@ -514,14 +524,26 @@ export function computeOverview(
   return {
     queued,
     running,
-    fleetUtilization: cells.length ? Math.round(cells.reduce((sum, cell) => sum + cell.utilization, 0) / cells.length) : 0,
+    fleetUtilization: cells.length
+      ? Math.round(cells.reduce((sum, cell) => sum + cell.utilization, 0) / cells.length)
+      : 0,
     monthlySpend: budgets.reduce((sum, budget) => sum + budget.spent, 0),
     monthlyBudget: budgets.reduce((sum, budget) => sum + budget.limit, 0),
-    successRate: terminal.length ? (terminal.filter((item) => item.status === "completed").length / terminal.length) * 100 : undefined,
+    successRate: terminal.length
+      ? (terminal.filter((item) => item.status === "completed").length / terminal.length) * 100
+      : undefined,
     queueTrend,
     priorityQueue,
     fleetBreakdown: [...resourceBreakdown].map(([resource, values]) => ({ resource, ...values })),
-    alerts: budgets.filter((budget) => budget.forecast !== undefined && budget.forecast > budget.limit).map((budget) => ({ id: budget.id, severity: "warning", title: "Budget forecast above limit", detail: budget.owner, timestamp: new Date().toISOString() })),
+    alerts: budgets
+      .filter((budget) => budget.forecast !== undefined && budget.forecast > budget.limit)
+      .map((budget) => ({
+        id: budget.id,
+        severity: "warning",
+        title: "Budget forecast above limit",
+        detail: budget.owner,
+        timestamp: new Date().toISOString(),
+      })),
   };
 }
 
@@ -538,10 +560,10 @@ const CONTROL_PLANE_TIMEOUT_MS = 3_500;
  * workload that has actually run somewhere.
  */
 // Forwarded log reads go browser -> plane -> cell agent. A dead or churning
-    // agent used to hold the whole detail page hostage for thirty seconds; the
-    // archive serves this attempt's history anyway, so five seconds is plenty
-    // before falling back to it.
-    const WORKER_FORWARDED_TIMEOUT_MS = 5_000;
+// agent used to hold the whole detail page hostage for thirty seconds; the
+// archive serves this attempt's history anyway, so five seconds is plenty
+// before falling back to it.
+const WORKER_FORWARDED_TIMEOUT_MS = 5_000;
 
 /**
  * Budget for a read the control plane answers by calling the cloud provider.
@@ -588,7 +610,12 @@ export class EyvanApiClient {
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
-        headers: { Accept: "application/json", "Content-Type": "application/json", ...apiAuthHeaders(), ...init.headers },
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          ...apiAuthHeaders(),
+          ...init.headers,
+        },
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -615,7 +642,9 @@ export class EyvanApiClient {
     } catch (error) {
       if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) throw new ApiError("Eyvan API request timed out");
-      throw new ApiError(error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API");
+      throw new ApiError(
+        error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API",
+      );
     } finally {
       externalSignal?.removeEventListener("abort", cancel);
       globalThis.clearTimeout(timeout);
@@ -644,7 +673,9 @@ export class EyvanApiClient {
     } catch (error) {
       if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) throw new ApiError("Eyvan API request timed out");
-      throw new ApiError(error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API");
+      throw new ApiError(
+        error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API",
+      );
     } finally {
       externalSignal?.removeEventListener("abort", cancel);
       globalThis.clearTimeout(timeout);
@@ -660,10 +691,7 @@ export class EyvanApiClient {
     return `${path}${join}org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`;
   }
 
-  async getSessionAuthority(
-    preferred: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<SessionAuthority> {
+  async getSessionAuthority(preferred: AuthScope = this.activeScope, signal?: AbortSignal): Promise<SessionAuthority> {
     const preferredScope = this.scopeSnapshot(preferred);
     if (this.forceDemo) {
       const scope: EffectiveProjectScope = {
@@ -818,10 +846,7 @@ export class EyvanApiClient {
     return computeOverview(workloads, cells, budgets, queueTrend);
   }
 
-  async getQueueTrend(
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<OverviewData["queueTrend"]> {
+  async getQueueTrend(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<OverviewData["queueTrend"]> {
     if (this.forceDemo) return [];
     const requestScope = this.scopeSnapshot(scope);
     // Seven explicit 24-hour buckets match the seven chart columns. These are
@@ -852,27 +877,30 @@ export class EyvanApiClient {
           })
         ).map(mapWorkload);
     const search = filters.search?.toLowerCase();
-    return workloads
-      .filter((workload) =>
-        (!search || workload.name.toLowerCase().includes(search) || workload.id.toLowerCase().includes(search) || workload.user.toLowerCase().includes(search)) &&
-        (!filters.status || workload.status === filters.status) &&
-        (!filters.priority || workload.priority === filters.priority))
-      // Newest first. The control plane returns insertion order, so a fleet that
-      // has run for a while buried the job you just submitted under every job
-      // you had ever submitted -- and the one you want is almost always the last
-      // one. Ties break on id so the order is stable across polls rather than
-      // shuffling under the reader.
-      .sort((left, right) => {
-        const delta = Date.parse(right.submittedAt) - Date.parse(left.submittedAt);
-        return delta !== 0 && Number.isFinite(delta) ? delta : right.id.localeCompare(left.id);
-      });
+    return (
+      workloads
+        .filter(
+          (workload) =>
+            (!search ||
+              workload.name.toLowerCase().includes(search) ||
+              workload.id.toLowerCase().includes(search) ||
+              workload.user.toLowerCase().includes(search)) &&
+            (!filters.status || workload.status === filters.status) &&
+            (!filters.priority || workload.priority === filters.priority),
+        )
+        // Newest first. The control plane returns insertion order, so a fleet that
+        // has run for a while buried the job you just submitted under every job
+        // you had ever submitted -- and the one you want is almost always the last
+        // one. Ties break on id so the order is stable across polls rather than
+        // shuffling under the reader.
+        .sort((left, right) => {
+          const delta = Date.parse(right.submittedAt) - Date.parse(left.submittedAt);
+          return delta !== 0 && Number.isFinite(delta) ? delta : right.id.localeCompare(left.id);
+        })
+    );
   }
 
-  async getWorkload(
-    id: string,
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<WorkloadDetail> {
+  async getWorkload(id: string, scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<WorkloadDetail> {
     // Capture the caller's UI scope before the first await. The resource route
     // resolves its own immutable scope server-side; the snapshot fences this
     // composition from a later project-switch mutating the active client.
@@ -893,10 +921,12 @@ export class EyvanApiClient {
       // Also best-effort. The timeline is context; losing it should cost the
       // timeline, not the page.
       this.request<RawEvent[]>(
-        this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`, workloadScope), {
-        method: "GET",
-        signal,
-      }).catch((error: unknown) => {
+        this.scope(`/events?entity_type=workload&entity_id=${encodeURIComponent(id)}`, workloadScope),
+        {
+          method: "GET",
+          signal,
+        },
+      ).catch((error: unknown) => {
         if (signal?.aborted) throw error;
         return [] as RawEvent[];
       }),
@@ -915,14 +945,20 @@ export class EyvanApiClient {
       this.request<RawWorkloadProgress>(`/workloads/${encodeURIComponent(id)}/progress`, {
         method: "GET",
         signal,
-      }).catch((error: unknown) => { if (signal?.aborted) throw error; return undefined; }),
+      }).catch((error: unknown) => {
+        if (signal?.aborted) throw error;
+        return undefined;
+      }),
       // Allocation comes from this workload's own leases. It used to be hardcoded
       // to [], so the panel rendered nothing against a live server while the mock
       // data populated it — the page looked implemented and was not.
-      this.request<RawLease[]>(
-        this.scope(`/leases?workload_id=${encodeURIComponent(id)}`, workloadScope),
-        { method: "GET", signal },
-      ).catch((error: unknown) => { if (signal?.aborted) throw error; return []; }),
+      this.request<RawLease[]>(this.scope(`/leases?workload_id=${encodeURIComponent(id)}`, workloadScope), {
+        method: "GET",
+        signal,
+      }).catch((error: unknown) => {
+        if (signal?.aborted) throw error;
+        return [];
+      }),
     ]);
     detail.allocation = leases.map((lease) => ({
       host: lease.cell_id,
@@ -933,8 +969,7 @@ export class EyvanApiClient {
     detail.timeline = events.map((event): TimelineEvent => {
       const payload = (event as { payload?: Record<string, unknown> }).payload ?? {};
       const elapsed = payload["dispatch_elapsed_s"];
-      const stage =
-        typeof elapsed === "number" ? `dispatch took ${elapsed < 1 ? "<1" : Math.round(elapsed)}s` : "";
+      const stage = typeof elapsed === "number" ? `dispatch took ${elapsed < 1 ? "<1" : Math.round(elapsed)}s` : "";
       return {
         id: event.id,
         timestamp: event.timestamp,
@@ -944,7 +979,10 @@ export class EyvanApiClient {
         actor: event.actor,
       };
     });
-    detail.logs = logs.split("\n").filter(Boolean).map((line, index): LogEntry => ({ id: `${id}-log-${index}`, ...parseLogLine(line) }));
+    detail.logs = logs
+      .split("\n")
+      .filter(Boolean)
+      .map((line, index): LogEntry => ({ id: `${id}-log-${index}`, ...parseLogLine(line) }));
     if (progress) {
       detail.progress = mapProgressPercent(progress);
       detail.queueReason ??= progress.failure_reason ?? progress.scheduling_reason ?? undefined;
@@ -980,11 +1018,7 @@ export class EyvanApiClient {
    * be limited to fleet administrators. It is authorized as a read of the
    * workload, which is the permission the question implies.
    */
-  async getWorkloadCost(
-    id: string,
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<WorkloadSpend> {
+  async getWorkloadCost(id: string, scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<WorkloadSpend> {
     void this.scopeSnapshot(scope);
     const raw = await this.request<RawWorkloadSpend>(`/workloads/${encodeURIComponent(id)}/cost`, { signal });
     return {
@@ -1026,10 +1060,7 @@ export class EyvanApiClient {
    * the warm floor -- undoing the fix that put it there.
    */
   /** Provisioning latency per pool, from the samples the scheduler ranks on. */
-  async getLaunchLatency(
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<LaunchLatencyReport> {
+  async getLaunchLatency(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<LaunchLatencyReport> {
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<LaunchLatencyReport>("/capacity/launch-latency", { signal });
@@ -1113,6 +1144,11 @@ export class EyvanApiClient {
           zone: cell.zone ?? "-",
           status: cellStatus(cell.state),
           state: cell.state,
+          // Surfaced where the fleet page decides something needs attention:
+          // the code names the class of problem, the detail carries the
+          // provider's own words, so the page answers "why" without a log.
+          unavailableReason: cell.unavailable_reason ?? undefined,
+          unavailableDetail: cell.unavailable_detail ?? undefined,
           availability: cell.availability
             ? {
                 cooldownUntil: cell.availability.cooldown_until ?? undefined,
@@ -1245,10 +1281,7 @@ export class EyvanApiClient {
     }));
   }
 
-  async listPolicies(
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<SchedulingPolicy[]> {
+  async listPolicies(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<SchedulingPolicy[]> {
     if (this.forceDemo) return cloneMock(mockPolicies);
     const requestScope = this.scopeSnapshot(scope);
     try {
@@ -1304,16 +1337,12 @@ export class EyvanApiClient {
    * choices -- a hard-coded list of accelerator types is a list of shapes some
    * other fleet had.
    */
-  async listAvailableShapes(
-    scope: AuthScope = this.activeScope,
-    signal?: AbortSignal,
-  ): Promise<AvailableShape[]> {
+  async listAvailableShapes(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<AvailableShape[]> {
     if (this.forceDemo) return cloneMock(mockAvailableShapes);
     const requestScope = this.scopeSnapshot(scope);
-    const payload = await this.request<{ pools: RawAvailablePool[] }>(
-      this.scope("/capacity", requestScope),
-      { signal },
-    );
+    const payload = await this.request<{ pools: RawAvailablePool[] }>(this.scope("/capacity", requestScope), {
+      signal,
+    });
     return payload.pools
       .filter((pool) => pool.enabled)
       .map((pool) => ({
@@ -1528,7 +1557,6 @@ export class EyvanApiClient {
     }
     return mapPolicy(raw);
   }
-
 }
 
 export const apiClient = new EyvanApiClient();

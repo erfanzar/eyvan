@@ -179,8 +179,7 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     listLeases: vi.fn(async () => mockLeases.slice(0, 1)),
     listBudgets: vi.fn(async () => mockBudgets.slice(0, 1)),
     listPolicies: vi.fn(
-      overrides.listPolicies ??
-        (async (scope) => [policyFor(scope ?? { orgId: "acme", projectId: "research" })]),
+      overrides.listPolicies ?? (async (scope) => [policyFor(scope ?? { orgId: "acme", projectId: "research" })]),
     ),
     getQueueTrend: vi.fn(async () => [{ label: "10:00", submitted: 1, admitted: 1 }]),
     listCells: vi.fn(async () => mockCells.slice(0, 1)),
@@ -191,11 +190,7 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     listAuditEvents: vi.fn(async () => mockAuditEvents.slice(0, 1)),
     followEvents: vi.fn(
       overrides.followEvents ??
-        (async (
-          onEvent: () => void,
-          signal: AbortSignal,
-          onConnectionChange?: (connected: boolean) => void,
-        ) => {
+        (async (onEvent: () => void, signal: AbortSignal, onConnectionChange?: (connected: boolean) => void) => {
           streamCallbacks.push(onEvent);
           onConnectionChange?.(true);
           await new Promise<void>((resolve) => {
@@ -298,6 +293,18 @@ afterEach(() => {
 });
 
 describe("App composes server session authority", () => {
+  it("offers sign-out for a server-resolved OIDC identity without browser tokens", async () => {
+    vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://issuer.example.com");
+    vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "dashboard");
+    try {
+      const { client } = fakeClient(authority("project_viewer"));
+      render(<App client={client} identityProvider={() => undefined} />);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Sign out Alice" })).toBeTruthy());
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it.each([
     ["project_viewer", false, false, false],
     ["project_submitter", true, false, false],
@@ -305,35 +312,32 @@ describe("App composes server session authority", () => {
     ["project_admin", true, true, false],
     ["org_admin", true, true, false],
     ["fleet_admin", true, true, true],
-  ])(
-    "renders real panels and actions for %s",
-    async (role, canSubmit, canManageProject, canManageFleet) => {
-      const { client } = fakeClient(authority(role));
-      renderApp(client);
+  ])("renders real panels and actions for %s", async (role, canSubmit, canManageProject, canManageFleet) => {
+    const { client } = fakeClient(authority(role));
+    renderApp(client);
 
-      await waitFor(() => expect(screen.getByRole("heading", { name: "Operations overview" })).toBeDefined());
-      expect(screen.queryByRole("button", { name: "Submit workload" }) !== null).toBe(canSubmit);
-      expect(screen.queryByRole("button", { name: "Fleet" }) !== null).toBe(canManageFleet);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Operations overview" })).toBeDefined());
+    expect(screen.queryByRole("button", { name: "Submit workload" }) !== null).toBe(canSubmit);
+    expect(screen.queryByRole("button", { name: "Fleet" }) !== null).toBe(canManageFleet);
 
-      await showPanel("Workloads");
-      expect(screen.queryByRole("button", { name: "New workload" }) !== null).toBe(canSubmit);
+    await showPanel("Workloads");
+    expect(screen.queryByRole("button", { name: "New workload" }) !== null).toBe(canSubmit);
 
-      if (role !== "project_submitter") {
-        await showPanel("Budgets & policies");
-        expect(screen.queryAllByRole("checkbox").length > 0).toBe(canManageProject);
-        await showPanel("Audit events");
-        expect(screen.getByText(mockAuditEvents[0].action)).toBeDefined();
-      }
+    if (role !== "project_submitter") {
+      await showPanel("Budgets & policies");
+      expect(screen.queryAllByRole("checkbox").length > 0).toBe(canManageProject);
+      await showPanel("Audit events");
+      expect(screen.getByText(mockAuditEvents[0].action)).toBeDefined();
+    }
 
-      if (canManageFleet) {
-        await showPanel("Fleet");
-        expect(screen.getByText("Fleet topology")).toBeDefined();
-      }
-      // Quota is resolved from capacity pool records, so it is gated by the
-      // authority that can read them and never offered to anyone else.
-      expect(screen.queryByRole("button", { name: "Quota & capacity" }) !== null).toBe(canManageFleet);
-    },
-  );
+    if (canManageFleet) {
+      await showPanel("Fleet");
+      expect(screen.getByText("Fleet topology")).toBeDefined();
+    }
+    // Quota is resolved from capacity pool records, so it is gated by the
+    // authority that can read them and never offered to anyone else.
+    expect(screen.queryByRole("button", { name: "Quota & capacity" }) !== null).toBe(canManageFleet);
+  });
 
   it("answers where a slice fits, and never shows an unmeasured zone as empty", async () => {
     const { client, calls } = fakeClient(authority("fleet_admin"));
@@ -466,10 +470,7 @@ describe("App scope and authority race guards", () => {
     const b = { orgId: "acme", projectId: "platform" };
     const sessions = [
       authority("project_operator", [effectiveScope("project_operator", a)]),
-      authority("project_viewer", [
-        effectiveScope("project_viewer", a),
-        effectiveScope("project_operator", b),
-      ]),
+      authority("project_viewer", [effectiveScope("project_viewer", a), effectiveScope("project_operator", b)]),
       authority("project_operator", [effectiveScope("project_operator", b)]),
     ];
     let index = 0;
@@ -496,10 +497,7 @@ describe("App scope and authority race guards", () => {
     const a = { orgId: "acme", projectId: "research" };
     const b = { orgId: "other", projectId: "platform" };
     const sessions = [
-      authority("project_operator", [
-        effectiveScope("project_operator", a),
-        effectiveScope("project_operator", b),
-      ]),
+      authority("project_operator", [effectiveScope("project_operator", a), effectiveScope("project_operator", b)]),
       authority("project_operator", [effectiveScope("project_operator", b)]),
     ];
     let sessionCall = 0;
@@ -546,10 +544,7 @@ describe("App scope and authority race guards", () => {
     const a = { orgId: "acme", projectId: "research" };
     const b = { orgId: "other", projectId: "research" };
     const sessions = [
-      authority("project_operator", [
-        effectiveScope("project_operator", a),
-        effectiveScope("project_operator", b),
-      ]),
+      authority("project_operator", [effectiveScope("project_operator", a), effectiveScope("project_operator", b)]),
       authority("project_operator", [effectiveScope("project_operator", b)]),
     ];
     const pending = deferred<WorkloadDetail>();

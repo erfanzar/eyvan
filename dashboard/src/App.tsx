@@ -11,6 +11,7 @@ import {
   capabilitiesForPermissions,
   configuredScope,
   currentIdentity,
+  isOidcConfigured,
   logout,
   NO_AUTH_CAPABILITIES,
   type AuthCapabilities,
@@ -30,14 +31,7 @@ import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
-import {
-  accessibleRoute,
-  navigate,
-  parseRoute,
-  type Route,
-  type Section,
-  type SectionAvailability,
-} from "./routing";
+import { accessibleRoute, navigate, parseRoute, type Route, type Section, type SectionAvailability } from "./routing";
 import type {
   AvailableShape,
   DashboardData,
@@ -84,9 +78,7 @@ export async function loadDashboardData(
   const healthPromise = client.getHealth(signal);
   if (!authority.canRead) {
     const health = await healthPromise;
-    const cells = authority.canManageFleet
-      ? await client.listCells([], immutableScope, signal)
-      : [];
+    const cells = authority.canManageFleet ? await client.listCells([], immutableScope, signal) : [];
     return {
       health,
       overview: computeOverview([], cells, [], []),
@@ -111,9 +103,7 @@ export async function loadDashboardData(
     client.getQueueTrend(immutableScope, signal),
     client.listAuditEvents(immutableScope, signal),
   ]);
-  const cells = authority.canManageFleet
-    ? await client.listCells(leases, immutableScope, signal)
-    : [];
+  const cells = authority.canManageFleet ? await client.listCells(leases, immutableScope, signal) : [];
   return {
     health,
     overview: computeOverview(workloads, cells, budgets, queueTrend),
@@ -254,8 +244,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     loading: boolean;
     error: string | null;
   }>({ shapes: [], loading: false, error: null });
-  const [submissionAcknowledgement, setSubmissionAcknowledgement] =
-    useState<SubmissionAcknowledgement | null>(null);
+  const [submissionAcknowledgement, setSubmissionAcknowledgement] = useState<SubmissionAcknowledgement | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null);
   const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
@@ -395,11 +384,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
         if (!session || !selected || !data || !currentRequest()) return false;
 
         const previous = snapshotRef.current;
-        const scopeChanged =
-          previous.selectedScope === null || scopeKey(previous.selectedScope) !== scopeKey(selected);
+        const scopeChanged = previous.selectedScope === null || scopeKey(previous.selectedScope) !== scopeKey(selected);
         const authorityChanged =
-          previous.authority === null ||
-          authorityFingerprint(previous.authority) !== authorityFingerprint(session);
+          previous.authority === null || authorityFingerprint(previous.authority) !== authorityFingerprint(session);
         if (scopeChanged || authorityChanged) {
           const pendingDetailFailure = detailFailureRef.current;
           const preserveDetailFailure =
@@ -428,8 +415,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
       } catch (loadError) {
         if (!currentRequest()) return false;
         const message = loadError instanceof Error ? loadError.message : "Unexpected dashboard error";
-        const authorizationFailure =
-          sawForbidden || (loadError instanceof ApiError && loadError.status === 403);
+        const authorizationFailure = sawForbidden || (loadError instanceof ApiError && loadError.status === 403);
         if (authorizationFailure) {
           // A stale data snapshot is acceptable during a transient outage, but
           // stale authority is not acceptable after an explicit denial.
@@ -444,13 +430,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
         return false;
       }
     },
-    [
-      client,
-      closeSubmitInteraction,
-      fencePresentationAuthority,
-      invalidateScopeOperations,
-      updateDetailFailure,
-    ],
+    [client, closeSubmitInteraction, fencePresentationAuthority, invalidateScopeOperations, updateDetailFailure],
   );
 
   const refreshAuthorityAfterForbidden = useCallback(
@@ -515,11 +495,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
         // to infer that authority.
         const resourceAuthority = await client.getSessionAuthority(workloadScope, controller.signal);
         if (!currentRequest()) return;
-        const permissions = permissionsForResource(
-          resourceAuthority,
-          workloadScope.orgId,
-          workloadScope.projectId,
-        );
+        const permissions = permissionsForResource(resourceAuthority, workloadScope.orgId, workloadScope.projectId);
         if (!permissions.includes("read")) throw new ApiError("Workload detail is no longer readable", 403);
         setDetailAuthority(resourceAuthority);
         setSelectedWorkload(workload);
@@ -598,18 +574,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
           // promise rejections in the hook. An obsolete scope's stream cannot
           // revoke the newly selected scope while its abort is racing the error.
           const latest = snapshotRef.current.selectedScope;
-          const relevant =
-            !signal.aborted && latest !== null && scopeKey(latest) === scopeKey(immutableScope);
+          const relevant = !signal.aborted && latest !== null && scopeKey(latest) === scopeKey(immutableScope);
           await refreshAuthorityAfterForbidden(streamError, relevant);
         });
     },
-    [
-      canReadSelectedScope,
-      client,
-      refreshAuthorityAfterForbidden,
-      selectedOrgId,
-      selectedProjectId,
-    ],
+    [canReadSelectedScope, client, refreshAuthorityAfterForbidden, selectedOrgId, selectedProjectId],
   );
   const live = useLiveRefresh({
     subscribe,
@@ -634,9 +603,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
   // detail loader and accidentally issue get/explain/poll reads. An already
   // typed denial is inert and may remain visible without mounting those reads.
   const activeRoute: Route =
-    "workloadId" in routed &&
-    !hasAnyRead(authority) &&
-    detailFailure?.workloadId !== routed.workloadId
+    "workloadId" in routed && !hasAnyRead(authority) && detailFailure?.workloadId !== routed.workloadId
       ? { section: "workloads" }
       : routed;
   const routeDetailId = "workloadId" in route ? route.workloadId : undefined;
@@ -780,14 +747,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
       immutableScope.orgId,
       immutableScope.projectId,
     );
-    if (!currentCapabilities.submitWorkloads) throw new ApiError("This scope does not accept workload submissions", 403);
+    if (!currentCapabilities.submitWorkloads)
+      throw new ApiError("This scope does not accept workload submissions", 403);
     const epoch = interaction.epoch;
     try {
-      const workload = await client.submitWorkload(
-        input,
-        immutableScope,
-        scopeOperationAbortRef.current.signal,
-      );
+      const workload = await client.submitWorkload(input, immutableScope, scopeOperationAbortRef.current.signal);
       if (!mutationIsCurrent(epoch, immutableScope)) return workload;
       const readable = permissionsForResource(
         current.authority,
@@ -800,10 +764,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
           data: latest.data
             ? {
                 ...latest.data,
-                workloads: [
-                  workload,
-                  ...latest.data.workloads.filter((item) => item.id !== workload.id),
-                ],
+                workloads: [workload, ...latest.data.workloads.filter((item) => item.id !== workload.id)],
               }
             : latest.data,
         }));
@@ -874,21 +835,14 @@ export default function App({ client = apiClient, identityProvider = currentIden
     try {
       // Both path components come from the selected immutable scope. policy.scope
       // is display data and can collide across organizations.
-      const updated = await client.updatePolicy(
-        policy,
-        enabled,
-        immutableScope,
-        scopeOperationAbortRef.current.signal,
-      );
+      const updated = await client.updatePolicy(policy, enabled, immutableScope, scopeOperationAbortRef.current.signal);
       if (mutationIsCurrent(epoch, immutableScope)) {
         updateSnapshot((latest) => ({
           ...latest,
           data: latest.data
             ? {
                 ...latest.data,
-                policies: latest.data.policies.map((item) =>
-                  item.id === updated.id ? updated : item,
-                ),
+                policies: latest.data.policies.map((item) => (item.id === updated.id ? updated : item)),
               }
             : latest.data,
         }));
@@ -934,9 +888,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
           data: latest.data
             ? {
                 ...latest.data,
-                workloads: latest.data.workloads.map((item) =>
-                  item.id === updated.id ? updated : item,
-                ),
+                workloads: latest.data.workloads.map((item) => (item.id === updated.id ? updated : item)),
               }
             : latest.data,
         }));
@@ -949,10 +901,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
       await refreshAuthorityAfterForbidden(operationError, relevant);
       if (mutationIsCurrent(epoch, selectedScopeSnapshot) && detailRouteIdRef.current === workload.id) {
         setToast({
-          message:
-            operationError instanceof Error
-              ? operationError.message
-              : `Unable to ${action} workload`,
+          message: operationError instanceof Error ? operationError.message : `Unable to ${action} workload`,
           error: true,
         });
       }
@@ -997,7 +946,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
     [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
   );
   const loadCost = useCallback(
-    (id: string, signal: AbortSignal) => withAuthorityRefresh(() => client.getWorkloadCost(id, explanationScope, signal)),
+    (id: string, signal: AbortSignal) =>
+      withAuthorityRefresh(() => client.getWorkloadCost(id, explanationScope, signal)),
     [client, explanationScope.orgId, explanationScope.projectId, withAuthorityRefresh],
   );
   const loadCapacityEvents = useCallback(
@@ -1025,14 +975,14 @@ export default function App({ client = apiClient, identityProvider = currentIden
   // not run -- above a Sign out button for a session there is nothing to sign
   // out of. The authority response already carries the subject; use it.
   //
-  // `development` is the honest mode: this is the loopback development path,
-  // and it is also the mode that suppresses the sign-out control.
+  // Both loopback development and HttpOnly OIDC sessions have no browser
+  // token. Only the former should suppress the sign-out control.
   const serverIdentity: AuthIdentity | undefined =
     !browserIdentity && authority?.subject
       ? {
           displayName: authority.displayName ?? authority.subject,
           detail: "",
-          mode: "development",
+          mode: isOidcConfigured() ? "oidc" : "development",
           roles: [],
           scope: configuredScope(),
           capabilities,
@@ -1059,12 +1009,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
 
   let content: ReactNode;
   if (error) {
-    content = (
-      <ErrorState
-        message={error}
-        onRetry={() => void refreshDashboard(desiredScopeRef.current)}
-      />
-    );
+    content = <ErrorState message={error} onRetry={() => void refreshDashboard(desiredScopeRef.current)} />;
   } else if (!data) {
     content = <LoadingState />;
   } else if ("workloadId" in activeRoute) {
@@ -1207,9 +1152,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
               <CheckCircle2 size={18} aria-hidden="true" />
               <span>
                 <strong>Workload submitted</strong>
-                {submissionAcknowledgement.name} ({submissionAcknowledgement.id}) was accepted for {" "}
-                {submissionAcknowledgement.orgId}/{submissionAcknowledgement.projectId}. This role cannot read
-                workload detail.
+                {submissionAcknowledgement.name} ({submissionAcknowledgement.id}) was accepted for{" "}
+                {submissionAcknowledgement.orgId}/{submissionAcknowledgement.projectId}. This role cannot read workload
+                detail.
               </span>
               <button
                 className="icon-button icon-button-small"
@@ -1241,11 +1186,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
         )}
       {toast && (
         <div className={`toast ${toast.error ? "toast-error" : ""}`} role={toast.error ? "alert" : "status"}>
-          {toast.error ? (
-            <AlertTriangle size={17} aria-hidden="true" />
-          ) : (
-            <CheckCircle2 size={17} aria-hidden="true" />
-          )}
+          {toast.error ? <AlertTriangle size={17} aria-hidden="true" /> : <CheckCircle2 size={17} aria-hidden="true" />}
           <span>{toast.message}</span>
           <button
             className="icon-button icon-button-small"

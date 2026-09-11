@@ -12,9 +12,23 @@ describe("summarizeShapes", () => {
     // The regression: shapes sort by generation, so "first three and a count"
     // rendered a fleet's whole v6e half as part of "+14 more".
     const fleet = [
-      "v5p-16", "v5p-32", "v5p-64", "v5p-128", "v5p-256", "v5p-384",
-      "v5p-512", "v5p-640", "v5p-768", "v5p-896", "v5p-1024",
-      "v6e-8", "v6e-16", "v6e-32", "v6e-64", "v6e-128", "v6e-256",
+      "v5p-16",
+      "v5p-32",
+      "v5p-64",
+      "v5p-128",
+      "v5p-256",
+      "v5p-384",
+      "v5p-512",
+      "v5p-640",
+      "v5p-768",
+      "v5p-896",
+      "v5p-1024",
+      "v6e-8",
+      "v6e-16",
+      "v6e-32",
+      "v6e-64",
+      "v6e-128",
+      "v6e-256",
     ];
     const summary = summarizeShapes(fleet);
     expect(summary).toBe("v5p 16-1024, v6e 8-256");

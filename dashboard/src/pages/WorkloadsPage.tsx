@@ -164,11 +164,7 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                     // else did nothing at all. The button stays for keyboard
                     // and screen-reader users, and stops the event so one click
                     // is one navigation.
-                    <tr
-                      key={workload.id}
-                      className="row-clickable"
-                      onClick={() => onOpenWorkload(workload.id)}
-                    >
+                    <tr key={workload.id} className="row-clickable" onClick={() => onOpenWorkload(workload.id)}>
                       <td>
                         <button
                           className="table-primary-link"
@@ -179,14 +175,22 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                           }}
                         >
                           <strong>{workload.name}</strong>
-                          <span>{workload.id} · {workload.project} · {workload.user}</span>
+                          <span>
+                            {workload.id} · {workload.project} · {workload.user}
+                          </span>
                         </button>
                       </td>
                       <td>
                         <StatusBadge value={workload.status} tone={workload.status} />
-                        {workload.queueReason && <small className="cell-note" title={workload.queueReason}>{workload.queueReason}</small>}
+                        {workload.queueReason && (
+                          <small className="cell-note" title={workload.queueReason}>
+                            {workload.queueReason}
+                          </small>
+                        )}
                       </td>
-                      <td><StatusBadge value={workload.priority} tone={workload.priority} dot={false} /></td>
+                      <td>
+                        <StatusBadge value={workload.priority} tone={workload.priority} dot={false} />
+                      </td>
                       <td>
                         <span className="resource-cell">
                           <strong className="monospace">
@@ -239,7 +243,9 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                           <span className="muted">Not tracked</span>
                         )}
                       </td>
-                      <td><span className="nowrap">{formatDateTime(workload.submittedAt)}</span></td>
+                      <td>
+                        <span className="nowrap">{formatDateTime(workload.submittedAt)}</span>
+                      </td>
                     </tr>
                   );
                 })}
@@ -248,7 +254,9 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
           </div>
         )}
         <div className="table-footer">
-          <span>Showing {filtered.length} of {workloads.length} workloads</span>
+          <span>
+            Showing {filtered.length} of {workloads.length} workloads
+          </span>
           <span>State refreshed from durable scheduler history</span>
         </div>
       </section>

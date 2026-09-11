@@ -107,7 +107,13 @@ export function ConfirmDialog({
   return (
     <div className="modal-layer" role="presentation">
       <button className="modal-scrim" type="button" onClick={onCancel} aria-label={`Close ${title} dialog`} />
-      <div className="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="confirm-title" ref={dialogRef}>
+      <div
+        className="modal modal-narrow"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-title"
+        ref={dialogRef}
+      >
         <div className="modal-header">
           <div>
             <h2 id="confirm-title">{title}</h2>

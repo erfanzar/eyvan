@@ -172,7 +172,6 @@ function formatWaited(createdIso: string): string {
   return `${rest}s`;
 }
 
-
 /** On-package HBM per chip, by generation prefix (v6e Trillium = 32 GB). */
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "completed"]);
 
@@ -320,25 +319,24 @@ export function WorkloadDetailPage({
 
   const shownLogs = following ? followed.entries : workload.logs;
   // Identical lines printed by every rank say one thing N times. Collapse
-    // each consecutive run to one row carrying an xN badge -- except rank-
-    // specific lines, which differ by construction and stay separate.
-    const collapsedLogs: typeof workload.logs = [];
-    for (const entry of workload.logs) {
-      const previous = collapsedLogs[collapsedLogs.length - 1];
-      if (
-        previous &&
-        previous.message === entry.message &&
-        previous.level === entry.level &&
-        !previous.source &&
-        !entry.source
-      ) {
-        previous.repeat = (previous.repeat ?? 1) + 1;
-        continue;
-      }
-      collapsedLogs.push({ ...entry });
+  // each consecutive run to one row carrying an xN badge -- except rank-
+  // specific lines, which differ by construction and stay separate.
+  const collapsedLogs: typeof workload.logs = [];
+  for (const entry of workload.logs) {
+    const previous = collapsedLogs[collapsedLogs.length - 1];
+    if (
+      previous &&
+      previous.message === entry.message &&
+      previous.level === entry.level &&
+      !previous.source &&
+      !entry.source
+    ) {
+      previous.repeat = (previous.repeat ?? 1) + 1;
+      continue;
     }
-const filteredLogs = useMemo(() => {
-    const source = collapsedLogs;
+    collapsedLogs.push({ ...entry });
+  }
+  const filteredLogs = useMemo(() => {
     const query = logQuery.trim().toLowerCase();
     return shownLogs.filter(
       (log) =>
@@ -367,7 +365,13 @@ const filteredLogs = useMemo(() => {
     <div className="page-stack">
       <div className="detail-heading">
         <div className="detail-title-row">
-          <button className="icon-button icon-button-bordered" type="button" onClick={onBack} aria-label="Back to workloads" title="Back to workloads">
+          <button
+            className="icon-button icon-button-bordered"
+            type="button"
+            onClick={onBack}
+            aria-label="Back to workloads"
+            title="Back to workloads"
+          >
             <ArrowLeft size={15} />
           </button>
           <div>
@@ -466,7 +470,11 @@ const filteredLogs = useMemo(() => {
             className={tab === item ? "tab-active" : ""}
             onClick={() => setTab(item)}
           >
-            {item === "overview" ? "Overview" : item === "timeline" ? `Timeline (${workload.timeline.length})` : `Logs (${workload.logs.length})`}
+            {item === "overview"
+              ? "Overview"
+              : item === "timeline"
+                ? `Timeline (${workload.timeline.length})`
+                : `Logs (${workload.logs.length})`}
           </button>
         ))}
       </div>
@@ -474,28 +482,84 @@ const filteredLogs = useMemo(() => {
       {tab === "overview" && (
         <div className="detail-overview-grid">
           <section className="panel detail-section">
-            <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Admission envelope</h2><p>What this shape occupies on a cell</p></div></div>
+            <div className="panel-header">
+              <Server size={15} aria-hidden="true" />
+              <div>
+                <h2>Admission envelope</h2>
+                <p>What this shape occupies on a cell</p>
+              </div>
+            </div>
             <dl className="definition-grid">
-              <div><dt>Request</dt><dd className="monospace">{formatAcceleratorRequest(workload.resources.accelerator, workload.resources.acceleratorCount, workload.resources.replicas)}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices} replicas` : ""}</dd></div>
+              <div>
+                <dt>Request</dt>
+                <dd className="monospace">
+                  {formatAcceleratorRequest(
+                    workload.resources.accelerator,
+                    workload.resources.acceleratorCount,
+                    workload.resources.replicas,
+                  )}
+                  {workload.resources.slices && workload.resources.slices > 1
+                    ? ` × ${workload.resources.slices} replicas`
+                    : ""}
+                </dd>
+              </div>
               {/* These are the VM host's DIMMs, not the accelerators' HBM --
                   conflating them sent an operator hunting for phantom memory. */}
-              <div><dt>Host vCPUs</dt><dd>{workload.resources.cpu}{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
-              <div><dt>Host RAM</dt><dd>{workload.resources.memoryGb} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+              <div>
+                <dt>Host vCPUs</dt>
+                <dd>
+                  {workload.resources.cpu}
+                  {workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}
+                </dd>
+              </div>
+              <div>
+                <dt>Host RAM</dt>
+                <dd>
+                  {workload.resources.memoryGb} GB
+                  {workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}
+                </dd>
+              </div>
               {workload.resources.accelerator && (
-                <div><dt>Accelerator HBM</dt><dd>{hbmGb(workload.resources.accelerator)} GB{workload.resources.slices && workload.resources.slices > 1 ? ` × ${workload.resources.slices}` : ""}</dd></div>
+                <div>
+                  <dt>Accelerator HBM</dt>
+                  <dd>
+                    {hbmGb(workload.resources.accelerator)} GB
+                    {workload.resources.slices && workload.resources.slices > 1
+                      ? ` × ${workload.resources.slices}`
+                      : ""}
+                  </dd>
+                </div>
               )}
-              <div><dt>Topology</dt><dd className="monospace">{workload.resources.topology ?? "No strict constraint"}</dd></div>
-              <div><dt>Priority</dt><dd>{workload.priority}</dd></div>
+              <div>
+                <dt>Topology</dt>
+                <dd className="monospace">{workload.resources.topology ?? "No strict constraint"}</dd>
+              </div>
+              <div>
+                <dt>Priority</dt>
+                <dd>{workload.priority}</dd>
+              </div>
               {/* Facts the header used to carry in a metric strip. They belong
                   beside the shape they qualify, not in a band of five tiles
                   repeating what the panels below already say. */}
-              <div><dt>Submitted</dt><dd>{formatDateTime(workload.submittedAt)}</dd></div>
-              <div><dt>Placement</dt><dd className="monospace">{
-                workload.cell
-                  ?? (["succeeded", "failed", "cancelled"].includes(workload.status) ? "Released" : "Pending")
-              }</dd></div>
-              <div><dt>Progress</dt><dd>{workload.progress === undefined ? "—" : `${workload.progress}%`}</dd></div>
-              <div><dt>Capacity lease</dt><dd className="monospace">{workload.leaseId ?? "None held"}</dd></div>
+              <div>
+                <dt>Submitted</dt>
+                <dd>{formatDateTime(workload.submittedAt)}</dd>
+              </div>
+              <div>
+                <dt>Placement</dt>
+                <dd className="monospace">
+                  {workload.cell ??
+                    (["succeeded", "failed", "cancelled"].includes(workload.status) ? "Released" : "Pending")}
+                </dd>
+              </div>
+              <div>
+                <dt>Progress</dt>
+                <dd>{workload.progress === undefined ? "—" : `${workload.progress}%`}</dd>
+              </div>
+              <div>
+                <dt>Capacity lease</dt>
+                <dd className="monospace">{workload.leaseId ?? "None held"}</dd>
+              </div>
             </dl>
           </section>
 
@@ -503,58 +567,128 @@ const filteredLogs = useMemo(() => {
               why a finished run is not placed invites "0 cells considered"
               nonsense, so settled runs skip the panel entirely. */}
           {!TERMINAL_STATUSES.has(workload.status) && (
-          <section className="panel detail-section">
-            <div className="panel-header"><Server size={15} aria-hidden="true" /><div><h2>Placement verdict</h2><p>Why the scheduler did or did not place this</p></div></div>
-            {explainError && <div className="resource-row-detail"><span>{explainError}</span></div>}
-            {!explainError && !explanation && <div className="resource-row-detail"><span>Asking the scheduler…</span></div>}
-            {explanation && (
-              <dl className="definition-grid">
-                <div><dt>Placeable</dt><dd className={explanation.placeable ? "" : "text-critical"}>{explanation.placeable ? "Yes" : "No"}</dd></div>
-                <div><dt>Reason</dt><dd>{explanation.message ?? explanation.scheduling_reason ?? "None reported"}</dd></div>
-                <div><dt>Cells considered</dt><dd>{explanation.considered_cell_count}</dd></div>
-                {/* The field that separates "waiting for capacity" from "can
+            <section className="panel detail-section">
+              <div className="panel-header">
+                <Server size={15} aria-hidden="true" />
+                <div>
+                  <h2>Placement verdict</h2>
+                  <p>Why the scheduler did or did not place this</p>
+                </div>
+              </div>
+              {explainError && (
+                <div className="resource-row-detail">
+                  <span>{explainError}</span>
+                </div>
+              )}
+              {!explainError && !explanation && (
+                <div className="resource-row-detail">
+                  <span>Asking the scheduler…</span>
+                </div>
+              )}
+              {explanation && (
+                <dl className="definition-grid">
+                  <div>
+                    <dt>Placeable</dt>
+                    <dd className={explanation.placeable ? "" : "text-critical"}>
+                      {explanation.placeable ? "Yes" : "No"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Reason</dt>
+                    <dd>{explanation.message ?? explanation.scheduling_reason ?? "None reported"}</dd>
+                  </div>
+                  <div>
+                    <dt>Cells considered</dt>
+                    <dd>{explanation.considered_cell_count}</dd>
+                  </div>
+                  {/* The field that separates "waiting for capacity" from "can
                     never be placed". Both report the same code, and only one is
                     a problem. */}
-                <div><dt>Being provisioned</dt><dd>{explanation.provisioning_cell_ids.length || "None"}</dd></div>
-                {explanation.cells.slice(0, 4).map((cell) => (
-                  <div key={cell.cell_id}><dt className="monospace">{cell.cell_id}</dt><dd>{cell.reason}</dd></div>
-                ))}
-              </dl>
-            )}
-          </section>
+                  <div>
+                    <dt>Being provisioned</dt>
+                    <dd>{explanation.provisioning_cell_ids.length || "None"}</dd>
+                  </div>
+                  {explanation.cells.slice(0, 4).map((cell) => (
+                    <div key={cell.cell_id}>
+                      <dt className="monospace">{cell.cell_id}</dt>
+                      <dd>{cell.reason}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+            </section>
           )}
 
           <section className="panel detail-section">
-            <div className="panel-header"><WalletCards size={15} aria-hidden="true" /><div><h2>What this run cost</h2><p>Measured hours, and the on-demand alternative</p></div></div>
+            <div className="panel-header">
+              <WalletCards size={15} aria-hidden="true" />
+              <div>
+                <h2>What this run cost</h2>
+                <p>Measured hours, and the on-demand alternative</p>
+              </div>
+            </div>
             <SpendPanel spend={spend} error={spendError} />
           </section>
 
           <section className="panel detail-section">
-            <div className="panel-header"><WalletCards size={15} aria-hidden="true" /><div><h2>Budget</h2><p>Workload-level spend guardrail</p></div></div>
+            <div className="panel-header">
+              <WalletCards size={15} aria-hidden="true" />
+              <div>
+                <h2>Budget</h2>
+                <p>Workload-level spend guardrail</p>
+              </div>
+            </div>
             {budgetTracked ? (
               <>
                 <div className="large-budget-value">
                   <strong>{formatMoney(workload.budgetSpent!)}</strong>
                   <span>of {formatMoney(workload.budgetLimit!)}</span>
                 </div>
-                <ProgressBar value={budgetPercent} label="Workload budget utilization" tone={budgetPercent > 90 ? "red" : "accent"} />
-                <div className="resource-row-detail"><span>{budgetPercent}% consumed</span><span>{formatMoney(workload.budgetLimit! - workload.budgetSpent!)} remaining</span></div>
+                <ProgressBar
+                  value={budgetPercent}
+                  label="Workload budget utilization"
+                  tone={budgetPercent > 90 ? "red" : "accent"}
+                />
+                <div className="resource-row-detail">
+                  <span>{budgetPercent}% consumed</span>
+                  <span>{formatMoney(workload.budgetLimit! - workload.budgetSpent!)} remaining</span>
+                </div>
               </>
             ) : (
-              <div className="resource-row-detail"><span>Per-workload spend is not reported by the control plane.</span></div>
+              <div className="resource-row-detail">
+                <span>Per-workload spend is not reported by the control plane.</span>
+              </div>
             )}
           </section>
 
           <section className="panel allocation-section">
-            <div className="panel-header"><Database size={15} aria-hidden="true" /><div><h2>Allocation</h2><p>Committed hosts and failure domains</p></div></div>
+            <div className="panel-header">
+              <Database size={15} aria-hidden="true" />
+              <div>
+                <h2>Allocation</h2>
+                <p>Committed hosts and failure domains</p>
+              </div>
+            </div>
             <div className="allocation-grid">
               {workload.allocation.map((allocation) => (
                 <div className="allocation-item" key={allocation.host}>
                   <span className={`allocation-state allocation-${allocation.state}`} aria-hidden="true" />
                   <span>
                     <strong>{allocation.host}</strong>
-                    <small>{allocation.rack} · {allocation.resource}</small>
-                    <StatusBadge value={allocation.state} tone={allocation.state === "ready" ? "healthy" : allocation.state === "starting" ? "activating" : "revoking"} dot={false} />
+                    <small>
+                      {allocation.rack} · {allocation.resource}
+                    </small>
+                    <StatusBadge
+                      value={allocation.state}
+                      tone={
+                        allocation.state === "ready"
+                          ? "healthy"
+                          : allocation.state === "starting"
+                            ? "activating"
+                            : "revoking"
+                      }
+                      dot={false}
+                    />
                   </span>
                 </div>
               ))}
@@ -562,84 +696,126 @@ const filteredLogs = useMemo(() => {
           </section>
 
           <section className="panel runtime-section">
-            <div className="panel-header"><Code2 size={15} aria-hidden="true" /><div><h2>Runtime</h2><p>Entrypoint and durable state</p></div></div>
+            <div className="panel-header">
+              <Code2 size={15} aria-hidden="true" />
+              <div>
+                <h2>Runtime</h2>
+                <p>Entrypoint and durable state</p>
+              </div>
+            </div>
             <div className="code-block">
               <code>{workload.command}</code>
-              <button className="icon-button code-copy" type="button" onClick={copyCommand} aria-label="Copy command" title="Copy command">
+              <button
+                className="icon-button code-copy"
+                type="button"
+                onClick={copyCommand}
+                aria-label="Copy command"
+                title="Copy command"
+              >
                 {copied ? <Check size={15} /> : <Clipboard size={15} />}
               </button>
             </div>
             <dl className="runtime-list">
-              <div><dt>Checkpoint</dt><dd className="monospace">{workload.checkpointUri ?? "No checkpoint"}</dd></div>
-              <div><dt>Attempt</dt><dd>{workload.attempt ?? "Unknown"}</dd></div>
+              <div>
+                <dt>Checkpoint</dt>
+                <dd className="monospace">{workload.checkpointUri ?? "No checkpoint"}</dd>
+              </div>
+              <div>
+                <dt>Attempt</dt>
+                <dd>{workload.attempt ?? "Unknown"}</dd>
+              </div>
               {/* Named for what was charged, not "retries". A job on its third
                   attempt because the cloud took the slice back twice is healthy
                   and expected; one on its third because the pool could not give
                   capacity is not, and the two look identical under one count. */}
-              <div><dt>Reclaimed</dt><dd>{workload.preemptionCount ?? "Unknown"}</dd></div>
-              <div><dt>Capacity lost</dt><dd>{workload.capacityLossCount ?? "Unknown"}</dd></div>
-              {workload.failureReason ? <div><dt>Failure</dt><dd className="text-critical">{workload.failureReason}</dd></div> : null}
-              <div><dt>Labels</dt><dd>{Object.entries(workload.labels).map(([key, value]) => <span className="label-chip" key={key}>{key}={value}</span>)}</dd></div>
+              <div>
+                <dt>Reclaimed</dt>
+                <dd>{workload.preemptionCount ?? "Unknown"}</dd>
+              </div>
+              <div>
+                <dt>Capacity lost</dt>
+                <dd>{workload.capacityLossCount ?? "Unknown"}</dd>
+              </div>
+              {workload.failureReason ? (
+                <div>
+                  <dt>Failure</dt>
+                  <dd className="text-critical">{workload.failureReason}</dd>
+                </div>
+              ) : null}
+              <div>
+                <dt>Labels</dt>
+                <dd>
+                  {Object.entries(workload.labels).map(([key, value]) => (
+                    <span className="label-chip" key={key}>
+                      {key}={value}
+                    </span>
+                  ))}
+                </dd>
+              </div>
             </dl>
           </section>
         </div>
       )}
 
-      {tab === "timeline" && (() => {
-        // Durations are the answer to "where did the time go": each row shows
-        // how long after the previous transition it happened, so a nine-hour
-        // admission wait is a number on the screen, not arithmetic.
-        const parse = (value: string) => new Date(value).getTime();
-        const fmtGap = (seconds: number) => {
-          const h = Math.floor(seconds / 3600);
-          const m = Math.floor((seconds % 3600) / 60);
-          const r = seconds % 60;
-          return h > 0 ? `${h}h ${m}m ${r}s` : m > 0 ? `${m}m ${r}s` : `${r}s`;
-        };
-        let previous: number | null = null;
-        const rows = workload.timeline.map((event) => {
-          const at = parse(event.timestamp);
-          const seconds = previous === null || !Number.isFinite(at) ? null : Math.round((at - previous) / 1000);
-          previous = Number.isFinite(at) ? at : previous;
-          return { event, seconds: seconds !== null && seconds >= 0 ? seconds : null };
-        });
-        const first = parse(workload.timeline[0]?.timestamp ?? "");
-        const last = parse(workload.timeline[workload.timeline.length - 1]?.timestamp ?? "");
-        const span =
-          Number.isFinite(first) && Number.isFinite(last) && last >= first
-            ? `${workload.timeline.length} transitions over ${fmtGap(Math.round((last - first) / 1000))}`
-            : `${workload.timeline.length} transitions`;
-        return (
-          <section className="panel timeline-panel">
-            <div className="panel-header">
-              <div><h2>Lifecycle timeline</h2><p>Each row carries the gap since the previous transition</p></div>
-              <span className="timeline-span">{span}</span>
-            </div>
-            <ol className="timeline-list">
-              {rows.map(({ event, seconds }) => (
-                <li key={event.id} className={`timeline-${event.severity}`}>
-                  <time>{formatDateTime(event.timestamp)}</time>
-                  <span className="timeline-rail" aria-hidden="true">
-                    <span className="timeline-marker" />
-                  </span>
-                  <div className="timeline-body">
-                    <span className="timeline-heading">
-                      <strong>{event.title}</strong>
-                      {seconds !== null && seconds > 0 && (
-                        <span className={`timeline-gap${seconds > HEAVY_GAP_SECONDS ? " timeline-gap-heavy" : ""}`}>
-                          +{fmtGap(seconds)}
-                        </span>
-                      )}
+      {tab === "timeline" &&
+        (() => {
+          // Durations are the answer to "where did the time go": each row shows
+          // how long after the previous transition it happened, so a nine-hour
+          // admission wait is a number on the screen, not arithmetic.
+          const parse = (value: string) => new Date(value).getTime();
+          const fmtGap = (seconds: number) => {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const r = seconds % 60;
+            return h > 0 ? `${h}h ${m}m ${r}s` : m > 0 ? `${m}m ${r}s` : `${r}s`;
+          };
+          let previous: number | null = null;
+          const rows = workload.timeline.map((event) => {
+            const at = parse(event.timestamp);
+            const seconds = previous === null || !Number.isFinite(at) ? null : Math.round((at - previous) / 1000);
+            previous = Number.isFinite(at) ? at : previous;
+            return { event, seconds: seconds !== null && seconds >= 0 ? seconds : null };
+          });
+          const first = parse(workload.timeline[0]?.timestamp ?? "");
+          const last = parse(workload.timeline[workload.timeline.length - 1]?.timestamp ?? "");
+          const span =
+            Number.isFinite(first) && Number.isFinite(last) && last >= first
+              ? `${workload.timeline.length} transitions over ${fmtGap(Math.round((last - first) / 1000))}`
+              : `${workload.timeline.length} transitions`;
+          return (
+            <section className="panel timeline-panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Lifecycle timeline</h2>
+                  <p>Each row carries the gap since the previous transition</p>
+                </div>
+                <span className="timeline-span">{span}</span>
+              </div>
+              <ol className="timeline-list">
+                {rows.map(({ event, seconds }) => (
+                  <li key={event.id} className={`timeline-${event.severity}`}>
+                    <time>{formatDateTime(event.timestamp)}</time>
+                    <span className="timeline-rail" aria-hidden="true">
+                      <span className="timeline-marker" />
                     </span>
-                    <p>{event.detail}</p>
-                    {event.actor && <small>{event.actor}</small>}
-                  </div>
-                </li>
-              ))}
-            </ol>
-          </section>
-        );
-      })()}
+                    <div className="timeline-body">
+                      <span className="timeline-heading">
+                        <strong>{event.title}</strong>
+                        {seconds !== null && seconds > 0 && (
+                          <span className={`timeline-gap${seconds > HEAVY_GAP_SECONDS ? " timeline-gap-heavy" : ""}`}>
+                            +{fmtGap(seconds)}
+                          </span>
+                        )}
+                      </span>
+                      <p>{event.detail}</p>
+                      {event.actor && <small>{event.actor}</small>}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          );
+        })()}
 
       {tab === "logs" && (
         <section className="panel logs-panel">
@@ -647,7 +823,12 @@ const filteredLogs = useMemo(() => {
             <label className="search-field">
               <Search size={14} aria-hidden="true" />
               <span className="sr-only">Search logs</span>
-              <input type="search" placeholder="Search log output" value={logQuery} onChange={(event) => setLogQuery(event.target.value)} />
+              <input
+                type="search"
+                placeholder="Search log output"
+                value={logQuery}
+                onChange={(event) => setLogQuery(event.target.value)}
+              />
             </label>
             <div className="segmented segmented-mono" role="group" aria-label="Filter log level">
               {LOG_LEVELS.map((level) => (
@@ -688,12 +869,22 @@ const filteredLogs = useMemo(() => {
               </button>
             )}
           </div>
-          {followError && <div className="log-notice log-notice-error"><AlertTriangle size={14} aria-hidden="true" />{followError}</div>}
-          {attemptNotice && <div className="log-notice"><AlertTriangle size={14} aria-hidden="true" />{attemptNotice}</div>}
+          {followError && (
+            <div className="log-notice log-notice-error">
+              <AlertTriangle size={14} aria-hidden="true" />
+              {followError}
+            </div>
+          )}
+          {attemptNotice && (
+            <div className="log-notice">
+              <AlertTriangle size={14} aria-hidden="true" />
+              {attemptNotice}
+            </div>
+          )}
           {following && followed.dropped > 0 && (
             <div className="log-notice">
-              Showing the last {FOLLOW_BUFFER_LINES.toLocaleString()} lines · {followed.dropped.toLocaleString()} earlier
-              lines dropped from this view
+              Showing the last {FOLLOW_BUFFER_LINES.toLocaleString()} lines · {followed.dropped.toLocaleString()}{" "}
+              earlier lines dropped from this view
             </div>
           )}
           <div
@@ -703,8 +894,7 @@ const filteredLogs = useMemo(() => {
             ref={streamRef}
             onScroll={(event) => {
               const element = event.currentTarget;
-              pinnedRef.current =
-                element.scrollHeight - element.scrollTop - element.clientHeight < PIN_TO_BOTTOM_PX;
+              pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < PIN_TO_BOTTOM_PX;
             }}
           >
             {filteredLogs.map((log: LogEntry) => (

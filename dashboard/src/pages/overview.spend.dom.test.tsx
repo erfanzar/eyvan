@@ -34,14 +34,30 @@ afterEach(cleanup);
 
 describe("the overview spend card", () => {
   it("does not report zero spend when no budget defines what spend means", () => {
-    render(<OverviewPage overview={snapshot()} workloads={[]} onOpenWorkload={() => {}} onShowWorkloads={() => {}} fleetAvailable />);
+    render(
+      <OverviewPage
+        overview={snapshot()}
+        workloads={[]}
+        onOpenWorkload={() => {}}
+        onShowWorkloads={() => {}}
+        fleetAvailable
+      />,
+    );
 
     expect(screen.getByText("No budget")).toBeDefined();
     expect(screen.queryByText("$0")).toBeNull();
   });
 
   it("says where the real number is", () => {
-    render(<OverviewPage overview={snapshot()} workloads={[]} onOpenWorkload={() => {}} onShowWorkloads={() => {}} fleetAvailable />);
+    render(
+      <OverviewPage
+        overview={snapshot()}
+        workloads={[]}
+        onOpenWorkload={() => {}}
+        onShowWorkloads={() => {}}
+        fleetAvailable
+      />,
+    );
 
     expect(screen.getByText(/cell cost still accrues/)).toBeDefined();
   });

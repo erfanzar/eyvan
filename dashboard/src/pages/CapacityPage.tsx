@@ -150,10 +150,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   }, [cells]);
 
   const entries = useMemo(() => snapshot?.entries ?? [], [snapshot]);
-  const generations = useMemo(
-    () => Array.from(new Set(entries.map((entry) => entry.generation))).sort(),
-    [entries],
-  );
+  const generations = useMemo(() => Array.from(new Set(entries.map((entry) => entry.generation))).sort(), [entries]);
   const acceleratorTypes = useMemo(
     () => Array.from(new Set(entries.map((entry) => entry.accelerator_type))).sort(),
     [entries],
@@ -209,7 +206,9 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     }
     return [...byQuota.values()].sort((left, right) => {
       if (sortKey === "zone")
-        return left.entry.zone.localeCompare(right.entry.zone) || left.entry.generation.localeCompare(right.entry.generation);
+        return (
+          left.entry.zone.localeCompare(right.entry.zone) || left.entry.generation.localeCompare(right.entry.generation)
+        );
       if (sortKey === "limit") return (right.entry.limit_chips ?? 0) - (left.entry.limit_chips ?? 0);
       return (right.entry.free_chips ?? 0) - (left.entry.free_chips ?? 0);
     });
@@ -258,9 +257,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   // one zone's 80000 free chips once per size the provider offered, so a single
   // v4 zone reported four million.
   const freeChips = measured.reduce((total, row) => total + (row.entry.free_chips ?? 0), 0);
-  const measuredZones = new Set(
-    measured.filter((row) => (row.entry.free_chips ?? 0) > 0).map((row) => row.entry.zone),
-  );
+  const measuredZones = new Set(measured.filter((row) => (row.entry.free_chips ?? 0) > 0).map((row) => row.entry.zone));
   const unmeasuredZones = new Set(unmeasured.map((row) => row.entry.zone));
   const age = snapshot?.age_s ?? null;
   const stale = snapshot !== null && snapshot.cached && age !== null && age > snapshot.ttl_s;
@@ -332,7 +329,10 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
           </span>
           {stale && <span>Older than the {Math.round(snapshot.ttl_s)}s refresh window</span>}
           {snapshot.available_projects.length > 1 && (
-            <span>Also declared by this fleet: {snapshot.available_projects.filter((name) => name !== snapshot.project).join(", ")}</span>
+            <span>
+              Also declared by this fleet:{" "}
+              {snapshot.available_projects.filter((name) => name !== snapshot.project).join(", ")}
+            </span>
           )}
         </div>
         {snapshot.status === "unconfigured" && (
@@ -524,7 +524,11 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         <td>
                           <strong>{chips(entry.free_chips)}</strong>
                         </td>
-                        <td className="numeric">{bestFit.free_slices === null ? UNKNOWN : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}</td>
+                        <td className="numeric">
+                          {bestFit.free_slices === null
+                            ? UNKNOWN
+                            : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}
+                        </td>
                         {/* The balance was measured at a point in time by a gauge
                             that lags by minutes. Presenting it without that is
                             how a stale number becomes a placement decision. */}
@@ -625,9 +629,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         {/* A cooldown is a decision, not an absence. Rendering
                             it as "0 free" would send an operator looking for
                             capacity that is being withheld on purpose. */}
-                        {row.cooling
-                          ? `${row.cooling} cooling until ${formatDateTime(row.until as string)}`
-                          : "none"}
+                        {row.cooling ? `${row.cooling} cooling until ${formatDateTime(row.until as string)}` : "none"}
                       </td>
                       <td>{row.interruptions ? row.interruptions.toFixed(1) : "none"}</td>
                     </tr>

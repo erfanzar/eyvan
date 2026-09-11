@@ -112,11 +112,12 @@ export function Shell({
   const meta = pageMeta[route.section];
   const detailId = "workloadId" in route ? route.workloadId : undefined;
   const connected = health?.status === "ok";
-  const initials = identity?.displayName
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("") || "ME";
+  const initials =
+    identity?.displayName
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase())
+      .join("") || "ME";
 
   useEffect(() => {
     try {
@@ -216,59 +217,85 @@ export function Shell({
 
         <nav className="sidebar-nav">
           <span className="nav-label">Control plane</span>
-          {navigation.filter(({ section }) => sectionAvailability[section] !== false).map(({ section, label, icon: Icon }) => {
-            const count = counts?.[section];
-            return (
-              <button
-                key={section}
-                className={`nav-item ${route.section === section ? "nav-item-active" : ""}`}
-                type="button"
-                title={label}
-                aria-current={route.section === section ? "page" : undefined}
-                onClick={() => chooseSection(section)}
-              >
-                <Icon size={15} strokeWidth={1.7} aria-hidden="true" />
-                <span className="rail-label">{label}</span>
-                {/* The count is the reason to look at the row before pressing
+          {navigation
+            .filter(({ section }) => sectionAvailability[section] !== false)
+            .map(({ section, label, icon: Icon }) => {
+              const count = counts?.[section];
+              return (
+                <button
+                  key={section}
+                  className={`nav-item ${route.section === section ? "nav-item-active" : ""}`}
+                  type="button"
+                  title={label}
+                  aria-current={route.section === section ? "page" : undefined}
+                  onClick={() => chooseSection(section)}
+                >
+                  <Icon size={15} strokeWidth={1.7} aria-hidden="true" />
+                  <span className="rail-label">{label}</span>
+                  {/* The count is the reason to look at the row before pressing
                     it. Absent rather than zero when the snapshot has not said:
                     an empty section and an unread one are the same number and
                     opposite facts. */}
-                {count !== undefined && (
-                  <span className="nav-count rail-label" aria-hidden="true">
-                    {count}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+                  {count !== undefined && (
+                    <span className="nav-count rail-label" aria-hidden="true">
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
         </nav>
 
         <div className="sidebar-footer">
           <div className="system-health">
             <span className={`health-indicator ${connected ? "" : "health-indicator-pending"}`} aria-hidden="true" />
             <span className="rail-label">
-              <strong>{connected ? "Control plane connected" : health?.status === "demo" ? "Demo mode" : "Checking control plane"}</strong>
+              <strong>
+                {connected
+                  ? "Control plane connected"
+                  : health?.status === "demo"
+                    ? "Demo mode"
+                    : "Checking control plane"}
+              </strong>
               <small>
                 {/* A stream that stopped and a fleet where nothing is happening look
                     identical from the page. The first is a bug; the second is a Tuesday. */}
-                {live ? "Live -- updating as changes commit" : health ? `${health.service} reported ${health.status}` : "Awaiting health response"}
+                {live
+                  ? "Live -- updating as changes commit"
+                  : health
+                    ? `${health.service} reported ${health.status}`
+                    : "Awaiting health response"}
               </small>
             </span>
           </div>
-          {onLogout ? <button className="profile-button" type="button" aria-label={`Sign out ${identity?.displayName ?? "current user"}`} title="Sign out" onClick={onLogout}>
-            <span className="avatar" aria-hidden="true">{initials}</span>
-            <span className="rail-label">
-              <strong>{identity?.displayName ?? "Authenticated user"}</strong>
-              <small>{identity?.detail ?? "OIDC session"}</small>
-            </span>
-            <LogOut size={14} aria-hidden="true" />
-          </button> : <div className="profile-button profile-static">
-            <span className="avatar" aria-hidden="true">{initials}</span>
-            <span className="rail-label">
-              <strong>{identity?.displayName ?? "Unauthenticated"}</strong>
-              <small>{identity?.detail ?? "No identity"}</small>
-            </span>
-          </div>}
+          {onLogout ? (
+            <button
+              className="profile-button"
+              type="button"
+              aria-label={`Sign out ${identity?.displayName ?? "current user"}`}
+              title="Sign out"
+              onClick={onLogout}
+            >
+              <span className="avatar" aria-hidden="true">
+                {initials}
+              </span>
+              <span className="rail-label">
+                <strong>{identity?.displayName ?? "Authenticated user"}</strong>
+                <small>{identity?.detail ?? "OIDC session"}</small>
+              </span>
+              <LogOut size={14} aria-hidden="true" />
+            </button>
+          ) : (
+            <div className="profile-button profile-static">
+              <span className="avatar" aria-hidden="true">
+                {initials}
+              </span>
+              <span className="rail-label">
+                <strong>{identity?.displayName ?? "Unauthenticated"}</strong>
+                <small>{identity?.detail ?? "No identity"}</small>
+              </span>
+            </div>
+          )}
         </div>
       </aside>
 

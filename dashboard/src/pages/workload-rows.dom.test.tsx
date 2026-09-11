@@ -24,12 +24,7 @@ const WORKLOAD = {
 
 function renderPage(onOpenWorkload: (id: string) => void) {
   return render(
-    <WorkloadsPage
-      workloads={[WORKLOAD]}
-      onOpenWorkload={onOpenWorkload}
-      onSubmit={() => {}}
-      canSubmit={false}
-    />,
+    <WorkloadsPage workloads={[WORKLOAD]} onOpenWorkload={onOpenWorkload} onSubmit={() => {}} canSubmit={false} />,
   );
 }
 
