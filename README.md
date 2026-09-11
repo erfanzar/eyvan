@@ -16,7 +16,7 @@ uv run eyvan start                       # find or point at a control plane
 uv run eyvan doctor                      # what is missing, named together
 ```
 
-Eyvan supports Python `>=3.10,<3.14` (the range declared in `pyproject.toml`).
+Eyvan supports Python `>=3.11,<3.14` (the range declared in `pyproject.toml`).
 
 ```python
 from eyvan import TpuConfig, execute, init
@@ -145,8 +145,11 @@ Four seams, in order of how often you need them:
 ```bash
 git clone <this repo> && cd eyvan
 uv sync --extra dev                # editable install + dev deps (pytest, pytest-asyncio)
-uv run pytest tests -q           # full suite (~7 min; host + disposable Postgres)
-uv run ruff check eyvan tests    # lint (line 121, py3.10)
+npm --prefix dashboard ci
+npm --prefix dashboard run build # build the SPA before Python tests
+uv run pytest tests -m fast -q   # smoke subset for iteration, not a release gate
+uv run pytest tests -q -rs       # full suite; real PostgreSQL requires the test fixture setup
+uv run ruff check eyvan tests    # lint (line 121, py3.11)
 uv run eyvan-server --log-level info   # run the plane from source
 uv run eyvan-agent --port 8090 --log-level info   # and an agent
 ```

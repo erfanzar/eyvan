@@ -1,7 +1,7 @@
 # Part 2 — Getting started
 
 This part takes you from a fresh checkout to a completed callable on the loopback
-fleet — no cloud account, no secrets. Eyvan requires Python `>=3.10,<3.14` (the
+fleet — no cloud account, no secrets. Eyvan requires Python `>=3.11,<3.14` (the
 range declared in `pyproject.toml`).
 
 ## 1. Install
@@ -15,15 +15,37 @@ uv sync --extra dev        # editable install + dev dependencies (pytest, pytest
 `eyvan-agent`, `eyvan-native-worker`, and `eyvan-migrate` console scripts all come
 from your working tree.
 
+### Optional: a disposable first check
+
+```bash
+uv run eyvan demo
+uv run eyvan demo --json
+```
+
+This starts a private loopback API and agent, applies a local CPU fleet, submits
+an actual callable through the SDK, and verifies its result came from a separate
+worker process. It tears down the listeners and temporary state before returning.
+It ignores saved contexts and never acquires cloud resources. The local backend
+claims no hardware isolation. Its internal HTTP artifact-transfer opt-in is
+limited to this disposable loopback runtime, not a network deployment.
+
+Use `--timeout SECONDS` to bound the callable wait. On timeout or failure, the
+demo attempts cancellation before shutting down; it reports an error rather
+than claiming a successful demo. The endpoints in JSON output are receipt data,
+not services left running for later CLI commands.
+
 ## 2. Bring up the laptop fleet
 
 ```bash
-uv run eyvan up
+uv run eyvan up examples/laptop.yaml
 ```
 
-`eyvan up` with no argument applies `examples/laptop.yaml`-style local capacity:
-one CPU pool served by the `local` backend, on a loopback URL. On a loopback
-address, `up` also starts and supervises the control plane for you. Do **not**
+The explicit laptop configuration describes CPU capacity on the `local` backend.
+Omitting the configuration instead selects from autoscale configuration; it is
+not an implicit laptop-fleet command. The persistent laptop path also requires
+a local cell agent at the endpoint declared in the YAML. Use the disposable
+`eyvan demo` above when you want all of that setup managed for one short run.
+On a loopback address, `up` starts and supervises the control plane for you. Do **not**
 start `eyvan-server` first in this path — `up` refuses a plane it cannot prove it
 owns, because adopting a process it did not supervise is how two control planes end
 up sharing one database.
@@ -146,7 +168,7 @@ Then see Part 13 for what the console shows.
 
 ```bash
 uv run pytest tests -q           # full suite (~7 min; host + disposable Postgres)
-uv run ruff check eyvan tests    # lint (line 121, py3.10)
+uv run ruff check eyvan tests    # lint (line 121, py3.11)
 ```
 
 ## Where you are

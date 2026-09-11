@@ -26,13 +26,13 @@ territory.
 | `eyvan up [CONFIG]` | apply a fleet config (`examples/laptop.yaml`, a generated zone fleet, `--region/--zone --preemptible`); `--select <fleet>` re-enables one; on a loopback URL it also starts and supervises the plane |
 | `eyvan down <config-path> -y` | drain every cell the fleet manages — takes the **config path**, not a fleet name |
 | `eyvan status` | fleet status |
-| `eyvan fleet-config validate <file>` | validate a config without applying it |
+| `eyvan config validate <file>` | validate a config without applying it |
 | `eyvan capacity fleets` | what exists, what is drained |
 | `eyvan capacity list` | pools this project can submit into |
 | `eyvan capacity quota --fits v5p-16:2` | zone-by-zone fit for a shape (quota **and** admission **and** supply are three different gates) |
 | `eyvan capacity launch-latency` | per-pool handover seconds the plane itself recorded |
 | `eyvan capacity warmth` / `queue-trend` / `billing` / `usage` / `carbon` / `builds` / `orphans` / `invariants` | the capacity reports |
-| `eyvan pool list/get`, `eyvan cell get`, `eyvan ingress list/release` | pool/cell/ingress detail |
+| `eyvan capacity pool list/get`, `eyvan capacity cell get`, `eyvan capacity ingress list/release` | pool/cell/ingress detail |
 
 ## Autoscale (generated zone fleets)
 
@@ -63,7 +63,7 @@ state on its own disk.
 ## Workloads
 
 Top-level convenience: `eyvan run` (run a callable/command workload),
-`eyvan exec` (exec beside a running workload).
+`eyvan workload exec` (exec beside a running workload).
 
 The `eyvan workload …` family:
 
@@ -92,8 +92,8 @@ candidate cells, provisioning cell ids, and delivery state/error.
   `eyvan system-reconcile` — policy surfaces
 - `eyvan org list/get/create`, `eyvan project list/create`,
   `eyvan grant list/add/revoke` — tenancy and role grants
-- `eyvan peer list/add`, `eyvan grant issue/revoke` (federation budget grants),
-  `eyvan quota-grant list/issue/revoke` — plane-to-plane federation
+- `eyvan federation peer list/add`, `eyvan federation grant issue/revoke` (federation budget grants),
+  `eyvan federation quota-grant list/issue/revoke` — plane-to-plane federation
 
 ## Proof, soak, services, query, resources
 
@@ -105,7 +105,7 @@ candidate cells, provisioning cell ids, and delivery state/error.
   and explained decisions
 - `eyvan query` — read-only query console (SQL-backed repositories only);
   `eyvan process stacks/allocations` — process diagnostics
-- `eyvan resources list/get` — a generic surface over `workloads`, `cells`,
+- `eyvan list <kind>` / `eyvan get <kind> <id>` — a generic surface over `workloads`, `cells`,
   `pools`, `leases`, `events`, `fleets`, `quotas`, `budgets`
 
 ## Artifacts

@@ -13,7 +13,7 @@ store was exercised.
 ```bash
 uv run pytest tests -q            # full suite (~7 min; host + disposable Postgres)
 uv run pytest tests/test_cli.py -q   # one file
-uv run ruff check eyvan tests     # lint (line-length 121, target py310)
+uv run ruff check eyvan tests     # lint (line-length 121, target py311)
 
 npm --prefix dashboard ci
 npm --prefix dashboard test

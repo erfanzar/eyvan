@@ -1,5 +1,9 @@
 # Security model
 
+The [working threat model and release checklist](design/0005-threat-model.md)
+separates implemented controls from remaining qualification gaps. It is not an
+independent security-review approval.
+
 ## Production boundary decisions
 
 These accepted design records have distinct implementation and qualification
@@ -72,14 +76,120 @@ enabled (see [artifact-safety](artifact-safety.md)).
 
 The loopback plane binds `127.0.0.1` and requires none of the off-loopback
 secrets; binding wider is refused at startup until
+`EYVAN_TLS_CERT_FILE` and `EYVAN_TLS_KEY_FILE` are set,
 `EYVAN_REPOSITORY_BACKEND=postgres`, `EYVAN_METRICS_TOKEN`, and
 `EYVAN_ARTIFACT_TOKEN_KEY` are set (`eyvan doctor --server-host 0.0.0.0`
-enumerates the refusals before you start). Mutual-TLS modes exist for the
-service boundary (`EYVAN_MUTUAL_TLS_MODE`,
-`EYVAN_MUTUAL_TLS_CLIENT_ENABLED`, `EYVAN_MUTUAL_TLS_TRUST_BUNDLE`,
-`EYVAN_MUTUAL_TLS_CERTIFICATE`, `EYVAN_MUTUAL_TLS_PRIVATE_KEY`); provider
-credentials (`EYVAN_AWS_ACCESS_KEY_ID`, `EYVAN_AWS_SECRET_ACCESS_KEY`,
+enumerates the refusals before you start). The TLS refusal can only be
+overridden by a reviewed, explicit decision — `EYVAN_INSECURE_PLAINTEXT_BIND=1`
+or `eyvan-server --insecure-plaintext` — never by default; plaintext on a
+network port is how bearer tokens, bootstrap credentials, and capability
+tokens get stolen. The listener TLS terminates the browser/API edge.
+
+Cell-agent and native-worker listeners support explicit mutual TLS through
+`EYVAN_MUTUAL_TLS_MODE`, `EYVAN_MUTUAL_TLS_TRUST_BUNDLE`,
+`EYVAN_MUTUAL_TLS_CERTIFICATE`, and `EYVAN_MUTUAL_TLS_PRIVATE_KEY`.
+`EYVAN_MUTUAL_TLS_CLIENT_ENABLED` configures controller-created cell-agent
+clients with the supplied trust and identity files. Required native-worker
+mTLS is covered by a local handshake test that rejects clients without a
+certificate. These paths remain opt-in: default internal listener enforcement,
+automated bootstrap certificate handoff, and all cross-machine client paths
+are not yet qualified. Use HTTPS endpoints and an explicitly configured
+mutually authenticated transport across machines; do not infer encryption
+from a bearer token or private network alone. Provider credentials (`EYVAN_AWS_ACCESS_KEY_ID`, `EYVAN_AWS_SECRET_ACCESS_KEY`,
 `EYVAN_AWS_SESSION_TOKEN`, `EYVAN_AWS_REGION`, `EYVAN_AZURE_ACCESS_TOKEN`,
 `EYVAN_AZURE_SUBSCRIPTION_ID`, `EYVAN_AZURE_RESOURCE_GROUP`,
 `EYVAN_AZURE_LOCATION`, and gcloud's own) stay scoped to the agent or plane
 process that talks to that cloud.
+
+### Preparatory native-worker certificate bootstrap
+
+The low-level `build_native_worker_startup_script()` renderer accepts an optional
+`worker_tls_secret_resource`: one immutable `projects/.../secrets/.../versions/N`
+resource, with a positive numeric version (not `latest`). The secret contains a
+JSON object with exactly `trust_bundle`, `certificate`, and `private_key`, each
+holding PEM text. Use a dedicated worker key, never an agent/controller private
+key. Provision and grant access to this bundle separately; Eyvan does not issue
+certificates or change its IAM policy through this option.
+
+The pre-start `eyvan.worker.runtime.native_tls_bootstrap` module fetches the
+bundle without echoing provider output, rejects malformed/inconsistent material
+and encrypted keys, and stages files with mode 0600 in an owner-only directory.
+Only after TLS validation does it publish `/run/eyvan-native/tls`; the existing
+root-run systemd unit owns that directory and requires client certificates.
+An existing destination is refused rather than overwritten. Systemd's private
+runtime-directory lifecycle removes these files on stop; prepare all clients
+before enabling a requiring listener. A new version changes the rendered script.
+The helper checks CA parsing and key-pair consistency, not certificate expiry,
+remote trust, endpoint SANs or per-cell issuance policy.
+
+**This is not a GCP fleet configuration option yet.** Current provider endpoints
+use provider-selected IP addresses; pre-issued certificates require a stable
+DNS or reserved-IP/SAN contract, including distinct multi-host identities.
+Automatic fleet wiring, replacement/rotation and deployed access remain open.
+Do not disable hostname verification to bridge that gap. When omitted, the
+renderer retains its previous output exactly; networking defaults are unchanged.
+
+## Dashboard sessions
+
+The dashboard never holds an OIDC token. Sign-in is a backend-for-frontend
+flow (`eyvan/server/api/dashboard_sessions.py`): the server mints the PKCE
+challenge and state, exchanges the authorization code at the identity
+provider, and opens an in-process session. The browser holds one
+`eyvan_session` cookie — HttpOnly, Secure, SameSite=Lax — and the tokens stay
+server-side, so a cross-site script in the dashboard page has no credential to
+steal. The API authenticates the cookie by verifying the stored access token
+exactly as it would a presented bearer; a presented bearer still wins, so SDK
+clients are unaffected. The one credential that still lives in the tab is the
+loopback development credential, whose model is this-machine-only by design.
+
+Before creating a session, the callback binds the ID token's issuer, audience,
+authorized party, subject, nonce and expiry to the configured provider/client
+and login transaction. Discovery issuer checks also apply on cache hits.
+The ID token's authenticity relies on the direct authenticated TLS token
+exchange, not a separate ID-token JWKS/signature verification step; API access
+tokens are independently verified. Provider-controlled error descriptions and
+unknown error codes are replaced with fixed messages rather than copied into
+redirect URLs. These request-level protections are tested; real-browser and
+multi-replica deployment qualification remain separate requirements.
+
+Limits that shape deployment, stated rather than discovered: the session
+store is in-process (more than one API replica needs sticky sessions until
+sessions move into the repository). Each process retains at most 1,024 pending
+login transactions and 1,024 sessions. Full stores reject new admissions with
+HTTP 503 and Retry-After rather than evicting a live session. Expiry and removal
+release slots; deployment-level rate limiting is still needed for login floods.
+Cookie-authenticated writes, including
+logout, require an Origin matching the configured public URL. SameSite=Lax
+is defense in depth, not the sole CSRF boundary: hostile sibling subdomains
+can be same-site without being same-origin. Missing or opaque origins are
+refused for these writes. Server-side session lifetime is bounded by the
+configured session TTL and any shorter provider lifetime, independently of
+browser cookie expiry. The unconditional `Secure` flag means a plane serving
+plain HTTP over a network cannot hold OIDC sessions at all.
+
+The dashboard's HTML is served with a strict Content-Security-Policy
+(`script-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`, and
+companions such as `X-Content-Type-Options: nosniff`), so an injected script
+has no external origin to load from and no sibling origin to frame.
+
+## Authentication and policy audit
+
+Set `EYVAN_AUTH_AUDIT_ENABLED=1` to retain protected-API authentication
+rejections as structured `authentication_failed` audit events. The default is
+off to preserve existing event-stream behavior. Events use the route template,
+HTTP method and rejection status; they do not retain credentials, cookies,
+query strings, raw path identifiers or unverified tenant claims. The actor is
+`anonymous` because a rejected credential establishes no trustworthy identity.
+
+These unscoped security events are visible through the fleet-administrator
+audit view, not a caller-selected project's history. Grant issuance/revocation
+and policy edits already produce transactional `grant.issued`, `grant.revoked`
+and `policy.updated` events carrying the verified actor and scope.
+
+An audit-store failure does not turn a rejected request into an authenticated
+one or replace its denial. It emits an error naming only the exception type,
+not exception text that could include sensitive database parameters. Retention
+and deployment-level rate limiting remain operator responsibilities: enabling
+this audit on an attacked endpoint creates durable writes. This coverage is
+for protected API authentication; IdP-side events and browser-login callback
+outcomes are not claimed as covered by it.

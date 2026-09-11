@@ -120,7 +120,7 @@ Inside a running callable:
 
 - `report_progress(...)` (`eyvan/worker/runtime/progress.py`) — advisory
   self-reported progress to the plane via `EYVAN_PROGRESS_URL` +
-  `EYVAN_PROGRESS_TOKEN`; stdlib-only, silent when nothing is listening.
+  `EYVAN_MANAGED_RESULT_TOKEN`; stdlib-only, silent when nothing is listening.
 - `submit_child(...)` / `in_job_context()` — when the shape declared
   `can_submit_children=True`, the job holds a submission capability under *your*
   identity: children's `created_by` is the submitting human, not a service

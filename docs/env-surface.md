@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-206 variables are currently referenced. Names set on workload
+213 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -33,16 +33,22 @@ is easier to audit when everything is in one table.
 | `EYVAN_CELL_STAGE_DIR` | `eyvan` |
 | `EYVAN_CELL_STAGE_SOURCES` | `eyvan` |
 | `EYVAN_CHILDREN_URL` | `eyvan` |
+| `EYVAN_CORRELATION_ENABLED` | `eyvan` |
 | `EYVAN_DASHBOARD_DIR` | `eyvan` |
 | `EYVAN_DATABASE_URL` | `eyvan` |
 | `EYVAN_DEV_AUTH_ENABLED` | `eyvan` |
 | `EYVAN_FLEET_STATE_URI` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_BUDGET` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_WINDOW_S` | `eyvan` |
+| `EYVAN_INSECURE_PLAINTEXT_BIND` | `eyvan` |
 | `EYVAN_KUBERNETES_NAMESPACE` | `eyvan` |
 | `EYVAN_MANAGED_RESULT_TOKEN` | `eyvan` |
 | `EYVAN_MAX_EXPANSION_CHILDREN` | `eyvan` |
 | `EYVAN_METRICS_TOKEN` | `eyvan` |
+| `EYVAN_MUTUAL_TLS_CERTIFICATE` | `eyvan` |
+| `EYVAN_MUTUAL_TLS_MODE` | `eyvan` |
+| `EYVAN_MUTUAL_TLS_PRIVATE_KEY` | `eyvan` |
+| `EYVAN_MUTUAL_TLS_TRUST_BUNDLE` | `eyvan` |
 | `EYVAN_NATIVE_WORKER_ARTIFACT_ROOT_URI` | `eyvan` |
 | `EYVAN_NATIVE_WORKER_PACKAGE` | `eyvan` |
 | `EYVAN_NATIVE_WORKER_PACKAGE_GENERATION` | `eyvan` |
@@ -58,6 +64,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_RESUME_CHECKPOINT_URI` | `eyvan` |
 | `EYVAN_SECRET_` | `eyvan` |
 | `EYVAN_SECRET_COUNT` | `eyvan` |
+| `EYVAN_TLS_CERT_FILE` | `eyvan` |
+| `EYVAN_TLS_KEY_FILE` | `eyvan` |
 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | `eyvan` |
 | `EYVAN_WORKLOAD_ID` | `eyvan` |
 | `EYVAN_WORKLOAD_TOKEN` | `eyvan` |
@@ -83,6 +91,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_ARTIFACT_TOKEN_TTL_S` | `eyvan/config` |
 | `EYVAN_ATOMIC_GROUP_PLACEMENT` | `eyvan/config` |
 | `EYVAN_AUDIT_RETENTION_S` | `eyvan/config` |
+| `EYVAN_AUTH_AUDIT_ENABLED` | `eyvan/config` |
 | `EYVAN_AUTO_CREATE_SCHEMA` | `eyvan/config` |
 | `EYVAN_AWS_ACCESS_KEY_ID` | `eyvan/config` |
 | `EYVAN_AWS_REGION` | `eyvan/config` |
@@ -103,6 +112,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_CHECKPOINT_GRACE_S` | `eyvan/config` |
 | `EYVAN_CONTROLLER_ENABLED` | `eyvan/config` |
 | `EYVAN_CREDENTIAL_ROTATION_OVERLAP_S` | `eyvan/config` |
+| `EYVAN_DASHBOARD_AUTH_TRANSACTION_TTL_S` | `eyvan/config` |
+| `EYVAN_DASHBOARD_SESSION_TTL_S` | `eyvan/config` |
 | `EYVAN_EXECUTION_BACKEND` | `eyvan/config` |
 | `EYVAN_EXPANSION_WAVE_SIZE` | `eyvan/config` |
 | `EYVAN_GANG_HEARTBEAT_TIMEOUT_S` | `eyvan/config` |
@@ -118,11 +129,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_LOG_RETENTION_S` | `eyvan/config` |
 | `EYVAN_METRICS_EXPORT_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_MIN_CLIENT_VERSION` | `eyvan/config` |
-| `EYVAN_MUTUAL_TLS_CERTIFICATE` | `eyvan/config` |
 | `EYVAN_MUTUAL_TLS_CLIENT_ENABLED` | `eyvan/config` |
-| `EYVAN_MUTUAL_TLS_MODE` | `eyvan/config` |
-| `EYVAN_MUTUAL_TLS_PRIVATE_KEY` | `eyvan/config` |
-| `EYVAN_MUTUAL_TLS_TRUST_BUNDLE` | `eyvan/config` |
 | `EYVAN_NATIVE_WORKER_PUBLIC_INGRESS_TAG` | `eyvan/config` |
 | `EYVAN_NATIVE_WORKER_WHEELHOUSE` | `eyvan/config` |
 | `EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION` | `eyvan/config` |

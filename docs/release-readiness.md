@@ -1,5 +1,9 @@
 # Release readiness — 0.0.1
 
+> Historical audit, not the current support matrix. Python now requires
+> `>=3.11,<3.14`; references below to Python 3.10 and missing Ruff setup
+> describe the audited tree. See `docs/roadmap.md` for current work.
+
 Audit performed 2026-09-03 on `main` at `e57fa18` (latest commit dated
 2026-08-31). Scope: version consistency, quickstart accuracy, licensing,
 release artifacts, open TODOs, CI gates from configuration plus local runs,

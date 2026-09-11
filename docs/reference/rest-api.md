@@ -7,6 +7,11 @@
 > source of truth. The notes below record high-value, source-backed behavior;
 > they are not an exhaustive API specification.
 
+For schema-derived documentation, use the [generated route index](api-generated.md)
+and [OpenAPI snapshot](openapi.json). Regenerate with
+`uv run python scripts/generate_api_reference.py`; CI checks for drift with
+`--check`. Routes intentionally excluded from OpenAPI remain outside that index.
+
 - [Conventions](#conventions)
 - [Authentication & Authorization](#authentication--authorization)
 - [Error model](#error-model)

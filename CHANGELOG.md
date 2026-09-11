@@ -134,6 +134,9 @@ that 0.0.1 will contain.
 
 ### Changed
 
+- Minimum Python is now 3.11 (`>=3.11,<3.14`); Python 3.10 support and its
+  compatibility backports are dropped. CI covers 3.11/3.12/3.13, and head/
+  worker bootstrap refuses explicitly unsupported interpreter versions.
 - Relicensed under AGPL-3.0-or-later (previously Apache-2.0); source headers
   carry the AGPL SPDX marker, enforced by `scripts/license_headers.py`.
 - Removed the Ray Jobs adapter and the Ray dependency; scheduling, gangs, and
@@ -189,6 +192,23 @@ that 0.0.1 will contain.
 
 ### Security
 
+- Static typing and lint ratchets: mypy gates the pinned scope in
+  `pyproject.toml` (domain, config, records, API policy modules), and the
+  dashboard is gated by ESLint + Prettier in CI; `ruff check`/`format` run
+  from pre-commit.
+- Dashboard OIDC sessions are backend-for-frontend: the server runs the
+  authorization-code + PKCE flow, and the browser holds an HttpOnly/Secure/
+  SameSite=Lax `eyvan_session` cookie instead of sessionStorage tokens that
+  any cross-site script could read; dashboard HTML is served with a strict
+  Content-Security-Policy and `nosniff`/`frame-deny` companions.
+- No static default database password anywhere in the shipped tree: the
+  loopback-development default is now password-less (trust/peer auth), and a
+  regression scan of every shipped surface keeps `eyvan:eyvan` from returning.
+- A network-bound server refuses to start without TLS listener material
+  (`EYVAN_TLS_CERT_FILE` + `EYVAN_TLS_KEY_FILE`) or an explicit,
+  operator-reviewed opt-in (`EYVAN_INSECURE_PLAINTEXT_BIND=1` or
+  `eyvan-server --insecure-plaintext`); loopback binds are unaffected and the
+  refusal is enumerated up front by `eyvan doctor`.
 - Callable trust enforced on every submission route, with trusted projects
   configurable via `EYVAN_TRUSTED_CALLABLE_PROJECTS`; a GPU callable is refused
   before upload rather than after, and a callable pinned to another interpreter

@@ -41,6 +41,21 @@ another's dependencies):
 | `manual` | operator-declared hosts | adopted, never provisioned/deleted |
 | `onprem-ssh` | SSH-claimed hosts | a fenced POSIX marker on the host |
 
+## GCP Compute networking
+
+New `gcp-compute` configurations default to a public IP
+(`provider_options.internal_ip_only: false`). This permits direct public-internet
+bootstrap; it does not bypass Google networking policies or Eyvan's authenticated
+worker ingress checks. Existing configurations explicitly recording
+`internal_ip_only: true` remain private.
+
+For private-only instances, explicitly set `internal_ip_only: true` and select
+`bootstrap_egress: cloud-nat` (with NAT configured on the subnet), or
+`bootstrap_egress: private-google-access` (with the required worker dependencies
+staged). Fleet validation rejects an explicitly private address combined with
+`bootstrap_egress: public-internet` before applying the fleet. Spot versus
+on-demand capacity selection is independent of these networking settings.
+
 ## Capabilities are declarative
 
 `BackendCapabilities` (data, in `drivers/base.py`) declares whether a backend can

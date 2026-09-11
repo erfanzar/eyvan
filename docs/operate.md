@@ -1,7 +1,10 @@
 # Operating Eyvan
 
 The runbook. Assumes the concepts from [eyvan-explained](eyvan-explained.md);
-installation lives in [install](install.md).
+installation lives in [install](install.md). The
+[receipts and elastic-packing design](design/0006-receipts-and-elastic-packing.md)
+separates workload admission from experimental proof and defines the still-open
+cross-scheduler comparison protocol.
 
 ## Production design contracts
 
