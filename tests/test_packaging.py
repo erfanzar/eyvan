@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import tomllib
 import typing as tp
 from pathlib import Path
 
 import pytest
-import tomllib
 from alembic.script import ScriptDirectory
 
 import eyvan.server.persistence.migrate as migrate

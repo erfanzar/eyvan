@@ -458,9 +458,9 @@ def test_standalone_ci_schedules_the_fault_matrix_itself() -> None:
 
     Inside a workspace checkout the monorepo workflow owns the scheduled fault
     matrix (the test above). In this repository -- which is where releases are
-    cut from -- the same guarantee must come from ``ci.yaml``: a weekly run of
+    cut from -- the same guarantee must come from ``ci.yaml``: a nightly run of
     the full suite against a real PostgreSQL, whether or not anyone touched the
-    package that week.
+    package that day.
     """
 
     import pathlib
@@ -473,8 +473,8 @@ def test_standalone_ci_schedules_the_fault_matrix_itself() -> None:
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = document.get("on") or document.get(True) or {}
     schedule = triggers.get("schedule") or []
-    assert any(entry.get("cron") == "17 4 * * 1" for entry in schedule), (
-        "the standalone fault matrix has no weekly scheduled run"
+    assert any(entry.get("cron") == "17 4 * * *" for entry in schedule), (
+        "the standalone fault matrix has no nightly scheduled run"
     )
 
     job = document["jobs"]["python"]
@@ -484,9 +484,11 @@ def test_standalone_ci_schedules_the_fault_matrix_itself() -> None:
     # The full suite -- not a selection -- so this file's fault matrix runs on
     # the schedule too.
     assert "tests" in suite["run"] and "-k" not in suite["run"]
-    installs = [step["run"] for step in job["steps"] if "Install" in step.get("name", "")]
+    # Browser installation has a separate lockfile policy. Match Python
+    # installer commands, not a display name shared with browser/tool steps.
+    installs = [step["run"] for step in job["steps"] if "uv pip install" in step.get("run", "")]
     assert installs and all("--require-hashes" in run for run in installs), (
-        "scheduled runs must install from the hashed exports, not a resolution"
+        "scheduled Python dependency installs must use the hashed exports, not a resolution"
     )
     # A scheduled run must never be cancelled by a push landing mid-week.
     assert document["concurrency"]["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"

@@ -528,3 +528,8 @@ def test_repacking_one_installation_twice_produces_identical_bytes(
     assert kind == "InstalledDistributionWheelBuilder"
     assert name == wheel_installation.wheel.name
     assert first == second
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

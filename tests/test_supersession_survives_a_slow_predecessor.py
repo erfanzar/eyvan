@@ -149,3 +149,8 @@ def test_a_terminal_predecessor_retires_without_attempting_a_stop(tmp_path: Path
     executor.retire(remote_id, _context())
 
     assert not [command for command in daemon.commands[before:] if command[:2] == ("docker", "stop")]
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

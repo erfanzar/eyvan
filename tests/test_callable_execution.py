@@ -1050,3 +1050,8 @@ def test_a_callable_with_no_file_ships_nothing_and_says_nothing(tmp_path) -> Non
 
     request = submitter.requests[0]
     assert request.workspace_uri is None
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

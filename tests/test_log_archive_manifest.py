@@ -1076,3 +1076,8 @@ async def test_an_archive_without_a_manifest_still_reads_through_the_embedded_in
     replayed = await controller._archived_log_page(await _workload(controller))
 
     assert [(record.rank, record.message) for record in replayed.records] == [(0, "zero"), (1, "one")]
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

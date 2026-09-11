@@ -409,3 +409,8 @@ def test_a_freshness_bound_that_would_discard_every_sample_is_refused(bound: flo
 
     with pytest.raises(ValueError):
         SoakEvidenceStore(max_age_s=bound)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

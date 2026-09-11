@@ -146,7 +146,13 @@ def _lease(
     workload_id: str,
     cell_id: str,
     state: LeaseState = LeaseState.ACTIVE,
+    stamp: datetime | None = None,
 ) -> LeaseRecord:
+    # ``stamp`` exists for tests that go through the service layer: submission
+    # reads the wall clock, and a lease stamped at the frozen ``NOW`` falls
+    # outside the six-hour locality TTL within a day of the fixture's date,
+    # which silently emptied the lease-history signal those tests assert.
+    moment = stamp or NOW
     return LeaseRecord(
         id=lease_id,
         workload_id=workload_id,
@@ -157,9 +163,9 @@ def _lease(
         resources=ResourceGang(replicas=1, per_replica=ResourceVector(cpu=1.0)),
         generation=1,
         fencing_token=f"token-{lease_id}",
-        expires_at=NOW + timedelta(hours=24),
-        created_at=NOW - timedelta(minutes=5),
-        updated_at=NOW - timedelta(minutes=1),
+        expires_at=moment + timedelta(hours=24),
+        created_at=moment - timedelta(minutes=5),
+        updated_at=moment - timedelta(minutes=1),
     )
 
 
@@ -461,7 +467,7 @@ async def test_submission_prefers_a_confirmed_stage_over_lease_history() -> None
         repository,
         cells=[_cell("cell-cold"), _cell("cell-warm")],
         workloads=[_workload("wl-old", _DATASET)],
-        leases=[_lease("l-old", workload_id="wl-old", cell_id="cell-cold")],
+        leases=[_lease("l-old", workload_id="wl-old", cell_id="cell-cold", stamp=datetime.now(UTC))],
         stages=[_stage("cell-warm", _DATASET)],
     )
     principal = Principal(
@@ -495,7 +501,7 @@ async def test_submission_ignores_a_stage_it_could_not_confirm() -> None:
         repository,
         cells=[_cell("cell-cold"), _cell("cell-warm")],
         workloads=[_workload("wl-old", _DATASET)],
-        leases=[_lease("l-old", workload_id="wl-old", cell_id="cell-cold")],
+        leases=[_lease("l-old", workload_id="wl-old", cell_id="cell-cold", stamp=datetime.now(UTC))],
         stages=[_stage("cell-warm", _DATASET, state=CellStageState.UNKNOWN)],
     )
     principal = Principal(

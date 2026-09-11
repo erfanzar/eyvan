@@ -42,6 +42,14 @@ def _pages() -> list[pathlib.Path]:
     return sorted(DOCS.rglob("*.md"))
 
 
+#: An invocation, not a mention: ``eyvan`` opening a fenced line or a backtick
+#: span (behind an optional ``$ `` prompt), or launched via ``uv run``.
+#: Anywhere else on the line it is an argument to another program -- in
+#: ``ruff check eyvan tests`` the words name paths, and reading them as an
+#: invocation demanded a command named ``eyvan tests``.
+_LAUNCH = re.compile(r"(?:^\s*(?:\$ )?|`\$? ?|uv run )eyvan((?: [a-z][a-z0-9-]*)+)")
+
+
 def _command_paths(text: str) -> set[tuple[str, ...]]:
     """Every ``eyvan a b c`` invocation, as the command path it names."""
 
@@ -52,7 +60,7 @@ def _command_paths(text: str) -> set[tuple[str, ...]]:
         # push a correct example out of the documentation to satisfy a test.
         if re.match(r"\s*(from eyvan\b|import eyvan\b)", line):
             continue
-        for match in re.finditer(r"`?\beyvan((?: [a-z][a-z0-9-]*)+)", line):
+        for match in _LAUNCH.finditer(line):
             words = tuple(match.group(1).split())
             if words:
                 found.add(words)
@@ -215,7 +223,7 @@ def test_every_documented_command_exists(page: pathlib.Path) -> None:
 
 
 def _known_variables() -> set[str]:
-    """Every ``EYVAN_*`` name the package actually spells.
+    """Every ``EYVAN_*`` name the repository actually spells.
 
     Not just the settings loader. Two distinct families exist and both are
     documented: variables an *operator* sets to configure a control plane, and
@@ -223,12 +231,17 @@ def _known_variables() -> set[str]:
     its siblings, which a diagnostic reads inside an exec'd process. Checking
     only the loader would have rejected the second family as unknown, which is
     how a guard that is too narrow trains people to weaken it.
+
+    The suite owns a third family of its own -- ``EYVAN_REQUIRE_POSTGRES`` turns
+    a skip into a failure -- and a doc telling a developer to set one of those
+    is exactly as wrong when it drifts, so the tests tree counts too.
     """
 
-    package = pathlib.Path(__file__).resolve().parent.parent / "eyvan"
+    root = pathlib.Path(__file__).resolve().parent.parent
     found: set[str] = set()
-    for path in package.rglob("*.py"):
-        found |= set(re.findall(r"\bEYVAN_[A-Z0-9_]+\b", path.read_text(encoding="utf-8")))
+    for tree in (root / "eyvan", root / "tests"):
+        for path in tree.rglob("*.py"):
+            found |= set(re.findall(r"\bEYVAN_[A-Z0-9_]+\b", path.read_text(encoding="utf-8")))
     return found
 
 
@@ -241,7 +254,16 @@ def test_every_documented_variable_exists(page: pathlib.Path) -> None:
     """
 
     documented = set(re.findall(r"\bEYVAN_[A-Z0-9_]+\b", page.read_text(encoding="utf-8")))
-    unknown = sorted(documented - _known_variables())
+    known = _known_variables()
+    # A name ending in an underscore is a family glob -- ``EYVAN_AWS_*`` stands
+    # for every variable carrying that prefix, and the glob exists when at least
+    # one member does. Forbidding the form would push prose toward enumerations
+    # that rot faster than the family they list.
+    unknown = sorted(
+        name
+        for name in documented
+        if name not in known and not (name.endswith("_") and any(variable.startswith(name) for variable in known))
+    )
 
     assert not unknown, f"{page.name} names variables the package does not spell: {', '.join(unknown)}"
 

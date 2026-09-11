@@ -13,13 +13,13 @@ deliberately does not cross.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from eyvan.records import CapacityPoolRecord, ResourceLimits, WarmWindow
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _pool(**updates) -> CapacityPoolRecord:

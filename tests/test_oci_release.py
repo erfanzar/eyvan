@@ -1303,7 +1303,7 @@ def test_eyvan_publish_is_tag_gated_trusted_publishing_without_a_secret() -> Non
     assert workflow["permissions"] == {"contents": "read"}
     publish = workflow["jobs"]["publish"]
     assert publish["environment"] == "pypi"
-    assert publish["permissions"] == {"contents": "read", "id-token": "write"}
+    assert publish["permissions"] == {"contents": "read", "id-token": "write", "attestations": "write"}
 
     checkout = publish["steps"][0]
     assert str(checkout["uses"]).startswith("actions/checkout@")
@@ -1313,7 +1313,8 @@ def test_eyvan_publish_is_tag_gated_trusted_publishing_without_a_secret() -> Non
     agreement_commands = agreement["run"]
     assert "pyproject.toml" in agreement_commands
     assert "GITHUB_REF_NAME" in agreement_commands
-    assert "github.event.inputs.version" in agreement_commands
+    assert agreement["env"]["REQUESTED_VERSION"] == "${{ github.event.inputs.version }}"
+    assert 'CLAIMED="$REQUESTED_VERSION"' in agreement_commands
     assert "but pyproject declares" in agreement_commands
 
     assert "uv publish --trusted-publishing always" in content

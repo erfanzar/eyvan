@@ -16,12 +16,58 @@ so no file reinvents (or skips) it.
 
 from __future__ import annotations
 
+import re
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 from postgres_fixture import postgres_url
 
 __all__ = ("postgres_url", "stop_local_daemons_recorded_under")
+
+# Bounded smoke coverage, not an alternative to the full integration gate.
+# Keep this selection explicit so adding slow integration work elsewhere does
+# not silently turn the default feedback loop into a multi-minute run.
+_FAST_MODULES = frozenset(
+    {
+        "test_scheduler.py",
+        "test_config_settings.py",
+        "test_provider_boundary.py",
+        "test_fleet_config.py",
+        "test_elastic_packing_preserves_feasible_subsets.py",
+        "test_dashboard_session_expiry.py",
+        "test_dashboard_cookie_csrf.py",
+        "test_dashboard_callback_input.py",
+    }
+)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Keep extended soak counts explicit instead of slowing every PR run."""
+
+    parser.addoption("--soak-iterations", type=int, default=10, help="repository soak cycles (1..10000)")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Label the documented smoke subset without skipping any full-suite test."""
+
+    for item in items:
+        if item.path.name in _FAST_MODULES:
+            item.add_marker(pytest.mark.fast)
+        for marker in item.iter_markers(name="quarantine"):
+            metadata = marker.kwargs
+            try:
+                if marker.args or set(metadata) != {"issue", "owner", "until"}:
+                    raise ValueError("requires issue, owner and until keyword arguments")
+                if not all(isinstance(value, str) and value.strip() for value in metadata.values()):
+                    raise ValueError("metadata must contain non-empty strings")
+                if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+/issues/[1-9][0-9]*", metadata["issue"]):
+                    raise ValueError("issue must name a GitHub tracking issue")
+                remaining = (date.fromisoformat(metadata["until"]) - datetime.now(UTC).date()).days
+                if not 0 <= remaining <= 14:
+                    raise ValueError("expiry must be today through 14 days from today (UTC)")
+            except (TypeError, ValueError) as error:
+                raise pytest.UsageError(f"{item.nodeid}: invalid quarantine: {error}") from error
 
 
 def stop_local_daemons_recorded_under(home: Path) -> None:

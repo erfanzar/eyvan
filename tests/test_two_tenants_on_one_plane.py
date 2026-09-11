@@ -161,6 +161,9 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
 #: Routes that carry no principal-scoped tenancy at all, each with the reason.
 EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/dashboard/config": "public OIDC discovery hints; no tenant data and no secret",
+    "GET /api/v1/dashboard/auth/login": "starts the OIDC redirect; names no tenant; sets the transaction cookie",
+    "GET /api/v1/dashboard/auth/callback": "completes sign-in; the code exchange is tenant-agnostic",
+    "POST /api/v1/dashboard/auth/logout": "drops the caller's own session cookie; reads nothing tenant-scoped",
     "GET /api/v1/session": "authenticated self-introspection; only the caller's resolved grants and scopes",
     "GET /api/v1/health": "liveness; no tenant data",
     "GET /api/v1/build": "what code this plane runs; authenticated because it fingerprints, but tenant-independent",

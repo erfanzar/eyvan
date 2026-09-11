@@ -3,16 +3,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+from datetime import UTC
+
 
 def test_dispatch_duration_is_named_where_the_stage_happened() -> None:
     """'dispatched' without its duration is a timestamp, not an answer."""
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from eyvan.records import AuditEvent
     from eyvan.sdk.timeline import timeline
 
-    base = datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
     events = [
         AuditEvent(
             id="evt_1",

@@ -107,7 +107,13 @@ def test_allocations_report_whether_tracking_was_already_running() -> None:
 def test_the_allocation_document_carries_the_flag_beside_the_sites() -> None:
     """Serialised together, so no caller can read the sites without the caveat."""
 
-    document = allocations_as_json()
-
-    assert "already_tracing" in document
-    assert isinstance(document["sites"], list)
+    was_tracing = tracemalloc.is_tracing()
+    try:
+        document = allocations_as_json()
+        assert "already_tracing" in document
+        assert isinstance(document["sites"], list)
+    finally:
+        # The production endpoint intentionally starts a persistent tracker;
+        # this test must not impose its allocation overhead on later tests.
+        if not was_tracing:
+            tracemalloc.stop()

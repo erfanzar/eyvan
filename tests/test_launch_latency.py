@@ -38,8 +38,6 @@ from eyvan.records import (
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 
-NOW = utcnow()
-
 
 def _admin() -> Principal:
     return Principal(subject="root", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
@@ -48,6 +46,10 @@ def _admin() -> Principal:
 def _cell(cell_id: str, *, pool: str, latencies: tuple[float, ...] = (), cooldown_s: float | None = None) -> CellRecord:
     from datetime import timedelta
 
+    # The cooldown is stamped when the fixture is built, not when the module is
+    # imported: the report compares it against the wall clock, and between
+    # collection-time import and this test's execution the window can quietly
+    # close (a slept machine alone is enough).
     return CellRecord(
         id=cell_id,
         provider="local",
@@ -59,7 +61,7 @@ def _cell(cell_id: str, *, pool: str, latencies: tuple[float, ...] = (), cooldow
         pool_id=pool,
         availability=CapacityBeliefState(
             provision_latencies_s=latencies,
-            cooldown_until=None if cooldown_s is None else NOW + timedelta(seconds=cooldown_s),
+            cooldown_until=None if cooldown_s is None else utcnow() + timedelta(seconds=cooldown_s),
         ),
     )
 

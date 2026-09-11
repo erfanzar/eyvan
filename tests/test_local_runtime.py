@@ -96,6 +96,14 @@ def test_runtime_import_and_native_resolution_do_not_import_ray(tmp_path: Path) 
     subprocess.run((sys.executable, "-c", code), check=True)
 
 
+def test_python_commands_use_the_local_executor_interpreter_without_activation(tmp_path: Path) -> None:
+    executor = LocalProcessExecutor(state_dir=tmp_path)
+    command = shlex.join(("python", "-c", f"import sys; assert sys.prefix == {sys.prefix!r}"))
+    remote_id = executor.submit(_spec(command, environment={"PATH": "/usr/bin:/bin"}), _context())
+    outcome = _wait_for(executor, remote_id, {ExecutionWorkloadStatus.SUCCEEDED, ExecutionWorkloadStatus.FAILED})
+    assert outcome is ExecutionWorkloadStatus.SUCCEEDED, executor.logs(remote_id)
+
+
 def test_detached_local_worker_startup_does_not_import_the_control_plane() -> None:
     """Keep a cold worker launch independent of API and provider imports.
 
@@ -617,3 +625,8 @@ def test_no_eyvan_module_imports_ray(tmp_path: Path) -> None:
         if re.search(r"^\s*(?:import ray\b|from ray[.\s])", path.read_text(encoding="utf-8"), re.MULTILINE)
     ]
     assert offenders == []
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

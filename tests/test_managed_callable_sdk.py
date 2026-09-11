@@ -650,3 +650,8 @@ def test_auto_resolve_without_a_matching_pool_raises_placement_error_not_type_er
     )
     assert [request.url.path for request in requests] == ["/api/v1/capacity"]
     raw.close()
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow
