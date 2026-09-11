@@ -15,10 +15,11 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_serializer, model_validator
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.compat import UTC, StrEnum
+from eyvan._internal.correlation_ids import CORRELATION_ID_WIRE_PATTERN
 from eyvan._internal.json_types import is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import (
@@ -334,7 +335,7 @@ class NativeRuntimeConfig(EyvanModel):
             return None
         parts = value.split(".")
         if len(parts) != 2 or not all(part.isdigit() for part in parts):
-            raise ValueError("runtime python must be a 'major.minor' version such as '3.10'")
+            raise ValueError("runtime python must be a 'major.minor' version such as '3.11'")
         return value
 
     @property
@@ -774,8 +775,10 @@ def scale_resources(resources: ResourceVectorT, multiplier: int) -> ResourceVect
 class ResourceHours(ResourceLimits):
     """Fractional resource-time quantities used only for accounting."""
 
-    gpu: float = Field(default=0, ge=0)
-    tpu: float = Field(default=0, ge=0)
+    # Widening int -> float is deliberate (whole-worker counts vs. fractional
+    # hours); mypy flags the override because the base fields are int.
+    gpu: float = Field(default=0, ge=0)  # type: ignore[assignment]
+    tpu: float = Field(default=0, ge=0)  # type: ignore[assignment]
 
 
 def normalize_resource_hours(value: tp.Any) -> tp.Any:
@@ -3246,6 +3249,14 @@ class OutboxRecord(EyvanModel):
     failure_code: CapacityProviderFailureCode | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+    correlation_id: str | None = Field(default=None, pattern=CORRELATION_ID_WIRE_PATTERN)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.correlation_id is None:
+            document.pop("correlation_id", None)
+        return document
 
 
 class WorkloadProgressPhase(StrEnum):

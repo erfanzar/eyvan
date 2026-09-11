@@ -11,10 +11,11 @@ import re
 import typing as tp
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.correlation_ids import CORRELATION_ID_WIRE_PATTERN
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, ExecutionWorkloadStatus
 from eyvan.records import MAX_CELL_STAGE_ASSET_LENGTH
@@ -109,6 +110,14 @@ class MutationModel(AgentModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
     generation: int = Field(ge=0)
     fencing_token: str = Field(min_length=1, max_length=512)
+    correlation_id: str | None = Field(default=None, pattern=CORRELATION_ID_WIRE_PATTERN)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.correlation_id is None:
+            document.pop("correlation_id", None)
+        return document
 
 
 class CapacityRequest(AgentModel):

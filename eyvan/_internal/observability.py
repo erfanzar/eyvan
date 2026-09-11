@@ -113,13 +113,20 @@ def trace_span(name: str, **attributes: AttributeValue) -> contextlib.AbstractCo
         from opentelemetry import trace
     except ImportError:
         return contextlib.nullcontext()
-    span = trace.get_tracer("eyvan").start_as_current_span(name)
+    span = trace.get_tracer("eyvan").start_as_current_span(name, record_exception=False, set_status_on_exception=False)
 
     @contextlib.contextmanager
     def scoped() -> tp.Iterator[Span]:
         with span as active:
             for key, value in attributes.items():
                 active.set_attribute(key, value)
-            yield active
+            try:
+                yield active
+            except BaseException as error:
+                # Provider exception messages can contain URLs, credentials or
+                # SQL parameters. Keep the failure signal without exporting them.
+                active.set_status(trace.Status(trace.StatusCode.ERROR))
+                active.set_attribute("error.type", type(error).__name__)
+                raise
 
     return scoped()

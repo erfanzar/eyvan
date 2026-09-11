@@ -392,6 +392,8 @@ class MutationContext:
     idempotency_key: str
     generation: int
     fencing_token: str
+    #: Observability only; never part of ownership or idempotency decisions.
+    correlation_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -34,6 +34,11 @@ def _csv(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+def _optional_path(name: str) -> Path | None:
+    raw = os.getenv(name)
+    return Path(raw).expanduser() if raw else None
+
+
 class RepositoryBackend(StrEnum):
     """Supported control-plane persistence backends."""
 
@@ -54,7 +59,11 @@ def _repository_backend(value: str) -> RepositoryBackend:
 class EyvanSettings:
     """Runtime settings shared by the API, scheduler, and cell agent."""
 
-    database_url: str = "postgresql+asyncpg://eyvan:eyvan@127.0.0.1:5432/eyvan"
+    # Loopback-development default, password-less on purpose: a static shipped
+    # credential would be one every installation shares, and the local default
+    # relies on the host's trust/peer auth. Any real deployment sets
+    # EYVAN_DATABASE_URL (or a secret reference) with its own credentials.
+    database_url: str = "postgresql+asyncpg://eyvan@127.0.0.1:5432/eyvan"
     # The in-memory backend is a loopback development default; eyvan.server.api.server_startup refuses to
     # start a network-bound server unless EYVAN_REPOSITORY_BACKEND=postgres is set explicitly.
     repository_backend: RepositoryBackend = RepositoryBackend.MEMORY
@@ -62,6 +71,13 @@ class EyvanSettings:
     auto_create_schema: bool = False
     controller_enabled: bool = True
     public_url: str = "http://127.0.0.1:8080"
+    #: TLS material for the API server's listener. A network-bound bind refuses
+    #: to start without both files (or an explicit insecure opt-in), because
+    #: OIDC bearer tokens, bootstrap credentials, and capability tokens would
+    #: otherwise cross the network in cleartext. Loopback binds are unaffected.
+    tls_cert_file: Path | None = None
+    tls_key_file: Path | None = None
+    allow_insecure_plaintext_bind: bool = False
     oidc_issuer: str | None = None
     #: Possession-based identity for a head that has no issuer yet. Unlike
     #: dev auth it trusts a generated secret, not a caller-supplied header.
@@ -74,6 +90,10 @@ class EyvanSettings:
     #: meant one image could serve exactly one identity provider.
     oidc_dashboard_client_id: str | None = None
     dev_auth_enabled: bool = False
+    #: Opt-in durable security audit; false preserves the existing event stream.
+    auth_audit_enabled: bool = False
+    #: Opt-in correlation envelopes/headers; disabled preserves legacy wire shapes.
+    correlation_enabled: bool = False
     # Unset accepts every client. See eyvan._internal.client_version for why the gate is one-sided.
     min_client_version: str | None = None
     trusted_callable_projects: tuple[str, ...] = ()
@@ -128,6 +148,11 @@ class EyvanSettings:
     outbox_retention_s: int = 7 * 24 * 3600
     audit_retention_s: int = 90 * 24 * 3600
     idempotency_retention_s: int = 30 * 24 * 3600
+    #: Backend-for-frontend dashboard sessions: how long an ``eyvan_session``
+    #: cookie stays valid, and how long a half-finished sign-in transaction is
+    #: kept before the identity provider's redirect must be restarted.
+    dashboard_session_ttl_s: int = 8 * 3600
+    dashboard_auth_transaction_ttl_s: int = 600
     #: How old the externally measured P8 sample may be and still be published
     #: as ``p8_evidence``. Past it the soak route reports ``null`` again, which
     #: is what a dead monitor should read as: a sample from an hour ago is the
@@ -439,6 +464,10 @@ class EyvanSettings:
             raise ValueError("outbox_dispatch_concurrency must be positive")
         if self.outbox_claim_ttl_s <= 0:
             raise ValueError("outbox_claim_ttl_s must be positive")
+        if self.dashboard_session_ttl_s <= 0:
+            raise ValueError("dashboard_session_ttl_s must be positive")
+        if self.dashboard_auth_transaction_ttl_s <= 0:
+            raise ValueError("dashboard_auth_transaction_ttl_s must be positive")
         for name in ("outbox_retention_s", "audit_retention_s", "idempotency_retention_s"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative; use 0 to disable pruning")
@@ -583,6 +612,12 @@ class EyvanSettings:
             native_worker_public_ingress_tag=profile.native_worker_public_ingress_tag,
         )
 
+    @property
+    def tls_enabled(self) -> bool:
+        """Return whether both TLS material pieces are configured."""
+
+        return self.tls_cert_file is not None and self.tls_key_file is not None
+
     @classmethod
     def from_env(cls) -> EyvanSettings:
         """Load settings from ``EYVAN_*`` environment variables."""
@@ -601,12 +636,19 @@ class EyvanSettings:
             auto_create_schema=truthy("EYVAN_AUTO_CREATE_SCHEMA"),
             controller_enabled=truthy("EYVAN_CONTROLLER_ENABLED", defaults.controller_enabled),
             public_url=os.getenv("EYVAN_PUBLIC_URL", defaults.public_url),
+            tls_cert_file=_optional_path("EYVAN_TLS_CERT_FILE"),
+            tls_key_file=_optional_path("EYVAN_TLS_KEY_FILE"),
+            allow_insecure_plaintext_bind=truthy(
+                "EYVAN_INSECURE_PLAINTEXT_BIND", defaults.allow_insecure_plaintext_bind
+            ),
             oidc_issuer=os.getenv("EYVAN_OIDC_ISSUER"),
             bootstrap_token=os.getenv("EYVAN_BOOTSTRAP_TOKEN"),
             oidc_dashboard_client_id=os.getenv("EYVAN_OIDC_DASHBOARD_CLIENT_ID"),
             oidc_audience=os.getenv("EYVAN_OIDC_AUDIENCE", defaults.oidc_audience),
             oidc_jwks_url=os.getenv("EYVAN_OIDC_JWKS_URL"),
             dev_auth_enabled=truthy("EYVAN_DEV_AUTH_ENABLED"),
+            auth_audit_enabled=truthy("EYVAN_AUTH_AUDIT_ENABLED", defaults.auth_audit_enabled),
+            correlation_enabled=truthy("EYVAN_CORRELATION_ENABLED", defaults.correlation_enabled),
             min_client_version=os.getenv("EYVAN_MIN_CLIENT_VERSION") or None,
             trusted_callable_projects=_csv(os.getenv("EYVAN_TRUSTED_CALLABLE_PROJECTS", "")),
             artifact_store_uri=os.getenv("EYVAN_ARTIFACT_STORE_URI", defaults.artifact_store_uri),
@@ -642,6 +684,10 @@ class EyvanSettings:
             outbox_retention_s=int(os.getenv("EYVAN_OUTBOX_RETENTION_S", defaults.outbox_retention_s)),
             audit_retention_s=int(os.getenv("EYVAN_AUDIT_RETENTION_S", defaults.audit_retention_s)),
             idempotency_retention_s=int(os.getenv("EYVAN_IDEMPOTENCY_RETENTION_S", defaults.idempotency_retention_s)),
+            dashboard_session_ttl_s=int(os.getenv("EYVAN_DASHBOARD_SESSION_TTL_S", defaults.dashboard_session_ttl_s)),
+            dashboard_auth_transaction_ttl_s=int(
+                os.getenv("EYVAN_DASHBOARD_AUTH_TRANSACTION_TTL_S", defaults.dashboard_auth_transaction_ttl_s)
+            ),
             soak_evidence_max_age_s=float(os.getenv("EYVAN_SOAK_EVIDENCE_MAX_AGE_S", defaults.soak_evidence_max_age_s)),
             plane_id=os.getenv("EYVAN_PLANE_ID", defaults.plane_id),
             kubernetes_namespace=os.getenv("EYVAN_KUBERNETES_NAMESPACE", defaults.kubernetes_namespace),
