@@ -582,34 +582,39 @@ def _profile_aware_supervisor(tmp_path: Path, health: HealthResponses) -> LocalD
     )
 
 
-def test_stale_pid_record_is_named_as_stale_not_as_a_profile_mismatch(tmp_path: Path) -> None:
-    """A record naming a dead pid must say so, not blame the runtime profile.
-
-    All three ownership failures reported "not owned by the selected native GCP
-    runtime profile". For a stale record that sentence is simply false, and it
-    sent the operator hunting a profile problem that did not exist -- the only
-    way forward was hand-editing the record's JSON.
-    """
+@pytest.mark.parametrize("mismatch", [None, "profile", "endpoint"], ids=["matching", "other-profile", "other-endpoint"])
+def test_stale_owner_record_respects_endpoint_and_profile(tmp_path: Path, monkeypatch, mismatch) -> None:
+    """Preserve intentional healthy-listener reuse without relying on /tmp aliases."""
 
     endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:8123")
+    profile = (tmp_path / "profile.json").resolve()
+    recorded_profile = profile if mismatch != "profile" else profile.with_name("other-profile.json")
+    recorded_endpoint = endpoint if mismatch != "endpoint" else ControlPlaneEndpoint.parse("http://127.0.0.1:8124")
     supervisor = _profile_aware_supervisor(tmp_path, HealthResponses([True]))
+    monkeypatch.setattr("eyvan.server.local.daemon.process_is_alive", lambda _pid: False)
     record_path = supervisor.paths.record_path(_target(endpoint.url))
     record_path.parent.mkdir(parents=True, exist_ok=True)
-    # A pid that cannot be running: process 0 is never a live user process, and
-    # os.kill(0, 0) would signal our own process group rather than probe it.
     write_owner_only_record(
         record_path,
-        LocalDaemonRecord(endpoint=endpoint, pid=2**31 - 1, runtime_profile_path="/tmp/profile.json"),
+        LocalDaemonRecord(endpoint=recorded_endpoint, pid=2**31 - 1, runtime_profile_path=str(recorded_profile)),
     )
+    original_record = record_path.read_bytes()
 
-    with pytest.raises(LocalDaemonConfigurationError) as excinfo:
-        supervisor.ensure(endpoint, runtime_profile_path=Path("/tmp/profile.json"))
-
-    message = str(excinfo.value)
-    assert "is not running" in message
-    assert str(record_path) in message
-    assert "stale" in message
-    assert "not owned by the selected native GCP runtime profile" not in message
+    if mismatch is None:
+        result = supervisor.ensure(endpoint, runtime_profile_path=profile)
+        assert result.state is LocalDaemonState.REUSED
+        assert result.endpoint == endpoint and result.pid is None
+    else:
+        with pytest.raises(LocalDaemonConfigurationError) as excinfo:
+            supervisor.ensure(endpoint, runtime_profile_path=profile)
+        message = str(excinfo.value)
+        assert str(record_path) in message
+        if mismatch == "profile":
+            assert "is not running" in message
+            assert "different runtime profile" in message
+        else:
+            assert "names endpoint" in message and recorded_endpoint.url in message
+    assert record_path.read_bytes() == original_record, "reuse/refusal must not invent PID ownership"
 
 
 def test_absent_pid_record_names_the_path_it_looked_for(tmp_path: Path) -> None:

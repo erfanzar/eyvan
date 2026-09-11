@@ -151,8 +151,22 @@ async def test_late_dispatch_response_preserves_the_new_claim_owner(repository, 
                 settings=controller_settings,
                 agent_factory=lambda _cell: held,
             )
+            renewal_allowed = asyncio.Event()
+            renewal_attempts = 0
             if lose_renewal:
-                # Accelerate only the polling cadence; renewal still checks real durable ownership.
+                # Gate the accelerated heartbeat until the deliberate expiry is committed.
+                # Otherwise it races admission's serializable transaction on PostgreSQL,
+                # testing an unrelated serialization conflict instead of claim refusal.
+                real_renewal = first._renew_outbox_claim
+
+                async def renew_after_expiry(command):
+                    nonlocal renewal_attempts
+                    if renewal_attempts:
+                        await renewal_allowed.wait()
+                    renewal_attempts += 1
+                    return await real_renewal(command)
+
+                monkeypatch.setattr(first, "_renew_outbox_claim", renew_after_expiry)
                 monkeypatch.setattr(first, "_outbox_claim_heartbeat_s", lambda: 0.02)
             second = ObservedDispatchController(
                 repository,
@@ -177,7 +191,10 @@ async def test_late_dispatch_response_preserves_the_new_claim_owner(repository, 
                 async with repository.transaction() as tx:
                     await tx.put_outbox(command.model_copy(update={"claimed_until": utcnow() - timedelta(seconds=1)}))
                 if lose_renewal:
+                    assert renewal_attempts == 1, "heartbeat must not race admission or deliberate expiry"
+                    renewal_allowed.set()
                     assert await asyncio.wait_for(delivery, 8) == 1
+                    assert renewal_attempts == 2, "the real renewal must inspect and refuse the expired claim"
                     assert first.inner_dispatch is not None and not first.inner_dispatch.done()
                     assert not first.inner_finished.is_set() and not held.returned.is_set()
                     assert native.status(remote_id).status is ExecutionWorkloadStatus.RUNNING
@@ -208,6 +225,7 @@ async def test_late_dispatch_response_preserves_the_new_claim_owner(repository, 
                 assert not any(event.action == "lease.settled" for event in winner["events"])
                 assert winner["cells"] == initial["cells"]
             finally:
+                renewal_allowed.set()
                 held.release.set()
                 try:
                     await _drain_dispatch(first, delivery)
