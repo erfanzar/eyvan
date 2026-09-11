@@ -224,7 +224,7 @@ def _utc(value: Any, context: str) -> dt.datetime:
     if not UTC_RE.fullmatch(text):
         _fail(f"{context} must be second-precision UTC in YYYY-MM-DDTHH:MM:SSZ form")
     try:
-        parsed = dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        parsed = dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
     except ValueError as error:
         _fail(f"{context} is not a valid UTC timestamp: {error}")
     return parsed
@@ -242,7 +242,7 @@ def _rfc3339_utc(value: Any, context: str) -> dt.datetime:
 
 def _parse_now(value: str | None) -> dt.datetime:
     if value is None:
-        return dt.datetime.now(dt.timezone.utc)
+        return dt.datetime.now(dt.UTC)
     return _utc(value, "--now")
 
 
@@ -429,6 +429,7 @@ def _validate_release_lock(path: Path, *, repository_root: Path | None = None) -
     actions = _exact_keys(
         lock["actions"],
         {
+            "attestBuildProvenance",
             "buildPush",
             "checkout",
             "downloadArtifact",
@@ -467,6 +468,7 @@ def _validate_release_lock(path: Path, *, repository_root: Path | None = None) -
 
 def _validate_workflow_pins(repository_root: Path, lock: dict[str, Any]) -> None:
     expected = {
+        "actions/attest-build-provenance": lock["actions"]["attestBuildProvenance"],
         "actions/checkout": lock["actions"]["checkout"],
         "actions/download-artifact": lock["actions"]["downloadArtifact"],
         "actions/upload-artifact": lock["actions"]["uploadArtifact"],
