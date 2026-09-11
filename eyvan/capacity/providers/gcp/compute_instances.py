@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import time
 import typing as tp
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -333,7 +335,7 @@ def normalize_compute_config(desired: tp.Mapping[str, ProviderOptionValue]) -> C
     minimum_disk_size = 40 if gpu_type or tpu_type else 10
     if isinstance(raw_disk_size, bool) or not isinstance(raw_disk_size, int) or raw_disk_size < minimum_disk_size:
         raise ValueError(f"Compute option 'boot_disk_size_gb' must be an integer of at least {minimum_disk_size}")
-    internal_ip_only = options.get("internal_ip_only", True)
+    internal_ip_only = options.get("internal_ip_only", False)
     if not isinstance(internal_ip_only, bool):
         raise ValueError("Compute option 'internal_ip_only' must be a boolean")
     maintenance_policy = _string(options.get("maintenance_policy"), "maintenance_policy", optional=True)
@@ -425,7 +427,7 @@ class ComputeInstanceSpec:
     labels: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
     startup_script: str | None = None
-    internal_ip_only: bool = True
+    internal_ip_only: bool = False
     maintenance_policy: str | None = None
     reservation: str | None = None
 
@@ -523,8 +525,14 @@ def _runner(args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
 class GcloudNativeWorkerSecretStore:
     """Create, rotate, and delete cell-scoped native-worker Secret Manager values."""
 
+    #: Permissions every eyvan-native bootstrap needs on the target project.
+    #: ``create`` covers the cell-scoped secret; ``setIamPolicy`` covers the
+    #: reader binding. Both are exercised by ``ensure`` on every new cell.
+    _BIND_PERMISSIONS = ("secretmanager.secrets.create", "secretmanager.secrets.setIamPolicy")
+
     def __init__(self, *, runner: Runner = _runner):
         self._runner = runner
+        self._preflight_ok: set[str] = set()
 
     def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
         """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
@@ -556,6 +564,65 @@ class GcloudNativeWorkerSecretStore:
         ):
             raise GcloudError(f"secret {secret_id!r} is not owned by this Eyvan cell")
 
+    def caller_bind_state(self, *, project: str) -> tuple[bool, str | None]:
+        """Return ``(allowed, denial)`` for binding cell secrets in ``project``.
+
+        ``(True, None)`` means every required permission is held. ``(False,
+        message)`` names the missing permissions and the grant that fixes
+        them. ``(False, None)`` means the state is unknown — no token, or the
+        API was unreachable — and by this project's rule unknown is reported
+        as unknown, never as allowed.
+
+        The check is a read-only project ``testIamPermissions`` request to
+        Cloud Resource Manager. Secret Manager exposes that method on secrets,
+        not on projects; using its project path silently produced an unknown
+        result instead of a useful preflight.
+        """
+
+        if project in self._preflight_ok:
+            return True, None
+        token_result = self._run(("auth", "print-access-token"))
+        token = (token_result.stdout or "").strip()
+        if token_result.returncode != 0 or not token:
+            return False, None
+        request = urllib.request.Request(
+            f"https://cloudresourcemanager.googleapis.com/v1/projects/{project}:testIamPermissions",
+            data=json.dumps({"permissions": list(self._BIND_PERMISSIONS)}).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            return False, None
+        allowed = decoded.get("permissions") if is_json_object(decoded) else None
+        missing = [permission for permission in self._BIND_PERMISSIONS if not (allowed and permission in allowed)]
+        if missing:
+            return False, (
+                "the active gcloud account cannot bind native-worker secrets in project "
+                f"{project!r} (missing: {', '.join(missing)}). Eyvan-native bootstrap needs a one-time "
+                "grant; ask a project owner to run: gcloud projects add-iam-policy-binding "
+                f"{project} --member=user:<your-account> --role=roles/secretmanager.admin — "
+                "or authenticate as a principal that already holds it (for example a project "
+                "owner). Non-native executors are unaffected."
+            )
+        self._preflight_ok.add(project)
+        return True, None
+
+    def ensure_caller_can_bind(self, *, project: str) -> None:
+        """Fail fast when the active gcloud account cannot bind cell secrets.
+
+        ``ensure`` calls this before creating anything. When the state is
+        unknown (no token, API unreachable), it stays silent and lets
+        ``ensure`` fail closed with the provider's own diagnostic — the one
+        rule that must survive every refactor of this check.
+        """
+
+        _allowed, denial = self.caller_bind_state(project=project)
+        if denial is not None:
+            raise GcloudError(denial)
+
     def ensure(
         self,
         *,
@@ -566,6 +633,7 @@ class GcloudNativeWorkerSecretStore:
     ) -> str:
         """Ensure a cell-owned secret contains ``value`` and the VM can read it."""
 
+        self.ensure_caller_can_bind(project=project)
         secret_id = native_worker_secret_id(management_uid)
         existing = self._describe(secret_id, project=project)
         if existing is None:

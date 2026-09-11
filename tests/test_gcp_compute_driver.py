@@ -853,3 +853,8 @@ def test_a_new_provider_generation_still_invalidates_it(tmp_path) -> None:
     second = FleetCellRecord(name="tpu-cell", project="p", zone="z", provider_generation=2)
 
     assert driver._bootstrap_key(first) != driver._bootstrap_key(second)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

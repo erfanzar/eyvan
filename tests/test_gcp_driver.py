@@ -1258,3 +1258,8 @@ def test_a_cell_whose_listing_holds_only_sibling_ids_is_not_recreated(tmp_path) 
 
     assert observation.state is CapacityStatus.WAITING
     assert "disowned_incarnations" not in observation.metadata
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

@@ -724,3 +724,8 @@ def test_a_newer_incarnation_may_drain_an_older_one(tmp_path) -> None:
     owner.mutate_or_create_record("cell-a", claim)
 
     assert owner.drain_record("cell-a", 8, "token-8", lambda record: None) is not None
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

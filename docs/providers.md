@@ -25,19 +25,48 @@ reached. Nothing else. The core never learns your cloud's name.
 
 ## 2. Turning it on
 
-Install the package into the plane's environment and enable it through the
-capacity backend selection (`EYVAN_CAPACITY_BACKEND`) or the fleet config's
-provider block. A fleet then references your backend; pools appear in
-`eyvan capacity list` once quota/fleet state says they exist.
+Install the package into the environment that creates the capacity driver.
+Publish a named entry point in the `eyvan.capacity_providers` group, then
+explicitly allow its entry-point name in `EYVAN_CAPACITY_PROVIDER_PLUGINS`
+(comma-separated). Discovery is **off by default**: installing a distribution
+or selecting a backend alone does not authorize importing its plugin code.
+`*` trusts every advertised plugin and should not be used where dependencies
+are not equally trusted. Plugin code runs inside the host process, not a sandbox.
+
+Select an advertised backend with `EYVAN_CAPACITY_BACKEND` or the fleet's
+capacity-backend configuration. Pools appear in `eyvan capacity list` once
+quota/fleet state says they exist. Import failures, missing allowed plugins,
+invalid contracts and backend-name collisions are reported; plugins cannot
+silently replace built-in backends.
 
 ## 3. The version contract
 
-Providers declare versions; the plane records which provider version served
-each cell and workload. Receipts are tied to the exact candidate — a proof
-run against provider X vN says nothing about vN+1. Keep the conformance
-suite green per release; it is the qualification surface for this contract,
-and it is deliberately harsher than unit tests (it found ownership bugs in
-`aws-ec2` that its own tests missed).
+The extension ABI is **1.0**, declared by
+`CAPACITY_PROVIDER_ABI_VERSION` in `eyvan/capacity/drivers/registry.py`.
+The entry point resolves to an object satisfying `CapacityProviderPlugin`
+(in `eyvan/capacity/drivers/base.py`), which may simply be a module with:
+
+- `abi_version`: a `"MAJOR.MINOR"` string;
+- `backend_names`: the backend names the plugin serves;
+- `create(name, *, state, settings)`: a factory returning a `CapacityDriver`.
+
+No base-class inheritance is required. Keep the ABI declaration importable
+without importing Eyvan; import driver dependencies inside `create` where
+necessary. A different major version or a newer minor version is refused,
+not silently adapted. An older minor within the same major is accepted.
+`validate_provider_plugin` in the registry exposes the same contract gate
+used by discovery. Changes that withdraw guarantees or change signatures
+require a major ABI change; additive guarantees require a minor change.
+
+The ABI version is **not** the provider distribution's release version, and
+this interface does not guarantee automatic persistence of a provider package
+version on every cell or workload. Record package/build identity explicitly
+in qualification receipts: a proof run against provider X vN says nothing
+about vN+1. Discovery/version-policy regressions live in
+`tests/test_provider_abi.py`; behavioral qualification lives in
+`tests/test_provider_abi_conformance.py` and the per-provider ABI suites.
+Keep these checks green per release; they do not replace real-provider
+ownership, fencing and cleanup validation.
 
 ## 4. What Eyvan guarantees to you
 

@@ -1653,7 +1653,7 @@ class GcpComputeCapacityDriver(GcpTpuCapacityDriver):
                 "eyvan-native Compute capacity requires provider_options.bootstrap_egress "
                 f"(one of: {bootstrap_egress_choices()})"
             )
-        if config.get("internal_ip_only", True) and egress == "public-internet":
+        if config["internal_ip_only"] and egress == "public-internet":
             raise ValueError("internal-only eyvan-native Compute capacity cannot use bootstrap_egress=public-internet")
         endpoint_mode = self._configure_native_worker_public_ingress(
             record,

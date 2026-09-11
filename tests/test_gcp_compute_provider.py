@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import replace
 
 import pytest
@@ -198,6 +200,12 @@ def test_compute_config_rejects_invalid_tpu_options(options: dict, message: str)
         normalize_compute_config({"machine_type": "ct5p-hightpu-4t", **options})
 
 
+@pytest.mark.parametrize("machine_type", ["c4-standard-8", "g2-standard-8", "ct5p-hightpu-4t"])
+def test_compute_networking_defaults_to_public_but_preserves_explicit_private_configuration(machine_type: str) -> None:
+    assert normalize_compute_config({"machine_type": machine_type})["internal_ip_only"] is False
+    assert normalize_compute_config({"machine_type": machine_type, "internal_ip_only": True})["internal_ip_only"] is True
+
+
 def test_compute_instance_spec_rejects_mixed_gpu_and_tpu_accelerators() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         replace(spec(), tpu_type="ct5p", tpu_count=4)
@@ -215,7 +223,8 @@ def test_compute_args_are_deterministic_for_cpu_gpu_tpu_and_spot() -> None:
     assert gpu_args[gpu_args.index("--provisioning-model") + 1] == "SPOT"
     assert gpu_args[gpu_args.index("--instance-termination-action") + 1] == "DELETE"
     assert gpu_args[gpu_args.index("--maintenance-policy") + 1] == "TERMINATE"
-    assert "--no-address" in gpu_args
+    assert "--no-address" not in gpu_args
+    assert "--no-address" in replace(spec(), internal_ip_only=True).create_args()
     assert "--accelerator" not in cpu_args
     assert "--provisioning-model" not in cpu_args
     assert "--accelerator" not in tpu_args
@@ -283,6 +292,10 @@ def test_native_worker_secret_store_scopes_a_rotated_token_to_the_vm_service_acc
         nonlocal stored_value
         command = tuple(args)
         calls.append(command)
+        if command[:2] == ("auth", "print-access-token"):
+            # No usable credential in this test: the bind preflight must treat
+            # the check as unknown and stay silent rather than fail the run.
+            return result(1, stderr="no active account")
         if command[:2] == ("secrets", "describe"):
             return result(1, stderr="NOT_FOUND")
         if command[:2] == ("secrets", "create"):
@@ -314,7 +327,10 @@ def test_native_worker_secret_store_scopes_a_rotated_token_to_the_vm_service_acc
 
 def test_native_worker_secret_store_refuses_a_foreign_secret() -> None:
     def runner(args):
-        assert tuple(args[:2]) == ("secrets", "describe")
+        command = tuple(args)
+        if command[:2] == ("auth", "print-access-token"):
+            return result(1, stderr="no active account")
+        assert command[:2] == ("secrets", "describe")
         return result(stdout=json.dumps({"labels": {"eyvan-managed": "true", "eyvan-uid": "foreign"}}))
 
     with pytest.raises(GcloudError, match="not owned"):
@@ -324,6 +340,145 @@ def test_native_worker_secret_store_refuses_a_foreign_secret() -> None:
             value="worker-token",
             reader_service_account="eyvan-worker@project-a.iam.gserviceaccount.com",
         )
+
+
+def test_native_worker_secret_store_fails_fast_when_the_account_cannot_bind_secrets(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        command = tuple(args)
+        calls.append(command)
+        if command[:2] == ("auth", "print-access-token"):
+            return result(stdout="fake-access-token\n")
+        raise AssertionError(command)
+
+    class _Denied:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"permissions": ["secretmanager.secrets.create"]}).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Denied())
+
+    store = GcloudNativeWorkerSecretStore(runner=runner)
+    with pytest.raises(GcloudError, match="cannot bind native-worker secrets") as error:
+        store.ensure(
+            project="project-a",
+            management_uid=UID,
+            value="worker-token",
+            reader_service_account="eyvan-worker@project-a.iam.gserviceaccount.com",
+        )
+
+    message = str(error.value)
+    assert "secretmanager.secrets.setIamPolicy" in message
+    assert "roles/secretmanager.admin" in message
+    assert "project-a" in message
+    # The check is read-only: no secret is created or modified before it fails.
+    assert not any(command[:2] == ("secrets", "create") for command in calls)
+
+
+def test_native_worker_secret_store_allows_a_project_that_passes_the_permission_check(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        command = tuple(args)
+        calls.append(command)
+        if command[:2] == ("auth", "print-access-token"):
+            return result(stdout="fake-access-token\n")
+        if command[:2] == ("secrets", "describe"):
+            return result(1, stderr="NOT_FOUND")
+        return result()
+
+    class _Allowed:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"permissions": ["secretmanager.secrets.create", "secretmanager.secrets.setIamPolicy"]}
+            ).encode("utf-8")
+
+    urlopen_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: urlopen_calls.append(tuple(args)) or _Allowed(),
+    )
+
+    store = GcloudNativeWorkerSecretStore(runner=runner)
+    for management_uid in (UID, "fedcba9876543210fedcba9876543210"):
+        store.ensure(
+            project="project-a",
+            management_uid=management_uid,
+            value="worker-token",
+            reader_service_account="eyvan-worker@project-a.iam.gserviceaccount.com",
+        )
+
+    # A passing project is preflighted once per process, not once per cell.
+    assert len(urlopen_calls) == 1
+    assert any(command[:2] == ("secrets", "create") for command in calls)
+
+
+def test_project_bind_permissions_are_checked_on_the_project_iam_api(monkeypatch) -> None:
+    import io
+
+    def project_api(request, **_kwargs):
+        if request.full_url != "https://cloudresourcemanager.googleapis.com/v1/projects/project-a:testIamPermissions":
+            raise urllib.error.URLError("this API does not expose project-level IAM checks")
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "permissions": [
+                        "secretmanager.secrets.create",
+                        "secretmanager.secrets.setIamPolicy",
+                    ]
+                }
+            ).encode()
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", project_api)
+    store = GcloudNativeWorkerSecretStore(runner=lambda _args: result(stdout="fake-access-token"))
+    assert store.caller_bind_state(project="project-a") == (True, None)
+
+
+def test_native_worker_secret_store_treats_an_unreachable_permission_check_as_unknown(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        command = tuple(args)
+        calls.append(command)
+        if command[:2] == ("auth", "print-access-token"):
+            return result(stdout="fake-access-token\n")
+        if command[:2] == ("secrets", "describe"):
+            return result(1, stderr="NOT_FOUND")
+        return result()
+
+    def unreachable(*args, **kwargs):
+        raise urllib.error.URLError("no route to secretmanager.googleapis.com")
+
+    monkeypatch.setattr(urllib.request, "urlopen", unreachable)
+
+    resource = GcloudNativeWorkerSecretStore(runner=runner).ensure(
+        project="project-a",
+        management_uid=UID,
+        value="worker-token",
+        reader_service_account="eyvan-worker@project-a.iam.gserviceaccount.com",
+    )
+
+    assert resource.endswith("/versions/latest")
+    # Unknown is not "denied": bootstrap proceeds and its own diagnostics apply.
+    assert any(command[:2] == ("secrets", "create") for command in calls)
 
 
 def test_native_worker_artifact_access_store_grants_only_read_and_create_roles() -> None:

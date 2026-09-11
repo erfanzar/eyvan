@@ -219,3 +219,8 @@ def test_the_harness_leaks_something_the_cell_will_actually_disown(harness) -> N
     # Generation 99 can never collide with a cell that has not applied yet.
     assert "cell-a-r99" in provider.live["cell-a"]
     assert driver.state.get("cell-a") is None
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

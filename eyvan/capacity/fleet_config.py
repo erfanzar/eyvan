@@ -791,6 +791,15 @@ class EyvanFleetConfig(FleetConfigModel):
                         f"node type {name!r} requires provider_options.bootstrap_egress for eyvan-native bootstrap "
                         f"(one of: {bootstrap_egress_choices()})"
                     )
+                private_option = "internal_ip_only" if compute_capacity else "internal_ips"
+                egress = options["bootstrap_egress"].lower().replace("_", "-")
+                if options.get(private_option, False) and egress == "public-internet":
+                    raise ValueError(
+                        f"node type {name!r} cannot combine provider_options.{private_option}=true with "
+                        "bootstrap_egress=public-internet; set it to false for a public IP, or keep it true "
+                        "and select cloud-nat (requires configured NAT) or private-google-access "
+                        "(requires staged dependencies)"
+                    )
             runtime = self._resolved_runtime(node_type)
             if not runtime.is_empty and executor != "eyvan-native":
                 raise ValueError(f"node type {name!r} runtime requires executor eyvan-native")
