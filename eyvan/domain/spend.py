@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import typing as tp
 from dataclasses import dataclass
+from decimal import Decimal
+
+from eyvan.domain import costing
 
 #: Resource dimensions billed per accelerator-hour, in the order they are read.
 _ACCELERATOR_DIMENSIONS: tuple[str, ...] = ("tpu", "gpu")
@@ -79,16 +82,20 @@ def spend_of(leases: tp.Sequence[tp.Mapping[str, object]], *, priced_cells: tp.C
         estimate.
     """
 
-    hours: dict[str, float] = {}
-    settled = 0.0
-    reserved = 0.0
+    # Sum persisted decimal values before returning to JSON floats. Rounding
+    # each contribution would discard valid tiny measurements, while binary
+    # addition would reintroduce drift already avoided during settlement.
+    zero = Decimal(0)
+    hours: dict[str, Decimal] = {}
+    settled = zero
+    reserved = zero
     priced = bool(leases) and priced_cells is not None
     for lease in leases:
         measured = lease.get("accelerator_hours_settled")
         if isinstance(measured, dict):
             for dimension, value in measured.items():
                 if isinstance(value, int | float) and not isinstance(value, bool):
-                    hours[str(dimension)] = hours.get(str(dimension), 0.0) + float(value)
+                    hours[str(dimension)] = hours.get(str(dimension), zero) + costing.money(value)
         # Settlement moves a lease's cost into ``settled_cost`` but leaves the
         # original ``reserved_cost`` standing on the record. That estimate is no
         # longer money held, so only leases that have not settled count as
@@ -98,17 +105,17 @@ def spend_of(leases: tp.Sequence[tp.Mapping[str, object]], *, priced_cells: tp.C
             value = lease.get(key)
             if isinstance(value, int | float) and not isinstance(value, bool):
                 if target == "settled":
-                    settled += float(value)
+                    settled += costing.money(value)
                 elif not has_settled:
-                    reserved += float(value)
+                    reserved += costing.money(value)
         cell_id = lease.get("cell_id")
         if priced_cells is not None and (not isinstance(cell_id, str) or cell_id not in priced_cells):
             priced = False
     return RunSpend(
-        accelerator_hours=hours,
-        settled=settled,
+        accelerator_hours={name: float(value) for name, value in hours.items()},
+        settled=float(settled),
         priced=priced,
-        reserved=reserved,
+        reserved=float(reserved),
         leases=len(leases),
     )
 

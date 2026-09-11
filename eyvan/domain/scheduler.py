@@ -51,6 +51,7 @@ _PreemptionSortKey: tp.TypeAlias = tuple[
     int,
     int,
     int,
+    bool,
     Decimal,
     int,
     int,
@@ -641,15 +642,24 @@ class Scheduler:
         if quota_failure is not None:
             return quota_failure
 
-        selected: list[tuple[CapacityCell, Decimal, Decimal, ResourceVector, PlacementScore]] = []
-        packed = 0
-        for candidate in sorted(candidates, key=lambda item: (-item[0].worker_count, item[4], item[0].cell_id)):
-            if candidate[0].worker_count > need - packed:
-                continue
-            selected.append(candidate)
-            packed += candidate[0].worker_count
-            if packed == need:
-                break
+        ordered = sorted(candidates, key=lambda item: (-item[0].worker_count, item[4], item[0].cell_id))
+        # Keep the fewest-cell subset for every reachable worker total. Greedy
+        # biggest-first gets stuck on 3+2+2 for a four-worker request, and can
+        # choose more worlds than necessary even when it does find a full pack.
+        # Snapshot each pass so a cell is never used twice. Equal-size answers
+        # retain the earlier, deterministically preferred candidate sequence.
+        packs: dict[int, tuple[int, ...]] = {0: ()}
+        for index, candidate in enumerate(ordered):
+            width = candidate[0].worker_count
+            for total, members in tuple(packs.items()):
+                combined = total + width
+                if combined > need:
+                    continue
+                previous = packs.get(combined)
+                if previous is None or len(members) + 1 < len(previous):
+                    packs[combined] = (*members, index)
+        packed = max(packs)
+        selected = [ordered[index] for index in packs[packed]]
 
         if packed < need:
             if not candidates and static_failures:
@@ -673,11 +683,35 @@ class Scheduler:
             accounting,
             budgets,
         ):
-            return Infeasibility(
-                workload_id=workload.workload_id,
-                code=InfeasibilityCode.BUDGET_EXCEEDED,
-                message=f"elastic reservation cost {total_reserved_cost} exceeds an ancestor budget",
+            # The preferred fewest-cell pack may be unaffordable even though
+            # another exact pack fits. Preserve the cheapest pack at each width
+            # and cardinality, then choose the fewest affordable worlds. Equal
+            # worker totals have identical resource-hours, independent of cells.
+            affordable: dict[tuple[int, int], tuple[Decimal, tuple[int, ...]]] = {(0, 0): (Decimal(0), ())}
+            for index, candidate in enumerate(ordered):
+                for (total, count), (cost, members) in tuple(affordable.items()):
+                    combined = total + candidate[0].worker_count
+                    if combined > need:
+                        continue
+                    key = (combined, count + 1)
+                    price = cost + candidate[2]
+                    prior_affordable = affordable.get(key)
+                    if prior_affordable is None or price < prior_affordable[0]:
+                        affordable[key] = (price, (*members, index))
+            alternatives = sorted(
+                (count, cost, members) for (total, count), (cost, members) in affordable.items() if total == need
             )
+            for _count, cost, members in alternatives:
+                if self._budget_allows(workload.identity, cost, total_resource_hours, accounting, budgets):
+                    selected = [ordered[index] for index in members]
+                    total_reserved_cost = cost
+                    break
+            else:
+                return Infeasibility(
+                    workload_id=workload.workload_id,
+                    code=InfeasibilityCode.BUDGET_EXCEEDED,
+                    message=f"elastic reservation cost {total_reserved_cost} exceeds an ancestor budget",
+                )
 
         leases = tuple(
             self._make_lease(
@@ -1185,7 +1219,7 @@ class Scheduler:
             )
             return None, unsafe
 
-        victims = tuple(
+        victim_actions = tuple(
             PreemptionVictim(
                 lease_id=lease.lease_id,
                 workload_id=lease.workload_id,
@@ -1211,7 +1245,7 @@ class Scheduler:
         plan = PreemptionPlan(
             workload_id=workload.workload_id,
             cell_id=cell.cell_id,
-            victims=victims,
+            victims=victim_actions,
             replacement_lease=replacement,
             score=score,
         )

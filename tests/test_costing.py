@@ -94,3 +94,10 @@ def test_scale_drops_resources_that_scale_to_nothing() -> None:
 
 def test_scale_is_exact_for_fractional_factors() -> None:
     assert costing.scale({"tpu": 3.0}, 0.1) == {"tpu": 0.3}
+
+
+def test_an_empty_charge_collection_has_json_safe_zero_total() -> None:
+    result = costing.total()
+
+    assert result == 0.0
+    assert isinstance(result, float)

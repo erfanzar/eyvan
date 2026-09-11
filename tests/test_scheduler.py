@@ -229,6 +229,30 @@ def test_ancestor_quota_accounts_for_active_and_provisional_leases() -> None:
     assert not result.placements
 
 
+@pytest.mark.parametrize("mode", ["single", "cell-group", "elastic"])
+def test_rejected_cell_diagnostics_survive_each_placement_path(mode: str) -> None:
+    options: _WorkloadOptions = {"required_labels": (("zone", "wanted"),)}
+    if mode == "cell-group":
+        options["cell_group_count"] = 2
+    elif mode == "elastic":
+        options.update(
+            worker_count=2, worker_resource_scope=WorkerResourceScope.PER_WORKER, placement=PlacementMode.ELASTIC
+        )
+    workload = _workload("constrained", resources=ResourceVector(tpu=8), **options)
+    cells = tuple(
+        _cell(name, capacity=ResourceVector(tpu=8), labels=(("zone", "wrong"),)) for name in ("cell-a", "cell-b")
+    )
+
+    result = Scheduler().schedule((workload,), cells)
+
+    assert result.placements == ()
+    assert len(result.infeasibilities) == 1
+    failure = result.infeasibilities[0]
+    assert failure.workload_id == "constrained"
+    assert {cell.cell_id for cell in failure.cells} == {"cell-a", "cell-b"}
+    assert all(cell.code is InfeasibilityCode.HARD_CONSTRAINT and cell.message for cell in failure.cells)
+
+
 def test_scheduler_places_a_pod_group_on_distinct_cells_atomically() -> None:
     workload = _workload(
         "six-slices",
@@ -489,6 +513,21 @@ def test_unpriced_cell_is_refused_under_a_hard_budget() -> None:
     assert [placement.workload_id for placement in result.placements] == ["training"]
     assert result.placements[0].lease.cell_id == "partial"
     assert result.infeasibilities == ()
+
+
+def test_a_hard_budget_refuses_unpriced_capacity_without_a_priced_alternative() -> None:
+    # A priced alternative can win a tie-break even if the safety filter is
+    # broken. With only unknown-price capacity, admission itself must fail.
+    budget = Budget(IdentityScope("tenant"), limit=15)
+    pending = _workload("training", resources=ResourceVector(tpu=2), estimated_duration_seconds=3600)
+    unpriced = _cell("unpriced", capacity=ResourceVector(tpu=8))
+
+    result = Scheduler().schedule((pending,), (unpriced,), budgets=(budget,))
+
+    assert result.placements == ()
+    assert len(result.infeasibilities) == 1
+    assert result.infeasibilities[0].workload_id == "training"
+    assert any(cell.code is InfeasibilityCode.UNPRICED_CELL for cell in result.infeasibilities[0].cells)
 
 
 def test_unpriced_cell_still_places_under_a_soft_budget() -> None:
@@ -874,3 +913,55 @@ def test_leases_that_jointly_overcommit_a_cell_are_rejected() -> None:
 
     with pytest.raises(ValueError, match="overcommit"):
         Scheduler().schedule((), (_cell("cell", capacity=ResourceVector(cpu=8)),), leases=leases)
+
+
+def test_pending_attempt_cannot_also_own_an_active_lease() -> None:
+    lease = _lease("active", identity=_identity("tenant"), resources=ResourceVector(cpu=1))
+    pending = _workload(lease.workload_id, attempt=lease.attempt)
+
+    with pytest.raises(ValueError, match="pending workload already has an active lease"):
+        Scheduler().schedule((pending,), (_cell("cell"),), leases=(lease,))
+
+
+def test_a_distinct_workload_attempt_can_be_scheduled_with_an_old_lease() -> None:
+    lease = _lease("active", identity=_identity("tenant"), resources=ResourceVector(cpu=1))
+    pending = _workload(lease.workload_id, attempt=lease.attempt + 1)
+
+    result = Scheduler().schedule((pending,), (_cell("cell"),), leases=(lease,))
+
+    assert [placement.workload_id for placement in result.placements] == [pending.workload_id]
+    assert result.placements[0].lease.attempt == pending.attempt
+
+
+def test_unknown_lease_cell_is_a_validation_error_even_without_pending_work() -> None:
+    lease = _lease("active", identity=_identity("tenant"), resources=ResourceVector(cpu=1), cell_id="missing")
+
+    with pytest.raises(ValueError, match="lease references unknown cell"):
+        Scheduler().schedule((), (_cell("cell"),), leases=(lease,))
+
+
+def test_known_lease_cell_is_valid_without_pending_work() -> None:
+    lease = _lease("active", identity=_identity("tenant"), resources=ResourceVector(cpu=1))
+
+    result = Scheduler().schedule((), (_cell("cell"),), leases=(lease,))
+
+    assert result.placements == () and result.infeasibilities == ()
+
+
+def test_budget_currency_mismatch_is_rejected_even_without_pending_work() -> None:
+    budget = Budget(IdentityScope("tenant", "project"), limit=100, currency="EUR")
+
+    with pytest.raises(ValueError, match="does not match scheduler currency"):
+        Scheduler(currency="USD").schedule((), (_cell("cell"),), budgets=(budget,))
+
+
+@pytest.mark.parametrize("currency", ["USD", "EUR"])
+def test_matching_budget_currency_allows_priced_admission(currency: str) -> None:
+    budget = Budget(IdentityScope("tenant", "project"), limit=100, currency=currency)
+    result = Scheduler(currency=currency.lower()).schedule(
+        (_workload("pending"),),
+        (_cell("cell", unit_prices=ResourceVector(cpu=1)),),
+        budgets=(budget,),
+    )
+
+    assert [placement.workload_id for placement in result.placements] == ["pending"]

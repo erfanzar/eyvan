@@ -137,6 +137,47 @@ def test_a_settled_lease_stops_counting_as_reserved_money() -> None:
     assert spend.leases == 2
 
 
+@pytest.mark.parametrize("field", ["settled", "reserved", "hours"])
+@pytest.mark.parametrize(("value", "expected"), [(0.1, 0.3), (0.00000000004, 0.00000000012)])
+def test_fractional_lease_totals_do_not_reintroduce_settlement_drift(field: str, value: float, expected: float) -> None:
+    leases = [
+        _lease(
+            f"cell-{index}",
+            **{field: value},
+            settled_at=None if field == "reserved" else "2026-01-01T00:00:00+00:00",
+        )
+        for index in range(3)
+    ]
+
+    spend = spend_of(leases, priced_cells={f"cell-{index}" for index in range(3)})
+
+    assert getattr(spend, field) == expected
+    assert isinstance(getattr(spend, field), float)
+    assert spend.priced
+
+
+@pytest.mark.parametrize("value", [True, False, "0.1", None, {}, []])
+def test_non_numeric_amounts_do_not_pollute_valid_lease_totals(value: object) -> None:
+    spend = spend_of(
+        [
+            {
+                "cell_id": "bad",
+                "settled_cost": value,
+                "reserved_cost": value,
+                "accelerator_hours_settled": {"tpu": value},
+            },
+            _lease("paid", settled=2.5, hours=2.0, reserved=99.0, settled_at="2026-01-01T00:00:00+00:00"),
+            _lease("running", reserved=1.0),
+        ],
+        priced_cells={"bad", "paid", "running"},
+    )
+
+    assert spend.settled == 2.5
+    assert spend.reserved == 1.0
+    assert spend.accelerator_hours == {"tpu": 2.0}
+    assert spend.priced
+
+
 # --------------------------------------------------------------------------- what it prints
 
 
