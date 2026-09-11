@@ -130,14 +130,16 @@ def test_loopback_startup_enables_development_auth_only_when_not_explicitly_conf
     assert explicit.development_auth_mode is DevelopmentAuthMode.DISABLED
 
 
-def test_network_startup_requires_an_explicit_postgres_repository(monkeypatch) -> None:
+def test_network_startup_requires_an_explicit_postgres_repository(monkeypatch, tmp_path) -> None:
     bind = ServerBindPolicy.from_host("0.0.0.0")
     monkeypatch.delenv("EYVAN_DEV_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("EYVAN_REPOSITORY_BACKEND", raising=False)
-    # A network bind separately requires a metrics token and an artifact signing
-    # key; this test is about the repository, so satisfy those requirements
-    # rather than assert them here. tests/test_startup_preflight.py asserts that
-    # all three are reported together.
+    # A network bind separately requires TLS material, a metrics token and an
+    # artifact signing key; this test is about the repository, so satisfy those
+    # requirements rather than assert them here. tests/test_startup_preflight.py
+    # asserts that all four are reported together.
+    monkeypatch.setenv("EYVAN_TLS_CERT_FILE", str(tmp_path / "cert.pem"))
+    monkeypatch.setenv("EYVAN_TLS_KEY_FILE", str(tmp_path / "key.pem"))
     monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
     monkeypatch.setenv("EYVAN_ARTIFACT_TOKEN_KEY", "k" * 32)
 
@@ -372,11 +374,15 @@ def test_local_daemon_app_rejects_a_mismatched_public_url(tmp_path: Path) -> Non
         )
 
 
-def test_network_factory_requires_postgres_and_never_enables_development_auth(monkeypatch) -> None:
+def test_network_factory_requires_postgres_and_never_enables_development_auth(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("EYVAN_DEV_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("EYVAN_REPOSITORY_BACKEND", raising=False)
     monkeypatch.setenv("EYVAN_CONTROLLER_ENABLED", "0")
     monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
+    # Satisfy the network-bind TLS requirement; the policy itself is pinned in
+    # tests/test_startup_preflight.py and tests/test_server_tls.py.
+    monkeypatch.setenv("EYVAN_TLS_CERT_FILE", str(tmp_path / "cert.pem"))
+    monkeypatch.setenv("EYVAN_TLS_KEY_FILE", str(tmp_path / "key.pem"))
 
     with pytest.raises(ValueError, match="EYVAN_REPOSITORY_BACKEND=postgres"):
         create_network_app()
@@ -812,7 +818,13 @@ def test_fleet_api_defaults_local_development_agent_but_rejects_missing_remote_r
 
     remote_client = TestClient(
         create_app(
-            settings=EyvanSettings(public_url="https://eyvan.example.com", metrics_token="scrape-token"),
+            settings=EyvanSettings(
+                public_url="https://eyvan.example.com",
+                metrics_token="scrape-token",
+                # App-behavior test on a network bind; the TLS policy itself is
+                # pinned in tests/test_server_tls.py.
+                allow_insecure_plaintext_bind=True,
+            ),
             server_bind=ServerBindPolicy.from_host("0.0.0.0"),
             verifier=_StaticTokenVerifier(Principal(subject="alice", grants=(RoleGrant(role=Role.FLEET_ADMIN),))),
         )
@@ -865,7 +877,13 @@ def test_loopback_development_trusts_only_the_default_callable_scope(tmp_path) -
 
 
 def test_network_bind_never_infers_callable_trust_from_loopback_public_url() -> None:
-    settings = EyvanSettings(public_url="http://127.0.0.1:8080", metrics_token="scrape-token")
+    # App-behavior test on a network bind; the TLS policy itself is pinned in
+    # tests/test_server_tls.py.
+    settings = EyvanSettings(
+        public_url="http://127.0.0.1:8080",
+        metrics_token="scrape-token",
+        allow_insecure_plaintext_bind=True,
+    )
     verifier = _StaticTokenVerifier(
         Principal(
             subject="alice",

@@ -5,7 +5,8 @@
 
 """Standing up a network-bound head must not be a crash-fix-restart loop.
 
-Three settings a network bind requires -- ``EYVAN_REPOSITORY_BACKEND``,
+Four settings a network bind requires -- ``EYVAN_TLS_CERT_FILE`` (with
+``EYVAN_TLS_KEY_FILE``, or an explicit insecure opt-in), ``EYVAN_REPOSITORY_BACKEND``,
 ``EYVAN_METRICS_TOKEN``, ``EYVAN_ARTIFACT_TOKEN_KEY`` -- were each discovered by
 reading a traceback, fixing the one variable it named, restarting, and meeting
 the next. Every one of those refusals is correct and each explains itself well.
@@ -49,6 +50,9 @@ from eyvan.server.api.server_startup import (
 #: before each case so a developer's own exported environment cannot decide the
 #: outcome of an assertion about which settings are missing.
 _STARTUP_VARIABLES = (
+    "EYVAN_TLS_CERT_FILE",
+    "EYVAN_TLS_KEY_FILE",
+    "EYVAN_INSECURE_PLAINTEXT_BIND",
     "EYVAN_REPOSITORY_BACKEND",
     "EYVAN_METRICS_TOKEN",
     "EYVAN_ARTIFACT_TOKEN_KEY",
@@ -64,6 +68,13 @@ _LOOPBACK = ServerBindPolicy.from_host("127.0.0.1")
 _POSTGRES_SENTENCE = (
     "a network-bound Eyvan server requires EYVAN_REPOSITORY_BACKEND=postgres so every replica "
     "shares durable control-plane state"
+)
+_TLS_SENTENCE = (
+    "a network-bound Eyvan server refuses to serve plaintext HTTP: OIDC bearer tokens, bootstrap "
+    "credentials, and capability tokens would cross the network unencrypted. Set EYVAN_TLS_CERT_FILE "
+    "and EYVAN_TLS_KEY_FILE to serve TLS, or set EYVAN_INSECURE_PLAINTEXT_BIND=1 (or pass "
+    "--insecure-plaintext to eyvan-server) to keep the pre-0.1 plaintext behavior as an explicit, "
+    "reviewed decision"
 )
 _METRICS_SENTENCE = (
     "a network-bound Eyvan server requires EYVAN_METRICS_TOKEN so /metrics does not expose "
@@ -92,6 +103,12 @@ def _clean_startup_environment(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Non
         str(tmp_path / "no-runtime-profile.json"),
     )
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
+    monkeypatch.setattr("eyvan.sdk.commands.doctor_preflights.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "eyvan.sdk.commands.doctor_preflights.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
+        tmp_path / "no-runtime-profile.json",
+    )
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path))
 
 
 def _configure(monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]) -> None:
@@ -152,16 +169,17 @@ def _doctor_check(host: str = "0.0.0.0", handler: tp.Callable[[str], tp.Any] | N
 
 
 def test_a_network_bind_names_every_missing_setting_in_one_refusal() -> None:
-    """The whole point: one traceback, three variables, no restart between them."""
+    """The whole point: one traceback, every variable, no restart between them."""
 
     message = _server_refusal()
 
     assert _requirement_names(message) == (
+        "EYVAN_TLS_CERT_FILE",
         "EYVAN_REPOSITORY_BACKEND",
         "EYVAN_METRICS_TOKEN",
         "EYVAN_ARTIFACT_TOKEN_KEY",
     )
-    assert "3 unsatisfied requirements" in message
+    assert "4 unsatisfied requirements" in message
 
 
 def test_every_explanation_is_preserved_word_for_word() -> None:
@@ -174,6 +192,7 @@ def test_every_explanation_is_preserved_word_for_word() -> None:
 
     message = _server_refusal()
 
+    assert _TLS_SENTENCE in message
     assert _POSTGRES_SENTENCE in message
     assert _METRICS_SENTENCE in message
     assert _ARTIFACT_SENTENCE in message
@@ -210,6 +229,11 @@ def test_fixing_one_setting_never_reveals_a_setting_that_was_hidden(monkeypatch:
 
     seen: list[tuple[str, ...]] = [_requirement_names(_server_refusal())]
 
+    # The TLS refusal names EYVAN_TLS_CERT_FILE; its own explanation says the
+    # key file is needed too, so the walk sets both halves at this step.
+    monkeypatch.setenv("EYVAN_TLS_CERT_FILE", "/tmp/eyvan-walk-cert.pem")
+    monkeypatch.setenv("EYVAN_TLS_KEY_FILE", "/tmp/eyvan-walk-key.pem")
+    seen.append(_requirement_names(_server_refusal()))
     monkeypatch.setenv("EYVAN_REPOSITORY_BACKEND", "postgres")
     seen.append(_requirement_names(_server_refusal()))
     monkeypatch.setenv("EYVAN_METRICS_TOKEN", "scrape-token")
@@ -217,6 +241,7 @@ def test_fixing_one_setting_never_reveals_a_setting_that_was_hidden(monkeypatch:
     monkeypatch.setenv("EYVAN_ARTIFACT_TOKEN_KEY", "k" * 32)
 
     assert seen == [
+        ("EYVAN_TLS_CERT_FILE", "EYVAN_REPOSITORY_BACKEND", "EYVAN_METRICS_TOKEN", "EYVAN_ARTIFACT_TOKEN_KEY"),
         ("EYVAN_REPOSITORY_BACKEND", "EYVAN_METRICS_TOKEN", "EYVAN_ARTIFACT_TOKEN_KEY"),
         ("EYVAN_METRICS_TOKEN", "EYVAN_ARTIFACT_TOKEN_KEY"),
         ("EYVAN_ARTIFACT_TOKEN_KEY",),
@@ -230,6 +255,8 @@ def test_a_single_unsatisfied_requirement_still_explains_itself(monkeypatch: pyt
     _configure(
         monkeypatch,
         {
+            "EYVAN_TLS_CERT_FILE": "/tmp/eyvan-single-cert.pem",
+            "EYVAN_TLS_KEY_FILE": "/tmp/eyvan-single-key.pem",
             "EYVAN_REPOSITORY_BACKEND": "postgres",
             "EYVAN_METRICS_TOKEN": "scrape-token",
             "EYVAN_ARTIFACT_TOKEN_KEY": "k" * 32,
@@ -259,8 +286,26 @@ _ENVIRONMENTS: tuple[tuple[str, dict[str, str]], ...] = (
         },
     ),
     (
+        "tls only",
+        {
+            "EYVAN_TLS_CERT_FILE": "/tmp/eyvan-tls-cert.pem",
+            "EYVAN_TLS_KEY_FILE": "/tmp/eyvan-tls-key.pem",
+        },
+    ),
+    (
         "fully configured",
         {
+            "EYVAN_TLS_CERT_FILE": "/tmp/eyvan-tls-cert.pem",
+            "EYVAN_TLS_KEY_FILE": "/tmp/eyvan-tls-key.pem",
+            "EYVAN_REPOSITORY_BACKEND": "postgres",
+            "EYVAN_METRICS_TOKEN": "scrape-token",
+            "EYVAN_ARTIFACT_TOKEN_KEY": "k" * 32,
+        },
+    ),
+    (
+        "explicit insecure opt-in",
+        {
+            "EYVAN_INSECURE_PLAINTEXT_BIND": "1",
             "EYVAN_REPOSITORY_BACKEND": "postgres",
             "EYVAN_METRICS_TOKEN": "scrape-token",
             "EYVAN_ARTIFACT_TOKEN_KEY": "k" * 32,
@@ -299,7 +344,12 @@ def test_doctor_names_the_settings_in_its_one_line_detail() -> None:
     check = _doctor_check()
 
     assert check.status is CheckStatus.FAIL
-    for name in ("EYVAN_REPOSITORY_BACKEND", "EYVAN_METRICS_TOKEN", "EYVAN_ARTIFACT_TOKEN_KEY"):
+    for name in (
+        "EYVAN_TLS_CERT_FILE",
+        "EYVAN_REPOSITORY_BACKEND",
+        "EYVAN_METRICS_TOKEN",
+        "EYVAN_ARTIFACT_TOKEN_KEY",
+    ):
         assert name in check.detail
     assert "0.0.0.0" in check.detail
 
@@ -309,6 +359,7 @@ def test_doctor_carries_the_same_explanations_the_server_would_print() -> None:
 
     check = _doctor_check()
 
+    assert _TLS_SENTENCE in check.remedy
     assert _POSTGRES_SENTENCE in check.remedy
     assert _METRICS_SENTENCE in check.remedy
     assert _ARTIFACT_SENTENCE in check.remedy
@@ -409,6 +460,8 @@ def test_a_network_bind_that_trusts_no_project_warns_without_turning_the_run_red
     _configure(
         monkeypatch,
         {
+            "EYVAN_TLS_CERT_FILE": "/tmp/eyvan-trust-cert.pem",
+            "EYVAN_TLS_KEY_FILE": "/tmp/eyvan-trust-key.pem",
             "EYVAN_REPOSITORY_BACKEND": "postgres",
             "EYVAN_ARTIFACT_TOKEN_KEY": "k" * 32,
             "EYVAN_METRICS_TOKEN": "m" * 32,

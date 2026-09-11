@@ -401,7 +401,7 @@ def test_the_cell_agent_cli_serves_with_the_redacting_access_log(monkeypatch: py
 
     monkeypatch.delenv("EYVAN_AGENT_SHARED_SECRET", raising=False)
     monkeypatch.delenv("EYVAN_AGENT_ALLOW_UNAUTHENTICATED", raising=False)
-    monkeypatch.setattr("sys.argv", ["eyvan-agent", "--allow-unauthenticated"])
+    monkeypatch.setattr("sys.argv", ["eyvan-agent", "--host", "127.0.0.1", "--allow-unauthenticated"])
     monkeypatch.setattr(cli, "create_agent_app", lambda **_options: FastAPI())
     served: list[dict[str, tp.Any]] = []
     monkeypatch.setattr(uvicorn, "run", lambda _application, **options: served.append(options))
@@ -617,3 +617,8 @@ def test_an_httpx_style_record_is_redacted_wherever_the_url_sits() -> None:
     # The %d conversion still has an int to render.
     assert '"HTTP/1.1 200 OK"' in line
     _assert_cursor_absent(line)
+
+
+#: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
+#: the fast iteration subset, `pytest tests -m "not slow"`.
+pytestmark = pytest.mark.slow

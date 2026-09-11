@@ -23,6 +23,17 @@ NETWORK_REQUIRES_POSTGRES = (
     "a network-bound Eyvan server requires EYVAN_REPOSITORY_BACKEND=postgres so every replica "
     "shares durable control-plane state"
 )
+NETWORK_REQUIRES_TLS = (
+    "a network-bound Eyvan server refuses to serve plaintext HTTP: OIDC bearer tokens, bootstrap "
+    "credentials, and capability tokens would cross the network unencrypted. Set EYVAN_TLS_CERT_FILE "
+    "and EYVAN_TLS_KEY_FILE to serve TLS, or set EYVAN_INSECURE_PLAINTEXT_BIND=1 (or pass "
+    "--insecure-plaintext to eyvan-server) to keep the pre-0.1 plaintext behavior as an explicit, "
+    "reviewed decision"
+)
+TLS_REQUIRES_BOTH_FILES = (
+    "TLS needs both halves of the listener identity: set EYVAN_TLS_CERT_FILE and "
+    "EYVAN_TLS_KEY_FILE together; a certificate without its key cannot terminate anything"
+)
 LOCAL_REPOSITORY_IS_LOOPBACK_ONLY = "the local Eyvan repository may only be used with a literal loopback server bind"
 DEVELOPMENT_AUTH_IS_LOOPBACK_ONLY = (
     "Eyvan development authentication may only be used with a literal loopback server bind; "
@@ -115,6 +126,11 @@ def unsatisfied_startup_requirements(
     if bind.is_loopback:
         return ()
     requirements: list[StartupRequirement] = []
+    if not settings.allow_insecure_plaintext_bind:
+        if settings.tls_cert_file is None and settings.tls_key_file is None:
+            requirements.append(StartupRequirement("EYVAN_TLS_CERT_FILE", NETWORK_REQUIRES_TLS))
+        elif settings.tls_cert_file is None or settings.tls_key_file is None:
+            requirements.append(StartupRequirement("EYVAN_TLS_CERT_FILE", TLS_REQUIRES_BOTH_FILES))
     if source is StartupConfigurationSource.ENVIRONMENT:
         if settings.repository_backend is not RepositoryBackend.POSTGRES:
             requirements.append(StartupRequirement(_REPOSITORY_BACKEND_ENVIRONMENT_VARIABLE, NETWORK_REQUIRES_POSTGRES))

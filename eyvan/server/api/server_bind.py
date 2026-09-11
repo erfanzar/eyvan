@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
+from typing import Any
 
 from eyvan._internal.compat import StrEnum
+from eyvan.config import EyvanSettings
 
 LOOPBACK_APP_FACTORY = "eyvan.server.api.app:create_loopback_app"
 NETWORK_APP_FACTORY = "eyvan.server.api.app:create_network_app"
@@ -58,9 +60,28 @@ class ServerBindPolicy:
         return LOOPBACK_APP_FACTORY if self.is_loopback else NETWORK_APP_FACTORY
 
 
+def uvicorn_tls_kwargs(settings: EyvanSettings) -> dict[str, Any]:
+    """Return the uvicorn SSL keyword arguments for configured TLS material.
+
+    Empty when either file is unset: uvicorn then serves plaintext, which the
+    startup policy only permits for loopback binds or an explicit insecure
+    opt-in. Missing files on disk surface as uvicorn's own startup error.
+    """
+
+    if not settings.tls_enabled:
+        return {}
+    assert settings.tls_cert_file is not None
+    assert settings.tls_key_file is not None
+    return {
+        "ssl_certfile": str(settings.tls_cert_file),
+        "ssl_keyfile": str(settings.tls_key_file),
+    }
+
+
 __all__ = (
     "LOOPBACK_APP_FACTORY",
     "NETWORK_APP_FACTORY",
     "ServerBindPolicy",
     "ServerExposure",
+    "uvicorn_tls_kwargs",
 )

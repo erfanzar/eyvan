@@ -53,6 +53,9 @@ CAPABILITY_ROUTES: dict[str, str] = {
 #: part of the Python SDK, so a Python caller would be the wrong thing to add.
 BROWSER_ROUTES: dict[str, str] = {
     "GET /api/v1/dashboard/config": "dashboard/src/auth/oidc.ts, so one image can serve two identity providers",
+    "GET /api/v1/dashboard/auth/login": "dashboard/src/auth/oidc.ts beginsLogin navigates to the server-side OIDC flow",
+    "GET /api/v1/dashboard/auth/callback": "the provider redirects the browser here; the server completes the exchange",
+    "POST /api/v1/dashboard/auth/logout": "dashboard/src/auth/oidc.ts logout drops the HttpOnly session cookie",
     "GET /api/v1/session": "dashboard/src/api/client.ts resolves effective durable authority and project scopes",
 }
 

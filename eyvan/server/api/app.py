@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from eyvan._internal.build_identity import build_identity
 from eyvan._internal.client_version import CLIENT_VERSION_HEADER, is_client_supported, stale_client_message
+from eyvan._internal.correlation import canonical_correlation_id
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan._internal.observability import EyvanMetrics
 from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
@@ -119,6 +120,10 @@ from eyvan.server.api.auth import (
     TokenVerifier,
     authenticated_principal,
 )
+from eyvan.server.api.dashboard_sessions import (
+    DashboardSessionStore,
+    register_dashboard_auth_routes,
+)
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
     ArtifactInventoryReindexRequest,
@@ -168,7 +173,7 @@ from eyvan.server.api.schemas import (
     WorkloadExecRequest,
     WorkloadSubmitRequest,
 )
-from eyvan.server.api.server_bind import ServerBindPolicy
+from eyvan.server.api.server_bind import ServerBindPolicy, uvicorn_tls_kwargs
 from eyvan.server.api.server_logging import ServerLogLevel, server_log_config
 from eyvan.server.api.server_startup import (
     NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY,
@@ -481,6 +486,14 @@ def _route_label(request: Request) -> str:
 #: that without changing a single byte of a response body that older clients
 #: already parse.
 EXPANSION_ADMISSION_HEADER = "Eyvan-Expansion-Admission"
+CORRELATION_HEADER = "X-Eyvan-Correlation-ID"
+
+
+def _set_correlation_header(response: Response, enabled: bool, identifier: str | None) -> None:
+    """Expose a server-owned correlation identity without changing response bodies."""
+
+    if enabled and identifier is not None:
+        response.headers[CORRELATION_HEADER] = canonical_correlation_id(identifier)
 
 
 async def _report_expansion_admission(
@@ -609,6 +622,7 @@ def create_app(
             # consulting them at admission, so federation was configurable,
             # tested, and off everywhere.
             plane_id=settings.plane_id,
+            correlation_enabled=settings.correlation_enabled,
             # The seam that makes the fan-out ceiling an operator control rather
             # than a constant: without it the setting exists and no submission is
             # ever judged against it.
@@ -726,11 +740,21 @@ def create_app(
 
     app = FastAPI(title="Eyvan Fleet API", version="1.0.0", lifespan=lifespan)
     app.state.service = service
+    dashboard_sessions = DashboardSessionStore(
+        session_ttl_s=settings.dashboard_session_ttl_s,
+        transaction_ttl_s=settings.dashboard_auth_transaction_ttl_s,
+    )
+    app.state.dashboard_sessions = dashboard_sessions
     app.state.authenticator = RequestAuthenticator(
         settings,
         verifier=verifier,
         local_development_credential=local_development_credential,
+        dashboard_sessions=dashboard_sessions,
     )
+    # The dashboard's backend-for-frontend auth: login/callback/logout. The
+    # routes self-check the OIDC configuration, so mounting them on a plane
+    # without one only makes the endpoints answer 404.
+    register_dashboard_auth_routes(app, settings=settings, store=dashboard_sessions)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for
@@ -783,6 +807,38 @@ def create_app(
                     },
                 )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        """CSP and companion headers on HTML responses — the dashboard itself.
+
+        Scoped to text/html so the policy cannot surprise API or streaming
+        clients; the dashboard is the only HTML this plane serves, and its
+        bundle needs no script from anywhere but itself. Google Fonts stay
+        allowed because the shipped index.html loads them; style attributes
+        keep 'unsafe-inline' because React renders them.
+        """
+
+        response = await call_next(request)
+        content_type = response.headers.get("Content-Type", "")
+        if content_type.startswith("text/html"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self'; "
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src 'self' https://fonts.gstatic.com; "
+                "img-src 'self' data:; "
+                "connect-src 'self'; "
+                "object-src 'none'; "
+                "base-uri 'self'; "
+                "form-action 'self'; "
+                "frame-ancestors 'none'"
+            )
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        return response
 
     @app.exception_handler(EyvanServiceError)
     async def handle_service_error(request: Request, exc: EyvanServiceError) -> JSONResponse:
@@ -2331,6 +2387,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post(
@@ -2363,6 +2421,7 @@ def create_app(
             max_fan_out=request.max_fan_out,
         )
         await _report_expansion_admission(service, principal, response, parent.id, children=len(tasks))
+        _set_correlation_header(response, settings.correlation_enabled, parent.id)
         # No Idempotent-Replay header: submit_batch is replay-transparent by
         # construction, returning the same parent and the same tasks in the same
         # order, so a caller cannot act differently on the two cases.
@@ -2393,6 +2452,7 @@ def create_app(
     )
     async def submit_group(
         request: GroupSubmitRequest,
+        response: Response,
         idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> GroupSubmitResponse:
@@ -2414,6 +2474,7 @@ def create_app(
             name_prefix=request.name_prefix,
             max_members=request.max_members,
         )
+        _set_correlation_header(response, settings.correlation_enabled, parent.id)
         return GroupSubmitResponse(parent=parent, members=members)
 
     @app.post(
@@ -2450,6 +2511,7 @@ def create_app(
             max_fan_out=request.max_fan_out,
         )
         await _report_expansion_admission(service, principal, response, parent.id, children=len(nodes))
+        _set_correlation_header(response, settings.correlation_enabled, parent.id)
         return DagSubmitResponse(parent=parent, nodes=nodes)
 
     @app.post(
@@ -2498,6 +2560,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post(
@@ -2551,6 +2615,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.get("/api/v1/workloads", response_model=list[WorkloadRecord], tags=["workloads"])
@@ -2564,9 +2630,12 @@ def create_app(
 
     @app.get("/api/v1/workloads/{workload_id}", response_model=WorkloadRecord, tags=["workloads"])
     async def get_workload(
-        workload_id: str, principal: tp.Annotated[Principal, Depends(authenticated_principal)]
+        workload_id: str, response: Response, principal: tp.Annotated[Principal, Depends(authenticated_principal)]
     ) -> WorkloadRecord:
-        return await service.get_workload(principal, workload_id)
+        workload = await service.get_workload(principal, workload_id)
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
+        return workload
 
     @app.get("/api/v1/workloads/{workload_id}/children", response_model=list[WorkloadRecord], tags=["workloads"])
     async def list_child_workloads(
@@ -2956,11 +3025,14 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post("/api/v1/workloads/{workload_id}/kick", response_model=WorkloadRecord, tags=["workloads"])
     async def kick_workload(
         workload_id: str,
+        response: Response,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> WorkloadRecord:
         """Interrupt one attempt and let it reschedule on its preemption budget.
@@ -2985,6 +3057,7 @@ def create_app(
             action="workload.kicked",
             provider_preempted=True,
         )
+        _set_correlation_header(response, settings.correlation_enabled, workload.id)
         return workload
 
     @app.post("/api/v1/workloads/{workload_id}/checkpoint", response_model=WorkloadRecord, tags=["workloads"])
@@ -2998,6 +3071,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post("/api/v1/workloads/{workload_id}/retry", response_model=WorkloadRecord, tags=["workloads"])
@@ -3011,6 +3086,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post(
@@ -3036,6 +3113,7 @@ def create_app(
         )
         if replayed:
             response.headers["Idempotent-Replay"] = "true"
+        _set_correlation_header(response, settings.correlation_enabled, workload.id)
         return workload
 
     @app.post(
@@ -3059,6 +3137,8 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
             response.headers["Idempotent-Replay"] = "true"
+        if settings.correlation_enabled:
+            response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
         return workload
 
     @app.post("/api/v1/cells", response_model=CellRecord, tags=["cells"])
@@ -3071,6 +3151,7 @@ def create_app(
         cell, replayed = await service.upsert_cell(principal, request.to_record(), idempotency_key=idempotency_key)
         if replayed:
             response.headers["Idempotent-Replay"] = "true"
+        _set_correlation_header(response, settings.correlation_enabled, cell.autoscale_request_workload_id)
         return cell
 
     @app.post("/api/v1/capacity-pools", response_model=CapacityPoolRecord, tags=["fleets"])
@@ -3224,8 +3305,14 @@ def create_app(
         return await service.list_cells(principal)
 
     @app.get("/api/v1/cells/{cell_id}", response_model=CellRecord, tags=["cells"])
-    async def get_cell(cell_id: str, principal: tp.Annotated[Principal, Depends(authenticated_principal)]) -> CellRecord:
-        return await service.get_cell(principal, cell_id)
+    async def get_cell(
+        cell_id: str,
+        response: Response,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> CellRecord:
+        cell = await service.get_cell(principal, cell_id)
+        _set_correlation_header(response, settings.correlation_enabled, cell.autoscale_request_workload_id)
+        return cell
 
     @app.post("/api/v1/cells/{cell_id}/drain", response_model=CellRecord, tags=["cells"])
     async def drain_cell(
@@ -3237,6 +3324,7 @@ def create_app(
         cell, replayed = await controller.drain_cell(principal, cell_id, idempotency_key=idempotency_key)
         if replayed:
             response.headers["Idempotent-Replay"] = "true"
+        _set_correlation_header(response, settings.correlation_enabled, cell.autoscale_request_workload_id)
         return cell
 
     @app.delete("/api/v1/cells/{cell_id}", response_model=CellRecord, tags=["cells"])
@@ -3249,6 +3337,7 @@ def create_app(
         cell, replayed = await controller.delete_cell(principal, cell_id, idempotency_key=idempotency_key)
         if replayed:
             response.headers["Idempotent-Replay"] = "true"
+        _set_correlation_header(response, settings.correlation_enabled, cell.autoscale_request_workload_id)
         return cell
 
     @app.post(
@@ -3309,9 +3398,13 @@ def create_app(
 
     @app.get("/api/v1/leases/{lease_id}", response_model=LeaseRecord, tags=["leases"])
     async def get_lease(
-        lease_id: str, principal: tp.Annotated[Principal, Depends(authenticated_principal)]
+        lease_id: str,
+        response: Response,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> LeaseRecord:
-        return await service.get_lease(principal, lease_id)
+        lease = await service.get_lease(principal, lease_id)
+        _set_correlation_header(response, settings.correlation_enabled, lease.workload_id)
+        return lease
 
     @app.put("/api/v1/policies/{org_id}/{project_id}", response_model=PolicyRecord, tags=["governance"])
     async def put_policy(
@@ -4029,6 +4122,11 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--reload", action="store_true")
+    parser.add_argument(
+        "--insecure-plaintext",
+        action="store_true",
+        help="allow a network bind to serve plaintext HTTP (equivalent to EYVAN_INSECURE_PLAINTEXT_BIND=1)",
+    )
     parser.add_argument("--local-daemon", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--public-url", help=argparse.SUPPRESS)
     parser.add_argument("--local-state-path", type=Path, help=argparse.SUPPRESS)
@@ -4043,6 +4141,12 @@ def main() -> None:
         default=ServerLogLevel.INFO,
     )
     args = parser.parse_args()
+    if args.insecure_plaintext:
+        if os.getenv("EYVAN_TLS_CERT_FILE") or os.getenv("EYVAN_TLS_KEY_FILE"):
+            parser.error("--insecure-plaintext conflicts with EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE")
+        # The startup policy reads the environment; make the flag equivalent to
+        # the documented opt-in, including under --reload subprocesses.
+        os.environ["EYVAN_INSECURE_PLAINTEXT_BIND"] = "1"
     server_bind = ServerBindPolicy.from_host(args.host)
     required_local_options = (
         args.public_url,
@@ -4061,6 +4165,7 @@ def main() -> None:
             reload=args.reload,
             log_config=server_log_config(args.log_level),
             log_level=args.log_level.value,
+            **uvicorn_tls_kwargs(EyvanSettings.from_env()),
         )
         return
     if args.reload:
@@ -4107,6 +4212,7 @@ def main() -> None:
         port=args.port,
         log_config=server_log_config(args.log_level),
         log_level=args.log_level.value,
+        **uvicorn_tls_kwargs(EyvanSettings.from_env()),
     )
 
 

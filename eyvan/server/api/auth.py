@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import typing as tp
 
@@ -19,6 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from eyvan._internal.json_types import JsonValue
 from eyvan.config import EyvanSettings
 from eyvan.records import Principal, Role, RoleGrant
+from eyvan.server.api.dashboard_sessions import (
+    DASHBOARD_SESSION_EXPIRED,
+    SESSION_COOKIE,
+    DashboardSessionStore,
+)
 from eyvan.server.local.auth import (
     LOCAL_DEVELOPMENT_CREDENTIAL_HEADER,
     LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL,
@@ -225,10 +231,12 @@ class RequestAuthenticator:
         *,
         verifier: TokenVerifier | None = None,
         local_development_credential: LocalDevelopmentCredential | None = None,
+        dashboard_sessions: DashboardSessionStore | None = None,
     ):
         self.settings = settings
         self.verifier = verifier
         self.local_development_credential = local_development_credential
+        self.dashboard_sessions = dashboard_sessions
         self.bootstrap_token = settings.bootstrap_token or None
 
     async def authenticate(self, request: Request) -> Principal:
@@ -258,6 +266,37 @@ class RequestAuthenticator:
                 return await self.verifier.verify(token)
             except Exception as exc:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token") from exc
+        # Backend-for-frontend dashboard session: the browser holds an HttpOnly
+        # cookie, the tokens live in the store, and the stored access token is
+        # verified exactly as a presented bearer token would be. A presented
+        # bearer always wins over the cookie, so API clients are unaffected.
+        if self.dashboard_sessions is not None:
+            session_token = request.cookies.get(SESSION_COOKIE)
+            if session_token:
+                if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    # SameSite does not isolate sibling origins. Cookie writes
+                    # must come from the configured dashboard, never Host or
+                    # forwarded headers supplied by the caller.
+                    expected_origin = str(
+                        httpx.URL(self.settings.public_url).copy_with(path="/", query=None, fragment=None)
+                    )
+                    if request.headers.get("origin", "") != expected_origin.rstrip("/"):
+                        raise HTTPException(status_code=403, detail="dashboard writes require a same-origin request")
+                session = self.dashboard_sessions.resolve(session_token)
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=DASHBOARD_SESSION_EXPIRED,
+                    )
+                if self.verifier is None:
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid dashboard session")
+                try:
+                    return await self.verifier.verify(session.access_token)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="the identity provider no longer accepts this dashboard session; sign in again",
+                    ) from exc
         if not self.settings.dev_auth_enabled:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
         self._require_local_development_credential(request)
@@ -326,7 +365,23 @@ async def authenticated_principal(request: Request) -> Principal:
     """
 
     authenticator: RequestAuthenticator = request.app.state.authenticator
-    principal = await authenticator.authenticate(request)
+    try:
+        principal = await authenticator.authenticate(request)
+    except HTTPException as refusal:
+        if authenticator.settings.auth_audit_enabled and refusal.status_code in {401, 403}:
+            route = getattr(request.scope.get("route"), "path", "unmatched")
+            try:
+                await request.app.state.service.record_authentication_failure(
+                    route=route, method=request.method, status_code=refusal.status_code
+                )
+            except Exception as audit_error:
+                # An audit-store outage must never authenticate the caller or
+                # replace the original denial. Do not log exception text/SQL,
+                # which could contain sensitive values.
+                logging.getLogger(__name__).error(
+                    "authentication_audit_write_failed exception_type=%s", type(audit_error).__name__
+                )
+        raise
     resolver = getattr(request.app.state, "grant_resolver", None)
     if resolver is None:
         return principal
