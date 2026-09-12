@@ -218,6 +218,32 @@ with the same suffixes as the costing campaign above. Scope overrides select
 `eyvan/domain/spend.py` and `tests/test_run_cost.py`; all other pinned-tool
 instructions are unchanged.
 
+## Availability dataclass contracts (2026-09-12)
+
+`tests/test_availability_contracts.py` adds 23 deterministic cases for the
+methods/properties that the pinned mutation generator skips: beta scoring,
+interruption exposure, evidence decay, success reset, latest-128 latency
+retention, default/custom/capped cooldowns, and all sixteen combinations of
+the four economic probe gates. Boundary cases distinguish strict value gain
+from inclusive budget, uncertainty and cooldown comparisons. The existing
+availability tests plus these contracts pass 29 cases.
+
+Eighteen explicitly selected process-local changes each fail semantic assertions
+in the new tests; an unmodified module re-executed by the same probe harness
+passes. The changes cover scoring denominators, omitted decay/accounting,
+reset and retention mistakes, empty custom policy versus default policy,
+backoff capping/incrementing, and the four comparison boundaries. Each probe
+runs in a fresh Python 3.11 process; neither altered source nor mutants are
+written into the production package. Source/test SHA-256 values were identical
+before and after the experiment. The receipt and individual failure logs are
+under `.pytest_cache/availability-contract-probes/`; the retained runner is
+`.pytest_cache/probe_availability_contracts.py`.
+
+This is **18 selected sensitivity probes**, not an exhaustive mutmut campaign
+or a generated-mutant percentage. Availability production code is unchanged.
+Invalid-input policies, all observation histories and the other dataclass-heavy
+domain methods are not fully qualified by these cases.
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,
