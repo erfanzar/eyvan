@@ -6,6 +6,45 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Ordinary scheduler optimization and availability contracts (2026-09-12)
+
+Hosted [CI run 34698658335](https://github.com/erfanzar/eyvan/actions/runs/34698658335)
+at `054279c` failed only its Python 3.12 job's scheduling budget. Python
+3.11/3.13, package, dashboard and secret-scan jobs succeeded. The original
+ordinary p99 was **77.317 ms / 75 ms**; the additional diagnostic sample
+passed at **64.122 ms**, without waiving the original failure.
+
+Profiling identified eager construction of losing candidate leases. The
+working-tree optimization reduces this from **26,600 to 80 constructions**
+for 80 selected ordinary placements in the same 20-iteration scenario, while
+retaining all candidate scoring and admission checks. Local Python 3.11.14
+ordinary scheduling p99 changed from **38.640 to 25.894 ms** at 1,000 cells
+(100 samples) and **393.905 to 257.776 ms** at 10,000 cells (30 samples).
+Budgets, scenarios and GC policy were unchanged. Full methodology, raw receipt
+paths and source fingerprints are in the [benchmark reference](reference/scheduler-benchmarks.md).
+These local samples do not establish a green hosted rerun.
+
+Twelve permutation/preference regressions failed the old materialization
+count and now pass. A read-only 500-snapshot comparison against immutable
+`054279c` matched all decisions, including 21 preemption plans. The focused
+scheduler/property selection passed 76 tests; scoped independent source review
+reported no confirmed correctness findings. Private factory overrides with
+side effects are not a supported equivalence claim.
+
+Availability belief/scoring gained 23 deterministic contracts, with all 18
+selected process-local sensitivity probes detected and an unmodified control
+passing. Source/test hashes remained unchanged during probing. This is bounded
+dataclass-method qualification, not full-domain mutation coverage; see the
+[mutation reference](reference/scheduler-mutations.md).
+
+After both changes, the full minimum-Python/required-PostgreSQL suite passed
+**6,819 tests, 17 skips, 164 warnings**, exit **0**, in **470.05 seconds**.
+Receipt stem: `.pytest_cache/python311-postgres-after-lazy-leases`.
+The earlier availability-only checkpoint passed 6,807 tests with 17 skips.
+Ruff check/format (680 files), the 15-file mypy ratchet, all four import
+contracts, focused documentation checks and dashboard coverage/build/lint/format
+also passed locally. No additional cloud allocation was used for this slice.
+
 ## Injected capacity loss and replacement-host TPU recovery (2026-09-12)
 
 Campaign `capacity-loss-a1c2f24faa77` used Eyvan to acquire two successive

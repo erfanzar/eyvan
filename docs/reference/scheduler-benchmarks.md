@@ -74,8 +74,14 @@ wall time is another diagnostic signal, not proof of a specific contention sourc
 
 CI now schedules this additional sample only when the original 1,000-cell budget
 step fails. Both receipts are retained; even a passing diagnostic rerun leaves
-the original failure blocking. Hosted qualification of this diagnostic step is
-still pending.
+the original failure blocking. This non-waiving behavior was observed in
+[run 34698658335](https://github.com/erfanzar/eyvan/actions/runs/34698658335)
+at `054279c`: ordinary scheduling failed at **77.317 ms** (budget 75), while
+the separate diagnostic sample passed at **64.122 ms**. The Python 3.12 job
+remained failed. Its slowest diagnostic scheduling iteration used **60.747 ms
+CPU**; its one generation-2 collection occurred in a different, faster sample.
+This does not attribute the original uninstrumented failure to GC or host
+contention.
 
 The retained Python 3.12 receipt from
 [run 34695978824](https://github.com/erfanzar/eyvan/actions/runs/34695978824)
@@ -85,3 +91,35 @@ Ordinary scheduling p50 was **45.032 ms**. That run failed the ordinary scheduli
 budget, not snapshot construction. These samples alone do not establish whether
 GC, host scheduling, or implementation work caused the tail. All checked-in
 budgets remain unchanged; no hosted green result is inferred from local timings.
+
+## Deferred ordinary lease construction (2026-09-12; local)
+
+Profiling the unchanged 1,000-cell ordinary scenario found 26,600 candidate
+lease constructions for 80 selected placements over 20 iterations. Ordinary
+placement now scores every eligible candidate with the same ordering and
+budget/quota checks, retaining the best candidate's fields and constructing
+only the selected lease. Cell-group and elastic algorithms are unchanged.
+
+Sequential before/after measurements on the same Darwin/Python **3.11.14** host,
+with no diagnostic instrumentation and unchanged scenarios/budgets:
+
+| Cells | Samples | Ordinary p50 before / after (ms) | Ordinary p99 before / after (ms) |
+|---:|---:|---:|---:|
+| 1,000 | 100 | 26.665 / 19.077 | 38.640 / 25.894 |
+| 10,000 | 30 | 291.497 / 195.542 | 393.905 / 257.776 |
+
+All four local receipts passed existing budgets. They are retained as
+`.pytest_cache/scheduler-lazy-{before,after}-{1000,10000}.json`. The baseline
+scheduler SHA-256 is `7259767ead43c72efc9847945674bc58cb578291e65446eaa31b7e9f14e5707d`;
+the candidate is `a0758a6ff57969cc7be032f3b357f2936ba219f68af8beba170396499049321c`.
+These sequential local samples are not controlled GitHub-runner measurements
+or proof that the hosted budget failure is resolved. The 30-sample larger run
+is not a replacement for the scheduled 100-sample lane.
+
+Twelve permutation/preference regressions compare the entire selected decision
+and its costs/resources while requiring only one materialized lease. A retained
+read-only differential probe compares complete results against the immutable
+`054279c` scheduler for 500 seeded snapshots, including budgets, quotas, pricing,
+preferences and existing lower-priority leases: 537 placements, 21 preemption
+plans and 958 infeasibilities match exactly. This is bounded parity evidence,
+not exhaustive equivalence or renewed full-domain mutation qualification.

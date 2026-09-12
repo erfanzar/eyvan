@@ -438,7 +438,7 @@ class Scheduler:
         if not feasible_cells:
             return self._summarize_static_failures(workload, static_failures)
 
-        placements: list[PlacementDecision] = []
+        best_placement: tuple[PlacementScore, CapacityCell, Decimal, Decimal, ResourceVector] | None = None
         dynamic_failures: list[CellInfeasibility] = []
         budget_allowed_cells: list[CapacityCell] = []
         for cell in feasible_cells:
@@ -474,21 +474,9 @@ class Scheduler:
             remaining = accounting.remaining(cell)
             exclusive_busy = cell.exclusive_workloads and any(accounting.leases_for_cell(cell.cell_id))
             if not exclusive_busy and requested.fits_within(remaining) and quota_failure is None:
-                lease = self._make_lease(
-                    workload,
-                    requested,
-                    cell,
-                    hourly_cost,
-                    reserved_cost,
-                    resource_hours,
-                )
-                placements.append(
-                    PlacementDecision(
-                        workload.workload_id,
-                        lease,
-                        self._placement_score(workload, requested, cell, remaining, reserved_cost),
-                    )
-                )
+                score = self._placement_score(workload, requested, cell, remaining, reserved_cost)
+                if best_placement is None or score < best_placement[0]:
+                    best_placement = (score, cell, hourly_cost, reserved_cost, resource_hours)
             else:
                 code = (
                     InfeasibilityCode.QUOTA_EXCEEDED
@@ -509,8 +497,10 @@ class Scheduler:
                         message=message,
                     )
                 )
-        if placements:
-            return min(placements, key=lambda decision: decision.score)
+        if best_placement is not None:
+            score, cell, hourly_cost, reserved_cost, resource_hours = best_placement
+            lease = self._make_lease(workload, requested, cell, hourly_cost, reserved_cost, resource_hours)
+            return PlacementDecision(workload.workload_id, lease, score)
 
         preemption_plans: list[_PreemptionCandidate] = []
         unsafe_preemption = False

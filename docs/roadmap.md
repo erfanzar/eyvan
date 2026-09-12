@@ -149,6 +149,10 @@ reviews).
   binary drift; its fresh campaign detected 74/76 mutants, with two explicitly
   classified equivalent internal-label changes. The latest costing/invariant/
   run-cost selection passed 49 tests. RunSpend properties were not mutated.
+  Availability dataclass/property contracts now pass 23 new deterministic cases
+  (29 with existing availability tests). Eighteen selected process-local
+  sensitivity probes are detected with an unmodified control and unchanged
+  source/test hashes; these are not a generated-mutant coverage percentage.
   Remaining scheduler survivors and other domain modules are still open;
   the tool's exit 0 with survivors is not a passing mutation gate.
 
@@ -355,6 +359,12 @@ reviews).
   with correctness assertions and raw timing receipts. Local 1k/10k budgeted
   runs pass; methodology and limits are in
   `docs/reference/scheduler-benchmarks.md`.
+- **[done]** Ordinary placement now materializes only its selected lease,
+  preserving candidate scoring and admission checks. Twelve regressions and
+  500 differential snapshots pass; local 1k/10k ordinary p99 improved from
+  38.640/393.905 ms to 25.894/257.776 ms with unchanged budgets. These are
+  local Python 3.11 samples, not proof of resolving the hosted tail failure.
+  The post-change required-PostgreSQL suite passed 6,819 tests with 17 skips.
 - **[next]** Verify the configured nightly 10k-cell simulation on GitHub's
   runner. The lane records 100 samples and retains p99 plus raw JSON.
   Full controller/database reconciliation-loop latency remains a separate
