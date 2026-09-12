@@ -244,6 +244,36 @@ or a generated-mutant percentage. Availability production code is unchanged.
 Invalid-input policies, all observation histories and the other dataclass-heavy
 domain methods are not fully qualified by these cases.
 
+## Accelerator ordering (2026-09-12)
+
+Three regressions reproduced an error while formatting unsupported accelerator
+names: `str.isdigit()` accepts superscript and circled digits that `int()` cannot
+parse. The numeric-suffix guard now uses `str.isdecimal()`, retaining decimal
+Unicode sizes and treating other names as opaque strings. Eleven fixed public
+contracts cover permutations, deduplication, final-hyphen families, numeric ties,
+empty families, bare-family/zero-size order and service error construction. The
+ordering and accelerator-configuration selection passes 23 tests.
+
+Fresh isolated Python 3.11 / mutmut 3.7.0 campaigns, with the project dependency
+export and seed `20260912`, generated 15 mutants across the two helper functions.
+The initial selection detected 13. Inspecting the two survivors led to an added
+bare-family versus zero-size regression; the strengthened campaign detects 14.
+Both runs exit 0 with unchanged input hashes. Exit 0 is not a zero-survivor gate.
+
+The remaining mutant changes the opaque-name sentinel from `-1` to `-2`. It is
+equivalent for **public sorting**: either negative value precedes every numeric
+size under the same family key, while equal opaque first keys identify the same
+string. Its raw surviving verdict is retained rather than hidden or killed by an
+assertion on the private tuple representation.
+
+Receipts are `.pytest_cache/accelerators-mutation.*` and
+`.pytest_cache/accelerators-strengthened-mutation.*`; generated code and raw
+verdicts remain in the corresponding `domain-mutation-accelerators` and
+`domain-mutation-accelerators-strengthened` snapshot directories. These results
+qualify this generated set, not every possible mutation or the entire domain.
+The post-fix Python 3.11/required-PostgreSQL suite passed **6,900 tests with 17
+monorepo-only skips**, exit 0 (`python311-postgres-after-accelerator-ordering`).
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,

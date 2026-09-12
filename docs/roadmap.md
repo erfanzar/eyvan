@@ -153,6 +153,12 @@ reviews).
   (29 with existing availability tests). Eighteen selected process-local
   sensitivity probes are detected with an unmodified control and unchanged
   source/test hashes; these are not a generated-mutant coverage percentage.
+  Accelerator ordering now rejects nondecimal digit suffixes from numeric
+  parsing instead of crashing diagnostics. Its fresh 15-mutant campaign improved
+  from 13 to 14 detected after adding a bare-family/zero-size ordering contract;
+  the sole remaining negative-sentinel change is equivalent for public sorting.
+  Eleven fixed contracts and the configuration selection pass 23 tests; full
+  required-PostgreSQL verification passes 6,900 with 17 monorepo-only skips.
   Remaining scheduler survivors and other domain modules are still open;
   the tool's exit 0 with survivors is not a passing mutation gate.
 

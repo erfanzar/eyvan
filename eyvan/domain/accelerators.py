@@ -14,7 +14,7 @@ def _accelerator_type_order(value: str) -> tuple[str, int, str]:
     """Sort a conventional ``family-size`` type by numeric size."""
 
     family, separator, raw_size = value.rpartition("-")
-    if separator and family and raw_size.isdigit():
+    if separator and family and raw_size.isdecimal():
         return family, int(raw_size), value
     return value, -1, value
 

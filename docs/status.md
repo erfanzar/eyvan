@@ -6,6 +6,24 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Accelerator ordering qualification (2026-09-12; local)
+
+Unsupported accelerator names containing nondecimal Unicode digits no longer
+crash diagnostic construction. Three cases failed before replacing `isdigit`
+with `isdecimal`; the final focused ordering/configuration selection passes 23
+tests. The [mutation reference](reference/scheduler-mutations.md) records the
+fresh 15-mutant campaigns: 13 initially detected, then 14 after a meaningful
+ordering regression; the remaining negative-sentinel change is equivalent for
+public sorting. Both input-hash checks passed, with no production-source mutation.
+
+The full Python 3.11/required-PostgreSQL run passed **6,900 tests, 17 monorepo-only
+skips, 164 warnings**, exit 0 in 348.07s; receipt stem
+`.pytest_cache/python311-postgres-after-accelerator-ordering`. Ruff/check/format,
+mypy, import contracts, locked exports, generated references and dashboard
+coverage/build/lint/format also passed. This is local qualification, not hosted
+CI recovery: the last hosted attempt could not start because GitHub reported an
+account billing/spending restriction. No billing/account changes were made.
+
 ## Reusable Spot priority example (2026-09-12)
 
 The working-tree `examples/spot_priority_demo.py` was executed unchanged with
