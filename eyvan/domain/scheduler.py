@@ -582,9 +582,8 @@ class Scheduler:
         candidates: list[tuple[CapacityCell, Decimal, Decimal, ResourceVector, PlacementScore]] = []
 
         for cell in sorted(cells.values(), key=lambda candidate: candidate.cell_id):
-            failure = self._static_cell_failure(
-                workload, per_worker.scale(cell.worker_count), cell, require_worker_count_equality=False
-            )
+            per_cell = per_worker.scale(cell.worker_count)
+            failure = self._static_cell_failure(workload, per_cell, cell, require_worker_count_equality=False)
             if failure is not None:
                 static_failures.append(failure)
                 continue
@@ -593,7 +592,6 @@ class Scheduler:
                 # leasing it would bill for workers nobody asked for. It stays
                 # warm for a workload of its own shape.
                 continue
-            per_cell = per_worker.scale(cell.worker_count)
             remaining = accounting.remaining(cell)
             exclusive_busy = cell.exclusive_workloads and any(accounting.leases_for_cell(cell.cell_id))
             if exclusive_busy or not per_cell.fits_within(remaining):

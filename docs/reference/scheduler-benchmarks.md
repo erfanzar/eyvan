@@ -123,3 +123,40 @@ read-only differential probe compares complete results against the immutable
 preferences and existing lower-priority leases: 537 placements, 21 preemption
 plans and 958 infeasibilities match exactly. This is bounded parity evidence,
 not exhaustive equivalence or renewed full-domain mutation qualification.
+
+## Elastic candidate resource reuse (2026-09-12)
+
+The next bounded change reuses the immutable per-cell resource vector between
+static validation and candidate costing instead of scaling it twice. Selected
+lease construction still performs its own scaling; this is not a claim to
+eliminate all resource-vector allocations. Six permutation regressions failed
+before the edit and pass afterward. A separate 500-case seeded comparison
+against `6f19bd5` matched all outcomes: 172 placements and 328 infeasibilities,
+including quotas, budgets, hard constraints, empty supply and capacity limits.
+The candidate source SHA-256 is
+`285868351241bf88ff84c9ddfdeeeb6dcf227366d30848afb912710e84363c08`;
+`.pytest_cache/scheduler-elastic-reuse-parity.json` retains source identities.
+
+Timing does **not** yet establish a tail-latency improvement. In the first
+1,000-cell/100-iteration samples, elastic p50/p99 changed from
+**19.040/33.831 ms** to **16.726/82.699 ms**. The candidate **failed** the unchanged
+75 ms p99 limit. Those raw receipts remain
+`.pytest_cache/scheduler-elastic-{before,after}-1000.json`. A separate diagnostic
+run passed; that does not waive or explain the earlier failure.
+
+After full-suite completion, four predetermined 20-iteration blocks in
+reference/candidate/candidate/reference order all passed the unchanged budgets.
+Their elastic p99 values were **21.196 / 33.751 / 17.543 / 19.085 ms**,
+respectively (`.pytest_cache/scheduler-elastic-reuse-abba.json`). No GC, scenario
+or budget changes were made. This remains local variability evidence, not
+hosted qualification or a causal explanation for the failed sample.
+
+Full Python 3.11/required-PostgreSQL validation passed **6,889 tests**, with
+**17 monorepo-only skips** and 164 warnings in 358.33 seconds. The focused
+scheduler/property selection passed 67 tests. Scoped read-only review found no
+changed placement/accounting semantics and highlighted the intentionally
+unchanged selected-lease scaling. Ruff, formatting, mypy, import contracts and
+lock checks passed. Current hosted CI run **34721399020** could not start jobs:
+GitHub reports failed account payments or an insufficient spending limit.
+Billing intervention is separate from resolving the earlier hosted snapshot
+and elastic-budget failures; no account settings were changed.
