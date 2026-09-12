@@ -407,10 +407,17 @@ reviews).
   was a final log-field parser error; corrected verification of the unchanged
   receipt passed, including negative controls (`docs/status.md`). This was
   injected physical capacity loss, not natural provider reclamation.
-- **[next]** Package the flagship preemption-aware training demo as a reusable
-  operator workflow. The bounded private campaigns above establish same-host
-  priority restoration and replacement-host recovery on the Spot fleet;
-  natural Spot reclamation and longer-running qualification remain unmeasured.
+- **[done]** Reusable dry-run-first `examples/spot_priority_demo.py` and portable
+  training payload, documented in [tutorial 17](tutorial/17-spot-priority-demo.md).
+  Campaign `8a7612f7f4974c36a456609f15ee16ca` ran the shipped example through
+  Eyvan on four-chip Spot capacity: checkpoint 20, interactive yield,
+  same-host batch attempt 2 restoration to step 40 matching uninterrupted control.
+  Owned teardown had no reported errors; independent provider listing was empty.
+  The example contains no destructive loss injection or private runtime profile.
+- **[next]** Natural Spot reclamation and longer-running training qualification.
+  The reusable example proves same-host priority restoration; the separately
+  authorized private campaign above proves injected replacement-host recovery,
+  not natural provider reclamation.
 
 ## Maturity (6 → 10)
 - **[next]** Qualify upgrade behavior against an actual published release.

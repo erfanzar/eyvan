@@ -219,8 +219,8 @@ needs both facts per backend, not the flattering one — see
 ## The docs map
 
 New to the project? Start with the [tutorial](docs/tutorial/README.md) —
-sixteen verified parts that walk from "what is Eyvan" through the SDK, the
-control plane, providers, operations, and deployment.
+seventeen source-grounded parts that walk from "what is Eyvan" through the SDK,
+the control plane, providers, operations, deployment, and an explicit Spot TPU example.
 
 | page | what it answers |
 |---|---|

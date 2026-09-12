@@ -6,6 +6,41 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Reusable Spot priority example (2026-09-12)
+
+The working-tree `examples/spot_priority_demo.py` was executed unchanged with
+explicit `--execute` against the isolated Eyvan plane in `example-spot-project`, zone
+`us-east5-a`. Campaign **`8a7612f7f4974c36a456609f15ee16ca`** used one
+provider-confirmed **SPOT** VM and four TPU devices. Batch
+`wl_7358381071264dfa9c934cabaa02e176` saved checkpoint step **20**, yielded to
+interactive workload `wl_6411ac5df7da4dd5a96f0ef9d7c61b14`, then succeeded on
+attempt **2**, restoring through step **40**. The interactive workload succeeded
+on attempt 1. Restored weights matched the uninterrupted control; loss went
+from **31.135807** initially to **0.009830652** at the checkpoint and
+**0.000008222324** after restoration. Checkpoint and restored instance names
+match: this is **same-host scheduler priority preemption**, not natural Spot
+reclamation or replacement-host recovery.
+
+The retained receipt is
+`.pytest_cache/spot-validation/public-priority/8a7612f7f4974c36a456609f15ee16ca.json`.
+It records verified restoration, no cleanup errors, teardown requested and API
+cells deleted. Its `provider_absence_verified` remains false by design: the
+example does not make independent provider queries. A separate GCP instance
+listing filtered to this run returned **`[]`**, verifying absence of its VM.
+The example contains no provider deletion command or private runtime profile;
+see [tutorial 17](tutorial/17-spot-priority-demo.md) for the bounded execution and
+owned-cleanup contract.
+
+Before allocation, Python **3.11.14** with required PostgreSQL **17.11** passed
+**6,883 tests**, with **17 monorepo-only skips**, 164 warnings, exit 0 in
+408.27 seconds (`python311-postgres-after-spot-example`). The focused
+example/documentation selection passed 452 tests. Ruff, formatting, mypy,
+import boundaries, lock and generated API/env checks passed. Dashboard coverage,
+build, lint and formatting passed again; secret scan found no new findings
+across 868 publishable paths. These checks do not erase the hosted performance
+failure: CI run **34701138715** at `6f5896e` remains failed, with snapshot and
+elastic tail-budget violations still to resolve.
+
 ## Ordinary scheduler optimization and availability contracts (2026-09-12)
 
 Hosted [CI run 34698658335](https://github.com/erfanzar/eyvan/actions/runs/34698658335)

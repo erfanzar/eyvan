@@ -29,6 +29,7 @@ can always go one level deeper.
 | 14 | [14-operations.md](14-operations.md) | The daily runbook, zone racing, troubleshooting, proofs |
 | 15 | [15-testing.md](15-testing.md) | Test layout, suites, the provider-boundary rule, dashboard tests |
 | 16 | [16-deployment.md](16-deployment.md) | The production prerequisites, `head up`, Helm and raw manifests |
+| 17 | [17-spot-priority-demo.md](17-spot-priority-demo.md) | Explicit Spot TPU priority/checkpoint example, receipts and owned cleanup |
 
 ## Suggested paths through it
 
