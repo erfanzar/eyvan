@@ -1786,6 +1786,21 @@ class SystemdTransientServiceExecutor:
         # not running -- including when ``systemctl stop`` reported a failure
         # because there was nothing there to stop.
         runtime_gone = self._runtime_is_gone(unit_name)
+        if result.returncode == 0 and runtime_gone and observed.status is ExecutionWorkloadStatus.INDETERMINATE:
+            # A successful stop followed by collection proves intentional
+            # termination, not a successful workload exit. Keep mere absence
+            # (including a failed stop) unknown; stop_requested alone is not
+            # evidence that either runtime stop stage succeeded.
+            with _file_lock(_record_lock_path(record_path)):
+                current = _load_json(record_path)
+                if current is not None:
+                    self._validate_fence(remote_id, current, context)
+                    if _known_persisted_status(current) is ExecutionWorkloadStatus.INDETERMINATE:
+                        self._set_status(
+                            current, ExecutionWorkloadStatus.STOPPED, "systemd stop completed before collection"
+                        )
+                        _atomic_write_json(record_path, current)
+                        self._secure_terminal_collection(record_path, current, runtime_absent=True)
         if observed.status is ExecutionWorkloadStatus.INDETERMINATE and not runtime_gone:
             raise RuntimeError(f"cannot safely verify that systemd execution {remote_id!r} stopped")
         if result.returncode != 0 and observed.status not in _TERMINAL_STATES and not runtime_gone:

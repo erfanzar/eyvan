@@ -997,6 +997,38 @@ def test_stopping_an_execution_whose_unit_is_already_gone_succeeds(tmp_path: Pat
     assert executor.status(remote_id).status is ExecutionWorkloadStatus.INDETERMINATE
 
 
+@pytest.mark.parametrize("stop_returncode", [0, 1])
+def test_stop_collected_unit_records_only_a_confirmed_stop(tmp_path: Path, stop_returncode: int) -> None:
+    """A successful stop survives collection without inventing a successful exit."""
+
+    class CollectOnStop(FakeSystemd):
+        def __call__(self, command: tuple[str, ...]) -> SystemdCommandResult:
+            result = super().__call__(command)
+            if command[:2] == ("systemctl", "stop") and result.returncode == 0:
+                self.remove(command[-1])
+                return SystemdCommandResult(returncode=stop_returncode)
+            return result
+
+    systemd = CollectOnStop()
+    executor = SystemdTransientServiceExecutor(
+        tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a", use_exit_type_cgroup=True
+    )
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    executor.stop(remote_id, _context())
+
+    assert unit_name not in systemd.units
+    assert not systemd.background_children[unit_name]
+    expected = ExecutionWorkloadStatus.STOPPED if stop_returncode == 0 else ExecutionWorkloadStatus.INDETERMINATE
+    assert _record(executor, remote_id)["status"] == expected.value
+    restarted = SystemdTransientServiceExecutor(
+        tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a", use_exit_type_cgroup=True
+    )
+    assert restarted.status(remote_id).status is expected
+    if stop_returncode == 0:
+        restarted.retire(remote_id, _context())
+
+
 def test_a_stop_that_cannot_see_systemd_at_all_still_refuses(tmp_path: Path) -> None:
     """An unreachable manager is not evidence of absence.
 
