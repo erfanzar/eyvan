@@ -389,8 +389,18 @@ reviews).
   matching an uninterrupted control. Both jobs succeeded and provider-side
   VM cleanup was verified (`docs/status.md`, campaign `priority-3ee7d85be890`).
   The checkpoint and restore used the same VM; this is not provider reclamation.
-- **[next]** Flagship preemption-aware training demo (checkpoint/restore
-  across physical Spot losses and replacement hosts) on the Spot fleet.
+- **[done]** Bounded replacement-host recovery after user-authorized deletion
+  of one owned Spot TPU VM: campaign `capacity-loss-a1c2f24faa77` resumed on a
+  different Spot instance at attempt 3, restored step 20, completed step 40 and
+  matched uninterrupted training. One capacity-loss event, zero failure/provider
+  preemption events; teardown independently verified. The raw harness exit 1
+  was a final log-field parser error; corrected verification of the unchanged
+  receipt passed, including negative controls (`docs/status.md`). This was
+  injected physical capacity loss, not natural provider reclamation.
+- **[next]** Package the flagship preemption-aware training demo as a reusable
+  operator workflow. The bounded private campaigns above establish same-host
+  priority restoration and replacement-host recovery on the Spot fleet;
+  natural Spot reclamation and longer-running qualification remain unmeasured.
 
 ## Maturity (6 → 10)
 - **[next]** Qualify upgrade behavior against an actual published release.

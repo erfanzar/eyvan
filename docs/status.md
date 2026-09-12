@@ -6,6 +6,63 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Injected capacity loss and replacement-host TPU recovery (2026-09-12)
+
+Campaign `capacity-loss-a1c2f24faa77` used Eyvan to acquire two successive
+Spot `v5p-8` cells, each with four TPU chips. After a durable step-20
+checkpoint and successful scheduler priority interruption, the user-authorized
+fault injection deleted only the campaign's first VM. Eyvan detected the loss,
+advanced the batch workload to attempt/generation **3**, acquired a replacement
+Spot cell, and completed training through step **40** on a **different VM**.
+The interactive workload also succeeded. The batch had one capacity-loss event,
+zero failure retries and zero provider-preemption events.
+
+The retained TPU output identifies both distinct instances, four devices,
+restored step 20, final step 40, and a result matching the uninterrupted control.
+Final loss was 0.000008222324. The replacement reports preemptible capacity;
+the first VM's provider descriptor independently recorded `SPOT`. The checkpoint
+URI remained the durable workload URI. This proves bounded replacement-host
+recovery after **controlled physical capacity deletion**, not a naturally
+occurring provider Spot reclamation or a production availability SLO.
+
+The orchestration process exited **1** after both workloads succeeded because
+its final parser incorrectly read `text` rather than the log API's `message`
+field. The original receipt and exit are preserved. The corrected post-run
+verifier exited **0**, checked the persisted output/counters/identities, and
+rejected negative controls for same-host restoration, mismatching results and
+non-preemptible capacity. It did not acquire another machine or rewrite the
+original receipt. Fleet teardown returned 200 without cleanup errors; fresh
+provider listings by owned fleet label and name both returned no instances.
+
+Receipts under `.pytest_cache/spot-validation/`:
+`capacity-loss-a1c2f24faa77.json` and `capacity-loss-a1c2f24faa77-verified.json`.
+The latter binds the original bytes by SHA-256 and records the parser correction,
+negative controls and empty provider listing. Batch workload:
+`wl_b0e5f59928df4ec890e84a451e85dd3b`.
+
+## Hosted scheduling budget and diagnostic checkpoint (2026-09-12)
+
+[GitHub run 34695978824](https://github.com/erfanzar/eyvan/actions/runs/34695978824)
+finished with Package, Dashboard, Secret scan and Python 3.11/3.13 jobs passing.
+The Python 3.12 job failed its scheduling budget: ordinary scheduling p99 was
+90.610 ms against 75 ms. Its snapshot p99 was 20.698 ms against 25 ms, so the
+older snapshot failure is not this run's failure. Hosted CI remains **red**.
+
+Opt-in CPU/GC diagnostics and a failure-only CI diagnostic step now retain
+additional evidence without replacing the original receipt or waiving its
+failure. Scenario, raw samples and budgets are unchanged. Independent read-only
+review found no confirmed actionable issue. See
+`docs/reference/scheduler-benchmarks.md` for attribution limits; the new
+hosted diagnostic step has not yet run.
+
+Fresh local Python 3.11/required-PostgreSQL verification: **6,784 passed,
+17 monorepo-only skips**, 164 warnings, exit 0 in 454.86 seconds. Receipt stem:
+`.pytest_cache/python311-postgres-after-benchmark-diagnostics`. Ruff check/format
+(679 files), mypy, import contracts, lock/generated-reference checks, 419
+focused documentation/CI tests, actionlint, and dashboard coverage/build/lint/
+format passed. The diagnostic 1,000-cell/20-sample run passed locally; this
+is not a hosted performance pass. These checks precede this status-only update.
+
 ## Live Spot TPU priority checkpoint restoration (2026-09-12)
 
 Campaign `priority-3ee7d85be890` passed through Eyvan on one Spot
