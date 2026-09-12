@@ -331,6 +331,29 @@ They remain visible in the raw verdict map and are not suppressed or declared
 equivalent. These generated totals do not cover dataclass methods such as
 `PredictiveConfig.__post_init__` or `Prediction.acts`.
 
+## Pricing contracts (2026-09-12)
+
+Production pricing policy is unchanged. Thirty-four added public contract cases
+cover numeric normalization/refusal, naive timestamp refusal, newest-sample
+retention, specificity before recency, deterministic scope ties, scope mismatch
+exclusion, positive projection dimensions and exact amounts/provenance. All 56
+related tests pass; independent read-only review found no actionable findings.
+The tests do not invent a same-key equal-timestamp replacement policy.
+
+Fresh isolated mutmut 3.7.0/Python 3.11 campaigns with seed `20260912` improve
+from **56/85 to 74/85** detected; both exit 0 with input hashes unchanged. Receipts
+are `.pytest_cache/pricing-mutation.*` and `pricing-strengthened-mutation.*`, with
+corresponding `domain-mutation-pricing*` snapshots and raw verdict maps. The 11
+remaining survivors change diagnostic formatting/context, equal-time replacement
+or zone tie-key expressions. They remain visible and unsuppressed; no blanket
+equivalence or full-qualification claim is made.
+
+Two separate process-local probes remove sample normalization and naive-time
+refusal from the dataclass method skipped by the generator. Both fail the new
+sample tests; the unmodified control passes, with source/test hashes unchanged
+(`.pytest_cache/pricing-dataclass-probes/receipt.json`). These two hand-selected
+changes are not added to the generated denominator or called exhaustive coverage.
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,

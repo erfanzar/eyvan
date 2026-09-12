@@ -6,6 +6,22 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Pricing contract qualification (2026-09-12; local)
+
+Production pricing code is unchanged. Thirty-four new public contract cases
+bring the pricing selection to **56 passing tests**, covering sample boundaries,
+scope/freshness ordering, projection amounts and provenance. Independent read-only
+review found no actionable findings. Fresh pinned generated campaigns improve
+from **56/85 to 74/85** detected, with unchanged input hashes; 11 survivors remain
+visible and unsuppressed. Two separate dataclass probes fail the new tests while
+the unmodified control passes. See the [mutation reference](reference/scheduler-mutations.md)
+for retained receipts and scope limits; these are not exhaustive qualifications.
+
+The full Python 3.11/required-PostgreSQL refresh passes **6,972 tests, 17
+monorepo-only skips, 164 warnings**, exit 0 in 311.89s; receipt stem
+`.pytest_cache/python311-postgres-after-pricing-contracts`. Ruff/format, fast tests
+and focused documentation checks pass. No deployed or hosted result follows.
+
 ## Predictive affordability qualification (2026-09-12; local)
 
 Four failing exact-budget cases exposed float floor division undercounting cells.

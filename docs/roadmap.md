@@ -168,7 +168,11 @@ reviews).
   using exact decimal integer ratios; 14 regressions pass (29 with existing
   policy tests). Its fresh 75-mutant campaign improves from 71 to 73 detected;
   two diagnostic-message changes remain unsuppressed and dataclass methods remain
-  outside the generated denominator.
+  outside the generated denominator. Pricing adds 34 public contract cases
+  (56 related tests pass), improving its fresh generated campaign from 56/85 to
+  74/85 with unchanged production pricing source. Two separate dataclass probes
+  detect missing sample normalization/time validation. Eleven generated survivors
+  remain unsuppressed; these bounded results do not qualify all dataclass methods.
   Remaining scheduler survivors and other domain modules are still open;
   the tool's exit 0 with survivors is not a passing mutation gate.
 
