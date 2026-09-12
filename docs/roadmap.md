@@ -164,7 +164,11 @@ reviews).
   with an unmodified control. A separate fresh 34-mutant campaign improves from
   26 to 29 detected; five visible diagnostic changes remain unsuppressed and
   are not declared equivalent. Neither generated totals nor selected probes
-  establish full dataclass coverage.
+  establish full dataclass coverage. Predictive budget undercounting is corrected
+  using exact decimal integer ratios; 14 regressions pass (29 with existing
+  policy tests). Its fresh 75-mutant campaign improves from 71 to 73 detected;
+  two diagnostic-message changes remain unsuppressed and dataclass methods remain
+  outside the generated denominator.
   Remaining scheduler survivors and other domain modules are still open;
   the tool's exit 0 with survivors is not a passing mutation gate.
 

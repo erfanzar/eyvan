@@ -39,6 +39,8 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import dataclass
 
+from eyvan.domain.costing import money
+
 #: Observations of the same hour needed before a pattern counts as one.
 #:
 #: Three weeks of one weekday. Two would let a fortnight's coincidence warm
@@ -144,7 +146,16 @@ def predict_demand(
         # A free cell is not evidence of a working price; it is evidence of an
         # unpriced pool, and dividing a budget by it would warm the whole fleet.
         return Prediction(0, "this pool has no hourly cost, so a budget cannot bound the prediction")
-    affordable = int(config.hourly_budget_usd // cell_hourly_cost)
+    budget, cost = money(config.hourly_budget_usd), money(cell_hourly_cost)
+    if budget.is_finite() and cost.is_finite():
+        # Integer ratios retain decimal dollars without rounding the quotient or
+        # depending on the process-wide Decimal precision for very small prices.
+        budget_numerator, budget_denominator = budget.as_integer_ratio()
+        cost_numerator, cost_denominator = cost.as_integer_ratio()
+        affordable = (budget_numerator * cost_denominator) // (budget_denominator * cost_numerator)
+    else:
+        # Preserve nonfinite-input behavior, including an unaffordable +inf cost.
+        affordable = int(config.hourly_budget_usd // cell_hourly_cost)
     cells = min(affordable, max_cells)
     if cells <= 0:
         return Prediction(0, f"the budget affords no cell at {cell_hourly_cost}/h")

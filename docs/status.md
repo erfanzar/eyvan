@@ -6,6 +6,29 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Predictive affordability qualification (2026-09-12; local)
+
+Four failing exact-budget cases exposed float floor division undercounting cells.
+Finite predictions now use decimal integer ratios, preserving caps and avoiding
+Decimal quotient precision failures for small prices. Fourteen new regressions
+cover thresholds, one-cell actions, context independence and existing nonfinite
+behavior; the combined prediction selection passes **29 tests**. Scoped independent
+read-only review found no confirmed actionable defects.
+
+Full Python 3.11/required-PostgreSQL verification of the final test set passed
+**6,938 tests, 17 monorepo-only skips, 164 warnings**, exit 0 in 358.64s;
+receipt stem `.pytest_cache/python311-postgres-after-prediction-strengthened`.
+The preceding 6,934-test receipt predates four mutation-driven test additions.
+Static/type/import, lock/export and generated-reference checks passed, as did
+fast tests and dashboard build/coverage/lint/format checks.
+
+Fresh isolated generated campaigns improve from **71/75 to 73/75** detected,
+with unchanged input hashes. Two diagnostic-message changes remain unsuppressed;
+the [mutation reference](reference/scheduler-mutations.md) explains the bounded
+scope and excluded dataclass methods. No hosted success follows: the latest
+listed CI run remains 34721399020 at `6f19bd5`, failed before jobs on GitHub's
+billing/spending-limit annotation. No account or billing settings were changed.
+
 ## Carbon boundary qualification (2026-09-12; local)
 
 NaN and positive infinity previously passed intensity and freshness-window

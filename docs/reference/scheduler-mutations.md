@@ -303,6 +303,34 @@ visible output**: they have not been suppressed or declared equivalent. A policy
 for diagnostic mutations remains open. Dataclass methods remain outside the
 34-mutant generated set; do not combine that denominator with the 16 probes.
 
+## Predictive affordability contracts (2026-09-12)
+
+Four regressions reproduce binary-float floor division undercounting exact decimal
+budgets (for example, USD 0.30 buys only two USD 0.10 cells). Finite budget/cost
+values now use exact decimal integer ratios. Ordinary Decimal floor division was
+not sufficient: a small positive price such as `1e-30` exceeded its quotient
+precision even when the resulting allocation was capped at three cells. The
+integer-ratio calculation also remains independent of the active Decimal context.
+Default/disabled policy and existing nonfinite-input behavior are preserved.
+
+Fourteen new regressions cover exact/just-under thresholds, caps, small prices,
+context precision, reasons, one-cell allocations and nonfinite behavior. The
+combined prediction selection passes 29 tests. An independent read-only review
+found no confirmed actionable defects; this does not certify hosted behavior.
+
+A separate fresh mutmut 3.7.0/Python 3.11 campaign with seed `20260912` generates
+75 mutants in `predict_demand`, initially detecting 71. Adding one-cell and
+nonfinite-budget refusal assertions raises detection to 73 in a fresh snapshot,
+with unchanged input hashes. Both exits are 0. Retained receipt stems are
+`.pytest_cache/prediction-mutation` and
+`.pytest_cache/prediction-strengthened-mutation`; isolated inputs and raw metadata
+are under the matching `domain-mutation-prediction*` directories.
+
+The two remaining survivors decorate disabled/unpriced diagnostic messages.
+They remain visible in the raw verdict map and are not suppressed or declared
+equivalent. These generated totals do not cover dataclass methods such as
+`PredictiveConfig.__post_init__` or `Prediction.acts`.
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,
