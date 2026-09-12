@@ -104,6 +104,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "POST /api/v1/capacity-pools": "create a pool",
     "DELETE /api/v1/capacity-pools/{pool_id}": "disable a pool",
     "GET /api/v1/capacity/orphans": "capacity no record claims",
+    "GET /api/v1/capacity/builds": "which build each cell agent runs",
     "GET /api/v1/capacity/billing": "fleet-wide cost",
     "GET /api/v1/capacity/carbon": "fleet-wide grid intensity",
     "GET /api/v1/capacity/warmth": "fleet-wide warm state",

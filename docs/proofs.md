@@ -47,9 +47,16 @@ before the plane is polled, while the run is still free -- and its `receipt_dige
 detects editing, not forgery: there is no signing key here, and the receipt says
 so in its own `unverified` list rather than implying one.
 
-What a receipt still cannot say: which build the cell agent and the worker were
-running. Only the client and the control plane identify themselves today, and
-every receipt records that gap explicitly.
+The agents are asked too. `eyvan capacity builds` reports the digest of every
+reachable cell agent beside the plane's, and a proof run records that sweep. It
+exits non-zero on proven skew *and* when agreement could not be shown -- an
+agent that did not answer is not an agent that agreed, and a proof has already
+been run against a stale agent and read as evidence.
+
+What a receipt still cannot say: which build the native worker process inside
+each cell was running. It is installed from the wheel the head staged, so it is
+expected to match the plane, and every receipt records that expected is not
+observed.
 
 P2 and P3 stay procedural on purpose: they need a host killed mid-stream and a
 job that submits its own children, and an "automated" verdict over a run whose

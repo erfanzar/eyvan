@@ -16,6 +16,7 @@ from eyvan._internal.json_types import JsonObject, is_json_object
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
+    AgentBuild,
     AgentCapabilities,
     AgentObservation,
     CapacityProviderFailure,
@@ -229,6 +230,27 @@ class CellAgentClient:
     def capabilities(self) -> AgentCapabilities:
         response = self._send("GET", "/api/v1/capabilities")
         return AgentCapabilities.model_validate_json(response.content)
+
+    def build(self) -> AgentBuild | None:
+        """Return what code this agent runs, or ``None`` if it cannot say.
+
+        A 404 is the answer from an agent that predates the route, and it is not
+        an error: that agent is reachable and working, it simply cannot describe
+        itself. ``None`` keeps "this agent does not report a build" distinct
+        from "this agent could not be reached", which is a difference an
+        operator chasing version skew has to be able to see.
+
+        Every other failure still raises. An agent that answers 500 to a plain
+        read is not one whose build should be quietly reported as unknown.
+        """
+
+        try:
+            response = self._send("GET", "/api/v1/build")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return AgentBuild.model_validate_json(response.content)
 
     def inventory(self) -> list[dict[str, object]]:
         """Return every cell this agent holds durable state for."""

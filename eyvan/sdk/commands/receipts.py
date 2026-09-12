@@ -244,6 +244,7 @@ def unverified_dimensions(
     plane_build: tp.Mapping[str, object] | None,
     git: tp.Mapping[str, object],
     evidence: tp.Mapping[str, object] | None,
+    fleet_builds: tp.Mapping[str, object] | None = None,
 ) -> list[str]:
     """State what this receipt does not establish.
 
@@ -264,10 +265,7 @@ def unverified_dimensions(
             "the exact build of the control plane: it reported a version but no source digest "
             f"({plane_build.get('digest_detail') or 'no reason given'})"
         )
-    gaps.append(
-        "the build of the cell agent and the worker that ran the observed work; "
-        "only the client and the control plane are identified here"
-    )
+    gaps.extend(_agent_build_gaps(fleet_builds))
     if git.get("commit") is None:
         gaps.append(f"the candidate commit: {git.get('detail') or 'unknown'}")
     elif git.get("clean") is False:
@@ -277,6 +275,51 @@ def unverified_dimensions(
     if evidence is None:
         gaps.append("the raw observations: they were not retained, so only the composed checks can be re-read")
     gaps.append("cryptographic provenance: this receipt is unsigned and its digest detects editing, not forgery")
+    return gaps
+
+
+def _agent_build_gaps(fleet_builds: tp.Mapping[str, object] | None) -> list[str]:
+    """State what the fleet's own builds do or do not establish.
+
+    This is the dimension a receipt could not close at all until the agents
+    learned to describe themselves, and the reason it mattered is on the record:
+    a proof was run against a stale agent and read as evidence. A sweep that
+    reaches every agent and finds one build closes it. Anything less says which
+    part is missing, because an agent that did not answer is not an agent that
+    agreed.
+
+    The native worker inside each cell is still not identified by any of this.
+    It is installed from the wheel the head staged, so it is *expected* to match
+    the plane, but expected is not observed and this keeps saying so.
+    """
+
+    if fleet_builds is None:
+        return [
+            "the build of the cell agent and the worker that ran the observed work; "
+            "only the client and the control plane are identified here"
+        ]
+    agents = fleet_builds.get("agents")
+    unreachable = fleet_builds.get("unreachable")
+    agreement = fleet_builds.get("in_agreement")
+    counted = len(agents) if isinstance(agents, list) else 0
+    missed = len(unreachable) if isinstance(unreachable, list) else 0
+    gaps: list[str] = []
+    if agreement is True:
+        gaps.append(
+            f"the build of the native worker process inside each cell; its {counted} cell agent(s) "
+            "were checked and run this control plane's build, but the worker itself reports none"
+        )
+        return gaps
+    if agreement is False:
+        gaps.append(
+            "nothing about agent builds can be assumed from this run: at least one cell agent "
+            "was running different code than the control plane while it ran"
+        )
+        return gaps
+    gaps.append(
+        f"whether the fleet's agents ran this build: {counted} answered and {missed} could not be reached, "
+        "so nothing disagreed rather than everything agreeing"
+    )
     return gaps
 
 
@@ -295,6 +338,7 @@ def build_proof_receipt(
     command: tp.Sequence[str],
     evidence: tp.Mapping[str, object] | None = None,
     git: tp.Mapping[str, object] | None = None,
+    fleet_builds: tp.Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Assemble one receipt, digest included.
 
@@ -316,6 +360,7 @@ def build_proof_receipt(
             "build": dict(plane_build) if plane_build is not None else None,
             "build_detail": plane_build_detail,
         },
+        "fleet": dict(fleet_builds) if fleet_builds is not None else None,
         "run": {
             "started_at": started_at,
             "completed_at": completed_at,
@@ -323,7 +368,12 @@ def build_proof_receipt(
             "host": socket.gethostname(),
         },
         "evidence": dict(evidence) if evidence is not None else None,
-        "unverified": unverified_dimensions(plane_build=plane_build, git=resolved_git, evidence=evidence),
+        "unverified": unverified_dimensions(
+            plane_build=plane_build,
+            git=resolved_git,
+            evidence=evidence,
+            fleet_builds=fleet_builds,
+        ),
         "signature": None,
     }
     document["receipt_digest"] = canonical_digest(document)

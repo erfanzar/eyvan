@@ -769,6 +769,25 @@ class _ProofRun:
             return None, f"the plane could not be reached for its build: {error}"
         return (document, "") if isinstance(document, dict) else (None, "the plane returned a malformed build document")
 
+    def _fleet_builds(self) -> dict[str, object] | None:
+        """Ask the plane which build each of its agents runs.
+
+        The dimension every receipt used to name and none could close. A plane
+        that predates the route, or one whose agents cannot be reached, leaves
+        it open exactly as before -- the receipt then says so rather than
+        implying the check was made.
+        """
+
+        if self.session is None:
+            return None
+        try:
+            document = self.session.client.request("GET", "/api/v1/capacity/builds")
+        except click.ClickException:
+            return None
+        except OSError:
+            return None
+        return document if isinstance(document, dict) else None
+
     def _write_evidence(self) -> dict[str, object] | None:
         if self.evidence is None or not self.observations:
             return None
@@ -806,6 +825,7 @@ class _ProofRun:
                 completed_at=_utc_now(),
                 command=sys.argv,
                 evidence=evidence,
+                fleet_builds=self._fleet_builds(),
             ),
         )
 

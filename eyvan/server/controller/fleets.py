@@ -12,6 +12,7 @@ import time
 import typing as tp
 from datetime import datetime
 
+from eyvan._internal.build_identity import build_identity
 from eyvan.capacity import (
     CapacityStatus,
 )
@@ -660,4 +661,66 @@ class _ControllerFleets:
             "orphans": orphans,
             "scanned_endpoints": sorted(endpoints),
             "unreachable": unreachable,
+        }
+
+    async def fleet_builds(self) -> dict[str, object]:
+        """Report which build each agent runs, beside this plane's own.
+
+        Every component of this package reports one version string, so that
+        string cannot answer the question an upgrade actually raises. A proof has
+        already been run against a stale agent and read as evidence, and nothing
+        in the plane could have shown that at the time.
+
+        Read-only and operator-triggered, like the orphan scan it is modelled on:
+        one request per distinct cell-agent endpoint, each failure recorded
+        against that endpoint rather than failing the sweep. Three outcomes per
+        agent and they stay distinct -- a digest, ``null`` from an agent that
+        predates the route, or an entry under ``unreachable``. Collapsing the
+        last two would report a plane nobody could reach as one in agreement.
+
+        Only endpoints that hold a cell are scanned, because that is where the
+        agent identity is discoverable from a durable record. A pool with no cell
+        is named in ``unscanned_pools`` rather than passed over in silence.
+        """
+
+        async with self.repository.transaction() as transaction:
+            cells = await transaction.list_cells()
+            pools = await transaction.list_capacity_pools()
+        endpoints: dict[str, CellRecord] = {}
+        for cell in cells:
+            if cell.endpoint and cell.state is not CellState.DELETED:
+                endpoints.setdefault(cell.endpoint, cell)
+        scanned_pools = {cell.pool_id for cell in cells if cell.endpoint and cell.state is not CellState.DELETED}
+
+        agents: list[dict[str, object]] = []
+        unreachable: list[dict[str, str]] = []
+        for endpoint, sample in sorted(endpoints.items()):
+            try:
+                reported = await asyncio.to_thread(self._agent_factory(sample).build)
+            except Exception as exc:
+                logger.warning("cell agent %s could not report its build: %s", endpoint, exc)
+                unreachable.append({"endpoint": endpoint, "detail": str(exc)})
+                continue
+            agents.append(
+                {
+                    "endpoint": endpoint,
+                    "cell_id": sample.id,
+                    "pool_id": sample.pool_id,
+                    "build": None if reported is None else reported.model_dump(mode="json"),
+                }
+            )
+
+        plane = build_identity()
+        matches = [plane.matches(entry["build"] or {}) for entry in agents]
+        return {
+            "plane": plane.as_dict(),
+            "agents": agents,
+            "unreachable": unreachable,
+            "unscanned_pools": sorted(pool.id for pool in pools if pool.id not in scanned_pools),
+            # Three answers, for the same reason every agent has three. False
+            # only when some agent provably runs other code; None while any of
+            # them could not say, because "nothing disagreed" is not agreement.
+            "in_agreement": (
+                False if any(match is False for match in matches) else None if not matches or None in matches else True
+            ),
         }

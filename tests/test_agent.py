@@ -1005,3 +1005,83 @@ def test_an_agent_can_be_asked_what_it_holds(tmp_path) -> None:
     assert [entry["name"] for entry in inventory] == ["ghost-cell"]
     assert inventory[0]["desired_state"] == "up"
     assert inventory[0]["generation"] == 3
+
+
+# --------------------------------------------------------------------------- which build an agent runs
+
+
+def test_an_agent_reports_the_code_it_is_running(tmp_path) -> None:
+    """Version is the same string in every component of this package.
+
+    So it cannot answer the question an upgrade raises -- is the agent holding
+    my capacity the build I deployed? -- and a proof has already been run
+    against a stale agent and read as evidence.
+    """
+
+    cell_service, _ = service(tmp_path)
+    client = TestClient(create_agent_app(cell_service, EyvanSettings(agent_shared_secret="secret")))
+
+    document = client.get("/api/v1/build", headers={"Authorization": "Bearer secret"}).json()
+
+    assert document["source_digest"].startswith("sha256:"), document["digest_detail"]
+    assert document["file_count"] > 100
+    assert document["origin"] in {"wheel", "editable", "source"}
+
+
+def test_the_agent_build_route_is_not_public(tmp_path) -> None:
+    """A build digest and an interpreter version are a fingerprint."""
+
+    cell_service, _ = service(tmp_path)
+    client = TestClient(create_agent_app(cell_service, EyvanSettings(agent_shared_secret="secret")))
+
+    assert client.get("/api/v1/build").status_code == 401
+
+
+def test_an_agent_that_predates_the_route_reports_no_build_rather_than_failing() -> None:
+    """404 is an answer from a working agent, not an error.
+
+    It is also why this is a route of its own rather than a field on
+    ``AgentCapabilities``, which forbids extras: a new field there would make a
+    control plane one version behind unable to decode capabilities at all.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    assert client.build() is None
+
+
+def test_an_agent_that_answers_500_to_a_build_read_still_raises() -> None:
+    """ "Cannot say" and "is broken" are different, and only the first is benign."""
+
+    from eyvan.worker.agent.client import CellAgentUnavailableError
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(CellAgentUnavailableError):
+        client.build()
+
+
+def test_an_unreachable_agent_is_not_a_missing_build() -> None:
+    """An agent nobody could reach has not reported that it has no build."""
+
+    from eyvan.worker.agent.client import CellAgentUnavailableError
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(CellAgentUnavailableError):
+        client.build()

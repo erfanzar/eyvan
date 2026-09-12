@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from eyvan._internal.build_identity import build_identity
 from eyvan._internal.json_types import JsonObject
 from eyvan.capacity.drivers.base import (
     CapacityProviderError,
@@ -24,6 +25,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.config import EyvanSettings
 from eyvan.worker.agent.models import (
+    AgentBuild,
     AgentCapabilities,
     AgentObservation,
     CapacityProviderFailure,
@@ -157,6 +159,28 @@ def create_agent_app(
     @app.get("/api/v1/capabilities", dependencies=[Depends(authenticate)])
     def capabilities() -> AgentCapabilities:
         return service.capabilities()
+
+    @app.get("/api/v1/build", dependencies=[Depends(authenticate)])
+    def build() -> AgentBuild:
+        """Report the code this agent is running, not only its version string.
+
+        Every component of this package ships one version, so an operator cannot
+        use it to tell whether the agent holding their capacity is the build
+        they deployed. A hardware proof has already been run against a stale
+        agent and read as evidence.
+        """
+
+        identity = build_identity()
+        return AgentBuild(
+            version=identity.version,
+            origin=identity.origin,
+            origin_detail=identity.origin_detail,
+            source_digest=identity.source_digest,
+            digest_detail=identity.digest_detail,
+            file_count=identity.file_count,
+            python=identity.python,
+            platform=identity.platform,
+        )
 
     @app.get("/api/v1/cells", dependencies=[Depends(authenticate)])
     def inventory() -> list[dict[str, str | int | None]]:

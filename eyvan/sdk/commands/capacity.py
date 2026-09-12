@@ -39,6 +39,70 @@ def capacity() -> None:
     """Inspect available capacity, pools, cells, and leases."""
 
 
+@capacity.command("builds")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def capacity_builds(session: CliSession, as_json: bool) -> None:
+    """Show which build each cell agent runs, beside this control plane's.
+
+    Every component of Eyvan reports the same version string, so it cannot
+    answer the question an upgrade raises: is the agent holding my capacity the
+    build I deployed? The digest of the installed package can, and this puts the
+    plane's beside every agent's.
+
+    A hardware proof has already been run against a stale agent and read as
+    evidence. This is the check that would have caught it.
+
+    Exits non-zero on proven skew, and also when some agent could not say --
+    "nothing disagreed" is not agreement, and an upgrade is exactly when that
+    distinction matters.
+    """
+
+    payload = session.client.request("GET", "/api/v1/capacity/builds")
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return
+    document = payload if isinstance(payload, dict) else {}
+    plane = document.get("plane") or {}
+    agents = document.get("agents") or []
+    unreachable = document.get("unreachable") or []
+    unscanned = document.get("unscanned_pools") or []
+
+    plane_digest = plane.get("source_digest")
+    click.echo(
+        f"control plane  {plane.get('version')}  {plane_digest or 'no digest: ' + str(plane.get('digest_detail'))}"
+    )
+    silent = 0
+    for entry in agents if isinstance(agents, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        build = entry.get("build") or {}
+        digest = build.get("source_digest") if isinstance(build, dict) else None
+        if not digest:
+            silent += 1
+            verdict = "does not report a build"
+        elif digest == plane_digest:
+            verdict = "same build"
+        else:
+            verdict = f"DIFFERENT BUILD  {digest}"
+        click.echo(f"agent {entry.get('endpoint')}  pool={entry.get('pool_id')}  {verdict}")
+
+    for entry in unreachable if isinstance(unreachable, list) else []:
+        click.echo(f"could not reach cell agent {entry.get('endpoint')}: {entry.get('detail')}", err=True)
+    for pool_id in unscanned if isinstance(unscanned, list) else []:
+        click.echo(f"pool {pool_id} holds no cell, so its agent was not scanned", err=True)
+
+    agreement = document.get("in_agreement")
+    if agreement is False:
+        raise click.ClickException("at least one cell agent is running different code than this control plane")
+    if agreement is None:
+        raise click.ClickException(
+            f"the fleet could not be shown to agree: {len(agents)} agent(s) answered, {silent} without a digest, "
+            f"{len(unreachable)} unreachable"
+        )
+    click.echo(f"every one of {len(agents)} reachable agent(s) runs this control plane's build")
+
+
 @capacity.command("orphans")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj

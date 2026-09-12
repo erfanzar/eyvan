@@ -189,6 +189,73 @@ def test_a_receipt_never_implies_it_is_signed() -> None:
     assert any("unsigned" in gap for gap in document["unverified"])
 
 
+def test_a_fleet_whose_agents_all_answered_narrows_the_gap_to_the_worker() -> None:
+    """The dimension no receipt could close until the agents could describe themselves.
+
+    Closing it does not close the whole thing: the native worker process inside
+    each cell still reports nothing, and "installed from the wheel the head
+    staged, so it should match" is an expectation rather than an observation.
+    """
+
+    gaps = unverified_dimensions(
+        plane_build={"source_digest": "sha256:plane"},
+        git={"commit": "a" * 40, "clean": True},
+        evidence={"path": "x"},
+        fleet_builds={"agents": [{"endpoint": "http://agent-a"}], "unreachable": [], "in_agreement": True},
+    )
+
+    assert not any("cell agent" in gap and "only the client" in gap for gap in gaps)
+    assert any("native worker process" in gap for gap in gaps)
+
+
+def test_an_unreachable_agent_leaves_the_gap_open() -> None:
+    """A sweep that could not reach an agent has not established anything about it."""
+
+    gaps = unverified_dimensions(
+        plane_build={"source_digest": "sha256:plane"},
+        git={"commit": "a" * 40, "clean": True},
+        evidence={"path": "x"},
+        fleet_builds={
+            "agents": [{"endpoint": "http://agent-a"}],
+            "unreachable": [{"endpoint": "http://agent-b"}],
+            "in_agreement": None,
+        },
+    )
+
+    assert any("could not be reached" in gap for gap in gaps)
+
+
+def test_a_run_against_a_stale_agent_says_so_rather_than_narrowing_anything() -> None:
+    """The exact history this whole mechanism exists for.
+
+    A proof was run against a stale agent and read as evidence. A receipt from
+    such a run must not quietly report a narrower gap than one that could not
+    check at all -- it has a positive finding, and it is bad news.
+    """
+
+    gaps = unverified_dimensions(
+        plane_build={"source_digest": "sha256:plane"},
+        git={"commit": "a" * 40, "clean": True},
+        evidence={"path": "x"},
+        fleet_builds={"agents": [{"endpoint": "http://agent-a"}], "unreachable": [], "in_agreement": False},
+    )
+
+    assert any("different code than the control plane" in gap for gap in gaps)
+
+
+def test_a_plane_that_cannot_sweep_its_agents_keeps_the_original_gap() -> None:
+    """An older plane has no such route; the receipt reads as it always did."""
+
+    gaps = unverified_dimensions(
+        plane_build={"source_digest": "sha256:plane"},
+        git={"commit": "a" * 40, "clean": True},
+        evidence={"path": "x"},
+        fleet_builds=None,
+    )
+
+    assert any("cell agent" in gap and "only the client" in gap for gap in gaps)
+
+
 # --------------------------------------------------------------------------- redaction
 
 
@@ -575,3 +642,43 @@ def test_a_leaked_secret_is_not_copied_into_the_evidence_file(tmp_path: Path, mo
 
     assert result.exit_code == EXIT_CODES[Verdict.FAIL], result.output
     assert "super-secret-token" not in evidence.read_text(encoding="utf-8")
+
+
+def test_a_receipt_records_the_fleet_sweep_the_plane_could_answer(tmp_path: Path, monkeypatch) -> None:
+    """End to end: the run asks, and what it learns lands in the receipt.
+
+    Without this the gap-narrowing above is a pure function nobody calls.
+    """
+
+    receipt = tmp_path / "p5.json"
+    plane = _preempted_plane(
+        **{
+            "/api/v1/build": {"version": "0.0.1", "source_digest": "sha256:the-plane", "origin": "wheel"},
+            "/api/v1/capacity/builds": {
+                "plane": {"source_digest": "sha256:the-plane"},
+                "agents": [{"endpoint": "http://agent-a:8090", "build": {"source_digest": "sha256:the-plane"}}],
+                "unreachable": [],
+                "unscanned_pools": [],
+                "in_agreement": True,
+            },
+        }
+    )
+
+    _run_proof(monkeypatch, plane, ["proof", "preemption", "wl-1", "--receipt", str(receipt)])
+
+    document = read_receipt(receipt)
+    assert document["fleet"]["in_agreement"] is True
+    assert any("native worker process" in gap for gap in document["unverified"])
+    assert receipt_digest_matches(document) is True
+
+
+def test_a_plane_without_the_sweep_route_still_writes_a_receipt(tmp_path: Path, monkeypatch) -> None:
+    """A 404 here must cost the receipt one dimension, not the whole receipt."""
+
+    receipt = tmp_path / "p5.json"
+
+    _run_proof(monkeypatch, _preempted_plane(), ["proof", "preemption", "wl-1", "--receipt", str(receipt)])
+
+    document = read_receipt(receipt)
+    assert document["fleet"] is None
+    assert any("cell agent" in gap and "only the client" in gap for gap in document["unverified"])

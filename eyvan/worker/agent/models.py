@@ -74,6 +74,28 @@ class AgentCapabilities(AgentModel):
     resource_enforcement: str
 
 
+class AgentBuild(AgentModel):
+    """What code one agent is made of.
+
+    A separate route rather than a field on :class:`AgentCapabilities`, which
+    forbids extras: an added field there would make a control plane one version
+    behind unable to decode any capabilities response at all. A route an old
+    caller never asks for costs it nothing, and a new caller meeting an old
+    agent gets 404 -- which it records as unknown rather than as a guess.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: str
+    origin: str
+    origin_detail: str = ""
+    source_digest: str | None = None
+    digest_detail: str = ""
+    file_count: int = 0
+    python: str
+    platform: str
+
+
 class NativeWorkerHealth(AgentModel):
     """Authenticated health response returned by an Eyvan native worker."""
 

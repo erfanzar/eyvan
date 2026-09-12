@@ -94,6 +94,21 @@ If you meet it on an older build, re-enabling the pool (`eyvan up <fleet.yaml>`)
 clears it immediately, which is also how to confirm you are looking at this and
 not something else.
 
+## Something behaves like an older build than the one deployed
+
+```bash
+eyvan capacity builds
+```
+
+Every component of Eyvan reports the same version string, so it cannot tell you
+whether the agent holding your capacity is the code you shipped. This puts the
+control plane's package digest beside every reachable agent's.
+
+It exits non-zero on proven skew and also when agreement could not be shown --
+an unreachable agent, or one predating the route and reporting no digest, is not
+an agent that agreed. Only endpoints holding a cell are scanned; a pool with no
+cell is named rather than passed over.
+
 ## A provider keeps failing
 
 `eyvan cells` shows `provider_failure_code` and `unavailable_detail`. The codes

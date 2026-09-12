@@ -2324,6 +2324,18 @@ def create_app(
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
         return await controller.capacity_orphans()
 
+    # response_model=None: this is a report about builds, and pinning a schema
+    # to it would make an agent that reports a field this plane predates
+    # undecodable -- the exact skew the route exists to surface.
+    @app.get("/api/v1/capacity/builds", tags=["capacity"], response_model=None)
+    async def capacity_builds(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> dict[str, object]:
+        """Report which build every reachable cell agent runs, beside this plane's."""
+
+        service.authorizer.require(principal, Permission.MANAGE_FLEET)
+        return await controller.fleet_builds()
+
     @app.get(
         "/api/v1/workloads/{workload_id}/logs",
         response_class=PlainTextResponse,
