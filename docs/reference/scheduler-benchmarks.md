@@ -60,3 +60,28 @@ benchmark from running, in which case no performance result has been measured.
 Real runner measurements, controller/database scaling and hardware validation
 remain distinct evidence. In particular, the repository soak is a different
 workload and is documented in `docs/testing-policy.md`.
+
+## Investigating tail failures without waiving the gate
+
+Run an additional diagnostic sample with `--diagnostics` and a different output
+path. It adds per-phase process CPU-time samples and collection-count deltas
+for each GC generation. It does not force collection, disable GC, change the
+scenario, discard slow samples, or change the wall-time budgets. Instrumentation
+itself adds overhead, so do not silently substitute its receipt for the original.
+With 20 samples, nearest-rank p99 is the maximum; inspect the whole distribution.
+Collection counts show overlap, not how much elapsed time GC consumed. CPU versus
+wall time is another diagnostic signal, not proof of a specific contention source.
+
+CI now schedules this additional sample only when the original 1,000-cell budget
+step fails. Both receipts are retained; even a passing diagnostic rerun leaves
+the original failure blocking. Hosted qualification of this diagnostic step is
+still pending.
+
+The retained Python 3.12 receipt from
+[run 34695978824](https://github.com/erfanzar/eyvan/actions/runs/34695978824)
+at `762610b` recorded snapshot p99 **20.698 ms** (budget 25), ordinary scheduling
+p99 **90.610 ms** (budget 75), and elastic p99 **60.931 ms** (budget 75).
+Ordinary scheduling p50 was **45.032 ms**. That run failed the ordinary scheduling
+budget, not snapshot construction. These samples alone do not establish whether
+GC, host scheduling, or implementation work caused the tail. All checked-in
+budgets remain unchanged; no hosted green result is inferred from local timings.
