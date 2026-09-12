@@ -120,6 +120,11 @@ files = [
     "eyvan/server/api/server_bind.py",
     "eyvan/server/api/server_startup.py",
 ]
+# Analyze imported modules for types, but report errors only in the declared
+# ratchet. Editable installs implicitly suppressed these imported-module errors;
+# non-editable CI installs did not. "silent" is not "skip": imported types are
+# still checked when used by the explicitly listed source files.
+follow_imports = "silent"
 ignore_missing_imports = true
 disallow_untyped_defs = false
 warn_redundant_casts = true
