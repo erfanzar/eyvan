@@ -354,7 +354,7 @@ class _ControllerPreemption:
                     "payload": {
                         **current.payload,
                         "execution_started": True,
-                        "execution_started_at": utcnow(),
+                        "execution_started_at": utcnow().isoformat(),
                         "phase": "checkpointing",
                         "checkpoint_uris": {},
                         "victim_outcomes": {},
@@ -406,7 +406,7 @@ class _ControllerPreemption:
                         "checkpoint_uris": checkpoint_uris,
                         "victim_outcomes": {lease_id: outcome.value for lease_id, outcome in victim_outcomes.items()},
                         "stopped_victims": self._preemption_stopped_victims(current),
-                        "stopping_started_at": utcnow(),
+                        "stopping_started_at": utcnow().isoformat(),
                     },
                     "claimed_until": utcnow() + timedelta(seconds=max(self.settings.outbox_claim_ttl_s, 1)),
                     "updated_at": utcnow(),
@@ -573,7 +573,7 @@ class _ControllerPreemption:
                             **current.payload,
                             "execution_completed": True,
                             "aborted_reason": reason[:1000],
-                            "execution_completed_at": utcnow(),
+                            "execution_completed_at": utcnow().isoformat(),
                         },
                         "updated_at": utcnow(),
                     }
@@ -779,7 +779,7 @@ class _ControllerPreemption:
                         "payload": {
                             **current_command.payload,
                             "execution_completed": True,
-                            "execution_completed_at": utcnow(),
+                            "execution_completed_at": utcnow().isoformat(),
                         },
                         "updated_at": utcnow(),
                     }
