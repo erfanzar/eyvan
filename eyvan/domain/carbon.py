@@ -38,6 +38,7 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import isfinite
 
 from eyvan._internal.compat import StrEnum
 
@@ -115,6 +116,8 @@ class CarbonIntensity:
             raise ValueError("a carbon reading requires a source; an unattributed number is not a reading")
         if self.grams_co2e_per_kwh < 0:
             raise ValueError("carbon intensity cannot be negative")
+        if not isfinite(self.grams_co2e_per_kwh):
+            raise ValueError("carbon intensity must be finite")
         if self.observed_at.tzinfo is None:
             raise ValueError("a carbon reading requires a timezone-aware observation time")
 
@@ -169,6 +172,8 @@ def fresh_reading(
         return reading
     if max_age_s <= 0:
         raise ValueError("carbon freshness window must be positive")
+    if not isfinite(max_age_s):
+        raise ValueError("carbon freshness window must be finite")
     age = reading.age_seconds(now)
     if age < -FUTURE_TOLERANCE_S:
         return CarbonUnavailable(

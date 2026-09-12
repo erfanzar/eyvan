@@ -159,6 +159,12 @@ reviews).
   the sole remaining negative-sentinel change is equivalent for public sorting.
   Eleven fixed contracts and the configuration selection pass 23 tests; full
   required-PostgreSQL verification passes 6,900 with 17 monorepo-only skips.
+  Carbon now rejects nonfinite intensities/windows; 24 new contracts pass
+  (42 with existing tests), and 16 selected process-local changes are detected
+  with an unmodified control. A separate fresh 34-mutant campaign improves from
+  26 to 29 detected; five visible diagnostic changes remain unsuppressed and
+  are not declared equivalent. Neither generated totals nor selected probes
+  establish full dataclass coverage.
   Remaining scheduler survivors and other domain modules are still open;
   the tool's exit 0 with survivors is not a passing mutation gate.
 

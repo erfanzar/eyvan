@@ -6,6 +6,25 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Carbon boundary qualification (2026-09-12; local)
+
+NaN and positive infinity previously passed intensity and freshness-window
+validation; four regression cases reproduced this before the finite-value checks.
+The fix retains unavailable values, finite nonnegative readings, existing negative
+value errors and default freshness/skew policy. Scoped independent review found
+no confirmed findings. No carbon provider or scheduler influence was added.
+
+Full Python 3.11/required-PostgreSQL verification passed **6,920 tests, 17
+monorepo-only skips, 164 warnings**, exit 0 in 328.62s, receipt stem
+`.pytest_cache/python311-postgres-after-carbon-numeric`. Four subsequent test-only
+boundary/diagnostic cases bring the focused carbon selection to **42 passed**;
+the full receipt predates those additions. Ruff/check/format, mypy, import
+contracts, lock and generated-reference checks also passed before those additions.
+The [mutation reference](reference/scheduler-mutations.md) records 16 detected
+selected probes and separate fresh generated campaigns improving from 26/34 to
+29/34, with five diagnostic-output survivors retained. This is not full-domain
+qualification or a hosted-CI success claim.
+
 ## Accelerator ordering qualification (2026-09-12; local)
 
 Unsupported accelerator names containing nondecimal Unicode digits no longer

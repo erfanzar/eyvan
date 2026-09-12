@@ -274,6 +274,35 @@ qualify this generated set, not every possible mutation or the entire domain.
 The post-fix Python 3.11/required-PostgreSQL suite passed **6,900 tests with 17
 monorepo-only skips**, exit 0 (`python311-postgres-after-accelerator-ordering`).
 
+## Carbon numeric and freshness contracts (2026-09-12)
+
+Four failing cases exposed acceptance of NaN and positive infinity as intensities
+and freshness windows. Both boundaries now require finite values, preserving
+negative-value diagnostics and unavailable-reading passthrough. Twenty-four new
+contracts cover finite values, invalid windows, inclusive age/skew boundaries,
+positive subsecond windows and useful clock-skew diagnostics. The combined carbon
+selection passes 42 tests. No provider or placement influence was introduced.
+
+Sixteen selected process-local changes, including dataclass methods skipped by
+mutmut, all fail the semantic tests; an unmodified re-executed control passes.
+Input hashes remain unchanged. Initial and strengthened receipts are retained
+under `.pytest_cache/carbon-contract-probes/` and
+`.pytest_cache/carbon-contract-probes-strengthened/`. These are selected
+sensitivity probes, not an exhaustive generated-mutant denominator.
+
+Separately, fresh pinned Python 3.11/mutmut 3.7.0 campaigns generate 34 mutants in
+`NoCarbonSource.read` and `fresh_reading`. Detection improves from 26 to 29 after
+adding assertions for small positive windows, the sign of reported future skew,
+and a useful invalid-window error. Both campaign exits are 0 with unchanged input
+hashes; receipts are `.pytest_cache/carbon-mutation.*` and
+`.pytest_cache/carbon-strengthened-mutation.*` with corresponding isolated trees.
+
+The five remaining raw survivors add decorations or change case in diagnostic
+messages. They do not bypass the numeric/freshness gates, but they **do change
+visible output**: they have not been suppressed or declared equivalent. A policy
+for diagnostic mutations remains open. Dataclass methods remain outside the
+34-mutant generated set; do not combine that denominator with the 16 probes.
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,
