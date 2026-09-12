@@ -383,8 +383,14 @@ reviews).
   whole-cell packing and affordable alternatives, with a comparison protocol.
   It links existing local scheduler measurements; no competitor measurements
   or performance superiority are claimed.
+- **[done]** Bounded live scheduler-priority checkpoint restoration on a
+  four-chip Spot TPU: the batch trainer checkpointed at step 20,
+  yielded to an interactive TPU job, and resumed on attempt 2 through step 40,
+  matching an uninterrupted control. Both jobs succeeded and provider-side
+  VM cleanup was verified (`docs/status.md`, campaign `priority-3ee7d85be890`).
+  The checkpoint and restore used the same VM; this is not provider reclamation.
 - **[next]** Flagship preemption-aware training demo (checkpoint/restore
-  across Spot losses) on the Spot fleet.
+  across physical Spot losses and replacement hosts) on the Spot fleet.
 
 ## Maturity (6 → 10)
 - **[next]** Qualify upgrade behavior against an actual published release.

@@ -6,6 +6,94 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Live Spot TPU priority checkpoint restoration (2026-09-12)
+
+Campaign `priority-3ee7d85be890` passed through Eyvan on one Spot
+`v5p-8` cell (four TPU chips), after both the controller JSON and systemd stop
+fixes below. The batch workload checkpointed at step 20, yielded the cell to an
+interactive TPU workload, then resumed automatically on attempt/generation 2
+and completed step 40. Both workloads succeeded. The restored training result
+matched the uninterrupted control; loss decreased from 31.135807 to
+0.000008222324. The recorded checkpoint URI matched the workload's durable URI.
+
+The training receipt reports TPU backend, four devices, restored step 20,
+final step 40, and matching checkpoint/restoration instance identities. Workload
+failure, provider-preemption and capacity-loss counters remained zero. This is
+**scheduler priority interruption and restoration on the same Spot VM**, not
+physical provider reclamation or replacement-host recovery.
+
+Receipt: `.pytest_cache/spot-validation/priority-3ee7d85be890.json`;
+runner exit 0. Batch workload `wl_d5e6ed3f5a6843f5bc4e7b112dfc86de`, interactive
+workload `wl_638839702a294f049777d439bd31df38`. Provider queries independently
+confirmed Spot provisioning. Fleet teardown returned 200 without cleanup
+errors; the VM subsequently disappeared from the provider's filtered listing.
+The failed predecessor's state was preserved separately, rather than repaired
+by silently rewriting records or allowing its pending workloads into this run.
+
+## Collected systemd stop follow-up (2026-09-12; local verification)
+
+The next Spot attempt reached a ready TPU and completed its checkpoint
+hook, but the victim remained in checkpointing while the interactive workload
+waited. Agent queries reported `INDETERMINATE` and independently confirmed the
+systemd unit was absent. The stop path could confirm termination yet leave an
+unknown durable status; the controller consequently kept waiting for a terminal
+observation. This attempt did **not** establish priority restoration.
+
+The corrected path records `STOPPED` only after successful systemd stop, verified
+unit absence, successful container stop stages where applicable, and renewed
+fence validation. It does not invent a successful exit. Unrequested disappearance,
+a nonzero stop, or an unobservable manager remain unknown. The new regression
+failed before the fix; **84** systemd/container/TLS/preemption tests passed with
+required PostgreSQL, and independent read-only review found no actionable defect.
+
+Full Python 3.11/required-PostgreSQL verification: **6,782 passed, 17 monorepo-only
+skips**, 164 warnings, exit 0 in 355.13 seconds. Receipt stem:
+`.pytest_cache/python311-postgres-after-collected-stop`. Ruff check/format, mypy,
+import contracts, lock/generated-reference checks and dashboard coverage, build,
+lint and formatting passed. These checks preceded the successful bounded
+hardware rerun documented above.
+
+Cleanup exposed an operational limit: cancellation was rejected while the
+preemption was executing, and fleet teardown did not remove its leased VM.
+The test was interrupted, its pool disabled, and that exact test VM explicitly
+deleted; a subsequent GCP listing returned no matching instance. The isolated
+agent release was replayed and its provider state contains zero cells. Stranded
+workload rows and a failed preemption command were retained as diagnostic
+evidence; they must not be allowed to consume the next campaign's capacity.
+
+## Priority-preemption and typing follow-up (2026-09-12; local verification)
+
+A live Spot TPU priority-preemption attempt reached checkpointing but exposed
+non-JSON datetime values in the durable command payload. The four phase
+payload timestamps now use timezone-aware ISO strings; ordinary record datetime
+fields are unchanged. Regression tests intercept intermediate writes before
+repository serialization, including successful phases and checkpoint abort.
+Those six cases pass with memory, SQLite and required PostgreSQL.
+
+Hosted mypy reporting differed between editable and non-editable installations.
+A clean non-editable installation reproduced 2,456 imported-module errors while
+checking the declared 15-file ratchet. Explicit `follow_imports = "silent"`
+keeps imported type analysis but limits diagnostic reporting to that ratchet;
+it does not skip imported modules. The same clean environment now passes, and
+an isolated copied-source control assigning an imported resource vector to an
+integer still fails with an assignment error.
+
+Fresh Python 3.11/required-PostgreSQL verification: **6,780 passed, 17
+monorepo-only skips**, 164 warnings, exit 0 in 356.15 seconds. Receipt stem:
+`.pytest_cache/python311-postgres-after-mypy-scope`. Ruff check/format (678
+files), import contracts, lock check, generated API/environment checks and
+dashboard coverage/build/lint/format also passed. This is local evidence, not a
+new hosted-CI pass. The hosted 1,000-cell snapshot p99 violation (27.843 ms
+against 25 ms) remains under investigation; the budget has not been relaxed.
+
+Subsequent hardware retries encountered laptop sleep, mismatched component
+builds, and a validation restart that omitted the isolated fleet-state setting.
+These attempts do **not** establish priority checkpoint restoration or physical
+provider-preemption recovery. The misplaced-state cleanup was verified against
+GCP, and the original release was replayed against the restored isolated agent.
+Further hardware qualification must retain the same state configuration and
+verify component build agreement before admission.
+
 ## Hosted-CI regression follow-up (2026-09-11; local verification)
 
 The first pushed suite exposed a nonportable stale-PID fixture on Linux and
