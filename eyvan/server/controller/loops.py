@@ -228,7 +228,8 @@ class _ControllerLoops:
         instead of changing this signature.
         """
 
-        for phase in self._leader_phases():
+        ordered = tuple(self._leader_phases())
+        for index, phase in enumerate(ordered):
             if phase.interval_s is not None:
                 if phase.zero_interval_disables and phase.interval_s <= 0:
                     continue
@@ -245,7 +246,24 @@ class _ControllerLoops:
             # nothing when nobody is collecting.
             with trace_span("eyvan.leader_phase", phase=phase.name):
                 if not phase.isolate_failures:
-                    await phase.run()
+                    try:
+                        await phase.run()
+                    except Exception:
+                        # Named, and with the cost stated. A phase that
+                        # propagates takes every later phase of the cycle with
+                        # it -- observation, settlement, release, billing -- and
+                        # the caller could only say "global scheduling
+                        # reconciliation failed". Reading a traceback to learn
+                        # which phase, and inferring what it stopped, is the
+                        # work this line does instead: a live fleet spent eight
+                        # minutes stranded on a planner nobody had identified.
+                        skipped = ", ".join(later.name for later in ordered[index + 1 :])
+                        logger.exception(
+                            "leader phase %s failed; the rest of this cycle did not run: %s",
+                            phase.name,
+                            skipped or "no later phase",
+                        )
+                        raise
                     continue
                 try:
                     await phase.run()

@@ -4118,6 +4118,75 @@ async def test_only_phases_that_declare_it_have_their_failures_isolated() -> Non
 
 
 @pytest.mark.asyncio
+async def test_a_propagating_phase_names_itself_and_what_it_stopped(caplog) -> None:
+    """The cost of the old message, paid on a live fleet.
+
+    A planner raised, took observation, settlement and release with it, and the
+    only thing written down was "global scheduling reconciliation failed". Eight
+    minutes of a v5p-16 multislice went by before a traceback identified the
+    phase, and nothing said which phases had not run.
+    """
+
+    import logging
+
+    class Leader:
+        async def acquire(self) -> bool:
+            return True
+
+        async def release(self) -> None:
+            return None
+
+    repository = InMemoryRepository()
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=Leader())
+
+    async def boom() -> None:
+        raise RuntimeError("phase failed")
+
+    async def never() -> None:  # pragma: no cover - the point is that it does not run
+        raise AssertionError("a later phase ran after a propagating failure")
+
+    controller._leader_phases = lambda: (  # type: ignore[method-assign]
+        LeaderPhase("capacity-pools", boom),
+        LeaderPhase("settle-orphan-leases", never),
+        LeaderPhase("cell-billing", never),
+    )
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="phase failed"):
+        await controller._run_leader_phases(now=0.0, due={})
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "capacity-pools" in message
+    assert "settle-orphan-leases, cell-billing" in message
+
+
+@pytest.mark.asyncio
+async def test_the_last_phase_failing_says_nothing_was_skipped(caplog) -> None:
+    """ "No later phase" is a fact worth writing, not an empty list to render."""
+
+    import logging
+
+    class Leader:
+        async def acquire(self) -> bool:
+            return True
+
+        async def release(self) -> None:
+            return None
+
+    repository = InMemoryRepository()
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=Leader())
+
+    async def boom() -> None:
+        raise RuntimeError("phase failed")
+
+    controller._leader_phases = lambda: (LeaderPhase("last", boom),)  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="phase failed"):
+        await controller._run_leader_phases(now=0.0, due={})
+
+    assert "no later phase" in "\n".join(record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_a_plain_http_plane_settles_the_attempt_instead_of_holding_the_accelerator(tmp_path) -> None:
     """The defect that burned two live TPUs, reproduced without one.
 
