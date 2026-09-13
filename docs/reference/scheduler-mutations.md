@@ -354,6 +354,55 @@ sample tests; the unmodified control passes, with source/test hashes unchanged
 (`.pytest_cache/pricing-dataclass-probes/receipt.json`). These two hand-selected
 changes are not added to the generated denominator or called exhaustive coverage.
 
+## Domain boundary contracts (2026-09-13)
+
+The public constructor/parse regressions in `tests/test_domain_boundary_contracts.py`
+cover boolean and nonfinite resource refusal with field context, trimmed resource
+names, topology duplicate canonicalization/conflict refusal, and actionable
+capacity-class errors. The new file plus `tests/test_domain.py` passes 34 tests.
+No production model changes were needed. The focused domain/scheduler/docs
+selection passes 498 tests. The full Python 3.11 suite with disposable PostgreSQL
+required passes **6,997 tests, 17 monorepo-only skips, 164 warnings**, exit 0,
+in 357.00 seconds (`.pytest_cache/python311-postgres-after-domain-boundaries.*`).
+This is local evidence, not hosted CI or hardware qualification.
+
+Fresh isolated mutmut 3.7.0/Python 3.11 campaigns with seed `20260912` improve
+from **42/60 to 56/60** detected, adding 14 detections without losing any previous
+ones. Both campaigns exit 0 and report unchanged inputs. The production model
+source and both snapshots share SHA256
+`e37dc1a589044fe1b86e5ab3fb36c66a88cc439f187c4190a142c64bf3ed0a07`.
+Receipts are `.pytest_cache/models-mutation.*` and
+`.pytest_cache/models-strengthened-mutation.*`; matching snapshots retain the
+configuration, instrumented source and raw verdict maps.
+
+The four remaining `CapacityClass.parse` survivors (3, 4, 5 and 27) decorate or
+change the case of refusal text, or decorate the choices separator. They remain
+visible and unsuppressed, not classified as equivalent. The generator excludes
+dataclass bodies: this 60-mutant denominator does not establish exhaustive model
+or full-domain qualification.
+
+## Resource-vector dataclass contracts (2026-09-13)
+
+`tests/test_resource_vector_contracts.py` adds 18 public cases for duplicate
+resource refusal, copy isolation, explicit zero versus missing keys, decimal
+subtraction/underflow, invalid scaling, missing capacity versus unconstrained
+limits, and dominant-share boundaries. Together with domain and boundary tests,
+52 cases pass locally. Production source is unchanged.
+
+Four selected process-local faults (missing capacity treated as unconstrained,
+zero-only vectors treated as truthy, dominant share always zero, and missing
+keys returning zero) each fail the new tests; the unmodified control passes.
+The source hash remains the model hash above. Receipt:
+`.pytest_cache/resource-vector-contract-probes.json`. These hand-selected
+checks are separate from the 60 generated helper mutants and do not establish
+exhaustive dataclass qualification. Independent review found no actionable
+contract findings. A fresh Python 3.11/required-PostgreSQL full run including
+these cases and the durable preemption-phase regressions passed **7,024 tests,
+17 monorepo-only skips, 164 warnings**, exit 0 in 353.55 seconds (receipt stem
+`.pytest_cache/python311-postgres-after-phase-recovery`). The final test-only
+preemption review assertions subsequently passed the 490-test focused/docs
+selection; no production code changed.
+
 ## Still open
 
 Verify fresh seeded verdict stability, classify remaining scheduler survivors,
