@@ -149,6 +149,7 @@ jobs:
             tests/test_preemption_settlement_properties.py tests/test_controller_retry_properties.py \
             tests/test_dispatch_delivery_properties.py tests/test_priority_preemption_properties.py \
             tests/test_dispatch_response_loss.py tests/test_dispatch_claim_takeover.py \
+            tests/test_preemption_phase_recovery.py \
             --hypothesis-seed="$FUZZ_SEED" --junitxml=fuzz-results/results.xml -q -rs
 
       - name: Retain invariant fuzz receipts

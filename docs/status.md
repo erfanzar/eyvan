@@ -6,6 +6,31 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Domain contracts and durable phase recovery (2026-09-13; local)
+
+New domain-boundary/resource-vector contracts strengthen public model coverage
+without production edits; the [mutation reference](reference/scheduler-mutations.md)
+separates generated helper campaigns from selected dataclass probes.
+`tests/test_preemption_phase_recovery.py` passes nine memory/LocalJson/required-
+PostgreSQL cases: interrupt after durable stopping/first-victim/finalization,
+expire the claim, and let a fresh controller reclaim. Completed victims are not
+observed or stopped again; settlement and target/victim replay remain stable.
+Independent review prompted explicit pending-target checks. A selected
+missing-outcome-skip fault fails while the unmodified control passes. This is
+in-process fault injection with agent doubles, not OS-crash or hardware proof.
+
+The fresh full Python 3.11/required-PostgreSQL run passes **7,024 tests, 17
+monorepo-only skips, 164 warnings**, exit 0 in **353.55 seconds**; receipt stem
+`.pytest_cache/python311-postgres-after-phase-recovery`. Final test-only review
+assertions subsequently pass a 490-test focused/docs selection. Ruff/check and
+format (690 files), mypy (15 sources), four import contracts, lock/three exports,
+generated API/env checks, actionlint, dashboard build/291 tests with 82.7% line
+coverage/lint/format and local Chromium HTTPS BFF qualification pass.
+
+Hosted CI is **not green**: run `34749608378` on `23417f1` did not start job
+steps; GitHub's annotation reports failed account payments or a spending limit.
+No billing/account change was made. Broader roadmap qualification remains open.
+
 ## Pricing contract qualification (2026-09-12; local)
 
 Production pricing code is unchanged. Thirty-four new public contract cases

@@ -223,6 +223,7 @@ def test_nightly_seeded_fuzz_is_reproducible_and_blocking() -> None:
         "test_controller_retry_properties.py",
         "test_dispatch_delivery_properties.py",
         "test_priority_preemption_properties.py",
+        "test_preemption_phase_recovery.py",
         "test_dispatch_response_loss.py",
         "test_dispatch_claim_takeover.py",
     ):
