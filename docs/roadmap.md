@@ -127,13 +127,15 @@ reviews).
   crash or deployed leadership failure.
 - **[done]** Bounded interruption after three durable priority-preemption
   boundaries: entering stopping, recording the first victim outcome, and final
-  settlement. A fresh controller reclaims the expired command and preserves
+  settlement; also interruption after a remote stop but before its outcome is
+  recorded. A fresh controller reclaims the expired command and preserves
   exactly-once stops/settlements, completed-victim observations and the pending
-  target's identity (`tests/test_preemption_phase_recovery.py`: nine passing
+  target's identity (`tests/test_preemption_phase_recovery.py`: twelve passing
   memory/LocalJson/required-PostgreSQL cases). Completed-command replay preserves
-  both workloads. A selected process-local missing-outcome-skip fault is detected;
-  the unmodified control passes. Nightly coverage is wired. These are injected
-  in-process interruptions with agent doubles, not actual OS crashes.
+  both workloads. Selected process-local missing-outcome-skip and duplicate-stop
+  faults are detected; unmodified controls pass. Nightly coverage is wired.
+  These are injected in-process interruptions with agent doubles, not actual
+  OS crashes or physical stop receipts.
 - **[next]** Extend generated histories to renewal failures, interruptions
   within priority-preemption phases and concurrent failover. The bounded
   controller and service properties do not establish conservation across every

@@ -11,13 +11,18 @@ grow a history, and a claim that stops being re-measured moves to
 New domain-boundary/resource-vector contracts strengthen public model coverage
 without production edits; the [mutation reference](reference/scheduler-mutations.md)
 separates generated helper campaigns from selected dataclass probes.
-`tests/test_preemption_phase_recovery.py` passes nine memory/LocalJson/required-
+`tests/test_preemption_phase_recovery.py` passes twelve memory/LocalJson/required-
 PostgreSQL cases: interrupt after durable stopping/first-victim/finalization,
-expire the claim, and let a fresh controller reclaim. Completed victims are not
-observed or stopped again; settlement and target/victim replay remain stable.
-Independent review prompted explicit pending-target checks. A selected
-missing-outcome-skip fault fails while the unmodified control passes. This is
-in-process fault injection with agent doubles, not OS-crash or hardware proof.
+or after a remote stop before recording its outcome, expire the claim, and let
+a fresh controller reclaim. Completed victims are not observed or stopped again;
+settlement and target/victim replay remain stable. Independent review prompted
+explicit pending-target checks. Selected missing-outcome-skip and duplicate-stop
+faults fail while unmodified controls pass. This is in-process fault injection
+with agent doubles, not OS-crash or hardware proof.
+
+The subsequent full refresh including the unrecorded-stop cases passes **7,027
+tests, 17 monorepo-only skips, 164 warnings**, exit 0 in **366.25 seconds**;
+receipt stem `.pytest_cache/python311-postgres-after-unrecorded-stop`.
 
 The fresh full Python 3.11/required-PostgreSQL run passes **7,024 tests, 17
 monorepo-only skips, 164 warnings**, exit 0 in **353.55 seconds**; receipt stem

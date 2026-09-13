@@ -19,10 +19,10 @@ repository = _repository_fixture
 
 
 class InjectedInterruption(BaseException):
-    """Bypass ordinary RPC retry/abort handlers at a persisted phase boundary."""
+    """Bypass ordinary RPC retry/abort handlers at a controlled preemption boundary."""
 
 
-@pytest.mark.parametrize("boundary", ["stopping", "first-victim", "finalized"])
+@pytest.mark.parametrize("boundary", ["stopping", "unrecorded-stop", "first-victim", "finalized"])
 async def test_fresh_controller_recovers_durable_preemption_phase(repository, monkeypatch, boundary):
     first, command = await _preemption(repository)
     agents = {f"cell-{suffix}": PerCellAgent("RUNNING") for suffix in "ab"}
@@ -34,18 +34,22 @@ async def test_fresh_controller_recovers_durable_preemption_phase(repository, mo
     target_before = (await _snapshot(repository, "priority"))["workload"]
     method_name = {
         "stopping": "_advance_preemption_to_stopping",
+        "unrecorded-stop": "_record_preemption_victim_stopped",
         "first-victim": "_record_preemption_victim_stopped",
         "finalized": "_finalize_preemption_plan",
     }[boundary]
     original = getattr(first, method_name)
     interrupted = []
 
-    async def interrupt_after_commit(*args, **kwargs):
-        await original(*args, **kwargs)
+    async def interrupt_at_boundary(*args, **kwargs):
+        # A stop may have completed remotely before its outcome is committed.
+        # Other cases interrupt only after the original durable commit returns.
+        if boundary != "unrecorded-stop":
+            await original(*args, **kwargs)
         interrupted.append(boundary)
         raise InjectedInterruption(boundary)
 
-    monkeypatch.setattr(first, method_name, interrupt_after_commit)
+    monkeypatch.setattr(first, method_name, interrupt_at_boundary)
     with pytest.raises(InjectedInterruption, match=boundary):
         await first._dispatch_preemption(command)
     assert interrupted == [boundary]
@@ -59,10 +63,15 @@ async def test_fresh_controller_recovers_durable_preemption_phase(repository, mo
         len(durable.payload.get("victim_outcomes", {}))
         == {
             "stopping": 0,
+            "unrecorded-stop": 0,
             "first-victim": 1,
             "finalized": 2,
         }[boundary]
     )
+    if boundary == "unrecorded-stop":
+        assert len(agents["cell-a"].stops) == 1
+        assert agents["cell-b"].stops == []
+        assert agents["cell-a"].remote_states["remote-victim"].name == "STOPPED"
     if boundary != "finalized":
         assert not durable.payload.get("execution_completed", False)
         assert all(lease.settled_at is None for lease in partial["leases"].values())
