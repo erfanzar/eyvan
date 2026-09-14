@@ -136,12 +136,34 @@ strict_equality = true
 # Optional local campaign; use the pinned, isolated command in
 # docs/reference/scheduler-mutations.md. This is not a zero-survivor CI gate.
 source_paths = ["eyvan"]
-only_mutate = ["eyvan/domain/scheduler.py"]
+only_mutate = ["eyvan/domain/*.py"]
 pytest_add_cli_args = ["-q", "--disable-warnings", "--hypothesis-seed=20260910"]
 pytest_add_cli_args_test_selection = [
-    "tests/test_scheduler.py",
-    "tests/test_scheduler_properties.py",
-    "tests/test_scheduler_budget_properties.py",
+    "tests/test_accelerator_type_ordering.py",
+    "tests/test_availability.py",
+    "tests/test_availability_contracts.py",
+    "tests/test_carbon_contract.py",
+    "tests/test_carbon_numeric_contracts.py",
+    "tests/test_costing.py",
+    "tests/test_domain.py",
+    "tests/test_domain_boundary_contracts.py",
     "tests/test_elastic_packing_preserves_feasible_subsets.py",
+    "tests/test_elastic_resource_materialization.py",
     "tests/test_gang_preemption_is_atomic.py",
+    "tests/test_generic_resource_surface.py",
+    "tests/test_prediction_budget_precision.py",
+    "tests/test_predictive_scale_up.py",
+    "tests/test_pricing.py",
+    "tests/test_pricing_contracts.py",
+    "tests/test_pricing_has_no_global_fallback.py",
+    "tests/test_pricing_resolver.py",
+    "tests/test_resource_vector_contracts.py",
+    "tests/test_run_cost.py",
+    "tests/test_scheduler.py",
+    "tests/test_scheduler_budget_properties.py",
+    "tests/test_scheduler_candidate_materialization.py",
+    "tests/test_scheduler_properties.py",
+    "tests/test_declared_backoff.py",
+    "tests/test_preemption_eligibility.py",
+    "tests/test_gang_rendezvous_collision.py",
 ]

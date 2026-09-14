@@ -147,9 +147,15 @@ reviews).
   checks passed 41 tests with one monorepo-only skip. The existing PostgreSQL
   chaos cases remain deterministic, not randomized state-machine histories.
 - **[next]** Complete mutation qualification across `eyvan/domain/`.
-  The pinned, isolated [scheduler campaign](reference/scheduler-mutations.md)
-  tested 1,576 mutants: the latest fresh seeded run detected 1,216 with 360
-  surviving. Two independent seeded baselines had identical inputs/verdicts
+  The current-source [aggregate domain campaign](reference/scheduler-mutations.md)
+  tests 1,959 generated mutants across all nine implementation modules. Expanded
+  selection and an independent repeat both detect 1,582 with 377 surviving;
+  full verdict maps and normalized input hashes match. The optional profile now
+  reproduces that 27-file selection. Survivor classification and skipped
+  dataclass bodies remain open, not hidden behind an aggregate passing score.
+  Historical scheduler-only campaigns tested 1,576 mutants; the final old-source
+  seeded run detected 1,216 with 360 surviving. Two independent old-source
+  seeded baselines had identical inputs/verdicts
   (1,213 detected / 363 survived). An explicit affordable-frontier example
   independently detects the three additional mutants; no baseline detection
   was lost. Nine earlier snapshot-validation mutations were independently

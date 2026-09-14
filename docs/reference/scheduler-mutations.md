@@ -7,10 +7,12 @@ cell wins a tie-break.
 
 ## Reproduce in an isolated snapshot
 
-The optional `[tool.mutmut]` configuration in `pyproject.toml` targets
-`eyvan/domain/scheduler.py`. The current selection includes ordinary scheduling,
-elastic feasibility/budget properties and atomic gang-preemption tests. It is
-not the full Python suite and does not cover every other domain module.
+The optional `[tool.mutmut]` configuration in `pyproject.toml` now targets
+`eyvan/domain/*.py`, with 27 explicitly listed test files covering the nine
+implementation modules. It includes domain contracts, scheduling and properties,
+configurable backoff, landed-capacity preemption eligibility and gang exclusivity.
+It is not the full Python suite. In particular, this mutmut version skips
+some dataclass bodies; targeting a module does not establish exhaustive coverage.
 The profile now passes `--hypothesis-seed=20260910` explicitly; a configuration
 regression test guards that replay input. The first four historical scheduler
 campaigns below were unseeded. The separate seeded comparison does not
@@ -41,6 +43,52 @@ hash-pinned runtime export or the blocking CI dependency gate.
 snapshot's generated `mutants/` directory using the same tool environment.
 Always run the unmutated case too. A test-collection failure is not evidence
 that the test detected the intended behavioral change.
+
+## Aggregate current-source baseline, 2026-09-13
+
+Three fresh campaigns use source at `4c2d8d5`, mutmut 3.7.0, Python 3.11 and
+seed 20260910. A uses 24 test files (359 unmodified tests passed). B adds three
+existing suites for declared backoff, preemption eligibility and gang rendezvous
+(390 unmodified tests passed); C independently repeats B. The current optional
+profile matches B/C exactly. No production or permanent test changes were made.
+
+| Campaign | Generated | Detected | Survived |
+|---|---:|---:|---:|
+| A: consolidated prior selection | 1,959 | 1,579 | 380 |
+| B: expanded existing-test selection | 1,959 | 1,582 | 377 |
+| C: independent repeat of B | 1,959 | 1,582 | 377 |
+
+All three exited 0 with unchanged recorded inputs and no timeout/error/no-test
+verdicts. B/C have identical normalized input hashes **and full verdict maps**,
+not merely matching totals. A/B differ only in snapshot configuration; B detects
+three additional scheduler mutations (`_static_cell_failure` 76 and
+`_preemption_candidate` 88/119), with no lost detections. These IDs refer only to
+this generated source; older scheduler campaigns below used a different source.
+
+| Module | Generated | Detected | Survived |
+|---|---:|---:|---:|
+| accelerators | 15 | 14 | 1 |
+| availability | 15 | 14 | 1 |
+| carbon | 34 | 29 | 5 |
+| costing | 22 | 22 | 0 |
+| models | 60 | 56 | 4 |
+| prediction | 75 | 73 | 2 |
+| pricing | 85 | 74 | 11 |
+| scheduler | 1,577 | 1,226 | 351 |
+| spend | 76 | 74 | 2 |
+
+The initializer generates no mutants. Dataclass probes elsewhere in this
+reference remain separate; they are not added to these denominators. Full
+qualification remains open: 377 survivors are not automatically equivalent or
+suppressed. For example, availability's `p95_latency` mutant 9 changes the first
+`min` operand from `n-1` to `n+1`; for nonempty input the other operand is
+`ceil(0.95*n)-1 <= n-1`, so this particular upper-bound change is equivalent.
+String-only differences in the review catalog are **not** presumed equivalent.
+
+Raw receipts: `.pytest_cache/aggregate-{a,b,c}-mutation.*`, generated metadata
+under `.pytest_cache/domain-mutation-aggregate-{a,b,c}/mutants/eyvan/domain/`,
+and `.pytest_cache/aggregate-mutation-comparison.json`. These local artifacts
+retain exact input hashes, controls, commands and verdict comparisons.
 
 ## Local observations, 2026-09-10
 
