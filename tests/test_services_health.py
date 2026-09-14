@@ -337,7 +337,7 @@ async def test_health_checking_is_off_unless_an_operator_turns_it_on() -> None:
     phase = next(entry for entry in controller._leader_phases() if entry.name == "probe-service-health")
 
     assert defaults.service_health_interval_s == 0.0
-    assert (phase.zero_interval_disables, phase.isolate_failures) == (True, True)
+    assert (phase.zero_interval_disables, phase.requires) == (True, ())
     assert phase.interval_s == 0.0
 
 

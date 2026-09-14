@@ -1264,7 +1264,7 @@ async def test_each_new_phase_is_registered_disabled_and_isolated(phase: str, se
 
     assert getattr(EyvanSettings(), setting) == 0.0
     assert registered.interval_s == 0.0
-    assert (registered.zero_interval_disables, registered.isolate_failures) == (True, True)
+    assert (registered.zero_interval_disables, registered.requires) == (True, ())
 
 
 async def test_the_lifecycle_phase_runs_before_the_replica_count_reconciler() -> None:

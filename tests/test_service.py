@@ -995,7 +995,7 @@ async def test_a_pods_request_is_refused_where_no_multislice_queued_resource_can
     ``gcp-tpu`` backend can create one, but this gate asked only whether the
     executor was ``eyvan-native`` -- which a compute-backed TPU pool legitimately
     is. So the submission was accepted and stored, and the failure surfaced later
-    inside the ``capacity-pools`` leader phase, which has no ``isolate_failures``:
+    inside the ``capacity-pools`` leader phase, which at the time stopped the cycle:
     it aborted every later phase on every tick and stopped the whole control
     plane. Refusing at submit keeps the cost with the caller who can act on it.
     """

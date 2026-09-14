@@ -253,8 +253,22 @@ class LeaderPhase:
     #: None runs the phase every cycle; a number gives it its own slower cadence.
     interval_s: float | None = None
     zero_interval_disables: bool = False
-    #: Housekeeping phases log and continue; phases the fleet depends on propagate.
-    isolate_failures: bool = False
+    #: Phases this one reads the results of. If any of them failed in this cycle,
+    #: this phase is skipped with that reason rather than run against a view it
+    #: was told not to trust.
+    #:
+    #: Every phase's failure is contained either way. The previous design let a
+    #: phase propagate instead, which stopped the whole rest of the cycle -- and
+    #: since the phases that release capacity and settle billing run in the
+    #: middle of that list, one failure upstream of them meant an accelerator
+    #: nobody stopped paying for. That happened to a live v5p-16 multislice.
+    #:
+    #: The safety the old behaviour bought is kept and made explicit: a phase
+    #: that *commits* work against the plane's view names the observations it
+    #: depends on, and is skipped when they are stale. A phase that gives
+    #: capacity back names nothing, because reclaiming is safe on any view and
+    #: not reclaiming is the expensive mistake.
+    requires: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

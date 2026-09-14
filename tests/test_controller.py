@@ -4079,10 +4079,7 @@ async def test_a_zero_interval_disables_only_the_phases_that_document_it() -> No
     assert ran == ["every-cycle"]
 
 
-@pytest.mark.asyncio
-async def test_only_phases_that_declare_it_have_their_failures_isolated() -> None:
-    """Housekeeping logs and continues; a phase the fleet depends on propagates."""
-
+def _always_leader():
     class Leader:
         async def acquire(self) -> bool:
             return True
@@ -4090,100 +4087,134 @@ async def test_only_phases_that_declare_it_have_their_failures_isolated() -> Non
         async def release(self) -> None:
             return None
 
+    return Leader()
+
+
+@pytest.mark.asyncio
+async def test_one_failing_phase_does_not_stop_the_rest_of_the_cycle() -> None:
+    """The property a live v5p-16 multislice paid for.
+
+    A failing phase used to propagate out of the whole cycle, and the phases
+    that release capacity and settle billing sit in the middle of the list --
+    so one failure upstream of them left an accelerator running that nothing
+    was going to stop paying for. Reclaiming has to be reachable from any
+    failure, because not reclaiming is the expensive mistake.
+    """
+
     repository = InMemoryRepository()
-    controller = EyvanController(repository, ControlPlaneService(repository), leader=Leader())
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=_always_leader())
     ran: list[str] = []
 
     async def boom() -> None:
         raise RuntimeError("phase failed")
 
-    async def after() -> None:
-        ran.append("after")
+    async def settle() -> None:
+        ran.append("settle-orphan-leases")
+
+    async def bill() -> None:
+        ran.append("cell-billing")
 
     controller._leader_phases = lambda: (  # type: ignore[method-assign]
-        LeaderPhase("housekeeping", boom, isolate_failures=True),
-        LeaderPhase("after", after),
+        LeaderPhase("observe-cells", boom),
+        LeaderPhase("settle-orphan-leases", settle),
+        LeaderPhase("cell-billing", bill),
     )
+
     await controller._run_leader_phases(now=0.0, due={})
-    assert ran == ["after"]
 
-    ran.clear()
-    controller._leader_phases = lambda: (  # type: ignore[method-assign]
-        LeaderPhase("critical", boom),
-        LeaderPhase("after", after),
-    )
-    with pytest.raises(RuntimeError, match="phase failed"):
-        await controller._run_leader_phases(now=0.0, due={})
-    assert ran == []
+    assert ran == ["settle-orphan-leases", "cell-billing"]
 
 
 @pytest.mark.asyncio
-async def test_a_propagating_phase_names_itself_and_what_it_stopped(caplog) -> None:
-    """The cost of the old message, paid on a live fleet.
+async def test_a_phase_that_commits_work_is_skipped_when_its_view_is_stale() -> None:
+    """The safety the old stop-the-cycle behaviour actually bought, kept.
 
-    A planner raised, took observation, settlement and release with it, and the
-    only thing written down was "global scheduling reconciliation failed". Eight
-    minutes of a v5p-16 multislice went by before a traceback identified the
-    phase, and nothing said which phases had not run.
+    Placing a workload decides where real money goes. Doing that against a cell
+    inventory this cycle failed to refresh is the mistake worth refusing -- so a
+    committing phase names what it reads, and is skipped rather than stopped as
+    a side effect of something unrelated.
     """
 
-    import logging
-
-    class Leader:
-        async def acquire(self) -> bool:
-            return True
-
-        async def release(self) -> None:
-            return None
-
     repository = InMemoryRepository()
-    controller = EyvanController(repository, ControlPlaneService(repository), leader=Leader())
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=_always_leader())
+    ran: list[str] = []
 
     async def boom() -> None:
-        raise RuntimeError("phase failed")
+        raise RuntimeError("observation failed")
 
-    async def never() -> None:  # pragma: no cover - the point is that it does not run
-        raise AssertionError("a later phase ran after a propagating failure")
+    async def scheduled() -> None:
+        ran.append("schedule")
+
+    async def settle() -> None:
+        ran.append("settle-orphan-leases")
+
+    controller._leader_phases = lambda: (  # type: ignore[method-assign]
+        LeaderPhase("observe-cells", boom),
+        LeaderPhase("settle-orphan-leases", settle),
+        LeaderPhase("schedule", scheduled, requires=("observe-cells", "observe-workloads")),
+    )
+
+    await controller._run_leader_phases(now=0.0, due={})
+
+    assert ran == ["settle-orphan-leases"]
+
+
+@pytest.mark.asyncio
+async def test_a_committing_phase_runs_when_the_failure_was_somewhere_else() -> None:
+    """Only the observations it named gate it, not any failure anywhere."""
+
+    repository = InMemoryRepository()
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=_always_leader())
+    ran: list[str] = []
+
+    async def boom() -> None:
+        raise RuntimeError("unrelated")
+
+    async def scheduled() -> None:
+        ran.append("schedule")
 
     controller._leader_phases = lambda: (  # type: ignore[method-assign]
         LeaderPhase("capacity-pools", boom),
-        LeaderPhase("settle-orphan-leases", never),
-        LeaderPhase("cell-billing", never),
+        LeaderPhase("observe-cells", lambda: _done()),
+        LeaderPhase("observe-workloads", lambda: _done()),
+        LeaderPhase("schedule", scheduled, requires=("observe-cells", "observe-workloads")),
     )
 
-    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="phase failed"):
-        await controller._run_leader_phases(now=0.0, due={})
+    await controller._run_leader_phases(now=0.0, due={})
 
-    message = "\n".join(record.getMessage() for record in caplog.records)
-    assert "capacity-pools" in message
-    assert "settle-orphan-leases, cell-billing" in message
+    assert ran == ["schedule"]
 
 
 @pytest.mark.asyncio
-async def test_the_last_phase_failing_says_nothing_was_skipped(caplog) -> None:
-    """ "No later phase" is a fact worth writing, not an empty list to render."""
+async def test_a_skipped_phase_says_which_observation_it_was_waiting_on(caplog) -> None:
+    """An operator reading the log must not have to infer the dependency."""
 
     import logging
 
-    class Leader:
-        async def acquire(self) -> bool:
-            return True
-
-        async def release(self) -> None:
-            return None
-
     repository = InMemoryRepository()
-    controller = EyvanController(repository, ControlPlaneService(repository), leader=Leader())
+    controller = EyvanController(repository, ControlPlaneService(repository), leader=_always_leader())
 
     async def boom() -> None:
-        raise RuntimeError("phase failed")
+        raise RuntimeError("observation failed")
 
-    controller._leader_phases = lambda: (LeaderPhase("last", boom),)  # type: ignore[method-assign]
+    async def scheduled() -> None:  # pragma: no cover - it must not run
+        raise AssertionError("scheduled against a stale view")
 
-    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="phase failed"):
+    controller._leader_phases = lambda: (  # type: ignore[method-assign]
+        LeaderPhase("observe-cells", boom),
+        LeaderPhase("schedule", scheduled, requires=("observe-cells",)),
+    )
+
+    with caplog.at_level(logging.WARNING):
         await controller._run_leader_phases(now=0.0, due={})
 
-    assert "no later phase" in "\n".join(record.getMessage() for record in caplog.records)
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "schedule" in message
+    assert "observe-cells" in message
+
+
+async def _done() -> None:
+    return None
 
 
 @pytest.mark.asyncio

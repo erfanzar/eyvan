@@ -1309,7 +1309,7 @@ def test_each_stage_phase_is_disabled_by_default_and_isolates_failures(phase: st
 
     assert registered.interval_s == 0.0
     assert registered.zero_interval_disables is True
-    assert registered.isolate_failures is True
+    assert registered.requires == ()
 
 
 # --------------------------------------------------------------------------- record and policy contracts

@@ -64,7 +64,10 @@ def test_each_housekeeping_phase_isolates_its_own_failures(phase: str) -> None:
 
     registered = next(entry for entry in _controller()._leader_phases() if entry.name == phase)
 
-    assert registered.isolate_failures is True
+    # Every phase's failure is contained now, so what this asserts is the other
+    # half: housekeeping names no observation it commits against, which is what
+    # would let an unrelated failure skip it.
+    assert registered.requires == ()
     assert registered.zero_interval_disables is True
 
 

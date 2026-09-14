@@ -300,10 +300,12 @@ async def test_generic_multislice_workload_scales_tpu_pool_end_to_end() -> None:
 async def test_a_multi_worker_workload_pinned_to_a_non_tpu_pool_cannot_stop_the_leader() -> None:
     """One unplaceable workload used to halt scheduling for the whole plane.
 
-    ``capacity-pools`` is the second leader phase and carries no
-    ``isolate_failures``, so anything it raises aborts every later phase of the
-    cycle -- observation, scheduling, settlement, billing -- and the scheduler
-    loop retries the identical failure on every tick. The pinned branch of
+    ``capacity-pools`` is the second leader phase, and when this was written a
+    raise there aborted every later phase of the cycle -- observation,
+    scheduling, settlement, billing -- with the loop retrying the identical
+    failure on every tick. Failures are contained per phase now, but the
+    behaviour asserted below is the one that made the containment unnecessary
+    here: the phase completes. The pinned branch of
     ``CapacitySimulation.build`` called ``make_cell(worker_count=2)`` with no
     backend guard, and ``make_cell`` refuses a multi-worker cell on a non-TPU
     backend by raising. So a workload pinned to such a pool was a durable poison
@@ -530,7 +532,7 @@ def test_a_pool_edit_that_orphans_a_cell_shape_does_not_stop_the_leader() -> Non
     cell from the pool, and `make_cell` refuses a multi-worker cell on a non-TPU
     backend by raising. Narrowing a pool that already has a multi-worker cell
     therefore raised inside the `capacity-pools` leader phase, which carries no
-    `isolate_failures` -- so scheduling, settlement and billing stopped every
+    failure isolation at the time -- so scheduling, settlement and billing stopped every
     cycle, over a configuration change.
 
     A pool that can no longer mint its own cell has answered both questions: the

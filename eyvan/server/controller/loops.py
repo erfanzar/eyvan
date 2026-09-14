@@ -15,6 +15,13 @@ from eyvan.server.controller._support import (
     logger,
 )
 
+#: The observations a phase must be able to trust before it commits work against
+#: them. Named here rather than inline so the two lists cannot drift: a phase
+#: that places a workload is deciding where real money goes, and doing that on a
+#: cell inventory this cycle failed to refresh is the mistake the old
+#: stop-the-whole-cycle behaviour was really protecting against.
+_FRESH_VIEW: tuple[str, ...] = ("observe-cells", "observe-workloads")
+
 
 class _ControllerLoops:
     """The leader-elected phase schedule and the long-running loops.
@@ -51,7 +58,7 @@ class _ControllerLoops:
             # a live fleet, for eight minutes of v5p-16, before the simulation
             # defect underneath was found. The failure is still logged with its
             # traceback; it just no longer takes settlement down with it.
-            LeaderPhase("capacity-pools", self.reconcile_capacity_pools_once, isolate_failures=True),
+            LeaderPhase("capacity-pools", self.reconcile_capacity_pools_once),
             LeaderPhase(
                 "observe-cells",
                 self._observe_cells_once,
@@ -74,19 +81,19 @@ class _ControllerLoops:
             LeaderPhase("settle-coordinators", self.settle_coordinator_workloads_once),
             # Before scheduling, so a node released this cycle can be placed in the
             # same cycle rather than waiting a full interval.
-            LeaderPhase("release-dag-nodes", self.release_ready_dag_nodes_once),
+            LeaderPhase("release-dag-nodes", self.release_ready_dag_nodes_once, requires=_FRESH_VIEW),
             # Before the feasibility gate, and before scheduling: a group that can
             # be placed whole is leased here as one transaction, so the gate below
             # never sees it and the ordinary pass never places half of it. Off by
             # default, in which case this phase returns immediately.
-            LeaderPhase("place-groups", self.place_admitted_groups_once),
+            LeaderPhase("place-groups", self.place_admitted_groups_once, requires=_FRESH_VIEW),
             # Before scheduling, for the same reason: a group that became feasible
             # this cycle should be placed in it, not a full interval later.
-            LeaderPhase("release-groups", self.release_admitted_groups_once),
+            LeaderPhase("release-groups", self.release_admitted_groups_once, requires=_FRESH_VIEW),
             # Before scheduling, so a wave released this cycle competes in it. After
             # settlement above, so a child that finished this cycle has already
             # freed its place in the wave rather than holding it for a full interval.
-            LeaderPhase("release-expansion-waves", self.release_expansion_waves_once),
+            LeaderPhase("release-expansion-waves", self.release_expansion_waves_once, requires=_FRESH_VIEW),
             # Health first, so a replica probed this cycle is judged in it. The
             # probe is the only phase here that talks to anything outside the
             # database, and it does so strictly between transactions.
@@ -95,7 +102,6 @@ class _ControllerLoops:
                 self.probe_service_health_once,
                 interval_s=self.settings.service_health_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Then lifecycle, which reads the observations the probe just wrote
             # and retires replicas whose claim on a host is provably gone. Before
@@ -106,7 +112,6 @@ class _ControllerLoops:
                 self.reconcile_service_replicas_once,
                 interval_s=self.settings.service_replica_lifecycle_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Then autoscaling, which changes the declared count the reconciler
             # below is about to converge on. After lifecycle deliberately: a
@@ -118,7 +123,6 @@ class _ControllerLoops:
                 self.autoscale_services_once,
                 interval_s=self.settings.service_autoscale_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Before scheduling: a replica started this cycle should be placed
             # in it rather than a full interval later, which for a service is
@@ -128,9 +132,8 @@ class _ControllerLoops:
                 self.reconcile_services_once,
                 interval_s=self.settings.service_reconcile_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
-            LeaderPhase("schedule", self.reconcile_once),
+            LeaderPhase("schedule", self.reconcile_once, requires=_FRESH_VIEW),
             # After scheduling, so a cell leased this cycle is not charged as idle
             # for the interval in which it was actually being placed. Failures are
             # isolated: an accounting gap must never stop placement.
@@ -139,7 +142,6 @@ class _ControllerLoops:
                 self.accrue_cell_billing_once,
                 interval_s=self.settings.cell_billing_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Retention is housekeeping and must never delay placement, so it runs
             # last, on its own slow interval, and its failures are isolated.
@@ -148,7 +150,6 @@ class _ControllerLoops:
                 self.prune_retained_state_once,
                 interval_s=self.settings.retention_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Housekeeping, same treatment. Each of the three below was fully
             # implemented and tested and called by nothing, so the behaviour did
@@ -163,14 +164,12 @@ class _ControllerLoops:
                 self.mark_superseded_results_once,
                 interval_s=self.settings.artifact_collection_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             LeaderPhase(
                 "collect-artifacts",
                 self.collect_artifacts_once,
                 interval_s=self.settings.artifact_collection_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Gauges describe a level rather than a rate, so they refresh on their
             # own interval. Four families were declared, exported, and written by
@@ -181,14 +180,12 @@ class _ControllerLoops:
                 self.export_metrics_once,
                 interval_s=self.settings.metrics_export_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             LeaderPhase(
                 "expire-grants",
                 self.expire_budget_grants_once,
                 interval_s=self.settings.grant_expiry_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             # Managed asset staging, and the eviction that bounds it. Both are
             # housekeeping and must never delay placement, so they run last, on
@@ -203,14 +200,12 @@ class _ControllerLoops:
                 self.stage_cell_assets_once,
                 interval_s=self.settings.cell_stage_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
             LeaderPhase(
                 "evict-stages",
                 self._evict_cell_stages_phase,
                 interval_s=self.settings.cell_stage_interval_s,
                 zero_interval_disables=True,
-                isolate_failures=True,
             ),
         )
 
@@ -228,8 +223,8 @@ class _ControllerLoops:
         instead of changing this signature.
         """
 
-        ordered = tuple(self._leader_phases())
-        for index, phase in enumerate(ordered):
+        failed: set[str] = set()
+        for phase in self._leader_phases():
             if phase.interval_s is not None:
                 if phase.zero_interval_disables and phase.interval_s <= 0:
                     continue
@@ -238,6 +233,17 @@ class _ControllerLoops:
                 # Advance before the call, so a persistently failing phase cannot pin
                 # the loop retrying it on every scheduler tick.
                 due[phase.name] = now + phase.interval_s
+            blocked = sorted(name for name in phase.requires if name in failed)
+            if blocked:
+                # Not an error of this phase's own, so it is stated plainly and
+                # the cycle continues. The phases that give capacity back depend
+                # on nothing and are therefore never reached by this branch.
+                logger.warning(
+                    "skipping leader phase %s: it commits against %s, which failed this cycle",
+                    phase.name,
+                    ", ".join(blocked),
+                )
+                continue
             if not await self.leader.acquire():
                 return due
             # One span per phase is where tracing earns its keep: a slow leader
@@ -245,30 +251,22 @@ class _ControllerLoops:
             # configured tracer provider this is a null context, so it costs
             # nothing when nobody is collecting.
             with trace_span("eyvan.leader_phase", phase=phase.name):
-                if not phase.isolate_failures:
-                    try:
-                        await phase.run()
-                    except Exception:
-                        # Named, and with the cost stated. A phase that
-                        # propagates takes every later phase of the cycle with
-                        # it -- observation, settlement, release, billing -- and
-                        # the caller could only say "global scheduling
-                        # reconciliation failed". Reading a traceback to learn
-                        # which phase, and inferring what it stopped, is the
-                        # work this line does instead: a live fleet spent eight
-                        # minutes stranded on a planner nobody had identified.
-                        skipped = ", ".join(later.name for later in ordered[index + 1 :])
-                        logger.exception(
-                            "leader phase %s failed; the rest of this cycle did not run: %s",
-                            phase.name,
-                            skipped or "no later phase",
-                        )
-                        raise
-                    continue
                 try:
                     await phase.run()
                 except Exception:
-                    logger.exception("leader phase %s failed; continuing", phase.name)
+                    # Contained, always. A failure used to propagate out of the
+                    # whole cycle, and because the phases that release capacity
+                    # and settle billing sit in the middle of this list, one
+                    # failure upstream of them left an accelerator running that
+                    # nobody was going to stop paying for. Observed on a live
+                    # v5p-16 multislice.
+                    #
+                    # What the old behaviour protected is kept by ``requires``:
+                    # a phase that commits work against the plane's view is
+                    # skipped above when that view is stale, rather than being
+                    # stopped as a side effect of an unrelated failure.
+                    failed.add(phase.name)
+                    logger.exception("leader phase %s failed; the rest of this cycle continues", phase.name)
         return due
 
     async def _run_scheduler_loop(self, stop: asyncio.Event) -> None:
