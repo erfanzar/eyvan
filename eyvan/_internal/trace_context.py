@@ -16,15 +16,22 @@ from eyvan._internal.correlation import current_correlation_id
 _PROPAGATOR = TraceContextTextMapPropagator()
 
 
-def outgoing_trace_headers() -> dict[str, str]:
-    """Expose a valid current parent only during an opted-in operation."""
-    if current_correlation_id() is None:
-        return {}
+def snapshot_trace_parent(*, enabled: bool) -> str | None:
+    """Copy the active parent without starting/ending spans or calling exporters.
+
+    Safe inside a transaction: only the built-in W3C propagator reads the current
+    context. Never invoke an operator-configured global propagator here.
+    """
+    if not enabled:
+        return None
     carrier: dict[str, str] = {}
     _PROPAGATOR.inject(carrier)
-    parent = carrier.get("traceparent")
-    # Do not use the operator's global propagator: it can include baggage or
-    # vendor state containing application data unrelated to this operation.
+    return carrier.get("traceparent")
+
+
+def outgoing_trace_headers() -> dict[str, str]:
+    """Expose a valid current parent only during an opted-in operation."""
+    parent = snapshot_trace_parent(enabled=current_correlation_id() is not None)
     return {"traceparent": parent} if parent is not None else {}
 
 

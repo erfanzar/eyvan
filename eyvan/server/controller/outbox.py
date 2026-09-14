@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from eyvan._internal.correlation import traced_operation
 from eyvan._internal.observability import trace_span
+from eyvan._internal.trace_context import remote_trace_parent
 from eyvan.capacity.audit import CapacityLifecycleEvent
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.records import (
@@ -155,6 +156,17 @@ class _ControllerOutbox:
 
     async def _dispatch_claimed_outbox(self, command: OutboxRecord) -> None:
         """Deliver and settle one command that this controller has just claimed."""
+
+        # Recovery can enqueue a replacement command after dispatch fails. Keep
+        # the producer parent attached until those handlers and settlement finish.
+        with remote_trace_parent(
+            command.traceparent,
+            enabled=self.settings.correlation_enabled and command.correlation_id is not None,
+        ):
+            await self._dispatch_claimed_outbox_in_context(command)
+
+    async def _dispatch_claimed_outbox_in_context(self, command: OutboxRecord) -> None:
+        """Run delivery and its recovery handlers under the command's parent."""
 
         try:
             # Delivery is the one place a provider or cell agent can block for

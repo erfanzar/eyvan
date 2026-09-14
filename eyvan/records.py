@@ -3250,12 +3250,15 @@ class OutboxRecord(EyvanModel):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     correlation_id: str | None = Field(default=None, pattern=CORRELATION_ID_WIRE_PATTERN)
+    traceparent: str | None = Field(default=None, max_length=55, pattern=r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         document = handler(self)
         if self.correlation_id is None:
             document.pop("correlation_id", None)
+        if self.traceparent is None:
+            document.pop("traceparent", None)
         return document
 
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from eyvan._internal.correlation import canonical_correlation_id
+from eyvan._internal.trace_context import snapshot_trace_parent
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
     AuthorizationError,
@@ -474,5 +475,6 @@ class AuditMixin:
                 if cell is not None and cell.autoscale_request_workload_id:
                     correlation_id = cell.autoscale_request_workload_id
             record = record.model_copy(update={"correlation_id": canonical_correlation_id(correlation_id)})
+            record = record.model_copy(update={"traceparent": snapshot_trace_parent(enabled=True)})
         await tx.put_outbox(record)
         return record
