@@ -371,6 +371,21 @@ class CellAgentService:
         self._close_execution_cell(cell_id)
         return self._observation(value)
 
+    def worker_builds(self, cell_id: str) -> list[dict[str, object]]:
+        """Return what code each native worker of one cell is running.
+
+        Empty when this cell's execution backend has no separate worker
+        processes to ask -- a local driver runs the workload in this very
+        process, whose build the agent already reports. Empty is honest there
+        and is distinguished by the caller from an agent that has no such route.
+        """
+
+        driver = self.executors.resolve(cell_id, self.capacity.observe(cell_id))
+        collect = getattr(driver, "worker_builds", None)
+        if collect is None:
+            return []
+        return list(collect())
+
     def close(self) -> None:
         """Release execution-driver resources when the agent process stops."""
 

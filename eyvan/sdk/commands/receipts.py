@@ -305,10 +305,9 @@ def _agent_build_gaps(fleet_builds: tp.Mapping[str, object] | None) -> list[str]
     missed = len(unreachable) if isinstance(unreachable, list) else 0
     gaps: list[str] = []
     if agreement is True:
-        gaps.append(
-            f"the build of the native worker process inside each cell; its {counted} cell agent(s) "
-            "were checked and run this control plane's build, but the worker itself reports none"
-        )
+        # Nothing to add. Agreement here means every agent *and* every native
+        # worker of every scanned cell reported this plane's build, which is the
+        # whole chain from the client that submitted to the process that ran it.
         return gaps
     if agreement is False:
         gaps.append(

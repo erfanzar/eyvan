@@ -47,16 +47,21 @@ before the plane is polled, while the run is still free -- and its `receipt_dige
 detects editing, not forgery: there is no signing key here, and the receipt says
 so in its own `unverified` list rather than implying one.
 
-The agents are asked too. `eyvan capacity builds` reports the digest of every
-reachable cell agent beside the plane's, and a proof run records that sweep. It
-exits non-zero on proven skew *and* when agreement could not be shown -- an
-agent that did not answer is not an agent that agreed, and a proof has already
-been run against a stale agent and read as evidence.
+The agents and the workers are asked too. `eyvan capacity builds` reports the
+digest of every reachable cell agent, and of every native worker process inside
+its cells, beside the plane's -- and a proof run records that sweep. It exits
+non-zero on proven skew *and* when agreement could not be shown: an agent that
+did not answer is not an agent that agreed, and a proof has already been run
+against a stale agent and read as evidence.
 
-What a receipt still cannot say: which build the native worker process inside
-each cell was running. It is installed from the wheel the head staged, so it is
-expected to match the plane, and every receipt records that expected is not
-observed.
+The worker ranks are in that sweep because they execute the workload and their
+wheel outlives a re-staged head. That is not theoretical -- during the
+2026-08-12 run the head's wheel was replaced twice while the running TPU workers
+kept the one their cell was provisioned with.
+
+A receipt from a fleet that answered therefore leaves no build dimension open:
+the client that submitted, the plane that scheduled, the agent that held the
+capacity and the process that ran the callable are all identified by content.
 
 P2 and P3 stay procedural on purpose: they need a host killed mid-stream and a
 job that submits its own children, and an "automated" verdict over a run whose

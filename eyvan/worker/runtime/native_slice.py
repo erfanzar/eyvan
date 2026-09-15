@@ -812,6 +812,32 @@ class NativeSliceExecutor:
 
         return all(worker.health() for worker in self._workers)
 
+    def worker_builds(self) -> list[dict[str, object]]:
+        """Return what code each host in this slice is running.
+
+        One entry per rank, always, in rank order. A rank that could not answer
+        carries ``None`` rather than being dropped: the caller is asking whether
+        a slice is uniform, and a shorter list would answer that question by
+        omitting the ranks it could not check.
+
+        These processes are the ones that execute the workload, and they are
+        installed from the wheel their cell was provisioned with -- which is not
+        necessarily the one the head stages now, because a cell outlives a
+        re-staged head.
+        """
+
+        collected: list[dict[str, object]] = []
+        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
+            reported = worker.build()
+            collected.append(
+                {
+                    "rank": rank,
+                    "endpoint": endpoint,
+                    "build": None if reported is None else reported.model_dump(mode="json"),
+                }
+            )
+        return collected
+
     def asset_stage_driver(self, *, generation: int, fence: StageFence | None = None) -> NativeSliceStageDriver:
         """Return a staging view over this slice, bound to one cell generation.
 

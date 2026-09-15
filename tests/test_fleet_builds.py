@@ -60,15 +60,28 @@ def _cell(cell_id: str, *, pool: CapacityPoolRecord, endpoint: str, state: CellS
 
 
 class _Agent:
-    """One agent's answer to being asked what it is."""
+    """One agent's answer to being asked what it, and its workers, are."""
 
-    def __init__(self, build: AgentBuild | None | Exception) -> None:
+    def __init__(
+        self,
+        build: AgentBuild | None | Exception,
+        workers: list[dict[str, object]] | None | Exception = None,
+    ) -> None:
         self._build = build
+        # Default: an agent whose cell runs the workload in this very process,
+        # so there is no separate worker to ask and nothing is unknown.
+        self._workers: list[dict[str, object]] | None | Exception = [] if workers is None else workers
 
     def build(self) -> AgentBuild | None:
         if isinstance(self._build, Exception):
             raise self._build
         return self._build
+
+    def worker_builds(self, cell_id: str) -> list[dict[str, object]] | None:
+        del cell_id
+        if isinstance(self._workers, Exception):
+            raise self._workers
+        return self._workers
 
 
 def _agent_build(digest: str | None) -> AgentBuild:
@@ -113,6 +126,73 @@ async def test_a_fleet_whose_agents_all_run_this_build_is_reported_as_agreeing()
     assert report["in_agreement"] is True
     assert report["plane"]["source_digest"] == plane
     assert report["agents"][0]["build"]["source_digest"] == plane
+
+
+@pytest.mark.asyncio
+async def test_a_worker_running_other_code_is_skew_even_when_its_agent_agrees() -> None:
+    """The worker executes the workload, and its wheel outlives a re-staged head.
+
+    Observed while this was written: the head's wheel was replaced twice and the
+    running TPU workers kept the one their cell was provisioned with. An agent
+    that agrees says nothing about them.
+    """
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {
+            "http://agent-a:8090": _Agent(
+                _agent_build(plane),
+                workers=[{"rank": 0, "endpoint": "http://w0:8100", "build": {"source_digest": "sha256:last-week"}}],
+            )
+        },
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_could_not_say_is_not_agreement() -> None:
+    """A rank that answered nothing has not agreed with anything."""
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {
+            "http://agent-a:8090": _Agent(
+                _agent_build(plane),
+                workers=[{"rank": 0, "endpoint": "http://w0:8100", "build": None}],
+            )
+        },
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_cannot_be_asked_about_its_workers_is_not_agreement() -> None:
+    """An agent predating the worker route leaves the ranks unestablished."""
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {"http://agent-a:8090": _Agent(_agent_build(plane), workers=RuntimeError("404"))},
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is None
+    assert report["agents"][0]["workers"] is None
 
 
 @pytest.mark.asyncio
@@ -253,7 +333,15 @@ def _run_builds(monkeypatch, payload: object):
 def _report(**overrides: object) -> dict:
     document: dict[str, object] = {
         "plane": {"version": "0.0.1", "source_digest": "sha256:plane", "digest_detail": ""},
-        "agents": [{"endpoint": "http://agent-a:8090", "pool_id": "p", "build": {"source_digest": "sha256:plane"}}],
+        "agents": [
+            {
+                "endpoint": "http://agent-a:8090",
+                "cell_id": "cell-a",
+                "pool_id": "p",
+                "build": {"source_digest": "sha256:plane"},
+                "workers": [],
+            }
+        ],
         "unreachable": [],
         "unscanned_pools": [],
         "in_agreement": True,
@@ -299,3 +387,52 @@ def test_the_command_fails_when_agreement_could_not_be_shown(monkeypatch) -> Non
 
     assert result.exit_code != 0
     assert "could not be shown to agree" in result.output
+
+
+def test_the_command_shows_a_rank_running_other_code(monkeypatch) -> None:
+    """The rank is what ran the workload; naming it is the point of the sweep."""
+
+    result, _fake = _run_builds(
+        monkeypatch,
+        _report(
+            agents=[
+                {
+                    "endpoint": "http://agent-a:8090",
+                    "cell_id": "cell-a",
+                    "pool_id": "p",
+                    "build": {"source_digest": "sha256:plane"},
+                    "workers": [
+                        {"rank": 0, "endpoint": "http://w0:8100", "build": {"source_digest": "sha256:plane"}},
+                        {"rank": 1, "endpoint": "http://w1:8100", "build": {"source_digest": "sha256:last-week"}},
+                    ],
+                }
+            ],
+            in_agreement=False,
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert "rank 1 http://w1:8100  DIFFERENT BUILD" in result.output
+
+
+def test_the_command_says_when_a_cells_workers_could_not_be_asked(monkeypatch) -> None:
+    """An agent predating the worker route leaves its ranks unestablished."""
+
+    result, _fake = _run_builds(
+        monkeypatch,
+        _report(
+            agents=[
+                {
+                    "endpoint": "http://agent-a:8090",
+                    "cell_id": "cell-a",
+                    "pool_id": "p",
+                    "build": {"source_digest": "sha256:plane"},
+                    "workers": None,
+                }
+            ],
+            in_agreement=None,
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert "its workers could not be asked" in result.output

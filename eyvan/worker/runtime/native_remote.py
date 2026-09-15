@@ -33,6 +33,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.agent.models import (
+    AgentBuild,
     CellStageAction,
     CellStageActionResult,
     CellStageVerdict,
@@ -154,6 +155,26 @@ class NativeRemoteExecutor:
         if timeout is None:
             return self.client.request(method, path, headers=self._headers, json=json, params=query)
         return self.client.request(method, path, headers=self._headers, json=json, params=query, timeout=timeout)
+
+    def build(self) -> AgentBuild | None:
+        """Return what code this worker runs, or ``None`` if it cannot say.
+
+        Never raises. One rank that predates the route, or that cannot be
+        reached at all, must not fail a sweep across a whole slice -- the caller
+        distinguishes the ranks that answered from the ranks that did not, and
+        an exception here would collapse that into "the slice is unknown".
+        """
+
+        try:
+            response = self._request("GET", "/api/v1/build", timeout=5.0 if self._owns_client else None)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return AgentBuild.model_validate_json(response.content)
+        except ValidationError:
+            return None
 
     def health(self) -> bool:
         """Return whether the native worker accepts HTTP requests."""

@@ -701,25 +701,47 @@ class _ControllerFleets:
                 logger.warning("cell agent %s could not report its build: %s", endpoint, exc)
                 unreachable.append({"endpoint": endpoint, "detail": str(exc)})
                 continue
+            try:
+                workers = await asyncio.to_thread(self._agent_factory(sample).worker_builds, sample.id)
+            except Exception as exc:
+                # The agent answered about itself, so this is not an unreachable
+                # agent. Recorded against the cell instead, because "its workers
+                # could not be asked" is a smaller fact than "the agent is gone".
+                logger.info("cell %s could not report its worker builds: %s", sample.id, exc)
+                workers = None
             agents.append(
                 {
                     "endpoint": endpoint,
                     "cell_id": sample.id,
                     "pool_id": sample.pool_id,
                     "build": None if reported is None else reported.model_dump(mode="json"),
+                    "workers": workers,
                 }
             )
 
         plane = build_identity()
-        matches = [plane.matches(entry["build"] or {}) for entry in agents]
+        matches: list[bool | None] = []
+        for entry in agents:
+            matches.append(plane.matches(entry["build"] or {}))
+            workers = entry["workers"]
+            if workers is None:
+                # The agent could not be asked about its workers at all.
+                matches.append(None)
+                continue
+            # An empty list is not an unknown: this cell's backend runs the
+            # workload in the agent process, whose build is the line above.
+            for worker in workers:
+                matches.append(plane.matches(worker.get("build") or {}))
         return {
             "plane": plane.as_dict(),
             "agents": agents,
             "unreachable": unreachable,
             "unscanned_pools": sorted(pool.id for pool in pools if pool.id not in scanned_pools),
-            # Three answers, for the same reason every agent has three. False
-            # only when some agent provably runs other code; None while any of
+            # Three answers, for the same reason every component has three. False
+            # only when something provably runs other code; None while any of
             # them could not say, because "nothing disagreed" is not agreement.
+            # Workers count here as much as agents: they execute the workload,
+            # and a cell outlives the head that staged its wheel.
             "in_agreement": (
                 False if any(match is False for match in matches) else None if not matches or None in matches else True
             ),

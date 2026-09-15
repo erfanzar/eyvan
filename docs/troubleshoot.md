@@ -104,10 +104,15 @@ Every component of Eyvan reports the same version string, so it cannot tell you
 whether the agent holding your capacity is the code you shipped. This puts the
 control plane's package digest beside every reachable agent's.
 
+Each cell's native worker ranks are listed under their agent. They are the
+processes that run the workload, and they install from the wheel their cell was
+provisioned with -- which a re-staged head does not change, so an agent that
+matches says nothing about them.
+
 It exits non-zero on proven skew and also when agreement could not be shown --
-an unreachable agent, or one predating the route and reporting no digest, is not
-an agent that agreed. Only endpoints holding a cell are scanned; a pool with no
-cell is named rather than passed over.
+an unreachable agent, a rank reporting no digest, or an agent predating the
+route -- because none of those agreed with anything. Only endpoints holding a
+cell are scanned; a pool with no cell is named rather than passed over.
 
 ## A provider keeps failing
 

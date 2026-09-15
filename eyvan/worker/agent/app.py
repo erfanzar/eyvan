@@ -182,6 +182,18 @@ def create_agent_app(
             platform=identity.platform,
         )
 
+    @app.get("/api/v1/cells/{cell_id}/worker-builds", dependencies=[Depends(authenticate)])
+    def worker_builds(cell_id: str) -> list[dict[str, object]]:
+        """Report the build of every native worker this cell holds.
+
+        The processes that actually execute a workload, and the last components
+        of this system that could not describe themselves. They install from the
+        wheel their cell was provisioned with, which a re-staged head does not
+        change -- so this is not a formality: it was observed drifting.
+        """
+
+        return service.worker_builds(cell_id)
+
     @app.get("/api/v1/cells", dependencies=[Depends(authenticate)])
     def inventory() -> list[dict[str, str | int | None]]:
         """List every cell this agent holds durable state for."""

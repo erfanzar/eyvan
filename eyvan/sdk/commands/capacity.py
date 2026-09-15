@@ -86,6 +86,23 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
         else:
             verdict = f"DIFFERENT BUILD  {digest}"
         click.echo(f"agent {entry.get('endpoint')}  pool={entry.get('pool_id')}  {verdict}")
+        workers = entry.get("workers")
+        if workers is None:
+            silent += 1
+            click.echo(f"  cell {entry.get('cell_id')}: its workers could not be asked")
+            continue
+        for worker in workers if isinstance(workers, list) else []:
+            if not isinstance(worker, dict):
+                continue
+            worker_build = worker.get("build") or {}
+            worker_digest = worker_build.get("source_digest") if isinstance(worker_build, dict) else None
+            if not worker_digest:
+                silent += 1
+                click.echo(f"  rank {worker.get('rank')} {worker.get('endpoint')}  does not report a build")
+            elif worker_digest == plane_digest:
+                click.echo(f"  rank {worker.get('rank')} {worker.get('endpoint')}  same build")
+            else:
+                click.echo(f"  rank {worker.get('rank')} {worker.get('endpoint')}  DIFFERENT BUILD  {worker_digest}")
 
     for entry in unreachable if isinstance(unreachable, list) else []:
         click.echo(f"could not reach cell agent {entry.get('endpoint')}: {entry.get('detail')}", err=True)
@@ -100,7 +117,7 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
             f"the fleet could not be shown to agree: {len(agents)} agent(s) answered, {silent} without a digest, "
             f"{len(unreachable)} unreachable"
         )
-    click.echo(f"every one of {len(agents)} reachable agent(s) runs this control plane's build")
+    click.echo(f"every reachable agent and worker of {len(agents)} cell(s) runs this control plane's build")
 
 
 @capacity.command("orphans")

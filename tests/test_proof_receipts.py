@@ -189,12 +189,12 @@ def test_a_receipt_never_implies_it_is_signed() -> None:
     assert any("unsigned" in gap for gap in document["unverified"])
 
 
-def test_a_fleet_whose_agents_all_answered_narrows_the_gap_to_the_worker() -> None:
-    """The dimension no receipt could close until the agents could describe themselves.
+def test_a_fleet_that_agreed_leaves_no_build_dimension_open() -> None:
+    """The dimension no receipt could close, closed.
 
-    Closing it does not close the whole thing: the native worker process inside
-    each cell still reports nothing, and "installed from the wheel the head
-    staged, so it should match" is an expectation rather than an observation.
+    Agreement covers the whole chain: the client that submitted, the plane that
+    scheduled, the agent that held the capacity, and the worker process that ran
+    the callable. Nothing about builds is left for the reader to assume.
     """
 
     gaps = unverified_dimensions(
@@ -204,8 +204,8 @@ def test_a_fleet_whose_agents_all_answered_narrows_the_gap_to_the_worker() -> No
         fleet_builds={"agents": [{"endpoint": "http://agent-a"}], "unreachable": [], "in_agreement": True},
     )
 
-    assert not any("cell agent" in gap and "only the client" in gap for gap in gaps)
-    assert any("native worker process" in gap for gap in gaps)
+    assert not any("cell agent" in gap for gap in gaps)
+    assert not any("worker" in gap for gap in gaps)
 
 
 def test_an_unreachable_agent_leaves_the_gap_open() -> None:
@@ -668,7 +668,7 @@ def test_a_receipt_records_the_fleet_sweep_the_plane_could_answer(tmp_path: Path
 
     document = read_receipt(receipt)
     assert document["fleet"]["in_agreement"] is True
-    assert any("native worker process" in gap for gap in document["unverified"])
+    assert not any("worker" in gap for gap in document["unverified"])
     assert receipt_digest_matches(document) is True
 
 

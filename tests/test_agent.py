@@ -1037,6 +1037,43 @@ def test_the_agent_build_route_is_not_public(tmp_path) -> None:
     assert client.get("/api/v1/build").status_code == 401
 
 
+def test_an_agent_reports_the_builds_of_the_workers_it_holds(tmp_path) -> None:
+    """A backend with no separate worker process says so with an empty list.
+
+    Distinguishable by the caller from an agent that has no such route: the
+    first is "nothing to ask", the second is "could not ask", and only the
+    second leaves a fleet's ranks unestablished.
+    """
+
+    cell_service, _ = service(tmp_path)
+    client = TestClient(create_agent_app(cell_service, EyvanSettings(agent_shared_secret="secret")))
+
+    response = client.get("/api/v1/cells/cell-a/worker-builds", headers={"Authorization": "Bearer secret"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_the_worker_builds_route_is_not_public(tmp_path) -> None:
+    cell_service, _ = service(tmp_path)
+    client = TestClient(create_agent_app(cell_service, EyvanSettings(agent_shared_secret="secret")))
+
+    assert client.get("/api/v1/cells/cell-a/worker-builds").status_code == 401
+
+
+def test_an_agent_predating_the_worker_route_reports_none(tmp_path) -> None:
+    """404 keeps "cannot ask" separate from "nothing to ask"."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    client = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+
+    assert client.worker_builds("cell-a") is None
+
+
 def test_an_agent_that_predates_the_route_reports_no_build_rather_than_failing() -> None:
     """404 is an answer from a working agent, not an error.
 

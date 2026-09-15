@@ -252,6 +252,25 @@ class CellAgentClient:
             raise
         return AgentBuild.model_validate_json(response.content)
 
+    def worker_builds(self, cell_id: str) -> list[dict[str, object]] | None:
+        """Return each native worker's build for one cell, or ``None`` if unasked.
+
+        ``None`` from an agent that predates the route, an empty list from one
+        whose backend runs the workload in the agent process itself. The two are
+        different facts and the caller reports them differently.
+        """
+
+        try:
+            response = self._send("GET", f"/api/v1/cells/{cell_id}/worker-builds")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError("cell agent worker builds must be a JSON array")
+        return payload
+
     def inventory(self) -> list[dict[str, object]]:
         """Return every cell this agent holds durable state for."""
 

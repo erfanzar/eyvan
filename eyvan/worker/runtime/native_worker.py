@@ -47,10 +47,12 @@ from pathlib import Path, PurePosixPath
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from eyvan._internal.build_identity import build_identity
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.drivers.base import ExecutionDriver, ExecutionWorkloadReport, MutationContext, StaleMutationError
 from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
 from eyvan.worker.agent.models import (
+    AgentBuild,
     CellStageAction,
     CellStageActionResult,
     CellStageVerdict,
@@ -325,6 +327,30 @@ def create_native_worker_app(
     @app.get("/api/v1/health", dependencies=[Depends(authenticate)])
     def authenticated_health() -> NativeWorkerHealth:
         return NativeWorkerHealth(status="ok", runtime="native-worker")
+
+    @app.get("/api/v1/build", dependencies=[Depends(authenticate)])
+    def build() -> AgentBuild:
+        """Report the code this worker is running.
+
+        The last component of this system that could not say. It is the process
+        that actually executes the workload, and it is installed from whatever
+        wheel its cell was provisioned with -- which is not necessarily the one
+        the head stages today, because a cell outlives a re-staged head. That
+        happened while this was being written: the head's wheel was replaced
+        twice while running TPU workers kept their original one.
+        """
+
+        identity = build_identity()
+        return AgentBuild(
+            version=identity.version,
+            origin=identity.origin,
+            origin_detail=identity.origin_detail,
+            source_digest=identity.source_digest,
+            digest_detail=identity.digest_detail,
+            file_count=identity.file_count,
+            python=identity.python,
+            platform=identity.platform,
+        )
 
     @app.post("/api/v1/cells/{cell_id}/stage-actions", dependencies=[Depends(authenticate)])
     def stage_asset(cell_id: str, body: NativeStageActionRequest) -> CellStageActionResult:
