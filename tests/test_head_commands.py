@@ -1760,6 +1760,48 @@ def test_a_head_without_an_artifact_store_says_its_capacity_requests_will_be_ref
     assert result.as_document()["artifact_store_warning"] == warning
 
 
+def test_a_private_google_access_head_warns_before_its_first_tpu_request_is_refused() -> None:
+    """The gap is known and pinned; this moves where an operator learns of it.
+
+    Workers on that egress cannot reach PyPI, and the head stages the wheel but
+    not its dependencies -- so the GCP driver refuses every eyvan-native TPU
+    request. That refusal used to arrive on the first request, which is the
+    point furthest from the flag that caused it.
+    """
+
+    spec = dataclasses.replace(_spec(), egress="private-google-access")
+
+    result = HeadProvisioner(
+        spec,
+        runner=FakeGcloud(spec=spec),
+        secret_factory=lambda: STUB_SECRETS,
+        wheel_source=_fake_wheel,
+    ).up()
+
+    warning = result.wheelhouse_warning
+
+    assert warning is not None
+    assert "EYVAN_NATIVE_WORKER_WHEELHOUSE" in warning
+    assert "cloud-nat" in warning
+    assert result.as_document()["wheelhouse_warning"] == warning
+
+
+def test_a_head_whose_workers_can_reach_pypi_is_not_warned() -> None:
+    """The other egresses stage nothing extra and need nothing said."""
+
+    for egress in ("cloud-nat", "public-internet"):
+        spec = dataclasses.replace(_spec(), egress=egress)
+
+        result = HeadProvisioner(
+            spec,
+            runner=FakeGcloud(spec=spec),
+            secret_factory=lambda: STUB_SECRETS,
+            wheel_source=_fake_wheel,
+        ).up()
+
+        assert result.wheelhouse_warning is None, egress
+
+
 def test_a_head_provisions_the_interpreter_its_own_workers_run() -> None:
     """Without it a head cannot submit to the TPUs it provisions.
 

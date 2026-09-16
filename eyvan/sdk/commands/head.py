@@ -1349,6 +1349,32 @@ class HeadUpResult:
         )
 
     @property
+    def wheelhouse_warning(self) -> str | None:
+        """Warn when this head's egress needs dependencies it does not stage.
+
+        Workers on ``private-google-access`` reach Google APIs and nothing else,
+        so they cannot install the wheel's dependencies from PyPI. The GCP
+        driver refuses an eyvan-native TPU request without
+        ``EYVAN_NATIVE_WORKER_WHEELHOUSE``, and this head publishes the wheel
+        and not the wheelhouse -- a known gap, pinned by
+        ``test_a_private_google_access_head_does_not_yet_stage_a_wheelhouse``.
+
+        Until it is closed the refusal is at least moved to where it can be
+        acted on. It used to arrive on the first TPU request, which is the point
+        furthest from the choice that caused it and the one where an operator is
+        least able to relate the two.
+        """
+
+        if self.spec.egress != "private-google-access":
+            return None
+        return (
+            "This head selected --egress private-google-access, whose workers cannot reach PyPI. It publishes the "
+            "native-worker wheel but not a wheelhouse of its dependencies, so every eyvan-native TPU request will be "
+            "refused with 'requires EYVAN_NATIVE_WORKER_WHEELHOUSE' -- on the first request rather than now. Stage one "
+            "and set EYVAN_NATIVE_WORKER_WHEELHOUSE in /etc/eyvan/head.env, or use --egress cloud-nat."
+        )
+
+    @property
     def callable_trust_warning(self) -> str | None:
         """Warn when this head will refuse every ``@execute`` submission.
 
@@ -1376,6 +1402,7 @@ class HeadUpResult:
             "adopted_instance": self.adopted_instance,
             "authentication_warning": self.authentication_warning,
             "artifact_store_warning": self.artifact_store_warning,
+            "wheelhouse_warning": self.wheelhouse_warning,
             "submitter_python_path": (f"{HEAD_SUBMITTER_DIR}/bin/python" if self.spec.submitter_python else None),
             "callable_trust_warning": self.callable_trust_warning,
             "created_firewall_rules": list(self.created_firewall_rules),
@@ -2632,6 +2659,9 @@ def head_up(
     store_warning = result.artifact_store_warning
     if store_warning is not None:
         click.echo(store_warning, err=True)
+    wheelhouse_warning = result.wheelhouse_warning
+    if wheelhouse_warning is not None:
+        click.echo(wheelhouse_warning, err=True)
     click.echo(f"Next: {result.next_command}")
 
 
