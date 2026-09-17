@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import typing as tp
 from datetime import timedelta
 
@@ -43,6 +44,41 @@ from eyvan.worker.agent.client import (
 )
 
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+
+
+#: Ceiling on the delay between retries of a transient failure. Lower than the
+#: non-transient ceiling on purpose: something is waiting on these -- a cancel, a
+#: dispatch -- and the condition is expected to clear.
+_TRANSIENT_RETRY_CEILING_S = 60
+
+#: How long a command may keep failing before its log line stops being routine.
+#: A cancel that has not landed in five minutes is not a blip, and an operator
+#: reading warnings at this rate will not notice one more of them.
+_STUCK_COMMAND_S = 300.0
+
+
+def transient_retry_delay_s(age_s: float) -> int:
+    """Return how long to wait before retrying a command failing transiently.
+
+    Grows with the command's own age rather than with an attempt count, because
+    a transient failure deliberately gives the attempt back -- an agent
+    restarting mid-dispatch must not spend a workload's retry budget. Nothing
+    else grew, so a condition that only looked transient retried once a second
+    indefinitely: watched live for twenty minutes against a worker that answered
+    500 to every stop, while four TPU VMs stayed leased.
+
+    A blip still comes back in a second. A command that has been failing for
+    minutes backs off, to a ceiling low enough that recovery is still noticed
+    promptly -- something is waiting on these.
+    """
+
+    return min(_TRANSIENT_RETRY_CEILING_S, max(1, int(max(0.0, age_s) // 30)))
+
+
+def command_is_stuck(age_s: float) -> bool:
+    """Return whether a failing command has stopped being a routine retry."""
+
+    return age_s >= _STUCK_COMMAND_S
 
 
 class _ControllerOutbox:
@@ -546,19 +582,37 @@ class _ControllerOutbox:
                     }
                 )
             else:
-                delay = 1 if transient else min(300, 5 * (2 ** min(current.attempts - 1, 6)))
+                # A transient failure must not consume the retry budget -- an
+                # agent restarting mid-dispatch is not the workload's fault --
+                # so `attempts` is given back below. That left nothing at all
+                # growing, though: a condition that merely *looks* transient and
+                # never recovers retried once a second forever, at an unchanged
+                # attempt number, with an identical warning each time. Watched
+                # live for twenty minutes while a cancelled multislice held four
+                # TPU VMs, and nothing in the plane escalated.
+                #
+                # Age is what grows in that case, and it needs no new field. A
+                # blip still retries in a second; a stuck command backs off and
+                # says how long it has been stuck.
+                age_s = max(0.0, (now - current.created_at).total_seconds())
+                delay = (
+                    transient_retry_delay_s(age_s) if transient else min(300, 5 * (2 ** min(current.attempts - 1, 6)))
+                )
                 # Logged here rather than at each raise site, because the two
                 # handlers that matter most -- the capacity-provider error and the
                 # bare `except Exception` -- logged nothing at all, so a dispatch
                 # could fail indefinitely in complete silence while the client
                 # showed a steady "waiting for dispatch".
-                logger.warning(
-                    "outbox %s (%s for %s %s) failed on attempt %d, retrying in %ds: %s",
+                stuck = command_is_stuck(age_s)
+                logger.log(
+                    logging.ERROR if stuck else logging.WARNING,
+                    "outbox %s (%s for %s %s) failed on attempt %d after %.0fs, retrying in %ds: %s",
                     current.id,
                     current.topic,
                     current.aggregate_type,
                     current.aggregate_id,
                     current.attempts,
+                    age_s,
                     delay,
                     error,
                 )
