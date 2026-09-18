@@ -436,3 +436,24 @@ def test_the_command_says_when_a_cells_workers_could_not_be_asked(monkeypatch) -
 
     assert result.exit_code != 0
     assert "its workers could not be asked" in result.output
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_worker_entry_is_an_unknown_rank_not_a_crash() -> None:
+    """This is a read-only operator command over data another process sent.
+
+    An agent answering something unexpected must leave the fleet unproven, not
+    raise out of the route an operator is using to find out what is wrong.
+    """
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {"http://agent-a:8090": _Agent(_agent_build(plane), workers=["not-a-document"])},
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is None

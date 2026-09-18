@@ -730,8 +730,11 @@ class _ControllerFleets:
                 continue
             # An empty list is not an unknown: this cell's backend runs the
             # workload in the agent process, whose build is the line above.
-            for worker in workers:
-                matches.append(plane.matches(worker.get("build") or {}))
+            for worker in workers if isinstance(workers, list) else ():
+                # An entry that is not a document is an agent this plane cannot
+                # read, which is an unknown rank rather than an exception out of
+                # an operator's read-only command.
+                matches.append(plane.matches(worker.get("build") or {}) if isinstance(worker, dict) else None)
         return {
             "plane": plane.as_dict(),
             "agents": agents,

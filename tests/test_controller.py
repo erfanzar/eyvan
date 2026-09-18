@@ -4090,6 +4090,61 @@ def _always_leader():
     return Leader()
 
 
+def test_every_declared_prerequisite_names_a_phase_that_exists() -> None:
+    """A typo would silently remove the guard rather than break anything.
+
+    ``requires`` only ever *blocks*, so a name matching no phase can never be in
+    the failed set and the phase simply always runs -- losing the one protection
+    that justified containing failures everywhere else.
+    """
+
+    repository = InMemoryRepository()
+    phases = EyvanController(repository, ControlPlaneService(repository))._leader_phases()
+    names = {phase.name for phase in phases}
+
+    dangling = {(phase.name, required) for phase in phases for required in phase.requires if required not in names}
+
+    assert dangling == set()
+
+
+def test_every_prerequisite_runs_before_the_phase_that_names_it() -> None:
+    """The failed set is per-cycle, so a later phase's failure is invisible here.
+
+    Declaring one would read as a guard and be none, which is worse than not
+    declaring it at all.
+    """
+
+    repository = InMemoryRepository()
+    phases = EyvanController(repository, ControlPlaneService(repository))._leader_phases()
+    position = {phase.name: index for index, phase in enumerate(phases)}
+
+    inverted = {
+        (phase.name, required)
+        for phase in phases
+        for required in phase.requires
+        if position[required] > position[phase.name]
+    }
+
+    assert inverted == set()
+
+
+def test_the_phases_that_give_capacity_back_depend_on_nothing() -> None:
+    """The property the redesign exists for, stated against the real list.
+
+    Reclaiming is safe against any view, and not reclaiming is what strands a
+    running accelerator. A prerequisite added to one of these would reintroduce
+    the failure that cost eight minutes of v5p-16 by a different route.
+    """
+
+    repository = InMemoryRepository()
+    phases = {
+        phase.name: phase for phase in EyvanController(repository, ControlPlaneService(repository))._leader_phases()
+    }
+
+    for name in ("settle-orphans", "settle-orphan-leases", "settle-coordinators", "cell-billing"):
+        assert phases[name].requires == (), name
+
+
 @pytest.mark.asyncio
 async def test_one_failing_phase_does_not_stop_the_rest_of_the_cycle() -> None:
     """The property a live v5p-16 multislice paid for.
