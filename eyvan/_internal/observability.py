@@ -56,6 +56,23 @@ class EyvanMetrics:
             ("state", "capacity_class", "accelerator_type"),
             registry=registry,
         )
+        #: Violations of each durability invariant, one series per invariant and
+        #: always all of them. The plane could already detect these -- I3 names a
+        #: stuck outbox command, I9 a lease pointing at a cell that is gone --
+        #: but only when a human ran `eyvan capacity invariants`. Both were true
+        #: of a live fleet for twenty minutes on 2026-08-12 while four TPU VMs
+        #: billed, and nothing said so.
+        #:
+        #: Zero is published for the satisfied ones deliberately. A gauge that
+        #: only appears when something is wrong cannot be alerted on before it
+        #: first breaks, and one left at its last value after a violation clears
+        #: is a false alarm that never ends.
+        self.invariant_violations = Gauge(
+            "eyvan_invariant_violations",
+            "Current violations of each durability invariant.",
+            ("invariant",),
+            registry=registry,
+        )
         self.project_spend = Gauge(
             "eyvan_project_spend_usd",
             "Estimated or reconciled project spend in USD.",

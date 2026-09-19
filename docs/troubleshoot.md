@@ -76,6 +76,19 @@ scheduling onto that cell again would be worse than the deadlock it escapes.
 Delete the cell afterwards with `eyvan cell-delete`, and confirm at the provider
 that the capacity is gone -- a released cell is not a deleted VM.
 
+## Alerting before an operator has to notice
+
+`eyvan_invariant_violations{invariant="I3"}` and friends are published on the
+metrics export interval, one series per named invariant, zero when satisfied.
+They are the plane's own durability checks -- I1 stranded cells, I2 leases
+outliving their workloads, I3 a stuck outbox command, I9 a lease naming a cell
+that is gone -- and until they were exported the only way to see one was to run
+`eyvan capacity invariants` by hand.
+
+Alert on any of them being non-zero for more than a scrape or two. I3 and I9 were
+both true of a live fleet for twenty minutes on 2026-08-12 while four TPU VMs
+billed, and each was found by reading journald rather than by anything saying so.
+
 ## The whole leader loop is failing every cycle
 
 `global scheduling reconciliation failed` in the head's log, repeating on the

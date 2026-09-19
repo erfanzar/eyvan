@@ -23,6 +23,9 @@ DECLARED_LABELS = {
     "eyvan_capacity_accelerators": {"state", "capacity_class", "accelerator_type"},
     "eyvan_project_spend_usd": {"org", "project", "kind"},
     "eyvan_workload_progress_fraction": {"workload", "rank"},
+    # Bounded by the Invariant enum: one series per named property, and adding
+    # one is already a deliberate breaking change to every reader of it.
+    "eyvan_invariant_violations": {"invariant"},
 }
 
 
@@ -35,6 +38,7 @@ def _instrumented_metrics(registry: CollectorRegistry) -> EyvanMetrics:
     metrics.api_requests.labels(operation="submit", result="ok").inc(2)
     metrics.scheduler_decisions.labels(outcome="placed", reason="ready_capacity").inc()
     metrics.scheduler_duration.observe(0.25)
+    metrics.invariant_violations.labels(invariant="I1").set(0)
     metrics.workloads.labels(state="running").set(3)
     metrics.capacity.labels(state="free", capacity_class="spot", accelerator_type="v5p-16").set(16)
     metrics.project_spend.labels(org="acme", project="research", kind="estimated").set(12.5)

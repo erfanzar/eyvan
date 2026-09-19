@@ -50,6 +50,7 @@ from eyvan.server.controller._support import (
     _provider_phase_start,
     logger,
 )
+from eyvan.server.invariants import Invariant, check_fleet
 from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import AuthorizationError, ConflictError, InputError, NotFoundError
 from eyvan.server.service.provider_diagnostics import safe_provider_diagnostic
@@ -1165,7 +1166,45 @@ class _ControllerSettlement:
         for workload_id, rank in self._progress_series_labels():
             if workload_id not in live:
                 self.metrics.workload_progress.remove(workload_id, rank)
+
+        await self._export_invariant_violations()
         return len(by_state)
+
+    async def _export_invariant_violations(self) -> None:
+        """Evaluate the fleet's own durability invariants and publish the result.
+
+        These were reachable only by an operator running
+        `eyvan capacity invariants` by hand. On 2026-08-12 two of them were true
+        of a live fleet for twenty minutes -- I9 for a lease naming a cell the
+        planner had dropped, I3 for the cancel that could not land -- while four
+        TPU VMs billed and the plane, which could have said so at any point, was
+        never asked.
+
+        Published from this phase rather than a new one because that is what it
+        is: a level, on a slow interval, next to the other gauges. Its own
+        failure is contained like every phase's, and it must not be the reason a
+        metrics export stops -- the invariant read is the newest and least
+        trusted part of it.
+        """
+
+        if self.metrics is None:
+            return
+        try:
+            violations = await check_fleet(self.repository, audit_retention_s=self.settings.audit_retention_s)
+        except Exception:
+            logger.exception("invariant check failed; its gauges keep their previous values")
+            return
+        counts = Counter(violation.invariant.value for violation in violations)
+        for invariant in Invariant:
+            self.metrics.invariant_violations.labels(invariant=invariant.value).set(counts.get(invariant.value, 0))
+        if violations:
+            # One line naming all of them, rather than one line each: these come
+            # in correlated groups -- a stranded cell violates I1 and its lease
+            # violates I9 -- and an operator wants the shape, not the list.
+            logger.warning(
+                "fleet invariant violations: %s",
+                "; ".join(f"{name} x{count}" for name, count in sorted(counts.items())),
+            )
 
     def _progress_series_labels(self) -> tuple[tuple[str, str], ...]:
         """Return the (workload, rank) label pairs currently held by the gauge."""
