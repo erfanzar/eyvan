@@ -1011,7 +1011,7 @@ class ControlPlaneService:
                 # what the catalog says a ``v5p-8`` is -- passed this gate, was
                 # stored, and then reached ``make_cell`` inside the
                 # ``capacity-pools`` leader phase, which carries no
-                # ``isolate_failures``. The ValueError raised there aborted every
+                # failure isolation at the time. The ValueError raised there aborted every
                 # later phase of that cycle -- scheduling, settlement, billing --
                 # on every tick, so one ordinary submission stopped the whole
                 # control plane, and the workload stayed PENDING so nothing ever

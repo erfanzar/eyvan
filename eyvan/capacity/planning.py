@@ -169,10 +169,10 @@ def cell_requires_replacement(cell: CellRecord, pool: CapacityPoolRecord) -> boo
     cell cannot be reconciled, so it requires replacement. Letting ``make_cell``
     raise here instead made an ordinary pool edit fatal -- narrowing a pool so an
     existing multi-worker cell became unmintable raised inside the
-    ``capacity-pools`` leader phase, which carries no ``isolate_failures``, and
-    every later phase of every cycle stopped. That is the same shape as the
-    submission that once halted a whole plane, reached through a config change
-    rather than a workload.
+    ``capacity-pools`` leader phase, which at the time stopped every later phase
+    of every cycle. A phase's failure is contained now, but answering the
+    question is still better than raising it: a pool edit is not an error, and a
+    cell that cannot be minted has a correct answer here.
     """
 
     try:
@@ -315,7 +315,7 @@ class CapacitySimulation:
                 # *workload* named, so a spec that is already durable decides whether
                 # this planner raises. ``make_cell`` refuses a multi-worker cell on
                 # any non-TPU backend by raising, and ``capacity-pools`` is a leader
-                # phase without ``isolate_failures`` -- so the raise would abort every
+                # phase whose failure, at the time, aborted every
                 # later phase of the cycle, including scheduling, settlement and
                 # billing, on every tick, for the whole control plane. A workload that
                 # can never be placed is skipped and left PENDING, which is what an
