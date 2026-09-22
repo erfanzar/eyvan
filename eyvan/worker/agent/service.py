@@ -371,19 +371,27 @@ class CellAgentService:
         self._close_execution_cell(cell_id)
         return self._observation(value)
 
-    def worker_builds(self, cell_id: str) -> list[dict[str, object]]:
+    def worker_builds(self, cell_id: str) -> list[dict[str, object]] | None:
         """Return what code each native worker of one cell is running.
 
-        Empty when this cell's execution backend has no separate worker
-        processes to ask -- a local driver runs the workload in this very
-        process, whose build the agent already reports. Empty is honest there
-        and is distinguished by the caller from an agent that has no such route.
+        Three answers, because there are three situations and conflating any two
+        of them reports agreement nobody established.
+
+        A list is the drivers that ran a probe. ``[]`` means this backend truly
+        has no separate worker -- a local driver runs the workload in the agent
+        process, whose build the agent already reports. ``None`` means this
+        driver cannot be asked at all.
+
+        The last case was returning ``[]``, and a live GCE cell running an
+        active native worker therefore reported no ranks while the sweep called
+        the fleet in agreement. That is the failure this whole check exists to
+        prevent, reached from inside the check.
         """
 
         driver = self.executors.resolve(cell_id, self.capacity.observe(cell_id))
         collect = getattr(driver, "worker_builds", None)
         if collect is None:
-            return []
+            return None
         return list(collect())
 
     def close(self) -> None:

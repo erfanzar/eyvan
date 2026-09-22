@@ -183,7 +183,7 @@ def create_agent_app(
         )
 
     @app.get("/api/v1/cells/{cell_id}/worker-builds", dependencies=[Depends(authenticate)])
-    def worker_builds(cell_id: str) -> list[dict[str, object]]:
+    def worker_builds(cell_id: str) -> list[dict[str, object]] | None:
         """Report the build of every native worker this cell holds.
 
         The processes that actually execute a workload, and the last components

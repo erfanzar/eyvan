@@ -156,6 +156,25 @@ class NativeRemoteExecutor:
             return self.client.request(method, path, headers=self._headers, json=json, params=query)
         return self.client.request(method, path, headers=self._headers, json=json, params=query, timeout=timeout)
 
+    def worker_builds(self) -> list[dict[str, object]]:
+        """Return this cell's one native worker, in the slice executor's shape.
+
+        A single-host cell has exactly one worker and it is this one. Without
+        this the agent had no probe to call, and the sweep read that as "this
+        backend has no separate worker" -- so a GCE cell running a native worker
+        reported no ranks at all and the fleet was called in agreement without
+        anything having asked it. Seen on a live CPU cell.
+        """
+
+        reported = self.build()
+        return [
+            {
+                "rank": 0,
+                "endpoint": self.endpoint,
+                "build": None if reported is None else reported.model_dump(mode="json"),
+            }
+        ]
+
     def build(self) -> AgentBuild | None:
         """Return what code this worker runs, or ``None`` if it cannot say.
 

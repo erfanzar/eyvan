@@ -1037,12 +1037,13 @@ def test_the_agent_build_route_is_not_public(tmp_path) -> None:
     assert client.get("/api/v1/build").status_code == 401
 
 
-def test_an_agent_reports_the_builds_of_the_workers_it_holds(tmp_path) -> None:
-    """A backend with no separate worker process says so with an empty list.
+def test_an_agent_whose_driver_cannot_be_asked_answers_null(tmp_path) -> None:
+    """Three answers, and the one that matters is this one.
 
-    Distinguishable by the caller from an agent that has no such route: the
-    first is "nothing to ask", the second is "could not ask", and only the
-    second leaves a fleet's ranks unestablished.
+    A driver with no probe used to answer ``[]`` -- the same thing a backend
+    with genuinely no worker says -- so a live GCE cell running an active native
+    worker reported no ranks and the fleet was called in agreement without
+    anything having asked it.
     """
 
     cell_service, _ = service(tmp_path)
@@ -1051,7 +1052,7 @@ def test_an_agent_reports_the_builds_of_the_workers_it_holds(tmp_path) -> None:
     response = client.get("/api/v1/cells/cell-a/worker-builds", headers={"Authorization": "Bearer secret"})
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json() is None
 
 
 def test_the_worker_builds_route_is_not_public(tmp_path) -> None:

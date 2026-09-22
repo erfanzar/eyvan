@@ -62,15 +62,20 @@ def _cell(cell_id: str, *, pool: CapacityPoolRecord, endpoint: str, state: CellS
 class _Agent:
     """One agent's answer to being asked what it, and its workers, are."""
 
+    #: Distinct from ``None``, which is the agent answering "this driver cannot
+    #: be asked". The default has to mean neither, or the two cases the sweep
+    #: must keep apart cannot both be written down here.
+    UNSET: tp.ClassVar[object] = object()
+
     def __init__(
         self,
         build: AgentBuild | None | Exception,
-        workers: list[dict[str, object]] | None | Exception = None,
+        workers: list[dict[str, object]] | None | Exception | object = UNSET,
     ) -> None:
         self._build = build
-        # Default: an agent whose cell runs the workload in this very process,
+        # Default: a cell whose backend runs the workload in the agent process,
         # so there is no separate worker to ask and nothing is unknown.
-        self._workers: list[dict[str, object]] | None | Exception = [] if workers is None else workers
+        self._workers: object = [] if workers is _Agent.UNSET else workers
 
     def build(self) -> AgentBuild | None:
         if isinstance(self._build, Exception):
@@ -81,7 +86,7 @@ class _Agent:
         del cell_id
         if isinstance(self._workers, Exception):
             raise self._workers
-        return self._workers
+        return tp.cast("list[dict[str, object]] | None", self._workers)
 
 
 def _agent_build(digest: str | None) -> AgentBuild:
@@ -457,3 +462,48 @@ async def test_a_malformed_worker_entry_is_an_unknown_rank_not_a_crash() -> None
     )
 
     assert report["in_agreement"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_cell_whose_driver_cannot_be_asked_is_not_agreement() -> None:
+    """Found on a live CPU cell, inside the check meant to prevent exactly this.
+
+    The agent returned an empty worker list for a driver that had no probe, the
+    sweep read that as "this backend has no separate worker", and reported the
+    fleet in agreement -- while a native worker was active on the VM and had
+    never been asked. An empty list now means only what it says.
+    """
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {"http://agent-a:8090": _Agent(_agent_build(plane), workers=None)},
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is None
+    assert report["agents"][0]["workers"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_backend_with_genuinely_no_worker_can_still_agree() -> None:
+    """The other side of the same distinction, so the fix is not just stricter.
+
+    A local driver runs the workload in the agent's own process. There is no
+    rank to ask, the agent's own build covers it, and that is agreement.
+    """
+
+    plane = build_identity().source_digest
+    pool = _pool()
+    cell = _cell("cell-a", pool=pool, endpoint="http://agent-a:8090")
+
+    report = await _sweep(
+        {"http://agent-a:8090": _Agent(_agent_build(plane), workers=[])},
+        cells=[cell],
+        pools=[pool],
+    )
+
+    assert report["in_agreement"] is True
