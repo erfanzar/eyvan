@@ -91,6 +91,43 @@ failure, `eyvan down CONFIG`, or any direct live harness. The live Python harnes
 
 All proof fleets are spot unless a proof explicitly states otherwise.
 
+## The 2026-08-12 regression run
+
+Not a proof. The two defects that stranded capacity that morning were fixed the
+same day and the fixes had only ever run against tests, which is a weaker claim
+than it sounds: both bugs were in the paths that give an accelerator back, and
+both were invisible until a fleet met them.
+
+So the sequence that produced them was run again on the fixed build. Spot TPU in
+`us-east5-a` was queued behind other tenants for over an hour, so the workload
+was placed on a CPU cell instead -- deliberately, and for the reason the CPU
+fleet config already exists: the lease, the transient unit, the stop, the
+simulation snapshot and the release are the same code on either shape, and the
+only thing an accelerator adds to this particular question is an hour of waiting
+per attempt.
+
+What it established, with the plane's package digest matching the checkout's:
+
+- a cancel of a running workload settled at `delivery_attempts = 1`, without
+  `workload-force-finalize`. That is the path that took twenty minutes and a
+  break-glass on 2026-08-12;
+- **zero** `lease references unknown cell` across the whole cancel-and-`down`
+  sequence, where that morning produced one every two seconds;
+- the age-based outbox backoff pacing a real failing command -- "failed on
+  attempt 1 after 68s, retrying in 2s", then 100s/3s, then 134s/4s -- against a
+  cell agent that was busy deleting a queued resource;
+- `eyvan capacity builds` reporting the agent's digest against the plane's, and
+  refusing to claim agreement for pools holding no cell.
+
+It also found one: the sweep reported a cell's workers as an empty list, which
+means "this backend has no separate worker", while a native worker was active on
+the VM and had never been asked. Fixed, with both sides of the distinction
+pinned.
+
+What it did **not** establish: anything about multislice, TPU provisioning, or
+any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
+is here so nobody reads it as one.
+
 ## Why these and not a general soak of everything
 
 Each row proves something a CPU cannot: Pallas lowering, real provider
