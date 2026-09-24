@@ -977,14 +977,29 @@ class ControlPlaneService:
                     requested_accelerator_type=accelerator_type,
                     available_enabled_accelerator_types=self._callable_accelerator_types(fleet_pools, pods=pods),
                 )
+            # `CpuConfig` sends exactly this string and nothing else does, so it
+            # is the one accelerator type whose kind is knowable from the wire.
+            # Deriving the kind for the rest -- from the catalog, say -- would
+            # refuse any TPU type the catalog has not got, which is a live
+            # possibility P1 already treats as inconclusive rather than absent.
+            # So this branch is additive: every non-`cpu` request takes exactly
+            # the path it took before, byte for byte, including GPU types, which
+            # are still refused because no run has ever placed a serialized
+            # callable on a GPU cell.
+            wants_cpu = accelerator_type == "cpu"
             tpu_matches = [
                 pool
                 for pool in exact_matches
-                if self._is_complete_tpu_pool(pool) and pool.capacity_class is capacity_class
+                if (self._is_complete_cpu_pool(pool) if wants_cpu else self._is_complete_tpu_pool(pool))
+                and pool.capacity_class is capacity_class
             ]
             if not tpu_matches:
                 available_capacity_classes = sorted(
-                    {pool.capacity_class.value for pool in exact_matches if self._is_complete_tpu_pool(pool)}
+                    {
+                        pool.capacity_class.value
+                        for pool in exact_matches
+                        if (self._is_complete_cpu_pool(pool) if wants_cpu else self._is_complete_tpu_pool(pool))
+                    }
                 )
                 if available_capacity_classes:
                     available = ", ".join(available_capacity_classes)
@@ -993,7 +1008,8 @@ class ControlPlaneService:
                         f"{capacity_class.value!r} capacity; available: {available}"
                     )
                 raise ConflictError(
-                    f"enabled capacity pool for {accelerator_type!r} in fleet {fleet_name!r} is not a TPU pool"
+                    f"enabled capacity pool for {accelerator_type!r} in fleet {fleet_name!r} is not a "
+                    f"{'CPU' if wants_cpu else 'TPU'} pool"
                 )
             if len(tpu_matches) > 1:
                 raise ConflictError(
@@ -1137,6 +1153,24 @@ class ControlPlaneService:
         kind = pool.labels.get("eyvan_resource_kind")
         declared_tpu = kind == "tpu" if kind is not None else pool.capacity_backend == "gcp-tpu"
         return declared_tpu and pool.allocatable.tpu > 0 and pool.allocatable.gpu == 0
+
+    @staticmethod
+    def _is_complete_cpu_pool(pool: CapacityPoolRecord) -> bool:
+        """Return whether a pool can really run a callable that asked for a CPU.
+
+        The same question :meth:`_is_complete_tpu_pool` asks, for the kind that
+        had no answer: `eyvan` ships `CpuConfig`, `@execute` accepts it, and
+        every such submission was refused with "is not a TPU pool" -- after the
+        callable had been serialized and uploaded.
+
+        A pool carrying an accelerator is refused even when it declares itself
+        CPU, because a callable placed there would hold a TPU or a GPU that
+        nothing asked for and nothing would account to it.
+        """
+
+        kind = pool.labels.get("eyvan_resource_kind")
+        declared_cpu = kind == "cpu" if kind is not None else pool.capacity_backend != "gcp-tpu"
+        return declared_cpu and pool.allocatable.tpu == 0 and pool.allocatable.gpu == 0
 
     @classmethod
     def _callable_accelerator_types(
