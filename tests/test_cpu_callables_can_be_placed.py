@@ -33,8 +33,8 @@ from eyvan.records import (
 )
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.errors import ConflictError
 
 
 def _operator() -> Principal:
