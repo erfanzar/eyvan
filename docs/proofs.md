@@ -119,10 +119,13 @@ What it established, with the plane's package digest matching the checkout's:
 - `eyvan capacity builds` reporting the agent's digest against the plane's, and
   refusing to claim agreement for pools holding no cell.
 
-It also found one: the sweep reported a cell's workers as an empty list, which
-means "this backend has no separate worker", while a native worker was active on
-the VM and had never been asked. Fixed, with both sides of the distinction
-pinned.
+It also found two. The build sweep reported a cell's workers as an empty list,
+which means "this backend has no separate worker", while a native worker was
+active on the VM and had never been asked. And `@execute(CpuConfig())` -- a
+config this package exports and the decorator accepts -- was refused against a
+healthy CPU pool with "is not a TPU pool", after the callable had been
+serialized and uploaded. Both fixed; the second was then run end to end on a GCE
+cell and returned its value.
 
 What it did **not** establish: anything about multislice, TPU provisioning, or
 any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
