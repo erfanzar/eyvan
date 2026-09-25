@@ -188,6 +188,7 @@ from eyvan.server.local.auth import LocalDevelopmentCredentialStore
 from eyvan.server.local.daemon import (
     DEFAULT_LOCAL_CELL_AGENT_URL,
     LocalDaemonRecord,
+    record_publication_lock,
     runtime_profile_identifier,
     write_owner_only_record,
 )
@@ -4206,19 +4207,20 @@ def main() -> None:
         # process makes every later native command refuse with "not owned by the
         # selected native GCP runtime profile", and the only way out was editing
         # the record's JSON by hand.
-        write_owner_only_record(
-            args.local_daemon_record_path,
-            LocalDaemonRecord(
-                endpoint=ControlPlaneEndpoint.parse(args.public_url),
-                pid=os.getpid(),
-                runtime_profile_path=runtime_profile_identifier(
-                    args.runtime_profile.expanduser().resolve() if args.runtime_profile is not None else None
+        with record_publication_lock(args.local_daemon_record_path):
+            write_owner_only_record(
+                args.local_daemon_record_path,
+                LocalDaemonRecord(
+                    endpoint=ControlPlaneEndpoint.parse(args.public_url),
+                    pid=os.getpid(),
+                    runtime_profile_path=runtime_profile_identifier(
+                        args.runtime_profile.expanduser().resolve() if args.runtime_profile is not None else None
+                    ),
+                    # The build this very process pinned when its app was created:
+                    # the one its cell agent must match (serving_source_digest).
+                    source_digest=build_identity().source_digest,
                 ),
-                # The build this very process pinned when its app was created:
-                # the one its cell agent must match (serving_source_digest).
-                source_digest=build_identity().source_digest,
-            ),
-        )
+            )
     uvicorn.run(
         application,
         host=server_bind.host,

@@ -433,6 +433,21 @@ def owner_only_startup_lock(path: Path) -> tp.Iterator[None]:
             os.close(descriptor)
 
 
+@contextmanager
+def record_publication_lock(record_path: Path) -> tp.Iterator[None]:
+    """Serialize the supervisor's fallback write with the served process's own write.
+
+    Distinct from the endpoint startup lock, which the supervisor holds for the
+    whole boot and which the child therefore cannot take. Without this, a child
+    that published its record (and its build digest) between the supervisor's
+    ownership read and its fallback write had that record replaced by one with
+    an unknown digest.
+    """
+
+    with owner_only_startup_lock(record_path.with_name(record_path.name + ".publish.lock")):
+        yield
+
+
 def write_owner_only_record(path: Path, record: LocalDaemonRecord) -> None:
     """Atomically replace one PID record after validating the target file shape."""
 
@@ -899,16 +914,20 @@ class LocalDaemonSupervisor:
                 # A record already published by this child is authoritative,
                 # including its independently computed source digest. The parent
                 # cannot vouch for the child's build from its own cached identity.
-                if claimed is None or claimed.pid != process.pid:
-                    write_owner_only_record(
-                        record_path,
-                        LocalDaemonRecord(
-                            endpoint=configured_endpoint,
-                            pid=process.pid,
-                            runtime_profile_path=profile_identifier,
-                            source_digest=None,
-                        ),
-                    )
+                # Re-read under the lock the child publishes under: ``claimed`` is
+                # an earlier snapshot the child may have overtaken since.
+                with record_publication_lock(record_path):
+                    current = read_owner_only_record(record_path)
+                    if current is None or current.pid != process.pid:
+                        write_owner_only_record(
+                            record_path,
+                            LocalDaemonRecord(
+                                endpoint=configured_endpoint,
+                                pid=process.pid,
+                                runtime_profile_path=profile_identifier,
+                                source_digest=None,
+                            ),
+                        )
             except BaseException:
                 stop_owned_process(process)
                 raise
@@ -1299,6 +1318,7 @@ __all__ = (
     "prepare_owner_only_directory",
     "process_is_alive",
     "read_owner_only_record",
+    "record_publication_lock",
     "require_owner_only_record_file",
     "require_owner_only_regular_file",
     "runtime_profile_identifier",

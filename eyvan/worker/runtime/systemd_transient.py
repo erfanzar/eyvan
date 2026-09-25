@@ -539,6 +539,14 @@ def _was_retired(record: tp.Mapping[str, JsonValue]) -> bool:
     return record.get("retired") is True
 
 
+#: How many incarnations back a retire key stays bound. Each partial-launch
+#: rollback carries a fresh key, so without a bound the replay ledger grows by
+#: one entry per rollback for the life of the record. A duplicate retire that
+#: arrives more than this many full retire-and-relaunch cycles late is no longer
+#: recognized as a replay.
+_RETIRE_KEY_INCARNATION_WINDOW = 8
+
+
 def _incarnation(record: tp.Mapping[str, JsonValue]) -> int:
     """Read the relaunch counter, preserving records written before it existed."""
 
@@ -1569,7 +1577,16 @@ class SystemdTransientServiceExecutor:
                 # Gang rollback reuses the submission key. Relaunch makes that
                 # key refer to this new run; distinct retirement-command keys
                 # stay bound to their old incarnations for late replay safety.
-                retire_keys = {key: value for key, value in retire_keys.items() if key != context.idempotency_key}
+                next_incarnation = _incarnation(existing) + 1 if existing is not None else 0
+                # Bounded by incarnation, not by count: the record is written with
+                # sorted keys, so insertion order cannot say which entries are oldest.
+                retire_keys = {
+                    key: value
+                    for key, value in retire_keys.items()
+                    if key != context.idempotency_key
+                    and type(value) is int
+                    and value > next_incarnation - _RETIRE_KEY_INCARNATION_WINDOW
+                }
                 record: JsonObject = {
                     "remote_id": remote_id,
                     "unit_name": unit_name,
@@ -1578,7 +1595,7 @@ class SystemdTransientServiceExecutor:
                     "generation": context.generation,
                     "fencing_token": context.fencing_token,
                     "idempotency_key": context.idempotency_key,
-                    "incarnation": _incarnation(existing) + 1 if existing is not None else 0,
+                    "incarnation": next_incarnation,
                     "retire_keys": retire_keys,
                     "entrypoint": entrypoint,
                     "environment": durable_environment,

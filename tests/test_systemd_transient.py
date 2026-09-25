@@ -1514,6 +1514,36 @@ def test_replayed_retire_does_not_stop_relaunched_incarnation(tmp_path: Path, le
     assert _record(executor, remote_id)["retired"] is True
 
 
+def test_retire_keys_are_bounded_to_recent_incarnations(tmp_path: Path) -> None:
+    """Every rollback now carries a fresh key, so the replay ledger must not grow forever.
+
+    It is pruned by incarnation, not by count: the record is written with sorted
+    keys, so insertion order cannot say which entries are oldest.
+    """
+
+    from eyvan.worker.runtime.systemd_transient import _RETIRE_KEY_INCARNATION_WINDOW as window
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    cycles = window * 3
+    for index in range(cycles):
+        executor.retire(remote_id, _context(key=f"retire-{index}"))
+        executor.submit(_spec(), _context())
+
+    record = _record(executor, remote_id)
+    assert record["incarnation"] == cycles
+    keys = record["retire_keys"]
+    assert len(keys) <= window
+    assert min(keys.values()) >= cycles - window
+
+    # A replay from inside the window is still refused against the current run.
+    stops = sum(command[:2] == ("systemctl", "stop") for command in systemd.commands)
+    executor.retire(remote_id, _context(key=f"retire-{cycles - 1}"))
+    assert _record(executor, remote_id) == record
+    assert sum(command[:2] == ("systemctl", "stop") for command in systemd.commands) == stops
+
+
 @pytest.mark.parametrize("terminal_observation", [False, True])
 def test_retire_rechecks_incarnation_after_observation(tmp_path: Path, monkeypatch, terminal_observation: bool) -> None:
     systemd = FakeSystemd()

@@ -298,6 +298,54 @@ def test_supervisor_starts_literal_loopback_server_and_persists_owner_only_pid_r
     assert stat.S_IMODE(paths.resolved_directory.stat().st_mode) == 0o700
 
 
+def test_a_child_record_published_after_the_parents_read_is_not_overwritten(tmp_path: Path, monkeypatch) -> None:
+    """The child can publish between the parent's ownership read and its fallback write.
+
+    The parent must re-read under the publication lock the child shares, or its
+    unknown-digest fallback replaces the child's authoritative build digest.
+    """
+
+    from eyvan.server.local import daemon as daemon_module
+
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:18080")
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    record_path = paths.record_path(target)
+    launcher = FakeLauncher(FakeProcess(pid=9877))
+    child_record = LocalDaemonRecord(
+        endpoint=endpoint,
+        pid=launcher.process.pid,
+        runtime_profile_path=None,
+        source_digest="sha256:child-build",
+    )
+    real_read = daemon_module.read_owner_only_record
+    published: list[bool] = []
+
+    def read_then_child_publishes(path: Path):
+        value = real_read(path)
+        if path == record_path and launcher.commands and not published and value is None:
+            # The child's own startup lands right after the parent's post-launch read.
+            published.append(True)
+            daemon_module.write_owner_only_record(path, child_record)
+        return value
+
+    monkeypatch.setattr(daemon_module, "read_owner_only_record", read_then_child_publishes)
+    supervisor = LocalDaemonSupervisor(
+        paths=paths,
+        launcher=launcher,
+        health_probe=HealthResponses([False, False, True]),
+    )
+
+    supervisor.ensure(endpoint)
+
+    assert published, "the interleaving under test never happened"
+    record = real_read(record_path)
+    assert record is not None
+    assert record.pid == launcher.process.pid
+    assert record.source_digest == "sha256:child-build"
+
+
 @pytest.mark.parametrize("child_publishes", [True, False])
 def test_startup_preserves_child_digest_or_writes_unknown(tmp_path, child_publishes) -> None:
     endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:19081")
