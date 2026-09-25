@@ -135,6 +135,15 @@ class NativeRemoteExecutor:
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> httpx.Response:
+        if response.status_code == 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("code") == "invalid_configuration":
+                # Re-raised as the ValueError it was on the worker, so the cell
+                # agent's own handler answers the plane with the same verdict.
+                raise ValueError(str(payload.get("detail") or "the native worker refused the request as invalid"))
         if response.status_code == 409:
             try:
                 conflict = MutationConflict.model_validate_json(response.content)

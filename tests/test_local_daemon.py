@@ -290,9 +290,38 @@ def test_supervisor_starts_literal_loopback_server_and_persists_owner_only_pid_r
         "--log-level",
         "info",
     )
-    assert json.loads(record_path.read_text(encoding="utf-8")) == {"endpoint": endpoint.url, "pid": 9876}
+    assert json.loads(record_path.read_text(encoding="utf-8")) == {
+        "endpoint": endpoint.url,
+        "pid": 9876,
+    }
     assert stat.S_IMODE(record_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(paths.resolved_directory.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("child_publishes", [True, False])
+def test_startup_preserves_child_digest_or_writes_unknown(tmp_path, child_publishes) -> None:
+    endpoint = ControlPlaneEndpoint.parse("http://127.0.0.1:19081")
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    record_path = paths.record_path(_target(endpoint.url))
+
+    class PublishingLauncher(FakeLauncher):
+        def start(self, command):
+            process = super().start(command)
+            assert command.record_path == record_path
+            if child_publishes:
+                write_owner_only_record(
+                    record_path, LocalDaemonRecord(endpoint=endpoint, pid=process.pid, source_digest="child-build")
+                )
+            return process
+
+    launcher = PublishingLauncher(FakeProcess(pid=9876))
+    supervisor = LocalDaemonSupervisor(
+        paths=paths, launcher=launcher, health_probe=HealthResponses([False, False, True])
+    )
+    assert supervisor.ensure(endpoint).state is LocalDaemonState.STARTED
+    document = json.loads(record_path.read_text())
+    assert document["pid"] == launcher.process.pid
+    assert document.get("source_digest") == ("child-build" if child_publishes else None)
 
 
 def test_supervisor_surfaces_server_exit_with_the_log_path_and_clears_its_pid_record(tmp_path: Path) -> None:

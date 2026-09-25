@@ -141,6 +141,37 @@ def _is_excluded(relative: Path, *, excludes: frozenset[str], excluded_suffixes:
     return relative.suffix in excluded_suffixes
 
 
+def _root_is_ignored(root: Path) -> bool:
+    """Return whether an *enclosing* repository ignores ``root`` itself.
+
+    A repository's top level is never "ignored" -- a ``.gitignore`` of ``*``
+    there says every file is unwanted, which is the caller's own statement and
+    still yields an empty workspace -- so only a root below the top level can
+    answer yes.
+    """
+
+    try:
+        prefix = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-prefix"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+        if prefix.returncode != 0 or not prefix.stdout.strip():
+            return False
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-q", "--", "."],
+            check=False,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # 0: ignored. 1: not ignored. 128: not a repository, or git failed.
+    return result.returncode == 0
+
+
 def _git_tracked_paths(root: Path) -> list[Path] | None:
     """Return the paths git would keep, or ``None`` when ``root`` is not a repo.
 
@@ -157,6 +188,11 @@ def _git_tracked_paths(root: Path) -> list[Path] | None:
     ``-z`` because filenames may contain newlines.
     """
 
+    if _root_is_ignored(root):
+        raise WorkspaceError(
+            f"repository ignores workspace directory {root}; move it outside the ignored tree or explicitly use "
+            "build_workspace(..., respect_gitignore=False) to include gitignored files (default excludes still apply)"
+        )
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -246,6 +282,12 @@ def build_workspace(
         respect_gitignore=respect_gitignore,
     )
     if not members:
+        on_disk = sum(1 for path in directory.rglob("*") if path.is_file() and not path.is_symlink())
+        if on_disk:
+            raise WorkspaceError(
+                f"workspace root {directory} has {on_disk} file(s) on disk but none is packageable: every one is "
+                "ignored by .gitignore or matches the default excludes (virtualenvs, caches, secrets, build output)"
+            )
         raise WorkspaceError(f"workspace root {directory} contains no packageable files")
 
     raw = io.BytesIO()

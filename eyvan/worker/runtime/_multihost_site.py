@@ -327,6 +327,39 @@ def _emit(line: str) -> None:
 terminate_rank: tp.Callable[[int], tp.NoReturn] = os._exit
 
 
+#: ``jax.distributed.initialize`` tuning arguments that not every JAX release
+#: accepts. The gang-identity arguments are required and always passed; these
+#: are passed only when the installed JAX names them. On 2026-09-24 a two-slice
+#: Spot v6e-4 job on JAX 0.6.2 died on both ranks with ``initialize() got an
+#: unexpected keyword argument 'heartbeat_timeout_seconds'`` before any user
+#: code ran.
+_OPTIONAL_INITIALIZE_ARGUMENTS = frozenset({"heartbeat_timeout_seconds", "initialization_timeout"})
+
+
+def _supported_arguments(initialize: tp.Callable[..., tp.Any], arguments: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Drop the optional tuning arguments the installed ``initialize`` does not take."""
+
+    import inspect
+
+    try:
+        parameters = inspect.signature(initialize).parameters
+    except (TypeError, ValueError):
+        return dict(arguments)
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(arguments)
+    supported = {}
+    for name, value in arguments.items():
+        if name in parameters or name not in _OPTIONAL_INITIALIZE_ARGUMENTS:
+            supported[name] = value
+        else:
+            print(
+                f"eyvan: this JAX's distributed.initialize() does not accept {name}; joining without it",
+                file=sys.stderr,
+                flush=True,
+            )
+    return supported
+
+
 def _initialize_distributed(
     distributed: tp.Any,
     arguments: tp.Mapping[str, tp.Any],
@@ -349,7 +382,7 @@ def _initialize_distributed(
     rank, processes = _rank_identity()
     started = time.monotonic()
     try:
-        distributed.initialize(**arguments)
+        distributed.initialize(**_supported_arguments(distributed.initialize, arguments))
     except (KeyboardInterrupt, SystemExit):
         # An interrupted rank is not a rank that could not join. Claiming
         # otherwise would send an operator to lengthen a deadline that was never
@@ -457,7 +490,14 @@ def initialize_from_environment() -> None:
         rank = int(process_id)
     except ValueError as exc:
         raise RuntimeError("Eyvan multi-host JAX process configuration must be integers") from exc
-    if num_processes < 2 or rank < 0 or rank >= num_processes:
+    if num_processes == 1 and rank == 0:
+        # An elastic job is one hardware world per cell, and a single-host
+        # cell's world is one process: there is nothing to join. Treating it as
+        # invalid printed "Error in sitecustomize ... process configuration is
+        # invalid" on every rank of every elastic multi-worker job (2026-09-24,
+        # Spot v6e-4 x 2 in asia-northeast1-b) while the job itself ran fine.
+        return
+    if num_processes < 1 or rank < 0 or rank >= num_processes:
         raise RuntimeError("Eyvan multi-host JAX process configuration is invalid")
     import jax
 

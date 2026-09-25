@@ -23,6 +23,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -447,7 +448,7 @@ def test_up_creates_one_labelled_head_and_returns_its_internal_address() -> None
     )
     assert "--no-address" in created
     assert result.address == "10.128.0.7"
-    assert result.url == "http://10.128.0.7:8080"
+    assert result.url == "https://10.128.0.7:8080"
     # Two audiences, two commands. On the head the installer recorded the plane,
     # so nothing is passed; from a laptop the address is private and needs both a
     # tunnel and explicit flags.
@@ -455,7 +456,8 @@ def test_up_creates_one_labelled_head_and_returns_its_internal_address() -> None
     # Python and the submit command is the plain one.
     assert result.next_command == (
         "on the head: eyvan up <fleet.yaml> && python train.py   |   "
-        "elsewhere: eyvan --url http://10.128.0.7:8080 --token <token> up <fleet.yaml>"
+        "elsewhere: EYVAN_CONTROL_PLANE_CA_FILE=<copy of /etc/eyvan/control-plane-ca.pem> "
+        "eyvan --url https://10.128.0.7:8080 --token <token> up <fleet.yaml>"
     )
     assert result.service_state == "active"
     assert result.adopted_instance is False
@@ -639,7 +641,7 @@ def test_the_head_environment_carries_every_setting_the_server_refuses_to_start_
     assert environment["EYVAN_DATABASE_URL"] == (
         f"postgresql+asyncpg://eyvan:{STUB_SECRETS.database_password}@127.0.0.1:5432/eyvan"
     )
-    assert environment["EYVAN_PUBLIC_URL"] == "http://10.128.0.7:8080"
+    assert environment["EYVAN_PUBLIC_URL"] == "https://10.128.0.7:8080"
 
 
 def test_generated_credentials_are_delivered_on_stdin_and_never_in_an_argument() -> None:
@@ -686,7 +688,7 @@ def test_the_non_secret_result_document_contains_no_generated_material() -> None
 
     encoded = json.dumps(result.as_document())
     assert not any(value in encoded for value in STUB_SECRETS.values())
-    assert result.as_document()["url"] == "http://10.128.0.7:8080"
+    assert result.as_document()["url"] == "https://10.128.0.7:8080"
 
 
 def test_a_head_with_no_issuer_says_so_instead_of_answering_401_silently() -> None:
@@ -1112,7 +1114,7 @@ def test_status_reports_the_address_ingress_and_unit_state_of_a_running_head() -
     assert result.address == "10.128.0.7"
     assert result.service_state == "active"
     assert result.source_ranges == ("10.128.0.0/20",)
-    assert result.as_document()["url"] == "http://10.128.0.7:8080"
+    assert result.as_document()["url"] == "https://10.128.0.7:8080"
 
 
 def test_status_reports_an_absent_head_without_failing_and_without_ssh() -> None:
@@ -1272,10 +1274,10 @@ def test_the_up_command_reports_the_address_the_ingress_and_the_next_command(mon
     )
 
     assert invoked.exit_code == 0, invoked.output
-    assert "http://10.128.0.7:8080" in invoked.output
+    assert "https://10.128.0.7:8080" in invoked.output
     assert "restricted to 10.128.0.0/20" in invoked.output
     assert "Next: on the head: eyvan up <fleet.yaml>" in invoked.output
-    assert "elsewhere: eyvan --url http://10.128.0.7:8080 --token <token> up <fleet.yaml>" in invoked.output
+    assert "eyvan --url https://10.128.0.7:8080 --token <token> up <fleet.yaml>" in invoked.output
     assert not any(value in invoked.output for value in STUB_SECRETS.values())
 
 
@@ -1462,6 +1464,67 @@ def test_a_unit_that_did_not_start_is_never_reported_as_a_running_head() -> None
 
     assert failure.value.step is HeadStep.SERVICE_VERIFY
     assert "journalctl -u eyvan-head.service" in failure.value.detail
+
+
+@pytest.mark.parametrize(
+    ("plane_state", "agent_state", "restarted", "success"),
+    [
+        ("active", "active", False, True),
+        ("active", "failed", False, False),
+        ("failed", "active", False, False),
+        ("active", "active", True, False),
+    ],
+)
+def test_settle_script_checks_both_units(tmp_path, plane_state, agent_state, restarted, success) -> None:
+    class Capture:
+        def _ssh_action(self, step, summary, remote_command, **kwargs):
+            return remote_command
+
+    remote = HeadProvisioner._service_settled_action(Capture())
+    script = shlex.split(remote)[3]
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(
+        '#!/bin/sh\nif [ "$1" = show ]; then\n'
+        f'  if [ -f "{tmp_path}/waited" ]; then echo {int(restarted)}; else echo 0; fi\n'
+        "  exit 0\nfi\n"
+        f'if [ "$2" = eyvan-head.service ]; then state={plane_state}; else state={agent_state}; fi\n'
+        'echo "$state"\n[ "$state" = active ]\n'
+    )
+    systemctl.chmod(0o700)
+    sleep = tmp_path / "sleep"
+    sleep.write_text(f'#!/bin/sh\n: > "{tmp_path}/waited"\n')
+    sleep.chmod(0o700)
+    result = subprocess.run(
+        ["/bin/sh", "-ec", script], env={"PATH": f"{tmp_path}:/usr/bin:/bin"}, capture_output=True, text=True
+    )
+    assert (result.returncode == 0) is success, result.stdout + result.stderr
+    if success:
+        assert result.stdout.strip() == "active"
+    else:
+        assert f"eyvan-head.service: {plane_state}" in result.stdout
+        assert f"eyvan-head-agent.service: {agent_state}" in result.stdout
+        assert "restart counts" in result.stdout
+
+
+def test_a_unit_that_restarts_between_checks_is_not_reported_running() -> None:
+    """Found live 2026-09-24: `head up` said a crash-looping head was active.
+
+    `eyvan-server` exited at every start, refusing a plaintext network bind, and
+    `Restart=always` brought it back each time, so a single `systemctl
+    is-active` read "active" between crashes. The settle check reads the
+    restart counters on both sides of a wait; on that head they went 47 -> 50.
+    """
+
+    spec = _spec()
+    gcloud = FakeGcloud(
+        spec=spec,
+        failures={"NRestarts": _ok_with_status("active, restart counts 47 0 -> 50 0\n", returncode=3)},
+    )
+
+    with pytest.raises(HeadCommandError, match=r"restart counts 47 0 -> 50 0, not active") as failure:
+        HeadProvisioner(spec, runner=gcloud, secret_factory=lambda: STUB_SECRETS).up()
+
+    assert failure.value.step is HeadStep.SERVICE_VERIFY
 
 
 def test_the_head_publishes_the_worker_wheel_and_names_the_state_agents_share() -> None:
@@ -2142,3 +2205,30 @@ def test_rollback_says_so_when_no_wheel_was_retained() -> None:
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow
+
+
+def test_a_spot_head_is_created_on_spot_and_stops_rather_than_deleting() -> None:
+    """A development plane on Spot keeps its disk, and its database, when reclaimed.
+
+    DELETE would lose the head's PostgreSQL along with the VM; STOP keeps the
+    disk, and the enabled unit resumes the plane when the VM is started again.
+    """
+
+    spec = _spec(spot=True)
+
+    create = next(action for action in HeadProvisioner(spec).plan().actions if action.step is HeadStep.INSTANCE_CREATE)
+
+    assert "--provisioning-model=SPOT" in create.args
+    assert "--instance-termination-action=STOP" in create.args
+    assert spec.as_document()["provisioning_model"] == "spot"
+
+
+def test_a_head_is_standard_capacity_unless_spot_is_asked_for() -> None:
+    """A production head that GCP may stop at any time must be a decision, not a default."""
+
+    spec = _spec()
+
+    create = next(action for action in HeadProvisioner(spec).plan().actions if action.step is HeadStep.INSTANCE_CREATE)
+
+    assert not any("provisioning-model" in arg for arg in create.args)
+    assert spec.as_document()["provisioning_model"] == "standard"

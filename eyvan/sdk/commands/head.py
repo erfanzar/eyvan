@@ -47,6 +47,7 @@ from rich.prompt import Confirm
 
 from eyvan._internal.compat import StrEnum
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.plane_tls import CONTROL_PLANE_CA_FILE_ENV, HEAD_CONTROL_PLANE_CA_PATH
 from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.fleet_config import EyvanFleetConfig
 from eyvan.sdk.commands.autoscale import autoscale_console, is_interactive
@@ -98,6 +99,14 @@ DEFAULT_SSH_READY_DELAY_S = 15.0
 
 #: Where the head keeps the environment the server and migration both read.
 HEAD_ENVIRONMENT_PATH = "/etc/eyvan/head.env"
+#: The head's TLS material. The server certificate is issued by a CA the head
+#: generates for itself: its address is a private VPC address, which no public CA
+#: will certify. The CA certificate is public and lives at
+#: ``HEAD_CONTROL_PLANE_CA_PATH``; its key never leaves ``HEAD_TLS_DIR``.
+HEAD_TLS_DIR = "/etc/eyvan/tls"
+HEAD_TLS_CERT_PATH = f"{HEAD_TLS_DIR}/server.pem"
+HEAD_TLS_KEY_PATH = f"{HEAD_TLS_DIR}/server.key"
+HEAD_TLS_CA_KEY_PATH = f"{HEAD_TLS_DIR}/ca.key"
 HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
 #: Where a staged distribution lands. A wheel must keep its PEP 427 name --
 #: pip refuses "eyvan-head.whl" as not a valid wheel filename -- so the file is
@@ -132,6 +141,11 @@ HEAD_SERVICE_NAME = "eyvan-head.service"
 #: a laptop was refused on a real head with "no default cell agent is
 #: configured". The head runs one and points the platform default at it.
 HEAD_AGENT_SERVICE_NAME = "eyvan-head-agent.service"
+
+#: How long ``eyvan head up`` watches the units before calling them running:
+#: several ``RestartSec`` intervals, so a unit that exits at every start restarts
+#: at least once inside the window.
+HEAD_SERVICE_SETTLE_S = 12
 HEAD_AGENT_PORT = 8090
 PLATFORM_CONFIG_PATH = "/etc/eyvan/platform.yaml"
 
@@ -341,6 +355,13 @@ class HeadSpec:
     submitter_python: str | None = None
     source_ranges: tuple[str, ...] = ()
     iap_ssh: bool = True
+    #: Run the head itself on Spot capacity. For development and qualification
+    #: planes, where an hour of a head is the cost being avoided: GCP may stop the
+    #: VM at any time. The termination action is STOP, never DELETE, so the boot
+    #: disk -- and the PostgreSQL on it -- survives; starting the VM again brings
+    #: the enabled unit back with its state. Off by default, because a stopped
+    #: head stops every fleet it controls from being reconciled.
+    spot: bool = False
 
     @property
     def installed_description(self) -> str:
@@ -510,6 +531,7 @@ class HeadSpec:
             "fleet": self.fleet,
             "iap_ssh": self.iap_ssh,
             "machine_type": self.machine_type,
+            "provisioning_model": "spot" if self.spot else "standard",
             "network": self.network,
             "package": self.package,
             "port": self.port,
@@ -668,7 +690,16 @@ class HeadSecrets:
             # never have created a cell. The Kubernetes manifests have always set
             # it; only this one-command path did not.
             "EYVAN_NATIVE_WORKER_ROOT_SECRET": self.native_worker_root_secret,
-            "EYVAN_PUBLIC_URL": f"http://{address}:{spec.port}",
+            # HTTPS on the private address, under the head's own CA. A network
+            # bind refuses plaintext since 300bba5, and `head up` set neither TLS
+            # nor the opt-out, so every head it built crash-looped at start
+            # (2026-09-24). The bootstrap script issues the certificate.
+            "EYVAN_PUBLIC_URL": f"https://{address}:{spec.port}",
+            "EYVAN_TLS_CERT_FILE": HEAD_TLS_CERT_PATH,
+            "EYVAN_TLS_KEY_FILE": HEAD_TLS_KEY_PATH,
+            # Read by the server to hand the CA to the jobs it dispatches, whose
+            # callbacks to this plane must verify it.
+            CONTROL_PLANE_CA_FILE_ENV: str(HEAD_CONTROL_PLANE_CA_PATH),
             "EYVAN_REPOSITORY_BACKEND": "postgres",
         }
         if spec.artifact_store_uri is not None:
@@ -977,6 +1008,53 @@ def _local_wheel_bytes() -> _LocalWheel:
     return _LocalWheel(data=data, digest=hashlib.sha256(data).hexdigest(), filename=filename)
 
 
+def _head_tls_lines() -> tuple[str, ...]:
+    """Return the bootstrap lines that give the head a CA and a server certificate.
+
+    The CA is created once and kept, so clients that already trust it keep
+    working across re-runs. The server certificate is reissued whenever it does
+    not name the head's current address, does not chain to that CA, or expires
+    within 30 days -- an adopted head whose address changed must not keep
+    serving a certificate for the old one.
+    """
+
+    ca = str(HEAD_CONTROL_PLANE_CA_PATH)
+    return (
+        "",
+        "# TLS for the control-plane listener, under a CA this head owns.",
+        f"head_address=$(sed -n 's#^EYVAN_PUBLIC_URL=https://\\([^:/]*\\):.*#\\1#p' {HEAD_ENVIRONMENT_PATH})",
+        'if [ -z "$head_address" ]; then',
+        f"  echo 'EYVAN_PUBLIC_URL in {HEAD_ENVIRONMENT_PATH} must be https://ADDRESS:PORT' >&2",
+        "  exit 1",
+        "fi",
+        f"install -d -o root -g eyvan-head -m 0750 {HEAD_TLS_DIR}",
+        f"if [ ! -s {HEAD_TLS_CA_KEY_PATH} ] || [ ! -s {ca} ]; then",
+        "  openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=Eyvan control-plane head CA' "
+        f"-keyout {HEAD_TLS_CA_KEY_PATH} -out {ca} "
+        "-addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign'",
+        "fi",
+        f"chown root:root {HEAD_TLS_CA_KEY_PATH}",
+        f"chmod 0600 {HEAD_TLS_CA_KEY_PATH}",
+        f"chmod 0644 {ca}",
+        f'if ! openssl x509 -in {HEAD_TLS_CERT_PATH} -noout -checkip "$head_address" 2>/dev/null '
+        "| grep -q 'does match' \\",
+        f"  || ! openssl verify -CAfile {ca} {HEAD_TLS_CERT_PATH} >/dev/null 2>&1 \\",
+        f"  || ! openssl x509 -in {HEAD_TLS_CERT_PATH} -noout -checkend 2592000 >/dev/null 2>&1; then",
+        f'  openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$head_address" -keyout {HEAD_TLS_KEY_PATH} '
+        f"-out {HEAD_TLS_DIR}/server.csr",
+        f"  openssl x509 -req -in {HEAD_TLS_DIR}/server.csr -CA {ca} -CAkey {HEAD_TLS_CA_KEY_PATH} "
+        f"-CAcreateserial -CAserial {HEAD_TLS_DIR}/ca.srl -days 825 -out {HEAD_TLS_CERT_PATH} "
+        "-extfile <(printf 'subjectAltName=IP:%s\\nbasicConstraints=CA:FALSE\\n"
+        'keyUsage=digitalSignature,keyEncipherment\\nextendedKeyUsage=serverAuth\\n\' "$head_address")',
+        f"  rm -f {HEAD_TLS_DIR}/server.csr",
+        "fi",
+        f"chown root:eyvan-head {HEAD_TLS_KEY_PATH} {HEAD_TLS_CERT_PATH}",
+        f"chmod 0640 {HEAD_TLS_KEY_PATH}",
+        f"chmod 0644 {HEAD_TLS_CERT_PATH}",
+        "",
+    )
+
+
 def render_head_bootstrap_script(spec: HeadSpec) -> str:
     """Render the idempotent installer the head runs under ``sudo``.
 
@@ -1040,6 +1118,7 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "install -d -o eyvan-head -g eyvan-head -m 0750 /var/lib/eyvan",
         f"chown root:eyvan-head {HEAD_ENVIRONMENT_PATH}",
         f"chmod 0640 {HEAD_ENVIRONMENT_PATH}",
+        *_head_tls_lines(),
         "# Group membership rather than a copy of the credential. Anyone who can",
         "# reach this host over IAP already has sudo and can already read this",
         "# file -- which is exactly what `head up` used to tell them to do. This",
@@ -1287,7 +1366,7 @@ class HeadUpResult:
     def url(self) -> str:
         """Return the control-plane URL reachable from inside the VPC."""
 
-        return f"http://{self.address}:{self.spec.port}"
+        return f"https://{self.address}:{self.spec.port}"
 
     @property
     def next_command(self) -> str:
@@ -1304,7 +1383,8 @@ class HeadUpResult:
         submit = f"{HEAD_SUBMITTER_DIR}/bin/python train.py" if self.spec.submitter_python else "python train.py"
         return (
             f"on the head: eyvan up <fleet.yaml> && {submit}   |   "
-            f"elsewhere: eyvan --url {self.url} --token <token> up <fleet.yaml>"
+            f"elsewhere: {CONTROL_PLANE_CA_FILE_ENV}=<copy of {HEAD_CONTROL_PLANE_CA_PATH}> "
+            f"eyvan --url {self.url} --token <token> up <fleet.yaml>"
         )
 
     @property
@@ -1340,7 +1420,9 @@ class HeadUpResult:
             "This head has no EYVAN_OIDC_ISSUER, so it authenticates with a generated bootstrap token instead. "
             "On the head itself nothing needs configuring: the CLI and the Python SDK discover this plane's "
             "address and credential from the node. From anywhere else, read it with "
-            "`sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env` and pass `eyvan --token <token> --url <address>`. "
+            "`sudo grep EYVAN_BOOTSTRAP_TOKEN /etc/eyvan/head.env` and pass `eyvan --token <token> --url <address>`, "
+            f"with {CONTROL_PLANE_CA_FILE_ENV} naming a copy of {HEAD_CONTROL_PLANE_CA_PATH}: the head serves "
+            "HTTPS under a CA it generated for itself. "
             "Register an identity provider and re-run with --oidc-issuer to retire it."
         )
 
@@ -1458,7 +1540,7 @@ class HeadStatusResult:
             "project": self.spec.project,
             "service_state": self.service_state,
             "source_ranges": list(self.source_ranges),
-            "url": None if self.address is None else f"http://{self.address}:{self.spec.port}",
+            "url": None if self.address is None else f"https://{self.address}:{self.spec.port}",
             "zone": self.spec.zone,
         }
 
@@ -1574,7 +1656,7 @@ class HeadProvisioner:
                 self._bootstrap_action(),
                 self._migrate_action(),
                 self._service_start_action(),
-                self._service_verify_action(),
+                self._service_settled_action(),
             )
         )
         return HeadPlan(spec=spec, actions=tuple(actions))
@@ -1813,6 +1895,8 @@ class HeadProvisioner:
             args.extend(("--service-account", spec.service_account))
         if not spec.has_external_address:
             args.append("--no-address")
+        if spec.spot:
+            args.extend(("--provisioning-model=SPOT", "--instance-termination-action=STOP"))
         args.append("--quiet")
         return HeadAction(
             step=HeadStep.INSTANCE_CREATE,
@@ -2272,6 +2356,38 @@ class HeadProvisioner:
             f"sudo systemctl is-active {HEAD_SERVICE_NAME}",
         )
 
+    def _service_settled_action(self) -> HeadAction:
+        """Build the check that both units are active *and stay up*.
+
+        ``systemctl is-active`` answers "active" in the seconds between two
+        crashes of a ``Restart=always`` unit. That reported a head as running on
+        2026-09-24 while ``eyvan-server`` exited at every start, refusing a
+        plaintext network bind. So the restart counters are read, the check waits
+        out several restart intervals, and a unit that restarted in between, or is
+        not active at the end, fails with its state and how often it restarted.
+        """
+
+        script = (
+            f"plane_before=$(systemctl show -p NRestarts --value {HEAD_SERVICE_NAME}); "
+            f"agent_before=$(systemctl show -p NRestarts --value {HEAD_AGENT_SERVICE_NAME}); "
+            f"sleep {HEAD_SERVICE_SETTLE_S}; "
+            f"plane_after=$(systemctl show -p NRestarts --value {HEAD_SERVICE_NAME}); "
+            f"agent_after=$(systemctl show -p NRestarts --value {HEAD_AGENT_SERVICE_NAME}); "
+            f"plane_state=$(systemctl is-active {HEAD_SERVICE_NAME} || true); "
+            f"agent_state=$(systemctl is-active {HEAD_AGENT_SERVICE_NAME} || true); "
+            'if [ "$plane_state" = active ] && [ "$agent_state" = active ] '
+            '&& [ "$plane_before" = "$plane_after" ] && [ "$agent_before" = "$agent_after" ]; '
+            "then echo active; else "
+            f'echo "{HEAD_SERVICE_NAME}: ${{plane_state:-unknown}}, restart counts $plane_before -> $plane_after; '
+            f'{HEAD_AGENT_SERVICE_NAME}: ${{agent_state:-unknown}}, restart counts $agent_before -> $agent_after"; '
+            "exit 3; fi"
+        )
+        return self._ssh_action(
+            HeadStep.SERVICE_VERIFY,
+            f"confirm {HEAD_SERVICE_NAME} and {HEAD_AGENT_SERVICE_NAME} stay active for {HEAD_SERVICE_SETTLE_S}s",
+            "sudo /bin/sh -ec " + shlex.quote(script),
+        )
+
     def _previous_wheel_action(self) -> HeadAction:
         """Build the lookup of the most recently superseded wheel."""
 
@@ -2471,7 +2587,7 @@ class HeadProvisioner:
         operator can be handed at that moment.
         """
 
-        action = self._service_verify_action()
+        action = self._service_settled_action()
         result = self._run(action)
         state = result.stdout.strip() or "unknown"
         if result.returncode != 0 or state != "active":
@@ -2671,6 +2787,14 @@ def head_group() -> None:
     show_default=True,
     help="Manage an SSH ingress rule for Google's IAP forwarding range and tunnel through it.",
 )
+@click.option(
+    "--spot",
+    is_flag=True,
+    help=(
+        "Run the head VM on Spot capacity, for development and qualification planes. GCP may stop it at "
+        "any time; its disk and database survive, and starting the VM again resumes the plane."
+    ),
+)
 @click.option("--rotate-secrets", is_flag=True, help="Regenerate this head's credentials instead of keeping them.")
 @click.option("--dry-run", is_flag=True, help="Print every action and resource name, changing nothing.")
 @click.option("--yes", is_flag=True, help="Confirm creating GCP resources without prompting.")
@@ -2697,6 +2821,7 @@ def head_up(
     source_ranges: tuple[str, ...],
     boot_disk_size_gb: int | None,
     iap_ssh: bool,
+    spot: bool,
     rotate_secrets: bool,
     dry_run: bool,
     yes: bool,
@@ -2738,6 +2863,7 @@ def head_up(
             source_ranges=tuple(source_ranges),
             boot_disk_size_gb=boot_disk_size_gb,
             iap_ssh=iap_ssh,
+            spot=spot or None,
         ),
     )
     provisioner = HeadProvisioner(spec)

@@ -42,6 +42,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileStore,
 )
 from eyvan.config import EyvanSettings
+from eyvan.server.local.daemon import serving_runtime_profile_path
 
 #: One check result as the doctor service consumes it:
 #: (name, status, detail, remedy). Kept positional so the service maps them
@@ -178,11 +179,18 @@ def check_artifact_store(settings: EyvanSettings) -> PreflightOutcome:
     )
 
 
-def check_runtime_profile() -> PreflightOutcome:
-    """Preflight the GCP native runtime profile: present, parseable, safe."""
+def check_runtime_profile(base_url: str | None = None) -> PreflightOutcome:
+    """Preflight the GCP native runtime profile: present, parseable, safe.
+
+    The profile checked is the one the loopback plane at ``base_url`` was
+    started with, when its owner-only record names one -- ``eyvan runtime
+    deploy --profile PATH`` -- and the default profile otherwise. Checking the
+    default beside a plane serving another profile reported a project the plane
+    was not using.
+    """
 
     name = "runtime-profile"
-    path = DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
+    path = serving_or_default_runtime_profile(base_url)
     if not path.expanduser().exists():
         return (
             name,
@@ -206,6 +214,19 @@ def check_runtime_profile() -> PreflightOutcome:
         f"profile for project {profile.project_id} with artifact root {profile.artifact_root_uri}",
         "",
     )
+
+
+def serving_or_default_runtime_profile(base_url: str | None) -> pathlib.Path:
+    """Return the runtime profile the loopback plane at ``base_url`` serves, else the default path."""
+
+    if base_url:
+        try:
+            serving = serving_runtime_profile_path(base_url)
+        except ValueError:
+            serving = None
+        if serving is not None:
+            return serving
+    return DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
 
 
 def check_control_plane_port(base_url: str) -> PreflightOutcome:

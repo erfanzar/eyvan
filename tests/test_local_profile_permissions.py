@@ -113,6 +113,7 @@ def test_the_staged_callable_runner_imports_only_files_that_travel_with_it() -> 
 
     staged = {
         "http_retry",
+        "plane_tls",
         "workspace",
         _pathlib.Path(oci_callable_stager.OCI_CALLABLE_PROTOCOL_FILENAME).stem,
     }

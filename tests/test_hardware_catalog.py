@@ -964,8 +964,9 @@ def test_a_slice_smaller_than_one_host_is_never_derived() -> None:
     """Below the floor a host is subdivided rather than replicated, and the
     resources of a fraction of a VM do not follow from the whole one."""
 
-    assert shape_for("v6e-4") is None
+    assert shape_for("v6e-2") is None, "below the v6e rule's floor and named by no row"
     assert shape_for("v5p-12") is None, "six chips is not whole four-chip hosts"
+    assert shape_for("v5litepod-2") is None, "below the v5e rule's floor and named by no row"
 
 
 def test_a_rule_may_not_claim_a_slice_smaller_than_its_own_host() -> None:
@@ -1043,3 +1044,37 @@ def test_the_autoscaler_will_generate_tpu7x_pools() -> None:
     assert resolution.skip_reason is None
     assert resolution.profile is not None
     assert resolution.profile.tpu == 64
+
+
+def test_single_vm_v5e_and_v6e_shapes_are_sourced_rows_not_derivations() -> None:
+    """Common Spot/TRC shapes: each is one published VM, so its numbers are exact.
+
+    Before these rows every v5e type and v6e-1/-4 needed a hand-written
+    ``resources:`` block, which is the guesswork this catalog exists to end.
+    """
+
+    expected = {
+        "v6e-1": (1, 44, 176),
+        "v6e-4": (4, 180, 720),
+        "v5litepod-1": (1, 24, 48),
+        "v5litepod-4": (4, 112, 192),
+        "v5litepod-8": (8, 224, 384),
+    }
+    for accelerator_type, (chips, cpu, memory) in expected.items():
+        shape = shape_for(accelerator_type)
+        assert shape is not None, accelerator_type
+        assert (shape.chips, shape.hosts, shape.chips_per_host) == (chips, 1, chips), accelerator_type
+        assert (shape.host_cpu, shape.host_memory_gib) == (cpu, memory), accelerator_type
+        assert shape.capacity_backend == "gcp-tpu"
+
+
+def test_multi_host_v5e_derives_per_vm_resources_without_claiming_an_endpoint_count() -> None:
+    """Google's v5e host column counts physical hosts, not four-chip VMs; claiming
+    it would make Eyvan refuse a correctly provisioned slice."""
+
+    for accelerator_type, chips in (("v5litepod-16", 16), ("v5litepod-256", 256)):
+        shape = shape_for(accelerator_type)
+        assert shape is not None
+        assert shape.chips == shape.quota_units == chips
+        assert (shape.host_cpu, shape.host_memory_gib) == (112, 192)
+        assert shape.hosts is None

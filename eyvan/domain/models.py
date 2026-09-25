@@ -469,6 +469,7 @@ class WorkloadSpec:
     worker_count: int = 1
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL
     placement: PlacementMode = PlacementMode.ATOMIC
+    allowed_label_combinations: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     def __post_init__(self) -> None:
         _non_empty(self.workload_id, field_name="workload_id")
@@ -510,6 +511,19 @@ class WorkloadSpec:
             self,
             "denied_label_values",
             self._canonical_label_sets(self.denied_label_values, field_name="denied_label_values"),
+        )
+
+        object.__setattr__(
+            self,
+            "allowed_label_combinations",
+            tuple(
+                sorted(
+                    {
+                        _canonical_pairs(combination, field_name="allowed_label_combinations")
+                        for combination in self.allowed_label_combinations
+                    }
+                )
+            ),
         )
 
         preferred_cells = tuple(self.preferred_cells)

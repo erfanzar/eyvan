@@ -46,10 +46,16 @@ The reconcile loop is `FleetService.reconcile_capacity_pools_once()`
    mismatched live cells are re-upserted idempotently.
 3. **Simulate supply** — `CapacitySimulation.build(...)` counts free cells by
    `(pool, worker_count)`, respecting cooldown/consecutive-failure belief,
-   disabled pools, and drained cells.
+   disabled pools, and drained cells. The acquisition bound also reads a pool's
+   recent *replaced* incarnations (`_recent_failed_acquisition_streak`, one-hour
+   memory), and a pool that denied a workload queue admission is dropped from
+   that workload's candidates.
 4. **Compute demand** — per-pool pending demand with priority bands and ages;
    `_race_alternates` implements cross-pool racing via the `eyvan_pool_alternates`
-   label so a shape can be raced across zones.
+   label so a shape can be raced across zones. At the scheduler boundary
+   (`to_core_workload`) a cross-zone workload's pool, template and region pins
+   become "one of its candidates" rather than exact matches, using the
+   `eyvan_pool_alternate_templates` recorded at submission.
 5. **Plan** — `CapacityPlanner.plan(demand)` produces launch counts honoring
    min/max cells, warm windows, defragmentation hysteresis
    (`_DEFRAG_MIN_PENDING_SECONDS = 180`), and shared-quota allocation across pools.

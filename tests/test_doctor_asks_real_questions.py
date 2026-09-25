@@ -90,7 +90,7 @@ def test_a_wheel_staged_after_the_source_is_reported_as_current(tmp_path: Path, 
 
     profile = tmp_path / "runtime.json"
     profile.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr("eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH", str(profile))
+    monkeypatch.setattr("eyvan.sdk.commands.doctor_preflights.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH", str(profile))
 
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
 
@@ -157,7 +157,7 @@ def test_no_runtime_profile_is_not_a_finding(tmp_path: Path, monkeypatch: pytest
     """Most deployments never stage a native GCP worker at all."""
 
     monkeypatch.setattr(
-        "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
+        "eyvan.sdk.commands.doctor_preflights.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
         str(tmp_path / "absent.json"),
     )
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())

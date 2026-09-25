@@ -232,9 +232,15 @@ def build_identity() -> BuildIdentity:
     """Return this process's build identity, computed once.
 
     Cached because it is served from an HTTP route and read by the CLI on every
-    proof: the tree a running process imports from does not change under it, and
-    a process that is upgraded in place is restarted by every deployment path
-    this package supports.
+    proof, and a process that is upgraded in place is restarted by every
+    deployment path this package supports.
+
+    The tree *can* change under a running process: an editable install is the
+    working tree. The plane and the cell agent therefore call this while they are
+    built, so each hashes the tree it started from. Computed on first use
+    instead, the agent hashed at startup and the plane at its first stale-build
+    check, a reformat landed in between, and the plane drained two healthy Spot
+    cells -- one mid-dispatch -- as running stale code (2026-09-24).
     """
 
     return compute_build_identity(_package_root())

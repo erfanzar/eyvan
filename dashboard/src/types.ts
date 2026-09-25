@@ -417,6 +417,8 @@ export interface PoolWarmth {
   window_active: boolean;
   warm_cells: number;
   warm_idle_cells: number;
+  /** Floor cells requested but not ready yet; absent from planes that predate it. */
+  provisioning_cells?: number;
   hourly_cost: number;
 }
 

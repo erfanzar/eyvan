@@ -177,6 +177,7 @@ class SubmissionMixin:
                     raise NotFoundError(f"fleet node type {fleet_name}/{node_type} has no pool in zone {zone}{detail}")
                 matching_pools = pinned
             alternate_pool_ids: tuple[str, ...] = ()
+            alternate_pool_templates: tuple[str, ...] = ()
             if len(matching_pools) > 1:
                 # Several pools of one shape is cross-zone capacity, not a
                 # misconfiguration, exactly as on the callable path: they are
@@ -197,6 +198,7 @@ class SubmissionMixin:
                     )
                 matching_pools = [primary]
                 alternate_pool_ids = tuple(candidate.id for candidate in interchangeable)
+                alternate_pool_templates = tuple(candidate.template_fingerprint for candidate in interchangeable)
             pool = matching_pools[0]
             if pool.max_cells == 0:
                 raise ConflictError(f"fleet node type {fleet_name}/{node_type} has max_workers set to zero")
@@ -234,6 +236,7 @@ class SubmissionMixin:
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
                 alternate_pool_ids=alternate_pool_ids,
+                alternate_pool_templates=alternate_pool_templates,
                 name=name if name is not None else f"{fleet_name}/{node_type}",
                 execution=CommandExecution(command=command),
                 environment=dict(environment or {}),

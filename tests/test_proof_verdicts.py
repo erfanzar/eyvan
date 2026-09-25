@@ -1253,3 +1253,95 @@ def test_p9_fails_a_workload_that_was_never_bound_to_a_pool() -> None:
     result = evaluate_control_plane_ran_it(_succeeded_workload(required_labels={}), [_fleet_cell()])
 
     assert result.verdict is Verdict.FAIL
+
+
+def test_a_secret_redelivered_to_a_second_attempt_passes() -> None:
+    """The documented P4 run: "across at least two attempts". Counting events over the
+    whole workload failed exactly this run with "expected exactly one; found 2"."""
+
+    result = evaluate_secret_delivery(
+        [
+            _event("secret.issued", attempt=1),
+            _event("secret.read", attempt=1),
+            _event("secret.issued", attempt=2),
+            _event("secret.read", attempt=2),
+        ],
+        {"id": "wl-1", "spec": {"secret_mounts": {"HF_TOKEN": "gcp-secret://p/t"}}},
+        "",
+        secret_value=_VALUE,
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert _check(result, "redelivered") is Verdict.PASS
+    assert "2 attempt(s)" in _detail(result, "one-read")
+
+
+def test_a_second_read_within_one_attempt_still_fails_when_other_attempts_are_clean() -> None:
+    result = evaluate_secret_delivery(
+        [
+            _event("secret.issued", attempt=1),
+            _event("secret.read", attempt=1),
+            _event("secret.issued", attempt=2),
+            _event("secret.read", attempt=2),
+            _event("secret.read", attempt=2),
+        ],
+        {"id": "wl-1"},
+        "",
+        secret_value=_VALUE,
+    )
+
+    assert _check(result, "one-read") is Verdict.FAIL
+    assert "attempt(s) 2" in _detail(result, "one-read")
+
+
+def test_a_cooldown_left_by_an_earlier_run_does_not_decide_this_one() -> None:
+    """Found live 2026-09-24: a clean P5 rerun failed on the first run's cell.
+
+    That cell was reclaimed, cooled and deleted an hour before the rerun was
+    submitted, by a build that still set the cooldown. Its record outlives it,
+    so the proof reads only cells touched after this workload was submitted.
+    """
+
+    workload = {**_preempted(), "created_at": "2026-09-24T17:22:00Z"}
+    result = evaluate_spot_preemption(
+        workload,
+        [
+            {
+                "id": "earlier-run",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "updated_at": "2026-09-24T16:52:00Z",
+                "availability": {"cooldown_until": "2026-09-24T16:51:07Z", "interruptions": 1.0},
+            },
+            {
+                "id": "this-run",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "updated_at": "2026-09-24T17:28:00Z",
+                "availability": {"interruptions": 1.0},
+            },
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+    assert "this-run" in _detail(result, "no-stockout-cooldown")
+
+
+def test_a_cooldown_set_during_this_run_still_fails() -> None:
+    workload = {**_preempted(), "created_at": "2026-09-24T17:22:00Z"}
+    result = evaluate_spot_preemption(
+        workload,
+        [
+            {
+                "id": "this-run",
+                "pool_id": "research/v5p",
+                "provider_failure_code": "preempted",
+                "updated_at": "2026-09-24T17:28:00Z",
+                "availability": {"cooldown_until": "2026-09-24T17:29:00Z"},
+            }
+        ],
+        [{"id": "research/v5p"}],
+    )
+
+    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL

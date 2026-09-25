@@ -53,10 +53,37 @@ _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
 #: dispatch -- and the condition is expected to clear.
 _TRANSIENT_RETRY_CEILING_S = 60
 
+
 #: How long a command may keep failing before its log line stops being routine.
 #: A cancel that has not landed in five minutes is not a blip, and an operator
 #: reading warnings at this rate will not notice one more of them.
 _STUCK_COMMAND_S = 300.0
+
+
+def _exception_origin(exc: BaseException) -> str:
+    """Name an exception's class and the innermost Eyvan frame that raised it.
+
+    Both are code identifiers, never data, so they are safe to keep when a
+    secret-bearing workload's message must be suppressed. Without them a
+    dispatch that failed eight times recorded eight identical "output
+    suppressed" lines and nothing that located the fault (2026-09-24).
+    """
+
+    location = ""
+    traceback = exc.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        module = str(frame.f_globals.get("__name__", ""))
+        if module.startswith("eyvan."):
+            location = f" in {module}.{frame.f_code.co_name}:{traceback.tb_lineno}"
+        traceback = traceback.tb_next
+    return f"{type(exc).__name__}{location}"
+
+
+def _suppressed_diagnostic(origin: str | None) -> str:
+    """Return the secret-safe diagnostic, keeping the failure's code location."""
+
+    return _SECRET_OUTPUT_SUPPRESSED if origin is None else f"{_SECRET_OUTPUT_SUPPRESSED} ({origin})"
 
 
 def transient_retry_delay_s(age_s: float) -> int:
@@ -235,7 +262,7 @@ class _ControllerOutbox:
             else:
                 await self._discard_outbox(command, provider_diagnostic=diagnostic)
         except CellAgentBusyError as exc:
-            await self._finish_outbox(command, error=str(exc), transient=True)
+            await self._finish_outbox(command, error=str(exc), transient=True, error_origin=_exception_origin(exc))
         except CellAgentUnavailableError as exc:
             # Transient, and specifically *not* a provider verdict. An agent that
             # cannot be reached has told us nothing about the provider, and this
@@ -245,7 +272,7 @@ class _ControllerOutbox:
             # that GCP had failed, which is how a healthy pool acquires a failure
             # it never had. Unknown is a third answer here, exactly as it is
             # everywhere else in this package.
-            await self._finish_outbox(command, error=str(exc), transient=True)
+            await self._finish_outbox(command, error=str(exc), transient=True, error_origin=_exception_origin(exc))
         except CellAgentUnsupportedCapabilityError as exc:
             # The backend does not implement this operation; retrying cannot
             # change that. Secret-bearing diagnostics are suppressed before
@@ -267,9 +294,11 @@ class _ControllerOutbox:
             logger.warning("cell agent rejected the configuration for command %s: %s", command.id, diagnostic)
             await self._finish_outbox(command, error=f"invalid configuration: {diagnostic}", terminal=True)
         except CellAgentCapacityProviderError as exc:
-            await self._finish_outbox(command, error=str(exc), failure_code=exc.code)
+            await self._finish_outbox(
+                command, error=str(exc), failure_code=exc.code, error_origin=_exception_origin(exc)
+            )
         except Exception as exc:
-            await self._finish_outbox(command, error=str(exc))
+            await self._finish_outbox(command, error=str(exc), error_origin=_exception_origin(exc))
         else:
             await self._finish_outbox(command)
 
@@ -528,13 +557,16 @@ class _ControllerOutbox:
         failure_code: CapacityProviderFailureCode | None = None,
         transient: bool = False,
         terminal: bool = False,
+        error_origin: str | None = None,
     ) -> bool:
         """Settle an outbox command only while this controller still owns its live claim.
 
         ``transient`` retries soon without spending an attempt. ``terminal``
         settles the command for good, keeping its diagnostic: it is for answers
         that will never change on a retry, such as a backend reporting that it
-        does not implement the operation at all.
+        does not implement the operation at all. ``error_origin`` names where
+        the failure was raised; it survives secret suppression, which the
+        message itself does not.
         """
 
         now = utcnow()
@@ -552,7 +584,7 @@ class _ControllerOutbox:
                 if current.aggregate_type == "workload":
                     workload = await transaction.get_workload(current.aggregate_id)
                     error = (
-                        _SECRET_OUTPUT_SUPPRESSED
+                        _suppressed_diagnostic(error_origin)
                         if workload is not None and workload.spec.secret_mounts
                         else redact_secret_material(error)
                     )

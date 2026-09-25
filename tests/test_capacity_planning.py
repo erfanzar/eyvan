@@ -52,6 +52,45 @@ from eyvan.server.service.errors import InputError
 from eyvan.server.service.scheduling import CoreSchedulingService
 
 
+@pytest.mark.parametrize("timestamp_source", ["observed", "housekeeping", "created"])
+def test_recent_acquisition_failures_use_outcome_time(timestamp_source: str) -> None:
+    from eyvan.capacity.planning import ACQUISITION_FAILURE_MEMORY_S, _recent_failed_acquisition_streak
+    from eyvan.records import CapacityBeliefState
+
+    now = utcnow()
+    old = now - timedelta(seconds=ACQUISITION_FAILURE_MEMORY_S + 60)
+    recent = now - timedelta(seconds=30)
+    cells = [
+        CellRecord.model_construct(
+            id=f"failed-{index}",
+            state=CellState.DELETED,
+            created_at=recent if timestamp_source == "created" else old,
+            updated_at=None if timestamp_source == "created" else recent,
+            availability=CapacityBeliefState(
+                consecutive_failures=1, last_observed_at=recent if timestamp_source == "observed" else None
+            ),
+        )
+        for index in range(5)
+    ]
+    # Ownership cleanup may refresh updated_at on an old tombstone, but it is
+    # not a new acquisition outcome and must not revive expired evidence.
+    expected = 0 if timestamp_source == "housekeeping" else 5
+    assert _recent_failed_acquisition_streak(cells, now) == expected
+    expired = [
+        cell.model_copy(update={"availability": CapacityBeliefState(consecutive_failures=1, last_observed_at=old)})
+        for cell in cells
+    ]
+    assert _recent_failed_acquisition_streak(expired, now) == 0
+    success = cells[0].model_copy(
+        update={
+            "id": "success",
+            "created_at": old - timedelta(seconds=60),
+            "availability": CapacityBeliefState(provision_latencies_s=(120.0,), last_observed_at=now),
+        }
+    )
+    assert _recent_failed_acquisition_streak([*cells, success], now) == 0
+
+
 def fleet_admin() -> Principal:
     return Principal(subject="admin", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
 
@@ -1253,3 +1292,88 @@ async def test_a_pool_upsert_that_disagrees_with_its_quota_group_is_rejected_lou
             quota_pool("research/shared-b", limit=6),
             idempotency_key="pool-b-2",
         )
+
+
+def _replaced_incarnations(pool, count: int, *, age_s: float, delivered_after: int | None = None):
+    """``count`` deleted cells, oldest first, each failed once and replaced by the next."""
+
+    from datetime import timedelta
+
+    now = utcnow()
+    cells = []
+    for index in range(count):
+        cell = _failing_cell(pool, f"cell-{index + 1}", consecutive_failures=2).model_copy(
+            update={
+                "state": CellState.DELETED,
+                "created_at": now - timedelta(seconds=age_s - index),
+                "updated_at": now - timedelta(seconds=age_s - index),
+            }
+        )
+        if delivered_after is not None and index == delivered_after:
+            cell = cell.model_copy(
+                update={"availability": cell.availability.model_copy(update={"provision_latencies_s": (120.0,)})}
+            )
+        cells.append(cell)
+    return tuple(cells), now
+
+
+def test_a_replacement_loop_trips_the_bound_even_though_each_cell_is_new() -> None:
+    """Found live on 2026-09-24: GCP failed every Spot v5litepod-8 queued resource in
+    us-west4-a ("tenant project creation"), and each failure minted a fresh cell with a
+    clean belief while the failed one was deleted -- fifteen cells in thirty minutes,
+    because the bound only read live cells and every live cell had failed at most twice.
+    """
+
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+    cells, now = _replaced_incarnations(pool, MAX_CONSECUTIVE_ACQUISITION_FAILURES, age_s=600)
+
+    simulation = CapacitySimulation.build((pool,), cells, (workload,), (), now)
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset({workload.id})
+    assert simulation.cells == ()
+
+
+def test_a_replacement_loop_below_the_bound_is_still_asked() -> None:
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+    cells, now = _replaced_incarnations(pool, MAX_CONSECUTIVE_ACQUISITION_FAILURES - 1, age_s=600)
+
+    simulation = CapacitySimulation.build((pool,), cells, (workload,), (), now)
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset()
+    assert len(simulation.cells) == 1
+
+
+def test_old_failed_incarnations_never_park_a_pool() -> None:
+    """Yesterday's outage is not today's belief: past the memory window the pool is asked again."""
+
+    from eyvan.capacity.planning import ACQUISITION_FAILURE_MEMORY_S
+
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+    cells, now = _replaced_incarnations(
+        pool, MAX_CONSECUTIVE_ACQUISITION_FAILURES + 3, age_s=ACQUISITION_FAILURE_MEMORY_S + 60
+    )
+
+    simulation = CapacitySimulation.build((pool,), cells, (workload,), (), now)
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset()
+    assert len(simulation.cells) == 1
+
+
+def test_one_delivered_incarnation_ends_the_failure_streak() -> None:
+    """A pool that granted since its failures is not failing; one success ends a run."""
+
+    pool = _shape_pool("research/zone-a")
+    workload = _pending_workload()
+    cells, now = _replaced_incarnations(
+        pool,
+        MAX_CONSECUTIVE_ACQUISITION_FAILURES + 2,
+        age_s=600,
+        delivered_after=MAX_CONSECUTIVE_ACQUISITION_FAILURES,
+    )
+
+    simulation = CapacitySimulation.build((pool,), cells, (workload,), (), now)
+
+    assert simulation.acquisition_exhausted_workload_ids == frozenset()

@@ -36,7 +36,6 @@ from pydantic import ValidationError
 
 from eyvan._internal.client_version import client_version
 from eyvan._internal.json_types import JsonValue, is_json_object
-from eyvan.capacity.providers.gcp.runtime.profile import DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
 from eyvan.config import EyvanSettings
 from eyvan.records import CapacityPoolRecord, CellRecord, CellState
 from eyvan.sdk.client.transport import EyvanUnavailableError
@@ -48,6 +47,7 @@ from eyvan.sdk.commands.doctor_preflights import (
     check_gcloud_authentication,
     check_runtime_profile,
     check_secret_manager_bind,
+    serving_or_default_runtime_profile,
 )
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
@@ -753,7 +753,7 @@ class DoctorCommandService:
         if newest_source_mtime() is None:
             return CheckResult("source-drift", CheckStatus.PASS, "installed package, not a source checkout")
 
-        stale = stale_components(runtime_profile_path=DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH)
+        stale = stale_components(runtime_profile_path=serving_or_default_runtime_profile(self.session.base_url))
         if not stale:
             return CheckResult("source-drift", CheckStatus.PASS, "every local component is newer than the source")
         return CheckResult(
@@ -791,7 +791,7 @@ class DoctorCommandService:
             check_gcloud_authentication(),
             check_secret_manager_bind(),
             check_artifact_store(settings),
-            check_runtime_profile(),
+            check_runtime_profile(self.session.base_url),
             check_control_plane_port(self.session.base_url),
         )
         status_by_name = {status.value: status for status in CheckStatus}

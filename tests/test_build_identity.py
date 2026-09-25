@@ -184,3 +184,45 @@ def test_the_identity_is_computed_once() -> None:
     """It is served from an HTTP route; the tree does not change under a process."""
 
     assert build_identity() is build_identity()
+
+
+@pytest.mark.parametrize("which", ["plane", "agent"])
+def test_building_the_app_pins_the_identity_before_the_tree_can_change(monkeypatch, which: str) -> None:
+    """Found live 2026-09-24: an editable install is the working tree, and it changed.
+
+    The agent hashed the tree when it started; the plane hashed it lazily, at its
+    first stale-build check, after a reformat had landed. The digests disagreed
+    and the plane drained two healthy Spot cells as running stale code. Each app
+    now hashes while it is built, so what it reports is the tree it started from.
+    """
+
+    from eyvan._internal import build_identity as module
+    from eyvan.config import EyvanSettings
+
+    calls: list[Path] = []
+    real = module.compute_build_identity
+
+    def counting(root: Path) -> BuildIdentity:
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr(module, "compute_build_identity", counting)
+    module.build_identity.cache_clear()
+    try:
+        if which == "plane":
+            from eyvan.server.api.app import create_app
+
+            create_app()
+        else:
+            from eyvan.worker.agent.app import create_agent_app
+
+            class _Service:
+                def close(self) -> None:
+                    pass
+
+            create_agent_app(_Service(), EyvanSettings(agent_shared_secret="agent-secret"))  # type: ignore[arg-type]
+        assert len(calls) == 1
+        build_identity()
+        assert len(calls) == 1
+    finally:
+        module.build_identity.cache_clear()

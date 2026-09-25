@@ -35,6 +35,10 @@ from eyvan.domain import (
 )
 from eyvan.domain.availability import p95_latency
 from eyvan.records import (
+    POOL_ALTERNATE_TEMPLATES_LABEL,
+    POOL_ALTERNATES_LABEL,
+    POOL_LABEL,
+    POOL_TEMPLATE_LABEL,
     WORKER_COUNT_LABEL,
     BudgetRecord,
     CellRecord,
@@ -120,6 +124,48 @@ def _checkpoint(record: WorkloadRecord, landed_capacity_class: ApiCapacityClass 
     )
 
 
+def _pool_choices(
+    required_labels: dict[str, str],
+) -> tuple[list[tuple[str, tuple[str, ...]]], tuple[tuple[tuple[str, str], ...], ...]]:
+    """Turn a cross-zone workload's pool pins into "one of" choices, in place.
+
+    Submission records a cross-zone workload as ``eyvan_pool`` (the first
+    choice), ``eyvan_pool_template`` (that pool's template) and the alternates
+    as a comma list -- and all three used to reach the scheduler as *required*
+    labels, matched by equality. No cell carries the alternates list, so such a
+    workload could not be placed anywhere, not even in its first-choice zone; and
+    an alternate's cells, whose template names another zone, could never have
+    matched the first choice's pin either. Found live on 2026-09-24: a four-zone
+    Spot v6e-4 fleet launched nothing at all.
+
+    The pool pin becomes "any candidate pool", with correlated pool/template
+    combinations -- never the Cartesian product of two independent label sets.
+    This refuses cells built from a different candidate pool's template. A workload stored before
+    the alternates' templates were recorded keeps its strict first-choice
+    template pin, so its first choice works again and nothing is loosened.
+    """
+
+    alternates_value = required_labels.pop(POOL_ALTERNATES_LABEL, "")
+    templates_value = required_labels.pop(POOL_ALTERNATE_TEMPLATES_LABEL, "")
+    alternates = [value.strip() for value in alternates_value.split(",") if value.strip()]
+    primary = required_labels.get(POOL_LABEL)
+    if not alternates or primary is None:
+        return [], ()
+    pools = tuple(dict.fromkeys((primary, *alternates)))
+    required_labels.pop(POOL_LABEL)
+    choices: list[tuple[str, tuple[str, ...]]] = [(POOL_LABEL, pools)]
+    templates = [value.strip() for value in templates_value.split(",") if value.strip()]
+    primary_template = required_labels.get(POOL_TEMPLATE_LABEL)
+    if primary_template is not None and len(templates) == len(alternates):
+        required_labels.pop(POOL_TEMPLATE_LABEL)
+        combinations = tuple(
+            ((POOL_LABEL, pool), (POOL_TEMPLATE_LABEL, template))
+            for pool, template in zip((primary, *alternates), (primary_template, *templates), strict=True)
+        )
+        return choices, combinations
+    return choices, ()
+
+
 def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None) -> WorkloadSpec:
     """Convert one persisted workload without sharing mutable API types."""
 
@@ -130,6 +176,13 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         **({"region": spec.region} if spec.region else {}),
         **({"accelerator_type": spec.accelerator_type} if spec.accelerator_type else {}),
     }
+    pool_choices, pool_combinations = _pool_choices(required_labels)
+    if pool_choices:
+        # The candidate pools are named outright, and each carries its own
+        # region. Keeping the first choice's region as a required label
+        # refused every alternate in another region -- a europe-west4 first
+        # choice could never race us-east1 (seen live, 2026-09-24).
+        required_labels.pop("region", None)
     if spec.placement is PlacementMode.ELASTIC:
         # The exact-shape pin, dropped: elastic workloads pack cells of any
         # worker count up to the request, and the pin lives in the elastic path
@@ -151,10 +204,15 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
     ):
         if choices:
             allowed_label_values.append((label, choices))
+    allowed_label_values.extend(pool_choices)
     if policy is not None:
         if not spec.provider and policy.allowed_providers:
             allowed_label_values.append(("provider", policy.allowed_providers))
-        if not spec.region and not spec.allowed_regions and policy.allowed_regions:
+        # A cross-zone workload has had its region pin dropped (its candidate
+        # pools may span regions), so the spec's region no longer stands in for
+        # the policy check it used to satisfy: apply the policy directly.
+        region_pinned = bool(spec.region) and not pool_choices
+        if not region_pinned and not spec.allowed_regions and policy.allowed_regions:
             allowed_label_values.append(("region", policy.allowed_regions))
     denied_label_values = (
         (("accelerator_type", policy.denied_accelerator_types),)
@@ -180,6 +238,7 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         required_labels=tuple(required_labels.items()),
         preferred_labels=tuple(spec.preferred_labels.items()),
         allowed_label_values=tuple(allowed_label_values),
+        allowed_label_combinations=pool_combinations,
         denied_label_values=denied_label_values,
         preferred_cells=spec.preferred_cells,
         # The portfolio, not the single requested class. The core scheduler has

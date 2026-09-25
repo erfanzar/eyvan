@@ -931,6 +931,29 @@ def test_create_classifies_explicit_gcp_queue_admission_permission_denial() -> N
     assert error.value.code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
 
 
+def test_create_classifies_a_zone_without_a_queue_for_the_type_as_denied() -> None:
+    """GCP's INVALID_ARGUMENT for a zone with no queue for this type is as final
+    as a permission denial: no retry of the same request can be admitted."""
+
+    def runner(args):
+        if "describe" in args:
+            return result(1, stderr="NOT_FOUND: queued resource does not exist")
+        if "create" in args:
+            return result(
+                1,
+                stderr=(
+                    "INVALID_ARGUMENT: Cloud TPU received an invalid argument. Queueing is not supported "
+                    'for accelerator type "v5litepod-8" in location europe-west3-c.'
+                ),
+            )
+        raise AssertionError(tuple(args))
+
+    with pytest.raises(GcloudQueueAdmissionDeniedError, match="Queueing is not supported") as error:
+        GcloudTpuProvider(runner=runner).create(spec(), qr_id="cell-a-r1")
+
+    assert error.value.code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
+
+
 def test_create_keeps_generic_permission_denial_as_provider_error() -> None:
     def runner(args):
         if "describe" in args:

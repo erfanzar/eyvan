@@ -452,3 +452,50 @@ def test_opting_out_of_gitignore_ships_the_ignored_files(tmp_path) -> None:
     names = _arcnames(build_workspace(tmp_path, respect_gitignore=False))
 
     assert "generated/weights.txt" in names
+
+
+def test_an_ignored_workspace_requires_explicit_gitignore_opt_out(tmp_path) -> None:
+    """An ignored root must not bypass nested exclusions without consent."""
+
+    (tmp_path / "train.py").write_text("print('hi')", encoding="utf-8")
+    _git_repo(tmp_path, "experiments/\n")
+    root = tmp_path / "experiments" / "run-1"
+    (root / "lib").mkdir(parents=True)
+    (root / "lib" / "__init__.py").write_text("VALUE = 1", encoding="utf-8")
+    (root / ".env").write_text("API_KEY=super-secret", encoding="utf-8")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "lib.cpython-311.pyc").write_bytes(b"\0")
+
+    (root / ".gitignore").write_text("tokens.txt\nprivate-config.json\n", encoding="utf-8")
+    (root / "tokens.txt").write_text("not-a-real-token", encoding="utf-8")
+    (root / "private-config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match=r"repository ignores.*respect_gitignore=False"):
+        build_workspace(root)
+
+    names = _arcnames(build_workspace(root, respect_gitignore=False))
+    assert names == {".gitignore", "lib/__init__.py", "tokens.txt", "private-config.json"}, names
+
+
+def test_ignore_rules_inside_a_shipped_root_still_apply(tmp_path) -> None:
+    """Git's nested exclusions still apply inside a non-ignored root."""
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "train.py").write_text("print('hi')", encoding="utf-8")
+    (root / "outputs").mkdir()
+    (root / "outputs" / "metrics.json").write_text("{}", encoding="utf-8")
+    _git_repo(root, "outputs/\n")
+
+    assert _arcnames(build_workspace(root)) == {".gitignore", "train.py"}
+
+
+def test_a_root_whose_every_file_is_excluded_says_so(tmp_path) -> None:
+    """ "No packageable files" beside files on disk sent the user looking for a missing file."""
+
+    (tmp_path / ".env").write_text("API_KEY=super-secret", encoding="utf-8")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "x.pyc").write_bytes(b"\0")
+
+    with pytest.raises(WorkspaceError, match=r"has 2 file\(s\) on disk but none is packageable"):
+        build_workspace(tmp_path)

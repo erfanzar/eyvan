@@ -128,6 +128,15 @@ The complete worked shape is
 
 `TpuConfig(dependencies=("flax",))` installs packages on the cell before
 the callable loads — adding a library should not mean rebuilding an image.
+The job gets its own environment, built from the worker's interpreter and
+layered over the worker's environment (`/opt/eyvan-native/venv`: Eyvan, JAX,
+libtpu) and the host's system packages, so a package it pins wins and
+everything else resolves to what the cell already has. Environments are cached
+per requirement set and interpreter in `/var/lib/eyvan/runtime-envs`, which the
+bootstrap creates for the workload user, so a second job or rank using the same
+interpreter reuses the install. The cache identity includes the format version,
+resolved interpreter path, Python version, and inherited parent site-packages
+paths. Older cache entries remain untouched for jobs that may still use them.
 `@execute(..., workspace="src/")` ships a source tree to the worker's
 working directory for the callable to import.
 

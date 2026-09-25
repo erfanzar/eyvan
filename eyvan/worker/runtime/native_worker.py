@@ -427,6 +427,19 @@ def create_native_worker_app(
             path=result.path,
         )
 
+    @app.exception_handler(ValueError)
+    async def invalid_request_handler(_request: Request, exc: ValueError) -> JSONResponse:
+        """Refuse a request the executor rejected as invalid, rather than crash on it.
+
+        The executor validates a launch by raising ``ValueError`` ("... must not
+        contain a newline"). Unhandled, that was a 500, which every caller up the
+        chain reads as a transient fault: a dispatch the worker could never
+        accept was retried for ever, with the reason visible only in this host's
+        journal (2026-09-24). The same code the cell agent uses for the same case.
+        """
+
+        return JSONResponse(status_code=400, content={"detail": str(exc), "code": "invalid_configuration"})
+
     @app.post("/api/v1/workloads", dependencies=[Depends(authenticate)])
     def submit(body: WorkloadRequest) -> WorkloadReference:
         metadata = body.spec.get("metadata")

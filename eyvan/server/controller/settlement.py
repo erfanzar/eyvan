@@ -42,6 +42,7 @@ from eyvan.records import (
     OutboxRecord,
     WorkloadRecord,
     WorkloadState,
+    candidate_pool_templates,
     utcnow,
 )
 from eyvan.server.controller._support import (
@@ -748,6 +749,21 @@ class _ControllerSettlement:
         """
 
         spec = workload.spec
+        candidates = candidate_pool_templates(spec.required_labels)
+        if candidates:
+            # A workload pinned to pools can only ever use those pools. Judging
+            # it by "any enabled pool of this shape and region" kept a
+            # single-pool workload PENDING forever beside an unrelated fleet's
+            # identical pool, and let two candidates that had *both* denied it
+            # each vouch for the other. Seen live on 2026-09-24.
+            denied = {denied_cell.pool_id}
+            denied.update(
+                cell.pool_id
+                for cell in await transaction.list_cells_for_autoscale_request(workload.id)
+                if cell.provider_failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
+            )
+            enabled = {pool.id for pool in await transaction.list_capacity_pools() if pool.enabled}
+            return any(pool_id in enabled and pool_id not in denied for pool_id in candidates)
         classes = {entry.value for entry in spec.capacity_class_portfolio}
         accelerators = set(spec.allowed_accelerator_types) | (
             {spec.accelerator_type} if spec.accelerator_type else set()

@@ -107,3 +107,29 @@ def test_an_unreadable_record_summarises_to_nothing_rather_than_guessing() -> No
 
     assert render("not a record") == ()
     assert render(None) == ()
+
+
+def test_a_cross_zone_request_is_not_reported_as_its_first_choice() -> None:
+    """Found live 2026-09-24: "placed on europe-west4-b" for a job in us-central1-a.
+
+    With alternates the first-choice pool is where the request starts, and its
+    region binds nothing; the scheduler may lease any candidate.
+    """
+
+    record = {
+        "id": "wl-x",
+        "state": "running",
+        "spec": {
+            "region": "europe-west4",
+            "metadata": {
+                "eyvan_pool": "spot-all-v5p8-v5p8-europe-west4-b",
+                "eyvan_pool_alternates": "spot-all-v5p8-v5p8-us-central1-a,spot-all-v5p8-v5p8-us-east5-a",
+            },
+        },
+    }
+
+    text = _rendered(record)
+
+    assert "placed on" not in text
+    assert "requested   spot-all-v5p8-v5p8-europe-west4-b or 2 alternate pool(s)" in text
+    assert "region" not in text

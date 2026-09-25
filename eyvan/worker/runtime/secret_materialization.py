@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import http.client
 import re
+import ssl
 import time
 import typing as tp
 import urllib.error
 import urllib.request
 
+from eyvan._internal.plane_tls import control_plane_urlopen_options
 from eyvan.secrets import MAX_SECRET_BYTES
 from eyvan.worker.distributed_environment import is_runtime_owned_environment_name
 from eyvan.worker.runtime.http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay
@@ -80,7 +82,16 @@ def materialize_secrets(
     count = _count(environment)
     if not count:
         return {}
-    resolve = fetch or _fetch
+    if fetch is not None:
+        resolve = fetch
+    else:
+        # The redemption runs in the native worker, before the job exists, so the
+        # plane's CA is read from the job's environment rather than this process's.
+        options = control_plane_urlopen_options(environment)
+
+        def resolve(url: str, token: str) -> bytes:
+            return _fetch(url, token, options=options)
+
     resolved: dict[str, str] = {}
     for index in range(count):
         name = environment.get(f"EYVAN_SECRET_{index}_NAME", "")
@@ -162,7 +173,7 @@ def _count(environment: tp.Mapping[str, str]) -> int:
     return count
 
 
-def _fetch(url: str, token: str) -> bytes:
+def _fetch(url: str, token: str, *, options: tp.Mapping[str, ssl.SSLContext] | None = None) -> bytes:
     """Redeem one capability, retrying only what is worth retrying.
 
     A 403 is the control plane saying this attempt is over; retrying it delays a
@@ -173,7 +184,7 @@ def _fetch(url: str, token: str) -> bytes:
     request = urllib.request.Request(url, method="GET", headers={"X-Eyvan-Secret-Token": token})
     for attempt in range(HTTP_ATTEMPTS):
         try:
-            with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
+            with urllib.request.urlopen(request, timeout=_TIMEOUT_S, **(options or {})) as response:
                 payload = response.read(_MAX_SECRET_BYTES + 1)
                 if len(payload) > _MAX_SECRET_BYTES:
                     # Never turn an oversized credential into a different,

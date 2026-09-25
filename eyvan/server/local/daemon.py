@@ -197,6 +197,9 @@ class LocalDaemonRecord:
     endpoint: ControlPlaneEndpoint
     pid: int
     runtime_profile_path: str | None = None
+    #: The source digest of the build this plane was launched from. The cell
+    #: agent is judged against it, not against whichever CLI happens to run.
+    source_digest: str | None = None
 
     def as_json(self) -> JsonObject:
         """Encode the record without any non-JSON values."""
@@ -204,6 +207,8 @@ class LocalDaemonRecord:
         document: JsonObject = {"endpoint": self.endpoint.url, "pid": self.pid}
         if self.runtime_profile_path is not None:
             document["runtime_profile_path"] = self.runtime_profile_path
+        if self.source_digest is not None:
+            document["source_digest"] = self.source_digest
         return document
 
     @classmethod
@@ -213,6 +218,7 @@ class LocalDaemonRecord:
         endpoint_value = value.get("endpoint")
         pid = value.get("pid")
         runtime_profile_path = value.get("runtime_profile_path")
+        source_digest = value.get("source_digest")
         if (
             not isinstance(endpoint_value, str)
             or isinstance(pid, bool)
@@ -225,7 +231,12 @@ class LocalDaemonRecord:
             endpoint = ControlPlaneEndpoint.parse(endpoint_value)
         except ValueError:
             return None
-        return cls(endpoint=endpoint, pid=pid, runtime_profile_path=runtime_profile_path)
+        return cls(
+            endpoint=endpoint,
+            pid=pid,
+            runtime_profile_path=runtime_profile_path,
+            source_digest=source_digest if isinstance(source_digest, str) else None,
+        )
 
 
 def runtime_profile_identifier(path: Path | None) -> str | None:
@@ -471,6 +482,69 @@ def read_owner_only_record(path: Path) -> LocalDaemonRecord | None:
     if not is_json_object(value):
         return None
     return LocalDaemonRecord.from_json(value)
+
+
+def _serving_record(
+    endpoint: str | ControlPlaneEndpoint,
+    paths: LocalDaemonPaths | None,
+) -> LocalDaemonRecord | None:
+    """Return the owner-only record of a live, Eyvan-owned plane at ``endpoint``."""
+
+    configured_endpoint = ControlPlaneEndpoint.parse(endpoint)
+    target = LocalDaemonTarget.from_endpoint(configured_endpoint)
+    if target is None:
+        return None
+    try:
+        record = read_owner_only_record((paths or LocalDaemonPaths()).record_path(target))
+    except (LocalDaemonError, OSError):
+        return None
+    if record is None or record.endpoint != configured_endpoint or not process_is_alive(record.pid):
+        return None
+    return record
+
+
+def serving_runtime_profile_path(
+    endpoint: str | ControlPlaneEndpoint,
+    *,
+    paths: LocalDaemonPaths | None = None,
+) -> Path | None:
+    """Return the runtime profile a live, Eyvan-owned loopback plane was started with.
+
+    ``eyvan runtime deploy --profile PATH`` starts a plane under a profile other
+    than the default, and records which one in the plane's owner-only PID
+    record. Every later client on this machine -- the SDK's ``init()``, doctor --
+    must follow that record rather than assume the default path: assuming it
+    made ``init()`` refuse the very plane the operator had just deployed, and
+    its advice ("restart the control plane") would have replaced that plane with
+    one bound to a different project.
+
+    Only a record naming this exact endpoint, a live PID, and a profile is an
+    answer. Anything else is ``None`` and callers keep their default.
+    """
+
+    record = _serving_record(endpoint, paths)
+    if record is None or record.runtime_profile_path is None:
+        return None
+    return Path(record.runtime_profile_path)
+
+
+def serving_source_digest(
+    endpoint: str | ControlPlaneEndpoint,
+    *,
+    paths: LocalDaemonPaths | None = None,
+) -> str | None:
+    """Return the build a live, Eyvan-owned loopback plane was launched from.
+
+    The plane stages the worker wheel, so it -- not the CLI that happens to be
+    running -- is the build its cell agent must match. Judged against the CLI,
+    an ``eyvan up`` from an edited tree replaced the agent alone; the plane and
+    the staged wheel stayed on the old build, and the plane recycled every new
+    cell as stale, including a freshly granted Spot v6e-16 (2026-09-24).
+    ``None`` for a plane that predates the record field, or none at all.
+    """
+
+    record = _serving_record(endpoint, paths)
+    return None if record is None else record.source_digest
 
 
 def clear_owner_only_record(path: Path, *, pid: int) -> None:
@@ -822,14 +896,19 @@ class LocalDaemonSupervisor:
                     f"starting, under runtime profile {claimed.runtime_profile_path}",
                 )
             try:
-                write_owner_only_record(
-                    record_path,
-                    LocalDaemonRecord(
-                        endpoint=configured_endpoint,
-                        pid=process.pid,
-                        runtime_profile_path=profile_identifier,
-                    ),
-                )
+                # A record already published by this child is authoritative,
+                # including its independently computed source digest. The parent
+                # cannot vouch for the child's build from its own cached identity.
+                if claimed is None or claimed.pid != process.pid:
+                    write_owner_only_record(
+                        record_path,
+                        LocalDaemonRecord(
+                            endpoint=configured_endpoint,
+                            pid=process.pid,
+                            runtime_profile_path=profile_identifier,
+                            source_digest=None,
+                        ),
+                    )
             except BaseException:
                 stop_owned_process(process)
                 raise
@@ -1223,6 +1302,8 @@ __all__ = (
     "require_owner_only_record_file",
     "require_owner_only_regular_file",
     "runtime_profile_identifier",
+    "serving_runtime_profile_path",
+    "serving_source_digest",
     "stop_owned_process",
     "stop_verified_process",
     "write_owner_only_record",

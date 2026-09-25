@@ -94,10 +94,6 @@ def _isolated_runtime_profile(tmp_path, monkeypatch) -> None:
     the machine running it has staged or has running.
     """
 
-    monkeypatch.setattr(
-        "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
-        str(tmp_path / "no-runtime-profile.json"),
-    )
     # Whether *this* machine happens to be running a stale control plane must
     # not decide a test's outcome either.
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())

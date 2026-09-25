@@ -9,6 +9,7 @@ from eyvan.server.service._control_plane.shared import (
     CALLABLE_SIGNING_KEY_ENV,
     DEFAULT_MAX_RETRIES,
     MAX_GCP_TPU_MULTISLICE_WORKERS,
+    POOL_ALTERNATE_TEMPLATES_LABEL,
     POOL_ALTERNATES_LABEL,
     REMOTE_CALLABLE_SIGNATURE_ERROR,
     REMOTE_CALLABLE_SIGNING_KEY_ERROR,
@@ -221,6 +222,7 @@ class CallableSubmissionMixin:
                     "exactly one, or make them match to use them as cross-zone alternates."
                 )
             alternate_pool_ids = tuple(candidate.id for candidate in interchangeable)
+            alternate_pool_templates = tuple(candidate.template_fingerprint for candidate in interchangeable)
             if pool.max_cells == 0:
                 raise ConflictError(
                     f"TPU accelerator type {accelerator_type!r} in fleet {fleet_name!r} has max_workers set to zero"
@@ -275,6 +277,7 @@ class CallableSubmissionMixin:
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
                 alternate_pool_ids=alternate_pool_ids,
+                alternate_pool_templates=alternate_pool_templates,
                 name=name if name is not None else f"{fleet_name}/{accelerator_type}",
                 execution=execution,
                 environment=dict(environment or {}),
@@ -490,6 +493,7 @@ class CallableSubmissionMixin:
         dependencies: tuple[str, ...] = (),
         alternate_pool_ids: tuple[str, ...] = (),
         placement: PlacementMode = PlacementMode.ATOMIC,
+        alternate_pool_templates: tuple[str, ...] = (),
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
 
@@ -512,6 +516,8 @@ class CallableSubmissionMixin:
             # cold, which is the difference between a job that waits on one zone
             # and a job that goes where the capacity is.
             pool_labels[POOL_ALTERNATES_LABEL] = ",".join(alternate_pool_ids)
+            if len(alternate_pool_templates) == len(alternate_pool_ids):
+                pool_labels[POOL_ALTERNATE_TEMPLATES_LABEL] = ",".join(alternate_pool_templates)
         required_labels = {**pool_labels, WORKER_COUNT_LABEL: str(worker_count)}
         return WorkloadDefinition(
             name=name,

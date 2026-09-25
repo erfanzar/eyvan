@@ -246,6 +246,7 @@ export function FleetPage({
                 <dd>
                   {pool.warm_cells}/{pool.floor} held{pool.window_active ? ", window active" : ""}
                   {pool.warm_idle_cells ? `, ${pool.warm_idle_cells} idle` : ""}
+                  {pool.provisioning_cells ? `, ${pool.provisioning_cells} provisioning` : ""}
                 </dd>
               </div>
             ))}

@@ -681,3 +681,43 @@ def test_the_native_worker_builds_its_staging_executor_from_its_own_environment(
     assert staged.verdict is AssetStageVerdict.OK
     assert Path(staged.path or "").read_bytes() == payload
     assert Path(staged.path or "").is_relative_to((tmp_path / "declared-disk").resolve())
+
+
+def test_a_launch_the_worker_rejects_is_a_value_error_not_a_server_fault(tmp_path) -> None:
+    """Found live 2026-09-24: a rejected launch was a 500, which reads as transient.
+
+    The worker's validator refused an environment value with a newline; with no
+    handler that became a 500, the cell agent passed on another 500, and the
+    plane retried the dispatch for twenty minutes. The worker now answers 400
+    ``invalid_configuration`` and the client raises the ValueError it was, so the
+    agent's existing handler carries the verdict to the plane.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from eyvan.worker.runtime.native_worker import create_native_worker_app
+
+    class RejectingExecutor:
+        """Rejects every launch the way the systemd executor rejects a newline."""
+
+        def submit(self, spec_document, context):
+            del spec_document, context
+            raise ValueError("native-systemd environment variable 'EXAMPLE' must not contain a newline")
+
+    app = create_native_worker_app(RejectingExecutor(), secret="worker-test-secret")  # type: ignore[arg-type]
+    invalid = spec(command("print(1)"), submission_id="refused")
+    with TestClient(app) as worker_http:
+        response = worker_http.post(
+            "/api/v1/workloads",
+            headers={"Authorization": "Bearer worker-test-secret"},
+            json={
+                "mutation": {"idempotency_key": "refused", "generation": 1, "fencing_token": "fence"},
+                "spec": invalid,
+            },
+        )
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_configuration"
+
+        native = NativeRemoteExecutor("http://testserver", secret="worker-test-secret", client=worker_http)
+        with pytest.raises(ValueError, match="must not contain a newline"):
+            native.submit(invalid, MutationContext(idempotency_key="refused-2", generation=1, fencing_token="fence"))

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import typing as tp
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from pydantic import ValidationError
 from eyvan._internal.build_identity import build_identity
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.providers.gcp.runtime.profile import (
+    DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH,
     GcpNativeRuntimeProfile,
     GcpNativeRuntimeProfileError,
     GcpNativeRuntimeProfileStore,
@@ -49,6 +51,8 @@ from eyvan.server.local.daemon import (
     owner_only_startup_lock,
     process_is_alive,
     read_owner_only_record,
+    serving_runtime_profile_path,
+    serving_source_digest,
     stop_owned_process,
     stop_verified_process,
     write_owner_only_record,
@@ -167,7 +171,13 @@ class LocalAgentResult:
 class NativeGcpCellAgentSupervisor(tp.Protocol):
     """Private cell-agent supervision required by the native GCP runtime."""
 
-    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+    def ensure(
+        self,
+        profile_path: Path,
+        profile: GcpNativeRuntimeProfile,
+        *,
+        reference_digest: str | None = None,
+    ) -> LocalAgentResult:
         """Start or reuse the authenticated agent for one selected profile."""
 
         ...
@@ -352,23 +362,35 @@ class LocalAgentSupervisor:
         if LocalDaemonTarget.from_endpoint(self.endpoint) is None:
             raise ValueError("local GCP cell agent endpoint must be literal HTTP loopback")
 
-    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+    def ensure(
+        self,
+        profile_path: Path,
+        profile: GcpNativeRuntimeProfile,
+        *,
+        reference_digest: str | None = None,
+    ) -> LocalAgentResult:
         """Start the profile's local agent or reuse its authenticated capability contract.
 
-        Reuse requires the running agent to be *this build*: a compatible
-        agent compiled from older code is replaced (when this process owns it)
-        rather than silently reused. Code fixes that never reach a long-lived
-        daemon have marooned cells before -- a supervisor that re-verifies
-        only profile and secret would have kept reusing the very agent an
-        operator just fixed (observed 2026-08-22).
+        Reuse requires the running agent to be *the runtime's build*: a
+        compatible agent compiled from other code is replaced (when this
+        process owns it) rather than silently reused. Code fixes that never
+        reach a long-lived daemon have marooned cells before -- a supervisor
+        that re-verifies only profile and secret would have kept reusing the
+        very agent an operator just fixed (observed 2026-08-22).
+
+        ``reference_digest`` is that build: the one the serving control plane
+        was launched from, which is also the build it stages for workers.
+        Without it the caller's own build is the reference, as before.
         """
 
         expanded_profile_path, profile_id = self._prepared_profile(profile_path, profile)
         target = self._target()
         record_path = self.paths.agent_record_path(target)
         log_path = self.paths.agent_log_path(target)
-        self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, target)
-        existing = self._existing_result(profile, profile_id, record_path, log_path)
+        self._replace_agent_running_stale_code(
+            profile, profile_id, record_path, log_path, target, reference_digest=reference_digest
+        )
+        existing = self._existing_result(profile, profile_id, record_path, log_path, reference_digest=reference_digest)
         if existing is not None:
             return existing
 
@@ -377,8 +399,12 @@ class LocalAgentSupervisor:
             # supervisor running older code can relaunch a stale agent in
             # exactly the rolling-upgrade window this check exists for, so the
             # check is repeated before anything is reused or started.
-            self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, target)
-            existing = self._existing_result(profile, profile_id, record_path, log_path)
+            self._replace_agent_running_stale_code(
+                profile, profile_id, record_path, log_path, target, reference_digest=reference_digest
+            )
+            existing = self._existing_result(
+                profile, profile_id, record_path, log_path, reference_digest=reference_digest
+            )
             if existing is not None:
                 return existing
             return self._start_locked(
@@ -388,6 +414,7 @@ class LocalAgentSupervisor:
                 profile_id=profile_id,
                 record_path=record_path,
                 log_path=log_path,
+                reference_digest=reference_digest,
             )
 
     def restart(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
@@ -510,9 +537,16 @@ class LocalAgentSupervisor:
         profile_id: str,
         record_path: Path,
         log_path: Path,
+        reference_digest: str | None = None,
     ) -> LocalAgentResult:
         """Launch and authenticate a fresh agent while holding its owner-only startup lock."""
 
+        caller_digest = build_identity().source_digest
+        if reference_digest is not None and caller_digest is not None and reference_digest != caller_digest:
+            raise LocalAgentConfigurationError(
+                "the serving control plane and this process run different builds; "
+                "run 'eyvan runtime deploy --yes' to replace them together"
+            )
         command = LocalAgentCommand(
             target=target,
             log_path=log_path,
@@ -534,32 +568,44 @@ class LocalAgentSupervisor:
         except BaseException:
             stop_owned_process(process)
             raise
-        return self._wait_for_ready(process, profile, record_path, log_path)
+        return self._wait_for_ready(process, profile, record_path, log_path, reference_digest=reference_digest)
 
-    def _agent_runs_different_code(self, profile: GcpNativeRuntimeProfile) -> bool:
+    def _agent_runs_different_code(
+        self,
+        profile: GcpNativeRuntimeProfile,
+        *,
+        reference_digest: str | None = None,
+    ) -> bool:
         """Return True only when the live agent provably runs a different build.
 
         An unknowable identity (route absent, digest uncomputable on either
         side) never counts as different, matching the replacement policy below.
         """
 
-        return self._agent_digest_skew(profile) is not None
+        return self._agent_digest_skew(profile, reference_digest=reference_digest) is not None
 
-    def _agent_digest_skew(self, profile: GcpNativeRuntimeProfile) -> tuple[str, str] | None:
-        """Return ``(running, this-process)`` digests when they provably differ.
+    def _agent_digest_skew(
+        self,
+        profile: GcpNativeRuntimeProfile,
+        *,
+        reference_digest: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Return ``(running, reference)`` digests when they provably differ.
 
-        An unknowable identity (route absent, digest uncomputable on either
-        side) returns ``None``: it never counts as different.
+        The reference is ``reference_digest`` when the caller knows the
+        runtime's build, else this process's own. An unknowable identity (route
+        absent, digest uncomputable on either side) returns ``None``: it never
+        counts as different.
         """
 
         probe = self.build_probe
         remote = probe(self.endpoint, profile.agent_shared_secret) if probe is not None else None
         if remote is None or remote.source_digest is None:
             return None
-        current = build_identity()
-        if current.source_digest is None or current.source_digest == remote.source_digest:
+        reference = reference_digest or build_identity().source_digest
+        if reference is None or reference == remote.source_digest:
             return None
-        return remote.source_digest, current.source_digest
+        return remote.source_digest, reference
 
     def _replace_agent_running_stale_code(
         self,
@@ -568,15 +614,17 @@ class LocalAgentSupervisor:
         record_path: Path,
         log_path: Path,
         target: LocalDaemonTarget,
+        *,
+        reference_digest: str | None = None,
     ) -> None:
-        """Stop a profile-owned agent whose build identity differs from this process.
+        """Stop a profile-owned agent whose build identity differs from the runtime's.
 
         An agent this process does not own is refused loudly instead of stopped,
         pointing the operator at the restart command that validates ownership
         the same way.
         """
 
-        skew = self._agent_digest_skew(profile)
+        skew = self._agent_digest_skew(profile, reference_digest=reference_digest)
         if skew is None:
             return
         remote_digest, current_digest = skew
@@ -607,6 +655,8 @@ class LocalAgentSupervisor:
         profile_id: str,
         record_path: Path,
         log_path: Path,
+        *,
+        reference_digest: str | None = None,
     ) -> LocalAgentResult | None:
         """Return a compatible authenticated agent or reject a conflicting live process."""
 
@@ -618,7 +668,9 @@ class LocalAgentSupervisor:
                     raise LocalAgentConfigurationError(
                         f"the local Eyvan cell agent at {self.endpoint.url} is running with a different runtime profile"
                     )
-                return self._wait_for_existing_agent(profile, profile_id, record, record_path, log_path)
+                return self._wait_for_existing_agent(
+                    profile, profile_id, record, record_path, log_path, reference_digest=reference_digest
+                )
             return None
         self._validate_capabilities(capabilities)
         if record is None or record.endpoint != self.endpoint or not self.process_liveness(record.pid):
@@ -630,12 +682,14 @@ class LocalAgentSupervisor:
             raise LocalAgentConfigurationError(
                 f"the local Eyvan cell agent at {self.endpoint.url} is running with a different runtime profile"
             )
-        if self._agent_runs_different_code(profile):
+        if self._agent_runs_different_code(profile, reference_digest=reference_digest):
             # Re-verify the build identity before handing the agent back: a
             # supervisor running older code can relaunch a stale agent between
             # the pre-lock digest probe and this lock, and reusing it would
             # defeat the rolling-upgrade check entirely.
-            self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, self._target())
+            self._replace_agent_running_stale_code(
+                profile, profile_id, record_path, log_path, self._target(), reference_digest=reference_digest
+            )
             return None
         return LocalAgentResult(
             endpoint=self.endpoint,
@@ -652,6 +706,8 @@ class LocalAgentSupervisor:
         record: LocalDaemonRecord,
         record_path: Path,
         log_path: Path,
+        *,
+        reference_digest: str | None = None,
     ) -> LocalAgentResult | None:
         """Wait for another supervisor's owned matching agent instead of racing a second bind.
 
@@ -665,8 +721,10 @@ class LocalAgentSupervisor:
             capabilities = self.capability_probe(self.endpoint, profile.agent_shared_secret)
             if capabilities is not None:
                 self._validate_capabilities(capabilities)
-                if self._agent_runs_different_code(profile):
-                    self._replace_agent_running_stale_code(profile, profile_id, record_path, log_path, self._target())
+                if self._agent_runs_different_code(profile, reference_digest=reference_digest):
+                    self._replace_agent_running_stale_code(
+                        profile, profile_id, record_path, log_path, self._target(), reference_digest=reference_digest
+                    )
                     return None
                 return LocalAgentResult(
                     endpoint=self.endpoint,
@@ -693,14 +751,23 @@ class LocalAgentSupervisor:
         profile: GcpNativeRuntimeProfile,
         record_path: Path,
         log_path: Path,
+        *,
+        reference_digest: str | None = None,
     ) -> LocalAgentResult:
-        """Wait for the started process to pass its authenticated native GCP capability probe."""
+        """Wait for authenticated capabilities and a non-conflicting build identity."""
 
         deadline = self.clock() + self.startup_timeout_s
         while True:
             capabilities = self.capability_probe(self.endpoint, profile.agent_shared_secret)
             if capabilities is not None:
                 self._validate_capabilities(capabilities)
+                if self._agent_runs_different_code(profile, reference_digest=reference_digest):
+                    stop_owned_process(process)
+                    clear_owner_only_record(record_path, pid=process.pid)
+                    raise LocalAgentConfigurationError(
+                        "the started cell agent runs a different build from the runtime; "
+                        "run 'eyvan runtime deploy --yes' to replace them together"
+                    )
                 return LocalAgentResult(
                     endpoint=self.endpoint,
                     state=LocalAgentState.STARTED,
@@ -806,6 +873,19 @@ class GcpNativeRuntimeSupervisor:
     control_plane: LocalControlPlaneSupervisor = field(default_factory=LocalDaemonSupervisor)
     agent: NativeGcpCellAgentSupervisor = field(default_factory=LocalAgentSupervisor)
 
+    @classmethod
+    def for_endpoint(cls, endpoint: str | ControlPlaneEndpoint) -> GcpNativeRuntimeSupervisor:
+        """Supervise with the profile the plane at ``endpoint`` already serves, else the default.
+
+        A plane started by ``eyvan runtime deploy --profile PATH`` records that
+        path. Ensuring it with the default profile instead refused it as
+        "running with a different runtime profile", so every command after the
+        deploy -- ``eyvan up``, the SDK's ``init()`` -- failed against the plane
+        the operator had just started.
+        """
+
+        return cls(profile_store=GcpNativeRuntimeProfileStore(runtime_profile_path_for(endpoint)))
+
     def ensure(self, endpoint: str | ControlPlaneEndpoint) -> GcpRuntimeResult:
         """Load one profile, then start/reuse its API and authenticated cell agent."""
 
@@ -836,7 +916,20 @@ class GcpNativeRuntimeSupervisor:
                 f"{exc}. Restart the locally supervised Eyvan control plane, then retry the native GCP command"
             ) from exc
         try:
-            agent = self.agent.ensure(self.profile_store.path, profile)
+            serving = serving_source_digest(configured_endpoint)
+            caller = build_identity().source_digest
+            if serving is not None and caller is not None and serving != caller:
+                # Replacing only the agent here split a runtime in two: agent on
+                # the new build, plane and staged worker wheel on the old one,
+                # and every new cell recycled as stale. The runtime moves as one.
+                warnings.warn(
+                    f"this Eyvan ({caller[:12]}) differs from the local runtime it is using "
+                    f"({serving[:12]}); run 'eyvan runtime deploy --yes' to move the control plane, "
+                    "cell agent and worker package to it together",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            agent = self.agent.ensure(self.profile_store.path, profile, reference_digest=serving)
         except Exception as agent_error:
             if control_plane.state is LocalDaemonState.STARTED:
                 try:
@@ -850,17 +943,45 @@ class GcpNativeRuntimeSupervisor:
         return GcpRuntimeResult(profile=profile, control_plane=control_plane, agent=agent)
 
 
-def ensure_gcp_native_runtime(endpoint: str | ControlPlaneEndpoint) -> GcpRuntimeResult:
-    """Ensure the default private native GCP runtime for a literal loopback control plane."""
+def ensure_gcp_native_runtime(
+    endpoint: str | ControlPlaneEndpoint,
+    *,
+    profile_path: Path | None = None,
+) -> GcpRuntimeResult:
+    """Ensure a private native GCP runtime for a literal loopback control plane.
 
-    return GcpNativeRuntimeSupervisor().ensure(endpoint)
+    ``profile_path`` selects the profile the runtime must be serving; omitted,
+    it is the profile an already-running plane at ``endpoint`` was deployed
+    with, else the default ``~/.eyvan/gcp-native-runtime.json``.
+    """
+
+    if profile_path is None:
+        return GcpNativeRuntimeSupervisor.for_endpoint(endpoint).ensure(endpoint)
+    return GcpNativeRuntimeSupervisor(profile_store=GcpNativeRuntimeProfileStore(profile_path)).ensure(endpoint)
 
 
-def has_gcp_native_runtime_profile() -> bool:
-    """Return whether the current user has a valid private native GCP runtime profile."""
+def runtime_profile_path_for(endpoint: str | ControlPlaneEndpoint | None) -> Path:
+    """Return the profile the loopback plane at ``endpoint`` serves, else the default profile path."""
+
+    if endpoint is not None:
+        try:
+            serving = serving_runtime_profile_path(endpoint)
+        except ValueError:
+            serving = None
+        if serving is not None:
+            return serving
+    return DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
+
+
+def has_gcp_native_runtime_profile(endpoint: str | ControlPlaneEndpoint | None = None) -> bool:
+    """Return whether a valid private native GCP runtime profile applies to ``endpoint``.
+
+    That is the profile a running plane at ``endpoint`` serves, else the
+    current user's default profile.
+    """
 
     try:
-        GcpNativeRuntimeProfileStore().load()
+        GcpNativeRuntimeProfileStore(runtime_profile_path_for(endpoint)).load()
     except FileNotFoundError:
         return False
     except GcpNativeRuntimeProfileError as exc:
@@ -909,4 +1030,5 @@ __all__ = (
     "ensure_gcp_native_runtime",
     "has_gcp_native_runtime_profile",
     "requires_native_gcp_runtime",
+    "runtime_profile_path_for",
 )

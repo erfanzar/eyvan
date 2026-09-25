@@ -248,3 +248,26 @@ async def test_pools_are_reported_in_a_stable_order() -> None:
     report = await service.warmth_report(_admin(), now=_WORKDAY)
 
     assert [pool.pool_id for pool in report.pools] == ["research/a", "research/b", "research/c"]
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cell_is_provisioning_not_warm() -> None:
+    """Found live 2026-09-24: a Spot floor read as held before its request reached GCP.
+
+    The planner rightly counts an in-flight request as supply so it does not
+    launch twice. Warmth is a different question -- whether capacity is serving
+    -- and a proof that reads it must not pass on a request still in the queue.
+    """
+
+    service = await _service()
+    pool = _pool(windows=(_workday_window(2),))
+    ready = _cell("cell-a", pool)
+    requested = _cell("cell-b", pool).model_copy(update={"state": CellState.REGISTERING})
+    await _seed(service, pool, requested, ready)
+
+    report = await service.warmth_report(_admin(), now=_WORKDAY)
+
+    assert report.pools[0].floor == 2
+    assert report.pools[0].warm_cells == 1
+    assert report.pools[0].provisioning_cells == 1
+    assert report.pools[0].satisfied is False

@@ -17,6 +17,7 @@ from eyvan.artifacts import ArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.records import (
     CallableExecution,
+    PlacementMode,
     WorkloadProgress,
     WorkloadProgressPhase,
     WorkloadRecord,
@@ -83,6 +84,27 @@ def _attributed(prefix: str, line: str) -> Text:
 
 R = tp.TypeVar("R")
 _ATOMIC_ALLOCATION = "atomic allocation"
+
+
+def _allocation(placement: PlacementMode, cells: int) -> str:
+    """Name what the plane is asking the provider for, in the job's own allocation mode.
+
+    Every job used to be narrated as "one atomic allocation". An elastic job --
+    the default -- is satisfied cell by cell from warm and newly provisioned
+    slices, so that sentence described a request the plane was not making.
+    """
+
+    if placement is PlacementMode.ATOMIC:
+        return f"one {_ATOMIC_ALLOCATION}"
+    return "one elastic cell" if cells == 1 else f"{cells} elastic cells"
+
+
+def _allocation_requests(placement: PlacementMode, cells: int) -> str:
+    """Name the provider requests being sent, in the job's own allocation mode."""
+
+    if placement is PlacementMode.ATOMIC:
+        return f"one {_ATOMIC_ALLOCATION} request"
+    return "one elastic cell request" if cells == 1 else f"{cells} elastic cell requests"
 
 
 def _tpu_vm_count(count: int) -> str:
@@ -154,7 +176,7 @@ class _CallableProgressRenderer:
             return
         if self._queue_admission_recorder is not None:
             self._queue_admission_recorder.record_workload(workload)
-        self._emit(self._progress_update(progress))
+        self._emit(self._progress_update(progress, placement=workload.spec.placement))
         self._drain_output(workload.id)
 
     def _emit(self, update: JobLifecycleUpdate) -> None:
@@ -284,10 +306,16 @@ class _CallableProgressRenderer:
             return progress.failure_reason
         return progress.scheduling_reason
 
-    def _progress_update(self, progress: WorkloadProgress) -> JobLifecycleUpdate:
+    def _progress_update(
+        self,
+        progress: WorkloadProgress,
+        *,
+        placement: PlacementMode = PlacementMode.ATOMIC,
+    ) -> JobLifecycleUpdate:
         """Map an exhaustive control-plane phase to a terminal lifecycle update."""
 
         phase = progress.phase
+        allocation = _allocation(placement, progress.request.cells)
         required_workers = self._required_workers(progress)
         ready_workers = self._ready_workers(progress)
         diagnostic = self._diagnostic(progress)
@@ -297,13 +325,13 @@ class _CallableProgressRenderer:
             return JobLifecycleUpdate(
                 JobLifecycleState.REQUESTING,
                 scope,
-                f"{ready_workers} | requesting one {_ATOMIC_ALLOCATION}",
+                f"{ready_workers} | requesting {allocation}",
             )
         if phase is WorkloadProgressPhase.REQUESTING_CAPACITY:
             return JobLifecycleUpdate(
                 JobLifecycleState.REQUESTING,
                 scope,
-                f"{ready_workers} | sending one {_ATOMIC_ALLOCATION} request to GCP",
+                f"{ready_workers} | sending {_allocation_requests(placement, progress.request.cells)} to GCP",
             )
         if phase is WorkloadProgressPhase.WAITING_FOR_CAPACITY:
             waiting = progress.capacity.waiting_workers
@@ -315,7 +343,8 @@ class _CallableProgressRenderer:
         if phase is WorkloadProgressPhase.PROVISIONING:
             provisioning = progress.capacity.provisioning_workers
             if provisioning:
-                summary = f"{ready_workers} | GCP is provisioning the {_ATOMIC_ALLOCATION}"
+                provisioned = f"the {_ATOMIC_ALLOCATION}" if placement is PlacementMode.ATOMIC else allocation
+                summary = f"{ready_workers} | GCP is provisioning {provisioned}"
             else:
                 summary = ready_workers
             return JobLifecycleUpdate(JobLifecycleState.PROVISIONING, scope, summary)

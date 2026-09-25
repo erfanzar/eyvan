@@ -32,7 +32,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileError,
     GcpNativeRuntimeProfileStore,
 )
-from eyvan.capacity.providers.gcp.runtime.supervisor import ensure_gcp_native_runtime
+from eyvan.capacity.providers.gcp.runtime.supervisor import ensure_gcp_native_runtime, runtime_profile_path_for
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.identity import resolve_control_plane_identity
@@ -108,13 +108,24 @@ def _optional(value: str | None) -> str | None:
     return normalized if normalized else None
 
 
+def _runtime_profile_store(endpoint: ControlPlaneEndpoint) -> GcpNativeRuntimeProfileStore:
+    """Return the profile the loopback plane at ``endpoint`` serves, else the default one.
+
+    A plane started by ``eyvan runtime deploy --profile PATH`` records that
+    path; following the record is what lets ``init()`` use that plane instead
+    of refusing it for not serving the default profile.
+    """
+
+    return GcpNativeRuntimeProfileStore(runtime_profile_path_for(endpoint))
+
+
 def _configured_gcp_runtime_profile(endpoint: ControlPlaneEndpoint) -> GcpNativeRuntimeProfile | None:
     """Load the private GCP profile selected by a loopback execution context, if any."""
 
     if not endpoint.is_loopback:
         return None
     try:
-        return GcpNativeRuntimeProfileStore().load()
+        return _runtime_profile_store(endpoint).load()
     except FileNotFoundError:
         return None
     except GcpNativeRuntimeProfileError as exc:
@@ -129,7 +140,7 @@ def _prepared_gcp_runtime_profile(
 
     if profile is None:
         return None
-    return ensure_gcp_native_runtime(endpoint).profile
+    return ensure_gcp_native_runtime(endpoint, profile_path=_runtime_profile_store(endpoint).path).profile
 
 
 def _ensure_fleet_applied(client: tp.Any, fleet: str | None, cache_dir: Path | None) -> None:

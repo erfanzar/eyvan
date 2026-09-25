@@ -11,7 +11,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from eyvan._internal import workspace
+from eyvan._internal import plane_tls, workspace
 
 OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY = "/opt/eyvan-native/oci-callable-runner"
 """Read-only container path holding the staged callable runtime."""
@@ -22,6 +22,7 @@ OCI_CALLABLE_RUNNER_FILENAME = "eyvan_oci_callable_worker.py"
 OCI_CALLABLE_PROTOCOL_FILENAME = "callable_protocol.py"
 OCI_WORKSPACE_FILENAME = "workspace.py"
 OCI_HTTP_RETRY_FILENAME = "http_retry.py"
+OCI_PLANE_TLS_FILENAME = "plane_tls.py"
 """Shared protocol sources staged beside the OCI callable runner."""
 
 
@@ -98,6 +99,9 @@ def stage_oci_callable_runner(directory: str | os.PathLike[str]) -> Path:
         source_directory / OCI_HTTP_RETRY_FILENAME,
         destination_directory / OCI_HTTP_RETRY_FILENAME,
     )
+    # And the control-plane CA trust, so a containerized callable verifies a
+    # head's private CA exactly as a native one does. Stdlib-only by design.
+    _stage_file(Path(plane_tls.__file__).resolve(), destination_directory / OCI_PLANE_TLS_FILENAME)
     return runner_destination
 
 
@@ -106,5 +110,6 @@ __all__ = (
     "OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY",
     "OCI_CALLABLE_RUNNER_FILENAME",
     "OCI_HTTP_RETRY_FILENAME",
+    "OCI_PLANE_TLS_FILENAME",
     "stage_oci_callable_runner",
 )

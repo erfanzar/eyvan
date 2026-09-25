@@ -18,6 +18,7 @@ from pathlib import PurePosixPath
 
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import NativeContainerConfig, NativeRuntimeConfig
+from eyvan.worker.runtime.dependency_entry import DEFAULT_CACHE_ROOT as DEPENDENCY_CACHE_ROOT
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WORKLOAD_RUNTIME_ENVIRONMENT = "/etc/eyvan-native/workload-runtime.json"
@@ -645,8 +646,12 @@ def build_native_worker_startup_script(
             "install its interpreter under a shared path such as /opt/eyvan-native/python' >&2",
             "  exit 1",
             "fi",
+            # The per-host cache for per-job ``dependencies``. Owned by the
+            # workload user because that is who installs into it: left to root,
+            # every job fell back to its own working directory and reinstalled
+            # its packages from scratch (seen on a Spot v6e-4, 2026-09-24).
             f"install -d -o {workload_user} -g {workload_group} -m 0750 {workload_directory} "
-            f"{workload_directory}/.cache",
+            f"{workload_directory}/.cache {DEPENDENCY_CACHE_ROOT}",
             "for device in /dev/vfio/* /dev/vfio/devices/* /dev/accel* /dev/nvidiactl /dev/nvidia-uvm "
             "/dev/nvidia[0-9]*; do",
             '  [ -c "${device}" ] || continue',

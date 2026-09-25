@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import typing as tp
 
 import pytest
@@ -1263,3 +1265,349 @@ def test_a_cell_whose_listing_holds_only_sibling_ids_is_not_recreated(tmp_path) 
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow
+
+
+@pytest.mark.parametrize("operation", ["apply", "reconcile"])
+def test_a_slow_provider_call_for_one_cell_does_not_stall_another(tmp_path, operation: str) -> None:
+    """The other half of the 2026-08-19 fix, found live on 2026-09-24.
+
+    ``apply_capacity`` and ``reconcile`` held ``_mutation_lock`` and the fleet
+    lease across ``provider.ensure`` -- a ``gcloud ... create`` that waits minutes
+    on a Spot insert -- so one v5p-8 create in us-central1-a stalled v5p-16,
+    v5litepod-8 and v6e-4 requests of three other fleets. As in the release
+    test, the first call blocks *inside* the provider and the second must finish
+    anyway; the join timeout turns "still serialised" into a failure.
+    """
+
+    import threading
+
+    inside_provider = threading.Event()
+    may_finish = threading.Event()
+
+    class BlockingProvider(FakeProvider):
+        def ensure(self, record: FleetCellRecord) -> ProviderObservation:
+            if record.name == "first" and not may_finish.is_set():
+                inside_provider.set()
+                assert may_finish.wait(timeout=10), "the other cell's mutation never completed"
+            return super().ensure(record)
+
+    state, _provider, driver = make_driver(tmp_path, BlockingProvider())
+    if operation == "reconcile":
+        may_finish.set()
+        driver.apply_capacity("first", desired(), context("create-first"))
+        driver.apply_capacity("second", desired(), context("create-second"))
+        may_finish.clear()
+
+        def slow_call() -> None:
+            driver.reconcile("first", context("reconcile-first"))
+
+        def fast_call() -> None:
+            driver.reconcile("second", context("reconcile-second"))
+    else:
+
+        def slow_call() -> None:
+            driver.apply_capacity("first", desired(), context("create-first"))
+
+        def fast_call() -> None:
+            driver.apply_capacity("second", desired(), context("create-second"))
+
+    slow = threading.Thread(target=slow_call)
+    slow.start()
+    assert inside_provider.wait(timeout=10), "the first mutation never reached the provider"
+
+    finished = threading.Thread(target=fast_call)
+    finished.start()
+    finished.join(timeout=10)
+    assert not finished.is_alive(), "the second cell waited on the first cell's provider call"
+    assert state.get("second") is not None
+
+    may_finish.set()
+    slow.join(timeout=10)
+    assert not slow.is_alive()
+    assert state.get("first") is not None
+
+
+def test_two_mutations_of_the_same_cell_never_reach_the_provider_together(tmp_path) -> None:
+    """Parallelism across cells must not become two creates racing one resource id."""
+
+    import threading
+
+    active = 0
+    overlap: list[int] = []
+    counter_guard = threading.Lock()
+    inside_provider = threading.Event()
+    may_finish = threading.Event()
+
+    class CountingProvider(FakeProvider):
+        def ensure(self, record: FleetCellRecord) -> ProviderObservation:
+            nonlocal active
+            with counter_guard:
+                active += 1
+                overlap.append(active)
+            inside_provider.set()
+            may_finish.wait(timeout=10)
+            try:
+                return super().ensure(record)
+            finally:
+                with counter_guard:
+                    active -= 1
+
+    state, _provider, driver = make_driver(tmp_path, CountingProvider())
+    first = threading.Thread(target=driver.apply_capacity, args=("cell", desired(), context("create")))
+    first.start()
+    assert inside_provider.wait(timeout=10)
+    second = threading.Thread(target=driver.reconcile, args=("cell", context("reconcile")))
+    second.start()
+    second.join(timeout=0.5)
+    assert second.is_alive(), "a reconcile of the same cell entered while its create was in the provider"
+
+    may_finish.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert max(overlap) == 1, overlap
+    assert state.get("cell") is not None
+
+
+def test_a_second_agent_process_cannot_touch_a_cell_whose_provider_call_is_in_flight(tmp_path) -> None:
+    """The fleet lease no longer spans provider calls, so a per-cell claim must.
+
+    Two agents sharing one fleet-state document -- or a redeploy's outgoing agent,
+    still inside ``gcloud ... create`` while its successor takes the retry -- must
+    not both drive the same cell's provider resource. The other process is
+    represented by the claim it leaves in the shared record.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    from eyvan.capacity.drivers.base import DriverBusyError
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    calls_before = len(provider.ensured)
+    foreign = {"owner": "other-host:4242:agent-b", "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()}
+
+    def plant(record: FleetCellRecord) -> None:
+        record.metadata[PROVIDER_OPERATION_KEY] = foreign
+
+    state.mutate_record("cell", plant)
+
+    with pytest.raises(DriverBusyError, match="provider operation in flight"):
+        driver.reconcile("cell", context("reconcile"))
+    with pytest.raises(DriverBusyError, match="provider operation in flight"):
+        driver.apply_capacity("cell", desired(), context("create-again"))
+
+    assert len(provider.ensured) == calls_before, "the provider is never called while another process holds the cell"
+    record = state.get("cell")
+    assert record is not None and record.metadata[PROVIDER_OPERATION_KEY] == foreign, "its claim is left intact"
+
+
+@pytest.mark.parametrize("operation", ["replay", "release", "release-replay", "drain", "drain-replay"])
+def test_live_foreign_claim_blocks_replayed_apply_release_and_drain(tmp_path, operation: str) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from eyvan.capacity.drivers.base import DriverBusyError
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    foreign = {"owner": "other-host:4242:agent-b", "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()}
+
+    def plant(record: FleetCellRecord) -> None:
+        record.metadata[PROVIDER_OPERATION_KEY] = foreign
+        if operation == "release-replay":
+            record.state = CapacityStatus.DELETING
+
+    state.mutate_record("cell", plant)
+    before = state.get("cell").to_dict()
+    calls_before = len(provider.ensured)
+    with pytest.raises(DriverBusyError, match="provider operation in flight"):
+        if operation == "replay":
+            driver.apply_capacity("cell", desired(), context("create"))
+        elif operation.startswith("release"):
+            driver.release("cell", context("create") if operation.endswith("replay") else context("release", 2, "new"))
+        else:
+            driver.drain("cell", context("create") if operation.endswith("replay") else context("drain", 2, "new"))
+    assert len(provider.ensured) == calls_before
+    assert provider.deleted == []
+    assert state.get("cell").to_dict() == before
+    assert state.cell_tombstone("cell") is None
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_own_provider_claim_allows_release_and_tombstone_replay(tmp_path, replay: bool) -> None:
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+
+    def plant(record: FleetCellRecord) -> None:
+        driver._claim_provider_operation(record)
+        if replay:
+            record.state = CapacityStatus.DELETING
+
+    state.mutate_record("cell", plant)
+    assert state.get("cell").metadata[PROVIDER_OPERATION_KEY]["owner"] == state.owner
+    release_context = context("create") if replay else context("release", 2, "new")
+    assert driver.release("cell", release_context).state is CapacityStatus.RELEASED
+    assert state.get("cell") is None
+    assert state.cell_tombstone("cell")["generation"] == release_context.generation
+    assert len(provider.deleted) == 1
+    assert driver.release("cell", release_context).state is CapacityStatus.RELEASED
+    assert len(provider.deleted) == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["delete", "auxiliary", "tombstone"])
+def test_release_holds_claim_through_io_and_clears_it_on_failure(tmp_path, monkeypatch, failure_stage: str) -> None:
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, _provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    stages = []
+
+    def stage(name):
+        def run(*args, **kwargs):
+            assert state.get("cell").metadata[PROVIDER_OPERATION_KEY]["owner"] == state.owner
+            stages.append(name)
+            if name == failure_stage:
+                raise RuntimeError("injected release failure")
+
+        return run
+
+    monkeypatch.setattr(driver, "_delete_owned_capacity", stage("delete"))
+    monkeypatch.setattr(driver, "_release_auxiliary_resources", stage("auxiliary"))
+    monkeypatch.setattr(driver, "_tombstone_after_release", stage("tombstone"))
+    with pytest.raises(RuntimeError, match="injected release failure"):
+        driver.release("cell", context("release", 2, "new"))
+    assert stages[-1] == failure_stage
+    assert state.get("cell") is not None
+    assert PROVIDER_OPERATION_KEY not in state.get("cell").metadata
+    assert state.cell_tombstone("cell") is None
+
+
+@pytest.mark.parametrize("operation", ["replay", "release"])
+def test_real_second_process_cannot_replay_or_release_inflight_create(tmp_path, operation: str) -> None:
+    import json
+    import threading
+    from pathlib import Path
+
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    inside = threading.Event()
+    may_finish = threading.Event()
+    errors = []
+
+    class BlockingProvider(FakeProvider):
+        def ensure(self, record):
+            inside.set()
+            assert may_finish.wait(timeout=30), "child did not finish in time"
+            return super().ensure(record)
+
+    state, provider, driver = make_driver(tmp_path, BlockingProvider())
+
+    def create():
+        try:
+            driver.apply_capacity("cell", desired(), context("create"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=create)
+    thread.start()
+    try:
+        assert inside.wait(timeout=10)
+        before = state.get("cell").to_dict()
+        script = """
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('driver_helpers', sys.argv[1])
+helpers = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = helpers
+spec.loader.exec_module(helpers)
+state, provider, driver = helpers.make_driver(Path(sys.argv[2]))
+error = None
+try:
+    if sys.argv[3] == 'replay':
+        driver.apply_capacity('cell', helpers.desired(), helpers.context('create'))
+    else:
+        driver.release('cell', helpers.context('release', 2, 'new'))
+except Exception as exc:
+    error = type(exc).__name__
+print(json.dumps({'error': error, 'ensure': len(provider.ensured), 'delete': provider.deleted, 'owner': state.owner}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).resolve()), str(tmp_path), operation],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        result = json.loads(completed.stdout)
+        assert result["owner"] != state.owner
+        assert result["error"] == "DriverBusyError", result
+        assert result["ensure"] == 0 and result["delete"] == []
+        assert state.get("cell").to_dict() == before
+        assert state.cell_tombstone("cell") is None
+    finally:
+        may_finish.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(provider.ensured) == 1 and provider.deleted == []
+    assert PROVIDER_OPERATION_KEY not in state.get("cell").metadata
+
+
+def test_this_process_releases_its_claim_after_the_provider_call(tmp_path) -> None:
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, _provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    driver.reconcile("cell", context("reconcile"))
+
+    record = state.get("cell")
+    assert record is not None and PROVIDER_OPERATION_KEY not in record.metadata
+
+
+@pytest.mark.parametrize("stale", ["expired", "dead-local-process"])
+def test_a_claim_left_by_a_crashed_process_does_not_wedge_its_cell(tmp_path, stale: str) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, _provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait()
+    host = __import__("socket").gethostname()
+    claim = (
+        {"owner": "other-host:1:x", "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat()}
+        if stale == "expired"
+        else {"owner": f"{host}:{process.pid}:x", "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()}
+    )
+
+    def plant(record: FleetCellRecord) -> None:
+        record.metadata[PROVIDER_OPERATION_KEY] = claim
+
+    state.mutate_record("cell", plant)
+
+    driver.reconcile("cell", context("reconcile"))
+
+    record = state.get("cell")
+    assert record is not None and PROVIDER_OPERATION_KEY not in record.metadata
+
+
+def test_the_claim_never_reaches_the_control_plane_as_cell_metadata(tmp_path) -> None:
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    captured: list[dict] = []
+
+    class Peeking(FakeProvider):
+        def ensure(self, record: FleetCellRecord) -> ProviderObservation:
+            captured.append(dict(record.metadata))
+            return super().ensure(record)
+
+    _state, _provider, driver = make_driver(tmp_path, Peeking())
+    observation = driver.apply_capacity("cell", desired(), context("create"))
+
+    assert PROVIDER_OPERATION_KEY in captured[0], "held while the provider is being called"
+    assert PROVIDER_OPERATION_KEY not in observation.metadata

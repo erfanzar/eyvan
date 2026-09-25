@@ -20,8 +20,21 @@ from eyvan.capacity import (
     EXECUTION_PENDING_CAPACITY_STATUSES,
     QUEUED_CAPACITY_STATUSES,
 )
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.domain import SchedulingResult
 from eyvan.domain.models import PlacementMode, PriorityBand
+from eyvan.records import (
+    POOL_ALTERNATE_TEMPLATES_LABEL as POOL_ALTERNATE_TEMPLATES_LABEL,
+)
+from eyvan.records import (
+    POOL_ALTERNATES_LABEL as POOL_ALTERNATES_LABEL,
+)
+from eyvan.records import (
+    POOL_LABEL as POOL_LABEL,
+)
+from eyvan.records import (
+    POOL_TEMPLATE_LABEL as POOL_TEMPLATE_LABEL,
+)
 from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
@@ -29,6 +42,9 @@ from eyvan.records import (
     LeaseRecord,
     WorkloadRecord,
     WorkloadState,
+)
+from eyvan.records import (
+    candidate_pool_templates as candidate_pool_templates,
 )
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
@@ -49,10 +65,9 @@ _CELL_ID_LIMIT = 96
 _CELL_EPOCH_CHARS = 6
 
 
-#: Additional pool ids a workload will accept, comma separated. ``eyvan_pool``
-#: stays the first choice, so a spec written before this existed behaves
-#: identically.
-POOL_ALTERNATES_LABEL = "eyvan_pool_alternates"
+# Re-exported: the constants and ``candidate_pool_templates`` live in
+# ``eyvan.records`` so the service scheduler can read them without importing
+# this module (which imports the service layer).
 
 
 def _candidate_pool_ids(workload: WorkloadRecord) -> tuple[str, ...]:
@@ -189,6 +204,48 @@ def candidate_zone_report(
 #: capacity is normally won; five failures in a row is the zone telling you
 #: something a sixth attempt will not change.
 MAX_CONSECUTIVE_ACQUISITION_FAILURES = 5
+
+
+#: How far back a *deleted* cell's failure still counts toward its pool's
+#: acquisition bound. An hour, the same horizon ``max_backoff_s`` caps a single
+#: cell's cooldown at: long enough to see a replacement loop, short enough that
+#: a pool which failed during yesterday's outage is asked again today.
+ACQUISITION_FAILURE_MEMORY_S = 3600.0
+
+
+def _recent_failed_acquisition_streak(cells: list[CellRecord], now: datetime) -> int:
+    """Count a pool's newest incarnations that failed without ever delivering.
+
+    A failing cell is replaced by a *new* cell, whose belief starts clean, and
+    the failed one is deleted -- and deleted cells were excluded from the bound
+    so that one frozen tombstone could not park a pool forever. Together that
+    meant the bound could never trip on a replacement loop: on 2026-09-24 a Spot
+    v5litepod-8 pool in us-west4-a, whose every queued resource GCP failed with
+    "tenant project creation", minted fifteen cells in thirty minutes.
+
+    So the streak is read across outcomes, newest first, and it ends at the
+    first cell that delivered capacity (one success ends a run of failures).
+    Deleted cells whose outcome predates ``ACQUISITION_FAILURE_MEMORY_S`` are
+    excluded: a long queue wait must not age out a newly observed failure.
+    """
+
+    streak = 0
+    horizon = now.timestamp() - ACQUISITION_FAILURE_MEMORY_S
+
+    # Tombstones are kept forever; only the recent ones can matter, so they are
+    # dropped before sorting rather than walked past on every pass.
+    def outcome_at(cell: CellRecord) -> datetime:
+        # Ownership cleanup can refresh updated_at even on tombstones. Without
+        # an observed outcome, conservatively age legacy evidence by cell birth.
+        return cell.availability.last_observed_at or cell.created_at
+
+    recent = [cell for cell in cells if cell.state is not CellState.DELETED or outcome_at(cell).timestamp() >= horizon]
+    for cell in sorted(recent, key=lambda candidate: (outcome_at(candidate), candidate.id), reverse=True):
+        if cell.availability.provision_latencies_s:
+            break
+        if cell.availability.consecutive_failures > 0:
+            streak += 1
+    return streak
 
 
 def _acquisition_exhausted(pool: CapacityPoolRecord, pool_consecutive_failures: Counter[str]) -> bool:
@@ -521,6 +578,23 @@ class CapacitySimulation:
     #: the simulation so the caller can say so on the workload instead of leaving
     #: it pending with no reason.
     acquisition_exhausted_workload_ids: frozenset[str] = frozenset()
+    #: Pools that refused queue admission for a workload, by workload id. A race
+    #: must not spend one of its slots re-asking a zone that already said this
+    #: project may not ask there.
+    queue_denied_pool_ids: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: Pools past the acquisition bound. Candidates already exclude them; a race
+    #: must too, or it re-asks the pool the bound exists to stop asking.
+    exhausted_pool_ids: frozenset[str] = frozenset()
+    #: Real cells still acquiring (queued or provisioning, not READY) and the
+    #: pools where each workload already owns such a cell. A placement on an
+    #: acquiring cell has not won anything yet, so it keeps racing -- but never
+    #: into a pool where the workload already has a request outstanding.
+    acquiring_cell_ids: dict[str, int] = field(default_factory=dict)
+    owned_pool_ids: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: Pools where a workload's request failed outright and has not been retired
+    #: yet (UNAVAILABLE with a provider failure). Not asked again by a race, and
+    #: not counted as racing either: nothing is outstanding there.
+    stalled_pool_ids: dict[str, frozenset[str]] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -550,19 +624,44 @@ class CapacitySimulation:
         # the capacity I could still use"; this wants "how often has asking here
         # failed", and they are different questions about the same field.
         pool_acquisition_failures: Counter[str] = Counter()
+        incarnations: dict[str, list[CellRecord]] = {}
         for cell in cells:
+            pool_id = cell.pool_id or ""
+            if pool_id not in pools_by_id:
+                continue
+            incarnations.setdefault(pool_id, []).append(cell)
             if cell.state is CellState.DELETED:
                 # A tombstone is retained forever as id evidence, and its belief
                 # is frozen: only the cell's own SUCCESS resets it, and a
                 # deleted cell has none. Letting it vote here made one cell
                 # that crossed the bound during an outage park every later
-                # workload for that pool permanently.
+                # workload for that pool permanently. Recent tombstones speak
+                # through the bounded streak below instead.
                 continue
-            pool_id = cell.pool_id or ""
-            if pool_id in pools_by_id:
-                pool_acquisition_failures[pool_id] = max(
-                    pool_acquisition_failures[pool_id], int(cell.availability.consecutive_failures)
-                )
+            pool_acquisition_failures[pool_id] = max(
+                pool_acquisition_failures[pool_id], int(cell.availability.consecutive_failures)
+            )
+        for pool_id, pool_cells in incarnations.items():
+            pool_acquisition_failures[pool_id] = max(
+                pool_acquisition_failures[pool_id], _recent_failed_acquisition_streak(pool_cells, now)
+            )
+        # A queue-admission denial is the provider saying this project may not
+        # ask for this shape in this zone. It is not a stockout to wait out: a
+        # denied cell went on counting as the workload's supply until the
+        # provisioning timeout, and the zone was then asked again, so a
+        # cross-zone workload never reached its other zones (2026-09-24). Each
+        # workload stops considering the pools that denied *it*.
+        queue_denied_pools: dict[str, set[str]] = {}
+        owned_pools: dict[str, set[str]] = {}
+        stalled_pools: dict[str, set[str]] = {}
+        acquiring_cell_ids: dict[str, int] = {}
+        for cell in cells:
+            if (
+                cell.provider_failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
+                and cell.autoscale_request_workload_id is not None
+                and cell.pool_id is not None
+            ):
+                queue_denied_pools.setdefault(cell.autoscale_request_workload_id, set()).add(cell.pool_id)
 
         for cell in cells:
             pool = pools_by_id.get(cell.pool_id or "")
@@ -570,10 +669,25 @@ class CapacitySimulation:
                 scheduler_cells.append(cell)
                 continue
             pool_by_cell_id[cell.id] = pool.id
-            supplies = pool.enabled and cell_provides_pool_supply(cell, pool, now)
+            supplies = (
+                pool.enabled
+                and cell.provider_failure_code is not CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
+                and cell_provides_pool_supply(cell, pool, now)
+            )
+            if supplies and cell.autoscale_request_workload_id is not None:
+                # A request the provider has already refused (a Compute stockout
+                # answers at once) still counts as supply until its timeout, so
+                # the pool does not launch a duplicate; but it is not racing.
+                # Counted as racing, twenty stocked-out v5e zones held all twenty
+                # race slots for the whole provisioning window while six zones
+                # were never asked (2026-09-25).
+                failed_request = cell.state is CellState.UNAVAILABLE and cell.provider_failure_code is not None
+                target = stalled_pools if failed_request else owned_pools
+                target.setdefault(cell.autoscale_request_workload_id, set()).add(pool.id)
             if supplies and cell.state is CellState.READY:
                 scheduler_cells.append(cell)
             elif supplies and cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE}:
+                acquiring_cell_ids[cell.id] = cell.worker_count
                 scheduler_cells.append(cell.model_copy(update={"state": CellState.READY}))
             elif cell.id in active_lease_cells:
                 # Not supply, and not omissible either. The scheduler is handed
@@ -622,7 +736,12 @@ class CapacitySimulation:
             # capacity again. Existing free capacity is still usable -- this bounds
             # acquisition, not placement -- so a pool that suddenly grants is picked
             # up by the free-supply branch below without waiting for belief to decay.
-            candidates = [pool for pool in named if not _acquisition_exhausted(pool, pool_acquisition_failures)]
+            denied_here = queue_denied_pools.get(workload.id, set())
+            candidates = [
+                pool
+                for pool in named
+                if not _acquisition_exhausted(pool, pool_acquisition_failures) and pool.id not in denied_here
+            ]
             if named and not candidates:
                 # Every zone it accepts has stopped granting. Say so once, durably,
                 # instead of asking again on the next tick forever.
@@ -697,7 +816,14 @@ class CapacitySimulation:
         for pool in pools:
             if not pool.enabled:
                 continue
+            exhausted = _acquisition_exhausted(pool, pool_acquisition_failures)
             for workload in generic_workloads:
+                if exhausted or pool.id in queue_denied_pools.get(workload.id, set()):
+                    # The same two bounds the named branch applies. Without them a
+                    # workload that names no pool -- a raw CLI submission -- was
+                    # offered every pool on every pass, and asked us-south1-c four
+                    # times after it had denied queue admission (2026-09-24).
+                    continue
                 worker_count = workload.spec.worker_count
                 if worker_count > 1 and not pool.hosts_multi_worker_cells:
                     # Multi-worker cells only exist on the GCP TPU backend with the
@@ -718,6 +844,13 @@ class CapacitySimulation:
             pool_by_cell_id=pool_by_cell_id,
             virtual_worker_count_by_cell_id=virtual_worker_count_by_cell_id,
             acquisition_exhausted_workload_ids=frozenset(acquisition_exhausted_workload_ids),
+            queue_denied_pool_ids={workload_id: frozenset(pools) for workload_id, pools in queue_denied_pools.items()},
+            exhausted_pool_ids=frozenset(
+                pool.id for pool in pools if _acquisition_exhausted(pool, pool_acquisition_failures)
+            ),
+            acquiring_cell_ids=acquiring_cell_ids,
+            owned_pool_ids={workload_id: frozenset(pool_ids) for workload_id, pool_ids in owned_pools.items()},
+            stalled_pool_ids={workload_id: frozenset(pool_ids) for workload_id, pool_ids in stalled_pools.items()},
         )
 
     @staticmethod
@@ -803,6 +936,7 @@ class CapacitySimulation:
                     served = cell_priorities[pool_id]
                     current = served.get(lease.cell_id)
                     served[lease.cell_id] = band if current is None else max(current, band)
+        race_seeds: list[tuple[str, str, int]] = []
         for placement in result.placements:
             for lease in placement.all_leases:
                 pool_id = self.pool_by_cell_id.get(lease.cell_id)
@@ -811,6 +945,12 @@ class CapacitySimulation:
                 worker_count = self.virtual_worker_count_by_cell_id.get(lease.cell_id)
                 if worker_count is None:
                     real_ids[pool_id].add(lease.cell_id)
+                    if lease.cell_id in self.acquiring_cell_ids:
+                        # Placed on a request the provider has not granted yet:
+                        # still a race. Without this, the first zone to accept
+                        # a *request* ended the race, even when it then sat in
+                        # WAITING_FOR_RESOURCES for hours (2026-09-24).
+                        race_seeds.append((pool_id, lease.workload_id, self.acquiring_cell_ids[lease.cell_id]))
                 else:
                     virtual_counts[pool_id].append(worker_count)
                     virtual_workload_ids[pool_id].append(lease.workload_id)
@@ -820,6 +960,11 @@ class CapacitySimulation:
                 virtual_workload_ids,
                 by_workload_id=by_workload_id,
                 race_width=race_width,
+                denied_pool_ids=self.queue_denied_pool_ids,
+                exhausted_pool_ids=self.exhausted_pool_ids,
+                owned_pool_ids=self.owned_pool_ids,
+                stalled_pool_ids=self.stalled_pool_ids,
+                seeds=tuple(race_seeds),
             )
         return {
             pool.id: PoolDemand(
@@ -850,6 +995,11 @@ class CapacitySimulation:
         *,
         by_workload_id: dict[str, WorkloadRecord],
         race_width: int,
+        denied_pool_ids: tp.Mapping[str, frozenset[str]] | None = None,
+        exhausted_pool_ids: frozenset[str] = frozenset(),
+        owned_pool_ids: tp.Mapping[str, frozenset[str]] | None = None,
+        stalled_pool_ids: tp.Mapping[str, frozenset[str]] | None = None,
+        seeds: tuple[tuple[str, str, int], ...] = (),
     ) -> None:
         """Ask a workload's other candidate zones for capacity too.
 
@@ -873,27 +1023,45 @@ class CapacitySimulation:
         which is why this is the last piece added rather than the first.
         """
 
-        for pool_id in list(virtual_counts):
-            for index, workload_id in enumerate(list(virtual_workload_ids[pool_id])):
-                workload = by_workload_id.get(workload_id)
-                if workload is None:
+        entries = [
+            (pool_id, workload_id, virtual_counts[pool_id][index])
+            for pool_id in list(virtual_counts)
+            for index, workload_id in enumerate(list(virtual_workload_ids[pool_id]))
+        ]
+        entries.extend(seeds)
+        for pool_id, workload_id, worker_count in entries:
+            workload = by_workload_id.get(workload_id)
+            if workload is None:
+                continue
+            denied = (denied_pool_ids or {}).get(workload_id, frozenset())
+            # A pool where this workload already has a request outstanding (or
+            # capacity) is already in the race; asking it again would mint a
+            # second cell for the same attempt on every pass.
+            owned = (owned_pool_ids or {}).get(workload_id, frozenset())
+            stalled = (stalled_pool_ids or {}).get(workload_id, frozenset())
+            alternates = [
+                candidate
+                for candidate in _candidate_pool_ids(workload)
+                if candidate != pool_id
+                and candidate in virtual_counts
+                and candidate not in denied
+                and candidate not in exhausted_pool_ids
+                and candidate not in owned
+                and candidate not in stalled
+            ]
+            # The width counts zones being asked, the ones already asked
+            # included, so an ongoing race tops up rather than grows.
+            slots = max(race_width - 1 - len(owned - {pool_id}), 0)
+            for alternate in alternates[:slots]:
+                already = sum(1 for existing in virtual_workload_ids[alternate] if existing == workload_id)
+                # One request per member per pool. Without this a workload
+                # already asking an alternate -- because a previous tick
+                # raced it, or because it is a multislice group -- would
+                # accumulate another request on every reconcile.
+                if already >= workload.spec.cell_group_count:
                     continue
-                worker_count = virtual_counts[pool_id][index]
-                alternates = [
-                    candidate
-                    for candidate in _candidate_pool_ids(workload)
-                    if candidate != pool_id and candidate in virtual_counts
-                ]
-                for alternate in alternates[: max(race_width - 1, 0)]:
-                    already = sum(1 for existing in virtual_workload_ids[alternate] if existing == workload_id)
-                    # One request per member per pool. Without this a workload
-                    # already asking an alternate -- because a previous tick
-                    # raced it, or because it is a multislice group -- would
-                    # accumulate another request on every reconcile.
-                    if already >= workload.spec.cell_group_count:
-                        continue
-                    virtual_counts[alternate].append(worker_count)
-                    virtual_workload_ids[alternate].append(workload_id)
+                virtual_counts[alternate].append(worker_count)
+                virtual_workload_ids[alternate].append(workload_id)
 
 
 @dataclass(frozen=True, slots=True)

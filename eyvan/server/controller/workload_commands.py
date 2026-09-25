@@ -16,6 +16,7 @@ from urllib.parse import urlencode, urlparse
 
 from pydantic import ValidationError
 
+from eyvan._internal.plane_tls import CONTROL_PLANE_CA_B64_ENV, control_plane_ca_b64
 from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
 )
@@ -36,11 +37,13 @@ from eyvan.records import (
     WorkspaceRef,
     utcnow,
 )
+from eyvan.secrets import redact_secret_material
 from eyvan.server.controller._support import (
     StaleOutboxCommand,
 )
 from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 from eyvan.worker.agent.models import (
     CheckpointRequest,
     GangWorkloadMember,
@@ -100,6 +103,31 @@ class PermanentDispatchRefusal(RuntimeError):
     shared decision -- "do not retry this, say why" -- while the reasons are
     unrelated and an operator has to be able to tell them apart in
     ``failure_reason``.
+    """
+
+
+def _invalid_launch_refusal(exc: Exception) -> PermanentDispatchRefusal:
+    """Turn a cell's "this launch is invalid" into the refusal that settles it.
+
+    Retrying an identical launch cannot change a validation verdict, and the
+    outbox has no dead letter: before this, a worker refusing every submit held
+    the lease and retried for ever. The worker's sentence names fields, not
+    values, and is redacted once more before it becomes the failure reason.
+    """
+
+    return PermanentDispatchRefusal(f"the cell refused this launch as invalid: {redact_secret_material(str(exc))}")
+
+
+class UnreachableCallbackRefusal(PermanentDispatchRefusal):
+    """A job needs to call the plane back, and the plane gives it no address it can reach.
+
+    Secret mounts, in-job submission and progress reporting are all redeemed by
+    the worker at ``EYVAN_PUBLIC_URL``. Raised as a bare ``RuntimeError`` this was
+    retried with backoff forever while the lease held a Spot TPU -- and, for a
+    secret-bearing workload, its own sentence was replaced by "output suppressed
+    for secret-bearing execution", so nobody could see why (2026-09-24, a v6e-4
+    in asia-northeast1-b against a loopback plane). The message is Eyvan's own,
+    raised before any cell is contacted, and carries no secret material.
     """
 
 
@@ -514,14 +542,14 @@ class _ControllerWorkloadCommands:
         """
 
         if workload.spec.secret_mounts and (self.secret_capability is None or self.artifact_access is None):
-            raise RuntimeError("secret delivery is not configured on this control-plane replica")
+            raise UnreachableCallbackRefusal("secret delivery is not configured on this control-plane replica")
         if workload.spec.secret_mounts and cell.executor not in _SECRET_MATERIALIZING_EXECUTORS:
             # Refused rather than run without them. The control plane has already
             # minted a per-attempt capability and written ``secret.issued``, so a
             # silent drop leaves an issuance with no matching read -- which is
             # precisely the signal a *leaked* token produces. Normal operation on
             # such an executor would make that signal meaningless.
-            raise RuntimeError(
+            raise UnreachableCallbackRefusal(
                 f"executor {cell.executor!r} does not materialize secret mounts, and this workload declares "
                 f"{sorted(workload.spec.secret_mounts)}; it would run with those variables absent"
             )
@@ -533,7 +561,7 @@ class _ControllerWorkloadCommands:
         if host not in _LOOPBACK_HOSTS or cell.provider in _LOCAL_PROVIDERS:
             return
         wants = "secret mounts" if workload.spec.secret_mounts else "in-job submission"
-        raise RuntimeError(
+        raise UnreachableCallbackRefusal(
             f"this control plane advertises {base!r}, which a cell on provider {cell.provider!r} cannot reach; "
             f"{wants} require a callback address the worker can resolve -- set EYVAN_PUBLIC_URL"
         )
@@ -669,6 +697,13 @@ class _ControllerWorkloadCommands:
             "EYVAN_ATTEMPT": str(workload.attempt),
             "EYVAN_RESUME_CHECKPOINT_URI": workload.checkpoint_uri or "",
         }
+        ca_b64 = control_plane_ca_b64()
+        if ca_b64 is not None:
+            # Every callback this job makes -- secret redemption, progress,
+            # children, managed artifacts -- is to this plane, whose certificate a
+            # private CA issued. The CA is public; handing it over is what lets
+            # those calls verify instead of failing or being told not to check.
+            environment[CONTROL_PLANE_CA_B64_ENV] = ca_b64
         if workload.spec.can_submit_children and self.workload_capability is not None:
             # Beside the workload identity rather than inside the managed-result
             # block: a command workload fans out too, and only callables get a
@@ -1511,6 +1546,10 @@ class _ControllerWorkloadCommands:
             return
         try:
             remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
+        except CellAgentInvalidConfigurationError as exc:
+            await self._release_dispatch_reservation(command, reservation)
+            await self._settle_unlaunchable_attempt(command, (lease_id,), _invalid_launch_refusal(exc))
+            return
         except Exception:
             await self._release_dispatch_reservation(command, reservation)
             raise
@@ -1542,6 +1581,10 @@ class _ControllerWorkloadCommands:
                 coordinator_lease.cell_id,
                 request,
             )
+        except CellAgentInvalidConfigurationError as exc:
+            await self._release_dispatch_reservation(command, reservation)
+            await self._settle_unlaunchable_attempt(command, lease_ids, _invalid_launch_refusal(exc))
+            return
         except Exception:
             await self._release_dispatch_reservation(command, reservation)
             raise

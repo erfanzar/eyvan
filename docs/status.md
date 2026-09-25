@@ -6,6 +6,287 @@ restated as a result. The intent is a living SLO record: each entry should
 grow a history, and a claim that stops being re-measured moves to
 "unverified" rather than silently staying green.
 
+## Spot TPU campaign across zones and generations (2026-09-24; live)
+
+Authorized, Spot-only campaign in `example-spot-project` , driven through the
+public SDK and CLI against an isolated loopback plane (`eyvan runtime deploy
+--profile`, port 18280). Project policy was set to `allowed_capacity_classes:
+[spot]`; nothing on-demand was requested. Fleets: v5p-8/v5p-16 in us-central1-a
+and us-east5-a, v6e-4/v6e-8 in us-east5-b, v5litepod-8/16 in us-west4-a, and two
+four-zone race fleets (v6e-4 across us-central1-a/b/c and us-south1-a; v5e-8
+across europe-west4-a, us-east1-b, us-south1-a, us-west1-c) with
+`EYVAN_CAPACITY_RACE_WIDTH=3`. Receipts are local, under
+`.pytest_cache/spot-campaign/`; they are not published attestations.
+
+**Hardware results so far.**
+
+- The campaign moved to JAX 0.11.2 (libtpu 0.0.48) and to all-zone race
+  fleets built from the project's Spot quota (v6e-4 across 15 zones, v5e-8 across
+  20, v5p-8 and v5p-16 across 3 each; `EYVAN_CAPACITY_RACE_WIDTH=20`). Denied and
+  exhausted zones drop out per workload and the race keeps asking the others.
+- Spot v5p-8 via Compute Engine (europe-west4-b, found by the race after
+  us-central1-a stocked out): `wl_422185917a0f4046927c3ff02c3e23ba` succeeded in
+  315 s; 4 `TPU v5` devices, exact all-reduce and matmul, `preemptible: TRUE`.
+- Spot v6e-4 via the all-zone race (asia-northeast1-b, after asia-east1-c
+  refused): `wl_0829c4b63c134e80a8cf77f8d6d81ff2` succeeded in 425 s on JAX 0.11.2.
+- Per-job `dependencies` on real hardware: `einops==0.8.1` installed into the
+  layered job environment and imported beside JAX 0.11.2 / Python 3.13.15, with
+  the `workspace=` package importable and an exact all-reduce.
+- Spot v6e-4 (us-east5-b, a shape first catalogued in this change): workload
+  `wl_88019da1771941619fc05c6a39b493fe` succeeded through `@execute`; JAX saw 4
+  `TPU v6 lite` devices, the all-reduce and a bf16 matmul were exact, and the VM
+  reported `preemptible: TRUE`. 2,131 s end to end, almost all of it Spot queueing.
+- Provider behaviour observed and handled: Spot stockouts on v5p-8
+  (`ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS`, us-central1-a, three times);
+  v5p-16 and v5e-8 slices granted and reclaimed before boot (`SUSPENDING`);
+  GCP failing every v5e queued resource in us-west4-a ("tenant project
+  creation"); queue-admission denials for v5p-16 (us-central1-a), v6e-4
+  (us-central1-a) and v5e-8 (europe-west4-a, us-east1-b).
+- `pods=2` on Spot v6e-4, both placements, JAX 0.11.2: elastic
+  (`wl_ecac7e2f9e8743448082465a0d251fc7`, one world per cell: process_count 1,
+  4 devices, psum 4.0, 504 s) and atomic (`wl_4ba1d3a77b7d428f8f19fef9f5a58c1b`,
+  one two-host world across two v6e-4 VMs in asia-northeast1-b: process_count 2,
+  8 devices, psum 8.0, 2,341 s including Spot queueing).
+- Operator CLI against a live Spot v6e-4 job (`wl_5f7f195cee85438f84e8105197068ded`):
+  the Spot-only policy refused an on-demand `submit-batch` (HTTP 400);
+  `estimate`, `run --with einops==0.8.1` (4 devices), `logs`, `process-status`,
+  `log-page`, `cost`, `timeline`, `explain` and `kick` all answered; the kicked
+  job came back as attempt 2 and ran; `cancel` settled it. `exec` was first
+  refused (exec not enabled, and the setting was inert -- fixed below) and
+  exited 0 anyway; after the fixes it ran beside attempt 2 on the Spot VM
+  (`/dev/vfio` visible, exit 0) and a failing command exited 1.
+- Secret mounts (P4) on a loopback plane now fail at once, permanently, with the
+  sentence that says what to set (`EYVAN_PUBLIC_URL`), instead of retrying behind
+  "output suppressed". A positive P4 run needs a plane the workers can reach.
+- Batch and DAG through the CLI on Spot v6e-4: `submit-batch --count 2`
+  (`EYVAN_BATCH_INDEX` 0 and 1, 4 devices each; coordinator succeeded) and a
+  two-node `submit-dag` whose `train` node was released only after `prepare`
+  succeeded (4 devices; coordinator succeeded).
+- P5 on a Spot v5p-8 (Compute Engine), `max_retries=0`, `max_failure_retries=0`:
+  the job checkpointed a step counter to GCS; at step 15 its VM was preempted
+  with `gcloud compute instances simulate-maintenance-event` (a real Spot
+  preemption: RUNNING -> STOPPING -> TERMINATED). Within ~20 s the plane charged
+  it to the preemption budget only (`preemption_count=1`,
+  `capacity_loss_count=0`, `failure_count=0`) and leased a race-won v5p-8 in
+  europe-west4-b; attempt 3 resumed from step 18 and finished at step 90
+  (`wl_259fe3422e0246bf829a7632b0e77bc3`). `eyvan proof preemption` passed every
+  check but one -- the STOPPING observation had put us-central1-a into cooldown
+  -- which is fix 20 below.
+- **P5 passes** on the fixed build: a fresh run
+  (`wl_f459d8e2882b472fadede061b3701510`) was preempted the same way in
+  europe-west4-b at step 9; the reclaimed cell carried `interruptions=1`, no
+  failure and no cooldown; attempt 2 resumed from step 9 and finished at 90 with
+  `preemption_count=1`, `capacity_loss_count=0`, `failure_count=0`. `eyvan proof
+  preemption` returns `pass` on all five criteria (after fix 21).
+- **P6** on a Spot v6e-4 pool (asia-northeast1-b) with a `[16:00, 18:00)` UTC
+  window, `min_cells: 1`: the floor was captured held by a READY cell inside the
+  window and fell to 0 at the boundary; `eyvan proof warm-window` passes
+  `window-was-active`, `floor-held` and `floor-released`, and reports
+  `idle-cost-accrued` inconclusive because TRC pools declare no price -- so the
+  overall verdict is `inconclusive`, not `pass`. (A CPU fleet, the documented
+  shape, is not covered by TRC and was not used.)
+- **Multi-host on one slice:** a Spot v6e-16 in asia-northeast1-b
+  (`wl_a60ed41897e64e2085101ee849b26a04`, 246 s) formed one native JAX world
+  across its four hosts -- `process_count 4`, 16 devices, `psum 40.0` on every
+  rank, `preemptible: TRUE` -- after fixes 24 and 25, each found by an earlier
+  attempt on the same slice. (v5p-16 stayed unobtainable: two of its three
+  zones deny the queue and us-east5-a reclaimed every grant before boot.)
+- **P3 and P4 from a Spot head** (`eyvan head up --spot`, HTTPS under its own
+  CA, after fixes 26-30). One Spot v6e-4 job (`wl_d798642b6a96439d8ed0a47524f32ebb`)
+  mounted a Secret Manager secret, reported progress, deliberately failed
+  attempt 1, and on attempt 2 submitted three Spot v6e-4 children, all of which
+  succeeded. `eyvan proof secret` **passes** all five criteria (one issuance and
+  one read per attempt across two attempts, re-delivered, value never recorded).
+  `eyvan proof children` passes creation, owner attribution and parenting; a
+  second job handed back its capability, and reusing it after the parent ended
+  was refused with 409 (`capability-expires-with-the-parent`: pass). A third
+  job (`wl_a01ceabd458844119a1e1e74537b769e`) submitted 256 children built to
+  stay pending at no cost (CPU-only, requiring a label no pool carries); the
+  257th was refused with 409 naming the ceiling (`width-ceiling`: pass), and the
+  256 were cancelled. Every P3 criterion has now passed on hardware, across
+  these runs.
+- **v5e on Spot**, after fixes 31-32: the TPU queue refuses v5litepod in every
+  zone of this project, so a `v5litepod-4` pool opted into `gcp-compute` raced
+  26 zones as Compute Engine Spot VMs (`ct5lp-hightpu-4t`). Twenty answered
+  STOCKOUT; us-south1-a granted, and `wl_6db81952a24d4fcc90295acc3c7f4044` ran
+  on 4 `TPU v5 lite` devices (exact all-reduce and matmul, `preemptible: TRUE`).
+  Every accelerator family the project can obtain -- v5e, v5p, v6e -- has now
+  run on Spot, single-host and multi-host.
+- Teardown: every campaign fleet was released with `eyvan down`; provider
+  listings across every zone used show no campaign TPU, queued resource or
+  Compute instance, and the test secret was deleted. In-job children (P3) and `report_progress`
+  need a plane the workers can reach; a laptop loopback plane is not one, and
+  `eyvan head up` has no Spot option, so they were not run.
+
+**Defects found live and fixed, each with a regression test that fails on the
+old code where the old code could be isolated:**
+
+1. Cross-zone alternates could never be placed: submission recorded the
+   alternates list and the first choice's pool, template and region as
+   *required* labels, matched by equality. `to_core_workload` now turns them into
+   "one of the candidates" (new `eyvan_pool_alternate_templates` label keeps the
+   template pin), while still applying the project's `allowed_regions`.
+2. `dependencies=` failed every job on native cells (`No module named 'eyvan'`):
+   the job venv could not see the worker venv. It is now built from the worker's
+   interpreter and layered over its site-packages; the bootstrap creates the
+   per-host cache for the workload user.
+3. A race stopped as soon as one zone accepted a *request*: the workload was
+   placed on that still-acquiring cell and no race demand followed, so zones
+   were tried one at a time as each refused. Acquiring cells now keep seeding
+   the race, never into a zone the workload already has a request in.
+4. Multi-worker gangs died on JAX 0.6.2 (`initialize() got an unexpected keyword
+   argument 'heartbeat_timeout_seconds'`); optional tuning arguments are now
+   passed only when the installed JAX accepts them.
+5. One slow `gcloud ... create` serialized capacity for every fleet on the agent
+   (driver lock + fleet lease held across provider I/O). Mutations are now
+   serialized per cell, with a fenced cross-process claim in the cell record.
+6. A failing pool was replaced forever: the acquisition bound could not see
+   deleted incarnations and each replacement started with a clean belief. The
+   bound now counts the pool's recent failed incarnations (one-hour memory).
+7. Queue-admission denials: a denied cell counted as supply until the
+   provisioning timeout, races re-asked the denying zone, alternatives were
+   judged by any same-shape pool (not the workload's own), and denials in
+   every candidate never became terminal. All four fixed.
+8. Diagnostics: Compute stockouts and preemptions of vanished Spot VMs,
+   `failedData` of FAILED queued resources, stockout/quota/agent-unreachable
+   sentences in the sanitizer, the Python error behind systemd's closing lines,
+   progress for exhausted and raced workloads, and HTTP 412 bucket-IAM races
+   (retried, no longer reported as a missing permission).
+9. `eyvan.init()`, `eyvan up` and `eyvan doctor` ignored the profile a plane
+   was deployed with; `workspace=` could not ship a gitignored directory it was
+   pointed at; the P4 proof counted secret events per workload instead of per
+   attempt; elastic jobs were narrated as "atomic"; the catalog lacked v6e-1,
+   v6e-4 and every v5e shape.
+10. The native GCP runtime path ignored operator settings: settings were built
+    from the profile plus bare defaults, so `EYVAN_CAPACITY_RACE_WIDTH=20` ran at
+    width 1 (a 20-zone v5e-8 fleet asked one zone per reconcile, each after the
+    previous was denied) and `EYVAN_CAPACITY_SUPPORTS_EXEC` was inert. The
+    profile now overrides only the fields it owns, over `from_env()`. After the
+    fix one reconcile asked eight zones at once.
+11. A secret-bearing dispatch whose callback address was loopback retried
+    forever, and every failure read only "output suppressed". The refusal is now
+    a permanent dispatch refusal that settles the attempt with its own sentence,
+    and suppressed outbox errors keep the exception class and Eyvan frame.
+12. `eyvan workload exec` exited 0 when every rank refused or failed; it now
+    exits 1 and names the ranks, including a failed host inside a slice.
+13. A runtime probe failing on capacity the provider still reported HEALTHY
+    (an agent restart) was logged as `preempted`; it is now `unhealthy`.
+14. A one-process native "world" called `jax.distributed.initialize`; it is now
+    a no-op, which is what makes elastic cells independent worlds.
+15. The warmth report counted a floor cell still being *requested* as warm (it
+    reused the planner's supply predicate), so a Spot floor read as held
+    seconds after its window opened and P6 could pass on a request that never
+    got capacity. Warm is now READY; in-flight floor cells are reported as
+    `provisioning_cells` (API, CLI JSON and dashboard). This changes what an
+    existing field means: `warm_cells` used to count every reserved floor cell,
+    including ones still being requested, and now counts only ready ones. A
+    reader that alerted on `warm_cells < floor` will now fire while a floor is
+    still being acquired, which is the truthful answer; `provisioning_cells`
+    (default 0, absent from older planes) says how much of the gap is in flight.
+16. The plane and the cell agent hashed their own source lazily, at first use.
+    With an editable install the tree changed in between (a reformat), the
+    digests disagreed, and the plane drained two healthy Spot cells -- one in
+    the middle of a P5 dispatch -- as running stale code. Both now hash while
+    they are built, so each reports the tree it started from.
+17. `eyvan workload status` printed a cross-zone job's first-choice pool and
+    region as "placed on" (europe-west4-b for a v5p-8 running in
+    us-central1-a). It now says "requested ... or N alternate pool(s)".
+18. "Queueing is not supported for accelerator type ... in location ..."
+    (GCP's `INVALID_ARGUMENT` for a zone with no queue for the type) was a
+    generic provider error, so the race asked those zones again once each
+    refusal was cleaned up. It is now a queue-admission denial like the
+    permission one.
+19. A workload naming no pool (a raw `submit-batch` task) took the planner's
+    generic branch, which offered it every pool on every pass: us-south1-c was
+    asked four times after denying it. The generic branch now applies the same
+    per-workload denial memory and per-pool acquisition bound as named
+    candidates.
+20. A Spot Compute VM observed STOPPING (reported as DRAINING, no reason yet)
+    was scored as a provider error: two failures and a cooldown on the zone
+    that had just delivered, although the TERMINATED observation that followed
+    was correctly a preemption. A reasonless DRAINING now leaves the zone's
+    belief untouched; the terminal state classifies the event.
+21. `eyvan proof preemption` judged the cooldown criterion over every cell the
+    pools had ever held, so a clean rerun failed on the first run's cell --
+    reclaimed and cooled by the old build an hour before the rerun was
+    submitted. It now reads only cells touched after the workload was submitted.
+22. `eyvan head up` reported a head "active" while `eyvan-server` exited at
+    every start: `Restart=always` brought it back and one `systemctl is-active`
+    read landed between crashes (the unit restarted 47 -> 50 times in 12 s). `up`
+    now requires both units to stay active with unchanged restart counters
+    across a settle window, and names the counts when they do not.
+23. New: `eyvan head up --spot` runs the head VM itself on Spot
+    (`--provisioning-model=SPOT --instance-termination-action=STOP`, so the disk
+    and its PostgreSQL survive a reclamation), for development and
+    qualification planes. Off by default.
+24. `eyvan up` from a source tree newer than the running local runtime replaced
+    the cell agent with the CLI's build and reused the plane, which -- with the
+    worker wheel it had staged -- stayed on the old one. The plane then recycled
+    every new cell as stale, a freshly granted Spot v6e-16 first. The plane now
+    records the build it serves in its owner-only PID record; the agent is
+    judged against that, and a CLI that differs is told to run `eyvan runtime
+    deploy`, which moves plane, agent and worker package together.
+25. A gang whose first submission reached some hosts and not others retired
+    the started ranks, and the dispatch retry -- same submission ID -- was
+    answered by those hosts as a replay of the launch Eyvan had just stopped. A
+    Spot v6e-16 gang was then observed with two of four ranks STOPPED and
+    declared lost. A retired execution record is now marked, and a submit
+    naming it launches again; an execution that ended by itself is still a
+    replay.
+
+26. `eyvan head up` could not produce a working head: since `300bba5` a
+    network-bound server refuses plaintext, and `head up` set neither TLS nor
+    the opt-out, so every head crash-looped at start. The head now issues
+    itself a certificate for its private address under a CA it generates (kept
+    across re-runs; the server certificate is reissued when its address, chain
+    or expiry no longer fits) and serves HTTPS. Clients *add* that CA to system
+    trust rather than replacing it: the SDK and CLI on the head find it at
+    `/etc/eyvan/control-plane-ca.pem`, elsewhere `EYVAN_CONTROL_PLANE_CA_FILE`
+    names it, and the plane hands it to every job it dispatches so the job's
+    callbacks (secret redemption, progress, children, managed artifacts,
+    including the staged OCI runner) verify it.
+27. That CA first reached jobs as PEM, and systemd forbids a newline in an
+    environment value: every dispatch from a TLS head was refused. It travels
+    base64-encoded (`EYVAN_CONTROL_PLANE_CA_B64`).
+28. The refusal itself was a 500, which every layer read as transient: the plane
+    retried a launch the worker could never accept for twenty minutes while
+    the lease held its v6e-4. The native worker now answers a rejected launch
+    with 400 `invalid_configuration`, the remote client and the cell agent pass
+    that verdict on, and the plane fails the attempt with the worker's sentence
+    and returns the capacity.
+29. The SDK retried mutations on 429/502/503/504 but not reads: one
+    `GET /workloads/{id}` answered 503 with `Retry-After` for a PostgreSQL
+    serialization conflict ended a client's `wait()` while the job ran on.
+    Safe reads now follow the same retry policy.
+30. Outbox failures on the transient paths (agent busy or unreachable) and
+    provider errors now keep the exception class and Eyvan frame through
+    secret suppression, as the generic path already did.
+31. A TPU shape could run on Compute Engine only if the catalog made Compute its
+    default, so v5e -- queue-only by default -- could not be obtained in a
+    project whose queue refuses it, although Compute Spot VMs of the same
+    machine family were available. Single-VM v5e and v6e rows now carry their
+    Compute TPU identity (`ct5lp`, `ct6e`, accelerator image), and a node type
+    may opt into `capacity_backend: gcp-compute`; the queue stays the default.
+32. A request the provider had already refused (a Compute stockout answers at
+    once) still counted as racing until its provisioning timeout, so twenty
+    stocked-out zones held all twenty race slots and six zones went unasked for
+    forty minutes. Such pools are now "stalled": never re-asked by the race and
+    not counted against its width. After the fix the six were asked on the next
+    pass and one granted.
+33. An idle loopback plane used a steady ~16% of a core: every repository
+    transaction deep-copied the whole in-memory state (about 30 transactions
+    per two-second leader cycle, each copying some 150 cells, 3,000 events and
+    their outbox history). Every stored record is a frozen model, so a
+    transaction now copies only the containers and shares the records;
+    rollback isolation is unchanged, nested containers included. Five idle
+    cycles went from 7.56 s to 0.16 s, and the live plane from ~16% to ~1%.
+
+**Local verification after all 33 fixes:** full suite 7,031 passed (175
+PostgreSQL/helm skips); with PostgreSQL 17.11 required, 7,155 passed and 30
+helm/monorepo-only skips; ruff, format, mypy, import contracts, lock, generated
+API/env references and license headers pass; dashboard typecheck, 291 tests,
+lint and format pass.
+
 ## Domain contracts and durable phase recovery (2026-09-13; local)
 
 New domain-boundary/resource-vector contracts strengthen public model coverage

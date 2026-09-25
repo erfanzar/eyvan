@@ -36,6 +36,8 @@ import typing as tp
 import urllib.request
 from pathlib import Path
 
+from eyvan._internal.plane_tls import control_plane_urlopen_options
+
 DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
 
 #: Written only after an extraction succeeds, and only ever seen inside a
@@ -54,7 +56,7 @@ def _fetch(uri: str, *, token: str | None) -> bytes:
         raise ValueError(f"unsupported workspace URI scheme: {uri}")
     if token:
         request.add_header("X-Eyvan-Artifact-Token", token)
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request, **control_plane_urlopen_options()) as response:
         return tp.cast(bytes, response.read())
 
 

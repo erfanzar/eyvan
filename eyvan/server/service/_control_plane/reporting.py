@@ -284,15 +284,24 @@ class ReportingMixin:
                 and cell_provides_pool_supply(cell, pool, moment)
             ]
             floor = pool.warm_floor(moment)
-            # Only the cells the floor actually reserves are warm; anything above it
+            # Only the cells the floor actually reserves count; anything above it
             # is ordinary demand-driven capacity and belongs to no warm promise.
-            warm = supplying[: max(floor, 0)]
+            # Ready ones first, so a floor that has one ready cell and one still
+            # being requested reports the ready one as warm.
+            reserved = sorted(supplying, key=lambda cell: cell.state is not CellState.READY)[: max(floor, 0)]
+            # The planner counts an in-flight request as supply so it does not
+            # launch twice, and that is right for planning. It is not warmth: a
+            # Spot request still in the queue serves no one at 09:00. Counting it
+            # reported a v6e-4 floor as held fifteen seconds after the window
+            # opened, while the request had not reached GCP (2026-09-24).
+            warm = [cell for cell in reserved if cell.state is CellState.READY]
             warmth.append(
                 PoolWarmth(
                     pool_id=pool.id,
                     floor=floor,
                     window_active=any(window.covers(moment) for window in pool.warm_windows),
                     warm_cells=len(warm),
+                    provisioning_cells=len(reserved) - len(warm),
                     warm_idle_cells=sum(1 for cell in warm if cell.id not in leased),
                     hourly_cost=costing.total(*(cell.hourly_cost() for cell in warm)),
                 )

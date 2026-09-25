@@ -37,7 +37,12 @@ from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import ContextConfigError
 from eyvan.sdk.shapes import summarize_shapes
 from eyvan.server.api.schemas import CellUpsertRequest, FleetApplyRequest, FleetStatusResponse
-from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, ensure_loopback_control_plane
+from eyvan.server.local.daemon import (
+    LocalDaemonError,
+    LocalDaemonResult,
+    ensure_loopback_control_plane,
+    serving_runtime_profile_path,
+)
 
 LoopbackControlPlanePreparer: tp.TypeAlias = tp.Callable[[str | ControlPlaneEndpoint], LocalDaemonResult]
 NativeGcpRuntimeProfileAvailability: tp.TypeAlias = tp.Callable[[], bool]
@@ -274,8 +279,16 @@ class FleetCommandService:
         endpoint = ControlPlaneEndpoint.parse(self.session.base_url)
         if not endpoint.is_loopback:
             return
-        if requires_native_gcp_runtime(config) or self.native_gcp_profile_available():
-            runtime = self.gcp_runtime if self.gcp_runtime is not None else GcpNativeRuntimeSupervisor()
+        # A plane already serving a profile (``eyvan runtime deploy --profile``)
+        # is a native runtime whether or not the default profile exists.
+        if (
+            requires_native_gcp_runtime(config)
+            or serving_runtime_profile_path(endpoint) is not None
+            or self.native_gcp_profile_available()
+        ):
+            runtime = (
+                self.gcp_runtime if self.gcp_runtime is not None else GcpNativeRuntimeSupervisor.for_endpoint(endpoint)
+            )
             runtime.ensure(endpoint)
             # The runtime just started (or reused) a plane that may have minted
             # the development credential this session resolved its identity

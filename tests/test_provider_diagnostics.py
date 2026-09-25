@@ -40,3 +40,25 @@ def test_safe_provider_diagnostic_matches_the_error_marker_case_insensitively(ma
     raw = f"Create request issued for: [cell-r1]\n{diagnostic}"
 
     assert safe_provider_diagnostic(raw) == diagnostic
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "Compute instance creation failed: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS The zone "
+        "'projects/p/zones/us-central1-a' does not have enough resources available to fulfill the request.",
+        "Quota exceeded for quota metric 'TPUV5sPreemptiblePodPerProjectPerRegionForTPUAPI'",
+        "Compute instance was reclaimed by the provider (Spot preemption)",
+    ),
+)
+def test_stockout_quota_and_preemption_causes_reach_the_user_verbatim(line: str) -> None:
+    """Compute's stockout code matched none of the gcloud markers, so every Compute
+    stockout was flattened into "inspect Eyvan controller logs" (2026-09-24)."""
+
+    assert safe_provider_diagnostic(f"some progress noise\n{line}\n") == line
+
+
+def test_an_unreachable_agent_is_not_reported_as_a_provider_rejection() -> None:
+    raw = "the cell agent could not be reached: [Errno 61] Connection refused"
+
+    assert safe_provider_diagnostic(raw) == raw

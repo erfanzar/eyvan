@@ -950,8 +950,59 @@ def exec_in_workload(
         f"/api/v1/workloads/{workload_id}/exec",
         json={"command": list(command), "timeout_s": timeout_s, "rank": rank},
     )
+    if is_json_object(response) and response.get("output_suppressed") is True and response.get("results") == []:
+        emit_result(service.renderer, response, "Exec not available", as_json=as_json)
+        click.echo("exec is not available for workloads with secret mounts; nothing ran", err=True)
+        raise SystemExit(1)
     where = "every rank" if rank is None else f"rank {rank}"
     emit_result(service.renderer, response, f"Ran {' '.join(command)} on {where}", as_json=as_json)
+    failed = _failed_exec_ranks(response)
+    if failed:
+        # The document above is complete either way; the exit status is what a
+        # script branches on. It was 0 while every rank answered "this fleet
+        # does not permit exec" (2026-09-24), so a caller could not tell a
+        # refused diagnostic from a successful one without parsing the body.
+        click.echo(f"exec failed on rank(s) {', '.join(str(index) for index in failed)}", err=True)
+        raise SystemExit(1)
+
+
+def _failed_exec_ranks(response: JsonValue) -> list[int]:
+    """Return the ranks whose exec was refused, unreachable, or exited non-zero.
+
+    A slice or gang answers for its hosts under ``ranks``; one failed host
+    fails the rank that owns it. An absent exit code alone is not a failure:
+    suppressed output withholds it on purpose.
+    """
+
+    if not is_json_object(response):
+        return []
+    results = response.get("results")
+    if not isinstance(results, list):
+        return []
+    failed: list[int] = []
+    for index, result in enumerate(results):
+        if not is_json_object(result):
+            continue
+        rank = result.get("rank")
+        if _exec_result_failed(result):
+            failed.append(rank if isinstance(rank, int) else index)
+    return failed
+
+
+def _exec_result_failed(result: JsonValue) -> bool:
+    """Return whether one exec answer, or any host nested under it, failed."""
+
+    if not is_json_object(result):
+        return False
+    exit_code = result.get("exit_code")
+    if result.get("error") is not None or result.get("observed") is False:
+        return True
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return True
+    hosts = result.get("ranks")
+    return isinstance(hosts, list) and any(
+        _exec_result_failed(host.get("result")) for host in hosts if is_json_object(host)
+    )
 
 
 @click.group("workload")

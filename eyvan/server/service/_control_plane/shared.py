@@ -44,7 +44,11 @@ from eyvan.artifacts.managed import (
 from eyvan.artifacts.managed import result_uri as managed_result_uri
 from eyvan.capacity.drivers.base import backend_capabilities, providers_hosting_multi_worker_cells
 from eyvan.capacity.planning import (
+    POOL_ALTERNATE_TEMPLATES_LABEL,
     POOL_ALTERNATES_LABEL,
+    POOL_LABEL,
+    POOL_TEMPLATE_LABEL,
+    candidate_pool_templates,
     candidate_zone_report,
     cell_matches_template,
     cell_provides_pool_supply,
@@ -645,6 +649,9 @@ __all__ = (
     "MAX_LIVE_CHILDREN",
     "MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE",
     "POOL_ALTERNATES_LABEL",
+    "POOL_ALTERNATE_TEMPLATES_LABEL",
+    "POOL_LABEL",
+    "POOL_TEMPLATE_LABEL",
     "QUEUE_TREND_MAX_BUCKETS",
     "QUEUE_TREND_MAX_WINDOW_S",
     "QUEUE_TREND_MIN_WINDOW_S",
@@ -809,6 +816,7 @@ __all__ = (
     "artifact_reference_id",
     "asyncio",
     "backend_capabilities",
+    "candidate_pool_templates",
     "candidate_zone_report",
     "cell_matches_template",
     "cell_provides_pool_supply",

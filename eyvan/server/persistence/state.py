@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import typing as tp
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
+
+from pydantic import BaseModel
 
 from eyvan.records import (
     ArtifactReferenceRecord,
@@ -728,10 +729,75 @@ class StateSession(RepositorySession):
         return claimed
 
 
+def _copy_containers(value: tp.Any) -> tp.Any:
+    """Copy every dict, list and set; share everything else."""
+
+    if isinstance(value, dict):
+        return {key: _copy_containers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_containers(item) for item in value]
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+def _structural_copy(state: ControlPlaneState) -> ControlPlaneState:
+    """Return a transaction's working copy: new containers, shared records.
+
+    Every value the state holds is a frozen model, so a session can change the
+    state only by putting a new record into a container -- and every container
+    is copied, nested ones included. A rolled-back session therefore leaves the
+    committed state untouched, exactly as a deep copy did.
+
+    A deep copy of every record, on every transaction, was the idle cost of
+    this store: a loopback plane with no fleets spent a steady ~16% of a core
+    re-copying some 150 cells, 3,000 events and their outbox history about 30
+    times per leader cycle (2026-09-25). Sharing the records also makes the
+    commit check cheap, since comparing a record with itself is an identity
+    test.
+    """
+
+    return ControlPlaneState(**{item.name: _copy_containers(getattr(state, item.name)) for item in fields(state)})
+
+
+class RecordMutatedInPlaceError(RuntimeError):
+    """A transaction changed a committed record instead of replacing it."""
+
+
+def _record_fingerprint(value: tp.Any) -> tp.Any:
+    """Return a comparable value snapshot of every record reachable from ``value``."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return {key: _record_fingerprint(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_record_fingerprint(item) for item in value]
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+def _state_fingerprint(state: ControlPlaneState) -> dict[str, tp.Any]:
+    return {item.name: _record_fingerprint(getattr(state, item.name)) for item in fields(state)}
+
+
 class StateRepository:
-    """Copy-on-write repository mechanics shared by memory and local JSON stores."""
+    """Copy-on-write repository mechanics shared by memory and local JSON stores.
+
+    Contract: a record returned by a session is shared with committed state and
+    must be treated as read-only. ``frozen=True`` stops attribute assignment but
+    not changes to a record's dict fields (``spec.environment``, ``labels``,
+    ``metadata``, outbox payloads); such a change would escape rollback and, on
+    a successful commit, would not even be detected as a change. Build a new
+    record with ``model_copy(update=...)`` and ``put_*`` it instead.
+    """
 
     session_type: type[StateSession] = StateSession
+    #: Off in production (it costs what the structural copy saved). The test
+    #: suite turns it on, so any code path that edits a committed record in place
+    #: fails loudly instead of silently corrupting rollback.
+    verify_record_immutability: tp.ClassVar[bool] = False
 
     def __init__(self) -> None:
         self._state = ControlPlaneState()
@@ -777,14 +843,25 @@ class StateRepository:
         await self.open()
         committed_events = False
         async with self._transaction_lock:
-            working = copy.deepcopy(self._state)
+            committed = self._state
+            fingerprint = _state_fingerprint(committed) if self.verify_record_immutability else None
+            working = _structural_copy(committed)
             start_sequence = working.next_event_sequence
-            yield self.session_type(working)
-            if working != self._state:
-                working.revision += 1
-                self._persist(working)
-                self._state = working
-                committed_events = working.next_event_sequence > start_sequence
+            try:
+                yield self.session_type(working)
+                if working != self._state:
+                    working.revision += 1
+                    self._persist(working)
+                    self._state = working
+                    committed_events = working.next_event_sequence > start_sequence
+            finally:
+                # ``committed``'s containers are never handed to the session, so
+                # any difference here is a record edited in place.
+                if fingerprint is not None and _state_fingerprint(committed) != fingerprint:
+                    raise RecordMutatedInPlaceError(
+                        "a transaction mutated a committed record in place; replace it with "
+                        "model_copy(update=...) and put_* instead"
+                    )
         if committed_events:
             async with self._event_condition:
                 self._event_condition.notify_all()
@@ -869,4 +946,4 @@ class StateRepository:
         return claimed[0] if claimed else None
 
 
-__all__ = ("ControlPlaneState", "StateRepository", "StateSession")
+__all__ = ("ControlPlaneState", "RecordMutatedInPlaceError", "StateRepository", "StateSession")

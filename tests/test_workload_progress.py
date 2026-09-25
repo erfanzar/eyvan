@@ -604,3 +604,176 @@ async def test_workload_progress_counts_every_cell_of_a_running_elastic_pack() -
     assert progress.phase is WorkloadProgressPhase.RUNNING
     assert progress.capacity.ready_workers == 6
     assert progress.capacity.active_cells == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cell_lost_after_a_successful_apply_narrates_its_own_provider_cause() -> None:
+    """2026-09-24, us-central1-a: the Spot insert failed after ``create`` returned,
+    so the apply command held no error and the user saw ``hard_constraint``."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool)
+    detail = (
+        "Compute instance creation failed: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS The zone "
+        "'projects/p/zones/us-central1-c' does not have enough resources available to fulfill the request."
+    )
+    lost_cell = pool.make_cell(
+        "research-us-central1-c-v6e-16-0003",
+        worker_count=2,
+        autoscale_request_workload_id=workload.id,
+    ).model_copy(
+        update={
+            "state": CellState.UNAVAILABLE,
+            "provider_phase": CapacityStatus.NEEDS_RECREATE,
+            "unavailable_detail": detail,
+            "provider_failure_code": CapacityProviderFailureCode.STOCKOUT,
+        }
+    )
+    succeeded = OutboxRecord(
+        id="capacity-apply-succeeded",
+        topic="capacity.apply",
+        aggregate_type="cell",
+        aggregate_id=lost_cell.id,
+        idempotency_key="capacity-apply-succeeded",
+        generation=lost_cell.generation,
+        state=OutboxState.SUCCEEDED,
+        attempts=1,
+    )
+    await _seed(repository, pool, workload, cells=(lost_cell,), commands=(succeeded,))
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.PROVIDER_FAILURE
+    assert progress.retry is not None
+    assert progress.retry.state is OutboxState.SUCCEEDED, "the command's own state is not rewritten"
+    assert progress.retry.diagnostic is not None
+    assert "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS" in progress.retry.diagnostic
+    assert progress.retry.failure_code is CapacityProviderFailureCode.STOCKOUT
+
+
+@pytest.mark.asyncio
+async def test_a_commands_own_diagnostic_still_wins_over_a_cell_detail() -> None:
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool)
+    lost_cell = pool.make_cell(
+        "research-us-central1-c-v6e-16-0004",
+        worker_count=2,
+        autoscale_request_workload_id=workload.id,
+    ).model_copy(
+        update={
+            "state": CellState.UNAVAILABLE,
+            "provider_phase": CapacityStatus.PROVIDER_ERROR,
+            "unavailable_detail": "an older cause recorded on the cell",
+        }
+    )
+    failed = OutboxRecord(
+        id="capacity-apply-failed",
+        topic="capacity.apply",
+        aggregate_type="cell",
+        aggregate_id=lost_cell.id,
+        idempotency_key="capacity-apply-failed",
+        generation=lost_cell.generation,
+        state=OutboxState.FAILED,
+        attempts=2,
+        last_error="ERROR: QUOTA_EXCEEDED: quota exceeded for TPUV6E",
+    )
+    await _seed(repository, pool, workload, cells=(lost_cell,), commands=(failed,))
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.retry is not None and progress.retry.diagnostic is not None
+    assert "QUOTA_EXCEEDED" in progress.retry.diagnostic
+    assert "older cause" not in progress.retry.diagnostic
+
+
+@pytest.mark.asyncio
+async def test_a_workload_the_planner_stopped_acquiring_for_does_not_say_requesting() -> None:
+    """2026-09-24: a v5e pool GCP failed sixteen times tripped the acquisition bound,
+    and the SDK went on printing "requesting one elastic cell" beneath it."""
+
+    from eyvan.records import ACQUISITION_EXHAUSTED_SCHEDULING_REASON
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool).model_copy(
+        update={
+            "autoscale_block_reason": AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED,
+            # What the scheduler writes on every pass, over the planner's sentence.
+            "scheduling_reason": "hard_constraint: no cell satisfies all hard workload constraints",
+        }
+    )
+    await _seed(repository, pool, workload)
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.PROVIDER_FAILURE
+    assert progress.scheduling_reason == ACQUISITION_EXHAUSTED_SCHEDULING_REASON
+
+
+@pytest.mark.asyncio
+async def test_a_denial_in_one_zone_does_not_hide_another_zone_provisioning() -> None:
+    """2026-09-24: us-east1-b denied a cross-zone v5e workload and the progress route kept
+    saying so while us-south1-a was provisioning the job's capacity."""
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool).model_copy(update={"autoscale_block_reason": AutoscaleBlockReason.QUEUE_ADMISSION_DENIED})
+    provisioning = pool.make_cell(
+        "research-us-central1-c-v6e-16-0009",
+        worker_count=2,
+        autoscale_request_workload_id=workload.id,
+    ).model_copy(update={"state": CellState.REGISTERING, "provider_phase": CapacityStatus.PROVISIONING})
+    await _seed(repository, pool, workload, cells=(provisioning,))
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.PROVISIONING
+
+
+@pytest.mark.asyncio
+async def test_a_denial_with_nothing_else_in_flight_is_still_reported() -> None:
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    pool = _pool()
+    workload = _workload(pool).model_copy(update={"autoscale_block_reason": AutoscaleBlockReason.QUEUE_ADMISSION_DENIED})
+    await _seed(repository, pool, workload)
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.QUEUE_ADMISSION_DENIED
+
+
+@pytest.mark.asyncio
+async def test_a_raced_workload_names_the_zone_building_its_capacity() -> None:
+    """2026-09-24: "provisioning | v5litepod-8 | europe-west4-a" while us-south1-a built the cell."""
+
+    from eyvan.records import POOL_ALTERNATE_TEMPLATES_LABEL, POOL_ALTERNATES_LABEL
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository)
+    first = _pool()
+    other = first.model_copy(update={"id": "research-us-south1-a-v6e-16", "zone": "us-south1-a", "region": "us-south1"})
+    workload = _workload(first)
+    labels = {
+        **workload.spec.required_labels,
+        POOL_ALTERNATES_LABEL: other.id,
+        POOL_ALTERNATE_TEMPLATES_LABEL: other.template_fingerprint,
+    }
+    workload = workload.model_copy(update={"spec": workload.spec.model_copy(update={"required_labels": labels})})
+    provisioning = other.make_cell(
+        "research-us-south1-a-v6e-16-0001", worker_count=2, autoscale_request_workload_id=workload.id
+    ).model_copy(update={"state": CellState.REGISTERING, "provider_phase": CapacityStatus.PROVISIONING})
+    await _seed(repository, first, workload, cells=(provisioning,))
+    async with repository.transaction() as transaction:
+        await transaction.put_capacity_pool(other)
+
+    progress = await WorkloadProgressResolver(service, repository).resolve(_operator(), workload.id)
+
+    assert progress.phase is WorkloadProgressPhase.PROVISIONING
+    assert progress.pool is not None and progress.pool.zone == "us-south1-a"

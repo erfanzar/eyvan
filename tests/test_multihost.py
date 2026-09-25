@@ -615,3 +615,101 @@ def test_an_interrupted_rank_is_not_recorded_as_a_gang_that_never_formed(monkeyp
 
     assert exits == []
     assert _multihost_site.GANG_INITIALIZATION_FAILED_MARKER not in capsys.readouterr().err
+
+
+class _OlderJaxDistributed(_FakeDistributed):
+    """``jax.distributed`` as JAX 0.6.2 shipped it: no ``heartbeat_timeout_seconds``."""
+
+    def initialize(  # type: ignore[override]
+        self,
+        *,
+        cluster_detection_method: str,
+        coordinator_address: str | None = None,
+        num_processes: int | None = None,
+        process_id: int | None = None,
+        initialization_timeout: int | None = None,
+    ) -> None:
+        super().initialize(
+            cluster_detection_method=cluster_detection_method,
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+            initialization_timeout=initialization_timeout,
+        )
+
+
+@pytest.mark.parametrize("detection", ["gcetpu", "explicit"])
+def test_a_jax_without_the_heartbeat_argument_still_forms_the_gang(monkeypatch, capsys, detection: str) -> None:
+    """Found on a two-slice Spot v6e-4 on 2026-09-24 (JAX 0.6.2): both ranks died with
+    ``initialize() got an unexpected keyword argument 'heartbeat_timeout_seconds'``
+    before any user code ran. A tuning argument this JAX does not name is dropped,
+    said so, and the gang forms; the identity arguments are never dropped."""
+
+    distributed = _OlderJaxDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", detection)
+    if detection == "explicit":
+        monkeypatch.setenv("JAX_COORDINATOR_ADDRESS", "10.0.0.2:8476")
+        monkeypatch.setenv("JAX_PROCESS_COUNT", "2")
+        monkeypatch.setenv("JAX_PROCESS_ID", "1")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert len(distributed.initialize_calls) == 1
+    assert distributed.initialization_timeout == _multihost_site.DEFAULT_INITIALIZATION_TIMEOUT_S
+    if detection == "explicit":
+        assert distributed.initialize_calls[0]["process_id"] == 1
+        assert distributed.initialize_calls[0]["num_processes"] == 2
+    assert "does not accept heartbeat_timeout_seconds" in capsys.readouterr().err
+
+
+def test_a_jax_that_takes_any_keyword_still_gets_the_heartbeat(monkeypatch) -> None:
+    received: dict[str, object] = {}
+
+    class _Permissive:
+        @staticmethod
+        def is_initialized() -> bool:
+            return False
+
+        @staticmethod
+        def initialize(**arguments: object) -> None:
+            received.update(arguments)
+
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=_Permissive()))
+
+    initialize_from_environment()
+
+    assert received["heartbeat_timeout_seconds"] == _multihost_site.DEFAULT_HEARTBEAT_TIMEOUT_S
+
+
+def test_a_one_process_world_joins_nothing_and_raises_nothing(monkeypatch) -> None:
+    """Each cell of an elastic job is its own world; a single-host cell's world is one
+    process. That printed "process configuration is invalid" on every rank."""
+
+    distributed = _FakeDistributed()
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "explicit")
+    monkeypatch.setenv("JAX_COORDINATOR_ADDRESS", "10.0.0.2:8476")
+    monkeypatch.setenv("JAX_PROCESS_COUNT", "1")
+    monkeypatch.setenv("JAX_PROCESS_ID", "0")
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=distributed))
+
+    initialize_from_environment()
+
+    assert distributed.initialize_calls == []
+
+
+@pytest.mark.parametrize(("count", "process_id"), (("0", "0"), ("1", "1"), ("2", "2")))
+def test_an_impossible_world_is_still_refused(monkeypatch, count: str, process_id: str) -> None:
+    monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "explicit")
+    monkeypatch.setenv("JAX_COORDINATOR_ADDRESS", "10.0.0.2:8476")
+    monkeypatch.setenv("JAX_PROCESS_COUNT", count)
+    monkeypatch.setenv("JAX_PROCESS_ID", process_id)
+    monkeypatch.setitem(sys.modules, "jax", SimpleNamespace(distributed=_FakeDistributed()))
+
+    with pytest.raises(RuntimeError, match="invalid"):
+        initialize_from_environment()

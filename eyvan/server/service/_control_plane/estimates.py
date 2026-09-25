@@ -8,6 +8,10 @@ from __future__ import annotations
 from eyvan.server.service._control_plane.shared import (
     _QUEUE_TREND_MAX_EVENTS,
     ACTIVE_LEASE_STATES,
+    POOL_ALTERNATE_TEMPLATES_LABEL,
+    POOL_ALTERNATES_LABEL,
+    POOL_LABEL,
+    POOL_TEMPLATE_LABEL,
     QUEUE_TREND_MAX_BUCKETS,
     QUEUE_TREND_MAX_WINDOW_S,
     QUEUE_TREND_MIN_WINDOW_S,
@@ -24,6 +28,7 @@ from eyvan.server.service._control_plane.shared import (
     WorkloadEstimate,
     WorkloadState,
     accelerator_unit_price,
+    candidate_pool_templates,
     costing,
     datetime,
     math,
@@ -123,10 +128,24 @@ class EstimatesMixin:
             return False
         if spec.capacity_class is not pool.capacity_class:
             return False
-        if spec.region and pool.region != spec.region:
+        cross_zone = bool(spec.required_labels.get(POOL_ALTERNATES_LABEL))
+        if spec.region and pool.region != spec.region and not cross_zone:
             return False
         if spec.provider and pool.provider != spec.provider:
             return False
+        # A cross-zone workload names its alternates and their templates as
+        # labels no pool carries; asking a pool to carry them made every
+        # cross-zone workload match no pool at all. Its pool pins are "one of".
+        choices = {}
+        if spec.required_labels.get(POOL_ALTERNATES_LABEL):
+            choices = candidate_pool_templates(spec.required_labels)
+        if choices:
+            if pool.id not in choices:
+                return False
+            ignored = {POOL_ALTERNATES_LABEL, POOL_ALTERNATE_TEMPLATES_LABEL, POOL_LABEL, POOL_TEMPLATE_LABEL}
+            return all(
+                pool.labels.get(name) == value for name, value in spec.required_labels.items() if name not in ignored
+            )
         return all(pool.labels.get(name) == value for name, value in spec.required_labels.items())
 
     async def queue_trend(

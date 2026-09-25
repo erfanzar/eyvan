@@ -85,7 +85,12 @@ Establishes that `secret_mounts` references resolve at dispatch into the
 attempt's environment, for every attempt, not just the first.
 
 **Passes when** the job exits 0 having read the value (it exits 1 when the
-variable is missing), across at least two attempts.
+variable is missing), across at least two attempts. `eyvan proof secret`
+judges the ledger *per attempt*: exactly one `secret.issued` and one
+`secret.read` in each attempt, no read without an issuance, and the value in
+no log, record or audit payload; a multi-attempt run adds a `redelivered`
+check. (Until 2026-09-24 it counted events across the whole workload and so
+failed the two-attempt run this section describes.)
 
 **Shape** any cell; CPU is enough. **~15 minutes.**
 

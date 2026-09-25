@@ -65,6 +65,8 @@ def create_agent_app(
         ValueError: If no shared secret is configured and ``allow_unauthenticated`` is False.
     """
 
+    # Pin this process's identity to the tree it started from; see build_identity.
+    build_identity()
     settings = settings or EyvanSettings.from_env()
     if settings.agent_shared_secret is None:
         if not allow_unauthenticated:

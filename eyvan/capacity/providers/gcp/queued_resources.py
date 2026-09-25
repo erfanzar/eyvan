@@ -384,6 +384,27 @@ class QueuedResourceSpec:
         return args
 
 
+def _queued_resource_failure(raw: JsonObject) -> str | None:
+    """Return the provider's own words for a FAILED queued resource, if it gave any.
+
+    GCP records why in ``state.failedData.error`` -- on 2026-09-24 a Spot
+    v5litepod-8 in us-west4-a failed with "Failed to perform tenant project
+    creation" -- and Eyvan reported only "queued resource is terminal".
+    """
+
+    state = raw.get("state")
+    failed = state.get("failedData") if is_json_object(state) else None
+    error = failed.get("error") if is_json_object(failed) else None
+    if not is_json_object(error):
+        return None
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    code = error.get("code")
+    words = " ".join(message.split())
+    return f"{words} (code {code})" if isinstance(code, int) and not isinstance(code, bool) else words
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedResource:
     qr_id: str
@@ -635,7 +656,15 @@ class GcloudTpuProvider:
         """
 
         normalized = " ".join(diagnostic.casefold().split())
-        return "does not have permission to submit requests into this queue" in normalized
+        # "Queueing is not supported" is the same answer from the other side: the
+        # zone has no queue for this accelerator type at all, so a retry can never
+        # be admitted either. Left as a generic provider error, a 20-zone v5e-8
+        # race asked asia-northeast1-b and europe-west3-c again after each
+        # refusal had been cleaned up (2026-09-24).
+        return (
+            "does not have permission to submit requests into this queue" in normalized
+            or "queueing is not supported for accelerator type" in normalized
+        )
 
     @staticmethod
     def _exposes_ownership_fields(qr: QueuedResource) -> bool:
@@ -1075,8 +1104,15 @@ class GcloudTpuProvider:
         if qr.state is GcpQueuedResourceState.ACTIVE:
             return ProviderObservation(CapacityStatus.ACTIVE, f"{prefix}GCP reports it active; TPU workers are starting")
         if qr.terminal:
+            failure = _queued_resource_failure(qr.raw)
+            if failure is None:
+                return ProviderObservation(
+                    CapacityStatus.NEEDS_RECREATE, f"{prefix}queued resource is terminal ({qr.state})"
+                )
             return ProviderObservation(
-                CapacityStatus.NEEDS_RECREATE, f"{prefix}queued resource is terminal ({qr.state})"
+                CapacityStatus.NEEDS_RECREATE,
+                f"{prefix}queued resource is terminal ({qr.state}): {failure}",
+                failure_code=provider_failure_from_diagnostic(failure),
             )
         return ProviderObservation(CapacityStatus.UNAVAILABLE, f"{prefix}GCP reports queued resource {qr.state}")
 

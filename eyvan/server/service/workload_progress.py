@@ -13,6 +13,7 @@ from eyvan.capacity import PENDING_CAPACITY_STATUSES, QUEUED_CAPACITY_STATUSES, 
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.domain.models import PlacementMode
 from eyvan.records import (
+    ACQUISITION_EXHAUSTED_SCHEDULING_REASON,
     AutoscaleBlockReason,
     CapacityRetryProgress,
     CellRecord,
@@ -28,6 +29,7 @@ from eyvan.records import (
     WorkloadProgressPhase,
     WorkloadRecord,
     WorkloadState,
+    candidate_pool_templates,
     scale_resources,
 )
 from eyvan.server.persistence.base import Repository
@@ -93,6 +95,13 @@ class WorkloadProgressResolver:
                     for cell in sorted(cells_by_id.values(), key=lambda candidate: candidate.id)
                     if _matches_workload_capacity(cell, workload, pool_id)
                 )
+            # Name the zone that is actually building this workload's capacity.
+            # A raced workload's first choice may have refused it outright, and
+            # "provisioning | europe-west4-a" beside capacity in us-south1-a
+            # sent the reader to the wrong zone (2026-09-24).
+            leading = _leading_pool_id(matching_cells, pool_id)
+            if leading is not None and leading != pool_id:
+                pool = await transaction.get_capacity_pool(leading) or pool
             commands = await transaction.list_outbox_for_aggregates(
                 "cell",
                 {cell.id: cell.generation for cell in matching_cells},
@@ -104,13 +113,21 @@ class WorkloadProgressResolver:
             reports = await transaction.list_progress_reports(workload.id)
 
         capacity = _capacity_summary(matching_cells)
-        retry = _capacity_retry(matching_cells, commands)
+        retry = _with_lost_cell_diagnostic(_capacity_retry(matching_cells, commands), matching_cells)
         resources_per_cell = workload.spec.resources_per_cell
         return WorkloadProgress(
             workload_id=workload.id,
             workload_state=workload.state,
             phase=_phase(workload, capacity, retry),
-            scheduling_reason=workload.scheduling_reason,
+            # The scheduler rewrites ``scheduling_reason`` every pass, usually
+            # to a generic "no cell satisfies" -- which, for a workload the
+            # planner has stopped acquiring for, hides the one sentence that
+            # names the remedy.
+            scheduling_reason=(
+                ACQUISITION_EXHAUSTED_SCHEDULING_REASON
+                if workload.autoscale_block_reason is AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED
+                else workload.scheduling_reason
+            ),
             failure_reason=workload.failure_reason,
             autoscale_block_reason=workload.autoscale_block_reason,
             queue_admission_denial=workload.queue_admission_denial,
@@ -140,13 +157,22 @@ class WorkloadProgressResolver:
 
 
 def _matches_workload_capacity(cell: CellRecord, workload: WorkloadRecord, pool_id: str | None) -> bool:
-    """Return whether a live cell is an exact physical candidate for a pinned workload."""
+    """Return whether a live cell is an exact physical candidate for a pinned workload.
+
+    Any of the workload's candidate pools counts, not only its first choice: a
+    racing cross-zone workload is provisioning in every zone it asked, and
+    reporting only the first would show "0 cells" beside capacity being built
+    for it elsewhere.
+    """
 
     if pool_id is None or cell.state is CellState.DELETED:
         return False
-    if cell.pool_id != pool_id or cell.worker_count != workload.spec.worker_count:
+    if cell.worker_count != workload.spec.worker_count:
         return False
-    template = workload.spec.required_labels.get(_POOL_TEMPLATE_LABEL)
+    candidates = candidate_pool_templates(workload.spec.required_labels) or {pool_id: None}
+    if cell.pool_id not in candidates:
+        return False
+    template = candidates[cell.pool_id]
     return template is None or cell.labels.get(_POOL_TEMPLATE_LABEL) == template
 
 
@@ -169,12 +195,13 @@ def _elastic_pack_candidates(
     if pool_id is None:
         return ()
     need = workload.spec.worker_count
-    template = workload.spec.required_labels.get(_POOL_TEMPLATE_LABEL)
+    candidates = candidate_pool_templates(workload.spec.required_labels) or {pool_id: None}
     own: list[CellRecord] = []
     warm: list[CellRecord] = []
     for cell in cells:
-        if cell.pool_id != pool_id or cell.state is CellState.DELETED or cell.worker_count > need:
+        if cell.pool_id not in candidates or cell.state is CellState.DELETED or cell.worker_count > need:
             continue
+        template = candidates[cell.pool_id]
         if template is not None and cell.labels.get(_POOL_TEMPLATE_LABEL) != template:
             continue
         if cell.id in leased_by_workload:
@@ -256,6 +283,26 @@ def _capacity_summary(cells: tuple[CellRecord, ...]) -> WorkloadCapacitySummary:
     )
 
 
+def _leading_pool_id(cells: tuple[CellRecord, ...], first_choice: str | None) -> str | None:
+    """Return the pool of the cell furthest along, preferring the first choice on a tie."""
+
+    def progress(cell: CellRecord) -> int:
+        if cell.state is CellState.READY:
+            return 4
+        if _is_provisioning(cell) or cell.provider_phase in {CapacityStatus.ACTIVE, CapacityStatus.EXECUTION_CONNECTING}:
+            return 3
+        if cell.provider_phase in QUEUED_CAPACITY_STATUSES:
+            return 2
+        if cell.provider_phase is CapacityStatus.REQUESTING:
+            return 1
+        return 0
+
+    ranked = [(progress(cell), cell.pool_id == first_choice, cell.pool_id) for cell in cells if cell.pool_id]
+    if not ranked or max(ranked)[0] == 0:
+        return first_choice
+    return max(ranked)[2]
+
+
 def _observed_tpu_vms(cells: tuple[CellRecord, ...]) -> int | None:
     """Return a total only when GCP observed every matching TPU allocation."""
 
@@ -308,6 +355,40 @@ def _capacity_retry(
     )
 
 
+def _with_lost_cell_diagnostic(
+    retry: CapacityRetryProgress | None,
+    cells: tuple[CellRecord, ...],
+) -> CapacityRetryProgress | None:
+    """Carry a lost cell's own cause when the capacity command has nothing to say.
+
+    A capacity apply can *succeed* and the cell still be lost minutes later --
+    a Spot insert that fails after the create call returned, a reclamation. The
+    command then holds no error, so a blocked workload narrated "capacity request
+    rejected" with ``hard_constraint`` or nothing beneath it, while the cell's
+    record held the provider's sentence (2026-09-24, a Spot stockout in
+    us-central1-a). Only fills a gap: a command's own diagnostic wins, and no
+    retry record is invented where no command exists.
+    """
+
+    if retry is None or retry.diagnostic is not None:
+        return retry
+    lost = [
+        cell
+        for cell in cells
+        if (cell.state is CellState.UNAVAILABLE or cell.provider_phase is CapacityStatus.PROVIDER_ERROR)
+        and cell.unavailable_detail
+    ]
+    if not lost:
+        return retry
+    newest = max(lost, key=lambda cell: (cell.updated_at, cell.id))
+    diagnostic = safe_provider_diagnostic(newest.unavailable_detail)
+    if diagnostic is None:
+        return retry
+    return retry.model_copy(
+        update={"diagnostic": diagnostic, "failure_code": retry.failure_code or newest.provider_failure_code}
+    )
+
+
 def _phase(
     workload: WorkloadRecord,
     capacity: WorkloadCapacitySummary,
@@ -335,7 +416,21 @@ def _phase(
         return WorkloadProgressPhase.RUNNING
     if workload.state is WorkloadState.DISPATCHING:
         return WorkloadProgressPhase.DISPATCHING
-    if denied:
+    # One zone's denial does not describe a cross-zone workload that another zone
+    # is now acquiring for. Checked first, it went on narrating "GCP denied
+    # queue admission" for us-east1-b while us-south1-a was provisioning the
+    # job's capacity (2026-09-24).
+    acquiring_elsewhere = bool(
+        capacity.requesting_workers
+        or capacity.waiting_workers
+        or capacity.provisioning_workers
+        or capacity.ready_workers
+        or any(
+            entry.provider_phase in {CapacityStatus.ACTIVE, CapacityStatus.EXECUTION_CONNECTING}
+            for entry in capacity.phases
+        )
+    )
+    if denied and not acquiring_elsewhere:
         return WorkloadProgressPhase.QUEUE_ADMISSION_DENIED
     if workload.preemption_id is not None:
         return WorkloadProgressPhase.PREEMPTED
@@ -343,6 +438,13 @@ def _phase(
         return WorkloadProgressPhase.WAITING_FOR_DISPATCH
     if workload.autoscale_block_reason is AutoscaleBlockReason.SHARED_TPU_QUOTA:
         return WorkloadProgressPhase.QUOTA_BLOCKED
+    if workload.autoscale_block_reason is AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED:
+        # The planner has stopped asking every zone this workload accepts. Left
+        # to the capacity branches below it read "requesting one elastic cell"
+        # -- the opposite of what the plane was doing (2026-09-24, a v5e pool
+        # GCP failed sixteen times). An existing phase rather than a new one: a
+        # new wire value would break every older SDK mid-wait.
+        return WorkloadProgressPhase.PROVIDER_FAILURE
     if workload.state is WorkloadState.ADMITTED:
         return WorkloadProgressPhase.WAITING_FOR_SCHEDULER
     requested_workers = workload.spec.cell_group_count * workload.spec.worker_count

@@ -512,7 +512,10 @@ not retry authorization, validation, conflict, or not-found responses.
 ### 11.2 Dependency entry
 
 `dependency_entry.prepare` content-addresses one environment per normalized
-requirement set, locks concurrent installers, layers a virtualenv over host
+requirement set and interpreter (cache-format version, resolved interpreter
+path, Python version and the parent site-packages it layers over, so an entry
+built by another interpreter or an older format is never reused), locks
+concurrent installers, layers a virtualenv over host
 site-packages (preserving accelerator libraries), and writes a completion
 marker only after installation succeeds. A failed install removes the partial
 environment and fails the job. The default cache is `/var/lib/eyvan/runtime-envs`,

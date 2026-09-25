@@ -4740,6 +4740,12 @@
             "title": "Pool Id",
             "type": "string"
           },
+          "provisioning_cells": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Provisioning Cells",
+            "type": "integer"
+          },
           "warm_cells": {
             "minimum": 0.0,
             "title": "Warm Cells",

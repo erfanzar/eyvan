@@ -240,6 +240,18 @@ def _is_positive_number(value: object) -> bool:
 # --------------------------------------------------------------------------- P5
 
 
+def _instant(value: object) -> datetime | None:
+    """Parse one API timestamp, or return ``None`` for anything else."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp.Sequence[dict]) -> ProofResult:
     """P5 -- a reclaimed Spot slice is a preemption, not a provider error.
 
@@ -325,8 +337,20 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     # provider error on a replacement that is already recovering, which is the
     # same way an unrelated pool's backoff would have, and how a proof turns
     # into something people re-run until it is green.
+    #
+    # And to cells touched after this workload was submitted. A cell reclaimed by
+    # an earlier run keeps its record -- and its cooldown -- long after it is
+    # deleted, so reading the pools' whole history failed a clean rerun on the
+    # fixed build for a cooldown the old build had set an hour before
+    # (2026-09-24). A record without timestamps is still read, as before.
     pool_ids = {pool["id"] for pool in pools}
-    mine = [cell for cell in cells if cell.get("pool_id") in pool_ids]
+    submitted = _instant(workload.get("created_at"))
+    mine = [
+        cell
+        for cell in cells
+        if cell.get("pool_id") in pool_ids
+        and not (submitted is not None and (touched := _instant(cell.get("updated_at"))) and touched < submitted)
+    ]
     reclaimed = [
         cell
         for cell in mine
@@ -490,11 +514,27 @@ def evaluate_secret_delivery(
             (_unknown("secret-was-used", "the ledger shows no secret event; the mount was never exercised"),),
         )
 
+    # Once *per attempt*. Counting across the whole workload made the documented
+    # P4 run -- the value re-delivered to a second attempt -- fail with "expected
+    # exactly one; found 2", so the proof refused the very behaviour it exists to
+    # establish.
+    def _attempt(event: dict) -> object:
+        return (event.get("payload") or {}).get("attempt")
+
     for name, matched in (("one-issuance", issued), ("one-read", read)):
-        if len(matched) == 1:
-            checks.append(_passed(name, f"exactly one {matched[0]['action']}"))
+        per_attempt: dict[object, int] = {}
+        for event in matched:
+            per_attempt[_attempt(event)] = per_attempt.get(_attempt(event), 0) + 1
+        repeated = sorted(str(attempt) for attempt, count in per_attempt.items() if count != 1)
+        action = "secret.issued" if name == "one-issuance" else "secret.read"
+        if not matched:
+            checks.append(_failed(name, f"expected exactly one {action} per attempt; found none"))
+        elif repeated:
+            checks.append(
+                _failed(name, f"expected exactly one {action} per attempt; attempt(s) {', '.join(repeated)} had more")
+            )
         else:
-            checks.append(_failed(name, f"expected exactly one; found {len(matched)}"))
+            checks.append(_passed(name, f"exactly one {action} in each of {len(per_attempt)} attempt(s)"))
 
     # A read with no issuance in the same attempt is the signal a leaked token
     # would produce, which is why both events exist rather than just the read.
@@ -504,6 +544,9 @@ def evaluate_secret_delivery(
         checks.append(_failed("read-matches-an-issuance", f"{len(orphans)} read(s) with no issuance in that attempt"))
     else:
         checks.append(_passed("read-matches-an-issuance", "every read has an issuance in its attempt"))
+    read_attempts = {_attempt(event) for event in read}
+    if len(read_attempts) > 1:
+        checks.append(_passed("redelivered", f"the value was issued and read afresh in {len(read_attempts)} attempts"))
 
     leaks = []
     if secret_value in logs:

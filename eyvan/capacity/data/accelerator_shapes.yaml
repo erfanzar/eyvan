@@ -49,7 +49,7 @@
 # exact provider page/version reviewed so future edits do not become guesses.
 
 catalog_version: 3
-revision: "2026-08-18.2"
+revision: "2026-09-24.1"
 
 # Multi-host slice rules, and why they are not more hand-written rows.
 #
@@ -112,6 +112,27 @@ generation_rules:
     establishes_hosts: false
     source_url: https://cloud.google.com/tpu/docs/v6e
     source_version: "Last updated 2026-08-04 UTC"
+
+  - generation: v5litepod
+    kind: tpu
+    # v5e is sold as "v5litepod" and its suffix counts chips.
+    quota_units_per_chip: 1
+    # Google's v5e table: every training slice from v5litepod-16 up is built
+    # from ct5lp-hightpu-4t VMs (4 chips, 112 vCPU, 192 GB); those are per-VM
+    # resources. v5litepod-1/-4/-8 use other single-VM machine types and are
+    # explicit rows.
+    min_chips: 16
+    chips_per_host: 4
+    host_cpu: 112
+    host_memory_gib: 192
+    capacity_backend: gcp-tpu
+    machine_type: ct5lp-hightpu-4t
+    # Left off for the reason v6e leaves it off: the published host column
+    # counts physical hosts, which do not divide evenly into four-chip VMs at
+    # every size, and no receipt here establishes v5e's endpoint count.
+    establishes_hosts: false
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
 
   - generation: tpu7x
     kind: tpu
@@ -210,6 +231,100 @@ shapes:
     multislice_capable: true
     source_url: https://cloud.google.com/tpu/docs/v6e
     source_version: "Last updated 2026-08-04 UTC"
+
+  # Single-VM v6e and v5e shapes. Each row is one VM of the machine type
+  # named, from Google's VM-type tables (retrieved 2026-09-24). v6e-4 is one
+  # ct6e-standard-4t "half-host" VM; v6e-1 and the v5e rows are the documented
+  # single-VM serving shapes.
+  - accelerator_type: v6e-1
+    kind: tpu
+    generation: v6e
+    chips: 1
+    quota_units: 1
+    hosts: 1
+    chips_per_host: 1
+    host_cpu: 44
+    host_memory_gib: 176
+    capacity_backend: gcp-tpu
+    multislice_capable: false
+    machine_type: ct6e-standard-1t
+    tpu_type: ct6e
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v6e-4
+    kind: tpu
+    generation: v6e
+    chips: 4
+    quota_units: 4
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 180
+    host_memory_gib: 720
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct6e-standard-4t
+    tpu_type: ct6e
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-1
+    kind: tpu
+    generation: v5litepod
+    chips: 1
+    quota_units: 1
+    hosts: 1
+    chips_per_host: 1
+    host_cpu: 24
+    host_memory_gib: 48
+    capacity_backend: gcp-tpu
+    multislice_capable: false
+    machine_type: ct5lp-hightpu-1t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-4
+    kind: tpu
+    generation: v5litepod
+    chips: 4
+    quota_units: 4
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 112
+    host_memory_gib: 192
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct5lp-hightpu-4t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-8
+    kind: tpu
+    generation: v5litepod
+    chips: 8
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 8
+    host_cpu: 224
+    host_memory_gib: 384
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct5lp-hightpu-8t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
 
   # ---------------------------------------------------------------- GPU hosts
   #

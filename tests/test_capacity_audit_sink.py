@@ -88,3 +88,19 @@ def test_without_a_sink_nothing_is_written_and_transitions_are_unchanged() -> No
     logger = CapacityLifecycleLogger(logging.getLogger("eyvan.test.audit"))
     assert logger.transition(_cell(), _cell()) is False
     assert logger.transition(_cell(), _cell(CellState.UNAVAILABLE)) is True
+
+
+def test_a_runtime_probe_failure_on_healthy_capacity_is_not_a_preemption() -> None:
+    """Found live 2026-09-24: an agent restart logged two v6e-4 cells as preempted.
+
+    Their VMs never stopped. The provider still reported HEALTHY; only Eyvan's
+    runtime probe had not answered yet. A preemption is the provider taking
+    the machine, so it needs the provider to say so.
+    """
+
+    ready = _cell(CellState.READY).model_copy(update={"provider_phase": CapacityStatus.HEALTHY})
+    probe_failed = ready.model_copy(update={"state": CellState.REGISTERING})
+    reclaimed = probe_failed.model_copy(update={"provider_phase": CapacityStatus.PROVISIONING})
+
+    assert CapacityLifecycleLogger.classify(ready, probe_failed) is CapacityLifecycleEvent.UNHEALTHY
+    assert CapacityLifecycleLogger.classify(ready, reclaimed) is CapacityLifecycleEvent.PREEMPTED

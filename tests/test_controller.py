@@ -4745,3 +4745,244 @@ async def test_a_matching_cell_build_dispatches(monkeypatch) -> None:
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow
+
+
+def _denial_harness():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            json={"detail": "GCP queued-resource admission denied", "code": "queue_admission_denied"},
+        )
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    agent = CellAgentClient(
+        "http://agent",
+        client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler)),
+    )
+    controller = EyvanController(repository, service, agent_factory=lambda _cell: agent)
+    return repository, service, controller, agent
+
+
+def _denial_pool(fleet: str, zone: str) -> CapacityPoolRecord:
+    return CapacityPoolRecord(
+        id=f"{fleet}/v6e-16-{zone}",
+        fleet_name=fleet,
+        node_type=f"v6e-16-{zone}",
+        provider="gcp",
+        capacity_backend="gcp-tpu",
+        provider_project="gcp-project-a",
+        region="us-central1",
+        zone=zone,
+        capacity=ResourceVector(cpu=64, tpu=16),
+        allocatable=ResourceVector(cpu=64, tpu=16),
+        accelerator_type="v6e-16",
+        capacity_class="spot",
+        executor="eyvan-native",
+        agent_endpoint="http://agent:8090",
+        labels={"eyvan_resource_kind": "tpu"},
+        min_cells=0,
+        max_cells=4,
+    )
+
+
+async def _submit_denied_callable(service, fleet: str, key: str):
+    workload, _ = await service.submit_pool_callable(
+        principal(Role.PROJECT_OPERATOR),
+        fleet_name=fleet,
+        org_id="acme",
+        project_id="research",
+        accelerator_type="v6e-16",
+        pods=1,
+        execution=CallableExecution(artifact_uri="gs://trusted/train.pkl", sha256="a" * 64, python="3.12"),
+        idempotency_key=key,
+    )
+    return workload
+
+
+@pytest.mark.asyncio
+async def test_an_unrelated_fleets_identical_pool_does_not_keep_a_denied_workload_waiting() -> None:
+    """A workload pinned to fleet A's pool can never use fleet B's.
+
+    Judging "is there an alternative" by any enabled pool of the same shape and
+    region kept this workload PENDING forever beside another fleet's pool, and
+    the provider's refusal never reached the user as a verdict (2026-09-24).
+    """
+
+    repository, service, controller, agent = _denial_harness()
+    await service.apply_fleet(
+        principal(Role.FLEET_ADMIN), "research", (_denial_pool("research", "us-central1-c"),), idempotency_key="a"
+    )
+    await service.apply_fleet(
+        principal(Role.FLEET_ADMIN), "other", (_denial_pool("other", "us-central1-c"),), idempotency_key="b"
+    )
+    workload = await _submit_denied_callable(service, "research", "pinned-denied")
+
+    assert (await controller.reconcile_capacity_pools_once())["launched"] == 1
+    await controller.dispatch_outbox_once()
+
+    workloads, _, _, _ = await snapshot(repository)
+    current = next(candidate for candidate in workloads if candidate.id == workload.id)
+    assert current.state is WorkloadState.FAILED
+    assert current.failure_reason == "GCP queued-resource admission denied"
+    agent.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cross_zone_workload_denied_in_every_zone_is_failed_not_left_waiting() -> None:
+    """Two candidates that have *both* refused must not vouch for each other."""
+
+    repository, service, controller, agent = _denial_harness()
+    await service.apply_fleet(
+        principal(Role.FLEET_ADMIN),
+        "research",
+        (_denial_pool("research", "us-central1-b"), _denial_pool("research", "us-central1-c")),
+        idempotency_key="a",
+    )
+    workload = await _submit_denied_callable(service, "research", "cross-zone-denied")
+
+    for _ in range(4):
+        await controller.reconcile_capacity_pools_once()
+        await controller.dispatch_outbox_once()
+        workloads, _, _, _ = await snapshot(repository)
+        current = next(candidate for candidate in workloads if candidate.id == workload.id)
+        if current.state is WorkloadState.FAILED:
+            break
+
+    assert current.state is WorkloadState.FAILED
+    assert current.autoscale_block_reason is AutoscaleBlockReason.QUEUE_ADMISSION_DENIED
+    _, cells, _, _ = await snapshot(repository)
+    denied_zones = sorted(
+        cell.zone for cell in cells if cell.provider_failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED
+    )
+    assert denied_zones == ["us-central1-b", "us-central1-c"], "both zones were asked before giving up"
+    agent.close()
+
+
+def _racing_harness(race_width: int, denied_zones: frozenset[str] = frozenset()):
+    import dataclasses
+
+    from eyvan.config import EyvanSettings
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if any(zone in body for zone in denied_zones):
+            return httpx.Response(
+                502, json={"detail": "GCP queued-resource admission denied", "code": "queue_admission_denied"}
+            )
+        return httpx.Response(202, json={"cell_id": "x", "state": "waiting", "generation": 1})
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(
+        repository,
+        scheduler=CoreSchedulingService(),
+        callable_trust=CallableProjectTrustPolicy.from_projects({"acme/research"}),
+    )
+    agent = CellAgentClient(
+        "http://agent", client=httpx.Client(base_url="http://agent", transport=httpx.MockTransport(handler))
+    )
+    settings = dataclasses.replace(EyvanSettings.from_env(), capacity_race_width=race_width)
+    controller = EyvanController(repository, service, settings=settings, agent_factory=lambda _cell: agent)
+    return repository, service, controller, agent
+
+
+async def _live_zones(repository) -> list[str]:
+    _, cells, _, _ = await snapshot(repository)
+    return sorted(cell.zone for cell in cells if cell.state is not CellState.DELETED)
+
+
+@pytest.mark.asyncio
+async def test_a_race_keeps_its_width_while_the_first_zone_is_still_only_a_request() -> None:
+    """Found live on 2026-09-24 racing v6e-4 across fifteen zones at width 20: once one
+    zone accepted the *request*, the workload was placed on that still-acquiring cell and
+    the race stopped, so zones were tried one at a time as each was refused."""
+
+    zones = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
+    repository, service, controller, agent = _racing_harness(3, denied_zones=frozenset({"us-central1-b"}))
+    await service.apply_fleet(
+        principal(Role.FLEET_ADMIN),
+        "research",
+        tuple(_denial_pool("research", zone) for zone in zones),
+        idempotency_key="a",
+    )
+    await _submit_denied_callable(service, "research", "racer")
+
+    await controller.reconcile_capacity_pools_once()
+    assert await _live_zones(repository) == ["us-central1-a", "us-central1-b", "us-central1-c"]
+    while await controller.dispatch_outbox_once():
+        pass
+
+    # us-central1-b refused; the race tops back up to three zones with the one not yet asked.
+    await controller.reconcile_capacity_pools_once()
+    await controller.reconcile_capacity_pools_once()
+    live = await _live_zones(repository)
+    assert "us-central1-f" in live
+    assert live.count("us-central1-a") == 1 and live.count("us-central1-c") == 1, (
+        "no second cell in a zone already asked"
+    )
+    agent.close()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_the_cell_rejects_as_invalid_fails_the_attempt_with_its_reason() -> None:
+    """Found live 2026-09-24 on a Spot head: a submit the worker could never accept.
+
+    The worker refused every launch ("... must not contain a newline") with a
+    500, the agent passed on a 500, and the plane retried the dispatch as
+    transient for twenty minutes while the lease held its v6e-4. A validation
+    verdict does not change on a retry, so it now fails the attempt with the
+    worker's sentence and gives the capacity back.
+    """
+
+    from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
+
+    class RefusingAgent(FakeAgent):
+        def submit(self, cell_id, request):
+            self.submissions.append((cell_id, request))
+            raise CellAgentInvalidConfigurationError(
+                "native-systemd environment variable 'EXAMPLE' must not contain a newline"
+            )
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    agent = RefusingAgent()
+    controller = EyvanController(repository, service, agent_factory=lambda _cell: agent)  # type: ignore[arg-type]
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-a",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(tpu=8),
+                allocatable=ResourceVector(tpu=8),
+            )
+        )
+    workload, _ = await service.submit_workload(
+        principal(Role.PROJECT_OPERATOR),
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="refused",
+            execution=CommandExecution(command="true"),
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+        ),
+        idempotency_key="refused-launch",
+    )
+
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+
+    async with repository.transaction() as transaction:
+        settled = await transaction.get_workload(workload.id)
+        leases = await transaction.list_leases()
+
+    assert settled.state is WorkloadState.FAILED
+    assert "refused this launch as invalid" in (settled.failure_reason or "")
+    assert "must not contain a newline" in (settled.failure_reason or "")
+    assert [lease for lease in leases if lease.state is LeaseState.PENDING] == []
+    assert len(agent.submissions) == 1

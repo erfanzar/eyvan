@@ -161,11 +161,21 @@ def summarize(record: JsonObject) -> tuple[str, ...]:
 
     metadata = spec.get("metadata")
     pool = _text(metadata.get("eyvan_pool")) if is_json_object(metadata) else None
+    raw_alternates = _text(metadata.get("eyvan_pool_alternates")) if is_json_object(metadata) else None
+    alternates = [name for name in (raw_alternates or "").split(",") if name.strip()]
     region = _text(spec.get("region"))
     zones = spec.get("allowed_zones")
     where = ", ".join(value for value in zones if isinstance(value, str)) if isinstance(zones, list) else ""
-    row("placed on", pool)
-    row("region", where or region)
+    if alternates:
+        # A cross-zone job may run in any of its candidates, so the first choice
+        # is a request, not a placement, and its region binds nothing. Printed as
+        # "placed on", it named europe-west4-b for a Spot v5p-8 that was running
+        # in us-central1-a (2026-09-24).
+        row("requested", f"{pool or 'unknown'} or {len(alternates)} alternate pool(s)")
+        row("region", where or None)
+    else:
+        row("placed on", pool)
+        row("region", where or region)
 
     lease = _text(record.get("lease_id"))
     row("lease", lease)

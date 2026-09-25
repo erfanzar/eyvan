@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import typing as tp
 import urllib.error
@@ -753,8 +755,18 @@ class GcloudNativeWorkerArtifactAccessStore:
         "roles/storage.objectCreator",
     )
 
-    def __init__(self, *, runner: Runner = _runner):
+    #: Bucket IAM is a read-modify-write guarded by an etag: two grants racing on
+    #: one bucket make the loser fail ``HTTPError 412``. Seen live on 2026-09-24
+    #: when three cells were provisioned in parallel -- and reported as a missing
+    #: *permission*, because the error discarded gcloud's own words.
+    _PRECONDITION_ATTEMPTS: tp.ClassVar[int] = 6
+    _PRECONDITION_BACKOFF_S: tp.ClassVar[float] = 0.5
+    _BUCKET_LOCKS: tp.ClassVar[dict[str, threading.Lock]] = {}
+    _BUCKET_LOCKS_GUARD: tp.ClassVar[threading.Lock] = threading.Lock()
+
+    def __init__(self, *, runner: Runner = _runner, sleep: tp.Callable[[float], None] = time.sleep):
         self._runner = runner
+        self._sleep = sleep
 
     def _run(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[str]:
         """Run one gcloud call, surfacing its subprocess timeout as a typed provider failure."""
@@ -762,6 +774,19 @@ class GcloudNativeWorkerArtifactAccessStore:
             return self._runner(args)
         except subprocess.TimeoutExpired as exc:
             raise GcloudError(str(exc), code=CapacityProviderFailureCode.PROVIDER_ERROR) from exc
+
+    @classmethod
+    def _bucket_lock(cls, bucket_uri: str) -> threading.Lock:
+        with cls._BUCKET_LOCKS_GUARD:
+            return cls._BUCKET_LOCKS.setdefault(bucket_uri, threading.Lock())
+
+    @staticmethod
+    def _lost_precondition(result: subprocess.CompletedProcess[str]) -> bool:
+        # The HTTP status as gcloud prints it, not any "412": EIDs, project
+        # numbers and request ids contain those digits too, and a permission
+        # failure mistaken for a race is retried and then misreported.
+        detail = f"{result.stdout}\n{result.stderr}".casefold()
+        return "httperror 412" in detail or "precondition" in detail
 
     def ensure(
         self,
@@ -787,27 +812,45 @@ class GcloudNativeWorkerArtifactAccessStore:
         """
 
         member = f"serviceAccount:{reader_service_account}"
-        for role in self._ROLES:
-            result = self._run(
-                (
-                    "storage",
-                    "buckets",
-                    "add-iam-policy-binding",
-                    artifact_bucket.uri,
-                    "--member",
-                    member,
-                    "--role",
-                    role,
-                    "--condition=None",
-                    f"--project={project}",
-                    "--quiet",
-                )
+        # In-process grants to one bucket take turns; the bounded retry below is
+        # for the race this lock cannot see -- another agent, or a human.
+        with self._bucket_lock(artifact_bucket.uri):
+            for role in self._ROLES:
+                self._grant(project=project, bucket_uri=artifact_bucket.uri, member=member, role=role)
+
+    def _grant(self, *, project: str, bucket_uri: str, member: str, role: str) -> None:
+        args = (
+            "storage",
+            "buckets",
+            "add-iam-policy-binding",
+            bucket_uri,
+            "--member",
+            member,
+            "--role",
+            role,
+            "--condition=None",
+            f"--project={project}",
+            "--quiet",
+        )
+        for attempt in range(1, self._PRECONDITION_ATTEMPTS + 1):
+            result = self._run(args)
+            if result.returncode == 0:
+                return
+            if not self._lost_precondition(result) or attempt == self._PRECONDITION_ATTEMPTS:
+                break
+            self._sleep(self._PRECONDITION_BACKOFF_S * attempt * (1 + random.random()))
+        diagnostic = (result.stderr or result.stdout).strip()
+        if self._lost_precondition(result):
+            raise GcloudError(
+                f"could not configure native worker artifact access on {bucket_uri}: the bucket's IAM policy kept "
+                f"changing underneath {self._PRECONDITION_ATTEMPTS} attempts to grant {role} (concurrent "
+                f"modification, not a permission problem): {diagnostic}",
+                code=CapacityProviderFailureCode.PROVIDER_ERROR,
             )
-            if result.returncode != 0:
-                raise GcloudError(
-                    f"could not configure native worker artifact access on {artifact_bucket.uri}; "
-                    f"Eyvan needs permission to grant {role} to the worker identity before provisioning"
-                )
+        raise GcloudError(
+            f"could not configure native worker artifact access on {bucket_uri}; Eyvan needs permission to grant "
+            f"{role} to the worker identity before provisioning: {diagnostic or 'gcloud gave no diagnostic'}"
+        )
 
 
 class GcloudComputeProvider:
@@ -873,6 +916,73 @@ class GcloudComputeProvider:
             raise GcloudError((result.stderr or result.stdout).strip() or f"could not describe Compute instance {name}")
         value = decode_gcloud_object(result.stdout, resource=f"Compute instance {name!r}")
         return self._parse_instance(value)
+
+    def absence_cause(
+        self, name: str, *, project: str, zone: str
+    ) -> tuple[str, CapacityProviderFailureCode | None] | None:
+        """Return what the provider's own operation log says happened to a vanished instance.
+
+        A Spot VM is created with ``instanceTerminationAction=DELETE``, so both a
+        reclamation and an insert that failed after the create call returned
+        (the waiter interrupted, or GCE giving up after ``PROVISIONING``) leave
+        the same evidence behind: no instance. Reported as "Compute instance is
+        absent", a Spot stockout on 2026-09-24 reached the user as
+        ``hard_constraint`` with the provider's sentence nowhere in sight. The
+        zone's operation log still holds that sentence, so read it.
+
+        Best effort by design: any failure to read the log answers ``None`` and
+        the caller keeps its generic observation. Diagnosis must never be the
+        reason a replacement does not happen.
+        """
+
+        args = (
+            "compute",
+            "operations",
+            "list",
+            "--project",
+            project,
+            "--zones",
+            zone,
+            f"--filter=targetLink ~ /instances/{name}$",
+            "--sort-by=~insertTime",
+            "--limit=5",
+            "--format=json",
+        )
+        try:
+            result = self._run(args)
+        except GcloudError:
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            operations = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(operations, list):
+            return None
+        for operation in operations:
+            if not is_json_object(operation):
+                continue
+            operation_type = operation.get("operationType")
+            if operation_type == "compute.instances.preempted":
+                return (
+                    "Compute instance was reclaimed by the provider (Spot preemption)",
+                    CapacityProviderFailureCode.PREEMPTED,
+                )
+            if operation_type != "insert":
+                continue
+            error = operation.get("error")
+            errors = error.get("errors") if is_json_object(error) else None
+            messages = [
+                " ".join(part for part in (item.get("code"), item.get("message")) if isinstance(part, str) and part)
+                for item in (errors if isinstance(errors, list) else [])
+                if is_json_object(item)
+            ]
+            diagnostic = "; ".join(message for message in messages if message)
+            if not diagnostic:
+                return None
+            return (f"Compute instance creation failed: {diagnostic}", provider_failure_from_diagnostic(diagnostic))
+        return None
 
     @staticmethod
     def _validate_instance(instance: ComputeInstance, spec: ComputeInstanceSpec) -> None:
@@ -1076,7 +1186,11 @@ class GcloudComputeProvider:
             # credential, and callers need the driver's fenced replacement
             # path to rotate the resource ID and worker token first.
             if record.state not in {CapacityStatus.UNOBSERVED, CapacityStatus.RECREATING}:
-                return ProviderObservation(CapacityStatus.NEEDS_RECREATE, "Compute instance is absent")
+                cause = self.absence_cause(spec.name, project=spec.project, zone=spec.zone)
+                if cause is None:
+                    return ProviderObservation(CapacityStatus.NEEDS_RECREATE, "Compute instance is absent")
+                detail, failure_code = cause
+                return ProviderObservation(CapacityStatus.NEEDS_RECREATE, detail, failure_code=failure_code)
             instance = self.create(spec)
             return ProviderObservation(CapacityStatus.WAITING, f"Compute instance created ({instance.status})")
         self._validate_instance(instance, spec)

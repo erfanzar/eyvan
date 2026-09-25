@@ -1032,3 +1032,55 @@ def test_a_pool_without_an_explicit_shape_still_takes_its_name() -> None:
     config = EyvanFleetConfig.model_validate(fleet)
 
     assert [pool["accelerator_type"] for pool in config.pool_payloads()] == ["v6e-8"]
+
+
+@pytest.mark.parametrize(
+    ("accelerator_type", "machine_type", "tpu_type", "chips"),
+    [
+        ("v5litepod-4", "ct5lp-hightpu-4t", "ct5lp", 4),
+        ("v5litepod-8", "ct5lp-hightpu-8t", "ct5lp", 8),
+        ("v6e-4", "ct6e-standard-4t", "ct6e", 4),
+    ],
+)
+def test_a_single_vm_tpu_can_opt_into_compute_capacity(
+    accelerator_type: str, machine_type: str, tpu_type: str, chips: int
+) -> None:
+    """Found live 2026-09-24: v5e could not be had here through the TPU queue.
+
+    Every zone of the TRC project denied the queue or did not queue v5litepod
+    types, while Compute Engine Spot VMs of the same machine family were
+    available -- v5p-8 had been won exactly that way. The catalog rows lacked the
+    Compute TPU identity, so opting a v5e pool into `gcp-compute` produced a spec
+    the Compute provider refused. The queue stays the default; Compute is opt-in.
+    """
+
+    from eyvan.capacity.providers.gcp.compute_instances import normalize_compute_config
+
+    raw = _mixed_fleet()
+    raw["node_types"] = {
+        "tpu": {
+            "kind": "tpu",
+            "accelerator_type": accelerator_type,
+            "capacity_backend": "gcp-compute",
+            "resources": {"tpu": chips},
+            "initial_workers": 1,
+        }
+    }
+
+    config = EyvanFleetConfig.model_validate(raw)
+    cell = config.desired_cells()[0]
+
+    assert cell["capacity_backend"] == "gcp-compute"
+    assert cell["provider_options"]["machine_type"] == machine_type
+    assert cell["provider_options"]["tpu_type"] == tpu_type
+    assert cell["provider_options"]["tpu_count"] == chips
+    assert normalize_compute_config(cell["provider_options"])["tpu_type"] == tpu_type
+
+
+def test_v5e_stays_on_the_tpu_queue_by_default() -> None:
+    raw = _mixed_fleet()
+    raw["node_types"] = {
+        "tpu": {"kind": "tpu", "accelerator_type": "v5litepod-4", "resources": {"tpu": 4}, "initial_workers": 1}
+    }
+
+    assert EyvanFleetConfig.model_validate(raw).desired_cells()[0]["capacity_backend"] == "gcp-tpu"

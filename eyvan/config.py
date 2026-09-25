@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from eyvan._internal.client_version import validate_minimum_client_version
@@ -586,7 +586,16 @@ class EyvanSettings:
 
         if not isinstance(profile, GcpNativeRuntimeProfile):
             raise TypeError("GCP native runtime settings require a GcpNativeRuntimeProfile")
-        return cls(
+        # Every other setting is the operator's, read from the environment
+        # exactly as ``from_env`` reads it; the profile overrides only what it
+        # owns. Built from bare defaults instead, each operator setting went
+        # inert on this path one at a time -- the callable allow-list
+        # (2026-08-01), then EYVAN_CAPACITY_RACE_WIDTH and
+        # EYVAN_CAPACITY_SUPPORTS_EXEC (2026-09-24): a twenty-zone Spot fleet
+        # asked one zone per reconcile while the variable said twenty, and exec
+        # was refused on a fleet that had enabled it.
+        return replace(
+            cls.from_env(),
             agent_shared_secret=profile.agent_shared_secret,
             native_worker_root_secret=profile.native_worker_root_secret,
             # The profile's agent runs on this machine beside its control plane,
@@ -597,17 +606,15 @@ class EyvanSettings:
             # which is how a remote head shares one document across agents --
             # still wins.
             fleet_state_uri=os.getenv("EYVAN_FLEET_STATE_URI") or str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH),
-            # Operator-owned and *not* something a runtime profile can know, so it
-            # is read from the environment here for the same reason
-            # ``fleet_state_uri`` is. Dropping it made the documented
-            # ``EYVAN_TRUSTED_CALLABLE_PROJECTS`` silently inert on the native GCP
-            # path -- every callable submission outside the loopback development
-            # project was refused with no way to grant it. Found live 2026-08-01.
-            trusted_callable_projects=_csv(os.getenv("EYVAN_TRUSTED_CALLABLE_PROJECTS", "")),
             capacity_backend="gcp",
             execution_backend="eyvan-native",
             artifact_store_uri=profile.artifact_root_uri,
             native_worker_package=profile.native_worker_wheel_uri,
+            # The pin and generation describe an environment-provided package; the
+            # profile's own wheel is content-addressed by its URI, and pairing it
+            # with another package's digest would fail every bootstrap.
+            native_worker_package_sha256=None,
+            native_worker_package_generation=None,
             native_worker_artifact_root_uri=profile.artifact_root_uri,
             native_worker_public_ingress_tag=profile.native_worker_public_ingress_tag,
         )

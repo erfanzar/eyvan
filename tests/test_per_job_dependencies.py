@@ -81,6 +81,42 @@ def test_the_same_packages_in_a_different_order_are_the_same_environment() -> No
     assert dependency_entry.environment_key(["jax"]) != dependency_entry.environment_key(["jax", "flax"])
 
 
+def test_old_requirement_only_cache_is_not_reused(tmp_path, monkeypatch) -> None:
+    import hashlib
+
+    old = tmp_path / hashlib.sha256(b"flax").hexdigest()[:32]
+    old.mkdir()
+    (old / dependency_entry.COMPLETE_MARKER).write_text("flax")
+    parent = tmp_path / "parent-site"
+    parent.mkdir()
+    monkeypatch.setattr(dependency_entry.site, "getsitepackages", lambda: [str(parent)])
+    monkeypatch.setattr(dependency_entry.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(
+        dependency_entry, "_install_commands", lambda environment, requirements: _fake_install(environment)
+    )
+    built = dependency_entry.prepare(["flax"], root=tmp_path)
+    assert built != old
+    paths = list(built.rglob(dependency_entry.PARENT_PATH_FILE))
+    assert len(paths) == 1
+    assert paths[0].read_text() == f"{parent}\n"
+    assert (old / dependency_entry.COMPLETE_MARKER).read_text() == "flax"
+    assert list(old.iterdir()) == [old / dependency_entry.COMPLETE_MARKER]
+
+
+def test_dependency_cache_key_includes_interpreter_and_parent_paths(tmp_path, monkeypatch) -> None:
+    original = dependency_entry.environment_key(["flax"])
+    monkeypatch.setattr(dependency_entry.sys, "executable", str(tmp_path / "other-python"))
+    other = dependency_entry.environment_key(["flax"])
+    assert other != original
+    parent = tmp_path / "parent-site"
+    parent.mkdir()
+    monkeypatch.setattr(dependency_entry.site, "getsitepackages", lambda: [str(parent)])
+    assert dependency_entry.environment_key(["flax"]) != other
+    assert dependency_entry.environment_key(["jax", " flax ", "jax"]) == dependency_entry.environment_key(
+        ["flax", "jax"]
+    )
+
+
 def test_the_environment_can_see_the_host_accelerator_stack() -> None:
     """The decision this whole feature stands on.
 
@@ -363,3 +399,50 @@ def test_an_explicit_runtime_env_dir_wins_over_both(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("EYVAN_RUNTIME_ENV_DIR", str(tmp_path / "declared"))
 
     assert dependency_entry.cache_root() == tmp_path / "declared"
+
+
+def test_a_real_job_environment_can_import_eyvan_and_the_parent_environment(tmp_path, monkeypatch) -> None:
+    """Found on a real Spot v6e-4 on 2026-09-24: every job declaring ``dependencies``
+    died at dispatch with ``No module named 'eyvan'``.
+
+    The native worker runs from a virtual environment, and
+    ``--system-site-packages`` exposes only the *base* interpreter's packages, so
+    Eyvan, JAX and libtpu were all invisible to the job. Every other test here
+    fakes the commands, which is how that shipped; this one builds the real
+    environment and asks its own interpreter what it can import.
+    """
+
+    import subprocess
+    import sys
+
+    real = dependency_entry._install_commands
+
+    def create_only(environment, requirements):
+        creation, _install = real(environment, requirements)
+        return [creation, [sys.executable, "-c", "pass"]]
+
+    monkeypatch.setattr(dependency_entry, "_install_commands", create_only)
+
+    environment = dependency_entry.prepare(["some-package==1.0"], root=tmp_path)
+    python = environment / "bin" / "python"
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import sys, eyvan, pytest, pathlib; "
+            "own = next(i for i, p in enumerate(sys.path) if p.endswith('site-packages') and p.startswith(sys.prefix)); "
+            "parent = sys.path.index(str(pathlib.Path(pytest.__file__).resolve().parent.parent)); "
+            "print(sys.version_info[:2]); print(sys.prefix); print(int(own < parent))",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    version, prefix, own_first = probe.stdout.splitlines()
+    assert version == str(tuple(sys.version_info[:2])), "the job must run the interpreter that pickled nothing else"
+    assert Path(prefix).resolve() == environment.resolve()
+    parents = (environment / "lib").glob(f"python*/site-packages/{dependency_entry.PARENT_PATH_FILE}")
+    assert list(parents), "the parent environment is linked explicitly, not by accident"
+    assert own_first == "1", "a package the job pins must win over the parent environment's copy"

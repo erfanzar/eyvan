@@ -129,7 +129,7 @@ def test_init_uses_direct_gcs_artifacts_after_native_gcp_runtime_setup(tmp_path,
     )
     ensured: list[ControlPlaneEndpoint] = []
 
-    def ensure(configured_endpoint: str | ControlPlaneEndpoint) -> GcpRuntimeResult:
+    def ensure(configured_endpoint: str | ControlPlaneEndpoint, *, profile_path: Path | None = None) -> GcpRuntimeResult:
         parsed = ControlPlaneEndpoint.parse(configured_endpoint)
         ensured.append(parsed)
         return GcpRuntimeResult(

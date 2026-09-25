@@ -539,9 +539,57 @@ def test_native_worker_artifact_access_store_stops_before_provisioning_on_iam_fa
             reader_service_account="123456789012-compute@developer.gserviceaccount.com",
         )
 
-    assert "PERMISSION_DENIED" not in str(error.value)
-    assert len(calls) == 1
+    # The provider's own words travel with the failure (README: "Diagnostics
+    # travel with failures"). Until 2026-09-24 they were dropped, so an etag race
+    # and a real permission gap produced the same sentence.
+    assert "PERMISSION_DENIED" in str(error.value)
+    assert "needs permission to grant roles/storage.objectViewer" in str(error.value)
+    assert len(calls) == 1, "a real permission failure is not retried"
     assert calls[0][calls[0].index("--role") + 1] == "roles/storage.objectViewer"
+
+
+def test_a_concurrent_bucket_policy_change_is_retried_not_reported_as_a_permission_gap() -> None:
+    """Reproduced live: three parallel grants on one bucket, two failed ``HTTPError 412``."""
+
+    calls: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+    outcomes = iter([412, 412, 0, 0])
+
+    def runner(args):
+        calls.append(tuple(args))
+        if next(outcomes) == 412:
+            return result(
+                1, stderr="ERROR: HTTPError 412: At least one of the pre-conditions you specified did not hold."
+            )
+        return result()
+
+    GcloudNativeWorkerArtifactAccessStore(runner=runner, sleep=sleeps.append).ensure(
+        project="project-a",
+        artifact_bucket=GcsArtifactBucket.from_artifact_root_uri("gs://eyvan-artifacts/eyvan"),
+        reader_service_account="123456789012-compute@developer.gserviceaccount.com",
+    )
+
+    roles = [call[call.index("--role") + 1] for call in calls]
+    assert roles == ["roles/storage.objectViewer"] * 3 + ["roles/storage.objectCreator"]
+    assert len(sleeps) == 2 and all(delay > 0 for delay in sleeps)
+
+
+def test_a_policy_that_never_settles_says_so_instead_of_blaming_permissions() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        calls.append(tuple(args))
+        return result(1, stderr="HTTPError 412: At least one of the pre-conditions you specified did not hold.")
+
+    with pytest.raises(GcloudError, match="concurrent modification, not a permission problem") as error:
+        GcloudNativeWorkerArtifactAccessStore(runner=runner, sleep=lambda _delay: None).ensure(
+            project="project-a",
+            artifact_bucket=GcsArtifactBucket.from_artifact_root_uri("gs://eyvan-artifacts/eyvan"),
+            reader_service_account="123456789012-compute@developer.gserviceaccount.com",
+        )
+
+    assert "needs permission" not in str(error.value)
+    assert len(calls) == GcloudNativeWorkerArtifactAccessStore._PRECONDITION_ATTEMPTS
 
 
 def test_provider_observes_only_owned_running_gpu() -> None:
@@ -645,6 +693,100 @@ def test_missing_previously_observed_compute_instance_requires_fenced_recreation
 
     assert observation.state is CapacityStatus.NEEDS_RECREATE
     assert calls and all("create" not in call for call in calls)
+
+
+def _absent_with_operations(operations: object, *, list_returncode: int = 0):
+    """A runner where ``describe`` finds nothing and ``operations list`` answers ``operations``."""
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        calls.append(tuple(args))
+        if tuple(args[:3]) == ("compute", "operations", "list"):
+            if list_returncode:
+                return result(list_returncode, stderr="PERMISSION_DENIED")
+            return result(stdout=json.dumps(operations))
+        return result(1, stderr="NOT_FOUND")
+
+    return runner, calls
+
+
+def _provisioning_record():
+    persisted = record()
+    persisted.state = CapacityStatus.PROVISIONING
+    return persisted
+
+
+def test_an_insert_that_failed_after_the_create_call_returned_names_the_stockout() -> None:
+    """Found on the 2026-09-24 Spot campaign: the create waiter was interrupted,
+    GCE then failed the insert with ZONE_RESOURCE_POOL_EXHAUSTED, and the cell was
+    narrated only as "absent" -- the provider's sentence never reached anyone."""
+
+    runner, calls = _absent_with_operations(
+        [
+            {
+                "operationType": "insert",
+                "status": "DONE",
+                "error": {
+                    "errors": [
+                        {
+                            "code": "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+                            "message": "The zone 'projects/p/zones/us-central1-a' does not have enough resources "
+                            "available to fulfill the request.",
+                        }
+                    ]
+                },
+            }
+        ]
+    )
+
+    observation = GcloudComputeProvider(runner=runner).ensure(_provisioning_record())
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.failure_code is CapacityProviderFailureCode.STOCKOUT
+    assert "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS" in observation.detail
+    assert "does not have enough resources" in observation.detail
+    assert all("create" not in call for call in calls), "diagnosis never recreates in place"
+
+
+def test_a_reclaimed_spot_instance_is_named_a_preemption_from_provider_evidence() -> None:
+    runner, _calls = _absent_with_operations(
+        [
+            {"operationType": "delete", "status": "DONE"},
+            {"operationType": "compute.instances.preempted", "status": "DONE"},
+            {"operationType": "insert", "status": "DONE"},
+        ]
+    )
+    persisted = record()
+    persisted.state = CapacityStatus.HEALTHY
+
+    observation = GcloudComputeProvider(runner=runner).ensure(persisted)
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.failure_code is CapacityProviderFailureCode.PREEMPTED
+    assert "preemption" in observation.detail
+
+
+@pytest.mark.parametrize(
+    ("operations", "list_returncode"),
+    (
+        ([], 0),
+        ([{"operationType": "insert", "status": "DONE"}], 0),
+        ("not a list", 0),
+        (None, 1),
+    ),
+)
+def test_an_unexplained_absence_keeps_the_generic_observation(operations: object, list_returncode: int) -> None:
+    """Diagnosis is best effort: no evidence, a clean insert, or an unreadable log
+    all leave the replacement path exactly as it was."""
+
+    runner, _calls = _absent_with_operations(operations, list_returncode=list_returncode)
+
+    observation = GcloudComputeProvider(runner=runner).ensure(_provisioning_record())
+
+    assert observation.state is CapacityStatus.NEEDS_RECREATE
+    assert observation.detail == "Compute instance is absent"
+    assert observation.failure_code is None
 
 
 def test_spot_instance_validation_accepts_the_modern_gce_shape_without_preemptible() -> None:
@@ -856,3 +998,21 @@ def test_compute_delete_and_secret_rotation_timeout_as_typed_provider_failures()
             reader_service_account="reader@project-a.iam.gserviceaccount.com",
         )
     assert ensure_error.value.code is CapacityProviderFailureCode.PROVIDER_ERROR
+
+
+def test_a_permission_failure_that_happens_to_contain_412_is_not_retried_as_a_race() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args):
+        calls.append(tuple(args))
+        return result(1, stderr="ERROR: PERMISSION_DENIED: caller lacks storage.buckets.setIamPolicy [EID: 0x9d412ab3]")
+
+    with pytest.raises(GcloudError, match="needs permission to grant") as error:
+        GcloudNativeWorkerArtifactAccessStore(runner=runner, sleep=lambda _delay: None).ensure(
+            project="project-a",
+            artifact_bucket=GcsArtifactBucket.from_artifact_root_uri("gs://eyvan-artifacts/eyvan"),
+            reader_service_account="123456789012-compute@developer.gserviceaccount.com",
+        )
+
+    assert len(calls) == 1
+    assert "concurrent modification" not in str(error.value)

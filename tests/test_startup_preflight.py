@@ -98,10 +98,6 @@ def _clean_startup_environment(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Non
         monkeypatch.delenv(variable, raising=False)
     # The unrelated checks in a full doctor run must not depend on what this
     # machine has staged or is running.
-    monkeypatch.setattr(
-        "eyvan.sdk.commands.doctor.DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
-        str(tmp_path / "no-runtime-profile.json"),
-    )
     monkeypatch.setattr("eyvan.sdk.commands.doctor.stale_components", lambda **_kwargs: ())
     monkeypatch.setattr("eyvan.sdk.commands.doctor_preflights.shutil.which", lambda _name: None)
     monkeypatch.setattr(

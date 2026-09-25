@@ -508,16 +508,29 @@ def test_profile_selection_accepts_generation_filters_and_rejects_unknown_profil
 def test_dynamic_profile_factory_skips_types_without_authoritative_host_resources() -> None:
     """Still refused, and each for its own reason.
 
-    v5litepod and v7 have no generation rule and no row, so nothing establishes
-    a host. v6e-4 is below its rule's floor, where a slice is a *subdivided*
-    host rather than whole VMs. v5p-8 is known and deliberately excluded: it is
-    compiled as an integrated Compute Engine TPU VM, not a queued resource.
+    v4 and v7 have no generation rule and no row, so nothing establishes a
+    host. v6e-2 is below its rule's floor and named by no row, where a slice is
+    a *subdivided* host rather than whole VMs. v5p-8 is known and deliberately
+    excluded: it is compiled as an integrated Compute Engine TPU VM, not a
+    queued resource.
     """
 
-    assert tpu_profile_from_accelerator_type("v5litepod-8") is None
+    assert tpu_profile_from_accelerator_type("v4-8") is None
     assert tpu_profile_from_accelerator_type("v7-64") is None
-    assert tpu_profile_from_accelerator_type("v6e-4") is None
+    assert tpu_profile_from_accelerator_type("v6e-2") is None
     assert tpu_profile_from_accelerator_type("v5p-8") is None
+
+
+def test_sourced_single_vm_shapes_become_queued_autoscale_profiles() -> None:
+    """v5e and small v6e are the bulk of Spot/TRC quota; generation must reach them."""
+
+    for accelerator_type, (tpu, cpu, memory) in {
+        "v5litepod-8": (8, 224, 384),
+        "v6e-4": (4, 180, 720),
+    }.items():
+        profile = tpu_profile_from_accelerator_type(accelerator_type)
+        assert profile is not None, accelerator_type
+        assert (profile.tpu, profile.cpu, profile.memory_gib) == (tpu, cpu, memory)
 
 
 def test_a_slice_size_with_no_row_is_derived_from_its_generation() -> None:

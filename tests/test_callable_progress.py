@@ -787,3 +787,39 @@ def test_callable_progress_wait_short_circuits_progress_polling_on_a_terminal_ob
         "  job completed",
     ]
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("phase", "cells", "requesting", "provisioning", "expected"),
+    (
+        (WorkloadProgressPhase.WAITING_FOR_AUTOSCALER, 1, 0, 0, "0/2 workers ready | requesting one elastic cell"),
+        (WorkloadProgressPhase.WAITING_FOR_AUTOSCALER, 2, 0, 0, "0/4 workers ready | requesting 2 elastic cells"),
+        (
+            WorkloadProgressPhase.REQUESTING_CAPACITY,
+            2,
+            2,
+            0,
+            "0/4 workers ready | sending 2 elastic cell requests to GCP",
+        ),
+        (WorkloadProgressPhase.PROVISIONING, 2, 0, 2, "0/4 workers ready | GCP is provisioning 2 elastic cells"),
+    ),
+)
+def test_an_elastic_job_is_never_narrated_as_one_atomic_allocation(
+    phase: WorkloadProgressPhase, cells: int, requesting: int, provisioning: int, expected: str
+) -> None:
+    """Found on the 2026-09-24 Spot campaign: the receipt said ``allocation elastic``
+    and the very next line said ``requesting one atomic allocation``."""
+
+    from eyvan.records import PlacementMode
+    from eyvan.sdk.client.callables import _CallableProgressRenderer
+
+    progress = _progress(phase=phase, requesting_workers=requesting, provisioning_workers=provisioning)
+    progress = progress.model_copy(update={"request": progress.request.model_copy(update={"cells": cells})})
+    renderer = _CallableProgressRenderer(None, _plain_output(), None)  # type: ignore[arg-type]
+
+    elastic = renderer._progress_update(progress, placement=PlacementMode.ELASTIC)
+    atomic = renderer._progress_update(progress, placement=PlacementMode.ATOMIC)
+
+    assert elastic.summary == expected
+    assert "atomic" not in elastic.summary
+    assert "atomic allocation" in atomic.summary

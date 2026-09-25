@@ -72,8 +72,18 @@ def run():
   (attempt N)` means the provider refused an attempt and the plane is
   retrying — watch, don't intervene, until the attempt budget is spent.
 - A queue-admission denial ("User does not have permission to submit requests
-  … in location X") is terminal: the workload fails with the provider's
-  words. Pick another zone.
+  … in location X") removes that zone from the workload's candidates. A
+  workload with cross-zone alternates keeps going in the zones that have not
+  refused it; once every candidate has refused, it fails with the provider's
+  words. A single-zone workload fails on the first denial. Pick another zone.
+- `blocked | … | every zone this job accepts has failed to grant capacity five
+  times running` means the planner has stopped asking (the acquisition bound,
+  counted across replaced cells for an hour). It asks again once that hour
+  passes, or at once if any candidate zone grants capacity.
+- Racing: with `EYVAN_CAPACITY_RACE_WIDTH=N` the planner asks up to N of a
+  workload's candidate zones at once, across regions, never a zone that has
+  already denied it. Candidates come from same-shape pools declared in one
+  fleet (`zones: [...]`, or one node type per zone).
 - Follow up detached: `eyvan workload status|logs|cancel <id>`, and
   `eyvan workload explain <id>` for placement truth — candidate cells,
   provisioning cell ids, delivery state and error.

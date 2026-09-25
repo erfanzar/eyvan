@@ -43,7 +43,9 @@ try:  # staged OCI layout: siblings on sys.path, no package
     # package raises. Nothing can shadow this on a native worker: the module is
     # already in ``sys.modules`` before any user workspace joins ``sys.path``.
     from http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay  # type: ignore[import-not-found]
+    from plane_tls import control_plane_urlopen_options  # type: ignore[import-not-found]
 except ImportError:
+    from eyvan._internal.plane_tls import control_plane_urlopen_options
     from eyvan.worker.runtime.http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay
 
 FORMAT_VERSION = 1
@@ -270,7 +272,7 @@ def _request_bytes(request: str | urllib.request.Request) -> bytes:
 
     for attempt in range(HTTP_ATTEMPTS):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60, **control_plane_urlopen_options()) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
             if exc.code not in RETRYABLE_HTTP_STATUS or attempt == HTTP_ATTEMPTS - 1:

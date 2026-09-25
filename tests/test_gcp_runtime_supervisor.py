@@ -531,11 +531,15 @@ class FakeCellAgentSupervisor:
     """Record private profile handoff without starting a real cell-agent process."""
 
     calls: list[tuple[Path, GcpNativeRuntimeProfile]] = field(default_factory=list)
+    reference_digests: list[str | None] = field(default_factory=list)
 
-    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+    def ensure(
+        self, profile_path: Path, profile: GcpNativeRuntimeProfile, *, reference_digest: str | None = None
+    ) -> LocalAgentResult:
         """Return a deterministic authenticated local-agent result."""
 
         self.calls.append((profile_path, profile))
+        self.reference_digests.append(reference_digest)
         endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
         return LocalAgentResult(
             endpoint=endpoint,
@@ -552,7 +556,9 @@ class FailingCellAgentSupervisor:
 
     calls: list[tuple[Path, GcpNativeRuntimeProfile]] = field(default_factory=list)
 
-    def ensure(self, profile_path: Path, profile: GcpNativeRuntimeProfile) -> LocalAgentResult:
+    def ensure(
+        self, profile_path: Path, profile: GcpNativeRuntimeProfile, *, reference_digest: str | None = None
+    ) -> LocalAgentResult:
         """Record the handoff and simulate an authenticated agent startup failure."""
 
         self.calls.append((profile_path, profile))
@@ -675,6 +681,56 @@ def _agent_build(source_digest: str | None) -> AgentBuild:
     )
 
 
+@pytest.mark.parametrize("caller_digest", ["plane-build", None, "caller-build"])
+def test_missing_agent_startup_rejects_known_caller_skew(monkeypatch, tmp_path, caller_digest) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build(caller_digest))
+    launcher = FakeAgentLauncher()
+    builds = BuildResponses([None, None, _agent_build("plane-build")])
+    supervisor = LocalAgentSupervisor(
+        paths=LocalDaemonPaths(tmp_path),
+        launcher=launcher,
+        capability_probe=CapabilityResponses([None, None, _capabilities()]),
+        build_probe=builds,
+        process_liveness=AgentProcessLiveness([]),
+    )
+    if caller_digest == "caller-build":
+        with pytest.raises(LocalAgentConfigurationError, match="runtime deploy --yes"):
+            supervisor.ensure(tmp_path / "profile.json", _profile(), reference_digest="plane-build")
+        assert launcher.commands == []
+    else:
+        result = supervisor.ensure(tmp_path / "profile.json", _profile(), reference_digest="plane-build")
+        assert result.state is LocalAgentState.STARTED
+        assert builds.values == []
+
+
+@pytest.mark.parametrize("remote_digest", ["plane-build", None, "unexpected-build"])
+def test_started_agent_build_is_checked_and_mismatch_cleaned_up(monkeypatch, tmp_path, remote_digest) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("plane-build"))
+    launcher = FakeAgentLauncher()
+    builds = BuildResponses([None, None, _agent_build(remote_digest)])
+    supervisor = LocalAgentSupervisor(
+        paths=LocalDaemonPaths(tmp_path),
+        launcher=launcher,
+        capability_probe=CapabilityResponses([None, None, _capabilities()]),
+        build_probe=builds,
+        process_liveness=AgentProcessLiveness([]),
+    )
+    if remote_digest == "unexpected-build":
+        with pytest.raises(LocalAgentConfigurationError, match="runtime deploy --yes"):
+            supervisor.ensure(tmp_path / "profile.json", _profile(), reference_digest="plane-build")
+        assert launcher.process.terminated
+        assert read_owner_only_record(supervisor.paths.agent_record_path(supervisor._target())) is None
+    else:
+        result = supervisor.ensure(tmp_path / "profile.json", _profile(), reference_digest="plane-build")
+        assert result.state is LocalAgentState.STARTED
+        assert not launcher.process.terminated
+    assert builds.values == []
+
+
 def test_agent_supervisor_replaces_an_owned_agent_running_different_code(monkeypatch, tmp_path: Path) -> None:
     from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
 
@@ -699,9 +755,8 @@ def test_agent_supervisor_replaces_an_owned_agent_running_different_code(monkeyp
         paths=paths,
         launcher=launcher,
         capability_probe=CapabilityResponses([None, None, capabilities]),
-        # Two build probes: the pre-lock check sees the stale agent and stops
-        # it; the in-lock re-check probes the (now stopped) agent again.
-        build_probe=BuildResponses([_agent_build("stale-agent-digest"), None]),
+        # The stale agent is stopped, absence rechecked, then the new build verified.
+        build_probe=BuildResponses([_agent_build("stale-agent-digest"), None, _agent_build("current-build-digest")]),
         process_argument_reader=lambda pid: (
             sys.executable,
             "-m",
@@ -823,13 +878,14 @@ def test_agent_supervisor_replaces_a_stale_agent_relaunched_after_the_prelock_di
         capability_probe=CapabilityResponses([None, None, capabilities, None, capabilities]),
         # Probe 1 (pre-lock): nothing digest-divergent is running. Probes 2-3
         # (in-lock re-check, then its replacement stop): the concurrent
-        # relaunch answers with a stale digest. Probe 4: it is gone.
+        # relaunch answers with a stale digest. Probe 4: it is gone. Probe 5: new build.
         build_probe=BuildResponses(
             [
                 _agent_build("current-build-digest"),
                 _agent_build("stale-agent-digest"),
                 _agent_build("stale-agent-digest"),
                 None,
+                _agent_build("current-build-digest"),
             ]
         ),
         process_argument_reader=lambda pid: (
@@ -937,3 +993,88 @@ def test_stop_ends_a_recorded_cell_agent_and_refuses_foreign_processes(tmp_path:
         foreign.stop()
     assert 9178 not in graceful
     assert read_owner_only_record(record_path) is not None, "a refusal must leave the record in place"
+
+
+# --------------------------------------------------------------------------- one runtime, one build
+
+
+def _plane_store(tmp_path: Path) -> GcpNativeRuntimeProfileStore:
+    store = GcpNativeRuntimeProfileStore(tmp_path / "runtime" / "gcp-native-runtime.json")
+    store.create(
+        project_id="eyvan-project",
+        artifact_root_uri="gs://eyvan-artifacts/eyvan",
+        native_worker_wheel_uri=(f"gs://eyvan-artifacts/eyvan/runtime/wheels/{'b' * 64}/eyvan-0.1.0-py3-none-any.whl"),
+    )
+    return store
+
+
+def test_the_agent_is_judged_against_the_serving_plane_not_the_calling_cli(monkeypatch, tmp_path: Path) -> None:
+    """Found live 2026-09-24: `eyvan up` from an edited tree split the runtime in two.
+
+    The CLI replaced the agent with its own build and reused the plane, which --
+    with the worker wheel it had staged -- stayed on the old one. The plane then
+    recycled a freshly granted Spot v6e-16 as stale, and would have recycled
+    every cell after it. The agent's reference is now the plane's build, and the
+    operator is told to move the runtime as one.
+    """
+
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    monkeypatch.setattr(supervisor_module, "serving_source_digest", lambda endpoint: "sha256:plane")
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("sha256:edited-cli"), raising=False)
+    cell_agent = FakeCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=_plane_store(tmp_path),
+        control_plane=FakeControlPlaneSupervisor(),
+        agent=cell_agent,
+    )
+
+    with pytest.warns(RuntimeWarning, match="eyvan runtime deploy"):
+        supervisor.ensure("http://127.0.0.1:19090")
+
+    assert cell_agent.reference_digests == ["sha256:plane"]
+
+
+def test_a_plane_without_a_recorded_build_keeps_the_callers_reference(monkeypatch, tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    monkeypatch.setattr(supervisor_module, "serving_source_digest", lambda endpoint: None)
+    cell_agent = FakeCellAgentSupervisor()
+    supervisor = GcpNativeRuntimeSupervisor(
+        profile_store=_plane_store(tmp_path),
+        control_plane=FakeControlPlaneSupervisor(),
+        agent=cell_agent,
+    )
+
+    supervisor.ensure("http://127.0.0.1:19090")
+
+    assert cell_agent.reference_digests == [None]
+
+
+def test_an_agent_matching_the_plane_is_reused_though_the_cli_differs(monkeypatch, tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
+
+    profile_path = tmp_path / "runtime" / "gcp-native-runtime.json"
+    profile = _profile()
+    paths = LocalDaemonPaths(tmp_path / "eyvan")
+    endpoint = ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    assert target is not None
+    write_owner_only_record(
+        paths.agent_record_path(target),
+        LocalDaemonRecord(endpoint=endpoint, pid=9142, runtime_profile_path=str(profile_path.resolve())),
+    )
+    monkeypatch.setattr(supervisor_module, "build_identity", lambda: _agent_build("sha256:edited-cli"), raising=False)
+    launcher = FakeAgentLauncher()
+    supervisor = LocalAgentSupervisor(
+        paths=paths,
+        launcher=launcher,
+        capability_probe=CapabilityResponses([_capabilities()]),
+        build_probe=BuildResponses([_agent_build("sha256:plane"), _agent_build("sha256:plane")]),
+        process_liveness=AgentProcessLiveness([True]),
+    )
+
+    result = supervisor.ensure(profile_path, profile, reference_digest="sha256:plane")
+
+    assert result.state is LocalAgentState.REUSED
+    assert launcher.commands == []

@@ -94,7 +94,7 @@ def build_plan(
                 "python": "3.11",
                 "init_commands": [
                     "uv pip install --python /opt/eyvan-native/venv/bin/python "
-                    "'jax[tpu]==0.6.2' 'google-cloud-storage==3.3.1'"
+                    "'jax[tpu]==0.11.2' 'google-cloud-storage==3.3.1'"
                 ],
             },
             "autoscaling": {"idle_timeout_s": 300, "provisioning_timeout_s": 1200, "launch_batch": 1},

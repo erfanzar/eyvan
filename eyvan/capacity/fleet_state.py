@@ -579,6 +579,12 @@ class FleetStateStore:
     def _holder(self) -> str:
         return self._owner
 
+    @property
+    def owner(self) -> str:
+        """This store's writer identity: ``host:pid:nonce`` unless a test names one."""
+
+        return self._owner
+
     def load(self) -> dict[str, FleetCellRecord]:
         document, _ = self.backend.read()
         return {

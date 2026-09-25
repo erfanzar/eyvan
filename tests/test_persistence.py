@@ -1047,3 +1047,84 @@ async def test_idempotency_reads_run_on_a_non_postgresql_dialect(tmp_path) -> No
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_write_into_a_nested_container_leaves_no_trace() -> None:
+    """Transactions share frozen records and copy only containers (2026-09-25).
+
+    A deep copy of the whole state per transaction was the idle CPU cost of a
+    loopback plane. The replacement must still isolate a rolled-back session,
+    including writes that land in a nested container in place -- progress
+    reports are kept per workload, per rank.
+    """
+
+    from eyvan.records import UserProgressReport
+
+    repository = InMemoryRepository()
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(_workload())
+        await transaction.put_progress_report("wl-1", UserProgressReport(rank=0, attempt=1, step=1))
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        async with repository.transaction() as transaction:
+            await transaction.put_progress_report("wl-1", UserProgressReport(rank=1, attempt=1, step=1))
+            raise RuntimeError("rollback")
+
+    async with repository.transaction() as transaction:
+        assert [report.rank for report in await transaction.list_progress_reports("wl-1")] == [0]
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_shares_committed_records_rather_than_copying_them() -> None:
+    """The records are frozen, so copying them bought nothing and cost a core."""
+
+    repository = InMemoryRepository()
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(_workload())
+
+    async with repository.transaction() as first:
+        seen = await first.get_workload("wl-1")
+    async with repository.transaction() as second:
+        assert await second.get_workload("wl-1") is seen
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_record_with_nested_changes_is_isolated_by_rollback() -> None:
+    """The supported way to change nested data: a new record, rolled back cleanly."""
+
+    repository = InMemoryRepository()
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(_workload())
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        async with repository.transaction() as transaction:
+            loaded = await transaction.get_workload("wl-1")
+            assert loaded is not None
+            spec = loaded.spec.model_copy(update={"environment": {**loaded.spec.environment, "INJECTED": "x"}})
+            await transaction.put_workload(loaded.model_copy(update={"spec": spec}))
+            raise RuntimeError("rollback")
+
+    async with repository.transaction() as transaction:
+        fresh = await transaction.get_workload("wl-1")
+    assert fresh is not None and "INJECTED" not in fresh.spec.environment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True], ids=["commit", "rollback"])
+async def test_editing_a_committed_record_in_place_is_refused(fails: bool) -> None:
+    """Structural sharing cannot isolate an in-place edit, so the suite forbids one."""
+
+    from eyvan.server.persistence.state import RecordMutatedInPlaceError
+
+    repository = InMemoryRepository()
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(_workload())
+
+    with pytest.raises(RecordMutatedInPlaceError):
+        async with repository.transaction() as transaction:
+            loaded = await transaction.get_workload("wl-1")
+            assert loaded is not None
+            loaded.spec.environment["INJECTED"] = "in place"
+            if fails:
+                raise RuntimeError("rollback")

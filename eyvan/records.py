@@ -51,6 +51,42 @@ DEFAULT_MAX_RETRIES = 3
 #: because it is imported across the package and by tests.
 MAX_GCP_TPU_MULTISLICE_WORKERS = backend_capabilities("gcp-tpu").max_workers_per_cell
 WORKER_COUNT_LABEL = "eyvan_worker_count"
+#: Additional pool ids a workload will accept, comma separated. ``eyvan_pool``
+#: stays the first choice, so a spec written before this existed behaves
+#: identically.
+POOL_ALTERNATES_LABEL = "eyvan_pool_alternates"
+#: The template fingerprint of each alternate, comma separated and aligned with
+#: ``POOL_ALTERNATES_LABEL``. ``eyvan_pool_template`` pins the *primary* pool's
+#: template, and a template includes the zone, so without these an alternate's
+#: cells could never satisfy the pin that keeps a rollout from mixing templates.
+POOL_ALTERNATE_TEMPLATES_LABEL = "eyvan_pool_alternate_templates"
+POOL_LABEL = "eyvan_pool"
+POOL_TEMPLATE_LABEL = "eyvan_pool_template"
+
+
+def candidate_pool_templates(labels: tp.Mapping[str, str]) -> dict[str, str | None]:
+    """Return each pool this workload may run in, and the template it must carry there.
+
+    ``None`` means the workload pins no template in that pool. An alternate
+    submitted before alternates' templates were recorded is left out: the
+    scheduler keeps such a workload to its first choice's template, so counting
+    the alternate's cells as its capacity would report supply it cannot use.
+    """
+
+    primary = labels.get(POOL_LABEL)
+    if not primary:
+        return {}
+    candidates: dict[str, str | None] = {primary: labels.get(POOL_TEMPLATE_LABEL)}
+    alternates = [value.strip() for value in (labels.get(POOL_ALTERNATES_LABEL) or "").split(",") if value.strip()]
+    templates = [
+        value.strip() for value in (labels.get(POOL_ALTERNATE_TEMPLATES_LABEL) or "").split(",") if value.strip()
+    ]
+    if len(templates) == len(alternates):
+        for pool_id, template in zip(alternates, templates, strict=True):
+            candidates.setdefault(pool_id, template)
+    return candidates
+
+
 CALLABLE_SIGNING_KEY_ENV = "EYVAN_CALLABLE_SIGNING_KEY"
 REMOTE_CALLABLE_SIGNATURE_ERROR = (
     "Eyvan remote callable signatures are not supported because no controller-managed verifier is available"
@@ -516,6 +552,16 @@ class AutoscaleBlockReason(StrEnum):
     #: attempts. Retrying forever is indistinguishable from working, so the
     #: workload is told instead.
     CAPACITY_ACQUISITION_EXHAUSTED = "capacity_acquisition_exhausted"
+
+
+#: Said when every pool a workload accepts has failed to acquire capacity
+#: ``MAX_CONSECUTIVE_ACQUISITION_FAILURES`` times running. Names the remedy,
+#: because the job is not going to progress where it is and the operator has to
+#: choose a different zone or shape.
+ACQUISITION_EXHAUSTED_SCHEDULING_REASON = (
+    "every zone this job accepts has failed to grant capacity five times running; "
+    "choose another zone or shape, or wait for the provider to free some"
+)
 
 
 class CellState(StrEnum):
@@ -2687,8 +2733,11 @@ class PoolWarmth(EyvanModel):
     #: standing ``min_cells``. An operator debugging "why is this pool not empty
     #: at 03:00" needs these distinguished.
     window_active: bool = False
-    #: Cells that currently count toward the floor.
+    #: Ready cells that currently count toward the floor.
     warm_cells: int = Field(ge=0)
+    #: Floor cells that are requested but not ready yet. The planner counts them
+    #: as supply, so it will not launch more; they are not warm until they serve.
+    provisioning_cells: int = Field(default=0, ge=0)
     #: Warm cells holding no lease. Not waste: this is the capacity the floor
     #: exists to reserve, and it is the number that must be subtracted from a
     #: fleet's idle cost before that cost means anything.

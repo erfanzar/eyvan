@@ -15,6 +15,7 @@ import httpx
 
 from eyvan._internal.client_version import CLIENT_VERSION_HEADER, client_version
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.plane_tls import control_plane_httpx_options
 from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.identity import ClientIdentity
@@ -138,6 +139,10 @@ def raise_for_status(response: httpx.Response) -> httpx.Response:
     return response
 
 
+#: Methods a retry cannot duplicate the effect of.
+_SAFE_METHODS = frozenset({"GET", "HEAD"})
+
+
 class SyncApiTransport:
     """Typed synchronous HTTP boundary with mutation retry handling."""
 
@@ -166,6 +171,8 @@ class SyncApiTransport:
                 headers=client_headers,
                 timeout=30,
                 trust_env=trust_env,
+                # A head's own CA, added to system trust; see eyvan._internal.plane_tls.
+                **control_plane_httpx_options(),
             )
             self._own_client = True
             self._injected_headers: HeaderMap = {}
@@ -220,9 +227,25 @@ class SyncApiTransport:
         content: bytes | None = None,
         headers: HeaderMap | None = None,
     ) -> httpx.Response:
-        """Send one request and require a successful response."""
+        """Send one request and require a successful response.
 
-        return raise_for_status(self.request(method, path, params=params, json=json, content=content, headers=headers))
+        A read is retried on the statuses a mutation is: the server answers a
+        PostgreSQL serialization conflict with 503 and ``Retry-After``, and a
+        read loses nothing by asking again. Unretried, one such conflict ended a
+        client's ``wait()`` on a live Spot job whose plane was fine (2026-09-24).
+        """
+
+        if method.upper() not in _SAFE_METHODS:
+            return raise_for_status(
+                self.request(method, path, params=params, json=json, content=content, headers=headers)
+            )
+        for attempt in range(self.retry_policy.max_attempts):
+            response = self.request(method, path, params=params, json=json, content=content, headers=headers)
+            delay = self.retry_policy.delay(status_code=response.status_code, headers=response.headers, attempt=attempt)
+            if delay is None or attempt == self.retry_policy.max_attempts - 1:
+                return raise_for_status(response)
+            time.sleep(delay)
+        raise AssertionError("retry policy must allow at least one attempt")
 
     def mutate(
         self,
@@ -301,6 +324,8 @@ class AsyncApiTransport:
                 headers=client_headers,
                 timeout=30,
                 trust_env=trust_env,
+                # A head's own CA, added to system trust; see eyvan._internal.plane_tls.
+                **control_plane_httpx_options(),
             )
             self._own_client = True
             self._injected_headers: HeaderMap = {}
@@ -355,10 +380,18 @@ class AsyncApiTransport:
         content: bytes | None = None,
         headers: HeaderMap | None = None,
     ) -> httpx.Response:
-        """Send one request and require a successful response."""
+        """Send one request and require a successful response; reads retry as in the sync transport."""
 
-        response = await self.request(method, path, params=params, json=json, content=content, headers=headers)
-        return raise_for_status(response)
+        if method.upper() not in _SAFE_METHODS:
+            response = await self.request(method, path, params=params, json=json, content=content, headers=headers)
+            return raise_for_status(response)
+        for attempt in range(self.retry_policy.max_attempts):
+            response = await self.request(method, path, params=params, json=json, content=content, headers=headers)
+            delay = self.retry_policy.delay(status_code=response.status_code, headers=response.headers, attempt=attempt)
+            if delay is None or attempt == self.retry_policy.max_attempts - 1:
+                return raise_for_status(response)
+            await asyncio.sleep(delay)
+        raise AssertionError("retry policy must allow at least one attempt")
 
     async def mutate(
         self,

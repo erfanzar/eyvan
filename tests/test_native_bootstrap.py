@@ -685,3 +685,25 @@ def test_an_undeclared_python_renders_exactly_the_script_it_always_did() -> None
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow
+
+
+def test_the_per_job_dependency_cache_is_created_for_the_workload_user() -> None:
+    """Jobs run as ``eyvan-workload``; a root-owned (or absent) cache made every job
+    fall back to its own working directory and reinstall its packages from scratch.
+    Seen on a Spot v6e-4 on 2026-09-24: ``/var/lib/eyvan/runtime-envs is not writable``.
+    """
+
+    from eyvan.worker.runtime.dependency_entry import DEFAULT_CACHE_ROOT
+
+    script = build_native_worker_startup_script(
+        package="gs://artifacts/eyvan/eyvan.whl",
+        package_sha256=_SHA256,
+        package_generation="1700000000000000",
+        port=8123,
+        state_dir="/var/lib/eyvan/worker",
+        worker_secret_resource="projects/project-a/secrets/eyvan-native-cell-uid/versions/latest",
+    )
+
+    creation = next(line for line in script.splitlines() if "install -d -o eyvan-workload" in line)
+    assert str(DEFAULT_CACHE_ROOT) in creation.split()
+    assert "-m 0750" in creation

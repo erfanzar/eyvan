@@ -192,3 +192,158 @@ def test_racing_never_asks_a_pool_that_is_not_a_candidate(width: int) -> None:
     asked = _demand(race_width=width, alternates=(f"pool-{ZONES[1]}",))
 
     assert asked[f"pool-{ZONES[2]}"] == ()
+
+
+def test_a_race_never_re_asks_a_zone_that_denied_the_workload() -> None:
+    """Found live on 2026-09-24: with width 3, us-central1-a had denied queue admission
+    and the race spent a slot asking it again instead of asking us-central1-c."""
+
+    pools = tuple(_pool(zone) for zone in ZONES)
+    workload = _workload(alternates=(f"pool-{ZONES[0]}", f"pool-{ZONES[2]}"))
+    workload = workload.model_copy(
+        update={
+            "spec": workload.spec.model_copy(
+                update={
+                    "required_labels": {
+                        "eyvan_pool": f"pool-{ZONES[1]}",
+                        POOL_ALTERNATES_LABEL: f"pool-{ZONES[0]},pool-{ZONES[2]}",
+                    }
+                }
+            )
+        }
+    )
+    simulation = CapacitySimulation(
+        cells=(),
+        pool_by_cell_id={"virtual-0": f"pool-{ZONES[1]}"},
+        virtual_worker_count_by_cell_id={"virtual-0": 1},
+        queue_denied_pool_ids={"wl-1": frozenset({f"pool-{ZONES[0]}"})},
+    )
+
+    class _Lease:
+        cell_id = "virtual-0"
+        workload_id = "wl-1"
+
+    class _Placement:
+        all_leases = (_Lease(),)
+
+    result = SchedulingResult.__new__(SchedulingResult)
+    object.__setattr__(result, "placements", (_Placement(),))
+    demand = simulation.demand(pools, (), result, (workload,), None, race_width=2)
+    asked = {pool_id: entry.virtual_workload_ids for pool_id, entry in demand.items()}
+
+    assert asked[f"pool-{ZONES[0]}"] == (), "the denying zone is not asked again"
+    assert asked[f"pool-{ZONES[2]}"] == ("wl-1",), "its race slot goes to a zone that has not refused"
+
+
+def test_a_race_never_asks_a_pool_past_the_acquisition_bound() -> None:
+    pools = tuple(_pool(zone) for zone in ZONES)
+    workload = _workload(alternates=(f"pool-{ZONES[1]}", f"pool-{ZONES[2]}"))
+    simulation = CapacitySimulation(
+        cells=(),
+        pool_by_cell_id={"virtual-0": f"pool-{ZONES[0]}"},
+        virtual_worker_count_by_cell_id={"virtual-0": 1},
+        exhausted_pool_ids=frozenset({f"pool-{ZONES[1]}"}),
+    )
+
+    class _Lease:
+        cell_id = "virtual-0"
+        workload_id = "wl-1"
+
+    class _Placement:
+        all_leases = (_Lease(),)
+
+    result = SchedulingResult.__new__(SchedulingResult)
+    object.__setattr__(result, "placements", (_Placement(),))
+    demand = simulation.demand(pools, (), result, (workload,), None, race_width=3)
+    asked = {pool_id: entry.virtual_workload_ids for pool_id, entry in demand.items()}
+
+    assert asked[f"pool-{ZONES[1]}"] == ()
+    assert asked[f"pool-{ZONES[2]}"] == ("wl-1",)
+
+
+def test_a_workload_naming_no_pool_is_not_offered_a_zone_that_denied_it() -> None:
+    """Found live on 2026-09-24: a raw `submit-batch` task named no pool, so it took
+    the generic branch, which offered every pool on every pass -- and us-south1-c,
+    which had denied queue admission, was asked four times running."""
+
+    from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+    from eyvan.records import CellState, utcnow
+
+    pools = tuple(_pool(zone) for zone in ZONES)
+    generic = WorkloadRecord(
+        id="wl-1",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="batch-0", execution=CommandExecution(command="true")),
+        state=WorkloadState.PENDING,
+        created_by="alice",
+    )
+    denied = (
+        pools[0]
+        .make_cell("pool-us-east5-a-0001", worker_count=1, autoscale_request_workload_id="wl-1")
+        .model_copy(
+            update={
+                "state": CellState.UNAVAILABLE,
+                "provider_failure_code": CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED,
+            }
+        )
+    )
+
+    simulation = CapacitySimulation.build(pools, (denied,), (generic,), (), utcnow())
+
+    offered = {
+        pool_id
+        for cell_id, pool_id in simulation.pool_by_cell_id.items()
+        if cell_id in simulation.virtual_worker_count_by_cell_id
+    }
+    assert f"pool-{ZONES[0]}" not in offered
+    assert offered == {f"pool-{ZONES[1]}", f"pool-{ZONES[2]}"}
+
+
+def test_a_request_the_provider_refused_holds_no_race_slot_and_is_not_asked_again() -> None:
+    """Found live on 2026-09-25: twenty stocked-out v5e zones held every race slot.
+
+    A Compute create answers a stockout at once, but the failed cell still counts
+    as supply until its provisioning timeout, so it was also counted as racing:
+    six zones went unasked for the whole window. Stalled pools are neither
+    re-asked nor counted against the width.
+    """
+
+    from eyvan.capacity.drivers.base import CapacityProviderFailureCode
+    from eyvan.records import CellState, utcnow
+
+    pools = tuple(_pool(zone) for zone in ZONES)
+    workload = _workload(alternates=(f"pool-{ZONES[1]}", f"pool-{ZONES[2]}"))
+    stocked_out = (
+        pools[1]
+        .make_cell("pool-us-east5-b-0001", worker_count=1, autoscale_request_workload_id="wl-1")
+        .model_copy(
+            update={"state": CellState.UNAVAILABLE, "provider_failure_code": CapacityProviderFailureCode.STOCKOUT}
+        )
+    )
+
+    built = CapacitySimulation.build(pools, (stocked_out,), (workload,), (), utcnow())
+    assert built.stalled_pool_ids == {"wl-1": frozenset({f"pool-{ZONES[1]}"})}
+    assert built.owned_pool_ids.get("wl-1", frozenset()) == frozenset()
+
+    simulation = CapacitySimulation(
+        cells=(),
+        pool_by_cell_id={"virtual-0": f"pool-{ZONES[0]}"},
+        virtual_worker_count_by_cell_id={"virtual-0": 1},
+        stalled_pool_ids=built.stalled_pool_ids,
+    )
+
+    class _Lease:
+        cell_id = "virtual-0"
+        workload_id = "wl-1"
+
+    class _Placement:
+        all_leases = (_Lease(),)
+
+    result = SchedulingResult.__new__(SchedulingResult)
+    object.__setattr__(result, "placements", (_Placement(),))
+    demand = simulation.demand(pools, (), result, (workload,), None, race_width=2)
+    asked = {pool_id: entry.virtual_workload_ids for pool_id, entry in demand.items()}
+
+    assert asked[f"pool-{ZONES[1]}"] == (), "the stocked-out zone is not asked again"
+    assert asked[f"pool-{ZONES[2]}"] == ("wl-1",), "and its failure did not use up the race slot"

@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-213 variables are currently referenced. Names set on workload
+215 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -69,6 +69,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | `eyvan` |
 | `EYVAN_WORKLOAD_ID` | `eyvan` |
 | `EYVAN_WORKLOAD_TOKEN` | `eyvan` |
+| `EYVAN_CONTROL_PLANE_CA_B64` | `eyvan/_internal/plane_tls` |
+| `EYVAN_CONTROL_PLANE_CA_FILE` | `eyvan/_internal/plane_tls` |
 | `EYVAN_CLUSTER_CAPACITY_MAX_AGE_S` | `eyvan/capacity/autoscale/pool_capacity` |
 | `EYVAN_CLUSTER_CAPACITY_PLANNING` | `eyvan/capacity/autoscale/pool_capacity` |
 | `EYVAN_KUBERNETES_CLUSTER_CAPACITY_DETAIL` | `eyvan/capacity/drivers/kubernetes` |

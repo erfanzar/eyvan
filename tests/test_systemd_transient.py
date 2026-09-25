@@ -1350,3 +1350,208 @@ def test_a_failed_worker_names_a_non_traceback_last_word_too(tmp_path: Path) -> 
 
     assert observation.status is ExecutionWorkloadStatus.FAILED
     assert "No module named device_test" in observation.message
+
+
+def test_systemds_own_closing_lines_are_never_the_reason(tmp_path: Path) -> None:
+    """Journal of the real failure on a Spot v6e-4, 2026-09-24, verbatim in shape.
+
+    Python's launcher named the cause mid-line and systemd appended two lines of
+    its own; the verdict quoted systemd's "Failed with result 'exit-code'".
+    """
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+    systemd.journal[unit_name] = "\n".join(
+        [
+            "Started /bin/sh -c python -m eyvan.worker.runtime.dependency_entry --require einops==0.8.1 -- ...",
+            "eyvan: /var/lib/eyvan/runtime-envs is not writable; caching this job's packages in ./.eyvan-runtime-envs",
+            "/var/lib/eyvan/workload/.eyvan-runtime-envs/6a88/bin/python: Error while finding module specification "
+            "for 'eyvan.worker.runtime.callable_worker' (ModuleNotFoundError: No module named 'eyvan')",
+            f"{unit_name}: Main process exited, code=exited, status=1/FAILURE",
+            f"{unit_name}: Failed with result 'exit-code'.",
+        ]
+    )
+
+    observation = executor.status(remote_id)
+
+    assert "ModuleNotFoundError: No module named 'eyvan'" in observation.message
+    assert "Failed with result" not in observation.message.split("worker output ended with:", 1)[1]
+
+
+def test_a_journal_of_nothing_but_systemd_lifecycle_keeps_the_plain_message(tmp_path: Path) -> None:
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+    systemd.journal[unit_name] = f"{unit_name}: Failed with result 'exit-code'.\n"
+
+    observation = executor.status(remote_id)
+
+    assert observation.message == "systemd service failed with result exit-code"
+
+
+def test_a_jobs_own_starting_line_is_not_mistaken_for_systemd(tmp_path: Path) -> None:
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    unit_name = _record(executor, remote_id)["unit_name"]
+    systemd.complete(unit_name, result="exit-code", status="1")
+    systemd.units[unit_name].update({"ActiveState": "failed", "SubState": "failed", "ControlGroup": ""})
+    systemd.journal[unit_name] = "\n".join(
+        ["loading data", "Stopping data loader: disk full", f"{unit_name}: Failed with result 'exit-code'."]
+    )
+
+    observation = executor.status(remote_id)
+
+    assert "Stopping data loader: disk full" in observation.message
+
+
+def test_a_retired_execution_is_launched_again_when_submitted_again(tmp_path: Path) -> None:
+    """Found live 2026-09-24 on a Spot v6e-16 gang.
+
+    One host dropped the first submission, so the gang retired the ranks it had
+    already started. The dispatch retry used the same submission ID, and those
+    hosts answered it as a replay of the launch Eyvan had just stopped: two of
+    four ranks were already STOPPED when the gang was first observed, and it was
+    declared lost. A retired record is Eyvan's own stop, so it is relaunched.
+    """
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(
+        tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a", use_exit_type_cgroup=True
+    )
+    remote_id = executor.submit(_spec(), _context())
+    executor.retire(remote_id, _context())
+    assert _record(executor, remote_id)["retired"] is True
+    launches_before = sum(1 for command in systemd.commands if command[0] == "systemd-run")
+
+    assert executor.submit(_spec(), _context()) == remote_id
+
+    launches_after = sum(1 for command in systemd.commands if command[0] == "systemd-run")
+    assert launches_after == launches_before + 1
+    record = _record(executor, remote_id)
+    assert "retired" not in record
+    assert record["status"] not in {ExecutionWorkloadStatus.STOPPED.value, ExecutionWorkloadStatus.FAILED.value}
+
+
+def test_retire_cleanup_failure_is_pending_and_submit_retries_it(tmp_path: Path, monkeypatch) -> None:
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    systemd.complete(systemd_unit_name(remote_id))
+    failures = True
+    cleanup_calls = []
+
+    def cleanup(record):
+        cleanup_calls.append(record["remote_id"])
+        if failures:
+            raise RuntimeError("docker rm failed")
+
+    monkeypatch.setattr(executor, "_retire_terminal_runtime", cleanup)
+    with pytest.raises(RuntimeError, match="docker rm failed"):
+        executor.retire(remote_id, _context(key="retire-1"))
+    record = _record(executor, remote_id)
+    assert record.get("retired") is not True
+    assert record["retire_cleanup_pending"] is True
+    launches = sum(command[0] == "systemd-run" for command in systemd.commands)
+    with pytest.raises(RuntimeError, match="docker rm failed"):
+        executor.submit(_spec(), _context())
+    assert sum(command[0] == "systemd-run" for command in systemd.commands) == launches
+    assert len(cleanup_calls) == 2
+    failures = False
+    executor.submit(_spec(), _context())
+    assert len(cleanup_calls) == 3
+    assert sum(command[0] == "systemd-run" for command in systemd.commands) == launches + 1
+    assert _record(executor, remote_id)["incarnation"] == 1
+
+
+def test_submission_key_can_retire_each_relaunched_incarnation(tmp_path: Path) -> None:
+    """Each failed gang launch must be able to roll back using its submission key."""
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    context = _context()
+    remote_id = executor.submit(_spec(), context)
+    executor.retire(remote_id, context)
+    assert _record(executor, remote_id)["retired"] is True
+    executor.submit(_spec(), context)
+    assert _record(executor, remote_id)["incarnation"] == 1
+    stops = sum(command[:2] == ("systemctl", "stop") for command in systemd.commands)
+
+    executor.retire(remote_id, context)
+
+    record = _record(executor, remote_id)
+    assert record["status"] == ExecutionWorkloadStatus.STOPPED.value
+    assert record["retired"] is True
+    assert record["incarnation"] == 1
+    assert sum(command[:2] == ("systemctl", "stop") for command in systemd.commands) > stops
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_replayed_retire_does_not_stop_relaunched_incarnation(tmp_path: Path, legacy: bool) -> None:
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    if legacy:
+        record = _record(executor, remote_id)
+        record.pop("incarnation", None)
+        executor._record_path(remote_id).write_text(json.dumps(record))
+    executor.retire(remote_id, _context(key="retire-1"))
+    executor.submit(_spec(), _context())
+    before = _record(executor, remote_id)
+    stops = sum(command[:2] == ("systemctl", "stop") for command in systemd.commands)
+    executor.retire(remote_id, _context(key="retire-1"))
+    assert _record(executor, remote_id) == before
+    assert sum(command[:2] == ("systemctl", "stop") for command in systemd.commands) == stops
+    assert before["incarnation"] == 1
+    executor.retire(remote_id, _context(key="retire-2"))
+    assert _record(executor, remote_id)["retired"] is True
+
+
+@pytest.mark.parametrize("terminal_observation", [False, True])
+def test_retire_rechecks_incarnation_after_observation(tmp_path: Path, monkeypatch, terminal_observation: bool) -> None:
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    if terminal_observation:
+        systemd.complete(systemd_unit_name(remote_id))
+    status = executor.status
+    replacement = []
+    stops = []
+
+    def interleaved_status(remote_id):
+        observed = status(remote_id)
+        monkeypatch.setattr(executor, "status", status)
+        executor.retire(remote_id, _context(key="concurrent-retire"))
+        executor.submit(_spec(), _context())
+        replacement.append(_record(executor, remote_id))
+        stops.append(sum(command[:2] == ("systemctl", "stop") for command in systemd.commands))
+        return observed
+
+    monkeypatch.setattr(executor, "status", interleaved_status)
+    executor.retire(remote_id, _context(key="original-retire"))
+    assert _record(executor, remote_id) == replacement[0]
+    assert sum(command[:2] == ("systemctl", "stop") for command in systemd.commands) == stops[0]
+
+
+def test_a_launch_that_ended_by_itself_is_still_a_replay(tmp_path: Path) -> None:
+    """At-least-once dispatch must not run a finished attempt twice."""
+
+    systemd = FakeSystemd()
+    executor = SystemdTransientServiceExecutor(
+        tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a", use_exit_type_cgroup=True
+    )
+    remote_id = executor.submit(_spec(), _context())
+    systemd.complete(_record(executor, remote_id)["unit_name"])
+    executor.status(remote_id)
+    launches_before = sum(1 for command in systemd.commands if command[0] == "systemd-run")
+
+    executor.submit(_spec(), _context())
+
+    assert sum(1 for command in systemd.commands if command[0] == "systemd-run") == launches_before

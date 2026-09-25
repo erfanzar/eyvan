@@ -207,6 +207,11 @@ def _isolated_context_file(monkeypatch, tmp_path) -> None:
     class ReadyNativeGcpRuntime:
         """Keep generic CLI tests independent from a private runtime profile."""
 
+        @classmethod
+        def for_endpoint(cls, endpoint: str | ControlPlaneEndpoint) -> ReadyNativeGcpRuntime:
+            del endpoint
+            return cls()
+
         def ensure(self, endpoint: str | ControlPlaneEndpoint) -> None:
             del endpoint
 

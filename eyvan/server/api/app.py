@@ -562,6 +562,8 @@ def create_app(
     injected one is the only thing an offline test can reach.
     """
 
+    # Pin this process's identity to the tree it started from; see build_identity.
+    build_identity()
     server_bind = server_bind or ServerBindPolicy.from_host("127.0.0.1")
     quota_cache = TpuQuotaCache(ttl_s=TPU_QUOTA_CACHE_TTL_S, deadline_s=TPU_QUOTA_READ_DEADLINE_S)
     resolved_quota_discovery: list[TpuQuotaDiscovery] = [quota_discovery] if quota_discovery is not None else []
@@ -4141,6 +4143,14 @@ def main() -> None:
         default=ServerLogLevel.INFO,
     )
     args = parser.parse_args()
+    # Validate distribution before serving: a combined CA/key file must never
+    # reach a job environment. Keep the error free of certificate/key bytes.
+    from eyvan._internal.plane_tls import ControlPlaneCAError, control_plane_ca_b64
+
+    try:
+        control_plane_ca_b64()
+    except ControlPlaneCAError as exc:
+        parser.error(str(exc))
     if args.insecure_plaintext:
         if os.getenv("EYVAN_TLS_CERT_FILE") or os.getenv("EYVAN_TLS_KEY_FILE"):
             parser.error("--insecure-plaintext conflicts with EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE")
@@ -4204,6 +4214,9 @@ def main() -> None:
                 runtime_profile_path=runtime_profile_identifier(
                     args.runtime_profile.expanduser().resolve() if args.runtime_profile is not None else None
                 ),
+                # The build this very process pinned when its app was created:
+                # the one its cell agent must match (serving_source_digest).
+                source_digest=build_identity().source_digest,
             ),
         )
     uvicorn.run(

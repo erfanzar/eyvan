@@ -90,6 +90,20 @@ _FAILURE_EXCERPT_LIMIT = 240
 #: 'spectrax'``. Anchored and shape-checked rather than substring-matched so a
 #: traceback *frame* line or incidental prose never poses as the reason.
 _FAILURE_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Exit|Timeout):")
+#: An exception named mid-line. Python's own launcher failures read
+#: ``/path/bin/python: Error while finding module specification for 'x'
+#: (ModuleNotFoundError: No module named 'eyvan')`` -- the reason is there, just
+#: not at the start of the line.
+_FAILURE_EXCEPTION_ANYWHERE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):")
+#: systemd's own narration of the unit's lifecycle. It is always the last thing
+#: in the journal of a failed unit, and it is never why the unit failed.
+_SYSTEMD_LIFECYCLE_LINE = re.compile(
+    r"^(?:\S+\.service: (?:Main process exited|Failed with result|Deactivated|Consumed|Scheduled restart)"
+    # systemd names the unit it started or stopped -- a transient unit by its
+    # command line or its ``.service`` name -- so a job's own "Starting epoch 3"
+    # is not mistaken for it.
+    r"|(?:Started|Starting|Stopped|Stopping) (?:/|\S+\.service\b))"
+)
 
 
 def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
@@ -517,6 +531,21 @@ def _file_lock(path: Path, *, shared: bool = False) -> tp.Iterator[None]:
         if locked:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _was_retired(record: tp.Mapping[str, JsonValue]) -> bool:
+    """Return whether Eyvan itself retired this execution, as opposed to it ending."""
+
+    return record.get("retired") is True
+
+
+def _incarnation(record: tp.Mapping[str, JsonValue]) -> int:
+    """Read the relaunch counter, preserving records written before it existed."""
+
+    value = record.get("incarnation", 0)
+    if type(value) is not int or value < 0:
+        raise RuntimeError("invalid systemd execution incarnation")
+    return value
 
 
 def _record_lock_path(record_path: Path) -> Path:
@@ -1064,12 +1093,19 @@ class SystemdTransientServiceExecutor:
         tail = self._failure_journal_reader(unit_name)
         if not tail:
             return None
-        lines = [stripped for line in tail.splitlines() if (stripped := line.strip())]
+        lines = [
+            stripped
+            for line in tail.splitlines()
+            if (stripped := line.strip()) and not _SYSTEMD_LIFECYCLE_LINE.match(stripped)
+        ]
         if not lines:
             return None
+        # A job that dies on a missing module names it mid-line, and systemd's
+        # "Failed with result 'exit-code'" follows it. Reporting that last line
+        # told a Spot v6e-4 user nothing on 2026-09-24; the reason was one line up.
         excerpt = next(
             (line for line in reversed(lines) if _FAILURE_EXCEPTION_LINE.match(line)),
-            lines[-1],
+            next((line for line in reversed(lines) if _FAILURE_EXCEPTION_ANYWHERE.search(line)), lines[-1]),
         )
         return excerpt[:_FAILURE_EXCERPT_LIMIT] or None
 
@@ -1400,6 +1436,22 @@ class SystemdTransientServiceExecutor:
 
         del record
 
+    def _complete_retirement(self, record_path: Path, record: JsonObject) -> None:
+        """Finish cleanup under the record lock before permitting a relaunch."""
+
+        record["retire_cleanup_pending"] = True
+        record.pop("retired", None)
+        _atomic_write_json(record_path, record)
+        try:
+            self._retire_terminal_runtime(record)
+            self._remove_environment_files(record)
+        except Exception:
+            _atomic_write_json(record_path, record)
+            raise
+        record.pop("retire_cleanup_pending", None)
+        record["retired"] = True
+        _atomic_write_json(record_path, record)
+
     def _runtime_logs(self, record: tp.Mapping[str, JsonValue]) -> str | None:
         """Return external-runtime logs, or ``None`` to fall back to journald."""
 
@@ -1446,18 +1498,32 @@ class SystemdTransientServiceExecutor:
                 # scaffolding. Terminal replays also retry plaintext cleanup.
                 self._remove_environment_files(existing)
                 _atomic_write_json(record_path, existing)
-                return remote_id
+                if existing.get("retire_cleanup_pending") is True:
+                    self._complete_retirement(record_path, existing)
+                if not _was_retired(existing):
+                    return remote_id
 
         def reserve_and_launch() -> str:
             """Reserve and launch while any logical workload lock remains held."""
 
-            with _file_lock(_record_lock_path(record_path)):
+            # Retirement stops release the record lock during runtime I/O. Keep
+            # relaunch excluded until that old-incarnation I/O has finished.
+            with _file_lock(record_path.with_suffix(".retire-stop.lock")), _file_lock(_record_lock_path(record_path)):
                 existing = _load_json(record_path)
                 if existing is not None:
                     self._validate_fence(remote_id, existing, context)
                     self._remove_environment_files(existing)
                     _atomic_write_json(record_path, existing)
-                    return remote_id
+                    if existing.get("retire_cleanup_pending") is True:
+                        self._complete_retirement(record_path, existing)
+                    if not _was_retired(existing):
+                        return remote_id
+                    # A retired record is one Eyvan stopped on purpose -- a gang
+                    # rolling back a partial launch -- so a submit naming it again
+                    # asks for a run, not a replay. Returned as a replay, the
+                    # dispatch retry on a Spot v6e-16 "launched" onto the two units
+                    # the rollback had just stopped, and the gang was declared lost
+                    # ten seconds later (2026-09-24). Falls through and replaces it.
                 now = _utcnow()
                 try:
                     boot_id = self._boot_id_reader()
@@ -1476,6 +1542,10 @@ class SystemdTransientServiceExecutor:
                     "generation",
                     "fencing_token",
                     "idempotency_key",
+                    "incarnation",
+                    "retire_keys",
+                    "retired",
+                    "retire_cleanup_pending",
                     "entrypoint",
                     "environment",
                     "metadata",
@@ -1493,6 +1563,13 @@ class SystemdTransientServiceExecutor:
                     raise ValueError(
                         f"systemd runtime record fields must not replace lifecycle field {conflicting_fields[0]!r}"
                     )
+                retire_keys = existing.get("retire_keys", {}) if existing is not None else {}
+                if not isinstance(retire_keys, dict):
+                    raise RuntimeError("invalid systemd execution retirement keys")
+                # Gang rollback reuses the submission key. Relaunch makes that
+                # key refer to this new run; distinct retirement-command keys
+                # stay bound to their old incarnations for late replay safety.
+                retire_keys = {key: value for key, value in retire_keys.items() if key != context.idempotency_key}
                 record: JsonObject = {
                     "remote_id": remote_id,
                     "unit_name": unit_name,
@@ -1501,6 +1578,8 @@ class SystemdTransientServiceExecutor:
                     "generation": context.generation,
                     "fencing_token": context.fencing_token,
                     "idempotency_key": context.idempotency_key,
+                    "incarnation": _incarnation(existing) + 1 if existing is not None else 0,
+                    "retire_keys": retire_keys,
                     "entrypoint": entrypoint,
                     "environment": durable_environment,
                     "metadata": dict(metadata),
@@ -1843,6 +1922,17 @@ class SystemdTransientServiceExecutor:
             if record is None:
                 return
             self._validate_fence(remote_id, record, context)
+            incarnation = _incarnation(record)
+            retire_keys = record.get("retire_keys", {})
+            if not isinstance(retire_keys, dict):
+                raise RuntimeError("invalid systemd execution retirement keys")
+            if context.idempotency_key in retire_keys and retire_keys[context.idempotency_key] != incarnation:
+                return
+            # Bind at admission, not completion: an overlapping retirement may
+            # finish this incarnation while this caller is observing it.
+            retire_keys[context.idempotency_key] = incarnation
+            record["retire_keys"] = retire_keys
+            _atomic_write_json(record_path, record)
 
         try:
             timeout_s = max(float(os.getenv("EYVAN_SUPERSEDE_WAIT_TIMEOUT_S", "300")), 0.1)
@@ -1860,20 +1950,26 @@ class SystemdTransientServiceExecutor:
                     record = _load_json(record_path)
                     if record is not None:
                         self._validate_fence(remote_id, record, context)
-                        try:
-                            self._retire_terminal_runtime(record)
-                        finally:
-                            try:
-                                self._remove_environment_files(record)
-                            finally:
-                                _atomic_write_json(record_path, record)
+                        if (
+                            _incarnation(record) != incarnation
+                            or _known_persisted_status(record) not in _TERMINAL_STATES
+                        ):
+                            return
+                        if not _was_retired(record):
+                            self._complete_retirement(record_path, record)
                 return
             if observed.status is ExecutionWorkloadStatus.INDETERMINATE and not self._indeterminacy_is_recoverable(
                 record_path
             ):
                 raise RuntimeError(f"cannot safely retire ambiguous systemd execution {remote_id!r}")
             try:
-                self.stop(remote_id, context)
+                with _file_lock(record_path.with_suffix(".retire-stop.lock")):
+                    with _file_lock(_record_lock_path(record_path)):
+                        current = _load_json(record_path)
+                        if current is None or _incarnation(current) != incarnation:
+                            return
+                        self._validate_fence(remote_id, current, context)
+                    self.stop(remote_id, context)
             except Exception:
                 # A stop that fails now may well succeed on the next poll: a
                 # container can still be shutting down, and this loop already

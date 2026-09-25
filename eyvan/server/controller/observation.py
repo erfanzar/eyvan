@@ -1481,9 +1481,19 @@ class _ControllerObservation:
                     # with it, rather than being flattened into its own name.
                     else (cell.unavailable_reason if provider_failure_code is not None else remote_state.value)
                 )
-                availability = self._observe_capacity_belief(
-                    cell,
-                    provision_outcome(reported_failure_code, remote_state),
+                # A provider draining capacity without saying why has not
+                # reported an outcome yet: the state that follows it does. Scored
+                # as a PROVIDER_ERROR, a Spot v5p-8 seen STOPPING on its way to a
+                # preemption put us-central1-a into cooldown and failed P5's
+                # no-cooldown check, although the TERMINATED observation that
+                # followed was correctly classified as preempted (2026-09-24).
+                availability = (
+                    cell.availability
+                    if reported_failure_code is None and remote_state is CapacityStatus.DRAINING
+                    else self._observe_capacity_belief(
+                        cell,
+                        provision_outcome(reported_failure_code, remote_state),
+                    )
                 )
         transition: tuple[CellRecord, CellRecord] | None = None
         async with self.repository.transaction() as transaction:

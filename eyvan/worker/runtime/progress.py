@@ -27,6 +27,7 @@ import typing as tp
 import urllib.error
 import urllib.request
 
+from eyvan._internal.plane_tls import control_plane_urlopen_options
 from eyvan.worker.runtime.http_retry import HTTP_ATTEMPTS, RETRYABLE_HTTP_STATUS, retry_delay
 
 #: Set by the control plane on a managed-result dispatch. Their absence is the
@@ -169,7 +170,7 @@ def _post(request: urllib.request.Request) -> bool:
 
     for attempt in range(HTTP_ATTEMPTS):
         try:
-            with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
+            with urllib.request.urlopen(request, timeout=_TIMEOUT_S, **control_plane_urlopen_options()) as response:
                 response.read()
                 return True
         except urllib.error.HTTPError as exc:

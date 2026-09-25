@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 
+from eyvan.capacity.drivers.base import provider_failure_from_diagnostic
+
 _GCLOUD_MESSAGE = re.compile(r'"message"\s*:\s*"(?P<message>(?:\\.|[^"\\])*)"', re.DOTALL)
 _ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _SAFE_DIAGNOSTIC_LIMIT = 500
@@ -55,8 +57,21 @@ def _is_safe_provider_diagnostic(value: str) -> bool:
     """Return whether one line is an operator diagnostic rather than command noise."""
 
     normalized = value.casefold()
+    # A line the shared classifier reads as a stockout or an exhausted quota is
+    # the provider naming why it said no. Compute Engine's stockout code,
+    # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS, matched none of the markers
+    # below, so every Compute stockout reached users as "inspect Eyvan
+    # controller logs" (2026-09-24).
+    if provider_failure_from_diagnostic(value) is not None:
+        return True
+    # Eyvan's own transport sentence, not the provider's. Filtered out, it became
+    # "Capacity provider rejected the request" -- blaming a provider that was
+    # never asked, while the cell agent was simply restarting (2026-09-24).
+    if normalized.startswith("the cell agent could not be reached"):
+        return True
     return (
         normalized.startswith("error:")
+        or "spot preemption" in normalized
         or "queue admission" in normalized
         or "admission denied" in normalized
         or any(

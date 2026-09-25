@@ -225,3 +225,31 @@ def test_the_capable_executor_set_is_stated_not_inferred() -> None:
     from eyvan.server.controller.workload_commands import _SECRET_MATERIALIZING_EXECUTORS
 
     assert _SECRET_MATERIALIZING_EXECUTORS == frozenset({"eyvan-native"})
+
+
+@pytest.mark.parametrize(
+    ("public_url", "workload_spec", "cell"),
+    (
+        ("http://127.0.0.1:18280", {"secret_mounts": {"T": "gcp-secret://p/t"}}, "remote"),
+        ("http://127.0.0.1:18280", {"can_submit_children": True}, "remote"),
+        (None, {"secret_mounts": {"T": "gcp-secret://p/t"}}, "local"),
+        ("http://127.0.0.1:18280", {"secret_mounts": {"T": "gcp-secret://p/t"}}, "native-local"),
+    ),
+)
+def test_every_callback_refusal_is_settled_rather_than_retried(public_url, workload_spec, cell) -> None:
+    """Seen live on 2026-09-24: this refusal was a bare ``RuntimeError``, so the outbox
+    retried it with backoff while the lease held a Spot v6e-4 -- and, for a secret
+    workload, printed only "output suppressed for secret-bearing execution".
+    ``PermanentDispatchRefusal`` is the family the outbox settles, with its reason."""
+
+    from eyvan.server.controller.workload_commands import PermanentDispatchRefusal
+
+    dispatcher = _Dispatcher(public_url)
+    target = {
+        "remote": _cell(),
+        "local": _cell_with("eyvan-native", "local"),
+        "native-local": _cell_with("native-local"),
+    }
+
+    with pytest.raises(PermanentDispatchRefusal):
+        dispatcher._refuse_unreachable_callback(_workload(**workload_spec), target[cell])

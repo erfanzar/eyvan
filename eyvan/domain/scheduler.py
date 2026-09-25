@@ -915,6 +915,15 @@ class Scheduler:
                 InfeasibilityCode.HARD_CONSTRAINT,
                 f"required labels do not match: {missing_labels!r}",
             )
+        if workload.allowed_label_combinations and not any(
+            all(labels.get(key) == value for key, value in combination)
+            for combination in workload.allowed_label_combinations
+        ):
+            return CellInfeasibility(
+                cell.cell_id,
+                InfeasibilityCode.HARD_CONSTRAINT,
+                "cell does not match an allowed label combination",
+            )
         disallowed = [
             (key, labels.get(key), values)
             for key, values in workload.allowed_label_values

@@ -343,7 +343,11 @@ async def test_failed_submit_revokes_the_issuance_and_retry_refences_it(tmp_path
     assert all(lease.state is LeaseState.PENDING for lease in failed_leases)
     assert failed_command.state is OutboxState.FAILED
     assert "dispatch_reservation" not in failed_command.payload
-    assert failed_command.last_error == "output suppressed for secret-bearing execution"
+    # The message is withheld; the class and the Eyvan frame that raised it are
+    # code identifiers, kept so a suppressed failure can still be located.
+    assert failed_command.last_error.startswith("output suppressed for secret-bearing execution (RuntimeError in eyvan.")
+    assert _VALUE.decode() not in failed_command.last_error
+    assert old_token not in failed_command.last_error
     assert "workload.dispatch_reservation_failed" in [event.action for event in events]
     with pytest.raises(AuthorizationError):
         await service.authorize_secret_mount(

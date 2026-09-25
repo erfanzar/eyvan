@@ -115,7 +115,9 @@ def probe(
     headers = {**(headers or {}), **({"Authorization": f"Bearer {token}"} if token else {})}
     base = url.rstrip("/")
     try:
-        with httpx.Client(timeout=timeout_s, trust_env=False) as client:
+        from eyvan._internal.plane_tls import control_plane_httpx_options
+
+        with httpx.Client(timeout=timeout_s, trust_env=False, **control_plane_httpx_options()) as client:
             health = client.get(f"{base}/api/v1/health", headers=headers)
             if health.status_code != 200:
                 return ConnectTarget(url, False, f"control plane answered {health.status_code} on /health")

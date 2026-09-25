@@ -42,6 +42,20 @@ _FAST_MODULES = frozenset(
 )
 
 
+@pytest.fixture(autouse=True)
+def _committed_records_are_never_edited_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any memory/local-JSON transaction that edits a committed record in place.
+
+    The state repositories share committed records with each transaction rather
+    than deep-copying them; that is only sound while nothing mutates a record's
+    nested dicts. Every test is therefore also a check of that contract.
+    """
+
+    from eyvan.server.persistence.state import StateRepository
+
+    monkeypatch.setattr(StateRepository, "verify_record_immutability", True)
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Keep extended soak counts explicit instead of slowing every PR run."""
 
