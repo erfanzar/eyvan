@@ -1555,3 +1555,84 @@ def test_a_launch_that_ended_by_itself_is_still_a_replay(tmp_path: Path) -> None
     executor.submit(_spec(), _context())
 
     assert sum(1 for command in systemd.commands if command[0] == "systemd-run") == launches_before
+
+
+def test_a_direct_stop_holds_the_relaunch_lock_through_runtime_io(tmp_path: Path) -> None:
+    """A stop releases the record lock for its runtime I/O; a relaunch must not slip in.
+
+    The unit name is deterministic, so a relaunch that landed between a stop's
+    record read and its ``systemctl stop`` would be killed by that stop.
+    """
+
+    import fcntl
+
+    seen: list[str] = []
+
+    class Probe(SystemdTransientServiceExecutor):
+        def _stop_runtime(self, record) -> None:
+            path = self._record_path(record["remote_id"]).with_suffix(".retire-stop.lock")
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    seen.append("held")
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    seen.append("free")
+            finally:
+                os.close(descriptor)
+
+    executor = Probe(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+
+    executor.stop(remote_id, _context(key="stop-1"))
+
+    assert seen == ["held"]
+
+
+def test_a_timed_out_retire_leaves_a_relaunched_incarnation_alone(tmp_path: Path, monkeypatch) -> None:
+    """The timeout branch must not mark a replacement run INDETERMINATE."""
+
+    from eyvan.worker.runtime import systemd_transient as module
+
+    class StopFails(SystemdTransientServiceExecutor):
+        fail = True
+
+        def _stop_runtime(self, record) -> None:
+            if self.fail:
+                raise RuntimeError("runtime stop failed")
+
+    executor = StopFails(tmp_path, command_runner=FakeSystemd(), boot_id_reader=lambda: "boot-a")
+    remote_id = executor.submit(_spec(), _context())
+    record_path = executor._record_path(remote_id)
+
+    class Clock:
+        calls = 0
+
+        @classmethod
+        def monotonic(cls) -> float:
+            cls.calls += 1
+            if cls.calls == 1:
+                return 0.0
+            if cls.calls == 2:
+                # Between the failed stop and the deadline check, another caller
+                # finishes retiring incarnation 0 and the dispatch retry relaunches.
+                executor.fail = False
+                record = module._load_json(record_path)
+                record.update(status=ExecutionWorkloadStatus.STOPPED.value, retired=True)
+                module._atomic_write_json(record_path, record)
+                executor.submit(_spec(), _context())
+            return 1e9
+
+        @staticmethod
+        def sleep(_seconds: float) -> None:
+            return None
+
+    monkeypatch.setattr(module, "time", Clock)
+
+    executor.retire(remote_id, _context(key="retire-1"))
+
+    record = _record(executor, remote_id)
+    assert record["incarnation"] == 1
+    assert record["status"] != ExecutionWorkloadStatus.INDETERMINATE.value

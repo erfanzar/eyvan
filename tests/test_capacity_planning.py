@@ -1294,6 +1294,29 @@ async def test_a_pool_upsert_that_disagrees_with_its_quota_group_is_rejected_lou
         )
 
 
+def test_mixed_naive_and_aware_outcomes_are_both_read_as_utc() -> None:
+    """A naive persisted timestamp must neither crash the sort nor shift by the host's zone."""
+
+    from datetime import timedelta
+
+    from eyvan.capacity.planning import _recent_failed_acquisition_streak
+    from eyvan.records import CapacityBeliefState
+
+    now = utcnow()
+    outcomes = (now - timedelta(seconds=30), (now - timedelta(seconds=60)).replace(tzinfo=None))
+    cells = [
+        CellRecord.model_construct(
+            id=f"failed-{index}",
+            state=CellState.DELETED,
+            created_at=now - timedelta(hours=3),
+            availability=CapacityBeliefState(consecutive_failures=1, last_observed_at=outcome),
+        )
+        for index, outcome in enumerate(outcomes)
+    ]
+
+    assert _recent_failed_acquisition_streak(cells, now) == 2
+
+
 def _replaced_incarnations(pool, count: int, *, age_s: float, delivered_after: int | None = None):
     """``count`` deleted cells, oldest first, each failed once and replaced by the next."""
 

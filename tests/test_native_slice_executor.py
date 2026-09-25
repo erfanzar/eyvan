@@ -216,13 +216,9 @@ def test_native_slice_retires_started_workers_when_a_fanout_submission_fails() -
         first_requests.append(request)
         if request.url.path == "/api/v1/workloads":
             return httpx.Response(200, json={"remote_id": "slice-partial"})
-        assert request.url.path == "/api/v1/workloads/slice-partial/retire"
-        assert request.method == "POST"
-        assert _payload(request)["mutation"] == {
-            "idempotency_key": "submit-1",
-            "generation": 1,
-            "fencing_token": "token-1",
-        }
+        # Asserted after the call, not here: the rollback loop catches every
+        # exception a retire raises, so an assertion in this handler could
+        # never fail the test.
         return httpx.Response(200, json={})
 
     def second_worker(request: httpx.Request) -> httpx.Response:
@@ -257,6 +253,15 @@ def test_native_slice_retires_started_workers_when_a_fanout_submission_fails() -
             "/api/v1/workloads",
             "/api/v1/workloads/slice-partial/retire",
         ]
+        retire = first_requests[1]
+        assert retire.method == "POST"
+        mutation = _payload(retire)["mutation"]
+        # The fence is the submission's; the key is the rollback's own.
+        assert (mutation["generation"], mutation["fencing_token"]) == (1, "token-1")
+        assert mutation["idempotency_key"].startswith("rollback:")
+        assert mutation["idempotency_key"].endswith(":submit-1")
+        keys = {_payload(request)["mutation"]["idempotency_key"] for request in (first_requests[1], second_requests[1])}
+        assert len(keys) == 2, "each rank's rollback carries its own key"
     finally:
         for client in clients:
             client.close()

@@ -274,6 +274,34 @@ def test_distribution_keeps_all_certificates_but_not_other_pem_blocks(tmp_path, 
     assert control_plane_ssl_context({CONTROL_PLANE_CA_B64_ENV: encoded}) is not None
 
 
+def test_a_certificate_bundle_with_a_non_ascii_comment_is_still_distributed(tmp_path, monkeypatch) -> None:
+    """Silently distributing nothing would break every job's TLS callback."""
+
+    ca, _, _ = _issue(tmp_path)
+    certificate = ca.read_text()
+    ca.write_bytes("# Research \u2013 CA\n".encode() + ca.read_bytes())
+    monkeypatch.setenv(CONTROL_PLANE_CA_FILE_ENV, str(ca))
+
+    encoded = control_plane_ca_b64()
+
+    assert encoded is not None
+    assert base64.b64decode(encoded).decode() == certificate
+    commented = base64.b64encode("# Research \u2013 CA\n".encode() + certificate.encode()).decode()
+    assert plane_tls._decoded_pem(commented) == certificate
+    assert control_plane_ssl_context({CONTROL_PLANE_CA_B64_ENV: encoded}) is not None
+
+
+def test_distribution_rejects_a_certificate_block_that_is_not_x509(tmp_path, monkeypatch) -> None:
+    """Valid base64 is not a certificate; the job would fail its first callback."""
+
+    ca = tmp_path / "bogus.pem"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv(CONTROL_PLANE_CA_FILE_ENV, str(ca))
+
+    with pytest.raises(plane_tls.ControlPlaneCAError, match="invalid certificate"):
+        control_plane_ca_b64()
+
+
 def test_server_startup_refuses_private_key_bundle_before_serving(tmp_path, monkeypatch, capsys) -> None:
     import sys
 

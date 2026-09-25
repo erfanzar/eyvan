@@ -1557,6 +1557,46 @@ print(json.dumps({'error': error, 'ensure': len(provider.ensured), 'delete': pro
     assert PROVIDER_OPERATION_KEY not in state.get("cell").metadata
 
 
+@pytest.mark.parametrize("operation", ["apply", "reconcile", "release"])
+def test_a_claim_persisted_before_an_interrupt_is_still_cleared(tmp_path, monkeypatch, operation) -> None:
+    """The claim is durable as soon as the fleet-locked mutation commits.
+
+    An interrupt between that commit and the provider call must still clear it,
+    or another agent is locked out of the cell until the TTL expires.
+    """
+
+    from contextlib import contextmanager
+
+    from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
+
+    state, _provider, driver = make_driver(tmp_path)
+    driver.apply_capacity("cell", desired(), context("create"))
+    original = state.exclusive
+    interrupts = [KeyboardInterrupt()]
+
+    @contextmanager
+    def interrupting():
+        with original():
+            yield
+        if interrupts:
+            raise interrupts.pop()
+
+    monkeypatch.setattr(state, "exclusive", interrupting)
+
+    with pytest.raises(KeyboardInterrupt):
+        if operation == "apply":
+            driver.apply_capacity("cell", desired(), context("create-2"))
+        elif operation == "reconcile":
+            driver.reconcile("cell", context("reconcile"))
+        else:
+            driver.release("cell", context("release", generation=2, token="leader-2"))
+
+    assert not interrupts, "the interrupt fired after the claim was persisted"
+    record = state.get("cell")
+    assert record is not None
+    assert PROVIDER_OPERATION_KEY not in record.metadata
+
+
 def test_this_process_releases_its_claim_after_the_provider_call(tmp_path) -> None:
     from eyvan.capacity.drivers.gcp import PROVIDER_OPERATION_KEY
 

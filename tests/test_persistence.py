@@ -1121,10 +1121,20 @@ async def test_editing_a_committed_record_in_place_is_refused(fails: bool) -> No
     async with repository.transaction() as transaction:
         await transaction.put_workload(_workload())
 
-    with pytest.raises(RecordMutatedInPlaceError):
+    expected = RuntimeError if fails else RecordMutatedInPlaceError
+    with pytest.raises(expected) as caught:
         async with repository.transaction() as transaction:
             loaded = await transaction.get_workload("wl-1")
             assert loaded is not None
             loaded.spec.environment["INJECTED"] = "in place"
+            await transaction.put_workload(_workload("wl-2"))
             if fails:
                 raise RuntimeError("rollback")
+
+    if fails:
+        # The transaction's own failure is what propagates; the guard only annotates it.
+        assert str(caught.value) == "rollback"
+        assert any("in place" in note for note in getattr(caught.value, "__notes__", ()))
+    async with repository.transaction() as transaction:
+        # Refused before commit: the legitimate write in the same transaction is not persisted.
+        assert await transaction.get_workload("wl-2") is None

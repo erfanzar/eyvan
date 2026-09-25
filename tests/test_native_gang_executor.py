@@ -283,7 +283,18 @@ def test_native_gang_retires_every_attempted_worker_with_its_cell_fence() -> Non
             }
             assert request.headers["Authorization"] == f"Bearer {expected_secret}"
             if path.endswith("/retire"):
-                assert _payload(request)["mutation"] == expected_mutation
+                mutation = _payload(request)["mutation"]
+                # Same fence, but a key of its own: a rollback that reused the
+                # submission key could not be told apart from a stale replay
+                # once the dispatch retry relaunched under that key.
+                assert mutation["generation"] == expected_mutation["generation"]
+                assert mutation["fencing_token"] == expected_mutation["fencing_token"]
+                assert mutation["idempotency_key"].startswith("rollback:")
+                assert mutation["idempotency_key"].endswith(f":{expected_mutation['idempotency_key']}")
+        retire_keys = [
+            _payload(request)["mutation"]["idempotency_key"] for _, path, request in calls if "retire" in path
+        ]
+        assert len(set(retire_keys)) == len(retire_keys), retire_keys
     finally:
         for client in clients:
             client.close()

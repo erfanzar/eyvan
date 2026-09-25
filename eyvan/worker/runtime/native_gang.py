@@ -46,6 +46,7 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadResult,
     ExecutionWorkloadStatus,
     MutationContext,
+    rollback_context,
 )
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import (
@@ -637,7 +638,7 @@ class NativeGangExecutor:
             for rank, worker, remote_ids in reversed(attempted):
                 for attempted_remote_id in sorted(remote_ids):
                     try:
-                        worker.executor.retire(attempted_remote_id, worker.context)
+                        worker.executor.retire(attempted_remote_id, rollback_context(worker.context))
                     except Exception as exc:
                         retire_failures.append(f"rank {rank} ({worker.endpoint}): {type(exc).__name__}")
             if retire_failures:

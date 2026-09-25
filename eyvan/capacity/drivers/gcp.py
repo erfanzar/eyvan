@@ -848,28 +848,35 @@ class GcpTpuCapacityDriver:
 
     def reconcile(self, cell_id: str, context: MutationContext) -> CellObservation:
         with self._cell_mutation(cell_id):
-            with self._mutation_lock, self.state.exclusive():
-
-                def claim(record: FleetCellRecord) -> None:
-                    if self._accept_mutation(record, context):
-                        self._stamp(record, context)
-                    self._claim_provider_operation(record)
-
-                try:
-                    self.state.mutate_record(
-                        cell_id,
-                        claim,
-                        generation=context.generation,
-                    )
-                except FleetCellNotRegisteredError:
-                    return self.observe(cell_id)
-                except StaleFenceError as exc:
-                    raise StaleMutationError(str(exc)) from exc
-            # Provider I/O outside the fleet lock; see ``_cell_mutation``.
+            claimed = False
+            # Acquisition sits inside the guard: the claim is durable as soon as
+            # the fleet-locked mutation commits, which can precede an interrupt at
+            # the lock's exit. A refused claim is never ours, so it is not cleared.
             try:
+                with self._mutation_lock, self.state.exclusive():
+
+                    def claim(record: FleetCellRecord) -> None:
+                        nonlocal claimed
+                        if self._accept_mutation(record, context):
+                            self._stamp(record, context)
+                        self._claim_provider_operation(record)
+                        claimed = True
+
+                    try:
+                        self.state.mutate_record(
+                            cell_id,
+                            claim,
+                            generation=context.generation,
+                        )
+                    except FleetCellNotRegisteredError:
+                        return self.observe(cell_id)
+                    except StaleFenceError as exc:
+                        raise StaleMutationError(str(exc)) from exc
+                # Provider I/O outside the fleet lock; see ``_cell_mutation``.
                 return self._ensure_owned(cell_id, context, recreate_terminal=True)
             finally:
-                self._release_provider_operation(cell_id)
+                if claimed:
+                    self._release_provider_operation(cell_id)
 
     def apply_capacity(
         self,
@@ -908,47 +915,54 @@ class GcpTpuCapacityDriver:
                 f"cell requests executor {requested_executor!r}, but this agent provides {self.execution_backend!r}"
             )
         with self._cell_mutation(cell_id):
-            with self._mutation_lock, self.state.exclusive():
-
-                def mutate(record: FleetCellRecord) -> None:
-                    accepted = self._accept_mutation(record, context)
-                    self._claim_provider_operation(record)
-                    if not accepted:
-                        return
-                    persisted_kind = record.metadata.get("capacity_kind")
-                    if persisted_kind not in {None, self.capacity_kind}:
-                        raise ValueError(
-                            f"cell {cell_id!r} is already managed by {persisted_kind!r} capacity; "
-                            "delete it before changing"
-                        )
-                    record.project = project
-                    record.zone = zone
-                    record.accelerator_type = accelerator_type
-                    record.capacity_class = capacity_class
-                    record.runtime_version = _optional_string(document, "runtime_version")
-                    record.execution_endpoint = _optional_string(document, "execution_endpoint")
-                    agent_endpoint = _optional_string(document, "agent_endpoint")
-                    if agent_endpoint is not None:
-                        record.metadata["agent_endpoint"] = agent_endpoint
-                    record.metadata["capacity_backend"] = self.provider_name
-                    record.metadata["capacity_kind"] = self.capacity_kind
-                    record.metadata.setdefault("management_uid", uuid.uuid4().hex)
-                    if record.qr_id is None:
-                        record.provider_generation += 1
-                        record.qr_id = self._resource_id(cell_id, record.provider_generation)
-                    self._persist_provider_config(record, normalized)
-                    record.desired_state = "up"
-                    self._stamp(record, context)
-
-                try:
-                    self.state.mutate_or_create_record(cell_id, mutate, generation=context.generation)
-                except StaleFenceError as exc:
-                    raise StaleMutationError(str(exc)) from exc
-            # Provider I/O outside the fleet lock; see ``_cell_mutation``.
+            claimed = False
+            # See ``reconcile``: the claim is acquired inside the guard that clears it.
             try:
+                with self._mutation_lock, self.state.exclusive():
+
+                    def mutate(record: FleetCellRecord) -> None:
+                        nonlocal claimed
+                        accepted = self._accept_mutation(record, context)
+                        self._claim_provider_operation(record)
+                        claimed = True
+                        if not accepted:
+                            return
+                        persisted_kind = record.metadata.get("capacity_kind")
+                        if persisted_kind not in {None, self.capacity_kind}:
+                            raise ValueError(
+                                f"cell {cell_id!r} is already managed by {persisted_kind!r} capacity; "
+                                "delete it before changing"
+                            )
+                        record.project = project
+                        record.zone = zone
+                        record.accelerator_type = accelerator_type
+                        record.capacity_class = capacity_class
+                        record.runtime_version = _optional_string(document, "runtime_version")
+                        record.execution_endpoint = _optional_string(document, "execution_endpoint")
+                        agent_endpoint = _optional_string(document, "agent_endpoint")
+                        if agent_endpoint is not None:
+                            record.metadata["agent_endpoint"] = agent_endpoint
+                        record.metadata["capacity_backend"] = self.provider_name
+                        record.metadata["capacity_kind"] = self.capacity_kind
+                        record.metadata.setdefault("management_uid", uuid.uuid4().hex)
+                        if record.qr_id is None:
+                            record.provider_generation += 1
+                            record.qr_id = self._resource_id(cell_id, record.provider_generation)
+                        self._persist_provider_config(record, normalized)
+                        record.desired_state = "up"
+                        self._stamp(record, context)
+
+                    try:
+                        self.state.mutate_or_create_record(cell_id, mutate, generation=context.generation)
+                    except StaleFenceError as exc:
+                        raise StaleMutationError(str(exc)) from exc
+                # Provider I/O outside the fleet lock; see ``_cell_mutation``.
                 return self._ensure_owned(cell_id, context)
             finally:
-                self._release_provider_operation(cell_id)
+                # Only this process's own claim is ever cleared, so clearing after
+                # a mutation that raised before persisting is a harmless no-op.
+                if claimed:
+                    self._release_provider_operation(cell_id)
 
     def _validate_normalized_document(self, document: JsonObject, runtime: NativeRuntimeConfig) -> None:
         """Validate execution/runtime fields common to GCP capacity kinds."""
@@ -1357,12 +1371,15 @@ class GcpTpuCapacityDriver:
         than corrupting it.
         """
 
-        record = self._claim_for_release(cell_id, context)
-        if isinstance(record, CellObservation):
-            return record
+        claim_taken: dict[str, bool] = {}
         released_project: str | None = None
         released_uid: str | None = None
+        # Acquisition sits inside the guard (see ``reconcile``): the claim is
+        # durable once the fleet-locked mutation commits, before the lock exits.
         try:
+            record = self._claim_for_release(cell_id, context, claim_taken)
+            if isinstance(record, CellObservation):
+                return record
             if record is not None:
                 # Outside the fleet lock: the durable provider claim protects
                 # this cell through both deletion and auxiliary cleanup.
@@ -1379,15 +1396,24 @@ class GcpTpuCapacityDriver:
             )
         finally:
             # Success removes the record; failure must allow another agent to retry.
-            if record is not None:
+            if claim_taken:
                 self._release_provider_operation(cell_id)
         if released_project is not None:
             # After the tombstone lands: the sweep reads tombstone metadata.
             self._sweep_orphaned_native_worker_secrets(released_project)
         return result
 
-    def _claim_for_release(self, cell_id: str, context: MutationContext) -> FleetCellRecord | CellObservation | None:
-        """Mark one cell DELETING under this fence, or report it already released."""
+    def _claim_for_release(
+        self,
+        cell_id: str,
+        context: MutationContext,
+        claim_taken: dict[str, bool] | None = None,
+    ) -> FleetCellRecord | CellObservation | None:
+        """Mark one cell DELETING under this fence, or report it already released.
+
+        ``claim_taken`` is set as soon as this process's provider claim is on the
+        record, so the caller can clear it even if the lock's exit is interrupted.
+        """
 
         with self._mutation_lock, self.state.exclusive():
             owned: dict[str, FleetCellRecord] = {}
@@ -1395,6 +1421,8 @@ class GcpTpuCapacityDriver:
             def claim(record: FleetCellRecord) -> None:
                 accepted = self._accept_mutation(record, context)
                 self._claim_provider_operation(record)
+                if claim_taken is not None:
+                    claim_taken["claim"] = True
                 if not accepted:
                     if (
                         record.state is CapacityStatus.DELETING

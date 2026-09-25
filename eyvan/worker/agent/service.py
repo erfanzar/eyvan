@@ -45,6 +45,7 @@ from eyvan.capacity.drivers.base import (
     StaleMutationError,
     UnsupportedCapabilityError,
     canonical_execution_backend,
+    rollback_context,
 )
 from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS
 from eyvan.capacity.fleet_state import FleetStateStore, StaleFenceError
@@ -472,7 +473,7 @@ class CellAgentService:
         except StaleFenceError as exc:
             if submitted_executor is not None and launched_remote_id is not None:
                 try:
-                    submitted_executor.retire(launched_remote_id, context)
+                    submitted_executor.retire(launched_remote_id, rollback_context(context))
                 except BaseException as cleanup_exc:
                     raise StaleMutationError(
                         f"{exc}; launched execution {launched_remote_id!r} could not be retired after lease loss"

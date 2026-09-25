@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 import typing as tp
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from typing_extensions import TypedDict
@@ -394,6 +395,25 @@ class MutationContext:
     fencing_token: str
     #: Observability only; never part of ownership or idempotency decisions.
     correlation_id: str | None = field(default=None, compare=False)
+
+
+#: The agent wire model's bound on an idempotency key.
+MAX_IDEMPOTENCY_KEY_LENGTH = 256
+
+
+def rollback_context(context: MutationContext) -> MutationContext:
+    """Return the context a partial-launch rollback retires under.
+
+    Same fence -- the rollback owns exactly what the submission owned -- but a
+    key of its own. Retiring under the submission key made a second rollback,
+    after the dispatch retry had relaunched under that key, indistinguishable
+    from a stale replay of the first: the executor ignored it and left a rank
+    running. The nonce comes first so the key stays unique even when a long
+    submission key is truncated to the wire bound.
+    """
+
+    key = f"rollback:{uuid.uuid4().hex}:{context.idempotency_key}"
+    return replace(context, idempotency_key=key[:MAX_IDEMPOTENCY_KEY_LENGTH])
 
 
 @dataclass(frozen=True, slots=True)

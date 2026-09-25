@@ -67,17 +67,31 @@ class ControlPlaneCAError(ValueError):
     """A configured CA bundle is unsafe to distribute to jobs."""
 
 
-def _certificate_pem(text: str) -> str | None:
-    """Extract validated certificate blocks without other PEM material."""
+_CERTIFICATE_BLOCK = re.compile(rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 
-    blocks = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text, flags=re.DOTALL)
-    if len(blocks) != text.count("-----BEGIN CERTIFICATE-----"):
+
+def _certificate_pem(data: bytes) -> str | None:
+    """Extract parsed X.509 certificate blocks without any other file content.
+
+    Works on bytes so a comment outside the blocks -- in any encoding -- is
+    ignored rather than making the whole bundle unreadable. Each block is loaded
+    into a real verify store: decodable base64 alone is not a certificate.
+    """
+
+    blocks = _CERTIFICATE_BLOCK.findall(data)
+    if len(blocks) != data.count(b"-----BEGIN CERTIFICATE-----"):
         raise ValueError("incomplete certificate block")
-    for block in blocks:
+    certificates: list[str] = []
+    for raw in blocks:
+        block = raw.decode("ascii")
         body = block.removeprefix("-----BEGIN CERTIFICATE-----").removesuffix("-----END CERTIFICATE-----")
         base64.b64decode("".join(body.split()), validate=True)
-        ssl.PEM_cert_to_DER_cert(block)
-    return "".join(block + "\n" for block in blocks) or None
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=block)
+        except ssl.SSLError as exc:
+            raise ValueError("not an X.509 certificate") from exc
+        certificates.append(block + "\n")
+    return "".join(certificates) or None
 
 
 def _decoded_pem(encoded: str | None) -> str | None:
@@ -86,11 +100,11 @@ def _decoded_pem(encoded: str | None) -> str | None:
     if not encoded:
         return None
     try:
-        text = base64.b64decode(encoded, validate=True).decode("ascii")
-    except (binascii.Error, UnicodeDecodeError):
+        data = base64.b64decode(encoded, validate=True)
+    except binascii.Error:
         return None
     try:
-        return _certificate_pem(text)
+        return _certificate_pem(data)
     except (ValueError, binascii.Error):
         return None
 
@@ -132,11 +146,7 @@ def control_plane_ca_b64() -> str | None:
             f"control-plane CA file {configured!r} contains a private key; use a certificate-only file"
         )
     try:
-        text = data.decode("ascii")
-    except UnicodeDecodeError:
-        return None
-    try:
-        certificates = _certificate_pem(text)
+        certificates = _certificate_pem(data)
     except (ValueError, binascii.Error):
         raise ControlPlaneCAError(f"control-plane CA file {configured!r} contains an invalid certificate") from None
     if certificates is None:

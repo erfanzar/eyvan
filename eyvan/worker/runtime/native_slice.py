@@ -72,6 +72,7 @@ from eyvan.capacity.drivers.base import (
     ExecutionWorkloadStatus,
     MutationContext,
     UnsupportedCapabilityError,
+    rollback_context,
 )
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
@@ -1023,7 +1024,7 @@ class NativeSliceExecutor:
             for rank, worker, remote_ids in reversed(attempted):
                 for attempted_remote_id in sorted(remote_ids):
                     try:
-                        worker.retire(attempted_remote_id, context)
+                        worker.retire(attempted_remote_id, rollback_context(context))
                     except Exception as exc:
                         retire_failures.append(f"rank {rank} ({worker.endpoint}): {type(exc).__name__}")
             if retire_failures:

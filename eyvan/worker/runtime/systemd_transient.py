@@ -1789,7 +1789,22 @@ class SystemdTransientServiceExecutor:
             return _durable_observation(remote_id, record)
 
     def stop(self, remote_id: str, context: MutationContext) -> None:
-        """Stop the workload's systemd cgroup through ``systemctl stop``."""
+        """Stop the workload's systemd cgroup through ``systemctl stop``.
+
+        The record lock is released for the runtime I/O below, and the unit name
+        is deterministic, so a relaunch landing in that gap would be stopped by
+        this call. Holding the relaunch lock for the whole stop closes the gap.
+        """
+
+        with _file_lock(self._record_path(remote_id).with_suffix(".retire-stop.lock")):
+            self._stop_locked(remote_id, context)
+
+    def _stop_locked(self, remote_id: str, context: MutationContext) -> None:
+        """Stop the workload; the caller already holds the relaunch lock.
+
+        ``flock`` is per open file description, so taking that lock again here
+        from ``retire`` would deadlock this process against itself.
+        """
 
         record_path = self._record_path(remote_id)
         with _file_lock(_record_lock_path(record_path)):
@@ -1969,7 +1984,7 @@ class SystemdTransientServiceExecutor:
                         if current is None or _incarnation(current) != incarnation:
                             return
                         self._validate_fence(remote_id, current, context)
-                    self.stop(remote_id, context)
+                    self._stop_locked(remote_id, context)
             except Exception:
                 # A stop that fails now may well succeed on the next poll: a
                 # container can still be shutting down, and this loop already
@@ -1987,6 +2002,11 @@ class SystemdTransientServiceExecutor:
 
         with _file_lock(_record_lock_path(record_path)):
             record = _load_json(record_path)
+            if record is not None and _incarnation(record) != incarnation:
+                # Another caller finished retiring the incarnation this one was
+                # waiting on, and a relaunch replaced it: the replacement is not
+                # this retirement's to judge.
+                return
             if record is not None and _known_persisted_status(record) not in _FINAL_STATES:
                 self._mark_indeterminate(record, "systemd retirement timed out; workload ownership is ambiguous")
                 _atomic_write_json(record_path, record)

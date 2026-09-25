@@ -764,6 +764,11 @@ class RecordMutatedInPlaceError(RuntimeError):
     """A transaction changed a committed record instead of replacing it."""
 
 
+_IN_PLACE_MUTATION = (
+    "a transaction mutated a committed record in place; replace it with model_copy(update=...) and put_* instead"
+)
+
+
 def _record_fingerprint(value: tp.Any) -> tp.Any:
     """Return a comparable value snapshot of every record reachable from ``value``."""
 
@@ -849,19 +854,22 @@ class StateRepository:
             start_sequence = working.next_event_sequence
             try:
                 yield self.session_type(working)
-                if working != self._state:
-                    working.revision += 1
-                    self._persist(working)
-                    self._state = working
-                    committed_events = working.next_event_sequence > start_sequence
-            finally:
+            except BaseException as exc:
                 # ``committed``'s containers are never handed to the session, so
-                # any difference here is a record edited in place.
+                # any difference is a record edited in place. The transaction's
+                # own failure still propagates; the guard only annotates it.
                 if fingerprint is not None and _state_fingerprint(committed) != fingerprint:
-                    raise RecordMutatedInPlaceError(
-                        "a transaction mutated a committed record in place; replace it with "
-                        "model_copy(update=...) and put_* instead"
-                    )
+                    exc.add_note(_IN_PLACE_MUTATION)
+                raise
+            # Checked before anything is persisted, so a refused transaction
+            # commits none of its other writes either.
+            if fingerprint is not None and _state_fingerprint(committed) != fingerprint:
+                raise RecordMutatedInPlaceError(_IN_PLACE_MUTATION)
+            if working != self._state:
+                working.revision += 1
+                self._persist(working)
+                self._state = working
+                committed_events = working.next_event_sequence > start_sequence
         if committed_events:
             async with self._event_condition:
                 self._event_condition.notify_all()

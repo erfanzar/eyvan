@@ -12,7 +12,7 @@ import re
 import typing as tp
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from eyvan._internal.identifiers import stable_id
 from eyvan.capacity import (
@@ -237,7 +237,10 @@ def _recent_failed_acquisition_streak(cells: list[CellRecord], now: datetime) ->
     def outcome_at(cell: CellRecord) -> datetime:
         # Ownership cleanup can refresh updated_at even on tombstones. Without
         # an observed outcome, conservatively age legacy evidence by cell birth.
-        return cell.availability.last_observed_at or cell.created_at
+        moment = cell.availability.last_observed_at or cell.created_at
+        # Eyvan writes aware UTC; a naive persisted value is read as UTC too, so
+        # it neither shifts by the host's zone nor breaks the sort below.
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
     recent = [cell for cell in cells if cell.state is not CellState.DELETED or outcome_at(cell).timestamp() >= horizon]
     for cell in sorted(recent, key=lambda candidate: (outcome_at(candidate), candidate.id), reverse=True):
