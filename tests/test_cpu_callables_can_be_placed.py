@@ -146,3 +146,72 @@ async def test_a_tpu_request_is_never_answered_by_a_cpu_pool() -> None:
 
     with pytest.raises(ConflictError, match="is not a TPU pool"):
         await _submit(_service(), [cpu_named_like_a_tpu], accelerator_type="v5p-8")
+
+
+# --------------------------------------------------------------------------- the kind that is still refused
+
+
+def test_a_gpu_callable_is_refused_before_anything_is_uploaded() -> None:
+    """The refusal existed; where it happened was the problem.
+
+    The control plane answered 409 only after the callable had been serialized
+    and put in the artifact store -- an object left behind, and an error naming
+    a pool rather than the limitation. Nothing is uploaded now.
+    """
+
+    from eyvan import GpuConfig, execute
+    from eyvan.sdk.execution import ExecutionContext
+
+    uploaded: list[object] = []
+
+    class _Store:
+        def put(self, payload: object) -> object:
+            uploaded.append(payload)
+            raise AssertionError("a GPU callable must be refused before it is uploaded")
+
+        def allocate_result_uri(self, invocation_id: str) -> str:
+            return f"gs://results/{invocation_id}"
+
+    class _Submitter:
+        def submit_callable(self, request: object) -> object:
+            raise AssertionError("a GPU callable must be refused before it is submitted")
+
+    context = ExecutionContext(
+        org_id="acme",
+        project_id="research",
+        fleet="research",
+        artifact_store=_Store(),  # type: ignore[arg-type]
+        submitter=_Submitter(),  # type: ignore[arg-type]
+    )
+
+    @execute(GpuConfig(type="nvidia-tesla-a100"), context=context)
+    def train() -> int:
+        return 1
+
+    with pytest.raises(NotImplementedError, match="GPU pool"):
+        train.submit()
+
+    assert uploaded == []
+
+
+def test_the_refusal_names_what_to_use_instead() -> None:
+    """A limit an operator cannot act on is a limit stated badly."""
+
+    from eyvan import GpuConfig
+    from eyvan.sdk.execution import _refuse_unplaceable_config
+
+    with pytest.raises(NotImplementedError) as error:
+        _refuse_unplaceable_config(GpuConfig(type="nvidia-h100-80gb"))
+
+    assert "CpuConfig" in str(error.value)
+    assert "eyvan workload submit" in str(error.value)
+
+
+@pytest.mark.parametrize("config_name", ["cpu", "tpu"])
+def test_the_placeable_kinds_are_not_refused(config_name: str) -> None:
+    """The check must not become a gate on everything it can see."""
+
+    from eyvan import CpuConfig, TpuConfig
+    from eyvan.sdk.execution import _refuse_unplaceable_config
+
+    _refuse_unplaceable_config(CpuConfig() if config_name == "cpu" else TpuConfig(type="v5p-16"))

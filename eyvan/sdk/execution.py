@@ -334,6 +334,28 @@ def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorC
     return pools[0].fleet
 
 
+def _refuse_unplaceable_config(config: AcceleratorConfig) -> None:
+    """Refuse a config the control plane will never place, before uploading.
+
+    ``GpuConfig`` is exported from the package root and ``@execute`` accepts it,
+    but the callable route requires a TPU or CPU pool, so every GPU submission is
+    refused -- and it was refused *after* the callable had been serialized and
+    uploaded to the artifact store, leaving an object behind and an error that
+    named a pool rather than the limitation.
+
+    Refusing here costs the caller nothing and forecloses nothing: if callable
+    placement on GPU is qualified later, this check is the thing that gets
+    deleted. Until then a limit stated up front is better than an upload that
+    ends in a conflict.
+    """
+
+    if isinstance(config, GpuConfig):
+        raise NotImplementedError(
+            "Eyvan cannot place a callable on a GPU pool: no run has qualified that path, so the control plane "
+            "refuses it. Use TpuConfig or CpuConfig, or submit a command workload with `eyvan workload submit`."
+        )
+
+
 class Executable(tp.Generic[P, R]):
     """Side-effect-free callable wrapper produced by ``@execute``."""
 
@@ -362,6 +384,7 @@ class Executable(tp.Generic[P, R]):
         context = self._context or get_context()
         if context.submitter is None:
             raise RuntimeError("Eyvan callable execution requires a configured CallableSubmitter")
+        _refuse_unplaceable_config(self._config)
         inspect.signature(self._fn).bind(*args, **kwargs)
         bound = _zero_arg_invocation(self._fn, *args, **kwargs)
         artifact = context.artifact_store.put(dump_callable(bound, signing_key=context.signing_key))
