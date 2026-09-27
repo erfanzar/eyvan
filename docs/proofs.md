@@ -131,6 +131,36 @@ What it did **not** establish: anything about multislice, TPU provisioning, or
 any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
 is here so nobody reads it as one.
 
+## A partial observation of v6e-16 topology
+
+`v6e-8` and `v6e-16` are the only catalogued shapes with no `hosts`, and the
+entry says why: Eyvan compares `observed_tpu_vms` against that number, Google's
+table counts physical hosts rather than VMs, and no receipt here established the
+endpoint count -- so a guess would make Eyvan refuse a correctly provisioned
+slice.
+
+On 2026-08-13 a `v6e-16` queued resource in `europe-west4-a` reported **four
+`networkEndpoints` on port 8470**, which is the quantity `observed_tpu_vms`
+carries. That is consistent with the four-chip VMs the entry's per-VM
+`host_cpu: 180` / `host_memory_gib: 720` describe.
+
+**It is not recorded in the catalog, and should not be until it is repeated.**
+The observation was taken while the node was still `CREATING`, on a resource
+that was being torn down and is now gone, so it cannot be re-read. Writing
+`hosts: 4` on that basis flips this shape from "the provider decides" to "Eyvan
+refuses a slice whose endpoint count disagrees" -- and the cost of being wrong is
+refusing capacity that is fine. One mid-creation reading is not enough to buy
+that.
+
+What would be: the same count from a `READY` v6e-16, which anyone with capacity
+can take in one command. Two receipts and the entry can be filled in, with P1's
+host check working for the shape for the first time.
+
+```bash
+gcloud compute tpus tpu-vm describe <node> --zone europe-west4-a \
+  --format="value(state, networkEndpoints.len())"
+```
+
 ## Why these and not a general soak of everything
 
 Each row proves something a CPU cannot: Pallas lowering, real provider
