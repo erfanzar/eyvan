@@ -131,6 +131,33 @@ What it did **not** establish: anything about multislice, TPU provisioning, or
 any of P1-P8. A CPU cell is not evidence about an accelerator, and this section
 is here so nobody reads it as one.
 
+## What blocked P2 on 2026-08-13
+
+Worth recording, because "not attempted" and "attempted and blocked" call for
+different next steps. P2 needs a workload running across two or more hosts, and
+then one of those hosts taken away.
+
+`v5p-16` in `us-east5-a` was unavailable for the whole session: another tenant
+held six `v5p-128` slices, with two more `v5p-64` requests queued ahead of ours
+that were still waiting hours later.
+
+`v6e-16` in `europe-west4-a` was tried instead -- it is the other granted shape
+that spans more than one host, and the zone held nothing of ours. Three attempts
+were made. Capacity was granted each time and then withdrawn during creation:
+the node reached `CREATING` with its four endpoints allocated, disappeared, and
+was retried, four times across the last attempt, never reaching `READY`.
+
+Eyvan's own behaviour through that is the one thing the attempt does establish.
+The cell stayed `registering`/`PROVISIONING` with no failure code and no state
+churn of its own while the provider flapped underneath it, which is the correct
+response: a node that GCP is still retrying is not a capacity loss, and treating
+it as one would have burned the workload's retry budget on the provider's
+indecision.
+
+So P2 remains at exit 2 for want of a slice that stays up, not for want of a
+run. The `v5p-16` route needs the zone to drain; the `v6e-16` route needs a
+grant that holds long enough to boot.
+
 ## A partial observation of v6e-16 topology
 
 `v6e-8` and `v6e-16` are the only catalogued shapes with no `hosts`, and the
