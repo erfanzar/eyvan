@@ -8,15 +8,19 @@
 from __future__ import annotations
 
 import typing as tp
+import unicodedata
 
 
-def _accelerator_type_order(value: str) -> tuple[str, int, str]:
+def _accelerator_type_order(value: str) -> tuple[str, int, str, str]:
     """Sort a conventional ``family-size`` type by numeric size."""
 
     family, separator, raw_size = value.rpartition("-")
     if separator and family and raw_size.isdecimal():
-        return family, int(raw_size), value
-    return value, -1, value
+        # Normalized digits compare numerically by length, then lexically,
+        # without converting an unbounded provider name to an integer.
+        size = "".join(str(unicodedata.decimal(digit)) for digit in raw_size).lstrip("0") or "0"
+        return family, len(size), size, value
+    return value, -1, "", value
 
 
 def sort_accelerator_types(values: tp.Iterable[str]) -> tuple[str, ...]:

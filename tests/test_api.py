@@ -42,6 +42,15 @@ from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 
 
+@pytest.fixture(autouse=True)
+def _isolated_api_home(monkeypatch, tmp_path: Path) -> None:
+    """Keep API startup out of the operator's artifact and credential state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "managed-artifacts"))
+
+
 def _headers(role: str = "operator", *, project: str = "research") -> dict[str, str]:
     return {
         "X-Eyvan-User": "alice",
@@ -1476,44 +1485,36 @@ def test_the_dag_route_rejects_a_cycle_before_creating_anything() -> None:
     assert listed.json() == []
 
 
-def test_the_secret_rotation_route_drives_the_fenced_ledger_and_the_keyring() -> None:
-    """Rotation is routable: mint in-process, install, commit the ledger row.
-
-    The ledger used to be constructed and parked on ``app.state`` with nothing
-    driving it, so rotating a compromised signing credential still meant a
-    restart that invalidated every outstanding capability token.
-    """
-
+def test_the_secret_rotation_route_fails_closed_without_changing_the_ledger_or_keyring() -> None:
+    """A local key replacement cannot implement recoverable shared rotation."""
     from eyvan.server.service.credential_rotation import SECRET_CAPABILITY_CREDENTIAL
 
-    app = create_app(settings=EyvanSettings(dev_auth_enabled=True))
+    key = "k" * 32
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_token_key=key))
+    credential = app.state.secret_capability_credential
+    epochs_before = credential.epochs()
+    signing_before = credential.signing_material()
+    verification_before = credential.verification_materials()
     with TestClient(app) as client:
+        ledger_before = client.portal.call(app.state.credential_rotation.current, SECRET_CAPABILITY_CREDENTIAL)
+        assert ledger_before is None
         refused = client.post("/api/v1/secrets/rotate", headers=_headers(), json={})
         response = client.post(
             "/api/v1/secrets/rotate",
             headers=_headers("fleet_admin"),
             json={"overlap_s": 300},
         )
+        ledger_after = client.portal.call(app.state.credential_rotation.current, SECRET_CAPABILITY_CREDENTIAL)
 
     assert refused.status_code == 403
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["credential"] == SECRET_CAPABILITY_CREDENTIAL
-    assert body["state"] == "committed"
-    assert body["previous_not_after"] is not None
-    # The keyring advanced with the ledger, and no signing material crossed the
-    # API: the response is the ledger row, which carries generations and fences.
-    credential = app.state.secret_capability_credential
-    assert credential.generation == body["generation"] == 2
-    assert set(body) == {
-        "id",
-        "credential",
-        "generation",
-        "fence",
-        "state",
-        "overlap_s",
-        "started_at",
-        "resolved_at",
-        "previous_not_after",
-        "detail",
-    }
+    assert response.status_code == 503, response.text
+    assert "protected shared credential distribution" in response.json()["detail"]
+    assert "startup recovery" in response.json()["detail"]
+    assert key not in response.text
+    assert ledger_after == ledger_before
+    assert credential.generation == 1
+    assert credential.rotation_state is None
+    assert credential.pending_generation is None
+    assert credential.epochs() == epochs_before
+    assert credential.signing_material() == signing_before
+    assert credential.verification_materials() == verification_before

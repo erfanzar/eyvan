@@ -107,6 +107,7 @@ def stop_local_daemons_recorded_under(home: Path) -> None:
         read_owner_only_record,
     )
 
+    survivors: list[str] = []
     for record_path in sorted(home.glob(".eyvan/*.pid")):
         record = read_owner_only_record(record_path)
         if record is None:
@@ -119,7 +120,9 @@ def stop_local_daemons_recorded_under(home: Path) -> None:
         except LocalDaemonError:
             pass
         if process_is_alive(record.pid):
-            pytest.fail(
-                f"a local Eyvan daemon (pid {record.pid}, {record.endpoint.url}) outlived the test; "
-                "record it for teardown or patch its ensure_* helper out"
-            )
+            survivors.append(f"pid {record.pid}, {record.endpoint.url}")
+    if survivors:
+        pytest.fail(
+            f"local Eyvan daemons ({'; '.join(survivors)}) outlived the test; "
+            "record them for teardown or patch their ensure_* helpers out"
+        )

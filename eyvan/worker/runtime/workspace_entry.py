@@ -40,9 +40,9 @@ from eyvan._internal.plane_tls import control_plane_urlopen_options
 
 DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
 
-#: Written only after an extraction succeeds, and only ever seen inside a
-#: published directory. A tree without it is a crashed attempt's partial
-#: extraction, which is rebuilt rather than entered.
+#: Written only after an extraction succeeds. This is completion metadata,
+#: not an integrity guarantee for the writable execution tree: later
+#: invocations always extract into their own private directory.
 COMPLETE_MARKER = ".eyvan-extraction-complete"
 
 
@@ -70,12 +70,12 @@ def materialize(
 ) -> Path:
     """Verify and unpack a bundle under ``base``, returning where it landed.
 
-    Both checks run before anything is written, and the extraction is named by
-    the bundle's digest: a retry, another rank on the host, or the next
-    workload shipping the same tree finds the completed directory and reuses
-    it, where one shared destination would meet the extractor's
-    refuse-non-empty rule and fail forever. Only a directory carrying the
-    completion marker is reused, so a crashed attempt is rebuilt whole.
+    Both checks run before anything is written. Each invocation extracts the
+    verified bytes into a new private directory: a previous workload may have
+    modified its writable cwd or added shadow modules, so neither a digest
+    directory name nor a completion marker makes that tree safe to reuse.
+    Completed trees are retained because a sibling workload or child process
+    may still be using them; reclaiming them requires execution ownership.
     """
 
     digest = hashlib.sha256(payload).hexdigest()
@@ -87,39 +87,18 @@ def materialize(
             raise ValueError("workspace bundle signature mismatch")
     from eyvan._internal.workspace import create_private_directory, extract_workspace
 
-    # One directory per bundle digest: a digest's contents are immutable, so a
-    # digest whose extraction exists already holds exactly this bundle's tree.
-    destination = base / digest[:12]
-    if (destination / COMPLETE_MARKER).is_file():
-        return destination
-
     create_private_directory(base)
-    if destination.exists():
-        # No marker means an earlier attempt died mid-extract. The extractor
-        # refuses non-empty destinations, so a partial tree can only be
-        # replaced, never filled in.
-        shutil.rmtree(destination, ignore_errors=True)
-    # Extract into a private staging directory and publish with one rename.
-    # Two ranks racing on the same host each build a complete tree, and the
-    # loser of the rename reuses the winner's -- nobody enters a
-    # half-populated extraction, because the marker becomes visible together
-    # with the directory it vouches for. mkdtemp names the staging directory
-    # uniquely, so concurrent attempts never collide even within one process.
-    staging = Path(tempfile.mkdtemp(dir=base, prefix=f".{digest[:12]}.staging-"))
+    # Never reuse, overwrite, or remove a sibling's execution tree. Unique
+    # directories isolate retries and concurrent ranks from prior cwd writes.
+    destination = Path(tempfile.mkdtemp(dir=base, prefix=f"{digest[:12]}-"))
     try:
-        extract_workspace(payload, staging)
-        (staging / COMPLETE_MARKER).write_text(digest, encoding="utf-8")
-        try:
-            os.replace(staging, destination)
-        except OSError:
-            # Lost the rename race to a rank that published first; reuse its
-            # extraction. Any other failure is real.
-            if not (destination / COMPLETE_MARKER).is_file():
-                raise
-    finally:
-        # A no-op after a successful rename; it is what keeps a failed or
-        # redundant attempt from leaving a staging tree behind.
-        shutil.rmtree(staging, ignore_errors=True)
+        extract_workspace(payload, destination)
+        (destination / COMPLETE_MARKER).write_text(digest, encoding="utf-8")
+    except BaseException:
+        # Only this invocation owns this incomplete tree. It has not been
+        # returned or entered yet, so cleanup cannot disturb a live workload.
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
     return destination
 
 

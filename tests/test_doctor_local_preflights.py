@@ -60,6 +60,10 @@ def _isolated_local_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         "DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH",
         tmp_path / "absent.json",
     )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(preflights.socket.socket, "connect_ex", lambda _self, _address: 111)
+    monkeypatch.setattr(preflights.socket.socket, "bind", lambda _self, _address: None)
     # Every test opts into the one boundary it exercises. The remaining
     # preflights must not invoke this developer's real cloud credentials.
     monkeypatch.setattr(preflights.shutil, "which", lambda _name: None)
@@ -230,7 +234,7 @@ def test_control_plane_port_squatted_by_a_non_eyvan_process_fails(monkeypatch: p
         status_code = 503
         text = ""
 
-    monkeypatch.setattr(preflights.httpx, "get", lambda _url, timeout: _RefusedResponse())
+    monkeypatch.setattr(preflights.httpx, "get", lambda _url, **_kwargs: _RefusedResponse())
 
     check = _check(DoctorCommandService(_session()).report().checks, "control-plane-port")
 
@@ -246,7 +250,9 @@ def test_control_plane_port_health_probe_preserves_valid_authority(
     monkeypatch.setattr(preflights.socket.socket, "connect_ex", lambda _self, _address: 0)
     observed = []
 
-    def health(url: str, timeout: float) -> tp.Any:
+    def health(url: str, *, timeout: float, trust_env: bool, **_tls: tp.Any) -> tp.Any:
+        assert timeout == 3.0
+        assert trust_env is False
         # Use the real URL parser: an unbracketed IPv6 authority raises
         # InvalidURL before any network request could be issued.
         request = preflights.httpx.Request("GET", url)

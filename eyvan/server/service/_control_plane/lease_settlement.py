@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from eyvan.server.service._control_plane.shared import (
     ACTIVE_LEASE_STATES,
     TERMINAL_WORKLOAD_STATES,
@@ -40,10 +42,10 @@ from eyvan.server.service._control_plane.shared import (
     ensure_workload_transition,
     hashlib,
     json,
-    timedelta,
     tp,
     utcnow,
 )
+from eyvan.server.service.scheduling import rolled_budget
 
 
 class LeaseSettlementMixin:
@@ -141,6 +143,19 @@ class LeaseSettlementMixin:
         elapsed_hours = (queued_seconds + running_seconds) / 3_600
         settled_cost = costing.cost_for_hours(lease.hourly_cost, elapsed_hours)
         hours = self._accelerator_hours(lease, elapsed_hours, workload)
+        if budget is not None:
+            # The occurrence and its actual charged window are persisted in the
+            # same transaction, before either the lease or budget is published.
+            budget = self._rolled_budget(budget, now)
+            if budget.settlement_period_id is None or budget.period_opening_spent is None:
+                # Start prospective attribution at the retained balance. This
+                # also covers lifetime/unknown periods, which never reset spend.
+                budget = budget.model_copy(
+                    update={
+                        "settlement_period_id": uuid4().hex,
+                        "period_opening_spent": budget.spent,
+                    }
+                )
         settled = lease.model_copy(
             update={
                 "state": lease.state if lease.state is LeaseState.EXPIRED else LeaseState.RELEASED,
@@ -148,6 +163,7 @@ class LeaseSettlementMixin:
                 "accelerator_hours_settled": hours,
                 "settlement_reason": reason,
                 "settled_at": now,
+                "settlement_budget_period_id": budget.settlement_period_id if budget is not None else None,
                 "queued_seconds": queued_seconds,
                 "running_seconds": running_seconds,
                 "updated_at": now,
@@ -173,9 +189,7 @@ class LeaseSettlementMixin:
         )
         if budget is None:
             return settled, None, True
-        # Roll the period before adding, so a settlement that lands after the window
-        # closed opens the new one rather than being absorbed by the old.
-        budget = self._rolled_budget(budget, now)
+        # The budget above was rolled before recording the lease attribution.
         accelerator_hours_spent = dict(budget.accelerator_hours_spent)
         for accelerator, quantity in hours.items():
             accelerator_hours_spent[accelerator] = _decimal_sum(
@@ -302,28 +316,7 @@ class LeaseSettlementMixin:
         and every alert threshold fires exactly once, ever.
         """
 
-        length = cls._period_seconds(budget.period)
-        if length is None:
-            return budget
-        started = budget.period_started_at
-        if started is None:
-            return budget.model_copy(update={"period_started_at": now})
-        if (now - started).total_seconds() < length:
-            return budget
-        # Advance by whole periods so a fleet idle for three months does not need
-        # three settlements to catch up, and the window stays aligned to its origin.
-        elapsed_periods = int((now - started).total_seconds() // length)
-        return budget.model_copy(
-            update={
-                "spent": 0.0,
-                "accelerator_hours_spent": {},
-                # Alerts are per-period. Carrying them across the boundary would
-                # silence every warning for the rest of the fleet's life after the
-                # first month that reached them.
-                "alerted_thresholds": (),
-                "period_started_at": started + timedelta(seconds=length * elapsed_periods),
-            }
-        )
+        return rolled_budget(budget, now)
 
     async def _transition_workload(
         self,

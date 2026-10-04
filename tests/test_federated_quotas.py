@@ -98,25 +98,22 @@ def test_headroom_is_per_dimension() -> None:
     assert headroom == {"cpu": 48.0, "memory_gib": 0.0, "gpu": 0.0, "tpu": 8.0}
 
 
-def test_an_expired_slice_returns_its_headroom() -> None:
-    """Otherwise a home plane's capacity leaks away one lapsed grant at a time."""
+def test_an_expired_slice_retains_its_headroom() -> None:
+    """Expiry is not proof that the peer stopped its existing work."""
 
     lapsed = _grant(expires_at=NOW - timedelta(seconds=1), issued_at=NOW - timedelta(days=1))
 
-    assert quota_headroom(ResourceLimits(tpu=16), [lapsed], now=NOW)["tpu"] == 16.0
+    assert not lapsed.active_at(NOW)
+    assert quota_headroom(ResourceLimits(tpu=16), [lapsed], now=NOW)["tpu"] == 8.0
+    assert outstanding_quota([lapsed], now=NOW)["tpu"] == 8.0
 
 
-def test_replacing_a_grant_is_measured_without_it() -> None:
-    """Raising a peer's slice must be possible at all.
-
-    Measured against headroom that still counted the old grant, every increase
-    would be refused and the only way to raise a peer would be revoke-then-issue
-    -- a window in which the peer admits nothing.
-    """
+def test_replacing_a_grant_preserves_its_retained_capacity() -> None:
+    """Replacement can use only headroom not already delegated to a peer."""
 
     headroom = quota_headroom(ResourceLimits(tpu=16), [_grant()], now=NOW, replacing="qgr-1")
 
-    assert headroom["tpu"] == 16.0
+    assert headroom["tpu"] == 8.0
 
 
 def test_every_overrun_dimension_is_named() -> None:
@@ -137,11 +134,11 @@ def test_a_dimension_the_quota_does_not_constrain_has_no_headroom() -> None:
     assert exceeds_quota_headroom(ResourceLimits(gpu=1), {"cpu": 48.0}) == ("gpu",)
 
 
-def test_outstanding_quota_sums_only_live_slices() -> None:
+def test_outstanding_quota_sums_live_and_retired_slices() -> None:
     second = _grant(id="qgr-2", grantee_plane_id="ap-1", limits=ResourceLimits(tpu=4))
     revoked = _grant(id="qgr-3", grantee_plane_id="ap-2", state=GrantState.REVOKED)
 
-    assert outstanding_quota([_grant(), second, revoked], now=NOW)["tpu"] == 12.0
+    assert outstanding_quota([_grant(), second, revoked], now=NOW)["tpu"] == 20.0
 
 
 # --------------------------------------------------------------------------- the record
@@ -174,7 +171,7 @@ async def test_the_home_plane_refuses_to_over_issue() -> None:
     service = await _service()
     await _seed(service)
 
-    with pytest.raises(InputError, match=r"tpu 32 > 16\.0"):
+    with pytest.raises(InputError, match=r"tpu 32 > 16(?:\.0)?$"):
         await service.issue_quota_grant(
             _admin(),
             org_id="acme",
@@ -217,25 +214,49 @@ async def test_a_second_grant_is_measured_against_what_the_first_took() -> None:
 
 
 @pytest.mark.asyncio
-async def test_re_issuing_replaces_rather_than_accumulates() -> None:
-    """A peer's authority must be one number an operator can read."""
+async def test_re_issuing_replaces_admission_but_retains_both_capacity_slices() -> None:
+    """Retiring the old grant does not prove its capacity has been released."""
 
     service = await _service()
     await _seed(service)
-    for key, tpu in (("k1", 8), ("k2", 12)):
+    first = await service.issue_quota_grant(
+        _admin(),
+        org_id="acme",
+        project_id="research",
+        grantee_plane_id=_PEER,
+        limits=ResourceLimits(tpu=8),
+        expires_at=NOW + timedelta(days=1),
+        idempotency_key="k1",
+    )
+    with pytest.raises(InputError, match="tpu"):
         await service.issue_quota_grant(
             _admin(),
             org_id="acme",
             project_id="research",
             grantee_plane_id=_PEER,
-            limits=ResourceLimits(tpu=tpu),
+            limits=ResourceLimits(tpu=12),
             expires_at=NOW + timedelta(days=1),
-            idempotency_key=key,
+            idempotency_key="k2",
         )
+    assert [grant.id for grant in await service.list_quota_grants(_admin())] == [first.id]
+    second = await service.issue_quota_grant(
+        _admin(),
+        org_id="acme",
+        project_id="research",
+        grantee_plane_id=_PEER,
+        limits=ResourceLimits(tpu=8),
+        expires_at=NOW + timedelta(days=1),
+        idempotency_key="k2",
+    )
 
     live = await service.list_quota_grants(_admin())
+    retained = await service.list_quota_grants(_admin(), include_inactive=True)
 
-    assert [grant.limits.tpu for grant in live] == [12]
+    assert [grant.id for grant in live] == [second.id]
+    assert second.id != first.id
+    assert next(grant for grant in retained if grant.id == first.id).state is GrantState.REVOKED
+    assert outstanding_quota(retained, now=NOW)["tpu"] == 16.0
+    assert quota_headroom(ResourceLimits(tpu=16), retained, now=NOW)["tpu"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -366,7 +387,8 @@ def test_an_expired_grant_stops_licensing_work() -> None:
 
     quotas = federated_quotas([], [lapsed], plane_id=_PEER, now=NOW)
 
-    assert quotas == []
+    assert len(quotas) == 1
+    assert quotas[0].limit.as_dict() == {"cpu": 0.0, "memory_gib": 0.0, "gpu": 0.0, "tpu": 0.0}
 
 
 def test_principal_scoped_quotas_are_left_alone() -> None:
@@ -439,21 +461,20 @@ async def test_admission_refuses_work_beyond_the_granted_slice() -> None:
     The local quota of 16 TPU would admit this. The grant of 8 does not.
     """
 
-    result = await _plane_with(_grant(), tpu=12)
+    result = await _plane_with(_grant(limits=ResourceLimits(cpu=16, memory_gib=1, tpu=8)), tpu=12)
 
     assert not result.placements
 
 
 @pytest.mark.asyncio
 async def test_the_same_plane_admits_the_work_within_its_slice() -> None:
-    """The gate must not block the configuration it exists to permit.
+    """The gate permits work within every explicitly delegated dimension.
 
-    Same fleet, same quota, same cell -- only the request size differs, so a
-    refusal here would mean the mechanism blocks everything rather than the right
-    thing.
+    The workload needs CPU and memory as well as TPU; omitted grant dimensions
+    carry zero authority even when the local quota constrains only TPU.
     """
 
-    result = await _plane_with(_grant(), tpu=8)
+    result = await _plane_with(_grant(limits=ResourceLimits(cpu=16, memory_gib=1, tpu=8)), tpu=8)
 
     assert [placement.workload_id for placement in result.placements]
 

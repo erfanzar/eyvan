@@ -20,10 +20,25 @@ cross-scheduler comparison protocol.
   loop). Start it with the profile's secrets:
 
   ```bash
-  export EYVAN_AGENT_SHARED_SECRET=$(python3 -c \
-    'import json;print(json.load(open("$HOME/.eyvan/gcp-native-runtime.json"))["agent_shared_secret"])')
-  eyvan-server --log-level info
+  if EYVAN_AGENT_SHARED_SECRET=$(python3 -c '
+  import json
+  from pathlib import Path
+  secret = json.loads((Path.home() / ".eyvan/gcp-native-runtime.json").read_text())["agent_shared_secret"]
+  if not isinstance(secret, str) or not secret:
+      raise SystemExit("Runtime profile has no nonempty agent_shared_secret")
+  print(secret)
+  '); then
+    export EYVAN_AGENT_SHARED_SECRET
+    eyvan-server --log-level info
+  else
+    printf '%s\n' 'Credential extraction failed; server was not started.' >&2
+    false
+  fi
   ```
+
+  The profile must contain a nonempty string secret. Missing or malformed
+  profiles and invalid secrets stop this command block before server startup;
+  do not bypass the check with a bare server command.
 
 - **Cells cost money; the plane reaps them.** Idle cells drain after the
   fleet's idle timeout. If you tear the plane down for the night, drain its

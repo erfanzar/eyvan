@@ -81,6 +81,18 @@ class SchemaRevisionMismatch(RuntimeError):
     """
 
 
+class ArtifactProtectionCounts(tp.NamedTuple):
+    """Unique ACTIVE artifacts protected in one scope: hold > reference > grace.
+
+    The three categories are mutually exclusive. Typed live-reference identity
+    protects an artifact even when the reference's display JSON is unreadable.
+    """
+
+    held: int
+    referenced: int
+    within_grace: int
+
+
 class RepositorySession(tp.Protocol):
     """One atomic read/write view of Eyvan state."""
 
@@ -213,6 +225,41 @@ class RepositorySession(tp.Protocol):
         limit: int = 100,
     ) -> list[ManagedArtifactRecord]:
         """Return a bounded oldest-first lifecycle recovery page."""
+        ...
+
+    async def list_collectable_managed_artifacts(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        """Filter ACTIVE, hold, live-reference and retention eligibility BEFORE the bounded LIMIT.
+
+        Return oldest updated_at/URI first. This is a candidate snapshot, not a
+        deletion authorization: collectors must transactionally revalidate it.
+        Excluded protected rows are not a checked diagnostic batch.
+        """
+        ...
+
+    async def count_managed_artifact_protections(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+    ) -> ArtifactProtectionCounts:
+        """Aggregate scoped ACTIVE protections without returning protected rows.
+
+        Count each artifact once, with hold > live reference > retention/grace
+        precedence. This diagnostic snapshot is not deletion authorization and
+        is independent of the eligible candidate LIMIT.
+        """
         ...
 
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
@@ -421,7 +468,9 @@ class RepositorySession(tp.Protocol):
 
     async def put_outbox(self, record: OutboxRecord) -> None: ...
 
-    async def list_outbox(self, *, state: OutboxState | None = None, limit: int = 100) -> list[OutboxRecord]: ...
+    async def list_outbox(
+        self, *, state: OutboxState | None = None, limit: int = 100, created_before: datetime | None = None
+    ) -> list[OutboxRecord]: ...
 
     async def list_outbox_for_aggregates(
         self,
@@ -442,7 +491,13 @@ class RepositorySession(tp.Protocol):
         """Delete idempotency bindings created before ``before``."""
         ...
 
-    async def append_event(self, event: AuditEvent) -> AuditEvent: ...
+    async def append_event(self, event: AuditEvent) -> AuditEvent:
+        """Allocate under commit serialization; higher visible cursors cannot hide later lower commits.
+
+        Sequences need not be contiguous (rollback/retention gaps are valid).
+        Allocation contention may abort the whole transaction with TransientRepositoryError.
+        """
+        ...
 
     async def list_events(
         self,

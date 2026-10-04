@@ -10,7 +10,8 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import replace
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from uuid import uuid4
 
 from eyvan.domain import (
     Budget,
@@ -58,7 +59,15 @@ from eyvan.records import (
 from eyvan.records import (
     ResourceVector as ApiResourceVector,
 )
-from eyvan.server.service.federation import BudgetGrantRecord, QuotaGrantRecord
+from eyvan.server.service.federation import (
+    _MONEY_PRECISION,
+    _QUOTA_PRECISION,
+    BudgetGrantRecord,
+    QuotaGrantRecord,
+    _issuable_amount_exact,
+    _outstanding_quota_exact,
+    _quota_headroom_exact,
+)
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 
@@ -193,10 +202,10 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         required_labels[WORKER_COUNT_LABEL] = str(spec.worker_count)
     portfolio = tuple(CapacityClass.parse(entry.value) for entry in spec.capacity_class_portfolio)
     allowed_label_values: list[tuple[str, tuple[str, ...]]] = []
-    # The workload's own lists come first and are narrower than any policy list
-    # could be: a policy says what a *project* may use, a spec says what this run
-    # will accept. Both are expressed through the same label mechanism the
-    # scheduler already applies, so widening costs no new matching code.
+    # Workload choices describe preferences, never additional project authority.
+    # Region choices outside the policy are denied below; keeping the original
+    # list also represents a disjoint intersection without an invalid empty
+    # allowed-label set.
     for label, choices in (
         ("region", spec.allowed_regions),
         ("zone", spec.allowed_zones),
@@ -211,14 +220,16 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         # A cross-zone workload has had its region pin dropped (its candidate
         # pools may span regions), so the spec's region no longer stands in for
         # the policy check it used to satisfy: apply the policy directly.
-        region_pinned = bool(spec.region) and not pool_choices
-        if not region_pinned and not spec.allowed_regions and policy.allowed_regions:
+        if not spec.allowed_regions and policy.allowed_regions:
             allowed_label_values.append(("region", policy.allowed_regions))
-    denied_label_values = (
-        (("accelerator_type", policy.denied_accelerator_types),)
-        if policy is not None and policy.denied_accelerator_types
-        else ()
-    )
+    denied_label_values: list[tuple[str, tuple[str, ...]]] = []
+    if policy is not None:
+        if policy.denied_accelerator_types:
+            denied_label_values.append(("accelerator_type", policy.denied_accelerator_types))
+        if policy.allowed_regions:
+            forbidden_regions = tuple(region for region in spec.allowed_regions if region not in policy.allowed_regions)
+            if forbidden_regions:
+                denied_label_values.append(("region", forbidden_regions))
     return WorkloadSpec(
         workload_id=record.id,
         identity=WorkloadIdentity(record.org_id, record.project_id, record.created_by),
@@ -239,7 +250,7 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         preferred_labels=tuple(spec.preferred_labels.items()),
         allowed_label_values=tuple(allowed_label_values),
         allowed_label_combinations=pool_combinations,
-        denied_label_values=denied_label_values,
+        denied_label_values=tuple(denied_label_values),
         preferred_cells=spec.preferred_cells,
         # The portfolio, not the single requested class. The core scheduler has
         # always ranked these -- ``capacity_class_rank`` is the fourth key of the
@@ -396,11 +407,20 @@ def rolled_budget(record: BudgetRecord, now: datetime) -> BudgetRecord:
     """
 
     length = _PERIOD_SECONDS.get(record.period.strip().lower())
+    started = record.period_started_at
+    if length is not None and started is None:
+        # Initializing a window is not a reset: all retained spend belongs to
+        # its opening, not to settlements whose clocks happen to be later.
+        return record.model_copy(
+            update={
+                "period_started_at": now,
+                "settlement_period_id": uuid4().hex,
+                "period_opening_spent": record.spent,
+            }
+        )
     if length is None:
         return record
-    started = record.period_started_at
-    if started is None:
-        return record.model_copy(update={"period_started_at": now})
+    assert started is not None
     if (now - started).total_seconds() < length:
         return record
     elapsed_periods = int((now - started).total_seconds() // length)
@@ -410,6 +430,8 @@ def rolled_budget(record: BudgetRecord, now: datetime) -> BudgetRecord:
             "accelerator_hours_spent": {},
             "alerted_thresholds": (),
             "period_started_at": started + timedelta(seconds=length * elapsed_periods),
+            "settlement_period_id": uuid4().hex,
+            "period_opening_spent": 0.0,
         }
     )
 
@@ -472,8 +494,8 @@ def federated_budgets(
 
     Three rules, and the second and third are the ones that matter:
 
-    * A plane holding no grants for a tenant is unchanged. That is the home
-      plane, and every non-federated deployment.
+    * A plane with no inbound grant history for a tenant is unchanged. An
+      inactive-only inbound scope retains zero authority, never a local fallback.
     * A grantee's effective limit is the **tighter** of its grant total and any
       local limit. A grant may not raise a ceiling a local operator set, and a
       local record may not exceed the slice the home plane issued.
@@ -481,38 +503,56 @@ def federated_budgets(
       Otherwise a grantee overspends its slice and the bound the whole mechanism
       provides is void.
 
-    A grantee with grants and no local budget record gets a synthesized one, so
-    the gate exists at all. Without it, the plane with the least local
-    configuration would be the one with no limit -- exactly backwards.
+    A grantee without a local budget record gets a hard zero monetary allowance.
+    A grant conveys authority but is not a durable consumption ledger: settlement
+    cannot accumulate spend without a BudgetRecord. Refuse positive-cost admission
+    until the operator supplies durable local accounting, rather than synthesize
+    fresh spent=0 on every pass. This does not reconstruct legacy consumption or
+    define a new cross-plane grant/window accounting protocol.
     """
 
-    granted: dict[tuple[str, str], float] = {}
+    outgoing: dict[tuple[str, str], list[BudgetGrantRecord]] = {}
+    if plane_id:
+        for grant in grants:
+            if grant.home_plane_id == plane_id:
+                outgoing.setdefault((grant.org_id, grant.project_id), []).append(grant)
+    # The home uses exactly the issuance partition: local spend/reservations
+    # plus retained issued rights. The core accounts active leases separately.
+    # Retirement and period changes never free unproven peer consumption.
+    granted: dict[tuple[str, str], Decimal] = {}
     # The empty check is a short-circuit, not the safety property. What actually
     # keeps a non-federated plane from matching is ``grantee_plane_id``'s
     # ``min_length=1``: no grant can be addressed to "".
     if plane_id:
         for grant in grants:
-            if grant.grantee_plane_id == plane_id and grant.active_at(now):
+            if grant.grantee_plane_id == plane_id:
                 key = (grant.org_id, grant.project_id)
-                granted[key] = granted.get(key, 0.0) + grant.amount
+                # Retained inactive records distinguish a scope that requires
+                # inbound authority from a genuinely never-federated scope.
+                granted.setdefault(key, Decimal(0))
+                if grant.active_at(now):
+                    granted[key] += Decimal(str(grant.amount))
     budgets: list[Budget] = []
     seen: set[tuple[str, str]] = set()
     for record in records:
         key = (record.org_id, record.project_id)
         seen.add(key)
+        local = to_core_budget(record, now=now)
+        issued = outgoing.get(key)
+        if issued:
+            local = replace(local, limit=_issuable_amount_exact(record.limit, issued, now=now), hard_limit=True)
         allowance = granted.get(key)
-        if allowance is None:
-            budgets.append(to_core_budget(record, now=now))
-            continue
-        budgets.append(replace(to_core_budget(record, now=now), limit=min(allowance, record.limit), hard_limit=True))
-    for key, allowance in sorted(granted.items()):
+        if allowance is not None:
+            local = replace(local, limit=min(allowance, local.limit), hard_limit=True)
+        budgets.append(local)
+    for key in sorted(granted.keys() | outgoing.keys()):
         if key in seen:
             continue
         org_id, project_id = key
         budgets.append(
             Budget(
                 scope=IdentityScope(org_id, project_id),
-                limit=allowance,
+                limit=0.0,
                 spent=0.0,
                 currency="USD",
                 hard_limit=True,
@@ -527,6 +567,7 @@ def federated_quotas(
     *,
     plane_id: str,
     now: datetime,
+    resource_names: tp.Iterable[str] = (),
 ) -> list[Quota]:
     """Bound this plane's placement by the quota slices it holds.
 
@@ -538,8 +579,8 @@ def federated_quotas(
 
     The same three rules:
 
-    * A plane holding no quota grants for a tenant is unchanged -- the home plane,
-      and every non-federated deployment.
+    * A plane with no inbound quota grant history for a tenant is unchanged.
+      Retained inactive grants close admission instead of removing the ceiling.
     * The effective limit is the **tighter** of the grant and any local quota,
       per dimension. A grant may not raise a ceiling a local operator set, and a
       local record may not exceed the slice the home plane issued.
@@ -552,19 +593,30 @@ def federated_quotas(
     say about how a tenant splits its own slice between its own people.
     """
 
-    granted: dict[tuple[str, str], dict[str, float]] = {}
-    # As with budgets, the ``plane_id`` check is a short-circuit rather than the
-    # safety property: ``grantee_plane_id`` has ``min_length=1``, so no grant can
-    # be addressed to "".
+    dimensions = {"cpu", "memory_gib", "gpu", "tpu", *resource_names}
+    for record in records:
+        dimensions.update(record.limits.custom)
+    for grant in grants:
+        dimensions.update(grant.limits.custom)
+    outgoing: dict[tuple[str, str], list[QuotaGrantRecord]] = {}
     if plane_id:
         for grant in grants:
-            if grant.grantee_plane_id != plane_id or not grant.active_at(now):
+            if grant.home_plane_id == plane_id:
+                outgoing.setdefault((grant.org_id, grant.project_id), []).append(grant)
+    granted: dict[tuple[str, str], dict[str, Decimal]] = {}
+    # An inactive-only scope retains explicit zero authority, including custom
+    # resources present in the scheduling snapshot.
+    if plane_id:
+        for grant in grants:
+            if grant.grantee_plane_id != plane_id:
                 continue
             key = (grant.org_id, grant.project_id)
-            totals = granted.setdefault(key, {})
-            for name, quantity in resource_quantities(grant.limits).items():
-                if quantity:
-                    totals[name] = totals.get(name, 0.0) + quantity
+            totals = granted.setdefault(key, dict.fromkeys(sorted(dimensions), Decimal(0)))
+            if not grant.active_at(now):
+                continue
+            with localcontext(prec=_QUOTA_PRECISION):
+                for name, quantity in resource_quantities(grant.limits).items():
+                    totals[name] += Decimal(str(quantity))
     quotas: list[Quota] = []
     seen: set[tuple[str, str]] = set()
     for record in records:
@@ -573,25 +625,37 @@ def federated_quotas(
             continue
         key = (record.org_id, record.project_id)
         allowance = granted.get(key)
-        if allowance is None:
-            quotas.append(to_core_quota(record))
-            continue
         seen.add(key)
         local = to_core_quota(record)
-        # A dimension the grant does not mention is zero, not unbounded: a slice
-        # that silently authorized everything it forgot to name would be the
-        # opposite of a ceiling. A dimension the *local* quota does not constrain
-        # is not introduced here either -- the grant cannot add a constraint the
-        # tenant's own operator did not ask for on a plane that is not the home.
+        issued = outgoing.get(key)
+        if issued:
+            retained = _outstanding_quota_exact(issued, now=now)
+            headroom = _quota_headroom_exact(record.limits, issued, now=now)
+            home_limits = local.limit.as_dict()
+            # Issuance uses declared quantities, even for locally unconstrained
+            # dimensions. Those delegated dimensions must bind the home too;
+            # otherwise a sparse local quota bypasses the same partition.
+            for name, quantity in retained.items():
+                if quantity > 0:
+                    remaining = headroom.get(name, Decimal(0))
+                    home_limits[name] = min(home_limits.get(name, remaining), remaining)
+            local = replace(local, limit=ResourceVector(home_limits))
+        if allowance is None:
+            quotas.append(local)
+            continue
+        # Local absence is unrestricted; grant absence is zero authority.
+        # Enforce the grant independently of the local quota's sparse keys.
+        local_limits = local.limit.as_dict()
         bounded = {
-            name: min(quantity, Decimal(str(allowance.get(name, 0.0))))
-            for name, quantity in local.limit.as_dict().items()
+            name: min(local_limits.get(name, Decimal(str(quantity))), Decimal(str(quantity)))
+            for name, quantity in allowance.items()
         }
         quotas.append(replace(local, limit=ResourceVector(bounded)))
-    for key, allowance in sorted(granted.items()):
+    for key in sorted(granted.keys() | outgoing.keys()):
         if key in seen:
             continue
         org_id, project_id = key
+        allowance = dict.fromkeys(sorted(dimensions), Decimal(0)) if key in outgoing else granted[key]
         quotas.append(Quota(scope=IdentityScope(org_id, project_id), limit=ResourceVector(dict(allowance)), weight=1.0))
     return quotas
 
@@ -634,22 +698,42 @@ class CoreSchedulingService:
         if orphans:
             raise ValueError(f"active lease {orphans[0]!r} references a missing workload")
         policy_by_scope = {(policy.org_id, policy.project_id): policy for policy in policies}
-        return self.scheduler.schedule(
-            (
-                to_core_workload(workload, policy_by_scope.get((workload.org_id, workload.project_id)))
-                for workload in pending
-            ),
-            (to_core_cell(cell) for cell in cell_records),
-            leases=(
-                to_core_lease(
-                    lease,
-                    workload_by_id[lease.workload_id],
-                    policy_by_scope.get((lease.org_id, lease.project_id)),
-                    class_by_cell.get(lease.cell_id),
-                    workers_by_cell.get(lease.cell_id),
-                )
-                for lease in active_leases
-            ),
-            quotas=federated_quotas(list(quotas), list(quota_grants), plane_id=plane_id, now=now or utcnow()),
-            budgets=federated_budgets(list(budgets), list(grants), plane_id=plane_id, now=now or utcnow()),
-        )
+        budget_grants = list(grants)
+        quota_grant_records = list(quota_grants)
+        quota_records = list(quotas)
+        moment = now or utcnow()
+        with localcontext() as context:
+            # Keep the complete retained-rights partition through core addition
+            # and comparison too; a default-context sum can erase a tiny active
+            # reservation even when issuance computed its headroom exactly.
+            # Local quota reservations require the same exact arithmetic even
+            # before a scope has issued or received any federation grants.
+            if quota_records or (plane_id and (budget_grants or quota_grant_records)):
+                context.prec = max(context.prec, _MONEY_PRECISION, _QUOTA_PRECISION)
+            return self.scheduler.schedule(
+                (
+                    to_core_workload(workload, policy_by_scope.get((workload.org_id, workload.project_id)))
+                    for workload in pending
+                ),
+                (to_core_cell(cell) for cell in cell_records),
+                leases=(
+                    to_core_lease(
+                        lease,
+                        workload_by_id[lease.workload_id],
+                        policy_by_scope.get((lease.org_id, lease.project_id)),
+                        class_by_cell.get(lease.cell_id),
+                        workers_by_cell.get(lease.cell_id),
+                    )
+                    for lease in active_leases
+                ),
+                quotas=federated_quotas(
+                    quota_records,
+                    quota_grant_records,
+                    plane_id=plane_id,
+                    now=moment,
+                    resource_names=(
+                        name for workload in workload_records for name in workload.spec.gang.per_replica.custom
+                    ),
+                ),
+                budgets=federated_budgets(list(budgets), budget_grants, plane_id=plane_id, now=moment),
+            )

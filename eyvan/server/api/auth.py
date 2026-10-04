@@ -61,7 +61,8 @@ class OIDCTokenVerifier:
     """PyJWT-backed verifier using an issuer's JWKS discovery endpoint."""
 
     def __init__(self, *, issuer: str, audience: str, jwks_url: str | None = None):
-        self.issuer = issuer.rstrip("/")
+        # The issuer is an exact identity, not a URL normalization target.
+        self.issuer = issuer
         self.audience = audience
         self._jwks_url = jwks_url
         self._jwks: jwt.PyJWKClient | None = None
@@ -75,12 +76,12 @@ class OIDCTokenVerifier:
                 return self._jwks
             jwks_url = self._jwks_url
             if jwks_url is None:
-                discovery_url = f"{self.issuer}/.well-known/openid-configuration"
+                discovery_url = f"{self.issuer.rstrip('/')}/.well-known/openid-configuration"
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(discovery_url)
                     response.raise_for_status()
                     discovery = _OIDCDiscovery.model_validate_json(response.content)
-                if discovery.issuer.rstrip("/") != self.issuer:
+                if discovery.issuer != self.issuer:
                     raise ValueError("OIDC discovery issuer does not match configured issuer")
                 jwks_url = discovery.jwks_uri
             self._jwks = jwt.PyJWKClient(jwks_url)

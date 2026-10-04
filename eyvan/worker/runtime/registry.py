@@ -180,6 +180,15 @@ class ExecCapableExecutionDriver(tp.Protocol):
     def exec_in_workload(self, remote_id: str, command: tp.Sequence[str], *, timeout_s: float) -> JsonObject: ...
 
 
+@tp.runtime_checkable
+class RankedExecCapableExecutionDriver(tp.Protocol):
+    """Optional exact inner-host diagnostic selection, distinct from fan-out."""
+
+    def exec_in_workload_rank(
+        self, remote_id: str, command: tp.Sequence[str], *, timeout_s: float, runtime_rank: int
+    ) -> JsonObject: ...
+
+
 @dataclass(frozen=True, slots=True)
 class NativeGangCell:
     """One cell selected for a native multi-cell workload group."""
@@ -511,6 +520,7 @@ class ExecutionDriverResolver:
             raise ValueError("native gang execution cell IDs must be unique")
 
         from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMember
+        from eyvan.worker.runtime.native_slice import JaxClusterDetectionMode
 
         cell_endpoints: dict[str, tuple[str, ...]] = {}
         for cell in ordered:
@@ -538,6 +548,11 @@ class ExecutionDriverResolver:
                     accelerators[cell.cell_id].gpu_devices_per_host if cell.cell_id in accelerators else None
                 ),
                 gpu_model=accelerators[cell.cell_id].gpu_model if cell.cell_id in accelerators else None,
+                jax_cluster_detection=(
+                    JaxClusterDetectionMode.GCE_TPU
+                    if _uses_gce_tpu_cluster_detection(cell.observation)
+                    else JaxClusterDetectionMode.EXPLICIT
+                ),
             )
             for cell in ordered
         ]

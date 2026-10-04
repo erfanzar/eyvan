@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+from math import isfinite
+
 from eyvan.server.service._control_plane.shared import (
-    _POOL_LABEL,
     AuditEvent,
     LeaseRecord,
     NotFoundError,
@@ -14,7 +15,6 @@ from eyvan.server.service._control_plane.shared import (
     Principal,
     WebhookRecord,
     WorkloadSpendRecord,
-    _declares_a_price,
     _new_id,
     _on_demand_price,
     spend_of,
@@ -141,19 +141,32 @@ class WebhooksMixin:
         async with self.repository.transaction() as tx:
             leases = await tx.list_leases(workload_id=workload_id)
             pools = await tx.list_capacity_pools()
+            cells = {cell_id: await tx.get_cell(cell_id) for cell_id in {lease.cell_id for lease in leases}}
 
-        # The placement contract, not the user-facing copy of it. Both carry the
-        # pool for a pool-submitted job, and a job submitted through the
-        # advanced API carries neither -- which is why an absent pool is
-        # "unknowable" rather than "unpriced".
-        pool_id = workload.spec.required_labels.get(_POOL_LABEL) or workload.spec.metadata.get(_POOL_LABEL)
-        used_pool = next((pool for pool in pools if pool.id == pool_id), None)
-        shape = used_pool.accelerator_type if used_pool is not None else None
-        # `None` means unknowable and is reported as unpriced; an empty set means
-        # known-unpriced. Both render as *unknown*, and neither is zero.
-        priced_cells: set[str] | None = None
-        if used_pool is not None:
-            priced_cells = {lease.cell_id for lease in leases} if _declares_a_price(used_pool.unit_prices) else set()
+        # The request's primary pool is only a first choice. Describe observed
+        # cells instead, and never let a replacement incarnation describe an
+        # older lease. Missing or mixed observations cannot prove one shape/class.
+        observed_cells = [
+            cell
+            for lease in leases
+            if (cell := cells[lease.cell_id]) is not None and cell.generation == lease.cell_generation
+        ]
+        shapes = {cell.accelerator_type for cell in observed_cells}
+        classes = {cell.capacity_class.value for cell in observed_cells}
+        complete = bool(leases) and len(observed_cells) == len(leases)
+        shape = next(iter(shapes)) if complete and len(shapes) == 1 else None
+        capacity_class = next(iter(classes)) if complete and len(classes) == 1 else None
+
+        # Admission freezes the actual billing rate on each lease. Today's pool
+        # or cell declarations cannot establish historical pricing. A zero or
+        # legacy-missing rate has no provenance proving "free", so stays unknown.
+        # Check every lease before constructing the cell set: retries can reuse
+        # the same cell with different frozen rates.
+        priced_cells = (
+            {lease.cell_id for lease in leases}
+            if all(isfinite(lease.hourly_cost) and lease.hourly_cost > 0 for lease in leases)
+            else None
+        )
         spend = spend_of(
             [lease.model_dump(mode="json") for lease in leases],
             priced_cells=priced_cells,
@@ -168,7 +181,7 @@ class WebhooksMixin:
             reserved=spend.reserved,
             leases=spend.leases,
             shape=shape,
-            capacity_class=used_pool.capacity_class.value if used_pool is not None else None,
+            capacity_class=capacity_class,
             on_demand_hourly=hourly,
             on_demand_source=source,
         )

@@ -357,11 +357,9 @@ code,
 }
 
 .sidebar-collapsed .brand-row {
-  padding: 0 0 0 18px;
-}
-
-.sidebar-collapsed .rail-toggle {
-  display: none;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 4px;
 }
 
 .sidebar .sidebar-close {
@@ -3302,8 +3300,10 @@ code,
 .modal {
   position: relative;
   z-index: 1;
+  display: flex;
   width: min(820px, 100%);
   max-height: calc(100vh - 36px);
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
@@ -3337,6 +3337,7 @@ code,
 .modal-header {
   display: flex;
   min-height: 68px;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -3353,10 +3354,13 @@ code,
 }
 .modal form {
   display: flex;
+  min-height: 0;
   max-height: calc(100vh - 105px);
   flex-direction: column;
 }
 .modal-body {
+  min-height: 0;
+  flex: 1 1 auto;
   overflow-y: auto;
   padding: 4px 18px 18px;
 }
@@ -3482,6 +3486,7 @@ code,
 .modal-footer {
   display: flex;
   min-height: 56px;
+  flex: none;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
@@ -3494,6 +3499,15 @@ code,
 .modal-footer .button {
   height: 30px;
   padding: 0 12px;
+}
+
+/* Base tracks precede the tablet and phone overrides below. */
+.stage-pipeline {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 16px 14px 15px;
 }
 
 @media (max-width: 1280px) {
@@ -3546,8 +3560,15 @@ code,
   }
   /* The rail is a drawer here, so the collapse control has nothing to collapse
      into and the close control has something to close. */
-  .sidebar .rail-label {
+  .sidebar .rail-label,
+  .sidebar.sidebar-collapsed .rail-label,
+  .sidebar.sidebar-collapsed .nav-label,
+  .sidebar.sidebar-collapsed .profile-button > svg {
     display: revert;
+  }
+  .sidebar.sidebar-collapsed .environment-switcher,
+  .sidebar.sidebar-collapsed .system-health small {
+    display: block;
   }
   .sidebar .sidebar-close {
     display: inline-flex;
@@ -3738,13 +3759,6 @@ code,
   font-size: var(--text-2xs);
 }
 
-.stage-pipeline {
-  display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
-  list-style: none;
-  margin: 0;
-  padding: 16px 14px 15px;
-}
 .stage-node {
   min-width: 0;
   padding-right: 8px;

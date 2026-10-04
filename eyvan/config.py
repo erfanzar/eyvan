@@ -517,6 +517,36 @@ class EyvanSettings:
             raise ValueError("log_archive_concurrency must be positive")
         if self.capacity_race_width < 1:
             raise ValueError("capacity_race_width must be at least 1; 1 asks one zone at a time")
+        # The remaining interval knobs: a NaN or negative value here would
+        # become the controller's next sleep, or silently disable a phase.
+        for name in (
+            "scheduler_interval_s",
+            "cell_reconcile_interval_s",
+            "service_reconcile_interval_s",
+            "retention_interval_s",
+            "metrics_export_interval_s",
+            "grant_expiry_interval_s",
+            "cell_billing_interval_s",
+            "webhook_delivery_interval_s",
+            "soak_evidence_max_age_s",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.lease_ttl_s <= 0:
+            raise ValueError("lease_ttl_s must be positive")
+        for name in ("checkpoint_grace_s", "preemption_stop_grace_s", "indeterminate_execution_grace_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.cell_reconcile_concurrency <= 0:
+            raise ValueError("cell_reconcile_concurrency must be positive")
+        if self.gang_init_deadline_s <= 0:
+            raise ValueError("gang_init_deadline_s must be positive")
+        if self.host_replacement_window_s <= 0:
+            raise ValueError("host_replacement_window_s must be positive")
+        if not 1 <= self.native_worker_port <= 65535:
+            raise ValueError("native_worker_port must be between 1 and 65535")
         self._validate_cell_stage_settings()
         validate_minimum_client_version(self.min_client_version)
 

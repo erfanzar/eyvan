@@ -213,6 +213,12 @@ class _ControllerScheduling:
                 budgets=() if budget is None else (budget,),
                 quotas=await transaction.list_quotas(org_id=target.org_id),
                 policies=await transaction.list_policies(),
+                # Same federation inputs the plan pass used; a preemption plan
+                # that only fits under the grant bound must not revalidate
+                # against the looser local limit.
+                grants=await transaction.list_budget_grants() if self.service.plane_id else [],
+                quota_grants=await transaction.list_quota_grants() if self.service.plane_id else [],
+                plane_id=self.service.plane_id,
             )
             current_plan = next(
                 (candidate for candidate in refreshed.preemptions if candidate.workload_id == target.id),

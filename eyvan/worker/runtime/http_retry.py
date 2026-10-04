@@ -14,6 +14,7 @@ for the same reason.
 
 from __future__ import annotations
 
+import math
 import urllib.error
 
 #: Total attempts, not retries: three tries, two backoffs.
@@ -36,7 +37,9 @@ def retry_delay(error: urllib.error.HTTPError | None, attempt: int) -> float:
         retry_after = error.headers.get("Retry-After")
         if retry_after is not None:
             try:
-                return min(max(float(retry_after), 0.0), 30.0)
+                delay = float(retry_after)
+                if math.isfinite(delay):
+                    return min(max(delay, 0.0), 30.0)
             except ValueError:
                 pass
     return min(0.25 * (2**attempt), 2.0)

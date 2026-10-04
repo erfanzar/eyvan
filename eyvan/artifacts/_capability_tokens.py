@@ -24,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import typing as tp
 
 MINIMUM_SECRET_BYTES = 32
@@ -40,13 +41,25 @@ def encode_segment(payload: bytes) -> str:
 
 
 def decode_segment(value: str) -> bytes:
-    """Decode a padding-stripped base64url segment."""
+    """Decode a padding-stripped base64url segment, refusing malleable input.
 
+    ``urlsafe_b64decode`` silently discards non-alphabet characters, so junk
+    interleaved with a signed segment would otherwise be stripped and the
+    remainder verified -- many distinct token strings all decoding to one
+    capability. Strict canonical base64url only; the same rule the artifact
+    signer enforces on its own segments.
+    """
+
+    if not value or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise InvalidCapabilityToken("invalid capability token")
     padding = "=" * (-len(value) % 4)
     try:
-        return base64.urlsafe_b64decode(value + padding)
+        decoded = base64.urlsafe_b64decode(value + padding)
     except (ValueError, TypeError) as exc:
         raise InvalidCapabilityToken("invalid capability token") from exc
+    if encode_segment(decoded) != value:
+        raise InvalidCapabilityToken("invalid capability token")
+    return decoded
 
 
 def sign_claims(secret: bytes, version: str, claims: tp.Mapping[str, object]) -> str:

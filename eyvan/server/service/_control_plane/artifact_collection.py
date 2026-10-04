@@ -227,7 +227,17 @@ class ArtifactCollectionMixin:
         limit: int = 500,
         now: datetime | None = None,
     ) -> ArtifactCollection:
-        """Dry-run candidates or claim/version-delete/finalize them safely."""
+        """Dry-run candidates or claim/version-delete/finalize them safely.
+
+        The bounded ACTIVE batch excludes holds, live references and retention
+        before LIMIT. A separate aggregate reports scoped ACTIVE protections
+        from one snapshot at the end of the pass, evaluated at ``now``, with
+        mutually exclusive hold > reference > grace precedence. Revalidation
+        never increments these counts: adding rejects to an earlier aggregate
+        can double-count artifacts whose protections change between queries.
+        Capped describes only unprocessed eligible/DELETING rows, not protected
+        inventory. The diagnostic query never authorizes deletion.
+        """
 
         if self.artifact_store is None:
             raise InputError("a versioned managed artifact store is not configured")
@@ -237,12 +247,22 @@ class ArtifactCollectionMixin:
             raise InputError("artifact collection grace period must be finite and non-negative")
         moment = now or utcnow()
         actor = principal or Principal(subject="system:artifact-collector")
+        if principal is not None:
+            # The sweep physically deletes stored results, so a caller-supplied
+            # principal authorizes exactly like the hold and release siblings
+            # it mirrors. Only the internal default (no caller at all) runs
+            # without one; the HTTP route always supplies a caller.
+            self.authorizer.require(
+                principal,
+                Permission.MANAGE_PROJECT,
+                org_id=org_id,
+                project_id=project_id,
+            )
         windows: dict[str, float | None] = dict(retention_by_kind or {})
         if any(value is not None and (not _is_finite_nonnegative_number(value)) for value in windows.values()):
             raise InputError("artifact retention windows must be finite non-negative numbers or null")
         collected: list[str] = []
         reclaimed = 0
-        held = referenced = within_grace = 0
         scan_limit = 10_000
         async with self.repository.transaction() as tx:
             deleting_candidates = await tx.list_managed_artifacts_by_state(
@@ -251,23 +271,30 @@ class ArtifactCollectionMixin:
                 project_id=project_id,
                 limit=scan_limit + 1,
             )
-            active_candidates = await tx.list_managed_artifacts_by_state(
-                state=ManagedArtifactState.ACTIVE,
+            active_candidates = await tx.list_collectable_managed_artifacts(
                 org_id=org_id,
                 project_id=project_id,
+                now=moment,
+                grace_period_s=grace_period_s,
+                retention_by_kind=windows,
                 limit=scan_limit + 1,
             )
         capped = len(deleting_candidates) > scan_limit or len(active_candidates) > scan_limit
         deleting_candidates = deleting_candidates[:scan_limit]
         active_candidates = active_candidates[:scan_limit]
 
-        # First resume claims whose owner crashed after the database commit. A
-        # claim already excludes new references/holds, and the provider version
-        # keeps a stale recovery pass away from any replacement.
+        # First report or resume claims whose owner crashed after the database
+        # commit. A claim already excludes new references/holds, and the provider
+        # version keeps a stale recovery pass away from any replacement. Preview
+        # must not execute deletion, quarantine or finalization of these claims.
         for index, candidate in enumerate(deleting_candidates):
             if len(collected) >= limit:
                 capped = capped or index < len(deleting_candidates)
                 break
+            if dry_run:
+                collected.append(candidate.uri)
+                reclaimed += candidate.size_bytes
+                continue
             finalized, removed = await self._execute_artifact_deletion_claim(
                 candidate,
                 principal=actor,
@@ -283,15 +310,15 @@ class ArtifactCollectionMixin:
                 capped = capped or index < len(active_candidates)
                 break
             if candidate.hold is not None and candidate.hold.active_at(moment):
-                held += 1
                 continue
             window = windows.get(candidate.kind, grace_period_s)
             if window is None:
-                within_grace += 1
                 continue
-            age_origin = candidate.activated_at or candidate.created_at
+            age_origin = max(
+                candidate.activated_at or candidate.created_at,
+                candidate.upload_started_at or candidate.created_at,
+            )
             if age_origin > moment - timedelta(seconds=window):
-                within_grace += 1
                 continue
 
             claim: ManagedArtifactRecord | None = None
@@ -300,12 +327,13 @@ class ArtifactCollectionMixin:
                 if current is None or current.state is not ManagedArtifactState.ACTIVE:
                     continue
                 if current.hold is not None and current.hold.active_at(moment):
-                    held += 1
                     continue
-                current_origin = current.activated_at or current.created_at
+                current_origin = max(
+                    current.activated_at or current.created_at,
+                    current.upload_started_at or current.created_at,
+                )
                 current_window = windows.get(current.kind, grace_period_s)
                 if current_window is None or current_origin > moment - timedelta(seconds=current_window):
-                    within_grace += 1
                     continue
                 if await tx.list_artifact_references(
                     org_id=org_id,
@@ -313,7 +341,6 @@ class ArtifactCollectionMixin:
                     uri=current.uri,
                     active_only=True,
                 ):
-                    referenced += 1
                     continue
                 if dry_run:
                     collected.append(current.uri)
@@ -364,6 +391,14 @@ class ArtifactCollectionMixin:
                     if removed:
                         reclaimed += claim.size_bytes
 
+        async with self.repository.transaction() as tx:
+            held, referenced, within_grace = await tx.count_managed_artifact_protections(
+                org_id=org_id,
+                project_id=project_id,
+                now=moment,
+                grace_period_s=grace_period_s,
+                retention_by_kind=windows,
+            )
         return ArtifactCollection(
             collected_uris=tuple(collected),
             reclaimed_bytes=reclaimed,

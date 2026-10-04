@@ -23,11 +23,13 @@ from eyvan.capacity.planning import (
     CapacitySimulation,
     PoolScalePlan,
     cell_matches_pool,
+    cell_provides_pool_supply,
     cell_requires_replacement,
     next_pool_cell_index,
     pool_cell_id,
 )
 from eyvan.domain import (
+    InfeasibilityCode,
     PlacementMode,
     SchedulingResult,
 )
@@ -37,6 +39,7 @@ from eyvan.records import (
     CellState,
     Principal,
     WorkloadDefinition,
+    WorkloadRecord,
     WorkloadState,
     utcnow,
 )
@@ -168,12 +171,24 @@ class _ControllerFleets:
         cell_id: str,
         *,
         idempotency_key: str,
+        expected_workload: WorkloadRecord | None = None,
+        expected_cell_generation: int | None = None,
+        expected_pool_generation: int | None = None,
+        require_empty: bool = False,
     ) -> tuple[CellRecord, bool]:
         """Persist a cell drain while serializing that cell's future capacity work."""
 
         cell = await self.service.get_cell(principal, cell_id)
         async with self._capacity_operation(cell):
-            return await self.service.drain_cell(principal, cell_id, idempotency_key=idempotency_key)
+            return await self.service.drain_cell(
+                principal,
+                cell_id,
+                idempotency_key=idempotency_key,
+                expected_workload=expected_workload,
+                expected_cell_generation=expected_cell_generation,
+                expected_pool_generation=expected_pool_generation,
+                require_empty=require_empty,
+            )
 
     async def delete_cell(
         self,
@@ -181,12 +196,20 @@ class _ControllerFleets:
         cell_id: str,
         *,
         idempotency_key: str,
+        expected_cell_generation: int | None = None,
+        expected_pool_generation: int | None = None,
     ) -> tuple[CellRecord, bool]:
         """Persist a cell release while serializing that cell's future capacity work."""
 
         cell = await self.service.get_cell(principal, cell_id)
         async with self._capacity_operation(cell):
-            return await self.service.delete_cell(principal, cell_id, idempotency_key=idempotency_key)
+            return await self.service.delete_cell(
+                principal,
+                cell_id,
+                idempotency_key=idempotency_key,
+                expected_cell_generation=expected_cell_generation,
+                expected_pool_generation=expected_pool_generation,
+            )
 
     async def recycle_stale_build_cells_once(self) -> int:
         """Drain every schedulable cell whose agent runs a different build.
@@ -330,7 +353,10 @@ class _ControllerFleets:
             if not await self.leader.acquire():
                 return result
             await self._commit_preemption(plan)
-        await self._record_infeasibilities(result)
+        if result.infeasibilities:
+            if not await self.leader.acquire():
+                return result
+            await self._record_infeasibilities(result)
         return result
 
     async def _release_inactive_autoscale_request_ownership(
@@ -343,6 +369,9 @@ class _ControllerFleets:
         it to be requested is still waiting for capacity. Lease creation clears
         the reservation atomically. This recovery path handles cancellation,
         terminal failure, and deleted legacy workloads before a lease exists.
+        On federated planes it also releases waiting owners that the current
+        budget or quota bounds demonstrably refuse; unknown capacity does not
+        justify releasing a reservation.
 
         Waiting is ``PENDING`` *or* ``ADMITTED``, matching what
         ``server/invariants.py`` already means by "not yet running". Both are
@@ -360,6 +389,43 @@ class _ControllerFleets:
 
         released_by_id: dict[str, CellRecord] = {}
         async with self.repository.transaction() as transaction:
+            refused_owners: set[str] = set()
+            leased_ids: set[str] = set()
+            if self.service.plane_id and self.service.scheduler is not None:
+                grants = await transaction.list_budget_grants()
+                quota_grants = await transaction.list_quota_grants()
+                if grants or quota_grants:
+                    # Waiting does not license capacity that current federation
+                    # bounds refuse. Rejudge against current records in this
+                    # transaction before returning its reservation to shared supply.
+                    current_workloads = await transaction.list_workloads()
+                    current_cells = await transaction.list_cells()
+                    current_leases = await transaction.list_leases()
+                    leased_ids = {lease.cell_id for lease in current_leases if lease.state in ACTIVE_LEASE_STATES}
+                    simulation = CapacitySimulation.build(
+                        tuple(await transaction.list_capacity_pools()),
+                        tuple(current_cells),
+                        tuple(current_workloads),
+                        tuple(current_leases),
+                        utcnow(),
+                        policies=tuple(await transaction.list_policies()),
+                    )
+                    result = self.service.scheduler.schedule(
+                        current_workloads,
+                        simulation.cells,
+                        leases=current_leases,
+                        budgets=await transaction.list_budgets(),
+                        quotas=await transaction.list_quotas(),
+                        policies=await transaction.list_policies(),
+                        grants=grants,
+                        quota_grants=quota_grants,
+                        plane_id=self.service.plane_id,
+                    )
+                    refused_owners = {
+                        failure.workload_id
+                        for failure in result.infeasibilities
+                        if failure.code in {InfeasibilityCode.BUDGET_EXCEEDED, InfeasibilityCode.QUOTA_EXCEEDED}
+                    }
             for snapshot in candidates:
                 current = await transaction.get_cell(snapshot.id)
                 if (
@@ -372,7 +438,8 @@ class _ControllerFleets:
                 assert owner_id is not None
                 owner = await transaction.get_workload(owner_id)
                 if owner is not None and owner.state in _WAITING_FOR_CAPACITY:
-                    continue
+                    if owner_id not in refused_owners or current.id in leased_ids:
+                        continue
                 released = current.model_copy(
                     update={
                         "autoscale_request_workload_id": None,
@@ -382,7 +449,7 @@ class _ControllerFleets:
                 await transaction.put_cell(released)
                 released_by_id[released.id] = released
                 logger.info(
-                    "releasing autoscale reservation on cell %s because workload %s is no longer pending",
+                    "releasing autoscale reservation on cell %s because workload %s is no longer waiting or admissible",
                     released.id,
                     owner_id,
                 )
@@ -419,6 +486,8 @@ class _ControllerFleets:
             budgets = await transaction.list_budgets()
             quotas = await transaction.list_quotas()
             policies = await transaction.list_policies()
+            grants = await transaction.list_budget_grants() if self.service.plane_id else []
+            quota_grants = await transaction.list_quota_grants() if self.service.plane_id else []
 
         cells = await self._release_inactive_autoscale_request_ownership(cells)
         pools_by_id = {pool.id: pool for pool in pools}
@@ -467,7 +536,9 @@ class _ControllerFleets:
                 cells_by_pool[pool_id].append(cell)
 
         pool_records = tuple(pools)
-        simulation = CapacitySimulation.build(pool_records, tuple(cells), tuple(workloads), tuple(leases), now)
+        simulation = CapacitySimulation.build(
+            pool_records, tuple(cells), tuple(workloads), tuple(leases), now, policies=tuple(policies)
+        )
         simulated = self.service.scheduler.schedule(
             workloads,
             simulation.cells,
@@ -475,6 +546,9 @@ class _ControllerFleets:
             budgets=budgets,
             quotas=quotas,
             policies=policies,
+            grants=grants,
+            quota_grants=quota_grants,
+            plane_id=self.service.plane_id,
         )
         demand_by_pool = simulation.demand(
             pool_records,
@@ -606,25 +680,40 @@ class _ControllerFleets:
                             pool.id,
                         )
 
-            if (
-                pool.enabled
-                and pool.initialized_at is None
-                and plan.supply_worker_units_after_launch >= pool.initial_target
-            ):
+            if pool.enabled and pool.initialized_at is None:
                 async with self.repository.transaction() as transaction:
                     current = await transaction.get_capacity_pool(pool.id)
-                    if current is not None and current.generation == pool.generation and current.initialized_at is None:
-                        await transaction.put_capacity_pool(current.model_copy(update={"initialized_at": now}))
+                    if (
+                        current is not None
+                        and current.enabled
+                        and current.generation == pool.generation
+                        and current.initialized_at is None
+                    ):
+                        # Advice can withhold launches and a stale upsert can be
+                        # skipped. Only durable, current-template supply fulfills
+                        # the initial target, never the planner's hypothetical batch.
+                        supply = sum(
+                            cell.worker_count
+                            for cell in await transaction.list_cells()
+                            if cell.pool_id == current.id and cell_provides_pool_supply(cell, current, now)
+                        )
+                        if supply >= current.initial_target:
+                            await transaction.put_capacity_pool(current.model_copy(update={"initialized_at": now}))
 
             draining = [cell for cell in live if cell.state is CellState.DRAINING]
             for cell in draining:
                 if cell.id in active_lease_cells:
                     continue
-                await self.delete_cell(
-                    self._principal,
-                    cell.id,
-                    idempotency_key=f"autoscale:delete:{cell.id}:g{cell.generation + 1}",
-                )
+                try:
+                    await self.delete_cell(
+                        self._principal,
+                        cell.id,
+                        idempotency_key=f"autoscale:delete:{cell.id}:g{cell.generation + 1}",
+                        expected_cell_generation=cell.generation,
+                        expected_pool_generation=pool.generation,
+                    )
+                except ConflictError:
+                    continue
                 deleted += 1
 
             current_candidates = [
@@ -697,11 +786,17 @@ class _ControllerFleets:
                             current.model_copy(update={"idle_since": idle_since, "updated_at": now})
                         )
             for cell in {candidate.id: candidate for candidate in to_drain}.values():
-                draining_cell, replayed = await self.drain_cell(
-                    self._principal,
-                    cell.id,
-                    idempotency_key=f"autoscale:drain:{cell.id}:g{cell.generation}",
-                )
+                try:
+                    draining_cell, replayed = await self.drain_cell(
+                        self._principal,
+                        cell.id,
+                        idempotency_key=f"autoscale:drain:{cell.id}:g{cell.generation}",
+                        expected_cell_generation=cell.generation,
+                        expected_pool_generation=pool.generation,
+                        require_empty=True,
+                    )
+                except ConflictError:
+                    continue
                 # "Never delivered capacity" is the question, and `state` answers a
                 # different one -- what the cell is *now*. A reclaimed spot cell is
                 # draining or NEEDS_RECREATE by the time it reaches here, so a cell
@@ -874,8 +969,9 @@ class _ControllerFleets:
         in the plane could have shown that at the time.
 
         Read-only and operator-triggered, like the orphan scan it is modelled on:
-        one request per distinct cell-agent endpoint, each failure recorded
-        against that endpoint rather than failing the sweep. Three outcomes per
+        one agent-build request per distinct endpoint and a worker-build request
+        per live cell, each failure recorded rather than failing the sweep.
+        Three outcomes per
         agent and they stay distinct -- a digest, ``null`` from an agent that
         predates the route, or an entry under ``unreachable``. Collapsing the
         last two would report a plane nobody could reach as one in agreement.
@@ -888,41 +984,47 @@ class _ControllerFleets:
         async with self.repository.transaction() as transaction:
             cells = await transaction.list_cells()
             pools = await transaction.list_capacity_pools()
-        endpoints: dict[str, CellRecord] = {}
+        endpoints: dict[str, list[CellRecord]] = {}
         for cell in cells:
             if cell.endpoint and cell.state is not CellState.DELETED:
-                endpoints.setdefault(cell.endpoint, cell)
+                endpoints.setdefault(cell.endpoint, []).append(cell)
         scanned_pools = {cell.pool_id for cell in cells if cell.endpoint and cell.state is not CellState.DELETED}
 
         agents: list[dict[str, object]] = []
         unreachable: list[dict[str, str]] = []
-        for endpoint, sample in sorted(endpoints.items()):
+        for endpoint, endpoint_cells in sorted(endpoints.items()):
+            sample = endpoint_cells[0]
             try:
                 reported = await asyncio.to_thread(self._agent_factory(sample).build)
             except Exception as exc:
                 logger.warning("cell agent %s could not report its build: %s", endpoint, exc)
                 unreachable.append({"endpoint": endpoint, "detail": str(exc)})
                 continue
-            try:
-                workers = await asyncio.to_thread(self._agent_factory(sample).worker_builds, sample.id)
-            except Exception as exc:
-                # The agent answered about itself, so this is not an unreachable
-                # agent. Recorded against the cell instead, because "its workers
-                # could not be asked" is a smaller fact than "the agent is gone".
-                logger.info("cell %s could not report its worker builds: %s", sample.id, exc)
-                workers = None
-            agents.append(
-                {
-                    "endpoint": endpoint,
-                    "cell_id": sample.id,
-                    "pool_id": sample.pool_id,
-                    "build": None if reported is None else reported.model_dump(mode="json"),
-                    "workers": workers,
-                }
-            )
+            # Agent identity belongs to the endpoint; worker identity belongs to
+            # a cell. One shared agent can own cells running different wheels.
+            for cell in sorted(endpoint_cells, key=lambda item: item.id):
+                try:
+                    workers = await asyncio.to_thread(self._agent_factory(cell).worker_builds, cell.id)
+                except Exception as exc:
+                    # The agent answered about itself, so this is not an unreachable
+                    # agent. Recorded against the cell instead, because "its workers
+                    # could not be asked" is a smaller fact than "the agent is gone".
+                    logger.info("cell %s could not report its worker builds: %s", cell.id, exc)
+                    workers = None
+                agents.append(
+                    {
+                        "endpoint": endpoint,
+                        "cell_id": cell.id,
+                        "pool_id": cell.pool_id,
+                        "build": None if reported is None else reported.model_dump(mode="json"),
+                        "workers": workers,
+                    }
+                )
 
         plane = build_identity()
-        matches: list[bool | None] = []
+        # An unreadable known endpoint is an unknown comparison, not missing
+        # inventory. Proven skew still takes precedence over these unknowns.
+        matches: list[bool | None] = [None for _ in unreachable]
         for entry in agents:
             matches.append(plane.matches(entry["build"] or {}))
             workers = entry["workers"]

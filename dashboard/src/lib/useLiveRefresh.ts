@@ -61,7 +61,11 @@ export function useLiveRefresh({ subscribe, onChange, active = true }: LiveRefre
         savedOnChange.current();
       }, COALESCE_MS);
     };
-    void subscribe(schedule, controller.signal, setConnected);
+    void subscribe(schedule, controller.signal, (nextConnected) => {
+      // An aborted stream can finish reconnect backoff after its replacement
+      // connects. Only the current subscription may update the live indicator.
+      if (!controller.signal.aborted) setConnected(nextConnected);
+    });
     return () => {
       controller.abort();
       if (timer !== undefined) globalThis.clearTimeout(timer);

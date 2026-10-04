@@ -142,3 +142,10 @@ serviceMonitor:
   # installs an object whose kind does not exist fails the whole release.
   enabled: false
   interval: 30s
+  tls:
+    # Required only for an enabled monitor targeting the TLS listener. The CA
+    # Secret must be in the release namespace and contain public CA certificates,
+    # never a private key. serverName must match the serving certificate's SAN.
+    caSecretName: ""
+    caSecretKey: ""
+    serverName: ""

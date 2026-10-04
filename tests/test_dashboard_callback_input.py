@@ -9,7 +9,11 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from eyvan.config import EyvanSettings
-from eyvan.server.api.dashboard_sessions import DashboardSessionStore, register_dashboard_auth_routes
+from eyvan.server.api.dashboard_sessions import (
+    TRANSACTION_COOKIE,
+    DashboardSessionStore,
+    register_dashboard_auth_routes,
+)
 
 
 def test_non_ascii_callback_state_is_a_bad_request_not_a_server_error() -> None:
@@ -26,7 +30,7 @@ def test_non_ascii_callback_state_is_a_bad_request_not_a_server_error() -> None:
         store=store,
     )
     with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-        client.cookies.set("eyvan_oidc_tx", transaction)
+        client.cookies.set(TRANSACTION_COOKIE, transaction)
         response = client.get("/api/v1/dashboard/auth/callback", params={"code": "test", "state": "نامعتبر"})
     assert response.status_code == 400
     assert "mismatched" in response.json()["detail"]
@@ -50,7 +54,7 @@ def test_provider_error_callbacks_still_require_the_initiating_transaction() -> 
             "/api/v1/dashboard/auth/callback", params={"error": "access_denied", "state": state}, follow_redirects=False
         )
         assert forged.status_code == 400
-        client.cookies.set("eyvan_oidc_tx", transaction)
+        client.cookies.set(TRANSACTION_COOKIE, transaction)
         legitimate = client.get(
             "/api/v1/dashboard/auth/callback", params={"error": "access_denied", "state": state}, follow_redirects=False
         )
@@ -80,7 +84,7 @@ def test_provider_error_details_are_not_reflected_into_the_dashboard_url() -> No
             store=store,
         )
         with TestClient(app, base_url="https://plane.example.com") as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback",
                 params={**provider_error, "state": state},

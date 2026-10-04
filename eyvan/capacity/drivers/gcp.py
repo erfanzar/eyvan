@@ -69,19 +69,38 @@ from eyvan.records import CapacityClass, NativeContainerConfig, NativeRuntimeCon
 #: that document in this process -- the GCP umbrella builds a TPU and a Compute
 #: driver over the same one, and a cell is only ever the other's by mistake.
 _CELL_MUTATION_LOCKS: dict[tuple[str, str], RLock] = {}
+_CELL_MUTATION_LOCK_USERS: dict[tuple[str, str], int] = {}
 _CELL_MUTATION_LOCKS_GUARD = RLock()
 
 
-def _cell_mutation_lock(scope: str, cell_id: str) -> RLock:
+@contextmanager
+def _cell_mutation_lock(scope: str, cell_id: str) -> tp.Iterator[None]:
+    key = (scope, cell_id)
     with _CELL_MUTATION_LOCKS_GUARD:
-        return _CELL_MUTATION_LOCKS.setdefault((scope, cell_id), RLock())
+        lock = _CELL_MUTATION_LOCKS.setdefault(key, RLock())
+        # Register before waiting: a waiter already holds a reference to this
+        # lock and must exclude later operations, even across cell resurrection.
+        _CELL_MUTATION_LOCK_USERS[key] = _CELL_MUTATION_LOCK_USERS.get(key, 0) + 1
+    try:
+        with lock:
+            yield
+    finally:
+        with _CELL_MUTATION_LOCKS_GUARD:
+            remaining = _CELL_MUTATION_LOCK_USERS[key] - 1
+            if remaining:
+                _CELL_MUTATION_LOCK_USERS[key] = remaining
+            else:
+                _CELL_MUTATION_LOCK_USERS.pop(key)
+                _CELL_MUTATION_LOCKS.pop(key)
 
 
 def _forget_cell_mutation_lock(scope: str, cell_id: str) -> None:
-    """Drop a released cell's lock; cell ids are never reused, so it is never needed again."""
+    """Evict only an unused lock, never a holder or waiter's shared reference."""
 
     with _CELL_MUTATION_LOCKS_GUARD:
-        _CELL_MUTATION_LOCKS.pop((scope, cell_id), None)
+        key = (scope, cell_id)
+        if not _CELL_MUTATION_LOCK_USERS.get(key, 0):
+            _CELL_MUTATION_LOCKS.pop(key, None)
 
 
 #: Record metadata naming the process whose provider operation is in flight for
@@ -974,7 +993,7 @@ class GcpTpuCapacityDriver:
         if backend_value is not None and not isinstance(backend_value, str):
             raise ValueError("capacity field 'capacity_backend' must be a string when set")
         requested_backend = (backend_value or self.provider_name).strip().lower().replace("_", "-")
-        if requested_backend not in {"gcp", self.provider_name}:
+        if requested_backend not in {"gcp", self.provider_name, self.capacity_kind}:
             raise ValueError(f"{self.provider_name} driver cannot satisfy capacity backend {requested_backend!r}")
 
     def _normalize_desired(self, desired: tp.Mapping[str, JsonValue]) -> NormalizedCapacityRequest:
@@ -1344,7 +1363,7 @@ class GcpTpuCapacityDriver:
         with self._cell_mutation(cell_id):
             result = self._release_claimed(cell_id, context)
         if self.state.get(cell_id) is None:
-            # Tombstoned: the id is never minted again, so its lock never will be.
+            # A newer generation may already be acquiring the same cell lock.
             _forget_cell_mutation_lock(self.state.backend.mutation_scope, cell_id)
         return result
 
@@ -1611,19 +1630,27 @@ class GcpTpuCapacityDriver:
                     continue
                 if other.state in (CapacityStatus.DELETING, CapacityStatus.RELEASED):
                     continue
-                # Compute cells persist their options under ``compute_config``,
-                # TPU cells under ``tpu_config``; both carry ``network``.
-                config = other.metadata.get("compute_config")
-                if not isinstance(config, dict) or not isinstance(config.get("network"), str):
+                # Read the owning kind's config; legacy records may lack the
+                # kind marker. A normalized null network means the default VPC,
+                # not the absence of a remaining ingress user.
+                kind = other.metadata.get("capacity_kind")
+                if kind == "compute" or (kind is None and "compute_config" in other.metadata):
+                    config = other.metadata.get("compute_config")
+                elif kind is None or kind == "tpu":
                     config = other.metadata.get("tpu_config")
-                if not isinstance(config, dict) or not isinstance(config.get("network"), str):
-                    continue
+                else:
+                    return True
+                if not isinstance(config, dict):
+                    return True
+                configured_network = config.get("network")
+                if configured_network is not None and not isinstance(configured_network, str):
+                    return True
                 other_network = FirewallNetworkReference.from_config(
-                    capacity_project=other.project, network=config["network"]
+                    capacity_project=other.project, network=configured_network
                 )
                 if other_network.canonical_name == network.canonical_name:
                     return True
-        except (CapacityProviderError, ValueError):
+        except (CapacityProviderError, OSError, ValueError):
             # An unreadable sibling must not cause a deletion: treat it as a
             # remaining user and keep the rule.
             return True

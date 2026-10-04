@@ -71,14 +71,25 @@ export function ConfirmDialog({
     // on the destructive button. A dialog that opens with "drain" under the
     // return key turns a keystroke meant for the page behind it into a fleet
     // mutation.
-    globalThis.setTimeout(() => {
+    const focusTimer = globalThis.setTimeout(() => {
       const dialog = dialogRef.current;
       const field = dialog?.querySelector<HTMLInputElement>("input");
       (field ?? dialog?.querySelector<HTMLButtonElement>("button"))?.focus();
     }, 0);
 
+    return () => {
+      globalThis.clearTimeout(focusTimer);
+      document.body.classList.remove("modal-open");
+      previousFocus.current?.focus();
+    };
+  }, [confirmPhrase, open, title]);
+
+  // Keep event callbacks current without restarting the confirmation session
+  // when a parent refresh supplies a new callback closure.
+  useEffect(() => {
+    if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
+      if (event.key === "Escape" && !busy) onCancel();
       if (event.key !== "Tab" || !dialogRef.current) return;
       const focusable = Array.from(
         dialogRef.current.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled])"),
@@ -97,16 +108,20 @@ export function ConfirmDialog({
     globalThis.addEventListener("keydown", onKeyDown);
     return () => {
       globalThis.removeEventListener("keydown", onKeyDown);
-      document.body.classList.remove("modal-open");
-      previousFocus.current?.focus();
     };
-  }, [onCancel, open]);
+  }, [busy, onCancel, open]);
 
   if (!open) return null;
 
   return (
     <div className="modal-layer" role="presentation">
-      <button className="modal-scrim" type="button" onClick={onCancel} aria-label={`Close ${title} dialog`} />
+      <button
+        className="modal-scrim"
+        type="button"
+        onClick={onCancel}
+        disabled={busy}
+        aria-label={`Close ${title} dialog`}
+      />
       <div
         className="modal modal-narrow"
         role="dialog"

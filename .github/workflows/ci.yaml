@@ -251,7 +251,13 @@ jobs:
       # same hash-pinned tool a developer gets from `uv sync --extra dev`.
       - run: uv sync --extra dev
       - name: No new secrets against the baseline
-        run: uv run --no-sync python -m detect_secrets.pre_commit_hook --baseline .secrets.baseline
+        run: |
+          set -euo pipefail
+          # The hook does not discover files. NUL delimiters preserve every
+          # tracked filename; xargs propagates failures from any scan batch.
+          # Never transmit a candidate credential for online verification.
+          git ls-files -z | xargs -0 uv run --no-sync python -m detect_secrets.pre_commit_hook \
+            --baseline .secrets.baseline --no-verify --
 
   dashboard:
     name: Dashboard

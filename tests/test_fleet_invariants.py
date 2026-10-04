@@ -289,9 +289,15 @@ async def test_i5_catches_a_budget_that_disagrees_with_its_settled_leases() -> N
     """Double-charging and under-charging look identical from the budget alone."""
 
     settled = _lease(state=LeaseState.RELEASED).model_copy(
-        update={"settled_at": utcnow(), "settled_cost": 10.0, "settlement_reason": "completed"}
+        update={
+            "settled_at": utcnow(),
+            "settled_cost": 10.0,
+            "settlement_reason": "completed",
+            "settlement_budget_period_id": "budget-period-1",
+        }
     )
-    repository = await _fleet(_pool(), _cell(), _workload(state=WorkloadState.SUCCEEDED), settled, _budget(25.0))
+    budget = _budget(25.0).model_copy(update={"settlement_period_id": "budget-period-1", "period_opening_spent": 0.0})
+    repository = await _fleet(_pool(), _cell(), _workload(state=WorkloadState.SUCCEEDED), settled, budget)
 
     violations = await check_fleet(repository)
 
@@ -302,9 +308,17 @@ async def test_i5_tolerates_floating_point_accumulation() -> None:
     """An invariant that fires on the last bit fires constantly and says nothing."""
 
     settled = _lease(state=LeaseState.RELEASED).model_copy(
-        update={"settled_at": utcnow(), "settled_cost": 10.0, "settlement_reason": "completed"}
+        update={
+            "settled_at": utcnow(),
+            "settled_cost": 10.0,
+            "settlement_reason": "completed",
+            "settlement_budget_period_id": "budget-period-1",
+        }
     )
-    repository = await _fleet(_pool(), _cell(), _workload(state=WorkloadState.SUCCEEDED), settled, _budget(10.000000001))
+    budget = _budget(10.000000001).model_copy(
+        update={"settlement_period_id": "budget-period-1", "period_opening_spent": 0.0}
+    )
+    repository = await _fleet(_pool(), _cell(), _workload(state=WorkloadState.SUCCEEDED), settled, budget)
 
     assert await check_fleet(repository) == ()
 

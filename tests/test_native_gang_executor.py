@@ -300,6 +300,56 @@ def test_native_gang_retires_every_attempted_worker_with_its_cell_fence() -> Non
             client.close()
 
 
+def test_native_gang_checkpoint_cleanup_rolls_back_under_each_cell_fence() -> None:
+    calls: list[tuple[str, str, httpx.Request]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        calls.append((host, request.url.path, request))
+        if request.url.path.endswith("/checkpoint"):
+            if host == "10.12.0.20":
+                return httpx.Response(503, json={"detail": "worker unavailable"})
+            return httpx.Response(200, json={"remote_id": "ckpt-shared"})
+        assert request.url.path == "/api/v1/workloads/ckpt-shared/retire"
+        return httpx.Response(200, json={})
+
+    endpoints = (
+        "http://10.12.0.10:8100",
+        "http://10.12.0.11:8100",
+        "http://10.12.0.20:8100",
+        "http://10.12.0.21:8100",
+    )
+    clients = [_client(endpoint, handler) for endpoint in endpoints]
+    try:
+        executor = NativeGangExecutor(_members(), clients=clients)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            executor.checkpoint(
+                "gang-x",
+                hook="python hook.py",
+                output_uri=None,
+                context=_context(key="ckpt-shared", generation=7, token="fence-a"),
+            )
+
+        retires = [(host, request) for host, path, request in calls if path.endswith("/retire")]
+        retired_hosts = {host for host, _request in retires}
+        assert {"10.12.0.10", "10.12.0.11"} <= retired_hosts
+        for host, request in retires:
+            expected_token = "fence-a" if host.startswith("10.12.0.1") else "fence-b"
+            mutation = _payload(request)["mutation"]
+            # Each rank is retired under its own cell fence with a rollback key
+            # of its own -- the shared checkpoint key would collide with the
+            # checkpoint command's own claim on the worker.
+            assert (mutation["generation"], mutation["fencing_token"]) == (7, expected_token)
+            assert mutation["idempotency_key"].startswith("rollback:")
+            assert mutation["idempotency_key"].endswith(":ckpt-shared")
+        keys = [_payload(request)["mutation"]["idempotency_key"] for _host, request in retires]
+        assert len(set(keys)) == len(keys), "each rank's rollback carries its own key"
+    finally:
+        for client in clients:
+            client.close()
+
+
 def test_native_gang_surfaces_retire_failures_and_still_retires_remaining_ranks() -> None:
     retire_attempts: list[str] = []
 

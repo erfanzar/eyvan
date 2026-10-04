@@ -962,6 +962,20 @@ class _ControllerWorkloadCommands:
         workload: WorkloadRecord,
         lease_ids: tuple[str, ...],
     ) -> WorkloadDispatchReservation:
+        prior = workload.dispatch_reservation
+        if prior is not None:
+            if (
+                prior.outbox_id != command.id
+                or prior.generation != command.generation
+                or prior.workload_attempt != workload.attempt
+                or prior.lease_ids != lease_ids
+                or not _ControllerWorkloadCommands._same_dispatch_reservation(command, prior)
+            ):
+                raise StaleOutboxCommand("dispatch replay no longer owns its possibly-started reservation")
+            # The delivery claim may change, but an already-admitted execution
+            # still holds capabilities signed with this fence. A lost response
+            # cannot revoke them or erase the cancellation recovery guard.
+            return prior.model_copy(update={"outbox_attempt": command.attempts})
         return WorkloadDispatchReservation(
             fence=f"dispatch_{uuid.uuid4().hex}",
             outbox_id=command.id,
@@ -1049,8 +1063,9 @@ class _ControllerWorkloadCommands:
             if lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells:
                 raise RuntimeError(f"cell {cell.id!r} quarantine recovery was not proven before dispatch")
 
+            await self.service._require_no_asset_eviction(transaction, workload, cell)
             self._refuse_unreachable_callback(workload, cell)
-            reservation = self._new_dispatch_reservation(command, workload, (lease.id,))
+            reservation = self._new_dispatch_reservation(current_command, workload, (lease.id,))
             reserved = await self._persist_dispatch_reservation(
                 transaction,
                 command,
@@ -1139,6 +1154,8 @@ class _ControllerWorkloadCommands:
                 for lease, cell in zip(members, concrete_cells, strict=True)
             ):
                 raise RuntimeError("gang dispatch quarantine recovery was not proven for every member")
+            for cell in concrete_cells:
+                await self.service._require_no_asset_eviction(transaction, workload, cell)
             if workload.spec.required_executor != "eyvan-native":
                 raise RuntimeError("multi-cell pod groups currently require the eyvan-native executor")
             endpoints = {cell.endpoint for cell in concrete_cells}
@@ -1159,7 +1176,7 @@ class _ControllerWorkloadCommands:
             # refusal after the reservation would leave a dispatch marker for a
             # launch that never happened.
             await self._refuse_shared_gang_rendezvous(transaction, workload, coordinator_cell)
-            reservation = self._new_dispatch_reservation(command, workload, lease_ids)
+            reservation = self._new_dispatch_reservation(current_command, workload, lease_ids)
             reserved = await self._persist_dispatch_reservation(
                 transaction,
                 command,
@@ -1209,13 +1226,26 @@ class _ControllerWorkloadCommands:
             )
             return reserved, members, concrete_cells, coordinator_lease, coordinator_cell, request, reservation
 
+    @staticmethod
+    def _require_no_prior_dispatch_admission(command: OutboxRecord) -> None:
+        """A refusal of this delivery cannot disprove an earlier admission.
+
+        A reservation already present when this delivery was claimed means an
+        earlier submit may have started. Even a definitive pre-submit refusal
+        now says nothing about that execution; keep its ownership for replay.
+        """
+
+        if _DISPATCH_RESERVATION_KEY in command.payload:
+            raise RuntimeError("dispatch acceptance is still unknown; a replay refusal cannot release its reservation")
+
     async def _release_dispatch_reservation(
         self,
         command: OutboxRecord,
         reservation: WorkloadDispatchReservation,
     ) -> bool:
-        """Revoke one failed submit's capabilities while its exact fence is owned."""
+        """Revoke a proven unstarted submit while its exact fence is owned."""
 
+        self._require_no_prior_dispatch_admission(command)
         async with self.repository.transaction() as transaction:
             workload = await transaction.get_workload(command.aggregate_id)
             if (
@@ -1374,6 +1404,7 @@ class _ControllerWorkloadCommands:
         change.
         """
 
+        self._require_no_prior_dispatch_admission(command)
         workload_id = str(command.payload["workload_id"])
         async with self.repository.transaction() as transaction:
             workload = await transaction.get_workload(workload_id)
@@ -1382,13 +1413,17 @@ class _ControllerWorkloadCommands:
             raise StaleOutboxCommand("unlaunchable attempt references a missing workload or lease")
         if workload.generation != command.generation:
             raise StaleOutboxCommand(f"workload generation is {workload.generation}, command is {command.generation}")
-        await self._release_terminal(
-            workload,
-            lease,
-            WorkloadState.FAILED,
-            "workload.failed",
-            failure_reason=str(refusal),
-        )
+        try:
+            await self._release_terminal(
+                workload,
+                lease,
+                WorkloadState.FAILED,
+                "workload.failed",
+                failure_reason=str(refusal),
+                expected_dispatch_command=command,
+            )
+        except ConflictError as exc:
+            raise StaleOutboxCommand("unlaunchable attempt lost ownership of the dispatch") from exc
 
     async def _stale_build_report(
         self,
@@ -1489,6 +1524,7 @@ class _ControllerWorkloadCommands:
         no amount of retrying hides.
         """
 
+        self._require_no_prior_dispatch_admission(command)
         for cell in refusal.cells:
             try:
                 await self.drain_cell(
@@ -1547,12 +1583,14 @@ class _ControllerWorkloadCommands:
         try:
             remote = await asyncio.to_thread(self._agent_factory(cell).submit, cell.id, request)
         except CellAgentInvalidConfigurationError as exc:
-            await self._release_dispatch_reservation(command, reservation)
+            if not await self._release_dispatch_reservation(command, reservation):
+                raise StaleOutboxCommand("dispatch refusal lost ownership of the reservation") from exc
             await self._settle_unlaunchable_attempt(command, (lease_id,), _invalid_launch_refusal(exc))
             return
-        except Exception:
-            await self._release_dispatch_reservation(command, reservation)
-            raise
+        # Any other submit exception leaves admission unknown: the agent may
+        # have started the execution before its response was lost. Retain the
+        # reservation until idempotent replay recovers the remote id, so cancel
+        # cannot release a lease while that execution is still unaccounted for.
         await self._finalize_dispatch_response(command, reservation, remote.remote_id)
 
     async def _dispatch_workload_gang(self, command: OutboxRecord, lease_ids: tuple[str, ...]) -> None:
@@ -1582,12 +1620,14 @@ class _ControllerWorkloadCommands:
                 request,
             )
         except CellAgentInvalidConfigurationError as exc:
-            await self._release_dispatch_reservation(command, reservation)
+            if not await self._release_dispatch_reservation(command, reservation):
+                raise StaleOutboxCommand("dispatch refusal lost ownership of the reservation") from exc
             await self._settle_unlaunchable_attempt(command, lease_ids, _invalid_launch_refusal(exc))
             return
-        except Exception:
-            await self._release_dispatch_reservation(command, reservation)
-            raise
+        # Any other submit exception leaves admission unknown: the agent may
+        # have started the execution before its response was lost. Retain the
+        # reservation until idempotent replay recovers the remote id, so cancel
+        # cannot release a lease while that execution is still unaccounted for.
         await self._finalize_dispatch_response(command, reservation, remote.remote_id)
 
     @staticmethod

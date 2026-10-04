@@ -99,6 +99,7 @@ def _with_init_commands(config: EyvanFleetConfig, commands: tuple[str, ...]) -> 
             artifacts=runtime.artifacts,
             vm_image=runtime.vm_image,
             container=runtime.container,
+            python=runtime.python,
         )
         pools[name] = pool.model_copy(update={"runtime": updated_runtime})
     return config.model_copy(update={"pools": pools})
@@ -299,6 +300,22 @@ class FleetCommandService:
         self.loopback_control_plane(endpoint)
         self.session.refresh_loopback_identity()
 
+    def require_apply_endpoint(self, fleet: str) -> None:
+        """Refuse an implicit apply that would activate a different saved plane."""
+
+        if self.session.overrides.base_url is not None:
+            return
+        existing = self.session.context_config.contexts.get(fleet)
+        if existing is None:
+            return
+        saved = ControlPlaneEndpoint.parse(existing.base_url)
+        current = ControlPlaneEndpoint.parse(self.session.base_url)
+        if saved != current:
+            raise click.ClickException(
+                f"fleet {fleet!r} has a different saved control-plane endpoint; "
+                f"run `eyvan use {fleet}` or supply an explicit --url before applying"
+            )
+
     def apply(
         self,
         config: EyvanFleetConfig,
@@ -329,6 +346,7 @@ class FleetCommandService:
                     click.echo(line)
             return
 
+        self.require_apply_endpoint(config.name)
         applied = self.session.client.request(
             "PUT",
             f"/api/v1/fleets/{config.name}",
@@ -517,6 +535,8 @@ def up_fleet(
         config = _with_init_commands(config, init_commands)
     if preemptible:
         autoscale_commands.require_preemptible_tpus(config)
+    if not dry_run:
+        service.require_apply_endpoint(config.name)
     if not dry_run and ControlPlaneEndpoint.parse(session.base_url).is_loopback:
         try:
             service.ensure_local_runtime(config)
@@ -542,9 +562,9 @@ def up_fleet(
         as_json=as_json,
         idempotency_key=idempotency_key,
     )
-    if region is not None and not dry_run:
+    if region is not None and not dry_run and not as_json:
         click.echo()
-        _print_capacity(session, as_json=as_json)
+        _print_capacity(session, as_json=False)
         click.echo("\nServer is running. Submit with:")
         click.echo("  python launch.py  # or any @eyvan.execute(eyvan.TpuConfig(...)) callable")
         click.echo("  eyvan status <fleet>")

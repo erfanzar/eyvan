@@ -64,10 +64,14 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
     """
 
     payload = session.client.request("GET", "/api/v1/capacity/builds")
+    document = payload if isinstance(payload, dict) else {}
+    agreement = document.get("in_agreement")
     if as_json:
         click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        # Formatting must not turn skew or an unknown verdict into a passing gate.
+        if agreement is False or agreement is None:
+            raise click.exceptions.Exit(1)
         return
-    document = payload if isinstance(payload, dict) else {}
     plane = document.get("plane") or {}
     agents = document.get("agents") or []
     unreachable = document.get("unreachable") or []
@@ -129,7 +133,6 @@ def capacity_builds(session: CliSession, as_json: bool) -> None:
     for pool_id in unscanned if isinstance(unscanned, list) else []:
         click.echo(f"pool {pool_id} holds no cell, so its agent was not scanned", err=True)
 
-    agreement = document.get("in_agreement")
     if agreement is False:
         raise click.ClickException(
             "at least one cell agent is running different code than this control plane; "
@@ -162,15 +165,18 @@ def capacity_orphans(session: CliSession, as_json: bool) -> None:
     """
 
     payload = session.client.request("GET", "/api/v1/capacity/orphans")
-    if as_json:
-        click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
-        return
     document = (
         payload if isinstance(payload, dict) else {"orphans": payload or [], "scanned_endpoints": [], "unreachable": []}
     )
     orphans = document.get("orphans") or []
     scanned = document.get("scanned_endpoints") or []
     unreachable = document.get("unreachable") or []
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        # A partial or absent scan is unknown in either output format.
+        if unreachable or not scanned:
+            raise click.exceptions.Exit(1)
+        return
 
     for entry in orphans if isinstance(orphans, list) else []:
         if not isinstance(entry, dict):

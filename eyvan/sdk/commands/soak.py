@@ -1299,6 +1299,15 @@ def _finite_monotonic(monotonic: tp.Callable[[], float]) -> float:
     return float(value)
 
 
+def _utc_wall_datetime(now: tp.Callable[[], datetime]) -> datetime:
+    value = now()
+    if not isinstance(value, datetime):
+        raise ValueError("wall clock returned a non-datetime value")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def run_soak_for_duration(
     observe: tp.Callable[[], dict[str, object]],
     *,
@@ -1306,10 +1315,15 @@ def run_soak_for_duration(
     interval_s: object,
     sleep: tp.Callable[[float], None],
     monotonic: tp.Callable[[], float],
+    wall_clock: tp.Callable[[], datetime] | None = None,
     on_tick: tp.Callable[[int, SoakState], None] | None = None,
     state: SoakState | None = None,
 ) -> SoakState:
-    """Observe fixed decimal wall-clock slots and remain through the deadline."""
+    """Schedule monotonic slots, checking continuity against both clocks.
+
+    A forward wall-clock correction is conservatively an observation gap, not
+    proof of suspension. A backward correction cannot hide a monotonic gap.
+    """
 
     duration = _decimal_value(duration_s, name="duration_s", maximum=MAX_SOAK_DURATION_S)
     interval = _decimal_value(interval_s, name="interval_s", maximum=MAX_INTERVAL_S)
@@ -1334,7 +1348,22 @@ def run_soak_for_duration(
         raise ValueError("the monotonic deadline overflowed")
     slot = 0
     previous: float | None = None
+    previous_wall: datetime | None = None
+    wall_clock = wall_clock or (lambda: datetime.now(UTC))
     interval_float = _rational_to_finite_float(interval_numerator, interval_denominator, name="observation interval")
+
+    def record_boundary(now: float, wall: datetime) -> None:
+        nonlocal previous, previous_wall
+        # Some monotonic clocks exclude suspend. Fresh evidence after resume
+        # cannot prove continuity across the missing wall-clock interval.
+        if previous is not None and previous_wall is not None:
+            gap = max(now - previous, (wall - previous_wall).total_seconds())
+            if gap > interval_float * _OBSERVATION_GAP_TOLERANCE:
+                current.longest_observation_gap_s = max(current.longest_observation_gap_s, gap)
+                current.unobserved_s += gap - interval_float
+        previous = now
+        previous_wall = wall
+
     while slot < total_slots:
         scheduled = started + slot_offset(slot)
         now = _finite_monotonic(monotonic)
@@ -1352,17 +1381,7 @@ def run_soak_for_duration(
             else:
                 high = middle
         slot = max(slot, low - 1)
-        # Measured on the same clock the deadline uses, so it answers the
-        # question that clock cannot: a monotonic deadline is immune to NTP
-        # steps, and on macOS it also stops while the machine sleeps. A run that
-        # suspends still completes every slot, so without this the receipt would
-        # describe a full-length soak over hours it spent not watching.
-        if previous is not None:
-            gap = now - previous
-            if gap > interval_float * _OBSERVATION_GAP_TOLERANCE:
-                current.longest_observation_gap_s = max(current.longest_observation_gap_s, gap)
-                current.unobserved_s += gap - interval_float
-        previous = now
+        record_boundary(now, _utc_wall_datetime(wall_clock))
         try:
             current.observe(observe())
         except Exception as error:
@@ -1373,6 +1392,10 @@ def run_soak_for_duration(
     remaining = deadline - _finite_monotonic(monotonic)
     if remaining > 0:
         sleep(remaining)
+    # There may be no next poll to expose a slow last request/checkpoint or
+    # suspension during the final deadline wait. Apply the same tolerance to
+    # the entire terminal stretch, without counting earlier gaps twice.
+    record_boundary(_finite_monotonic(monotonic), _utc_wall_datetime(wall_clock))
     return current
 
 
@@ -1751,9 +1774,7 @@ def execute_soak(
     state = SoakState()
     closed_preflight = list(preflight_reason_codes)
     try:
-        started_at = wall_clock()
-        if not isinstance(started_at, datetime):
-            raise ValueError("wall clock returned a non-datetime value")
+        started_at = _utc_wall_datetime(wall_clock)
         started_monotonic = _finite_monotonic(monotonic)
     except Exception as error:
         category = _exception_category(error, filesystem=True)
@@ -1765,13 +1786,11 @@ def execute_soak(
 
     def receipt(status: str, *, codes: tp.Iterable[str] = ()) -> dict[str, object]:
         try:
-            ended = wall_clock()
-            if not isinstance(ended, datetime):
-                ended = started_at
+            ended = _utc_wall_datetime(wall_clock)
         except Exception:
             ended = started_at
         try:
-            elapsed = _finite_monotonic(monotonic) - started_monotonic
+            elapsed = max(_finite_monotonic(monotonic) - started_monotonic, (ended - started_at).total_seconds())
         except Exception:
             elapsed = float("nan")
         return build_soak_receipt(
@@ -1818,6 +1837,7 @@ def execute_soak(
                 interval_s=inputs.interval_decimal,
                 sleep=sleep,
                 monotonic=monotonic,
+                wall_clock=wall_clock,
                 on_tick=checkpoint,
                 state=state,
             )

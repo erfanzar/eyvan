@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import tempfile
 from pathlib import Path
 
 from eyvan._internal.workspace import create_private_directory
@@ -77,29 +78,34 @@ class LocalArtifactTokenKeyStore:
 
         key = secrets.token_bytes(32)
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-        except FileExistsError:
-            return self._load()
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         except OSError as exc:
             raise LocalProfileSecretError(f"could not create local artifact token key {self.path}: {exc}") from exc
+        temporary = Path(temporary_name)
         try:
-            offset = 0
-            while offset < len(key):
-                written = os.write(descriptor, key[offset:])
-                if written <= 0:
-                    raise LocalProfileSecretError(f"could not persist local artifact token key {self.path}")
-                offset += written
-            os.fsync(descriptor)
-        except OSError as exc:
-            raise LocalProfileSecretError(f"could not persist local artifact token key {self.path}: {exc}") from exc
+            try:
+                offset = 0
+                while offset < len(key):
+                    written = os.write(descriptor, key[offset:])
+                    if written <= 0:
+                        raise LocalProfileSecretError(f"could not persist local artifact token key {self.path}")
+                    offset += written
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise LocalProfileSecretError(f"could not persist local artifact token key {self.path}: {exc}") from exc
+            finally:
+                os.close(descriptor)
+            try:
+                # A hard link publishes complete bytes without replacing a concurrent winner.
+                os.link(temporary, self.path)
+            except FileExistsError:
+                return self._load()
+            except OSError as exc:
+                raise LocalProfileSecretError(f"could not create local artifact token key {self.path}: {exc}") from exc
+            self._fsync_parent()
+            return key
         finally:
-            os.close(descriptor)
-        self._fsync_parent()
-        return key
+            temporary.unlink(missing_ok=True)
 
     def _fsync_parent(self) -> None:
         """Persist the directory entry created for a new key file."""

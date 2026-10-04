@@ -27,6 +27,10 @@ from eyvan.server.api.schemas import ServiceEndpointRequest
         "http://169.254.169.254/latest/meta-data/",
         "http://[fe80::1]:8080",
         "http://[fd00::1]:8080",
+        "http://[::ffff:127.0.0.1]:8080",
+        "http://[::ffff:7f00:1]:8080",
+        "http://[::ffff:169.254.169.254]:8080",
+        "http://[::ffff:a9fe:a9fe]:8080",
     ],
 )
 def test_an_endpoint_that_resolves_into_the_plane_or_its_metadata_is_refused(endpoint: str) -> None:
@@ -51,6 +55,8 @@ def test_an_endpoint_without_an_http_target_is_refused(endpoint: str) -> None:
         "http://10.0.0.1:8080",
         "https://192.168.1.10:8443",
         "http://8.8.8.8",
+        "http://[::ffff:10.0.0.1]:8080",
+        "https://[::ffff:192.168.1.10]:8443",
     ],
 )
 def test_endpoints_on_site_local_or_public_space_are_accepted(endpoint: str) -> None:

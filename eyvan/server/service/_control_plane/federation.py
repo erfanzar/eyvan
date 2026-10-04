@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import math
+from decimal import Decimal, localcontext
+
 from eyvan.server.service._control_plane.shared import (
     BudgetGrantRecord,
     BudgetRecord,
@@ -17,21 +20,20 @@ from eyvan.server.service._control_plane.shared import (
     Principal,
     QuotaGrantRecord,
     ResourceLimits,
-    Role,
     _dump_limits,
     _fingerprint,
     _new_id,
     _scope,
     _validate_idempotency_key,
     datetime,
-    exceeds_quota_headroom,
     federated_spend,
-    issuable_amount,
     outstanding_total,
-    quota_headroom,
     resource_quantities,
     utcnow,
 )
+from eyvan.server.service.federation import _QUOTA_PRECISION, _issuable_amount_exact, _quota_headroom_exact, _sum_money
+from eyvan.server.service.scheduling import to_core_lease
+from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 
 class FederationMixin:
@@ -101,6 +103,8 @@ class FederationMixin:
         returned and is the one direction this number must never move on its own.
         """
 
+        if not math.isfinite(reported_spend):
+            raise InputError("reported grant spend must be finite")
         moment = now or utcnow()
         async with self.repository.transaction() as tx:
             grant = await tx.get_budget_grant(grant_id)
@@ -132,10 +136,11 @@ class FederationMixin:
         time, and the fleet-wide total is bounded because the slices were bounded
         when they were cut.
 
-        Re-issuing to a plane that already holds a grant *replaces* it rather than
-        adding to it, so a peer's authority is always one number an operator can
-        read. The replacement is measured against headroom excluding the old grant,
-        which is what makes raising a peer's slice possible at all.
+        Replacement retires the old new-admission authority, but keeps its full
+        monetary reservation and all reports. Neither retirement nor a report is
+        reliable proof of final consumption. Local active reservations and all
+        retained issued rights partition the same current-period limit under the
+        admission lock; no final-consumption/refund protocol is invented here.
 
         Raises:
             InputError: If the grant would exceed the tenant's remaining limit, or
@@ -147,6 +152,8 @@ class FederationMixin:
             raise InputError("this control plane has no plane_id, so it cannot issue budget grants")
         if grantee_plane_id == self.plane_id:
             raise InputError("a plane does not grant budget to itself; it holds the limit directly")
+        if not math.isfinite(amount):
+            raise InputError("budget grant amount must be finite")
         moment = now or utcnow()
         key = _validate_idempotency_key(idempotency_key)
         scope = _scope(org_id, project_id)
@@ -164,19 +171,33 @@ class FederationMixin:
             peer = await tx.get_plane_peer(grantee_plane_id)
             if peer is None or not peer.enabled:
                 raise NotFoundError(f"plane peer {grantee_plane_id!r} is not registered or is disabled")
+            rolled = self._rolled_budget(budget, moment)
+            if rolled != budget:
+                await tx.put_budget(rolled)
+            budget = rolled
             grants = await tx.list_budget_grants(org_id=org_id, project_id=project_id)
+            if any(grant.grantee_plane_id == self.plane_id for grant in grants):
+                # The local record is the peer's consumption ledger, not a new
+                # home limit. No multi-hop delegation/finality protocol exists.
+                raise InputError("an inbound budget scope cannot issue independent home authority")
+            grants = [grant for grant in grants if grant.home_plane_id == self.plane_id]
+            local_reserved = _sum_money(
+                lease.reserved_cost
+                for lease in await tx.list_leases()
+                if lease.org_id == org_id and lease.project_id == project_id and lease.state in ACTIVE_LEASE_STATES
+            )
             replacing = next(
                 (grant for grant in grants if grant.grantee_plane_id == grantee_plane_id and grant.active_at(moment)),
                 None,
             )
-            headroom = issuable_amount(
+            headroom = _issuable_amount_exact(
                 budget.limit,
                 grants,
                 now=moment,
                 local_spent=budget.spent,
-                replacing=None if replacing is None else replacing.id,
+                local_reserved=local_reserved,
             )
-            if amount > headroom:
+            if Decimal(str(amount)) > headroom:
                 raise InputError(
                     f"grant of {amount} exceeds the {headroom} remaining on {org_id}/{project_id}; "
                     f"the limit is {budget.limit}, {budget.spent} is spent here and the rest is granted away"
@@ -208,7 +229,7 @@ class FederationMixin:
                     "grantee_plane_id": grantee_plane_id,
                     "amount": amount,
                     "replaced": None if replacing is None else replacing.id,
-                    "remaining_headroom": headroom - amount,
+                    "remaining_headroom": float(headroom - Decimal(str(amount))),
                 },
             )
             return grant
@@ -224,9 +245,10 @@ class FederationMixin:
     ) -> list[BudgetGrantRecord]:
         """List the budget slices this plane has issued or been issued.
 
-        Narrowed exactly as ``list_role_grants`` is. A grant names a tenant and a
-        sum of money, so an unfiltered listing would be every tenant's budget
-        posture readable by anyone with a token.
+        Fleet administrators see all scopes, organization administrators see
+        their organizations, and project administrators see only their projects.
+        A grant names a tenant and a sum of money, so an unfiltered listing would
+        be every tenant's budget posture readable by anyone with a token.
 
         Expired grants are excluded by default and not deleted: the sweep marks
         them EXPIRED and the record stays, because "this peer used to hold
@@ -241,12 +263,13 @@ class FederationMixin:
             grants = [grant for grant in grants if grant.active_at(moment)]
         if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
             return list(grants)
-        visible = {
-            grant.org_id
-            for grant in principal.grants
-            if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
-        }
-        return [grant for grant in grants if grant.org_id in visible]
+        return [
+            grant
+            for grant in grants
+            if self.authorizer.allows(
+                principal, Permission.MANAGE_PROJECT, org_id=grant.org_id, project_id=grant.project_id
+            )
+        ]
 
     async def revoke_budget_grant(self, principal: Principal, *, grant_id: str) -> BudgetGrantRecord:
         """Withdraw a peer's authority to spend.
@@ -300,6 +323,8 @@ class FederationMixin:
             if budget is None:
                 raise NotFoundError(f"budget for {org_id}/{project_id} was not found")
             grants = await tx.list_budget_grants(org_id=org_id, project_id=project_id)
+        budget = self._rolled_budget(budget, moment)
+        grants = [grant for grant in grants if not self.plane_id or grant.home_plane_id == self.plane_id]
         active = [grant for grant in grants if grant.active_at(moment)]
         return FederatedBudgetStatus(
             org_id=org_id,
@@ -308,8 +333,8 @@ class FederationMixin:
             limit=budget.limit,
             local_spent=budget.spent,
             granted_away=outstanding_total(grants, now=moment),
-            reported_peer_spend=federated_spend(0.0, active),
-            total_spent=federated_spend(budget.spent, active),
+            reported_peer_spend=federated_spend(0.0, grants),
+            total_spent=federated_spend(budget.spent, grants),
             active_grants=len(active),
             stale_reports=sum(1 for grant in active if grant.reported_at is None),
         )
@@ -366,14 +391,41 @@ class FederationMixin:
             if peer is None or not peer.enabled:
                 raise NotFoundError(f"plane peer {grantee_plane_id!r} is not registered or is disabled")
             grants = await tx.list_quota_grants(org_id=org_id, project_id=project_id)
+            if any(grant.grantee_plane_id == self.plane_id for grant in grants):
+                raise InputError("an inbound quota scope cannot issue independent home authority")
+            grants = [grant for grant in grants if grant.home_plane_id == self.plane_id]
             replacing = next(
                 (grant for grant in grants if grant.grantee_plane_id == grantee_plane_id and grant.active_at(moment)),
                 None,
             )
-            headroom = quota_headroom(
-                quota.limits, grants, now=moment, replacing=None if replacing is None else replacing.id
+            local_usage: dict[str, Decimal] = {}
+            # Use the scheduler's canonical worker/elastic scaling, rather than
+            # counting raw per-worker gangs as if they occupied only one worker.
+            # Keep both scaling and accumulation exact through the admission
+            # decision: float subtraction can erase a tiny active reservation.
+            with localcontext(prec=_QUOTA_PRECISION):
+                for lease in await tx.list_leases():
+                    if (
+                        lease.org_id != org_id
+                        or lease.project_id != project_id
+                        or lease.state not in ACTIVE_LEASE_STATES
+                    ):
+                        continue
+                    workload = await tx.get_workload(lease.workload_id)
+                    cell = await tx.get_cell(lease.cell_id)
+                    if workload is None or cell is None:
+                        raise InputError("active quota reservation lacks its workload or cell accounting")
+                    usage = to_core_lease(lease, workload, landed_worker_count=cell.worker_count).resources
+                    for name, quantity in usage.items():
+                        local_usage[name] = local_usage.get(name, Decimal(0)) + quantity
+            headroom = _quota_headroom_exact(quota.limits, grants, now=moment, local_usage=local_usage)
+            overrun = tuple(
+                sorted(
+                    name
+                    for name, quantity in resource_quantities(limits).items()
+                    if Decimal(str(quantity)) > headroom.get(name, Decimal(0))
+                )
             )
-            overrun = exceeds_quota_headroom(limits, headroom)
             if overrun:
                 detail = ", ".join(
                     f"{name} {resource_quantities(limits)[name]} > {headroom.get(name, 0.0)}" for name in overrun
@@ -427,12 +479,13 @@ class FederationMixin:
             grants = [grant for grant in grants if grant.active_at(moment)]
         if self.authorizer.allows(principal, Permission.MANAGE_FLEET):
             return list(grants)
-        visible = {
-            grant.org_id
-            for grant in principal.grants
-            if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
-        }
-        return [grant for grant in grants if grant.org_id in visible]
+        return [
+            grant
+            for grant in grants
+            if self.authorizer.allows(
+                principal, Permission.MANAGE_PROJECT, org_id=grant.org_id, project_id=grant.project_id
+            )
+        ]
 
     async def revoke_quota_grant(self, principal: Principal, *, grant_id: str) -> QuotaGrantRecord:
         """Withdraw a peer's authority to place work against this tenant's quota.

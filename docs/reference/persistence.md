@@ -78,11 +78,37 @@ backend that can safely serve the arbitrary read-only query surface.
 
 ## Transactions and concurrency
 
-The in-memory/local implementation takes an async process lock, deep-copies the
-current state, yields the mutable transaction view, and publishes a changed
-snapshot only after `_persist` succeeds.  A changed snapshot increments its
-revision; audit-event waiters are notified only after commit.  An exception from
-the caller aborts the transaction and leaves the prior snapshot visible.
+The in-memory/local implementation takes an async process lock and makes a
+structural copy of the state's containers, including nested containers; record
+models themselves are shared with committed state.  It yields the transaction
+view and publishes a changed snapshot only after `_persist` succeeds.  A changed
+snapshot increments its revision; audit-event waiters are notified only after
+commit.
+
+Treat every fetched record and all of its nested values as read-only.  Frozen
+model attributes do not freeze dictionaries such as `labels`, `metadata`,
+`spec.environment`, or outbox payloads.  Mutating them in place changes the
+shared committed record, escapes rollback, and can evade change detection.
+Instead, construct new nested values and replace the record with
+`model_copy(update=...)` and the session's matching `put_*` method.  For example,
+inside a transaction with an existing `cell-1`:
+
+```python
+cell = await transaction.get_cell("cell-1")
+assert cell is not None
+labels = {**cell.labels, "phase": "updated"}
+updated = cell.model_copy(update={"labels": labels})
+await transaction.put_cell(updated)
+```
+
+For nested models, replace the changed nested model as well as its parent; do
+not mutate a mapping that the replacement still shares with the original.
+Provided callers follow this replacement-only contract, an exception from the
+caller aborts the transaction and leaves the prior snapshot unchanged.
+`StateRepository.verify_record_immutability` is a test-only diagnostic guard,
+disabled in production: it detects in-place edits before persistence or adds a
+diagnostic note to a caller exception, but does not restore already mutated
+shared records or provide production isolation.
 
 PostgreSQL commits one service operation in one database transaction.  Row reads
 used for read/modify/write are acquired with `FOR UPDATE`; uniqueness and

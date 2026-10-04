@@ -31,14 +31,20 @@ states and must not be read as provider claims:
 The plane is the authority for placement, leasing, and reap. Agents own
 machines and execute what the plane leases to them. Your callable runs on
 worker hosts under the native runtime — it is workload code, not trusted
-code, and the security posture is: signed, digest-verified inputs; least
-privilege on the worker; no plane credentials in the workload environment.
+code. Standalone callable execution requires explicitly trusted projects
+and digest-verified unsigned inputs; least privilege on the worker; no plane
+credentials in the workload environment. Digests do not authenticate a submitter
+or make an untrusted pickle safe.
 
 ## Who a request is
 
-- **SDK → plane:** your submission is a callable artifact (signed with the
-  submitter's key context) plus a workload record. The plane verifies and
-  stores the artifact by content digest before anything is scheduled.
+- **SDK → plane:** standalone submissions contain an unsigned callable artifact
+  plus a workload record. The standalone SDK/API rejects caller signing keys
+  and artifact signatures, including on loopback planes. Artifact integrity is
+  verified by content digest; admission requires an explicitly trusted project.
+  Optional low-level HMAC/custom-submitter helpers do not establish controller
+  key distribution or end-to-end standalone signature authentication: the
+  standalone controller does not distribute a producer/verifier key.
 - **Plane → agent:** bearer authentication with
   `EYVAN_AGENT_SHARED_SECRET`. A mismatch does not fail closed silently —
   it 401-loops visibly in both logs (receipt: 2026-08-29, a bare
@@ -67,10 +73,13 @@ or the repository. The full surface is tabulated in
 
 A callable may: use its leased hardware, read its inputs from the artifact
 store by digest, and write its result manifest. It may not: name other
-tenants' artifacts, hold plane credentials, or outlive its lease silently —
-cells are reaped on the fleet's idle timeout regardless of what the workload
-believes. Destructive artifact collection is disabled unless explicitly
-enabled (see [artifact-safety](artifact-safety.md)).
+tenants' artifacts or hold plane credentials. The fleet's idle timeout
+governs eligible unleased surplus capacity, subject to demand, protection,
+and minimum-capacity policy; it is not a workload runtime or cost deadline.
+Active lease expiry/quarantine and fenced retirement are separate lifecycle
+controls. Use explicit workload cancellation to request termination; an idle
+capacity timer does not cancel a valid leased workload. Destructive artifact
+collection is disabled unless explicitly enabled (see [artifact-safety](artifact-safety.md)).
 
 ## Exposure
 
@@ -134,13 +143,17 @@ renderer retains its previous output exactly; networking defaults are unchanged.
 The dashboard never holds an OIDC token. Sign-in is a backend-for-frontend
 flow (`eyvan/server/api/dashboard_sessions.py`): the server mints the PKCE
 challenge and state, exchanges the authorization code at the identity
-provider, and opens an in-process session. The browser holds one
-`eyvan_session` cookie — HttpOnly, Secure, SameSite=Lax — and the tokens stay
-server-side, so a cross-site script in the dashboard page has no credential to
-steal. The API authenticates the cookie by verifying the stored access token
-exactly as it would a presented bearer; a presented bearer still wins, so SDK
-clients are unaffected. The one credential that still lives in the tab is the
-loopback development credential, whose model is this-machine-only by design.
+provider, and opens an in-process session. The browser holds a
+`__Host-eyvan_session` cookie — HttpOnly, Secure, SameSite=Lax — and a temporary
+`__Host-eyvan_oidc_tx` cookie binds the login transaction. Both use `Path=/` and
+no `Domain`; the `__Host-` prefix prevents a sibling subdomain from planting a
+parent-domain authentication cookie. The legacy unprefixed cookies are not accepted;
+existing browsers must sign in again. OIDC tokens stay server-side, and these
+cookies are inaccessible to JavaScript. The API authenticates the session cookie
+by verifying the stored access token exactly as it would a presented bearer;
+a presented bearer still wins, so SDK clients are unaffected. The one credential
+that still lives in the tab is the loopback development credential, whose model
+is this-machine-only by design.
 
 Before creating a session, the callback binds the ID token's issuer, audience,
 authorized party, subject, nonce and expiry to the configured provider/client
@@ -166,6 +179,15 @@ refused for these writes. Server-side session lifetime is bounded by the
 configured session TTL and any shorter provider lifetime, independently of
 browser cookie expiry. The unconditional `Secure` flag means a plane serving
 plain HTTP over a network cannot hold OIDC sessions at all.
+
+For TLS termination at a reverse proxy, the browser must still use HTTPS.
+Set `EYVAN_PUBLIC_URL` to that browser-facing HTTPS URL: the callback URI and
+cookie-write Origin checks use this configuration, not Host or forwarded headers.
+The proxy must preserve the browser's Origin and cookies and route authentication
+and API paths to the same session-owning process. Proxy headers do not establish
+a different trusted public origin. If the proxy-to-API listener is network-bound
+plaintext, the separate explicit acknowledgement described under Exposure is
+still required; external HTTPS does not waive the listener's startup refusal.
 
 The dashboard's HTML is served with a strict Content-Security-Policy
 (`script-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`, and

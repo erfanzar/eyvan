@@ -603,6 +603,15 @@ def test_submit_holds_state_lease_through_execution_side_effect(tmp_path) -> Non
             submitted.append("new")
             return str(spec["submission_id"])
 
+        def status(self, remote_id):
+            from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+
+            return {
+                "remote_id": remote_id,
+                "status": ExecutionWorkloadStatus.STOPPED,
+                "message": "double",
+            }
+
         def retire(self, remote_id, context):
             assert new_state.lease_holder() == "new-agent"
             assert remote_id == "workload-1-a1"
@@ -687,6 +696,15 @@ def test_one_agent_serializes_concurrent_workload_generations(tmp_path) -> None:
                 assert release_first.wait(timeout=2)
             events.append(f"submit-{context.generation}")
             return str(spec["submission_id"])
+
+        def status(self, remote_id):
+            from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+
+            return {
+                "remote_id": remote_id,
+                "status": ExecutionWorkloadStatus.STOPPED,
+                "message": "double",
+            }
 
         def retire(self, remote_id, context):
             events.append(f"retire-{remote_id}-g{context.generation}")

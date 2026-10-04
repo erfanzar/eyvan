@@ -74,8 +74,12 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def write_receipt_atomic(path: Path | str, receipt: tp.Mapping[str, object]) -> None:
-    """Fsync and atomically replace ``path`` with one finite JSON receipt.
+def write_receipt_atomic(path: Path | str, receipt: tp.Mapping[str, object], *, replace_existing: bool = True) -> None:
+    """Fsync and atomically publish one finite JSON receipt.
+
+    Mutable soak checkpoints retain replacement by default. Immutable proof
+    receipts set ``replace_existing=False``: a same-directory hard link publishes
+    the complete file only if the target is absent, including at publication time.
 
     ``allow_nan=False`` is load-bearing: a NaN would serialize as a bare token
     that is not JSON, and every reader of the evidence would fail on the one run
@@ -92,7 +96,10 @@ def write_receipt_atomic(path: Path | str, receipt: tp.Mapping[str, object]) -> 
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        if replace_existing:
+            os.replace(temporary, target)
+        else:
+            os.link(temporary, target)
         try:
             directory = os.open(parent, os.O_RDONLY)
             try:

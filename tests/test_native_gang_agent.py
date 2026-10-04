@@ -31,6 +31,8 @@ from eyvan.worker.agent.models import (
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationModel,
+    WorkloadMutationRequest,
+    WorkloadObservation,
     WorkloadRequest,
 )
 from eyvan.worker.agent.service import CellAgentService, InvalidWorkloadRequestError
@@ -68,6 +70,7 @@ class GangCapacity:
 class GangExecutor:
     def __init__(self, calls: list[tuple[str, GangCallValue]]):
         self.calls = calls
+        self.retired: set[str] = set()
 
     def submit(self, spec: tp.Mapping[str, JsonValue]) -> str:
         self.calls.append(("submit", dict(spec)))
@@ -77,10 +80,11 @@ class GangExecutor:
 
     def status(self, remote_id: str) -> NativeGangWorkloadResult:
         self.calls.append(("status", remote_id))
+        status = ExecutionWorkloadStatus.STOPPED if remote_id in self.retired else ExecutionWorkloadStatus.RUNNING
         return {
             "remote_id": remote_id,
-            "status": ExecutionWorkloadStatus.RUNNING,
-            "message": "all ranks running",
+            "status": status,
+            "message": "all ranks running" if status is ExecutionWorkloadStatus.RUNNING else "ranks retired",
             "workers": [],
         }
 
@@ -101,6 +105,7 @@ class GangExecutor:
 
     def retire(self, remote_id: str) -> None:
         self.calls.append(("retire", remote_id))
+        self.retired.add(remote_id)
 
     def logs(self, remote_id: str) -> str:
         self.calls.append(("logs", remote_id))
@@ -246,6 +251,7 @@ def test_native_gang_agent_api_submits_observes_stops_retires_and_logs(tmp_path)
         "stop",
         "close",
         "retire",
+        "status",
         "close",
         "logs",
         "close",
@@ -480,3 +486,343 @@ def test_cell_agent_client_uses_group_routes() -> None:
         "/api/v1/cells/cell-a/workload-gangs/workload-1/workload-1-a7/stop",
         "/api/v1/cells/cell-a/workload-gangs/workload-1/workload-1-a7/retire",
     ]
+
+
+class StuckRankGangExecutor(GangExecutor):
+    """A rank that keeps reporting RUNNING even after retire was accepted."""
+
+    def retire(self, remote_id: str) -> None:
+        self.calls.append(("retire", remote_id))
+
+
+class _StaticGangResolver:
+    def __init__(self, executor: GangExecutor) -> None:
+        self.executor = executor
+
+    def resolve_gang(self, cells: tp.Sequence[NativeGangCell]) -> GangExecutor:
+        return self.executor
+
+
+class SingleCellDriver:
+    """Minimal execution-driver double for single-cell service tests."""
+
+    def __init__(self, calls: list[tuple[str, tp.Any]]) -> None:
+        self.calls = calls
+        self.submit_called = False
+
+    def submit(self, spec: tp.Mapping[str, JsonValue], context: MutationContext) -> str:
+        self.calls.append(("submit", context.idempotency_key))
+        self.submit_called = True
+        submission_id = spec.get("submission_id")
+        assert isinstance(submission_id, str) and submission_id.strip()
+        return submission_id.strip()
+
+    def status(self, remote_id: str) -> dict[str, tp.Any]:
+        self.calls.append(("status", remote_id))
+        return {"remote_id": remote_id, "status": ExecutionWorkloadStatus.RUNNING, "message": "double"}
+
+    def retire(self, remote_id: str, context: MutationContext) -> None:
+        self.calls.append(("retire", context.idempotency_key))
+
+
+class SingleCellResolver:
+    def __init__(self, driver: SingleCellDriver) -> None:
+        self.driver = driver
+
+    def resolve(self, _cell_id: str, _observation: tp.Any) -> SingleCellDriver:
+        return self.driver
+
+
+def _single_cell_service(tmp_path, driver: SingleCellDriver) -> CellAgentService:
+    return CellAgentService(
+        capacity=GangCapacity(),  # type: ignore[arg-type]
+        state=FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        executors=SingleCellResolver(driver),  # type: ignore[arg-type]
+    )
+
+
+def test_retire_reports_the_status_the_cell_actually_reaches(tmp_path) -> None:
+    calls: list[tuple[str, tp.Any]] = []
+    service = _single_cell_service(tmp_path, SingleCellDriver(calls))
+    request = WorkloadMutationRequest(
+        mutation=MutationModel(idempotency_key="retire-1", generation=3, fencing_token="fence-3")
+    )
+
+    observation = service.retire("cell-a", "pred-1", request)
+
+    assert observation.status is ExecutionWorkloadStatus.RUNNING
+    assert ("status", "pred-1") in calls
+
+
+def test_retire_gang_reports_the_status_the_ranks_actually_reach(tmp_path) -> None:
+    calls: list[tuple[str, GangCallValue]] = []
+    service = CellAgentService(
+        capacity=GangCapacity(),  # type: ignore[arg-type]
+        state=FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        executors=_StaticGangResolver(StuckRankGangExecutor(calls)),  # type: ignore[arg-type]
+    )
+    service.submit_gang("cell-a", _request())
+    action = GangWorkloadMutationRequest(
+        members=(
+            _member("cell-a", key="retire-a", token="fence-a"),
+            _member("cell-b", key="retire-b", token="fence-b"),
+        )
+    )
+
+    observation = service.retire_gang("cell-a", "workload-1", "workload-1-a7", action)
+
+    assert observation.status is ExecutionWorkloadStatus.RUNNING
+
+
+def test_remote_predecessor_retirement_refuses_a_rank_that_is_still_running(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eyvan.worker.agent import client as agent_client_module
+
+    class _Client:
+        def __init__(self, _endpoint: str, *, token: str | None = None) -> None:
+            pass
+
+        def retire(self, cell_id: str, remote_id: str, request: WorkloadMutationRequest) -> WorkloadObservation:
+            return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.RUNNING)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(agent_client_module, "CellAgentClient", _Client)
+    service, _state, _resolver = _service(tmp_path)
+    request = WorkloadMutationRequest(
+        mutation=MutationModel(idempotency_key="supersede-1", generation=2, fencing_token="fence-2")
+    )
+
+    with pytest.raises(RuntimeError, match="still reports"):
+        service._retire_on_source_agent("cell-a", "pred-1", request)
+
+
+def test_local_predecessor_retirement_refuses_a_rank_that_is_still_running(tmp_path) -> None:
+    calls: list[tuple[str, tp.Any]] = []
+    service = _single_cell_service(tmp_path, SingleCellDriver(calls))
+    context = MutationContext(idempotency_key="submit-new", generation=2, fencing_token="fence-2")
+    predecessor = {"cell_id": "cell-a", "remote_id": "pred-1", "generation": 1, "fencing_token": "fence-1"}
+
+    with pytest.raises(RuntimeError, match="still reports"):
+        service._retire_predecessor("workload-1", "cell-a", context, predecessor)
+
+    assert ("retire", "supersede:workload-1:2") in calls
+
+
+def test_submit_retires_a_launched_execution_when_a_later_step_fails(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, tp.Any]] = []
+    driver = SingleCellDriver(calls)
+    service = _single_cell_service(tmp_path, driver)
+    state = service.state
+    original_require_lease = state.require_lease
+
+    def explode_after_launch() -> None:
+        if driver.submit_called:
+            raise RuntimeError("lease check exploded after launch")
+        original_require_lease()
+
+    monkeypatch.setattr(state, "require_lease", explode_after_launch)
+    request = WorkloadRequest(
+        mutation=MutationModel(idempotency_key="submit-new", generation=3, fencing_token="fence-3"),
+        spec={
+            "submission_id": "wl-1",
+            "metadata": {"eyvan_workload_id": "workload-1"},
+            "environment": {},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="exploded"):
+        service.submit("cell-a", request)
+
+    rollback_retires = [
+        key for name, key in calls if name == "retire" and isinstance(key, str) and key.startswith("rollback:")
+    ]
+    assert rollback_retires, "a launched execution must be retired when a later submit step fails"
+
+
+class RetirementEvidenceDriver(SingleCellDriver):
+    """Keep execution state separate from a retirement's potentially unknown read-back."""
+
+    def __init__(self, retirement_status: ExecutionWorkloadStatus) -> None:
+        super().__init__([])
+        self.retirement_status = retirement_status
+        self.launches: list[str] = []
+        self.live: set[str] = set()
+        self.retirement_requested: set[str] = set()
+
+    def submit(self, spec: tp.Mapping[str, JsonValue], context: MutationContext) -> str:
+        remote_id = super().submit(spec, context)
+        self.launches.append(remote_id)
+        self.live.add(remote_id)
+        return remote_id
+
+    def retire(self, remote_id: str, context: MutationContext) -> None:
+        self.retirement_requested.add(remote_id)
+        if self.retirement_status in {
+            ExecutionWorkloadStatus.SUCCEEDED,
+            ExecutionWorkloadStatus.FAILED,
+            ExecutionWorkloadStatus.STOPPED,
+            ExecutionWorkloadStatus.LOST,
+            ExecutionWorkloadStatus.NOT_FOUND,
+        }:
+            self.live.discard(remote_id)
+
+    def status(self, remote_id: str) -> dict[str, tp.Any]:
+        status = self.retirement_status if remote_id in self.retirement_requested else ExecutionWorkloadStatus.RUNNING
+        return {"remote_id": remote_id, "status": status, "message": "retirement read-back"}
+
+
+def _retirement_request(generation: int) -> WorkloadRequest:
+    return WorkloadRequest(
+        mutation=MutationModel(
+            idempotency_key=f"submit-{generation}", generation=generation, fencing_token=f"fence-{generation}"
+        ),
+        spec={
+            "submission_id": f"workload-1-a{generation}",
+            "metadata": {"eyvan_workload_id": "workload-1"},
+            "environment": {},
+        },
+    )
+
+
+def _retirement_services(tmp_path, monkeypatch, *, remote: bool, status: ExecutionWorkloadStatus):
+    """Route remote retirement through the real source-agent API and typed client."""
+
+    from eyvan.worker.agent import client as agent_client_module
+
+    source_driver = RetirementEvidenceDriver(status)
+    source = _single_cell_service(tmp_path, source_driver)
+    source.submit("cell-a", _retirement_request(1))
+    if not remote:
+        return source, source_driver, source_driver, "cell-a"
+
+    target_driver = RetirementEvidenceDriver(ExecutionWorkloadStatus.STOPPED)
+    target = _single_cell_service(tmp_path, target_driver)
+    source_app = create_agent_app(source, EyvanSettings(agent_shared_secret="agent-secret"))
+    original_client = CellAgentClient
+
+    def source_client(endpoint: str, *, token: str | None = None) -> CellAgentClient:
+        transport_client = TestClient(source_app, headers={"Authorization": "Bearer agent-secret"})
+        return original_client(endpoint, client=transport_client)
+
+    monkeypatch.setattr(agent_client_module, "CellAgentClient", source_client)
+    return target, source_driver, target_driver, "cell-b"
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "source-agent"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        ExecutionWorkloadStatus.INDETERMINATE,
+        ExecutionWorkloadStatus.PENDING,
+        ExecutionWorkloadStatus.SUBMITTED,
+        ExecutionWorkloadStatus.RUNNING,
+        ExecutionWorkloadStatus.CHECKPOINTING,
+        ExecutionWorkloadStatus.STOPPING,
+    ],
+)
+def test_successor_refuses_nonterminal_retirement_and_retains_predecessor(tmp_path, monkeypatch, remote, status) -> None:
+    service, source_driver, target_driver, cell_id = _retirement_services(
+        tmp_path, monkeypatch, remote=remote, status=status
+    )
+    errors: list[RuntimeError] = []
+    for _ in range(2):
+        try:
+            service.submit(cell_id, _retirement_request(2))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    assert source_driver.live == {"workload-1-a1"}, "an unknown read-back does not prove the predecessor stopped"
+    assert target_driver.launches == ([] if remote else ["workload-1-a1"]), "no successor or duplicate may launch"
+    persisted = FleetStateStore(LocalBackend(tmp_path / "fleet.json")).workload_fence("workload-1")
+    assert persisted is not None
+    assert persisted.get("predecessors") == [
+        {"cell_id": "cell-a", "remote_id": "workload-1-a1", "generation": 1, "fencing_token": "fence-1"}
+    ]
+    assert len(errors) == 2
+    assert all("still reports" in str(error) and status.value in str(error) for error in errors)
+
+    # Retrying the same successor may proceed only once quiescence can be observed.
+    source_driver.retirement_status = ExecutionWorkloadStatus.STOPPED
+    result = service.submit(cell_id, _retirement_request(2))
+    assert result.remote_id == "workload-1-a2"
+    assert target_driver.live == {"workload-1-a2"}
+    assert target_driver.launches == (["workload-1-a2"] if remote else ["workload-1-a1", "workload-1-a2"])
+    persisted = FleetStateStore(LocalBackend(tmp_path / "fleet.json")).workload_fence("workload-1")
+    assert persisted is not None and "predecessors" not in persisted
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "source-agent"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        ExecutionWorkloadStatus.SUCCEEDED,
+        ExecutionWorkloadStatus.FAILED,
+        ExecutionWorkloadStatus.STOPPED,
+        ExecutionWorkloadStatus.LOST,
+        ExecutionWorkloadStatus.NOT_FOUND,
+    ],
+)
+def test_successor_accepts_terminal_or_absent_retirement(tmp_path, monkeypatch, remote, status) -> None:
+    service, source_driver, target_driver, cell_id = _retirement_services(
+        tmp_path, monkeypatch, remote=remote, status=status
+    )
+
+    result = service.submit(cell_id, _retirement_request(2))
+
+    assert result.remote_id == "workload-1-a2"
+    assert result.status is ExecutionWorkloadStatus.SUBMITTED
+    assert "workload-1-a1" not in source_driver.live
+    assert target_driver.live == {"workload-1-a2"}
+    assert target_driver.launches == (["workload-1-a2"] if remote else ["workload-1-a1", "workload-1-a2"])
+    persisted = FleetStateStore(LocalBackend(tmp_path / "fleet.json")).workload_fence("workload-1")
+    assert persisted is not None and "predecessors" not in persisted
+
+
+@pytest.mark.parametrize(
+    "capacity_status",
+    [
+        CapacityStatus.ABSENT,
+        CapacityStatus.RELEASED,
+        CapacityStatus.NEEDS_RECREATE,
+        CapacityStatus.HALTED_BUDGET,
+        CapacityStatus.HALTED_QUOTA,
+        CapacityStatus.UNOBSERVED,
+        CapacityStatus.UNAVAILABLE,
+        CapacityStatus.PROVIDER_ERROR,
+        CapacityStatus.HEALTHY,
+    ],
+)
+def test_successor_without_source_endpoint_requires_definitive_capacity_loss(tmp_path, capacity_status) -> None:
+    class SourceCapacity(GangCapacity):
+        def observe(self, cell_id: str):
+            if cell_id == "cell-a":
+                return CellObservation(cell_id=cell_id, state=capacity_status, generation=1)
+            return super().observe(cell_id)
+
+    driver = RetirementEvidenceDriver(ExecutionWorkloadStatus.STOPPED)
+    service = _single_cell_service(tmp_path, driver)
+    service.capacity = SourceCapacity()  # type: ignore[assignment]
+    service.state.claim_workload_fence("workload-1", 1, "fence-1", remote_id="workload-1-a1", cell_id="cell-a")
+    definitive_loss = capacity_status in {
+        CapacityStatus.ABSENT,
+        CapacityStatus.RELEASED,
+        CapacityStatus.NEEDS_RECREATE,
+        CapacityStatus.HALTED_BUDGET,
+        CapacityStatus.HALTED_QUOTA,
+    }
+    if definitive_loss:
+        result = service.submit("cell-b", _retirement_request(2))
+        assert result.remote_id == "workload-1-a2"
+        assert driver.live == {"workload-1-a2"}
+        assert driver.launches == ["workload-1-a2"]
+    else:
+        with pytest.raises(RuntimeError, match="no agent endpoint"):
+            service.submit("cell-b", _retirement_request(2))
+        assert driver.live == set()
+        assert driver.launches == []
+    persisted = FleetStateStore(LocalBackend(tmp_path / "fleet.json")).workload_fence("workload-1")
+    assert persisted is not None
+    assert bool(persisted.get("predecessors")) is not definitive_loss

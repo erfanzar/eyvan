@@ -44,6 +44,7 @@ from eyvan.records import (
     WorkloadTopologyCell,
     utcnow,
 )
+from eyvan.secrets import redact_secret_material
 from eyvan.server.controller._support import (
     _LIVE_WORKLOAD_STATES,
     _PREEMPTION_OWNED_TERMINAL_WORKLOAD_STATUSES,
@@ -450,19 +451,30 @@ def _chunk_truncated_ranks(header: JsonObject) -> set[int]:
 
 
 def _joined_archive_replays(earlier: _ArchiveReplay, later: _ArchiveReplay) -> _ArchiveReplay:
-    """Join the incremental stream to the terminal archive, in that order.
+    """Join archives in file order, retaining only one copy of identified overlap.
 
-    Concatenation rather than a merge, and it is only correct because the two
-    do not overlap: settlement resumes its read from the last chunk's cursor, so
-    the terminal objects hold exactly the lines written after the final chunk.
-    Interleaving them by timestamp instead would reorder a rank's own output
-    whenever its clock and the controller's disagreed, and the offsets a
-    resumable read hands back address file order, not time.
+    A terminal writer on another replica can read before an in-flight chunk is
+    published. Nonempty per-rank cursors identify that overlap; equality of the
+    complete record guards against cursor collisions with different content.
+    Missing or repeated cursors cannot establish identity and are never removed.
+    In particular messages and timestamps alone are not record identities.
     """
 
     ranks = {rank: tuple(lines) for rank, lines in earlier.ranks.items()}
     for rank, lines in later.ranks.items():
-        ranks[rank] = ranks.get(rank, ()) + tuple(lines)
+        previous = ranks.get(rank, ())
+        earlier_counts: dict[str, int] = {}
+        later_counts: dict[str, int] = {}
+        for record in previous:
+            earlier_counts[record.cursor] = earlier_counts.get(record.cursor, 0) + 1
+        for record in lines:
+            later_counts[record.cursor] = later_counts.get(record.cursor, 0) + 1
+        identified = {
+            record
+            for record in previous
+            if record.cursor and earlier_counts[record.cursor] == 1 and later_counts.get(record.cursor) == 1
+        }
+        ranks[rank] = previous + tuple(record for record in lines if record not in identified)
     details = [detail for detail in (earlier.detail, later.detail) if detail]
     return _ArchiveReplay(
         ranks=ranks,
@@ -662,18 +674,22 @@ class _ControllerObservation:
                 else:
                     remote = await asyncio.to_thread(self._agent_factory(cell).workload, cell.id, workload.remote_id)
             except Exception as exc:
-                detail = _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else str(exc)
+                # Redacted even for workloads without secret mounts: the
+                # exception text itself can carry capability tokens or URLs
+                # that were part of the failed observation round trip.
+                detail = _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else redact_secret_material(str(exc))
                 logger.warning("workload %s observation failed: %s", workload.id, detail)
                 continue
             try:
                 if is_group:
-                    await self._recover_group_member_leases(pairs, remote.status)
+                    await self._recover_group_member_leases(workload, pairs, remote.status)
                 await self._apply_workload_observation(
                     workload,
                     lease,
                     cell,
                     remote.status,
                     remote.message,
+                    observed_members=pairs,
                 )
             except Exception as exc:
                 logger.info("workload %s observation became stale: %s", workload.id, exc)
@@ -682,6 +698,7 @@ class _ControllerObservation:
 
     async def _recover_group_member_leases(
         self,
+        workload: WorkloadRecord,
         members: tuple[tuple[LeaseRecord, CellRecord], ...],
         status: ExecutionWorkloadStatus,
     ) -> None:
@@ -689,27 +706,74 @@ class _ControllerObservation:
 
         if status not in _RECOVERABLE_WORKLOAD_STATUSES:
             return
-        for lease, _cell in members[1:]:
+        for lease, cell in members[1:]:
             if lease.state is not LeaseState.QUARANTINED or lease.revocation_reason == "preemption":
                 continue
-            await self.service.transition_lease(
-                self._principal,
-                lease.id,
-                LeaseState.ACTIVE,
-                action="lease.recovered",
+            await self._recover_observed_lease(workload, lease, cell)
+
+    async def _recover_observed_lease(self, workload: WorkloadRecord, lease: LeaseRecord, cell: CellRecord) -> bool:
+        """Recover and renew only the still-owned execution, in one transaction."""
+
+        async with self.repository.transaction() as transaction:
+            current_workload = await transaction.get_workload(workload.id)
+            if (
+                current_workload is None
+                or current_workload.state not in {WorkloadState.LEASED, WorkloadState.DISPATCHING, WorkloadState.RUNNING}
+                or current_workload.state is not workload.state
+                or current_workload.generation != workload.generation
+                or current_workload.attempt != workload.attempt
+                or current_workload.remote_id != workload.remote_id
+                or current_workload.preemption_id != workload.preemption_id
+                or self._workload_lease_ids(current_workload) != self._workload_lease_ids(workload)
+            ):
+                return False
+            current = await transaction.get_lease(lease.id)
+            if (
+                current is None
+                or current.id not in self._workload_lease_ids(current_workload)
+                or current.workload_id != workload.id
+                or current.cell_id != cell.id
+                or current.generation != lease.generation
+                or current.fencing_token != lease.fencing_token
+                or current.cell_generation != lease.cell_generation
+                or current.state is not LeaseState.QUARANTINED
+                or current.revocation_reason == "preemption"
+                or current.revocation_reason != lease.revocation_reason
+            ):
+                return False
+            current_cell = await transaction.get_cell(cell.id)
+            if (
+                current_cell is None
+                or current_cell.generation != cell.generation
+                or current_cell.generation != current.cell_generation
+                or current_cell.state not in {CellState.READY, CellState.DRAINING}
+            ):
+                return False
+            now = utcnow()
+            await transaction.put_lease(
+                current.model_copy(
+                    update={
+                        "state": LeaseState.ACTIVE,
+                        "run_started_at": current.run_started_at or now,
+                        "expires_at": now + timedelta(seconds=self.settings.lease_ttl_s),
+                        "updated_at": now,
+                    }
+                )
             )
-            async with self.repository.transaction() as transaction:
-                current = await transaction.get_lease(lease.id)
-                if current is not None and current.state is LeaseState.ACTIVE:
-                    now = utcnow()
-                    await transaction.put_lease(
-                        current.model_copy(
-                            update={
-                                "expires_at": now + timedelta(seconds=self.settings.lease_ttl_s),
-                                "updated_at": now,
-                            }
-                        )
-                    )
+            await transaction.append_event(
+                AuditEvent(
+                    id=f"evt_{uuid.uuid4().hex}",
+                    actor=self._principal.subject,
+                    org_id=current.org_id,
+                    project_id=current.project_id,
+                    entity_type="lease",
+                    entity_id=current.id,
+                    action="lease.recovered",
+                    previous_state=current.state.value,
+                    new_state=LeaseState.ACTIVE.value,
+                )
+            )
+            return True
 
     async def _apply_workload_observation(
         self,
@@ -718,6 +782,8 @@ class _ControllerObservation:
         cell: CellRecord,
         status: ExecutionWorkloadStatus,
         message: str | None,
+        *,
+        observed_members: tuple[tuple[LeaseRecord, CellRecord], ...] | None = None,
     ) -> None:
         if workload.spec.secret_mounts:
             message = _SECRET_OUTPUT_SUPPRESSED
@@ -732,23 +798,8 @@ class _ControllerObservation:
         if preemption_owned and status in _PREEMPTION_OWNED_TERMINAL_WORKLOAD_STATUSES:
             return
         if lease.state is LeaseState.QUARANTINED and not preemption_owned and status in _RECOVERABLE_WORKLOAD_STATUSES:
-            await self.service.transition_lease(
-                self._principal,
-                lease.id,
-                LeaseState.ACTIVE,
-                action="lease.recovered",
-            )
-            async with self.repository.transaction() as transaction:
-                recovered = await transaction.get_lease(lease.id)
-                if recovered is not None:
-                    await transaction.put_lease(
-                        recovered.model_copy(
-                            update={
-                                "expires_at": utcnow() + timedelta(seconds=self.settings.lease_ttl_s),
-                                "updated_at": utcnow(),
-                            }
-                        )
-                    )
+            if not await self._recover_observed_lease(workload, lease, cell):
+                return
         if status is ExecutionWorkloadStatus.RUNNING and workload.state is WorkloadState.DISPATCHING:
             await self.service.transition_workload(
                 self._principal,
@@ -773,7 +824,9 @@ class _ControllerObservation:
         elif status in {ExecutionWorkloadStatus.FAILED, ExecutionWorkloadStatus.STOPPED}:
             if status is ExecutionWorkloadStatus.FAILED:
                 await self._stop_terminal_workload_peers(workload, lease, cell, status)
-                if not preemption_owned and await self._quarantine_faulted_host(workload, message):
+                if not preemption_owned and await self._quarantine_faulted_host(
+                    workload, message, observed_members or ((lease, cell),)
+                ):
                     # The machine, not the workload, is what failed. Its cell is
                     # now a definitive capacity loss, so the loss path in
                     # ``observe_workloads_once`` requeues this attempt against
@@ -883,7 +936,12 @@ class _ControllerObservation:
                 _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else exc,
             )
 
-    async def _quarantine_faulted_host(self, workload: WorkloadRecord, message: str | None) -> bool:
+    async def _quarantine_faulted_host(
+        self,
+        workload: WorkloadRecord,
+        message: str | None,
+        members: tuple[tuple[LeaseRecord, CellRecord], ...],
+    ) -> bool:
         """Replace the host behind a failure that names an unrecoverable machine fault.
 
         Eyvan's failure vocabulary describes attempts, not machines, so a TPU
@@ -910,15 +968,11 @@ class _ControllerObservation:
         budget = self._host_replacement_budget
         if not budget.enabled or not message:
             return False
-        try:
-            members = await self._load_workload_members(workload)
-        except StaleOutboxCommand as exc:
-            logger.info("workload %s host-fault attribution became stale: %s", workload.id, exc)
-            return False
         faults = await self._attribute_host_faults(workload, members, message)
+        leases_by_cell = {cell.id: lease for lease, cell in members}
         quarantined = False
         for cell_id, fault in sorted(faults.items()):
-            if await self._quarantine_faulted_cell(workload, cell_id, fault, budget):
+            if await self._quarantine_faulted_cell(workload, cell_id, fault, budget, leases_by_cell[cell_id]):
                 quarantined = True
         return quarantined
 
@@ -972,6 +1026,7 @@ class _ControllerObservation:
         cell_id: str,
         fault: HostFault,
         budget: HostReplacementBudget,
+        observed_lease: LeaseRecord,
     ) -> bool:
         """Mark one cell as a lost host, inside its pool's replacement budget."""
 
@@ -979,8 +1034,35 @@ class _ControllerObservation:
         transition: tuple[CellRecord, CellRecord] | None = None
         refusal: tuple[CellRecord, str, str] | None = None
         async with self.repository.transaction() as transaction:
+            # Attribution preceded this transaction (and an agent round trip).
+            # Lock the execution first, then its lease and cell: a historical
+            # lease must never diagnose the machine that replaced or reused it.
+            current_workload = await transaction.get_workload(workload.id)
+            if (
+                current_workload is None
+                or current_workload.state not in _LIVE_WORKLOAD_STATES
+                or current_workload.state is not workload.state
+                or current_workload.generation != workload.generation
+                or current_workload.attempt != workload.attempt
+                or current_workload.remote_id != workload.remote_id
+                or self._workload_lease_ids(current_workload) != self._workload_lease_ids(workload)
+            ):
+                return False
+            owning_lease = await transaction.get_lease(observed_lease.id)
+            if (
+                owning_lease is None
+                or owning_lease.id not in self._workload_lease_ids(current_workload)
+                or owning_lease.workload_id != workload.id
+                or owning_lease.cell_id != cell_id
+                or owning_lease.generation != observed_lease.generation
+                or owning_lease.fencing_token != observed_lease.fencing_token
+                or owning_lease.cell_generation != observed_lease.cell_generation
+                or owning_lease.state not in {LeaseState.PENDING, LeaseState.ACTIVE, LeaseState.QUARANTINED}
+                or owning_lease.revocation_reason == "preemption"
+            ):
+                return False
             current = await transaction.get_cell(cell_id)
-            if current is None:
+            if current is None or current.generation != owning_lease.cell_generation:
                 return False
             existing = parse_host_fault_marker(current.unavailable_reason, current.unavailable_detail)
             if (
@@ -1156,11 +1238,18 @@ class _ControllerObservation:
             self.settings.indeterminate_execution_grace_s,
             message or "no diagnostic",
         )
-        await self.drain_cell(
-            self._principal,
-            cell.id,
-            idempotency_key=f"unreadable-execution:{workload.id}:{workload.generation}",
-        )
+        try:
+            await self.drain_cell(
+                self._principal,
+                cell.id,
+                idempotency_key=f"unreadable-execution:{workload.id}:{workload.generation}",
+                expected_workload=workload,
+                expected_cell_generation=cell.generation,
+            )
+        except ConflictError:
+            # A terminal observation or replacement won while this RPC waited.
+            # Its current execution must not inherit the old attempt's drain.
+            return
 
     async def _recover_lost_workload(
         self,
@@ -1413,14 +1502,14 @@ class _ControllerObservation:
             logger.warning("cell %s could not be observed: %s", cell.id, exc)
             return False
         except CellAgentCapacityProviderError as exc:
-            provider_detail = str(exc)
+            provider_detail = redact_secret_material(str(exc))
             provider_failure_code = exc.code
             unavailable_reason = exc.code.value
             state = CellState.UNAVAILABLE
             remote_state = CapacityStatus.PROVIDER_ERROR
             availability = self._observe_capacity_belief(cell, ProvisionOutcome.PROVIDER_ERROR)
         except Exception as exc:
-            provider_detail = str(exc) or type(exc).__name__
+            provider_detail = redact_secret_material(str(exc)) or type(exc).__name__
             state = CellState.UNAVAILABLE
             remote_state = CapacityStatus.PROVIDER_ERROR
             availability = self._observe_capacity_belief(cell, ProvisionOutcome.PROVIDER_ERROR)
@@ -1509,14 +1598,39 @@ class _ControllerObservation:
                 # generation returns such a cell to observation.
                 return False
             phase_started_at = _provider_phase_start(current, remote_state, now)
+            new_failure = provider_failure_code is not None and (
+                current.provider_failure_code is not provider_failure_code
+                or (
+                    current.provider_failure_generation is not None
+                    and current.provider_failure_generation != current.generation
+                )
+            )
+            # An unchanged legacy failure has no occurrence clock. Preserve that
+            # unknown rather than stamping a heartbeat as a fresh provider event.
+            failure_at = now if new_failure else current.provider_failure_occurred_at
+            failure_id = uuid.uuid4().hex if new_failure else current.provider_failure_event_id
+            failure_generation = current.generation if new_failure else current.provider_failure_generation
             updated = current.model_copy(
                 update={
                     "state": state,
                     "provider_phase": remote_state,
                     "provider_failure_code": provider_failure_code,
+                    "provider_failure_occurred_at": failure_at if provider_failure_code is not None else None,
+                    "provider_failure_event_id": failure_id if provider_failure_code is not None else None,
+                    "provider_failure_generation": failure_generation if provider_failure_code is not None else None,
                     "observed_tpu_vms": observed_tpu_vms,
                     "runtime_process_count": runtime_process_count,
                     "materialized_assets": materialized_assets,
+                    "billing_started_at": (
+                        now
+                        if state is CellState.READY and current.billing_started_at is None
+                        else current.billing_started_at
+                    ),
+                    "billing_ticked_at": (
+                        now
+                        if state is CellState.READY and current.billing_started_at is None
+                        else current.billing_ticked_at
+                    ),
                     "provider_phase_started_at": phase_started_at,
                     "unavailable_reason": unavailable_reason,
                     "unavailable_detail": (provider_detail or None) if unavailable_reason else None,
@@ -2878,22 +2992,40 @@ class _ControllerObservation:
             # finished between the read and the exec -- into a 500.
             raise ConflictError(f"workload {workload_id!r} no longer holds a cell: {exc}") from exc
         ordered = self._ordered_gang_member_pairs(members) if len(members) > 1 else tuple(members)
+        selected: tuple[CellRecord, int, int] | None = None
+        if rank is not None:
+            async with self.repository.transaction() as transaction:
+                topology = await transaction.get_workload_topology(workload.id, workload.attempt)
+            if topology is None or not topology.contains_rank(rank):
+                raise ConflictError(f"workload {workload_id!r} has no frozen rank {rank}")
+            current_cells = {cell.id: cell for _lease, cell in ordered}
+            for frozen in topology.cells:
+                if frozen.global_rank_offset <= rank < frozen.global_rank_offset + frozen.runtime_process_count:
+                    cell = current_cells.get(frozen.cell_id)
+                    if cell is None or _topology_mismatch(frozen, cell, self._cell_worker_endpoints(cell)):
+                        raise ConflictError("runtime topology changed before selected-rank exec")
+                    selected = (cell, rank - frozen.global_rank_offset, frozen.runtime_process_count)
+                    break
         results: list[JsonObject] = []
         for index, (_lease, cell) in enumerate(ordered):
-            if rank is not None and index != rank:
+            if selected is not None and cell.id != selected[0].id:
                 continue
+            result_rank = rank if rank is not None else index
+            kwargs: dict[str, object] = {"timeout_s": timeout_s}
+            if selected is not None and selected[2] > 1:
+                kwargs["runtime_rank"] = selected[1]
             try:
                 payload = await asyncio.to_thread(
                     self._agent_factory(cell).exec_in_workload,
                     cell.id,
                     workload.remote_id,
                     list(command),
-                    timeout_s=timeout_s,
+                    **kwargs,
                 )
             except Exception as exc:
-                results.append({"rank": index, "cell_id": cell.id, "error": str(exc)})
+                results.append({"rank": result_rank, "cell_id": cell.id, "error": str(exc)})
                 continue
-            results.append({**payload, "rank": index, "cell_id": cell.id})
+            results.append({**payload, "rank": result_rank, "cell_id": cell.id})
         if rank is not None and not results:
             raise ConflictError(f"workload {workload_id!r} has no rank {rank}")
         document: JsonObject = {
@@ -2924,7 +3056,10 @@ class _ControllerObservation:
             }
         if workload.remote_id is None:
             return {"workload_id": workload_id, "observed": False, "detail": "workload has no dispatched attempt"}
-        members = await self._load_workload_members(workload)
+        try:
+            members = await self._load_workload_members(workload)
+        except StaleOutboxCommand:
+            return {"workload_id": workload_id, "observed": False, "detail": "workload no longer holds a cell"}
         lease, cell = self._ordered_gang_member_pairs(members)[0] if len(members) > 1 else members[0]
         return await asyncio.to_thread(
             self._agent_factory(cell).process_status,

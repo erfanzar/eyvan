@@ -274,7 +274,14 @@ def test_server_options_map_the_two_modes_uvicorn_actually_sees(pki) -> None:
     assert required["ssl_cert_reqs"] == int(ssl.CERT_REQUIRED)
     assert required["ssl_certfile"] == pki["server"].certificate
     assert required["ssl_ca_certs"] == pki["server"].trust_bundle
-    assert {key for key in required} == {"ssl_certfile", "ssl_keyfile", "ssl_ca_certs", "ssl_cert_reqs"}
+    assert required["ssl_version"] == int(ssl.PROTOCOL_TLS_SERVER)
+    assert {key for key in required} == {
+        "ssl_certfile",
+        "ssl_keyfile",
+        "ssl_ca_certs",
+        "ssl_cert_reqs",
+        "ssl_version",
+    }
 
 
 def test_a_broken_key_pair_is_reported_without_openssl_detail(tmp_path: Path, pki) -> None:

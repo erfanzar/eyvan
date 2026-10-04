@@ -29,6 +29,7 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
@@ -339,6 +340,7 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
     monkeypatch.setenv("EYVAN_CONFIG_FILE", str(config_path))
     monkeypatch.setattr(execution_module, "_context", None)
     submitted: WorkloadRecord | None = None
+    denial_occurred_at = utcnow()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/log-page"):
@@ -366,6 +368,8 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
                         zone="us-east5-a",
                         accelerator_type="v6e-16",
                         capacity_class=CapacityClass.SPOT,
+                        occurred_at=denial_occurred_at,
+                        event_id="queue-denial-current-occurrence",
                     ),
                     "state": WorkloadState.FAILED,
                 }
@@ -389,9 +393,17 @@ def test_decorator_uses_the_active_context_autoscale_cache_for_queue_denials(tmp
     job = train.remote()
 
     assert job.status() is WorkloadState.FAILED
-    assert AutoscaleConfigCache(cache_dir).blocks_queue_admission_denial(
+    cache = AutoscaleConfigCache(cache_dir)
+    assert cache.blocks_queue_admission_denial(
         project="gcp-project",
         zone="us-east5-a",
+        accelerator_type="v6e-16",
+        capacity_class=CapacityClass.SPOT,
+    )
+    assert cache.list_queue_admission_denials()[0].observed_at == denial_occurred_at
+    assert not cache.blocks_queue_admission_denial(
+        project="gcp-project",
+        zone="us-east5-b",
         accelerator_type="v6e-16",
         capacity_class=CapacityClass.SPOT,
     )

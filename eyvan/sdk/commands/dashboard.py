@@ -130,6 +130,7 @@ def dashboard_dev(
     """Run the source-checkout-only Vite dashboard against this session."""
 
     root = _dashboard_root()
+    endpoint = ControlPlaneEndpoint.parse(session.base_url)
     roles = role_override or ",".join(session.identity.dev_roles) or "fleet_admin"
     environment = {
         "EYVAN_DASHBOARD_API": session.base_url,
@@ -142,7 +143,9 @@ def dashboard_dev(
         environment["VITE_EYVAN_ORG"] = session.org_id
     if session.project_id:
         environment["VITE_EYVAN_PROJECT"] = session.project_id
-    credential = _local_credential(credential_path)
+    # The browser sends this credential through Vite's API proxy, so only a
+    # loopback API target may receive this workstation's owner credential.
+    credential = _local_credential(credential_path) if endpoint.is_loopback else None
     if credential is not None:
         environment["VITE_EYVAN_LOCAL_CREDENTIAL"] = credential
 
@@ -154,7 +157,7 @@ def dashboard_dev(
             click.echo(f"{name}={shown}")
         return
 
-    if credential is None and "127.0.0.1" in session.base_url:
+    if credential is None and endpoint.is_loopback:
         click.echo(
             f"No development credential at {credential_path}; a loopback control plane will reject "
             "every dashboard request. Run 'eyvan runtime init' first.",
@@ -169,11 +172,15 @@ def dashboard_dev(
     click.echo(f"  http://localhost:{port}/")
     if open_browser:
         click.launch(f"http://localhost:{port}/")
+    process_environment = {**os.environ, **environment}
+    if not endpoint.is_loopback:
+        # An inherited credential is just as sensitive as one read above.
+        process_environment.pop("VITE_EYVAN_LOCAL_CREDENTIAL", None)
     try:
         subprocess.run(
             [npm, "run", "dev", "--", "--port", str(port)],
             cwd=root,
-            env={**os.environ, **environment},
+            env=process_environment,
             check=True,
         )
     except KeyboardInterrupt:  # pragma: no cover - interactive exit

@@ -74,7 +74,10 @@ def test_exec_runs_on_every_host_of_the_slice() -> None:
     assert [rank["rank"] for rank in result["ranks"]] == [0, 1]
     assert [rank["result"]["host"] for rank in result["ranks"]] == ["w0", "w1"]
     for worker in workers:
-        assert worker.calls == [("rem-1", ("py-spy", "dump"), 12.0)]
+        assert len(worker.calls) == 1
+        remote_id, command, remaining_budget = worker.calls[0]
+        assert (remote_id, command) == ("rem-1", ("py-spy", "dump"))
+        assert 0 < remaining_budget <= 12.0
 
 
 @pytest.mark.parametrize(

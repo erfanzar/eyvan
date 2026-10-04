@@ -739,14 +739,20 @@ class ServiceEndpointRequest(ApiModel):
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("service endpoint must be an http(s) URL with a hostname")
         try:
-            resolved = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
-        except OSError:
-            # An unresolvable name answers nothing, including the probe; the
-            # address checks below are the boundary, so leave the verdict about
-            # reachability to the probe that runs when a replica is watched.
-            return self
-        for entry in resolved:
-            address = ipaddress.ip_address(entry[4][0])
+            addresses = [ipaddress.ip_address(parsed.hostname)]
+        except ValueError:
+            try:
+                resolved = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
+            except OSError:
+                # Unresolvable names remain registerable. The probe resolves and
+                # pins its own checked destination before making a connection.
+                return self
+            addresses = [ipaddress.ip_address(entry[4][0]) for entry in resolved]
+        for address in addresses:
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                address = address.ipv4_mapped
+            if address.is_unspecified:
+                raise ValueError("service endpoint must not resolve to an unspecified address")
             forbidden = _ENDPOINT_FORBIDDEN_V4_NETWORKS if address.version == 4 else _ENDPOINT_FORBIDDEN_V6_NETWORKS
             if any(address in network for network in forbidden):
                 raise ValueError("service endpoint must not resolve to a loopback, link-local, or unique-local address")

@@ -15,6 +15,7 @@ import type { BillingReport, ProjectUsage } from "../types";
 interface BillingPageProps {
   loadBilling: (signal: AbortSignal) => Promise<BillingReport>;
   loadUsage: (signal: AbortSignal) => Promise<ProjectUsage>;
+  refreshRevision?: number;
 }
 
 /** Hours rendered the way somebody reads a bill, not as raw seconds. */
@@ -24,15 +25,19 @@ function hours(seconds: number | undefined): string {
   return value < 1 ? `${Math.round(seconds / 60)}m` : `${value.toFixed(1)}h`;
 }
 
-export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
+export function BillingPage({ loadBilling, loadUsage, refreshRevision = 0 }: BillingPageProps) {
   const [billing, setBilling] = useState<BillingReport | null>(null);
   const [usage, setUsage] = useState<ProjectUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
+    setBilling(null);
+    setUsage(null);
+    setError(null);
     Promise.all([loadBilling(controller.signal), loadUsage(controller.signal)])
       .then(([bill, use]) => {
+        if (controller.signal.aborted) return;
         setBilling(bill);
         setUsage(use);
       })
@@ -41,7 +46,7 @@ export function BillingPage({ loadBilling, loadUsage }: BillingPageProps) {
         setError(failure instanceof Error ? failure.message : "Could not read billing");
       });
     return () => controller.abort();
-  }, [loadBilling, loadUsage]);
+  }, [loadBilling, loadUsage, refreshRevision]);
 
   if (error) {
     return (

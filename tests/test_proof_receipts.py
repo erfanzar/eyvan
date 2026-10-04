@@ -26,6 +26,9 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from eyvan._internal import build_identity as identity_module
+from eyvan._internal.build_identity import BuildIdentity
+from eyvan.sdk.commands import receipts as receipts_module
 from eyvan.sdk.commands.proof import (
     EXIT_CODES,
     EXIT_NOT_RUN,
@@ -49,6 +52,26 @@ from eyvan.sdk.commands.receipts import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Receipt fixtures identify one candidate without depending on package scanning."""
+
+    candidate = BuildIdentity(
+        version="0.0.1",
+        origin="source",
+        origin_detail="test fixture",
+        source_digest="sha256:plane",
+        digest_detail="",
+        file_count=1,
+        python="3.11",
+        platform="test",
+    )
+    monkeypatch.setattr(identity_module, "build_identity", lambda: candidate)
+    monkeypatch.setattr(receipts_module, "build_identity", lambda: candidate)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "artifacts"))
+
+
 def _receipt(**overrides: object) -> dict[str, object]:
     fields: dict[str, object] = {
         "proof": "P5",
@@ -59,6 +82,13 @@ def _receipt(**overrides: object) -> dict[str, object]:
         "plane_url": "http://10.128.0.7:8080",
         "plane_build": {"version": "0.0.1", "source_digest": "sha256:plane"},
         "plane_build_detail": "",
+        "fleet_builds": {
+            "plane": {"source_digest": "sha256:plane"},
+            "agents": [{"endpoint": "http://agent-a", "build": {"source_digest": "sha256:plane"}}],
+            "unreachable": [],
+            "unscanned_pools": [],
+            "in_agreement": True,
+        },
         "started_at": "2026-08-11T00:00:00+00:00",
         "completed_at": "2026-08-11T00:01:00+00:00",
         "command": ["eyvan", "proof", "preemption", "wl-1"],
@@ -380,6 +410,15 @@ def test_an_unknown_build_digest_compares_to_neither() -> None:
     result = _verify_result(_receipt(), build_now={"source_digest": None})
 
     assert _check(result, "candidate-current") is Verdict.INCONCLUSIVE
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+@pytest.mark.parametrize("overrides", [{"plane_build": None}, {"fleet_builds": None}])
+def test_a_client_match_cannot_qualify_unknown_backend_builds(overrides: dict[str, object]) -> None:
+    result = _verify_result(_receipt(**overrides))
+
+    assert _check(result, "candidate-current") is Verdict.PASS
+    assert result.verdict is Verdict.INCONCLUSIVE
 
 
 # --------------------------------------------------------------------------- the command surface
@@ -491,6 +530,8 @@ def test_a_verdict_algebra_receipt_reports_every_check() -> None:
         "verdict",
         "criterion-current",
         "candidate-current",
+        "plane-current",
+        "fleet-current",
     }
     assert isinstance(result.checks[0], Check)
 

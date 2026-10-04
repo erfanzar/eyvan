@@ -11,6 +11,7 @@ import math
 import typing as tp
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from sys import float_info
 
 from eyvan._internal.compat import UTC, StrEnum
 
@@ -91,7 +92,10 @@ class CapacityBelief:
     def uncertainty(self) -> float:
         alpha = self.success_evidence
         beta = self.failure_evidence
-        return math.sqrt((alpha * beta) / (((alpha + beta) ** 2) * (alpha + beta + 1)))
+        total = alpha + beta
+        # Factoring the beta standard deviation avoids underflow in the product
+        # and squared denominator when both evidence values have decayed away.
+        return math.sqrt(alpha / total) * math.sqrt(beta / total) / math.sqrt(total + 1)
 
     @property
     def interruption_rate_per_hour(self) -> float:
@@ -127,10 +131,17 @@ class CapacityBelief:
             raise ValueError("capacity observations require a timezone-aware timestamp")
         if not 0 < evidence_decay <= 1:
             raise ValueError("evidence_decay must be in (0, 1]")
+        if latency_s is not None and not math.isfinite(latency_s):
+            # One NaN sample would sit in the rolling window forever and turn
+            # every later p95 into NaN.
+            raise ValueError("latency_s must be a finite non-negative number")
         if latency_s is not None and latency_s < 0:
             raise ValueError("latency_s must be non-negative")
-        success = self.success_evidence * evidence_decay
-        failure = self.failure_evidence * evidence_decay
+        # Persisted evidence must remain strictly positive even for a valid,
+        # very small decay or a long run of one outcome. The smallest normal
+        # float is a negligible prior floor, not a new success/failure sample.
+        success = max(float_info.min, self.success_evidence * evidence_decay)
+        failure = max(float_info.min, self.failure_evidence * evidence_decay)
         interruptions = self.interruptions * evidence_decay
         hours = self.successful_hours * evidence_decay + successful_hours
         failures = self.consecutive_failures

@@ -71,8 +71,8 @@ async def test_a_live_claim_holds_back_the_aggregates_next_command(repository: S
     assert await repository.snapshot_claimable_outbox_ids(limit=10) == ()
 
 
-async def test_an_expired_claim_releases_its_hold_on_the_aggregate(repository: SqlAlchemyRepository) -> None:
-    """A dead replica must not strand its aggregate's tail forever."""
+async def test_an_expired_claim_reclaims_the_head_before_the_aggregate_tail(repository: SqlAlchemyRepository) -> None:
+    """A dead replica's head is retried without letting its tail overtake it."""
 
     async with repository.transaction() as transaction:
         for record_id, aggregate_id in (("cmd-apply", "wl-1"), ("cmd-drain", "wl-1")):
@@ -87,7 +87,17 @@ async def test_an_expired_claim_releases_its_hold_on_the_aggregate(repository: S
 
     recovered = await repository.claim_outbox(worker_id="replica-b", limit=10)
 
-    assert [command.id for command in recovered] == ["cmd-apply", "cmd-drain"]
+    assert [command.id for command in recovered] == ["cmd-apply"]
+    assert recovered[0].claimed_by == "replica-b"
+    assert await repository.claim_outbox(worker_id="replica-c", limit=10) == []
+    async with repository.transaction() as transaction:
+        current = await transaction.get_outbox("cmd-apply")
+        assert current is not None
+        await transaction.put_outbox(
+            current.model_copy(update={"state": OutboxState.SUCCEEDED, "claimed_by": None, "claimed_until": None})
+        )
+    tail = await repository.claim_outbox(worker_id="replica-b", limit=10)
+    assert [command.id for command in tail] == ["cmd-drain"]
 
 
 async def test_a_settled_command_releases_its_hold_on_the_aggregate(repository: SqlAlchemyRepository) -> None:

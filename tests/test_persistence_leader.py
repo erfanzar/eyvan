@@ -25,6 +25,7 @@ class FakeAsyncConnection:
         self.liveness_probes = 0
         self.unlocked: list[int] = []
         self.close_calls = 0
+        self.invalidate_calls = 0
 
     async def execution_options(self, *, isolation_level: str) -> FakeAsyncConnection:
         """Record the requested isolation level like the real connection would."""
@@ -58,6 +59,13 @@ class FakeAsyncConnection:
         assert params is not None
         self.unlocked.append(params["lock_id"])
         self.engine.advisory_unlock(self, params["lock_id"])
+
+    async def invalidate(self) -> None:
+        """Discard the physical session rather than returning it to the pool."""
+
+        self.invalidate_calls += 1
+        self.broken = True
+        self.engine.session_closed(self)
 
     async def close(self) -> None:
         """Close the session, which drops any server-side session advisory lock."""
@@ -182,7 +190,7 @@ async def test_lost_connection_reacquires_the_lock_on_a_fresh_session() -> None:
 
     assert await leader.acquire() is True
 
-    assert dead.close_calls == 1
+    assert dead.invalidate_calls == dead.close_calls == 1
     assert len(engine.connections) == 2
     assert engine.lock_holder is engine.connections[1]
 
@@ -249,6 +257,7 @@ async def test_try_lock_failure_closes_the_session_and_propagates() -> None:
         await leader.acquire()
 
     assert engine.connections[0].closed
+    assert engine.connections[0].invalidate_calls == 1
     assert engine.lock_holder is None
 
     engine.try_lock_failure = None

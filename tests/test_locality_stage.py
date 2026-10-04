@@ -1250,9 +1250,11 @@ async def test_an_inconclusive_eviction_keeps_the_bytes_charged() -> None:
     await controller.evict_cell_stages_once(dry_run=False, now=NOW)
     stored = (await _stages(repository))[0]
 
-    assert stored.state is CellStageState.UNKNOWN
+    assert stored.state is CellStageState.EVICTING
     assert stored.reserved_bytes == 9
     assert stored.confirmed_at is None
+    assert "inconclusive" in stored.detail
+    assert len(executor.evicted) == 1
 
 
 async def test_a_live_eviction_rechecks_protection_before_it_deletes() -> None:
@@ -1466,13 +1468,12 @@ async def test_a_state_without_stages_still_writes_the_older_document(tmp_path) 
     assert document.version == 2
 
 
-async def test_repeated_inconclusive_evictions_stop_at_the_attempt_budget() -> None:
-    """A permanent failure must not hold a cell in a delete loop forever.
+async def test_inconclusive_eviction_is_not_automatically_retried() -> None:
+    """A deletion with unknown completion must not be issued a second time.
 
-    Blocked here is the same claim it always is -- this control plane has stopped
-    taking automatic action -- and the bytes stay charged because nobody proved
-    they left the disk. The cell then reports a shortfall it cannot fix itself,
-    which is an operator's problem and is stated as one.
+    Its durable EVICTING reservation and charged bytes remain until completion or
+    host replacement is authoritative. Repeated reconciliation reports the disk
+    shortfall without racing a possible still-running delete or new admission.
     """
 
     repository = InMemoryRepository()
@@ -1494,9 +1495,11 @@ async def test_repeated_inconclusive_evictions_stop_at_the_attempt_budget() -> N
         plans = await controller.evict_cell_stages_once(dry_run=False, now=NOW + timedelta(minutes=minute))
     stored = (await _stages(repository))[0]
 
-    assert len(executor.evicted) == 2
-    assert stored.state is CellStageState.BLOCKED
+    assert len(executor.evicted) == 1
+    assert stored.state is CellStageState.EVICTING
     assert stored.reserved_bytes == 9
+    assert stored.attempts == 1 and stored.confirmed_at is None
+    assert "inconclusive" in stored.detail
     # The cell is still over budget and says so rather than pretending otherwise.
     assert plans[0].victims == ()
     assert plans[0].shortfall_bytes == 5

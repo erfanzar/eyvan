@@ -122,3 +122,24 @@ async def test_fresh_controller_recovers_durable_preemption_phase(repository, mo
     assert (await _snapshot(repository, "priority"))["workload"] == target_recovered
     assert {cell: agent.observations for cell, agent in agents.items()} == observations
     assert all(len(agent.stops) == 1 for agent in agents.values())
+
+
+async def test_a_terminal_gang_sibling_cannot_erase_the_checkpoint_uri(repository):
+    """Order must not decide whether a saved checkpoint survives.
+
+    Both gang members share one workload id, so the terminal branch used to
+    overwrite a rank's real checkpoint URI with None whenever it was processed
+    after the rank that had checkpointed -- the resumed attempt then restarted
+    from scratch with the checkpoint still sitting on the cell.
+    """
+
+    first, command = await _preemption(repository, checkpointable=True, remote_id="remote-victim")
+    agents = {
+        "cell-a": PerCellAgent("RUNNING"),
+        "cell-b": PerCellAgent("SUCCEEDED"),
+    }
+    first._agent_factory = lambda cell: agents[cell.id]
+    await first._dispatch_preemption(command)
+    durable = (await _snapshot(repository, "victim"))["outbox"][command.id]
+    assert durable.payload["phase"] == "stopping"
+    assert durable.payload.get("checkpoint_uris", {}).get("victim") == "gs://checkpoints/gang"

@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import typing as tp
+import uuid
 from datetime import datetime
 
 import httpx
@@ -531,12 +532,22 @@ class _ControllerStaging:
             if measured.size_bytes > headroom:
                 return None
             existing = await transaction.get_cell_stage(request.cell_id, request.asset)
+            if existing is not None and existing.cell_generation != request.cell_generation:
+                existing = None
+            if existing is not None and existing.state is CellStageState.EVICTING:
+                # A staging response cannot resolve a possibly-running delete.
+                return None
+            # A new source length is not proof that an earlier partial copy was
+            # removed. Keep its charge until the fetch confirms replacement.
+            reservation_bytes = max(measured.size_bytes, 0 if existing is None else existing.reserved_bytes)
+            if reservation_bytes > headroom:
+                return None
             reserved = CellStageRecord(
                 cell_id=request.cell_id,
                 asset=request.asset,
                 cell_generation=request.cell_generation,
                 state=CellStageState.STAGING,
-                reserved_bytes=measured.size_bytes,
+                reserved_bytes=reservation_bytes,
                 observed_bytes=None if existing is None else existing.observed_bytes,
                 digest=measured.digest,
                 last_used_at=now,
@@ -575,7 +586,11 @@ class _ControllerStaging:
                 )
                 return
             existing = await transaction.get_cell_stage(request.cell_id, request.asset)
-            if existing is None or existing.cell_generation != request.cell_generation:
+            if (
+                existing is None
+                or existing.cell_generation != request.cell_generation
+                or existing.state is CellStageState.EVICTING
+            ):
                 return
             await transaction.put_cell_stage(
                 existing.model_copy(
@@ -594,7 +609,19 @@ class _ControllerStaging:
             )
         outcome.staged += 1
 
-    async def _restore_stage(self, stored: CellStageRecord, *, now: datetime) -> None:
+    @staticmethod
+    def _owns_eviction(current: CellStageRecord | None, generation: int, operation: str) -> bool:
+        """Match the exact durable reservation, not merely a reused asset key."""
+
+        return (
+            current is not None
+            and current.cell_generation == generation
+            and current.state is CellStageState.EVICTING
+            and current.detail is not None
+            and current.detail.startswith(f"{operation}:")
+        )
+
+    async def _restore_stage(self, stored: CellStageRecord, *, now: datetime, operation: str) -> None:
         """Put one row back as it was, after an action that never ran.
 
         Only for an eviction that found no executor at all. The row was marked
@@ -606,10 +633,11 @@ class _ControllerStaging:
         """
 
         async with self.repository.transaction() as transaction:
+            cell = await transaction.get_cell(stored.cell_id)
             current = await transaction.get_cell_stage(stored.cell_id, stored.asset)
-            if current is None or current.cell_generation != stored.cell_generation:
+            if cell is None or cell.generation != stored.cell_generation:
                 return
-            if current.state is not CellStageState.EVICTING:
+            if not self._owns_eviction(current, stored.cell_generation, operation):
                 return
             await transaction.put_cell_stage(stored.model_copy(update={"updated_at": now}))
 
@@ -637,6 +665,15 @@ class _ControllerStaging:
             if cell is None or cell.generation != request.cell_generation:
                 return
             existing = await transaction.get_cell_stage(request.cell_id, request.asset)
+            if existing is not None and existing.cell_generation != request.cell_generation:
+                existing = None
+            if existing is not None and existing.state is CellStageState.EVICTING:
+                # A staging response cannot resolve a possibly-running delete.
+                return None
+            # Failure/refusal reports no absence: even a fetch refusal can leave
+            # partial or quarantined bytes. Only confirmed replacement, eviction
+            # or a superseded host may release a prior reservation.
+            reserved_bytes = max(reserved_bytes, 0 if existing is None else existing.reserved_bytes)
             attempts = (0 if existing is None else existing.attempts) + int(charge_attempt)
             resolved = state
             if state is CellStageState.UNKNOWN and attempts >= policy.max_attempts:
@@ -704,7 +741,7 @@ class _ControllerStaging:
             by_cell.setdefault(stage.cell_id, []).append(stage)
 
         plans: list[CellStageEvictionPlan] = []
-        deleted = 0
+        actions = 0
         for cell in sorted(cells, key=lambda record: record.id):
             held = by_cell.get(cell.id)
             if not held:
@@ -713,27 +750,33 @@ class _ControllerStaging:
                 held,
                 cell=cell,
                 policy=policy,
-                protected=declared_assets_on_cell(cell.id, workloads, leases),
+                protected=declared_assets_on_cell(cell.id, workloads, leases)
+                | {stage.asset for stage in held if stage.state is CellStageState.EVICTING},
             )
             plans.append(plan)
             if plan.shortfall_bytes:
                 logger.warning(
-                    "cell %s is %s bytes over its stage budget and every remaining asset is in use by a "
-                    "running workload; nothing was evicted",
+                    "cell %s is %s bytes over its stage budget and remaining assets are protected, "
+                    "blocked or have unresolved evictions; nothing was evicted",
                     cell.id,
                     plan.shortfall_bytes,
                 )
             if dry_run or not plan.deletes_anything:
                 continue
-            if deleted >= MAX_STAGE_ACTIONS_PER_PASS:
+            if actions >= MAX_STAGE_ACTIONS_PER_PASS:
                 # Planning is pure and cheap, so every cell still gets a plan;
                 # only the round trips are rationed. An operator reading the
                 # result sees the whole picture and a partially executed pass.
                 logger.info("cell stage eviction reached its %s action budget", MAX_STAGE_ACTIONS_PER_PASS)
                 continue
-            deleted += len(plan.victims)
             with trace_span("eyvan.cell_stage_eviction", cell=cell.id):
-                await self._execute_eviction(cell, plan, executor=executor, now=moment)
+                actions += await self._execute_eviction(
+                    cell,
+                    plan,
+                    executor=executor,
+                    now=moment,
+                    max_actions=MAX_STAGE_ACTIONS_PER_PASS - actions,
+                )
         return tuple(plans)
 
     async def _execute_eviction(
@@ -743,8 +786,9 @@ class _ControllerStaging:
         *,
         executor: CellStageExecutor,
         now: datetime,
-    ) -> None:
-        """Delete one plan's victims, re-checking protection against fresh state.
+        max_actions: int = MAX_STAGE_ACTIONS_PER_PASS,
+    ) -> int:
+        """Delete bounded victims and return the number of attempted executor calls.
 
         Protection is recomputed inside the transaction that marks each victim,
         not trusted from the plan. Between planning and deleting, a workload can
@@ -752,13 +796,18 @@ class _ControllerStaging:
         removed, and the plan has no way to know.
         """
 
+        actions = 0
         for victim in plan.victims:
+            if actions >= max_actions:
+                break
             async with self.repository.transaction() as transaction:
                 current = await transaction.get_cell(cell.id)
                 stored = await transaction.get_cell_stage(cell.id, victim.asset)
                 if current is None or current.generation != plan.cell_generation or stored is None:
                     continue
-                if stored.cell_generation != plan.cell_generation:
+                if stored.cell_generation != plan.cell_generation or stored.state is CellStageState.EVICTING:
+                    # A lost response may leave a remote delete running. Neither
+                    # another delete nor a fetch may supersede its reservation.
                     continue
                 protected = declared_assets_on_cell(
                     cell.id,
@@ -772,12 +821,15 @@ class _ControllerStaging:
                         cell.id,
                     )
                     continue
+                # Persist identity in the existing detail field: no schema or
+                # wire change. Every response must still own this reservation.
+                operation = f"eviction:{uuid.uuid4().hex}"
                 await transaction.put_cell_stage(
                     stored.model_copy(
                         update={
                             "state": CellStageState.EVICTING,
                             "confirmed_at": None,
-                            "detail": "eviction in progress",
+                            "detail": f"{operation}: in progress",
                             "updated_at": now,
                         }
                     )
@@ -789,6 +841,9 @@ class _ControllerStaging:
                 fencing_token=self._stage_fence(cell),
                 max_bytes=victim.reserved_bytes,
             )
+            # Fresh protection/generation skips cost no round trip. A failed
+            # call still spends one, because it can be just as slow as success.
+            actions += 1
             try:
                 await asyncio.to_thread(executor.evict, request)
             except CellStageUnsupportedError as exc:
@@ -797,7 +852,7 @@ class _ControllerStaging:
                 # the same deletion against the same absent executor forever --
                 # an unbounded retry loop begun by a rolling upgrade.
                 logger.info("no staging executor for cell %s: %s", cell.id, exc)
-                await self._restore_stage(stored, now=now)
+                await self._restore_stage(stored, now=now, operation=operation)
                 continue
             except CellStageStaleError as exc:
                 # Fenced out before anything was deleted, so the row goes back
@@ -805,30 +860,42 @@ class _ControllerStaging:
                 # always promised and what stops the next pass planning the same
                 # deletion against the same refusal on every cycle.
                 logger.info("evicting %s from cell %s was fenced out: %s", victim.asset, cell.id, exc)
-                await self._restore_stage(stored, now=now)
+                await self._restore_stage(stored, now=now, operation=operation)
                 continue
             except (CellStageInconclusiveError, OSError) as exc:
                 # The bytes may or may not be gone, so the row stays charged and
                 # stays unproven. Uncharging here would be inventing evidence
                 # that a disk is free.
                 logger.warning("eviction of %s from cell %s was inconclusive: %s", victim.asset, cell.id, exc)
-                await self._record_stage(
-                    request,
-                    state=CellStageState.UNKNOWN,
-                    reserved_bytes=victim.reserved_bytes,
-                    detail=f"eviction was inconclusive: {exc}",
-                    now=now,
-                    charge_attempt=True,
-                )
+                # UNKNOWN would permit admission/fetch while a timed-out remote
+                # deletion is still running. Keep its exclusion and byte charge
+                # until a definitive response or host replacement resolves it.
+                async with self.repository.transaction() as transaction:
+                    current = await transaction.get_cell(cell.id)
+                    pending = await transaction.get_cell_stage(cell.id, victim.asset)
+                    if current is None or current.generation != plan.cell_generation:
+                        continue
+                    if pending is None or not self._owns_eviction(pending, plan.cell_generation, operation):
+                        continue
+                    await transaction.put_cell_stage(
+                        pending.model_copy(
+                            update={
+                                "detail": f"{operation}: eviction was inconclusive: {exc}"[:2048],
+                                "attempts": pending.attempts + 1,
+                                "updated_at": now,
+                            }
+                        )
+                    )
                 continue
             async with self.repository.transaction() as transaction:
                 current = await transaction.get_cell(cell.id)
                 stored = await transaction.get_cell_stage(cell.id, victim.asset)
-                if current is None or current.generation != plan.cell_generation or stored is None:
+                if current is None or current.generation != plan.cell_generation:
                     continue
-                if stored.cell_generation != plan.cell_generation:
+                if not self._owns_eviction(stored, plan.cell_generation, operation):
                     continue
                 await transaction.delete_cell_stage(cell.id, victim.asset)
+        return actions
 
 
 def _desired_stages(

@@ -647,12 +647,9 @@ def test_a_preemption_retry_serves_the_callable_from_the_cell_cache(
         )
 
 
-def test_a_rerun_of_the_same_bundle_reuses_its_extraction(tmp_path, monkeypatch) -> None:
-    """Iteration -- run, see the error, fix nothing, rerun -- must not need cell surgery."""
+def test_a_rerun_of_the_same_bundle_uses_a_private_extraction(tmp_path, monkeypatch) -> None:
+    """Retries never trust a writable cwd or remove another execution's tree."""
 
-    import os
-
-    from eyvan._internal.workspace import build_workspace
     from eyvan.worker.runtime.callable_protocol import _materialize_workspace
 
     root = tmp_path / "ws"
@@ -664,21 +661,23 @@ def test_a_rerun_of_the_same_bundle_reuses_its_extraction(tmp_path, monkeypatch)
 
     monkeypatch.chdir(tmp_path)
     first = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
+    (first / "helper.py").write_text("VALUE = 2\n")
     second = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
 
-    assert first == second
-    assert (first / ".eyvan-extraction-complete").is_file()
-    assert os.path.isdir(first)
+    assert first != second
+    assert (first / "helper.py").read_text() == "VALUE = 2\n"
+    assert (second / "helper.py").read_text() == "VALUE = 1\n"
+    assert (second / ".eyvan-extraction-complete").read_text() == digest
+    assert first.stat().st_mode & 0o777 == second.stat().st_mode & 0o777 == 0o700
 
-    # A partial extraction (no marker) is torn down rather than trusted.
-    import shutil
-
-    shutil.rmtree(first)
-    first.mkdir(parents=True)
-    (first / "leftover-shadow.py").write_text("VALUE = 2\n")  # simulate a torn extraction
+    # A prior incomplete tree may still belong to a sibling execution.
+    (first / ".eyvan-extraction-complete").unlink()
+    (first / "leftover-shadow.py").write_text("VALUE = 2\n")
     third = _materialize_workspace(payload, sha256=digest, signature=None, signing_key=None, environment={})
-    assert third == first
-    assert not (first / "leftover-shadow.py").exists()
+    assert third not in (first, second)
+    assert (first / "leftover-shadow.py").read_text() == "VALUE = 2\n"
+    assert not (third / "leftover-shadow.py").exists()
+    assert (third / "helper.py").read_text() == "VALUE = 1\n"
 
 
 # --------------------------------------------------------------------------- the command-path entry
@@ -731,9 +730,12 @@ def test_a_second_extraction_into_the_same_base_succeeds(tmp_path: Path) -> None
         bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
     )
 
-    assert first == second
-    assert (first / "helper.py").exists()
-    assert (first / workspace_entry.COMPLETE_MARKER).is_file()
+    assert first != second
+    for workspace in (first, second):
+        assert workspace.parent == base
+        assert workspace.stat().st_mode & 0o777 == 0o700
+        assert (workspace / "helper.py").read_text() == "VALUE = 1\n"
+        assert (workspace / workspace_entry.COMPLETE_MARKER).read_text() == bundle.sha256
 
 
 def test_an_extraction_lands_under_its_own_digest(tmp_path: Path) -> None:
@@ -754,14 +756,15 @@ def test_an_extraction_lands_under_its_own_digest(tmp_path: Path) -> None:
     )
 
     assert first != second
-    assert first.name == first_bundle.sha256[:12]
-    assert second.name == second_bundle.sha256[:12]
+    assert first.name.startswith(first_bundle.sha256[:12] + "-")
+    assert second.name.startswith(second_bundle.sha256[:12] + "-")
+    assert (second / "helper.py").read_text() == "VALUE = 2\n"
     # The old extraction is untouched by the new one.
     assert (first / "helper.py").read_text() == "VALUE = 1\n"
 
 
-def test_a_torn_extraction_is_rebuilt_rather_than_entered(tmp_path: Path) -> None:
-    """A crashed attempt leaves a partial tree, and only the marker says so."""
+def test_a_torn_extraction_is_preserved_but_never_entered(tmp_path: Path) -> None:
+    """An incomplete sibling tree authorizes neither reuse nor deletion."""
 
     import eyvan.worker.runtime.workspace_entry as workspace_entry
 
@@ -775,18 +778,15 @@ def test_a_torn_extraction_is_rebuilt_rather_than_entered(tmp_path: Path) -> Non
         bundle.payload, sha256=bundle.sha256, signature=None, signing_key=None, base=base
     )
 
-    assert workspace == partial
-    assert not (partial / "leftover-shadow.py").exists()
-    assert (partial / "helper.py").exists()
+    assert workspace != partial
+    assert (partial / "leftover-shadow.py").read_text() == "VALUE = 2\n"
+    assert not (workspace / "leftover-shadow.py").exists()
+    assert (workspace / "helper.py").read_text() == "VALUE = 1\n"
+    assert (workspace / workspace_entry.COMPLETE_MARKER).read_text() == bundle.sha256
 
 
 def test_two_races_to_extract_the_same_bundle_both_succeed(tmp_path: Path) -> None:
-    """Ranks sharing a host race; both must land on a whole tree.
-
-    Each thread extracts into its own staging directory and the loser of the
-    rename reuses the winner's published extraction, so no interleaving ends
-    with a partial directory or a failure.
-    """
+    """Ranks sharing a host race; each must land on its own complete private tree."""
 
     import threading
 
@@ -811,10 +811,14 @@ def test_two_races_to_extract_the_same_bundle_both_succeed(tmp_path: Path) -> No
     for thread in threads:
         thread.join()
 
-    assert results[0] == results[1]
-    assert (results[0] / "helper.py").exists()
-    assert (results[0] / workspace_entry.COMPLETE_MARKER).is_file()
-    assert not list(base.glob(".*staging*"))
+    assert len(results) == 2
+    assert results[0] != results[1]
+    for workspace in results:
+        assert workspace.parent == base
+        assert workspace.stat().st_mode & 0o777 == 0o700
+        assert (workspace / "helper.py").read_text() == "VALUE = 1\n"
+        assert (workspace / workspace_entry.COMPLETE_MARKER).read_text() == bundle.sha256
+    assert set(base.iterdir()) == set(results)
 
 
 def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path: Path, monkeypatch, no_execvp) -> None:
@@ -841,5 +845,8 @@ def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path: Path
 
         assert raised.value.command == ["python", "tool.py", "--", "--fast"]
 
-    # The EYVAN_WORKSPACE_DIR override stayed the base: extraction landed under it.
-    assert (tmp_path / "ws" / bundle.sha256[:12] / "helper.py").exists()
+    # The override stayed the base; each invocation entered a distinct private tree.
+    workspaces = list((tmp_path / "ws").iterdir())
+    assert len(workspaces) == 2
+    assert Path.cwd() in workspaces
+    assert all((workspace / "helper.py").read_text() == "VALUE = 1\n" for workspace in workspaces)

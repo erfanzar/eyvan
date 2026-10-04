@@ -93,6 +93,7 @@ class FakeSshFleet:
             return RemoteResult(exit_code=self.lifecycle_exit_code, stdout="", stderr="")
         assert stdin == MARKER_SCRIPT, "the marker protocol must ship the audited script, not a built command"
         action, _path, cell, uid, generation, fence = argv[3:9]
+        command = tuple(argv[9:])
         current = self.markers.get(host)
         if action == "observe":
             if current is None:
@@ -101,25 +102,40 @@ class FakeSshFleet:
         if action == "claim":
             if self.refuse_claims:
                 return RemoteResult(exit_code=3, stdout="", stderr="host is claimed elsewhere")
-            if current is not None and not self._supersedable(current, cell, generation):
+            if current is not None and not self._supersedable(current, cell, uid, generation, fence):
                 return RemoteResult(exit_code=3, stdout="", stderr="host is claimed elsewhere")
             payload = _marker(cell, uid, int(generation), fence)
             self.markers[host] = payload
+            if command:
+                self.lifecycle_commands.append((host, command))
+                if self.lifecycle_exit_code:
+                    return RemoteResult(
+                        exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
+                    )
             return RemoteResult(exit_code=0, stdout=payload, stderr="")
         if action == "release":
             if current is not None:
-                if not self._supersedable(current, cell, generation):
+                expected = _marker(cell, uid, int(generation), fence)
+                if current != expected:
                     return RemoteResult(exit_code=3, stdout="", stderr="host is claimed elsewhere")
+                if command:
+                    self.lifecycle_commands.append((host, command))
+                    if self.lifecycle_exit_code:
+                        return RemoteResult(
+                            exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
+                        )
                 self.markers.pop(host)
             return RemoteResult(exit_code=0, stdout="", stderr="")
         return RemoteResult(exit_code=6, stdout="", stderr="unknown action")
 
     @staticmethod
-    def _supersedable(current: str, cell: str, generation: str) -> bool:
-        if _field(current, "cell_id") != cell:
+    def _supersedable(current: str, cell: str, uid: str, generation: str, fence: str) -> bool:
+        if _field(current, "cell_id") != cell or _field(current, "management_uid") != uid:
             return False
         observed = _field(current, "provider_generation")
-        return observed.isdigit() and int(observed) <= int(generation)
+        return observed.isdigit() and (
+            int(observed) < int(generation) or (int(observed) == int(generation) and _field(current, "fence") == fence)
+        )
 
 
 class OnPremSshConformanceHarness(ProviderConformanceHarness):
@@ -316,11 +332,12 @@ def test_a_release_replay_removes_the_markers_a_crash_left_behind(tmp_path) -> N
 
     driver, fleet, desired = _driver(tmp_path)
     driver.apply_capacity("cell-a", desired, _context("apply"))
+    claimed_marker = fleet.markers["eyvan@rack-a"]
     release = _context("release", generation=2)
     driver.release("cell-a", release)
     # A crash after the tombstone, before the host was cleaned: the marker is
     # back and the durable record is already gone.
-    fleet.markers["eyvan@rack-a"] = _marker("cell-a", "uid", 1, marker_fingerprint("fence-1"))
+    fleet.markers["eyvan@rack-a"] = claimed_marker
 
     replayed = driver.release("cell-a", release)
 

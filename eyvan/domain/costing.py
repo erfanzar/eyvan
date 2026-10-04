@@ -24,8 +24,9 @@ lets a cost be asserted for exact equality in tests rather than with a tolerance
 
 from __future__ import annotations
 
+import math
 import typing as tp
-from decimal import Decimal
+from decimal import Decimal, Overflow, localcontext
 
 #: Places retained when a Decimal result returns to float. Ten is well beyond any
 #: real currency precision and well inside float's exact-integer range for the
@@ -38,22 +39,39 @@ def money(value: float | int | str | Decimal) -> Decimal:
     """Return ``value`` as an exact Decimal.
 
     Floats are routed through ``str`` on purpose: ``Decimal(0.1)`` is the binary
-    approximation, ``Decimal(str(0.1))`` is ``0.1``.
+    approximation, ``Decimal(str(0.1))`` is ``0.1``. Nonfinite inputs are
+    refused: a NaN that slipped into a settlement would silently poison every
+    later budget comparison (NaN comparisons are all False, so a hard gate
+    would pass), and an infinity would only crash ``quantize`` deep in
+    reporting instead of failing here with a cause.
     """
 
-    return value if isinstance(value, Decimal) else Decimal(str(value))
+    amount = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not amount.is_finite():
+        raise ValueError(f"money must be finite, got {value!r}")
+    return amount
 
 
 def total(*values: float | int | str | Decimal) -> float:
     """Sum money exactly, returning a JSON-representable float."""
 
-    return _to_float(sum((money(value) for value in values), Decimal(0)))
+    try:
+        with localcontext():
+            amount = sum((money(value) for value in values), Decimal(0))
+    except Overflow as exc:
+        raise ValueError("money result must be a finite float") from exc
+    return _to_float(amount)
 
 
 def cost_for_hours(hourly_cost: float | int | str | Decimal, hours: float | int | str | Decimal) -> float:
     """Return the cost of holding capacity priced at ``hourly_cost`` for ``hours``."""
 
-    return _to_float(money(hourly_cost) * money(hours))
+    try:
+        with localcontext():
+            amount = money(hourly_cost) * money(hours)
+    except Overflow as exc:
+        raise ValueError("money result must be a finite float") from exc
+    return _to_float(amount)
 
 
 def scale(values: tp.Mapping[str, float], factor: float | int | str | Decimal) -> dict[str, float]:
@@ -65,14 +83,32 @@ def scale(values: tp.Mapping[str, float], factor: float | int | str | Decimal) -
     """
 
     multiplier = money(factor)
-    scaled = {name: _to_float(money(quantity) * multiplier) for name, quantity in values.items()}
+    scaled = {name: cost_for_hours(quantity, multiplier) for name, quantity in values.items()}
     return {name: quantity for name, quantity in scaled.items() if quantity}
 
 
 def _to_float(value: Decimal) -> float:
-    """Quantize away accumulated noise and return a JSON-safe float."""
+    """Quantize away accumulated noise and return a JSON-safe float.
 
-    return float(value.quantize(_QUANTUM).normalize())
+    The quantum bounds the *fraction*, not the magnitude: ``quantize`` raises
+    InvalidOperation once the significant digits exceed the context precision,
+    so the rounding runs in a context widened for the magnitude at hand.
+    """
+
+    # Check before widening precision: an arbitrary Decimal exponent must not
+    # cause an allocation proportional to a magnitude JSON cannot represent.
+    if not value.is_finite() or not math.isfinite(float(value)):
+        raise ValueError("money result must be a finite float")
+    with localcontext() as context:
+        # Quantization retains ten fractional places, regardless of the input's
+        # exponent. One additional digit accommodates a carry during rounding.
+        context.prec = max(context.prec, (value.adjusted() if value else 0) + 12)
+        rounded = value.quantize(_QUANTUM)
+    # normalize() would round again using the caller's (possibly lower) precision.
+    result = float(rounded)
+    if not math.isfinite(result):
+        raise ValueError("money result must be a finite float")
+    return result
 
 
 __all__ = ("cost_for_hours", "money", "scale", "total")

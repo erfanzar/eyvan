@@ -49,6 +49,8 @@ export interface ResourceRequest {
   cpu: number;
   memoryGb: number;
   accelerator?: string;
+  /** Resource dimension, independent of the provider's accelerator model name. */
+  acceleratorKind?: "gpu" | "tpu";
   acceleratorCount?: number;
   replicas: number;
   slices?: number;

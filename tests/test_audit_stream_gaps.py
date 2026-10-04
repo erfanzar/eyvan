@@ -3,14 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Audit-stream completeness when transactions commit out of sequence order.
+"""Existing bounded SSE lookback compatibility and genuine stored rollback gaps.
 
-``AuditEventRow.sequence`` is a BIGSERIAL allocated at *flush*, while rows become
-visible at *commit*. Two overlapping transactions can therefore commit out of
-sequence order. A follower that only ever advances ``sequence > cursor`` would
-skip the lower one permanently -- and because the in-memory backend assigns
-sequences under a single lock, the guarantee was strictly weaker on the
-production backend than on the development one, with nothing covering it.
+Repository allocation is commit-safe; the production concurrency proof lives in
+``test_review_cycle2_commit_safe_audit``. Explicit stored sequence gaps here pin
+legacy lookback bytes without pretending StateSession accepts caller sequences.
 """
 
 from __future__ import annotations
@@ -58,39 +55,41 @@ def _stream(client: TestClient, *, after: int) -> list[dict]:
     return [json.loads(block.split("data: ", 1)[1]) for block in response.text.split("\n\n") if "data: " in block]
 
 
-def _client(repository: InMemoryRepository) -> TestClient:
+def _client(repository: InMemoryRepository, tmp_path) -> TestClient:
     return TestClient(
         create_app(
-            settings=EyvanSettings(dev_auth_enabled=True, controller_enabled=False),
+            settings=EyvanSettings(
+                dev_auth_enabled=True,
+                controller_enabled=False,
+                artifact_store_uri=str(tmp_path / "artifacts"),
+                artifact_token_key="a" * 32,
+            ),
             repository=repository,
             service=ControlPlaneService(repository),
         )
     )
 
 
-async def test_a_late_committing_lower_sequence_event_is_still_delivered() -> None:
-    """The gap: sequence 100 lands after 101 was already streamed."""
+async def test_stored_gap_preserves_existing_bounded_reconnect_lookback(tmp_path) -> None:
+    """Stored sequences, not supplied append sequences, exercise lookback compatibility."""
 
     repository = InMemoryRepository()
     async with repository.transaction() as transaction:
-        await transaction.append_event(_event("evt-101", 101))
+        transaction._state.next_event_sequence = 101
+        stored = await transaction.append_event(_event("evt-101", 101))
+        assert stored.sequence == 101
 
-    with _client(repository) as client:
+    with _client(repository, tmp_path) as client:
         first = _stream(client, after=0)
         assert [event["id"] for event in first] == ["evt-101"]
 
-        # The straggler commits now, below the cursor the follower already reached.
-        async with repository.transaction() as transaction:
-            await transaction.append_event(_event("evt-100", 100))
-
         second = _stream(client, after=101)
 
-    assert "evt-100" in [event["id"] for event in second], (
-        "a follower that only advances its cursor would lose this event permanently"
-    )
+    assert [event["sequence"] for event in second] == [101]
+    assert [event["id"] for event in second] == ["evt-101"]
 
 
-async def test_lookback_does_not_redeliver_within_one_stream() -> None:
+async def test_lookback_does_not_redeliver_within_one_stream(tmp_path) -> None:
     """Re-scanning behind the cursor must not duplicate what was already sent."""
 
     repository = InMemoryRepository()
@@ -98,7 +97,7 @@ async def test_lookback_does_not_redeliver_within_one_stream() -> None:
         for index in range(1, 6):
             await transaction.append_event(_event(f"evt-{index}", index))
 
-    with _client(repository) as client:
+    with _client(repository, tmp_path) as client:
         delivered = _stream(client, after=0)
 
     ids = [event["id"] for event in delivered]

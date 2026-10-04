@@ -44,7 +44,7 @@ class TransactionProbe:
             self.active_transactions -= 1
 
 
-async def _delivery_history(repository, failures: int, rate: int) -> None:
+async def _delivery_history(repository, failures: int, rate: int, accepted_before_failure: bool = False) -> None:
     repository = TransactionProbe(repository)
     key = f"delivery-{failures}-{rate}"
     workload_id, cell = await _seed(repository, key, 0)
@@ -84,15 +84,24 @@ async def _delivery_history(repository, failures: int, rate: int) -> None:
         def __init__(self):
             super().__init__()
             self.requests = []
+            self.accepted = {}
 
         def submit(self, cell_id, request):
             assert repository.active_transactions == 0
             self.requests.append((cell_id, request))
-            if len(self.requests) <= failures:
+            key = request.mutation.idempotency_key
+            failing = len(self.requests) <= failures
+            if accepted_before_failure or not failing:
+                if key not in self.accepted:
+                    self.accepted[key] = super().submit(cell_id, request)
+            if failing:
+                # The controller sees the same exception whether admission never
+                # happened or the worker admitted it and lost its response.
                 raise RuntimeError("deliberate submit failure")
-            return super().submit(cell_id, request)
+            return self.accepted[key]
 
     agent = FailingSubmit()
+    fence = None
     for delivery in range(failures + 1):
         # Reconstruct the controller between deliveries; reservation and retry
         # state must come from storage rather than process-local counters.
@@ -114,30 +123,31 @@ async def _delivery_history(repository, failures: int, rate: int) -> None:
         failed = [event for event in after["events"] if event.action == "workload.dispatch_reservation_failed"]
         dispatched = [event for event in after["events"] if event.action == "workload.dispatched"]
         assert len(reserved) == delivery + 1
-        assert len(failed) == min(delivery + 1, failures)
+        assert not failed
+        reservation = current.dispatch_reservation
+        assert reservation is not None
+        fence = fence or reservation.fence
+        assert reservation.fence == fence
+        assert reservation.outbox_id == command.id
+        assert reservation.outbox_attempt == command.attempts
+        assert reservation.generation == current.generation
+        assert reservation.workload_attempt == current.attempt
+        assert reservation.lease_ids == (lease.id,)
+        assert command.payload["dispatch_reservation"] == reservation.model_dump(mode="json")
         assert not any(event.action == "lease.settled" for event in after["events"])
         if delivery < failures:
             assert command.state is OutboxState.FAILED
             assert "deliberate submit failure" in command.last_error
             assert current.state is WorkloadState.LEASED and current.remote_id is None
-            assert current.dispatch_reservation is None
-            assert "dispatch_reservation" not in command.payload
             assert after["leases"] == initial["leases"]
-            assert not dispatched and not agent.submissions
+            assert not dispatched
+            assert len(agent.submissions) == int(accepted_before_failure)
             # Advance only the retry clock; do not alter states/claims/attempts.
             async with repository.transaction() as tx:
                 await tx.put_outbox(command.model_copy(update={"available_at": utcnow() - timedelta(seconds=1)}))
         else:
             assert command.state is OutboxState.SUCCEEDED and command.last_error is None
             assert current.state is WorkloadState.DISPATCHING
-            reservation = current.dispatch_reservation
-            assert reservation is not None
-            assert reservation.outbox_id == command.id
-            assert reservation.outbox_attempt == command.attempts
-            assert reservation.generation == current.generation
-            assert reservation.workload_attempt == current.attempt
-            assert reservation.lease_ids == (lease.id,)
-            assert command.payload["dispatch_reservation"] == reservation.model_dump(mode="json")
             assert current.remote_id == agent.requests[-1][1].spec["submission_id"]
             assert len(dispatched) == len(agent.submissions) == 1
             active = after["leases"][lease.id]
@@ -147,28 +157,40 @@ async def _delivery_history(repository, failures: int, rate: int) -> None:
             assert await _snapshot(repository, workload_id) == after
     assert {identifier for identifier, _ in agent.requests} == {cell.id}
     assert len({request.spec["submission_id"] for _, request in agent.requests}) == 1
+    assert len({request.mutation.idempotency_key for _, request in agent.requests}) == 1
+    assert len(agent.submissions) == len(agent.accepted) == 1
 
 
 @pytest.mark.asyncio
 @settings(max_examples=15, deadline=None)
-@given(failures=st.integers(min_value=0, max_value=3), rate=st.integers(min_value=0, max_value=10))
-async def test_generated_dispatch_delivery_history(failures: int, rate: int) -> None:
-    await _delivery_history(InMemoryRepository(), failures, rate)
+@given(
+    failures=st.integers(min_value=0, max_value=3),
+    rate=st.integers(min_value=0, max_value=10),
+    accepted_before_failure=st.booleans(),
+)
+async def test_generated_dispatch_delivery_history(failures: int, rate: int, accepted_before_failure: bool) -> None:
+    await _delivery_history(InMemoryRepository(), failures, rate, accepted_before_failure)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repository", ["memory", "postgres"], indirect=True)
 @pytest.mark.parametrize("failures,rate", [(0, 0), (1, 7), (3, 0), (3, 5)])
-async def test_dispatch_delivery_history_on_repository(repository, failures: int, rate: int) -> None:
-    await _delivery_history(repository, failures, rate)
+@pytest.mark.parametrize("accepted_before_failure", [False, True])
+async def test_dispatch_delivery_history_on_repository(
+    repository, failures: int, rate: int, accepted_before_failure: bool
+) -> None:
+    await _delivery_history(repository, failures, rate, accepted_before_failure)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failures,rate", [(0, 0), (1, 7), (3, 0), (3, 5)])
-async def test_dispatch_delivery_history_on_local_repository(tmp_path, failures: int, rate: int) -> None:
+@pytest.mark.parametrize("accepted_before_failure", [False, True])
+async def test_dispatch_delivery_history_on_local_repository(
+    tmp_path, failures: int, rate: int, accepted_before_failure: bool
+) -> None:
     repository = LocalJsonRepository(tmp_path / "state.json")
     await repository.open()
     try:
-        await _delivery_history(repository, failures, rate)
+        await _delivery_history(repository, failures, rate, accepted_before_failure)
     finally:
         await repository.close()

@@ -76,7 +76,14 @@ class EstimatesMixin:
             # hourly price scale with the worker count, so multiplying by it again
             # here priced a pods=8 job at eight times its real hourly.
             cells = spec.cell_group_count
-            template = pool.make_cell(f"estimate-{pool.id}", worker_count=spec.worker_count)
+            try:
+                template = pool.make_cell(f"estimate-{pool.id}", worker_count=spec.worker_count)
+            except ValueError:
+                # Capability declarations need not guarantee that this pool's
+                # factory can materialize the requested width. An impossible
+                # declared shape is not a candidate, nor a failure of the whole
+                # estimate; make_cell performs no provider or live-state I/O.
+                continue
             # Not costing.scale: that drops zero entries by design, because it exists
             # for accelerator-hour vectors where a zero reads as "used no GPU". A
             # scalar price of zero is a real answer an unpriced pool must be able to
@@ -124,6 +131,10 @@ class EstimatesMixin:
         their workload is unaffordable when it is merely queued.
         """
 
+        if spec.required_executor is not None and pool.executor != spec.required_executor:
+            return False
+        if spec.worker_count > 1 and not pool.hosts_multi_worker_cells:
+            return False
         if spec.accelerator_type and pool.accelerator_type != spec.accelerator_type:
             return False
         if spec.capacity_class is not pool.capacity_class:

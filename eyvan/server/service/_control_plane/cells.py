@@ -50,6 +50,14 @@ class CellsMixin:
                     raise ConflictError("idempotency record points to a missing cell")
                 return existing_cell, True
             existing = await tx.get_cell(cell.id)
+            if (
+                existing is not None
+                and (existing.billing_started_at is not None or existing.billed_seconds > 0 or existing.idle_seconds > 0)
+                and (existing.unit_prices != cell.unit_prices or existing.hourly_cost() != cell.hourly_cost())
+            ):
+                # The ledger stores elapsed time, not historical rate intervals.
+                # Until such a ledger exists, a new rate would reprice old hours.
+                raise ConflictError("cannot change a cell billing rate after billing has started")
             endpoint_changed = existing is not None and existing.endpoint != cell.endpoint
             if existing is not None and existing.state is not CellState.DELETED:
                 changed_identity = _changed_cell_capacity_identity(existing, cell)
@@ -144,6 +152,10 @@ class CellsMixin:
                     "provider_phase_started_at": None if requires_provision else existing.provider_phase_started_at,
                     "unavailable_reason": None if requires_provision else existing.unavailable_reason,
                     "last_heartbeat_at": None if requires_provision else existing.last_heartbeat_at,
+                    "billed_seconds": 0.0 if existing is None else existing.billed_seconds,
+                    "idle_seconds": 0.0 if existing is None else existing.idle_seconds,
+                    "billing_started_at": (None if requires_provision else existing.billing_started_at),
+                    "billing_ticked_at": None if requires_provision else existing.billing_ticked_at,
                     "updated_at": now,
                 }
             )
@@ -225,6 +237,8 @@ class CellsMixin:
                     "provider_phase_started_at": None,
                     "unavailable_reason": None,
                     "last_heartbeat_at": None,
+                    "billing_started_at": None,
+                    "billing_ticked_at": None,
                     "updated_at": now,
                 }
             )

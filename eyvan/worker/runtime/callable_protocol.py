@@ -336,12 +336,20 @@ class UriArtifactTransfer:
             _current = _current.parent
         for _directory in reversed(_missing):
             _directory.mkdir(mode=0o700, exist_ok=True)
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
-            temporary.write(payload)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        os.replace(temporary_path, path)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, path)
+        except BaseException:
+            # The temp file is created with delete=False; a failed write must
+            # not leave it behind, because nothing prunes this directory.
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
 
     def _validate_http(self, uri: str, subject: str) -> None:
         if uri.startswith("http://") and self._environment.get("EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP", "").lower() not in {
@@ -431,30 +439,22 @@ def _materialize_workspace(
         if _WORKSPACE_BASE_ANCHOR is None or not _WORKSPACE_BASE_ANCHOR.is_dir():
             _WORKSPACE_BASE_ANCHOR = Path.cwd() / ".eyvan-workspace"
         base = _WORKSPACE_BASE_ANCHOR
-    # One directory per bundle digest: a digest's contents are immutable, so a
-    # resubmission reuses its extraction and a changed bundle never meets the
-    # old one. Iteration -- run, see the error, fix, rerun -- must not require
-    # cleaning cells between attempts.
-    destination = base / sha256[:12]
+    # Archive bytes can be cached by digest, but execution trees are writable:
+    # an earlier attempt may have changed or removed submitted files. Extract
+    # verified bytes afresh into a private, unique tree for each invocation.
+    # Concurrent invocations never write, reuse, or remove each other's tree.
     _ensure_private_dir(base)
+    destination = Path(tempfile.mkdtemp(dir=base, prefix=f"{sha256[:12]}-"))
     try:
-        for stale in sorted(base.iterdir())[:-4]:
-            if stale.is_dir() and stale.name not in (sha256[:12],):
-                _remove_tree(stale)
-    except OSError:
-        pass
-    # A completed extraction is reusable -- the directory is named by the
-    # bundle's digest, so its contents are pinned. But an extraction that died
-    # mid-write leaves a partial directory that would silently shadow modules;
-    # only the completion marker makes "exists" mean "whole".
-    marker = destination / ".eyvan-extraction-complete"
-    if marker.is_file():
-        pass
-    else:
-        if destination.exists():
-            _remove_tree(destination)
         _workspace_extractor()(payload, destination)
-        marker.write_text(sha256)
+        (destination / ".eyvan-extraction-complete").write_text(sha256, encoding="utf-8")
+    except BaseException:
+        # Only this invocation owns this incomplete tree; it has not been
+        # entered or added to sys.path yet, so removing it is safe.
+        _remove_tree(destination)
+        raise
+    # Completed trees may still be cwd/sys.path of live workloads or children.
+    # Without an execution ownership ledger, never evict a sibling here.
     # Enter the workspace so relative paths behave as they did for the caller,
     # and make its modules importable by the unpickling that follows.
     os.chdir(destination)
@@ -489,7 +489,7 @@ def _cache_root(environment: tp.Mapping[str, str]) -> Path | None:
 
 
 def _remove_tree(root: Path) -> None:
-    """Best-effort recursive remove for stale workspace extractions."""
+    """Best-effort recursive removal of an invocation's own incomplete tree."""
 
     import shutil
 
@@ -505,7 +505,8 @@ def _ensure_private_dir(root: Path) -> None:
         missing.append(cursor)
         cursor = cursor.parent
     for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
+        # Another invocation may create the shared base after our exists check.
+        directory.mkdir(mode=0o700, exist_ok=True)
         existing_mode = directory.stat().st_mode & 0o777
         if existing_mode != 0o700:
             directory.chmod(0o700)
@@ -547,7 +548,12 @@ def _read_cached(
             os.replace(temporary, candidate)
             _prune_cache(cache_root)
         except OSError:
-            pass
+            # Pruning counts only .pkl entries, so remove partial fills when
+            # possible without turning an optional cache failure into a job failure.
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     return payload
 
 

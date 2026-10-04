@@ -422,46 +422,69 @@ async def test_a_transaction_that_raises_leaves_nothing_behind(database) -> None
 
 
 async def test_a_late_commit_is_still_delivered_to_a_follower(database) -> None:
-    """The exact hazard the streaming route documents, on the database that has it.
+    """A held allocation cannot be skipped by a concurrent audit follower.
 
-    ``sequence`` is a BIGSERIAL allocated at *flush* while rows become visible at
-    *commit*, so two overlapping transactions can commit out of sequence order.
-    A follower that only ever advanced past its high-water mark would skip the
-    lower sequence forever -- an audit stream silently missing events, which is
-    the one thing an audit stream must not do.
-
-    This test's value is proving the out-of-order commit is real here. SQLite
-    serializes writers and could never produce it.
+    The commit-safe sequence lock prevents out-of-order visibility. Contending
+    appenders abort with TransientRepositoryError and retry the whole transaction,
+    rather than waiting while holding any domain locks they already acquired.
     """
 
     repository = await _migrated(database)
+    allocated = asyncio.Event()
+    contended = asyncio.Event()
+    release = asyncio.Event()
 
-    async def emit(entity: str, hold: float) -> int:
+    async def emit(entity: str, *, hold: bool = False) -> int:
+        for attempt in range(100):
+            try:
+                async with repository.transaction() as transaction:
+                    event = await transaction.append_event(
+                        AuditEvent(
+                            id=f"evt-{entity}",
+                            org_id="acme",
+                            project_id="research",
+                            entity_type="workload",
+                            entity_id=entity,
+                            action="test.emitted",
+                            actor="alice",
+                        )
+                    )
+                    if hold:
+                        allocated.set()
+                        await release.wait()
+                    sequence = int(event.sequence or 0)
+                return sequence
+            except TransientRepositoryError:
+                contended.set()
+                if attempt == 99:
+                    raise
+                await asyncio.sleep(0.01)
+        raise AssertionError("audit append retries exhausted")
+
+    early = asyncio.create_task(emit("early", hold=True))
+    late = None
+    try:
+        await asyncio.wait_for(allocated.wait(), timeout=5)
+        late = asyncio.create_task(emit("late"))
+        await asyncio.wait_for(contended.wait(), timeout=5)
         async with repository.transaction() as transaction:
-            event = await transaction.append_event(
-                AuditEvent(
-                    id=f"evt-{entity}",
-                    org_id="acme",
-                    project_id="research",
-                    entity_type="workload",
-                    entity_id=entity,
-                    action="test.emitted",
-                    actor="alice",
-                )
-            )
-            await asyncio.sleep(hold)
-            return int(event.sequence or 0)
+            visible = await transaction.list_events(org_id="acme", project_id="research")
+        assert visible == [], "a higher cursor must not become visible ahead of the held allocation"
+        release.set()
+        low, high = await asyncio.gather(early, late)
+    finally:
+        release.set()
+        tasks = [early] if late is None else [early, late]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    # The first transaction takes its sequence first and commits last.
-    low, high = await asyncio.gather(emit("early", 0.3), emit("late", 0.0))
-    assert low < high, "the sequences were not allocated in the order this test needs"
-
+    assert low < high, "the held allocation must commit before the contending appender"
     async with repository.transaction() as transaction:
-        # A follower already past `low` re-scans behind its cursor, which is what
-        # the streaming route does with `_AUDIT_STREAM_LOOKBACK`.
         rescanned = await transaction.list_events(after_sequence=low - 1, org_id="acme", project_id="research")
 
-    assert low in {int(event.sequence or 0) for event in rescanned}, "the late commit was lost"
+    assert [(event.entity_id, int(event.sequence or 0)) for event in rescanned] == [("early", low), ("late", high)]
 
 
 # --------------------------------------------------------------------------- deployment constraint

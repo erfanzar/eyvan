@@ -38,6 +38,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shlex
 import subprocess
 import time
@@ -67,9 +68,13 @@ _RELEASED_CELL_STATE: tp.Final[str] = CellState.DELETED.value
 #: terminal; the whole cleanup measurement becomes unknown instead.
 _KNOWN_CELL_STATES: tp.Final[frozenset[str]] = frozenset(state.value for state in CellState)
 
-#: Largest stdout an inventory command may print before it is unusable. A count
-#: is at most twenty digits; anything larger is a command doing something else.
+#: Largest stdout or stderr an inventory command may print before it is unusable.
+#: A count is at most twenty digits; large diagnostics also make the probe unknown.
 MAX_INVENTORY_OUTPUT_BYTES: tp.Final[int] = 4_096
+
+#: Per-stream acquisition ceiling for ps/lsof, whose descriptor listings can be
+#: much longer than an inventory count. Oversized output is unknown, not truncated.
+MAX_PROCESS_OUTPUT_BYTES: tp.Final[int] = 1_048_576
 
 #: Largest pid file the monitor will read.
 MAX_PID_FILE_BYTES: tp.Final[int] = 64
@@ -92,22 +97,57 @@ def _bounded_count(text: str) -> int | None:
     return value if 0 <= value <= MAX_SAFE_COUNTER else None
 
 
-def _run_command(argv: tp.Sequence[str], *, timeout_s: float) -> subprocess.CompletedProcess[str] | None:
-    """Run one bounded external command, returning None if it could not run."""
+def _run_command(
+    argv: tp.Sequence[str], *, timeout_s: float, max_output_bytes: int = MAX_PROCESS_OUTPUT_BYTES
+) -> subprocess.CompletedProcess[str] | None:
+    """Capture bounded streams, killing and reaping a timed-out or oversized child."""
 
+    if not math.isfinite(timeout_s) or timeout_s <= 0 or max_output_bytes <= 0:
+        return None
+    deadline = time.monotonic() + timeout_s
     try:
-        # No shell: the operator's argv is executed literally, so quoting and
-        # $IFS in the surrounding environment cannot change what runs. The
-        # environment is still scrubbed of interpreter steering, because the
-        # command is usually a provider CLI embedding its own Python.
-        return subprocess.run(
-            list(argv),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-            env=provider_cli_env(),
-        )
+        # No shell, and no inherited interpreter steering for embedded Python.
+        # Read both pipes together so a full stderr pipe cannot deadlock stdout.
+        with subprocess.Popen(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=provider_cli_env()
+        ) as process:
+            try:
+                assert process.stdout is not None and process.stderr is not None
+                stdout = bytearray()
+                stderr = bytearray()
+                with selectors.DefaultSelector() as selector:
+                    for pipe, buffer in ((process.stdout, stdout), (process.stderr, stderr)):
+                        os.set_blocking(pipe.fileno(), False)
+                        selector.register(pipe, selectors.EVENT_READ, buffer)
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return None
+                        for key, _events in selector.select(remaining):
+                            buffer = key.data
+                            try:
+                                chunk = os.read(key.fd, min(65_536, max_output_bytes + 1 - len(buffer)))
+                            except BlockingIOError:
+                                continue
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                continue
+                            buffer.extend(chunk)
+                            if len(buffer) > max_output_bytes:
+                                return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                returncode = process.wait(timeout=remaining)
+                # Match subprocess text mode's encoding and universal newlines,
+                # but decode only after byte-bounded acquisition has completed.
+                out = stdout.decode(process.stdout.encoding).replace("\r\n", "\n").replace("\r", "\n")
+                err = stderr.decode(process.stderr.encoding).replace("\r\n", "\n").replace("\r", "\n")
+                return subprocess.CompletedProcess(list(argv), returncode, out, err)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -129,7 +169,8 @@ def read_pid_file(path: Path) -> int | None:
     """
 
     try:
-        raw = path.read_bytes()[: MAX_PID_FILE_BYTES + 1]
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_PID_FILE_BYTES + 1)
     except OSError:
         return None
     if len(raw) > MAX_PID_FILE_BYTES:
@@ -300,7 +341,7 @@ def measure_provider_inventory(command: str, *, timeout_s: float) -> int | None:
         return None
     if not argv:
         return None
-    completed = _run_command(argv, timeout_s=timeout_s)
+    completed = _run_command(argv, timeout_s=timeout_s, max_output_bytes=MAX_INVENTORY_OUTPUT_BYTES)
     if completed is None or completed.returncode != 0:
         return None
     if len(completed.stdout) > MAX_INVENTORY_OUTPUT_BYTES:

@@ -154,8 +154,8 @@ def test_local_store_rejects_symlink_escape_before_writing(tmp_path: Path) -> No
     outside = tmp_path / "outside"
     root.mkdir()
     outside.mkdir()
-    (root / "scopes").symlink_to(outside, target_is_directory=True)
     store = LocalManagedArtifactStore(root)
+    (root / "scopes").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(InvalidManagedArtifactURI, match="symbolic links"):
         store.put(result_uri("run-1"), b"secret", org_id="acme", project_id="research")
@@ -705,8 +705,7 @@ def test_local_delete_retry_finishes_a_post_detach_crash(
     )
 
     assert outcome.status is ManagedArtifactDeleteStatus.DELETED
-    generation_directory = next((store.root / ".generations").iterdir())
-    assert list(generation_directory.iterdir()) == []
+    assert list((store.root / ".generations").iterdir()) == []
 
 
 def test_local_delete_reuse_keeps_inode_consumption_bounded(tmp_path: Path) -> None:
@@ -729,8 +728,7 @@ def test_local_delete_reuse_keeps_inode_consumption_bounded(tmp_path: Path) -> N
         )
         assert deleted.status is ManagedArtifactDeleteStatus.DELETED
 
-    generation_directory = next((root / ".generations").iterdir())
-    assert list(generation_directory.iterdir()) == []
+    assert list((root / ".generations").iterdir()) == []
     physical_entries = (root, *root.rglob("*"))
     allocated_inodes = {(entry.lstat().st_dev, entry.lstat().st_ino) for entry in physical_entries}
     assert len(allocated_inodes) <= 8
@@ -870,9 +868,12 @@ def test_local_delete_cleanup_recovers_after_every_durable_boundary(
         assert stale_delete.current_metadata == replacement.metadata
         assert restarted.get(uri, org_id="acme", project_id="research") == b"generation-b"
 
-    generation_directory = next((root / ".generations").iterdir())
-    assert not list(generation_directory.glob(".delete-*"))
-    assert not list(generation_directory.glob(".trash-*"))
+    assert not list((root / ".generations").glob("*/.delete-*"))
+    assert not list((root / ".generations").glob("*/.trash-*"))
+    if retry_operation == "delete":
+        assert list((root / ".generations").iterdir()) == []
+    else:
+        assert list((root / ".generations").glob("*/*.artifact"))
 
 
 class _SimulatedArchivedReceiptCrash(BaseException):
@@ -1994,7 +1995,7 @@ class FakeGCSInventoryAPI:
         assert query["softDeleted"] == ["false"]
         assert query["projection"] == ["noAcl"]
         assert query["fields"] == ["items(name,size,generation),nextPageToken"]
-        assert "pageToken" not in query
+        page_offset = int(query.get("pageToken", ["provider-page-0"])[0].removeprefix("provider-page-"))
         prefix = query["prefix"][0]
         maximum = int(query["maxResults"][0])
         live: list[tuple[str, int, int]] = []
@@ -2012,14 +2013,14 @@ class FakeGCSInventoryAPI:
         if start_offset is not None:
             live = [item for item in live if item[0] >= start_offset]
         page_size = maximum if self.server_page_size is None else min(maximum, self.server_page_size)
-        selected = live[:page_size]
+        selected = live[page_offset : page_offset + page_size]
         document: dict[str, tp.Any] = {}
         if selected:
             document["items"] = [
                 {"name": name, "size": str(size), "generation": str(generation)} for name, size, generation in selected
             ]
-        if len(live) > len(selected):
-            document["nextPageToken"] = f"provider-page-{len(selected)}"
+        if len(live) > page_offset + len(selected):
+            document["nextPageToken"] = f"provider-page-{page_offset + len(selected)}"
         return 200, json.dumps(document, separators=(",", ":")).encode()
 
     def _get(self, name: str, query: dict[str, list[str]]) -> tuple[int, bytes]:
@@ -2139,17 +2140,17 @@ def test_gcs_inventory_json_api_returns_only_the_current_live_generation() -> No
     assert deleted is None
     first_query = api.calls[0]["query"]
     assert first_query["prefix"] == [prefix]
-    assert first_query["maxResults"] == ["2"]
+    assert first_query["maxResults"] == ["1000"]
     assert first_query["versions"] == ["false"]
     assert first_query["softDeleted"] == ["false"]
     assert "startOffset" not in first_query
-    assert api.calls[1]["query"]["startOffset"] == [f"{first_name}!"]
+    assert "startOffset" not in api.calls[1]["query"]
     stat_calls = api.calls[2:]
     assert all(call["path"] != "/storage/v1/b/eyvan-managed/o" for call in stat_calls)
     assert all("versions" not in call["query"] and "generation" not in call["query"] for call in stat_calls)
 
 
-def test_gcs_inventory_honors_bounded_page_tokens_and_resumes_with_start_offset() -> None:
+def test_gcs_inventory_honors_bounded_page_tokens_and_resumes_with_logical_cursor() -> None:
     api = FakeGCSInventoryAPI()
     store = _inventory_store(api)
     prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/"
@@ -2158,33 +2159,20 @@ def test_gcs_inventory_honors_bounded_page_tokens_and_resumes_with_start_offset(
     for index, name in enumerate(names):
         api.add(name, size=index + 1, generation=100 + index, live=True)
 
-    # A provider may return fewer than maxResults. Each public request still
-    # advances even when the server emits one object plus a nextPageToken.
+    # Short provider pages are consumed within the bounded logical scan.
     api.server_page_size = 1
     first = store.list_scope(org_id="acme", project_id="research", limit=2)
-    assert [item.uri for item in first.objects] == [uris[0]]
-    assert first.next_cursor == uris[0]
+    assert [item.uri for item in first.objects] == list(uris[:2])
+    assert first.next_cursor == uris[1]
+    assert len(api.calls) == 3
+    assert api.calls[1]["query"]["pageToken"] == ["provider-page-1"]
+    assert api.calls[2]["query"]["pageToken"] == ["provider-page-2"]
 
-    second = store.list_scope(
-        org_id="acme",
-        project_id="research",
-        cursor=first.next_cursor,
-        limit=2,
-    )
-    assert [item.uri for item in second.objects] == [uris[1]]
-    assert second.next_cursor == uris[1]
-    assert api.calls[1]["query"]["startOffset"] == [f"{names[0]}!"]
-    assert "pageToken" not in api.calls[1]["query"]
-
-    third = store.list_scope(
-        org_id="acme",
-        project_id="research",
-        cursor=second.next_cursor,
-        limit=2,
-    )
-    assert [item.uri for item in third.objects] == [uris[2]]
-    assert third.next_cursor is None
-    assert api.calls[2]["query"]["startOffset"] == [f"{names[1]}!"]
+    second = store.list_scope(org_id="acme", project_id="research", cursor=first.next_cursor, limit=2)
+    assert [item.uri for item in second.objects] == [uris[2]]
+    assert second.next_cursor is None
+    assert len(api.calls) == 6
+    assert all("startOffset" not in call["query"] for call in api.calls)
 
 
 def test_gcs_inventory_cursor_does_not_skip_a_longer_canonical_filename() -> None:
@@ -2212,10 +2200,10 @@ def test_gcs_inventory_cursor_does_not_skip_a_longer_canonical_filename() -> Non
             break
 
     assert observed == list(uris)
-    assert api.calls[1]["query"]["startOffset"][0].endswith("a.result!")
+    assert all("startOffset" not in call["query"] for call in api.calls)
 
 
-def test_gcs_inventory_consumes_exactly_one_bounded_request_for_a_large_prefix() -> None:
+def test_gcs_inventory_consumes_bounded_requests_for_a_large_prefix() -> None:
     api = FakeGCSInventoryAPI()
     store = _inventory_store(api)
     prefix = f"artifacts/scopes/{storage_scope('acme', 'research')}/results/"
@@ -2226,9 +2214,9 @@ def test_gcs_inventory_consumes_exactly_one_bounded_request_for_a_large_prefix()
 
     assert len(page.objects) == 4
     assert page.next_cursor == result_uri("run-00003")
-    assert len(api.calls) == 1
-    assert api.calls[0]["query"]["maxResults"] == ["5"]
-    assert api.calls[0]["maximum_response_bytes"] == 2 * 1024 * 1024
+    assert len(api.calls) == 5
+    assert all(call["query"]["maxResults"] == ["1000"] for call in api.calls)
+    assert all(call["maximum_response_bytes"] == 2 * 1024 * 1024 for call in api.calls)
 
 
 def test_gcs_inventory_percent_encodes_scope_prefix_and_exact_object_name() -> None:

@@ -277,7 +277,8 @@ export function workloadStatus(value: string): WorkloadStatus {
 
 function mapWorkload(raw: RawWorkload): WorkloadDetail {
   const resources = raw.spec.gang.per_replica;
-  const accelerator = resources.tpu ? (raw.spec.accelerator_type ?? "TPU") : undefined;
+  const acceleratorKind = resources.tpu ? "tpu" : resources.gpu ? "gpu" : undefined;
+  const accelerator = acceleratorKind ? (raw.spec.accelerator_type ?? acceleratorKind.toUpperCase()) : undefined;
   return {
     id: raw.id,
     name: raw.spec.name,
@@ -290,7 +291,8 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
       cpu: resources.cpu,
       memoryGb: resources.memory_gib,
       accelerator,
-      acceleratorCount: resources.tpu || undefined,
+      acceleratorKind,
+      acceleratorCount: resources.tpu || resources.gpu || undefined,
       replicas: raw.spec.gang.replicas,
       // Replicas are the product of both counts: cells × workers-per-cell.
       // The callable path stores `pods` as worker_count with one cell group,
@@ -357,6 +359,7 @@ function resourceRows(raw: RawResources): Array<{ name: string; total: number }>
     ["CPU", raw.cpu],
     ["Memory GiB", raw.memory_gib],
     ["TPU", raw.tpu],
+    ["GPU", raw.gpu],
     ...Object.entries(raw.custom),
   ];
   return resources.filter(([, total]) => total > 0).map(([name, total]) => ({ name, total }));
@@ -501,7 +504,10 @@ export function computeOverview(
       const pendingResources: Array<[string, number]> = [
         ["CPU", workload.resources.cpu * workload.resources.replicas],
         ["Memory GiB", workload.resources.memoryGb * workload.resources.replicas],
-        ["TPU", (workload.resources.acceleratorCount ?? 0) * workload.resources.replicas],
+        [
+          workload.resources.acceleratorKind === "gpu" ? "GPU" : "TPU",
+          (workload.resources.acceleratorCount ?? 0) * workload.resources.replicas,
+        ],
       ];
       pendingResources.forEach(([name, pending]) => {
         const current = resourceBreakdown.get(name) ?? { used: 0, total: 0, pending: 0 };
@@ -1061,12 +1067,18 @@ export class EyvanApiClient {
    */
   /** Provisioning latency per pool, from the samples the scheduler ranks on. */
   async getLaunchLatency(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<LaunchLatencyReport> {
+    if (this.forceDemo) {
+      throw new ApiError("Launch latency is unavailable in demo mode; no live readings are requested.");
+    }
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<LaunchLatencyReport>("/capacity/launch-latency", { signal });
   }
 
   async getWarmth(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<WarmthReport> {
+    if (this.forceDemo) {
+      throw new ApiError("Warm capacity is unavailable in demo mode; no live readings are requested.");
+    }
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<WarmthReport>("/capacity/warmth", { signal });
@@ -1074,6 +1086,9 @@ export class EyvanApiClient {
 
   /** Accrued and idle cell cost across the fleet. */
   async getBilling(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<BillingReport> {
+    if (this.forceDemo) {
+      throw new ApiError("Fleet billing is unavailable in demo mode; no live readings are requested.");
+    }
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     return this.request<BillingReport>("/capacity/billing", { signal });
@@ -1096,6 +1111,11 @@ export class EyvanApiClient {
     signal?: AbortSignal,
     options: { project?: string; refresh?: boolean } = {},
   ): Promise<TpuQuotaSnapshot> {
+    // Demo data has no provider reading. Refuse instead of mixing live quota
+    // (including an explicit refresh) or fabricated zero usage into the sample.
+    if (this.forceDemo) {
+      throw new ApiError("Provider quota is unavailable in demo mode; no live readings are requested.");
+    }
     const requestScope = this.scopeSnapshot(scope);
     void requestScope;
     const query = new URLSearchParams();
@@ -1190,8 +1210,8 @@ export class EyvanApiClient {
       workloadId: lease.workload_id,
       owner: lease.project_id,
       cell: lease.cell_id,
-      resource: lease.resources.per_replica.tpu ? "TPU" : "CPU",
-      amount: `${lease.resources.replicas} x ${lease.resources.per_replica.tpu || lease.resources.per_replica.cpu}`,
+      resource: lease.resources.per_replica.tpu ? "TPU" : lease.resources.per_replica.gpu ? "GPU" : "CPU",
+      amount: `${lease.resources.replicas} x ${lease.resources.per_replica.tpu || lease.resources.per_replica.gpu || lease.resources.per_replica.cpu}`,
       state:
         lease.state === "pending"
           ? "activating"
@@ -1486,6 +1506,12 @@ export class EyvanApiClient {
    * beside it rather than being folded in.
    */
   async getProjectUsage(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<ProjectUsage> {
+    // Demo mode is fully self-contained like its sibling reads: no real
+    // network call, an empty (honest) usage answer instead of an error that
+    // blanks the Billing page.
+    if (this.forceDemo) {
+      return { orgId: scope.orgId, projectId: scope.projectId, subjects: [] };
+    }
     const raw = await this.request<Record<string, unknown>>(
       `/usage?org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`,
       { signal },

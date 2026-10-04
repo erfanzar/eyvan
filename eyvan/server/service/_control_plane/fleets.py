@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from eyvan.records import WorkloadRecord
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
     CapacityClass,
@@ -14,6 +15,7 @@ from eyvan.server.service._control_plane.shared import (
     ConflictError,
     IdempotencyRecord,
     InputError,
+    JsonObject,
     LeaseState,
     NotFoundError,
     Permission,
@@ -27,6 +29,14 @@ from eyvan.server.service._control_plane.shared import (
     utcnow,
     validate_capacity_pool_quota_groups,
 )
+
+
+def _fleet_pool_declaration(pool: CapacityPoolRecord) -> JsonObject:
+    """Exclude controller-owned shrink state as well as initialization bookkeeping."""
+
+    declaration = _pool_declaration(pool)
+    declaration["demand_below_supply_since"] = None
+    return declaration
 
 
 class FleetsMixin:
@@ -47,11 +57,11 @@ class FleetsMixin:
         )
         async with self.repository.transaction() as tx:
             existing_key = await self._idempotent_resource(tx, "fleet", "capacity-pool.upsert", key, fingerprint)
+            replayed: CapacityPoolRecord | None = None
             if existing_key is not None:
-                existing = await tx.get_capacity_pool(existing_key.resource_id)
-                if existing is None:
+                replayed = await tx.get_capacity_pool(existing_key.resource_id)
+                if replayed is None:
                     raise ConflictError("idempotency record points to a missing capacity pool")
-                return existing, True
             existing = await tx.get_capacity_pool(pool.id)
             # Authorized inside the transaction, against the stored owner rather
             # than the one the request asserts: reading it outside would leave a
@@ -67,6 +77,12 @@ class FleetsMixin:
                 # from here on, which deserves its own deliberate call rather
                 # than being a side effect of an update that changed max_cells.
                 self.authorizer.require(principal, Permission.MANAGE_FLEET)
+            if replayed is not None:
+                # The replay runs the same ownership gate as the original call:
+                # the pool may have changed hands or the caller's grant may
+                # have been revoked since, and a replay must not become an
+                # authorization-skipping read of the current configuration.
+                return replayed, True
             # A pool joining (or editing) a shared-quota group must agree with
             # the group it lands in. The planner spends the *minimum* member
             # limit, so a silently disagreeing upsert would tighten the whole
@@ -149,9 +165,7 @@ class FleetsMixin:
             raise InputError(str(exc)) from exc
         key = _validate_idempotency_key(idempotency_key)
         normalized = [
-            pool.model_copy(update={"generation": 1, "created_at": datetime.min, "updated_at": datetime.min}).model_dump(
-                mode="json"
-            )
+            {**_fleet_pool_declaration(pool), "enabled": pool.enabled}
             for pool in sorted(pools, key=lambda item: item.id)
         ]
         fingerprint = _fingerprint({"fleet_name": fleet_name, "pools": normalized})
@@ -160,6 +174,15 @@ class FleetsMixin:
             if existing_key is not None:
                 return await tx.list_capacity_pools(fleet_name=fleet_name), True
             existing = {pool.id: pool for pool in await tx.list_capacity_pools(fleet_name=fleet_name)}
+            # Pool IDs are global persistence keys, not fleet-local names. Check
+            # all supplied IDs before writes or pruning so an apply cannot move
+            # another fleet's template or reset its fencing generation.
+            for pool in pools:
+                globally_stored = await tx.get_capacity_pool(pool.id)
+                if globally_stored is not None and globally_stored.fleet_name != fleet_name:
+                    raise ConflictError(
+                        f"capacity pool {pool.id!r} already belongs to fleet {globally_stored.fleet_name!r}"
+                    )
             now = utcnow()
             supplied_ids = {pool.id for pool in pools}
             for pool in pools:
@@ -173,10 +196,15 @@ class FleetsMixin:
                 # twenty cells in one zone across nineteen hours, one per apply,
                 # each granted and released without ever becoming READY.
                 #
-                # `enabled` is normalised to True on both sides, so re-applying a
-                # drained fleet still counts as a change and still bumps, which is
-                # what brings its pools back.
-                if previous is not None and _pool_declaration(previous) == _pool_declaration(pool):
+                # Applying a fleet enables its supplied pools. A disabled stored
+                # pool is therefore a change even when its other fields match.
+                # Runtime clocks are not declarations and cannot invalidate cells
+                # or re-arm one-time initialization on an unchanged apply.
+                if (
+                    previous is not None
+                    and previous.enabled
+                    and _fleet_pool_declaration(previous) == _fleet_pool_declaration(pool)
+                ):
                     continue
                 await tx.put_capacity_pool(
                     pool.model_copy(
@@ -435,6 +463,10 @@ class FleetsMixin:
         cell_id: str,
         *,
         idempotency_key: str,
+        expected_workload: WorkloadRecord | None = None,
+        expected_cell_generation: int | None = None,
+        expected_pool_generation: int | None = None,
+        require_empty: bool = False,
     ) -> tuple[CellRecord, bool]:
         """Stop new placement and ask the cell agent to drain capacity."""
 
@@ -445,6 +477,10 @@ class FleetsMixin:
             topic="capacity.drain",
             operation="cell.drain",
             idempotency_key=idempotency_key,
+            expected_workload=expected_workload,
+            expected_cell_generation=expected_cell_generation,
+            expected_pool_generation=expected_pool_generation,
+            require_empty=require_empty,
         )
 
     async def delete_cell(
@@ -453,6 +489,8 @@ class FleetsMixin:
         cell_id: str,
         *,
         idempotency_key: str,
+        expected_cell_generation: int | None = None,
+        expected_pool_generation: int | None = None,
     ) -> tuple[CellRecord, bool]:
         """Release provider capacity after every lease has left the cell."""
 
@@ -465,6 +503,8 @@ class FleetsMixin:
             idempotency_key=idempotency_key,
             require_empty=True,
             bump_generation=True,
+            expected_cell_generation=expected_cell_generation,
+            expected_pool_generation=expected_pool_generation,
         )
 
     async def _change_cell_state(
@@ -478,15 +518,56 @@ class FleetsMixin:
         idempotency_key: str,
         require_empty: bool = False,
         bump_generation: bool = False,
+        expected_workload: WorkloadRecord | None = None,
+        expected_cell_generation: int | None = None,
+        expected_pool_generation: int | None = None,
     ) -> tuple[CellRecord, bool]:
         self.authorizer.require(principal, Permission.MANAGE_FLEET)
         key = _validate_idempotency_key(idempotency_key)
-        fingerprint = _fingerprint({"cell_id": cell_id, "target": target.value})
+        declaration: JsonObject = {"cell_id": cell_id, "target": target.value}
+        if expected_workload is not None:
+            declaration["expected_workload"] = expected_workload.model_dump(mode="json")
+        if expected_cell_generation is not None:
+            declaration["expected_cell_generation"] = expected_cell_generation
+        if expected_pool_generation is not None:
+            declaration["expected_pool_generation"] = expected_pool_generation
+        if require_empty and operation == "cell.drain":
+            declaration["require_empty"] = True
+        fingerprint = _fingerprint(declaration)
         async with self.repository.transaction() as tx:
             existing_key = await self._idempotent_resource(tx, "fleet", operation, key, fingerprint)
+            if expected_workload is not None:
+                current_workload = await tx.get_workload(expected_workload.id)
+                if current_workload is None or any(
+                    getattr(current_workload, name) != getattr(expected_workload, name)
+                    for name in ("generation", "state", "lease_id", "lease_ids", "remote_id")
+                ):
+                    raise ConflictError("execution ownership changed before cell drain")
             cell = await tx.get_cell(cell_id)
             if cell is None:
                 raise NotFoundError(f"cell {cell_id!r} was not found")
+            if expected_cell_generation is not None and cell.generation != expected_cell_generation:
+                raise ConflictError("cell generation changed before capacity mutation")
+            if expected_pool_generation is not None:
+                pool = await tx.get_capacity_pool(cell.pool_id) if cell.pool_id else None
+                if pool is None or pool.generation != expected_pool_generation:
+                    raise ConflictError("capacity pool changed before autoscale mutation")
+            if expected_workload is not None:
+                owned_ids = set(expected_workload.lease_ids or ())
+                if expected_workload.lease_id is not None:
+                    owned_ids.add(expected_workload.lease_id)
+                owned = False
+                for lease_id in owned_ids:
+                    lease = await tx.get_lease(lease_id)
+                    if (
+                        lease is not None
+                        and lease.cell_id == cell_id
+                        and lease.workload_id == expected_workload.id
+                        and lease.state not in {LeaseState.RELEASED, LeaseState.EXPIRED}
+                    ):
+                        owned = True
+                if not owned or cell.state is not CellState.READY:
+                    raise ConflictError("execution no longer owns ready capacity")
             if existing_key is not None:
                 return cell, True
             if require_empty:

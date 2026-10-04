@@ -123,7 +123,7 @@ class _ControllerWebhookDelivery:
                 # Isolated deliberately. A subscription pointing at something
                 # that raises in a way nothing here anticipated is one broken
                 # integration, not a reason to stop notifying everybody else.
-                logger.warning("webhook %s delivery failed unexpectedly: %s", webhook.id, error)
+                logger.warning("webhook %s delivery failed unexpectedly (%s)", webhook.id, type(error).__name__)
         return delivered
 
     async def _deliver_one(self, webhook: WebhookRecord) -> bool:
@@ -205,7 +205,13 @@ class _ControllerWebhookDelivery:
                 )
             response.raise_for_status()
         except (httpx.HTTPError, WebhookTargetRefused) as error:
-            await self._record_failure(webhook, str(error))
+            # Exception text can echo signed URLs, headers or response bytes.
+            # Keep only a controlled category/status; the subscription id already
+            # identifies the target without guessing credential parameter names.
+            detail = type(error).__name__
+            if isinstance(error, httpx.HTTPStatusError):
+                detail += f": HTTP {error.response.status_code}"
+            await self._record_failure(webhook, detail)
             return False
 
         await self._advance(webhook, highest)

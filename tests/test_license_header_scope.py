@@ -8,6 +8,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def test_default_header_scan_is_limited_to_first_party_sources(tmp_path):
     script = Path(__file__).resolve().parents[1] / "scripts" / "license_headers.py"
@@ -42,3 +44,51 @@ def test_existing_header_preserves_following_directives_and_comments(tmp_path):
         path.write_text(original)
         assert module.apply(path) is False
         assert path.read_text() == original
+
+
+@pytest.mark.parametrize("separator", ["", "\n"])
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("suite.tsx", "// @vitest-environment jsdom\n\nexport {};\n"),
+        ("block.tsx", "/** @vitest-environment jsdom */\n\nexport {};\n"),
+        ("module.py", "# Important module comment\n# mypy: ignore-errors\n\nvalue = 1\n"),
+    ],
+)
+def test_repaired_header_preserves_following_metadata(tmp_path, separator, name, body):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "license_headers.py"
+    spec = importlib.util.spec_from_file_location("license_headers_repair", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / name
+    canonical = module.header_for(path)
+    path.write_text(canonical.replace("Chavoshi", "Chavashi") + separator + body)
+
+    assert module.apply(path) is True
+    assert path.read_text() == canonical + "\n" + body
+    assert module.apply(path) is False
+
+
+@pytest.mark.parametrize("closing", [" */\n", "\n */\n", " *\n */\n"])
+@pytest.mark.parametrize(
+    "body", ["// @vitest-environment jsdom\n\nexport {};\n", "/** @vitest-environment jsdom */\n\nexport {};\n"]
+)
+def test_repaired_block_notice_consumes_its_closing_delimiter(tmp_path, closing, body):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "license_headers.py"
+    spec = importlib.util.spec_from_file_location("license_headers_block_repair", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "suite.tsx"
+    path.write_text(
+        "/*\n"
+        " * Copyright (C) 2026 Erfan Zare Chavoshi\n"
+        " * This file is part of Eyvan.\n"
+        " *\n"
+        " * SPDX-License-Identifier: AGPL-3.0-or-later\n" + closing + "\n" + body
+    )
+
+    assert module.apply(path) is True
+    assert path.read_text() == module.header_for(path) + "\n" + body
+    assert module.apply(path) is False

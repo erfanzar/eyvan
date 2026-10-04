@@ -389,24 +389,39 @@ through the native worker's GCS identity. Result ownership is rank zero only;
 `ReplicaContext` validates rank metadata and prevents every rank from writing
 the same durable result.
 
-### 4.2 sha256 / HMAC verification
+### 4.2 sha256 / optional low-level HMAC verification
 
 `load_callable` checks format and Python compatibility, then verifies the
-payload digest before deserializing. If a signing key is configured it also
-requires the HMAC-SHA256 signature. `load_result` applies the same checks to
-the result envelope. Workspace bundles use the same digest/signature ordering
-in `workspace_entry.materialize`: verification happens before extraction.
-Digest checks provide integrity, not identity; HMAC is the authenticity check.
+payload digest before deserializing. `load_result` verifies the result envelope.
+Workspace bundles are verified before extraction by
+`workspace_entry.materialize`. These digest checks provide integrity, not
+submitter identity.
+
+The standalone SDK/API callables are unsigned: `EyvanCallableSubmitter`
+(`eyvan/sdk/client/callables.py`) rejects caller signing keys and artifact
+signatures, and the control-plane service independently rejects signed callable
+submissions and caller-provided signing-key environments. This applies to
+loopback as well as remote standalone planes.
+
+The low-level `dump_callable` / `load_callable` and result helpers support
+optional HMAC-SHA256 for a custom submitter that owns its producer/verifier
+protocol. When a verifier key is configured, a matching signature is required;
+setting `EYVAN_CALLABLE_SIGNING_KEY` on a worker consequently refuses ordinary
+unsigned standalone artifacts. The standalone controller does not distribute a
+producer/verifier key, so this is not a standalone worker-setup instruction or
+an end-to-end signing guarantee. HMAC authenticates bytes relative to the shared
+key; it does not sandbox code or identify an individual submitter.
 
 ### 4.3 Trusted-project policy
 
 Cloudpickle deserialization executes pickle opcodes. It is therefore only for
 trusted Eyvan projects and trusted artifact locations; a digest alone does not
-make an untrusted callable safe. Operators should configure the callable
-signing key and distribute it only to workers allowed to run those projects.
-The runtime validates the artifact before execution but does not sandbox Python
-code. In OCI mode the staged callable bridge imports the dependency-light
-protocol rather than the host `eyvan` package.
+make an untrusted callable safe. Standalone callable admission requires an
+explicitly trusted project (`EYVAN_TRUSTED_CALLABLE_PROJECTS`); trust admission
+and digest verification are not signature authentication. The runtime validates
+the artifact before execution but does not sandbox Python code. In OCI mode the
+staged callable bridge imports the dependency-light protocol rather than the
+host `eyvan` package.
 
 ## 5. JAX multi-host bootstrap
 
@@ -531,9 +546,11 @@ transport failure raises `ChildSubmissionError`.
 
 ### 11.4 Workspace entry
 
-`workspace_entry.py` verifies and extracts a signed, content-addressed bundle,
-then changes directory and `exec`s the user's command so PID, signals, exit
-status, cgroup accounting, and process introspection describe the workload.
+`workspace_entry.py` verifies the digest of a content-addressed bundle and,
+when a low-level verifier key is configured, requires its matching signature
+before extraction. Standalone SDK bundles are unsigned. It then changes
+directory and `exec`s the user's command so PID, signals, exit status, cgroup
+accounting, and process introspection describe the workload.
 Only a directory carrying `.eyvan-extraction-complete` is reused; a partial
 extraction is rebuilt.
 

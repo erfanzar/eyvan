@@ -67,8 +67,6 @@ class WorkloadLifecycleMixin:
                 return workload, True
             if workload.state in {WorkloadState.SUCCEEDED, WorkloadState.FAILED}:
                 raise ConflictError(f"cannot cancel a {workload.state.value} workload")
-            if await self._preemption_execution_started(tx, workload):
-                raise ConflictError("preemption is already executing; retry cancellation after it completes")
             updated = await self._cancel_one(tx, principal, workload, "workload.cancel_requested")
             if cascade:
                 # Descendants are cancelled through the same path as the root, so
@@ -98,6 +96,11 @@ class WorkloadLifecycleMixin:
         so omitting it leaves the remote process alive.
         """
 
+        # Every member of a cascade must respect the preemption owner, not
+        # only its root. Refusal rolls back the whole cancellation transaction,
+        # including earlier ancestors, before any ownership markers are lost.
+        if await self._preemption_execution_started(tx, workload):
+            raise ConflictError("preemption is already executing; retry cancellation after it completes")
         target = WorkloadState.CANCELLED if workload.state is WorkloadState.PENDING else WorkloadState.CANCELLING
         updated = await self._transition_workload(
             tx,
@@ -238,6 +241,7 @@ class WorkloadLifecycleMixin:
                     "lease_ids": (),
                     "dispatch_reservation": None,
                     "remote_id": None,
+                    "service_endpoint": None,
                     "failure_reason": None,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,

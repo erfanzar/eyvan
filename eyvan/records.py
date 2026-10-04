@@ -15,7 +15,16 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_serializer, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic import JsonValue as PydanticJsonValue
 
 from eyvan._internal.compat import UTC, StrEnum
@@ -488,17 +497,19 @@ class WarmWindow(EyvanModel):
         return self
 
     def covers(self, moment: datetime) -> bool:
-        """Return whether ``moment`` falls inside this window."""
+        """Return whether ``moment`` falls inside this window; naive times are UTC."""
 
-        local = moment + timedelta(minutes=self.utc_offset_minutes)
-        if self.days and local.isoweekday() not in self.days:
-            return False
+        utc = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+        local = utc + timedelta(minutes=self.utc_offset_minutes)
+        start_day = local
         if self.start_hour < self.end_hour:
-            return self.start_hour <= local.hour < self.end_hour
-        # Wraps past midnight: the window is the union of both ends of the day. The
-        # weekday test above uses the *start* side, so an overnight window is named
-        # by the day it begins on.
-        return local.hour >= self.start_hour or local.hour < self.end_hour
+            inside = self.start_hour <= local.hour < self.end_hour
+        else:
+            inside = local.hour >= self.start_hour or local.hour < self.end_hour
+            # The post-midnight segment belongs to the preceding local start day.
+            if local.hour < self.end_hour:
+                start_day = local - timedelta(days=1)
+        return inside and (not self.days or start_day.isoweekday() in self.days)
 
 
 class CoordinationKind(StrEnum):
@@ -660,6 +671,18 @@ class GcpQueueAdmissionDenialTarget(EyvanModel):
     zone: str
     accelerator_type: str
     capacity_class: CanonicalCapacityClass
+    #: Provider-denial occurrence, not the time a client reread this target.
+    #: Missing on legacy documents; never inferred from a status heartbeat.
+    occurred_at: datetime | None = None
+    event_id: str | None = Field(default=None, min_length=1, max_length=192)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        for name in ("occurred_at", "event_id"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_identity(self) -> GcpQueueAdmissionDenialTarget:
@@ -738,10 +761,12 @@ class RoleGrantRecord(EyvanModel):
     #: Time-boxed access, for the case that would otherwise be permanent: a
     #: temporary elevation during an incident. ``None`` is indefinite, which is
     #: the ordinary case and should not be dressed up as an expiry nobody chose.
-    expires_at: datetime | None = None
+    #: Grant timestamps require an explicit timezone; ambiguous local times fail
+    #: validation before they can confer authority or reach expiry comparisons.
+    expires_at: Annotated[datetime, AwareDatetime] | None = None
     reason: str = Field(default="", max_length=512)
     granted_by: str = Field(min_length=1, max_length=256)
-    granted_at: datetime = Field(default_factory=utcnow)
+    granted_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
 
     @property
     def key(self) -> tuple[str, str, str, str]:
@@ -750,8 +775,10 @@ class RoleGrantRecord(EyvanModel):
         return (self.subject, self.grant.role.value, self.grant.org_id or "", self.grant.project_id or "")
 
     def active_at(self, moment: datetime) -> bool:
-        """Return whether this grant confers authority at one instant."""
+        """Return whether this grant confers authority at one timezone-aware instant."""
 
+        if moment.utcoffset() is None:
+            raise ValueError("grant observation time must include a timezone")
         return self.expires_at is None or self.expires_at > moment
 
     @model_validator(mode="after")
@@ -1667,6 +1694,11 @@ class CellRecord(EyvanModel):
     worker_count: int = Field(default=1, ge=1, le=10_000, strict=True)
     provider_phase: CapacityStatus | None = None
     provider_failure_code: CapacityProviderFailureCode | None = None
+    #: First observation of this failure in this provider attempt. Heartbeats
+    #: preserve it; legacy failures without attribution remain unknown.
+    provider_failure_occurred_at: datetime | None = None
+    provider_failure_event_id: str | None = Field(default=None, min_length=1, max_length=192)
+    provider_failure_generation: int | None = Field(default=None, ge=1)
     observed_tpu_vms: int | None = Field(default=None, ge=1)
     #: Durable width of this cell in runtime/native-worker/JAX processes.
     #:
@@ -1726,6 +1758,14 @@ class CellRecord(EyvanModel):
     idle_seconds: float = Field(default=0.0, ge=0)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        for name in ("provider_failure_occurred_at", "provider_failure_event_id", "provider_failure_generation"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
 
     def hourly_cost(self) -> float:
         """Return what this cell costs per hour at its declared unit prices.
@@ -2202,6 +2242,9 @@ class LeaseRecord(EyvanModel):
     accelerator_hours_settled: dict[str, float] = Field(default_factory=dict)
     settlement_reason: str | None = None
     settled_at: datetime | None = None
+    #: Budget accounting epoch charged by this settlement. None means no
+    #: attributable budget charge (including documents written before tracking).
+    settlement_budget_period_id: str | None = Field(default=None, min_length=1, max_length=64)
     #: Write-once, stamped the first time this lease enters ACTIVE -- which the
     #: dispatch transaction already commits atomically with the workload's move to
     #: DISPATCHING, so ACTIVE *is* this system's run boundary and no new plumbing is
@@ -2221,6 +2264,13 @@ class LeaseRecord(EyvanModel):
     expires_at: datetime
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.settlement_budget_period_id is None:
+            document.pop("settlement_budget_period_id", None)
+        return document
 
     @model_validator(mode="after")
     def validate_settlement(self) -> LeaseRecord:
@@ -2482,6 +2532,11 @@ class BudgetRecord(EyvanModel):
     #: in the fleet's lifetime and never again. None means "not yet rolled"; the first
     #: settlement stamps it.
     period_started_at: datetime | None = None
+    #: Server-owned accounting epoch and retained spend at its opening. This
+    #: baseline need not be zero: initializing a legacy window retains spend.
+    #: Missing attribution is unknown, never an inferred zero opening balance.
+    settlement_period_id: str | None = Field(default=None, min_length=1, max_length=64)
+    period_opening_spent: float | None = Field(default=None, ge=0)
     #: Fractions of ``limit`` that emit an audit event the first time spend crosses
     #: them in a period. Warning before the wall is the point: a hard budget that
     #: speaks only by refusing admission tells an operator at the exact moment when
@@ -2495,6 +2550,14 @@ class BudgetRecord(EyvanModel):
     revision: int = 1
     updated_by: str
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        for name in ("settlement_period_id", "period_opening_spent"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_spend(self) -> BudgetRecord:

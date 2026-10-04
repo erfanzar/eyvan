@@ -227,6 +227,16 @@ class _ControllerCapacityCommands:
                             ),
                             "provider_phase_started_at": phase_started_at,
                             "availability": availability,
+                            "billing_started_at": (
+                                observed_at
+                                if state is CellState.READY and current.billing_started_at is None
+                                else current.billing_started_at
+                            ),
+                            "billing_ticked_at": (
+                                observed_at
+                                if state is CellState.READY and current.billing_started_at is None
+                                else current.billing_ticked_at
+                            ),
                             "last_heartbeat_at": observed_at,
                             "updated_at": observed_at,
                         }

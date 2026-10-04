@@ -76,7 +76,7 @@ from eyvan.worker.runtime.log_records import (
     merge_pages,
 )
 from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
-from eyvan.worker.runtime.native_slice import _RESUME_CHECKPOINT_ENV
+from eyvan.worker.runtime.native_slice import _RESUME_CHECKPOINT_ENV, JaxClusterDetectionMode, _exec_fanout
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
 _MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
@@ -144,6 +144,8 @@ class NativeGangMember:
         gpu_devices_per_host: GPUs on each of this member's hosts, or ``None``
             when the member is not GPU-coordinated.
         gpu_model: The attached accelerator's provider name, when recorded.
+        jax_cluster_detection: Validated discovery mode for this cell's elastic
+            JAX world. Atomic cross-cell worlds remain explicitly coordinated.
     """
 
     cell_id: str
@@ -152,8 +154,11 @@ class NativeGangMember:
     context: MutationContext
     gpu_devices_per_host: int | None = None
     gpu_model: str | None = None
+    jax_cluster_detection: JaxClusterDetectionMode = JaxClusterDetectionMode.EXPLICIT
 
     def __post_init__(self) -> None:
+        if not isinstance(self.jax_cluster_detection, JaxClusterDetectionMode):
+            raise TypeError("native gang member JAX cluster detection must be a JaxClusterDetectionMode")
         if not isinstance(self.cell_id, str) or not self.cell_id.strip():
             raise ValueError("native gang member cell ID must be non-empty and trimmed")
         if not self.endpoints or any(
@@ -189,6 +194,7 @@ class _GangWorker:
     executor: NativeRemoteExecutor
     gpu_devices: int | None = None
     gpu_model: str | None = None
+    jax_cluster_detection: JaxClusterDetectionMode = JaxClusterDetectionMode.EXPLICIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +486,7 @@ class NativeGangExecutor:
                 ),
                 gpu_devices=member.gpu_devices_per_host,
                 gpu_model=member.gpu_model,
+                jax_cluster_detection=member.jax_cluster_detection,
             )
             for (member, cell_index, endpoint), client in zip(flattened, supplied_clients, strict=True)
         )
@@ -581,15 +588,24 @@ class NativeGangExecutor:
                 "EYVAN_JAX_MULTIHOST": "1",
                 "EYVAN_REPLICA_COUNT": str(len(self._workers)),
                 "EYVAN_REPLICA_INDEX": str(rank),
-                "JAX_COORDINATOR_ADDRESS": coordinator_address,
-                "JAX_COORDINATOR_PORT": str(_COORDINATOR_PORT),
-                "JAX_PARTITION_INDEX": str(worker.cell_index),
-                "JAX_PROCESS_COUNT": str(process_count),
-                "JAX_PROCESS_ID": str(process_id),
-                "JAX_PROCESS_INDEX": str(process_id),
                 "PYTHONPATH": f"{_MULTIHOST_SITE_PATH}:{python_path}" if python_path else _MULTIHOST_SITE_PATH,
             }
         )
+        if one_world_per_cell and worker.jax_cluster_detection is JaxClusterDetectionMode.GCE_TPU:
+            # A management endpoint may be public; GCE metadata identifies the
+            # internal coordinator and process topology of this cell instead.
+            environment["EYVAN_JAX_CLUSTER_DETECTION"] = JaxClusterDetectionMode.GCE_TPU.value
+        else:
+            environment.update(
+                {
+                    "JAX_COORDINATOR_ADDRESS": coordinator_address,
+                    "JAX_COORDINATOR_PORT": str(_COORDINATOR_PORT),
+                    "JAX_PARTITION_INDEX": str(worker.cell_index),
+                    "JAX_PROCESS_COUNT": str(process_count),
+                    "JAX_PROCESS_ID": str(process_id),
+                    "JAX_PROCESS_INDEX": str(process_id),
+                }
+            )
         # Last, and after the topology scrub above, so the deadline a cold gang
         # gets is the one this control plane configured. A caller who submits
         # its own copy has already had it stripped -- the whole ``EYVAN_JAX_``
@@ -846,7 +862,7 @@ class NativeGangExecutor:
                         # is allowed to retire it.
                         worker.executor.retire(
                             attempted_remote_id,
-                            replace(worker.context, idempotency_key=checkpoint_id),
+                            rollback_context(replace(worker.context, idempotency_key=checkpoint_id)),
                         )
                     except Exception as exc:
                         retire_failures.append(
@@ -954,16 +970,8 @@ class NativeGangExecutor:
         gang missing a member reads as missing rather than as complete.
         """
 
-        ranks: list[JsonValue] = []
-        for rank, worker in enumerate(self._workers):
-            try:
-                result: JsonValue = worker.executor.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
-            except httpx.TransportError as exc:
-                result = {"observed": False, "detail": f"native worker is unreachable: {type(exc).__name__}: {exc}"}
-            except (httpx.HTTPStatusError, RuntimeError, ValueError) as exc:
-                result = {"observed": False, "detail": f"exec failed: {type(exc).__name__}: {exc}"}
-            ranks.append({"rank": rank, "endpoint": worker.endpoint, "result": result})
-        return {"remote_id": remote_id, "ranks": ranks}
+        workers = [(rank, worker.endpoint, worker.executor) for rank, worker in enumerate(self._workers)]
+        return {"remote_id": remote_id, "ranks": _exec_fanout(workers, remote_id, command, timeout_s=timeout_s)}
 
     def close(self) -> None:
         """Close internally owned native-worker clients."""

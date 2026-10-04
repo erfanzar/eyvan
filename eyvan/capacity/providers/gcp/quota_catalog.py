@@ -88,11 +88,11 @@ class ApiQuotaCatalog:
 
         import httpx
 
-        token = self._token or self.token_source()
-        self._token = token
         entries: list[dict[str, object]] = []
         page: str | None = None
         try:
+            token = self._token or self.token_source()
+            self._token = token
             with httpx.Client(timeout=REQUEST_TIMEOUT_S, trust_env=False) as client:
                 while True:
                     params: dict[str, object] = {"pageSize": PAGE_SIZE}

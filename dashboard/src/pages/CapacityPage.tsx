@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertTriangle, FilterX, Gauge, HelpCircle, MapPin, RefreshCw, Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { MetricCard } from "../components/MetricCard";
@@ -57,8 +57,12 @@ interface QuotaRow {
 }
 
 export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: CapacityPageProps) {
-  const [snapshot, setSnapshot] = useState<TpuQuotaSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // A loader represents one scope. A new loader must not render an older
+  // scope's quota even for the frame before its effect starts the next read.
+  const [quotaResult, setQuotaResult] = useState<{ loader: typeof loadQuota; value: TpuQuotaSnapshot } | null>(null);
+  const [quotaError, setQuotaError] = useState<{ loader: typeof loadQuota; message: string } | null>(null);
+  const snapshot = quotaResult?.loader === loadQuota ? quotaResult.value : null;
+  const error = quotaError?.loader === loadQuota ? quotaError.message : null;
   const [refreshing, setRefreshing] = useState(false);
   const [zoneQuery, setZoneQuery] = useState("");
   const [capacityClass, setCapacityClass] = useState("all");
@@ -66,24 +70,30 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   const [sortKey, setSortKey] = useState<SortKey>("free");
   const [fitsType, setFitsType] = useState("any");
   const [fitsCount, setFitsCount] = useState(1);
+  const latestQuotaRequest = useRef(0);
 
   const load = useCallback(
-    (signal: AbortSignal, refresh = false) =>
-      loadQuota(signal, { refresh })
+    (signal: AbortSignal, refresh = false) => {
+      const request = ++latestQuotaRequest.current;
+      return loadQuota(signal, { refresh })
         .then((value) => {
-          if (!signal.aborted) {
-            setSnapshot(value);
-            setError(null);
+          if (!signal.aborted && request === latestQuotaRequest.current) {
+            setQuotaResult({ loader: loadQuota, value });
+            setQuotaError(null);
           }
         })
         .catch((loadError: unknown) => {
           // Named, never swallowed. An empty quota table reads as "there is no
           // capacity anywhere", which is a statement about the fleet rather
           // than about this request having failed.
-          if (!signal.aborted) {
-            setError(loadError instanceof Error ? loadError.message : "Unable to read provider quota");
+          if (!signal.aborted && request === latestQuotaRequest.current) {
+            setQuotaError({
+              loader: loadQuota,
+              message: loadError instanceof Error ? loadError.message : "Unable to read provider quota",
+            });
           }
-        }),
+        });
+    },
     [loadQuota],
   );
 
@@ -103,22 +113,38 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     }
   };
 
-  const [capacityEvents, setCapacityEvents] = useState<AuditEvent[] | null>(null);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyResult, setHistoryResult] = useState<{
+    loader: NonNullable<typeof loadCapacityEvents>;
+    events: AuditEvent[];
+  } | null>(null);
+  const [historyFailure, setHistoryFailure] = useState<{
+    loader: NonNullable<typeof loadCapacityEvents>;
+    message: string;
+  } | null>(null);
+  const capacityEvents =
+    loadCapacityEvents && historyResult?.loader === loadCapacityEvents ? historyResult.events : null;
+  const historyError =
+    loadCapacityEvents && historyFailure?.loader === loadCapacityEvents ? historyFailure.message : null;
 
   useEffect(() => {
     if (!loadCapacityEvents) return;
     const controller = new AbortController();
     loadCapacityEvents(controller.signal)
       .then((events) => {
-        if (!controller.signal.aborted) setCapacityEvents(events);
+        if (!controller.signal.aborted) {
+          setHistoryResult({ loader: loadCapacityEvents, events });
+          setHistoryFailure(null);
+        }
       })
       .catch((error: unknown) => {
         // Named. An empty history reads as "this fleet has been quiet", which
         // is the opposite of what a failed read means on the afternoon somebody
         // is looking at this page.
         if (!controller.signal.aborted) {
-          setHistoryError(error instanceof Error ? error.message : "Unable to read capacity history");
+          setHistoryFailure({
+            loader: loadCapacityEvents,
+            message: error instanceof Error ? error.message : "Unable to read capacity history",
+          });
         }
       });
     return () => controller.abort();

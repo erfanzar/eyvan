@@ -13,6 +13,8 @@ from eyvan.server.service._control_plane.shared import (
     InputError,
     LeaseRecord,
     LeaseState,
+    OutboxRecord,
+    OutboxState,
     Permission,
     Principal,
     WorkloadRecord,
@@ -77,6 +79,10 @@ class WorkloadSettlementMixin:
         #: controller's orphan sweep -- which exists precisely to clear that state --
         #: has the standing to say the absence is the point.
         settle_without_leases: bool = False,
+        #: A pre-admission refusal may settle only while its exact delivery still
+        #: owns the claim and no submit reservation has appeared. Ordinary terminal
+        #: observations retain their existing semantics when this is omitted.
+        expected_dispatch_command: OutboxRecord | None = None,
     ) -> tuple[WorkloadRecord, LeaseRecord | None, BudgetRecord | None]:
         """Atomically finish a workload and settle its current lease reservation.
 
@@ -92,6 +98,24 @@ class WorkloadSettlementMixin:
             await self._lock_settlement(tx, workload_id)
             workload = await self._require_workload(tx, workload_id)
             self._validate_expected_workload(workload, expected_generation, expected_lease_id, expected_state)
+            if expected_dispatch_command is not None:
+                command = await tx.get_outbox(expected_dispatch_command.id)
+                if (
+                    workload.dispatch_reservation is not None
+                    or command is None
+                    or command.topic != "workload.dispatch"
+                    or command.aggregate_type != "workload"
+                    or command.aggregate_id != workload.id
+                    or command.generation != workload.generation
+                    or command.attempts != expected_dispatch_command.attempts
+                    or command.state is not OutboxState.PROCESSING
+                    or command.claimed_by is None
+                    or command.claimed_by != expected_dispatch_command.claimed_by
+                    or command.claimed_until is None
+                    or command.claimed_until <= utcnow()
+                    or "dispatch_reservation" in command.payload
+                ):
+                    raise ConflictError("dispatch refusal no longer owns an unreserved workload and live claim")
             await self._lock_admission_scope(tx, workload.org_id, workload.project_id)
             await self._validate_expected_cell_snapshot(
                 tx,
@@ -247,6 +271,7 @@ class WorkloadSettlementMixin:
                     "lease_ids": (),
                     "dispatch_reservation": None,
                     "remote_id": None,
+                    "service_endpoint": None,
                     "checkpoint_uri": checkpoint_uri,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
@@ -347,6 +372,7 @@ class WorkloadSettlementMixin:
                     "lease_ids": (),
                     "dispatch_reservation": None,
                     "remote_id": None,
+                    "service_endpoint": None,
                     "checkpoint_uri": checkpoint_uri,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
@@ -433,6 +459,7 @@ class WorkloadSettlementMixin:
                     "lease_ids": (),
                     "dispatch_reservation": None,
                     "remote_id": None,
+                    "service_endpoint": None,
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
                     "scheduling_reason": scheduling_reason,

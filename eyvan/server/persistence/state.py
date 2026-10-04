@@ -45,7 +45,7 @@ from eyvan.records import (
     WorkloadState,
     utcnow,
 )
-from eyvan.server.persistence.base import ReadOnlyQueryUnsupported, RepositorySession
+from eyvan.server.persistence.base import ArtifactProtectionCounts, ReadOnlyQueryUnsupported, RepositorySession
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
 #: Outbox states safe to delete. Both are absorbing, so removing a row cannot
@@ -510,6 +510,65 @@ class StateSession(RepositorySession):
         )
         return items[:limit]
 
+    async def list_collectable_managed_artifacts(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        live_uris = {
+            reference.uri
+            for reference in self._state.artifact_references.values()
+            if reference.org_id == org_id and reference.project_id == project_id and reference.released_at is None
+        }
+        candidates = []
+        for item in self._state.managed_artifacts.values():
+            if item.org_id != org_id or item.project_id != project_id:
+                continue
+            if not item.collectable_at(now, has_live_reference=item.uri in live_uris):
+                continue
+            window = retention_by_kind.get(item.kind, grace_period_s)
+            if window is None:
+                continue
+            origin = max(item.activated_at or item.created_at, item.upload_started_at or item.created_at)
+            if origin <= now - timedelta(seconds=window):
+                candidates.append(item)
+        candidates.sort(key=lambda item: (item.updated_at, item.uri))
+        return candidates[:limit]
+
+    async def count_managed_artifact_protections(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+    ) -> ArtifactProtectionCounts:
+        live_uris = {
+            reference.uri
+            for reference in self._state.artifact_references.values()
+            if reference.org_id == org_id and reference.project_id == project_id and reference.released_at is None
+        }
+        held = referenced = within_grace = 0
+        for item in self._state.managed_artifacts.values():
+            if item.org_id != org_id or item.project_id != project_id or item.state is not ManagedArtifactState.ACTIVE:
+                continue
+            if item.hold is not None and item.hold.active_at(now):
+                held += 1
+            elif item.uri in live_uris:
+                referenced += 1
+            else:
+                window = retention_by_kind.get(item.kind, grace_period_s)
+                origin = max(item.activated_at or item.created_at, item.upload_started_at or item.created_at)
+                if window is None or origin > now - timedelta(seconds=window):
+                    within_grace += 1
+        return ArtifactProtectionCounts(held, referenced, within_grace)
+
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
         return sum(
             item.charged_bytes
@@ -558,7 +617,11 @@ class StateSession(RepositorySession):
         return self._state.idempotency.get((scope, operation, key))
 
     async def put_idempotency(self, record: IdempotencyRecord) -> None:
-        self._state.idempotency[(record.scope, record.operation, record.key)] = record
+        # First binding wins, matching the SQL backend: a replay that reaches
+        # put with a different payload must not replace the recorded response.
+        key = (record.scope, record.operation, record.key)
+        if key not in self._state.idempotency:
+            self._state.idempotency[key] = record
 
     async def get_outbox(self, record_id: str) -> OutboxRecord | None:
         return self._state.outbox.get(record_id)
@@ -566,8 +629,17 @@ class StateSession(RepositorySession):
     async def put_outbox(self, record: OutboxRecord) -> None:
         self._state.outbox[record.id] = record
 
-    async def list_outbox(self, *, state: OutboxState | None = None, limit: int = 100) -> list[OutboxRecord]:
-        records = (record for record in self._state.outbox.values() if state is None or record.state is state)
+    async def list_outbox(
+        self, *, state: OutboxState | None = None, limit: int = 100, created_before: datetime | None = None
+    ) -> list[OutboxRecord]:
+        records = (
+            record
+            for record in self._state.outbox.values()
+            if (state is None or record.state is state)
+            and (created_before is None or record.created_at < created_before)
+        )
+        if created_before is not None:
+            return sorted(records, key=lambda record: (record.created_at, record.id))[:limit]
         return sorted(records, key=lambda record: (record.available_at, record.created_at, record.id))[:limit]
 
     async def list_outbox_for_aggregates(

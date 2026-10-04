@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import httpx
 import pytest
 
@@ -28,6 +30,7 @@ from eyvan.records import (
     WorkloadProgressPhase,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.jobs import CallableSubmission, EyvanJobError, TpuConfig
@@ -252,6 +255,8 @@ def test_callable_result_renders_scale_from_zero_and_provider_diagnostic_once(tm
         zone="us-central1-c",
         accelerator_type="v6e-16",
         capacity_class=CapacityClass.SPOT,
+        occurred_at=utcnow() - timedelta(minutes=5),
+        event_id="queue-denial-wl-v6e-16",
     )
     provider_failure = _progress(
         phase=WorkloadProgressPhase.QUEUE_ADMISSION_DENIED,
@@ -347,6 +352,8 @@ def test_callable_wait_caches_a_terminal_queue_denial_without_progress_polling(t
         zone="us-central1-c",
         accelerator_type="v6e-16",
         capacity_class=CapacityClass.SPOT,
+        occurred_at=utcnow() - timedelta(minutes=5),
+        event_id="queue-denial-wl-v6e-16",
     )
 
     def handler(request: httpx.Request) -> httpx.Response:

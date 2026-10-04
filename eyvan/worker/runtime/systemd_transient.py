@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import tempfile
@@ -364,8 +365,24 @@ def _atomic_write_json(path: Path, value: tp.Mapping[str, JsonValue]) -> None:
                 os.close(descriptor)
 
 
-def _write_environment_file(path: Path, environment: tp.Mapping[str, str]) -> None:
-    """Atomically write one owner-only env file without line injection."""
+def _systemd_environment_value(value: str) -> str:
+    """Encode a value for EnvironmentFile, not Docker's literal env grammar."""
+
+    if not (value.startswith(("'", '"')) or "\\" in value or value != value.strip(" \t")):
+        return value
+    # Double-quoted EnvironmentFile values preserve whitespace. Backslashes
+    # escape only these syntax characters; dollar/backtick expansion does not
+    # occur, and encoding them explicitly preserves their literal bytes.
+    escaped = "".join("\\" + character if character in '\\"$`' else character for character in value)
+    return '"' + escaped + '"'
+
+
+def _write_environment_file(path: Path, environment: tp.Mapping[str, str], *, systemd: bool = False) -> None:
+    """Atomically write one owner-only env file without line injection.
+
+    Docker consumes literal assignment values. Native systemd callers opt into
+    EnvironmentFile quoting; sharing that encoding would corrupt Docker values.
+    """
 
     lines: list[str] = []
     for name, value in sorted(environment.items()):
@@ -373,7 +390,8 @@ def _write_environment_file(path: Path, environment: tp.Mapping[str, str]) -> No
             raise ValueError("environment variable names must be valid shell identifiers")
         if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
             raise ValueError(f"environment variable {name!r} must be a NUL- and newline-free string")
-        lines.append(f"{name}={value}")
+        encoded = _systemd_environment_value(value) if systemd else value
+        lines.append(f"{name}={encoded}")
     _ensure_private_directory(path.parent)
     with _atomic_writer_exclusion(path):
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -747,6 +765,72 @@ def _systemd_runner(command: tuple[str, ...], *, timeout_s: float) -> SystemdCom
     )
 
 
+def _systemd_journal_runner(command: tuple[str, ...], *, limit: int, timeout_s: float) -> SystemdCommandResult:
+    """Read only the first requested journal entries with bounded pipe buffers.
+
+    journalctl's finite --lines option selects the tail, including after a
+    cursor. Forward continuation therefore needs --lines=all, but must stop
+    ingestion itself rather than capturing the entire unread backlog.
+    """
+
+    maximum_bytes = 8 * 1024 * 1024
+    output = bytearray()
+    errors = bytearray()
+    deadline = time.monotonic() + timeout_s
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert process.stdout is not None and process.stderr is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            lines = 0
+            scanned = 0
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return SystemdCommandResult(returncode=127, stderr="journalctl page read timed out")
+                for key, _events in selector.select(remaining):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    if key.data == "stderr":
+                        errors.extend(chunk)
+                        del errors[:-8192]
+                        continue
+                    output.extend(chunk)
+                    while True:
+                        newline = output.find(b"\n", scanned)
+                        if newline < 0:
+                            break
+                        scanned = newline + 1
+                        lines += 1
+                        if lines >= max(1, limit):
+                            if scanned > maximum_bytes:
+                                return SystemdCommandResult(returncode=127, stderr="journalctl page exceeds byte limit")
+                            return SystemdCommandResult(returncode=0, stdout=output[:scanned].decode("utf-8", "replace"))
+                    if len(output) > maximum_bytes:
+                        return SystemdCommandResult(returncode=127, stderr="journalctl page exceeds byte limit")
+        returncode = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        return SystemdCommandResult(
+            returncode=returncode,
+            stdout=output.decode("utf-8", "replace"),
+            stderr=errors.decode("utf-8", "replace"),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return SystemdCommandResult(returncode=127, stderr=str(exc))
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
 class SystemdTransientServiceExecutor:
     """Execute fenced native workloads as durable systemd transient services.
 
@@ -806,6 +890,7 @@ class SystemdTransientServiceExecutor:
         for directory in (self.state_dir, self.jobs_dir, self.workloads_dir, self.env_dir):
             _ensure_private_directory(directory)
         self._command_timeout_s = command_timeout_s
+        self._custom_command_runner = command_runner is not None
         self._command_runner = command_runner or (
             lambda command: _systemd_runner(command, timeout_s=self._command_timeout_s)
         )
@@ -1213,8 +1298,13 @@ class SystemdTransientServiceExecutor:
         runtime_absent: bool = False,
         environment_consumed: bool = False,
     ) -> None:
-        """Remove plaintext before persisting and collecting runtime state."""
+        """Persist the outcome before any destructive runtime collection."""
 
+        # External-runtime observations and boot-loss observations reach this
+        # helper with a newly derived outcome. A finally-only write cannot
+        # survive process loss after collection removes the last runtime evidence.
+        # Publish the sanitized record first; fail closed if durability fails.
+        _atomic_write_json(record_path, record)
         try:
             self._remove_environment_files(
                 record,
@@ -1374,7 +1464,7 @@ class SystemdTransientServiceExecutor:
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
         launch_environment = self._resolved_launch_environment({**self._base_environment, **_environment(spec)})
-        _write_environment_file(self._environment_file_path(remote_id), launch_environment)
+        _write_environment_file(self._environment_file_path(remote_id), launch_environment, systemd=True)
 
     def _launch_command(
         self,
@@ -2250,13 +2340,19 @@ class SystemdTransientServiceExecutor:
             # journald resumes *after* the cursor, so a follower never re-reads
             # the line it already has.
             arguments.extend((f"--after-cursor={after}", "--lines=all"))
-        result = self._run(tuple(arguments))
+        if self._custom_command_runner:
+            # Injected runners own their transport buffering. Enforce the same
+            # forward-entry window before parsing their returned payload.
+            result = self._run(tuple(arguments))
+        else:
+            result = _systemd_journal_runner(tuple(arguments), limit=max(1, limit), timeout_s=self._command_timeout_s)
         if result.returncode != 0:
             return LogPage(
                 unavailable=True,
                 detail=redact_secret_material(result.stderr.strip()) or "journalctl failed",
             )
-        return parse_journal_json(redact_secret_material(result.stdout))
+        payload = "\n".join(result.stdout.splitlines()[: max(1, limit)])
+        return parse_journal_json(redact_secret_material(payload))
 
     def process_status(self, remote_id: str) -> JsonObject:
         """Return live process detail for one workload attempt.

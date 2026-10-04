@@ -387,18 +387,20 @@ class LocalAgentSupervisor:
         target = self._target()
         record_path = self.paths.agent_record_path(target)
         log_path = self.paths.agent_log_path(target)
-        self._replace_agent_running_stale_code(
-            profile, profile_id, record_path, log_path, target, reference_digest=reference_digest
-        )
-        existing = self._existing_result(profile, profile_id, record_path, log_path, reference_digest=reference_digest)
-        if existing is not None:
-            return existing
-
         with owner_only_startup_lock(self.paths.agent_lock_path(target)):
-            # The digest probe above ran without the lock: a concurrent
-            # supervisor running older code can relaunch a stale agent in
-            # exactly the rolling-upgrade window this check exists for, so the
-            # check is repeated before anything is reused or started.
+            # Reuse checks can themselves stop a stale build or clear a dead
+            # record. Keep them under the same lock as replacement startup.
+            self._replace_agent_running_stale_code(
+                profile, profile_id, record_path, log_path, target, reference_digest=reference_digest
+            )
+            existing = self._existing_result(
+                profile, profile_id, record_path, log_path, reference_digest=reference_digest
+            )
+            if existing is not None:
+                return existing
+
+            # Recheck after a stale agent's stop or a wait for an existing
+            # agent before publishing a fresh replacement's ownership.
             self._replace_agent_running_stale_code(
                 profile, profile_id, record_path, log_path, target, reference_digest=reference_digest
             )
@@ -466,14 +468,14 @@ class LocalAgentSupervisor:
                         "is stale; refusing to stop it"
                     )
                 clear_owner_only_record(record_path, pid=record.pid)
-        return self._start_locked(
-            target=target,
-            expanded_profile_path=expanded_profile_path,
-            profile=profile,
-            profile_id=profile_id,
-            record_path=record_path,
-            log_path=log_path,
-        )
+            return self._start_locked(
+                target=target,
+                expanded_profile_path=expanded_profile_path,
+                profile=profile,
+                profile_id=profile_id,
+                record_path=record_path,
+                log_path=log_path,
+            )
 
     def stop(self) -> None:
         """Stop the cell agent this profile recorded for this supervisor's endpoint.
@@ -565,10 +567,25 @@ class LocalAgentSupervisor:
                     runtime_profile_path=profile_id,
                 ),
             )
-        except BaseException:
-            stop_owned_process(process)
+            return self._wait_for_ready(process, profile, record_path, log_path, reference_digest=reference_digest)
+        except BaseException as startup_error:
+            # Only this attempt's exact child belongs to failure cleanup. An
+            # existing agent's wait is deliberately outside this guard.
+            try:
+                stop_owned_process(process)
+                if process.poll() is None:
+                    startup_error.add_note(
+                        f"new cell-agent PID {process.pid} did not exit after startup cleanup; "
+                        f"any ownership record was retained. See {log_path}."
+                    )
+                else:
+                    clear_owner_only_record(record_path, pid=process.pid)
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    f"startup cleanup for new cell-agent PID {process.pid} failed "
+                    f"({type(cleanup_error).__name__}); any ownership record was retained. See {log_path}."
+                )
             raise
-        return self._wait_for_ready(process, profile, record_path, log_path, reference_digest=reference_digest)
 
     def _agent_runs_different_code(
         self,
@@ -683,10 +700,8 @@ class LocalAgentSupervisor:
                 f"the local Eyvan cell agent at {self.endpoint.url} is running with a different runtime profile"
             )
         if self._agent_runs_different_code(profile, reference_digest=reference_digest):
-            # Re-verify the build identity before handing the agent back: a
-            # supervisor running older code can relaunch a stale agent between
-            # the pre-lock digest probe and this lock, and reusing it would
-            # defeat the rolling-upgrade check entirely.
+            # A compatible capability response must not bypass build identity
+            # verification. Replacement stays under the caller's endpoint lock.
             self._replace_agent_running_stale_code(
                 profile, profile_id, record_path, log_path, self._target(), reference_digest=reference_digest
             )
@@ -762,8 +777,6 @@ class LocalAgentSupervisor:
             if capabilities is not None:
                 self._validate_capabilities(capabilities)
                 if self._agent_runs_different_code(profile, reference_digest=reference_digest):
-                    stop_owned_process(process)
-                    clear_owner_only_record(record_path, pid=process.pid)
                     raise LocalAgentConfigurationError(
                         "the started cell agent runs a different build from the runtime; "
                         "run 'eyvan runtime deploy --yes' to replace them together"
@@ -781,8 +794,8 @@ class LocalAgentSupervisor:
                 raise LocalAgentStartupError(self.endpoint, log_path, f"agent process exited with status {exit_code}")
             remaining = deadline - self.clock()
             if remaining <= 0:
-                stop_owned_process(process)
-                clear_owner_only_record(record_path, pid=process.pid)
+                # _start_locked owns exact-child cleanup and only clears the
+                # record once exit is verified, including on timeout.
                 raise LocalAgentStartupError(self.endpoint, log_path, "agent did not become ready before timeout")
             self.sleeper(min(self.poll_interval_s, remaining))
 
@@ -930,15 +943,22 @@ class GcpNativeRuntimeSupervisor:
                     stacklevel=2,
                 )
             agent = self.agent.ensure(self.profile_store.path, profile, reference_digest=serving)
-        except Exception as agent_error:
+        except BaseException as agent_error:
             if control_plane.state is LocalDaemonState.STARTED:
                 try:
                     self.control_plane.stop_started(control_plane, runtime_profile_path=self.profile_store.path)
-                except LocalDaemonError as cleanup_error:
-                    raise GcpRuntimeError(
-                        "Eyvan could not start its local GCP cell agent and could not stop the newly started "
-                        f"control plane: {cleanup_error}"
-                    ) from agent_error
+                except BaseException as cleanup_error:
+                    if isinstance(agent_error, Exception) and isinstance(cleanup_error, LocalDaemonError):
+                        raise GcpRuntimeError(
+                            "Eyvan could not start its local GCP cell agent and could not stop the newly started "
+                            f"control plane: {cleanup_error}"
+                        ) from agent_error
+                    # Startup cancellation owns the same rollback as an ordinary
+                    # failure. Cleanup must never replace the original interrupt.
+                    agent_error.add_note(
+                        "Eyvan could not stop the newly started control plane during agent startup rollback: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             raise
         return GcpRuntimeResult(profile=profile, control_plane=control_plane, agent=agent)
 

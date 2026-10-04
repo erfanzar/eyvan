@@ -9,6 +9,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   AUTH_CHANGED_EVENT,
   absorbLocalCredentialFromLocation,
+  authRevision,
   beginLogin,
   consumeSessionNotice,
   currentIdentity,
@@ -61,10 +62,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // Then ask the server whether a dashboard session already exists. The
     // cookie is unreadable from here by design, so the authority endpoint is
     // the only witness; a 401 simply means "show the sign-in screen".
+    //
+    // The probe can outlive the session it asked about: any other call that
+    // comes back 401 rejects the session mid-flight, and an answer captured
+    // under the revoked cookie must not re-open the gate. So the auth
+    // revision is read before the probe starts, and a result from a world
+    // that has since changed is dropped -- same shape as `cancelled`.
+    const startRevision = authRevision();
     loadRuntimeOidcConfig()
       .then(() => serverIdentity())
       .then((server) => {
-        if (!cancelled) setIdentity((current) => current ?? server);
+        if (!cancelled && authRevision() === startRevision) setIdentity((current) => current ?? server);
       })
       .catch((authError) => {
         if (!cancelled) setError(authError instanceof Error ? authError.message : "Unable to complete sign-in");

@@ -48,10 +48,22 @@ def _leading_comment_block(text: str, prefix: str) -> tuple[str, str]:
 
     lines = text.split("\n")
     index = 0
+    in_block_comment = False
     while index < len(lines):
         line = lines[index]
         if line.startswith((prefix, "/*", " *", "*/")) or not line.strip():
+            if line.startswith("/*"):
+                in_block_comment = True
+            if in_block_comment and "*/" in line:
+                in_block_comment = False
             index += 1
+            if SPDX_MARKER in line:
+                # Consume the notice's closing delimiter, but not a following
+                # tooling comment—even when blanks separate SPDX from */.
+                while in_block_comment and index < len(lines):
+                    in_block_comment = "*/" not in lines[index]
+                    index += 1
+                break
             continue
         break
     # Trailing blank lines belong to the separator, not the block.

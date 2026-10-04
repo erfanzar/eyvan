@@ -20,7 +20,15 @@ from types import FrameType
 from eyvan._internal.json_types import JsonObject
 from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
-from eyvan.worker.runtime.local_process import _mutate_record, _read_record, _utcnow
+from eyvan.worker.runtime.local_process import (
+    _group_has_live_members,
+    _mutate_record,
+    _process_start_marker,
+    _quiesce_process_group,
+    _read_record,
+    _unreaped_process_is_running,
+    _utcnow,
+)
 
 # Grace period between a SIGTERM stop request and the SIGKILL escalation. The
 # executor scrubs EYVAN_* from the worker environment, so this stays a plain
@@ -34,16 +42,20 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
     os.fchmod(owner_descriptor, 0o600)
     fcntl.flock(owner_descriptor, fcntl.LOCK_EX)
     child: subprocess.Popen[bytes] | None = None
+    command_quiescent = False
     stop_requested = False
 
     def request_stop(_signum: int, _frame: FrameType | None) -> None:
         nonlocal stop_requested
         stop_requested = True
-        if child is not None and child.poll() is None:
+        if child is not None and not command_quiescent:
             try:
-                child.terminate()
+                os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                if _group_has_live_members(child.pid):
+                    raise
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
@@ -74,6 +86,7 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
                 current["message"] = "native-local worker stopped before command launch"
                 current["exit_code"] = None
                 current["finished_at"] = _utcnow()
+                current["group_quiescent"] = True
 
             _mutate_record(record_path, stopped_before_start)
             return 0
@@ -110,39 +123,61 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
             # never leak into the untrusted workload process. Workload-scoped
             # EYVAN_* values are persisted explicitly in ``environment``.
             inherited_environment = {key: value for key, value in os.environ.items() if not key.startswith("EYVAN_")}
-            child = subprocess.Popen(
-                ("/bin/sh", "-lc", entrypoint),
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
-                env={**inherited_environment, **environment},
-            )
+            # The launch gate prevents command execution before subgroup
+            # ownership is durably published. EOF (worker crash/publication
+            # failure) makes the launcher exit without executing the command.
+            gate_read, gate_write = os.pipe()
+            try:
+                child = subprocess.Popen(
+                    (
+                        "/bin/sh",
+                        "-c",
+                        'IFS= read -r permit && [ "$permit" = launch ] && exec </dev/null && exec /bin/sh -lc "$1"',
+                        "eyvan-local-launch",
+                        entrypoint,
+                    ),
+                    stdin=gate_read,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                    process_group=0,
+                    env={**inherited_environment, **environment},
+                )
+                marker = _process_start_marker(child.pid)
+                if marker is None:
+                    raise RuntimeError("native-local command identity could not be established")
+
+                def command_owned(current: JsonObject) -> None:
+                    if current.get("worker_token") != worker_token or current.get("worker_pid") != os.getpid():
+                        raise RuntimeError("native-local worker ownership changed before launch")
+                    current["command_pid"] = child.pid
+                    current["command_start_marker"] = marker
+
+                published = _mutate_record(record_path, command_owned)
+                if published is None:
+                    raise RuntimeError("native-local execution disappeared before command launch")
+                stop_requested = stop_requested or bool(published.get("stop_requested"))
+                if not stop_requested:
+                    os.write(gate_write, b"launch\n")
+            finally:
+                os.close(gate_read)
+                os.close(gate_write)
             if stop_requested:
-                child.terminate()
-            # A workload that ignores SIGTERM must not hold the owner lock
-            # forever: escalate to SIGKILL after the stop grace period, then
-            # reap the child so the durable record reaches a terminal state.
-            # The workload deliberately shares the worker's process group —
-            # the owning executor signals and cleans up that whole group — so
-            # only the direct child is killed here and the worker survives to
-            # persist the terminal record.
+                request_stop(signal.SIGTERM, None)
             stop_deadline = time.monotonic() + _STOP_GRACE_S if stop_requested else None
-            while True:
-                exit_code = child.poll()
-                if exit_code is not None:
-                    break
+            # Do not poll/wait the leader yet: retaining it unreaped pins the
+            # process-group identity through descendant TERM/KILL cleanup.
+            while _unreaped_process_is_running(child.pid):
                 if stop_requested:
                     if stop_deadline is None:
                         stop_deadline = time.monotonic() + _STOP_GRACE_S
                     elif time.monotonic() >= stop_deadline:
-                        try:
-                            child.kill()
-                        except ProcessLookupError:
-                            pass
-                        exit_code = child.wait()
                         break
                 time.sleep(0.05)
+            if not _quiesce_process_group(child.pid):
+                raise RuntimeError("native-local command group did not quiesce")
+            command_quiescent = True
+            exit_code = child.wait()
 
         def finished(current: JsonObject) -> None:
             stopped = stop_requested or bool(current.get("stop_requested"))
@@ -162,16 +197,28 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
             )
             current["exit_code"] = exit_code
             current["finished_at"] = _utcnow()
+            current["group_quiescent"] = True
 
         _mutate_record(record_path, finished)
         return 0
     except BaseException as exc:
         failure_message = str(exc)
+        quiescent = child is None or command_quiescent
+        if child is not None and not command_quiescent:
+            try:
+                quiescent = _quiesce_process_group(child.pid)
+                if quiescent:
+                    child.wait()
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                quiescent = False
 
         def failed(current: JsonObject) -> None:
-            current["status"] = ExecutionWorkloadStatus.FAILED.value
+            current["status"] = (
+                ExecutionWorkloadStatus.FAILED.value if quiescent else ExecutionWorkloadStatus.INDETERMINATE.value
+            )
             current["message"] = f"native-local worker failed: {failure_message}"
             current["finished_at"] = _utcnow()
+            current["group_quiescent"] = quiescent
 
         _mutate_record(record_path, failed)
         return 1

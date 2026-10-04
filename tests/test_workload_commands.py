@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import typing as tp
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadRecord,
     WorkloadState,
+    utcnow,
 )
 from eyvan.sdk.client.identity import ClientIdentity
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
@@ -115,6 +117,7 @@ def _queue_admission_denied_workload() -> WorkloadRecord:
             zone="us-east5-a",
             accelerator_type="v6e-16",
             capacity_class=CapacityClass.SPOT,
+            occurred_at=utcnow(),
         ),
         created_by="alice",
     )
@@ -197,8 +200,9 @@ def test_workload_status_keeps_the_api_response_when_local_denial_cache_fails(
             zone: str,
             accelerator_type: str,
             capacity_class: CapacityClass,
+            observed_at: datetime,
         ) -> None:
-            del project, zone, accelerator_type, capacity_class
+            del project, zone, accelerator_type, capacity_class, observed_at
             type(self).calls += 1
             raise ValueError("invalid local denial cache")
 

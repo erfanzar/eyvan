@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import re
 import sys
 import typing as tp
 from dataclasses import dataclass
@@ -26,7 +25,8 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from alembic.script.revision import RevisionError
 from alembic.util.exc import CommandError
-from sqlalchemy import inspect, text
+from sqlalchemy import URL, inspect, make_url, text
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -50,16 +50,22 @@ class MigrationConnectionError(RuntimeError):
 
 
 def _redacted_url(url: str) -> str:
-    """Return a database URL with any password removed.
+    """Return only the driver, host, port and database for diagnostics.
 
-    An error message is the most-copied string a tool emits -- into issues, chat,
-    and logs -- so it must not be the thing that leaks a credential.
+    Query parameters may carry actual driver credentials, not just metadata.
+    Never echo an unparseable URL: it may also contain a password.
     """
 
-    match = re.match(r"^(?P<scheme>[^:]+://)(?P<user>[^:@/]+)(?::[^@]*)?@(?P<rest>.*)$", url)
-    if match is None:
-        return url
-    return f"{match.group('scheme')}{match.group('user')}:***@{match.group('rest')}"
+    try:
+        parsed = make_url(url)
+    except (ArgumentError, ValueError):
+        return "<unparseable database URL>"
+    return URL.create(
+        drivername=parsed.drivername,
+        host=parsed.host,
+        port=parsed.port,
+        database=parsed.database,
+    ).render_as_string()
 
 
 class UnsafeAutomaticMigrationError(RuntimeError):
@@ -127,10 +133,11 @@ def build_alembic_config(database_url: str | None = None) -> Config:
 
     Args:
         database_url: SQLAlchemy URL for the control-plane database. Defaults to
-            ``EYVAN_DATABASE_URL``, then to the local-development default. When
-            migrations actually run, the packaged ``env.py`` re-applies
-            ``EYVAN_DATABASE_URL`` if set, matching the source-tree
-            ``alembic.ini`` flow.
+            ``EYVAN_DATABASE_URL``, then to the local-development default. An
+            explicitly passed URL is flagged authoritative and env.py will not
+            override it with the ambient environment variable; the source-tree
+            ``alembic.ini`` flow still reads ``EYVAN_DATABASE_URL`` when nothing
+            else provided a URL.
 
     Returns:
         Config: Alembic configuration pointing at the packaged migration scripts.
@@ -138,7 +145,14 @@ def build_alembic_config(database_url: str | None = None) -> Config:
 
     config = Config()
     config.set_main_option("script_location", str(MIGRATIONS_DIR))
-    config.set_main_option("sqlalchemy.url", database_url or os.getenv("EYVAN_DATABASE_URL") or DEFAULT_DATABASE_URL)
+    url = database_url or os.getenv("EYVAN_DATABASE_URL") or DEFAULT_DATABASE_URL
+    # ConfigParser interpolates percent signs; getters must return the original
+    # SQLAlchemy URL, including its percent-encoded credentials.
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    # Mark a per-invocation URL as authoritative: env.py must not re-apply the
+    # ambient EYVAN_DATABASE_URL over it, or the tool would classify one
+    # database and migrate another.
+    config.attributes["eyvan_explicit_database_url"] = database_url is not None
     return config
 
 

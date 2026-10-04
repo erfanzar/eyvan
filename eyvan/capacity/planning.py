@@ -20,8 +20,8 @@ from eyvan.capacity import (
     EXECUTION_PENDING_CAPACITY_STATUSES,
     QUEUED_CAPACITY_STATUSES,
 )
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode
-from eyvan.domain import SchedulingResult
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, backend_capabilities
+from eyvan.domain import Scheduler, SchedulingResult
 from eyvan.domain.models import PlacementMode, PriorityBand
 from eyvan.records import (
     POOL_ALTERNATE_TEMPLATES_LABEL as POOL_ALTERNATE_TEMPLATES_LABEL,
@@ -40,12 +40,14 @@ from eyvan.records import (
     CellRecord,
     CellState,
     LeaseRecord,
+    PolicyRecord,
     WorkloadRecord,
     WorkloadState,
 )
 from eyvan.records import (
     candidate_pool_templates as candidate_pool_templates,
 )
+from eyvan.server.service.scheduling import to_core_cell, to_core_workload
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
 
 #: How long a shape must have gone unplaced before one pool may reclaim another
@@ -68,6 +70,50 @@ _CELL_EPOCH_CHARS = 6
 # Re-exported: the constants and ``candidate_pool_templates`` live in
 # ``eyvan.records`` so the service scheduler can read them without importing
 # this module (which imports the service layer).
+
+
+def _virtual_pool_cell(pool: CapacityPoolRecord, cell_id: str, worker_count: int) -> CellRecord | None:
+    """Treat a backend/factory shape refusal as infeasibility, not a fleet-wide failure.
+
+    Capability declarations describe an upper bound, not a promise that this
+    pool's factory can compile every shape. In particular, existing non-GCP
+    factories still refuse multi-worker cells. Keep those durable requests
+    pending without manufacturing a cell the real launch path cannot create.
+    """
+
+    if worker_count > min(pool.max_cells, backend_capabilities(pool.capacity_backend).max_workers_per_cell):
+        return None
+    if worker_count > 1 and not pool.hosts_multi_worker_cells:
+        return None
+    try:
+        cell = pool.make_cell(cell_id, worker_count=worker_count)
+    except ValueError:
+        return None
+    return cell.model_copy(update={"state": CellState.READY})
+
+
+def _pool_workload_eligible(
+    workload: WorkloadRecord,
+    pool: CapacityPoolRecord,
+    width: int,
+    policy: PolicyRecord | None,
+) -> bool:
+    """Apply the same current shape and placement constraints to every acquisition."""
+
+    if not pool.enabled:
+        return False
+    candidate = _virtual_pool_cell(pool, stable_id("policy_candidate", pool.id, workload.id, width), width)
+    if candidate is None:
+        return False
+    core = to_core_workload(workload, policy)
+    elastic = workload.spec.placement is PlacementMode.ELASTIC
+    requested = core.total_resources.scale(width) if elastic else core.allocation_resources
+    return (
+        Scheduler._static_cell_failure(
+            core, requested, to_core_cell(candidate), require_worker_count_equality=not elastic
+        )
+        is None
+    )
 
 
 def _candidate_pool_ids(workload: WorkloadRecord) -> tuple[str, ...]:
@@ -598,6 +644,11 @@ class CapacitySimulation:
     #: yet (UNAVAILABLE with a provider failure). Not asked again by a race, and
     #: not counted as racing either: nothing is outstanding there.
     stalled_pool_ids: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: The same policy snapshot used to admit virtual candidates must also gate
+    #: race expansion, including races seeded by an already-acquiring cell.
+    #: ``build`` always supplies it, even when empty. Hand-assembled demand-only
+    #: snapshots retain their compatibility path without a simulation context.
+    policies: tuple[PolicyRecord, ...] | None = None
 
     @classmethod
     def build(
@@ -607,10 +658,19 @@ class CapacitySimulation:
         workloads: tuple[WorkloadRecord, ...],
         leases: tuple[LeaseRecord, ...],
         now: datetime,
+        *,
+        policies: tuple[PolicyRecord, ...] = (),
     ) -> CapacitySimulation:
         """Build real supply and shape-exact virtual candidates for pending work."""
 
         pools_by_id = {pool.id: pool for pool in pools}
+        policy_by_scope = {(policy.org_id, policy.project_id): policy for policy in policies}
+
+        def eligible(workload: WorkloadRecord, pool: CapacityPoolRecord, width: int) -> bool:
+            return _pool_workload_eligible(
+                workload, pool, width, policy_by_scope.get((workload.org_id, workload.project_id))
+            )
+
         scheduler_cells: list[CellRecord] = []
         pool_by_cell_id: dict[str, str] = {}
         virtual_worker_count_by_cell_id: dict[str, int] = {}
@@ -740,9 +800,18 @@ class CapacitySimulation:
             # acquisition, not placement -- so a pool that suddenly grants is picked
             # up by the free-supply branch below without waiting for belief to decay.
             denied_here = queue_denied_pools.get(workload.id, set())
-            candidates = [
+            eligible_named = [
                 pool
                 for pool in named
+                if eligible(
+                    workload, pool, 1 if workload.spec.placement is PlacementMode.ELASTIC else workload.spec.worker_count
+                )
+            ]
+            if named and not eligible_named:
+                continue
+            candidates = [
+                pool
+                for pool in eligible_named
                 if not _acquisition_exhausted(pool, pool_acquisition_failures) and pool.id not in denied_here
             ]
             if named and not candidates:
@@ -773,18 +842,18 @@ class CapacitySimulation:
                     candidates,
                     free_owned_exact_supply=free_owned_exact_supply,
                     free_shared_exact_supply=free_shared_exact_supply,
+                    eligible_width=lambda pool_id, width, owner=workload: eligible(owner, pools_by_id[pool_id], width),
                 )
                 deficit = workload.spec.worker_count - packed
                 if deficit == 0:
                     continue
-                if deficit > 1 and not exact_pool.hosts_multi_worker_cells:
-                    continue
                 cell_id = stable_id("virtual_cell", exact_pool.id, workload.id, "elastic")
+                virtual_cell = _virtual_pool_cell(exact_pool, cell_id, deficit)
+                if virtual_cell is None:
+                    continue
                 pool_by_cell_id[cell_id] = exact_pool.id
                 virtual_worker_count_by_cell_id[cell_id] = deficit
-                scheduler_cells.append(
-                    exact_pool.make_cell(cell_id, worker_count=deficit).model_copy(update={"state": CellState.READY})
-                )
+                scheduler_cells.append(virtual_cell)
                 continue
             if workload.spec.worker_count > 1 and not exact_pool.hosts_multi_worker_cells:
                 # The same guard the generic branch below has always had, and for a
@@ -808,13 +877,12 @@ class CapacitySimulation:
                     free_shared_exact_supply[supply_key] -= 1
                     continue
                 cell_id = stable_id("virtual_cell", exact_pool.id, workload.id, member)
+                virtual_cell = _virtual_pool_cell(exact_pool, cell_id, workload.spec.worker_count)
+                if virtual_cell is None:
+                    continue
                 pool_by_cell_id[cell_id] = exact_pool.id
                 virtual_worker_count_by_cell_id[cell_id] = workload.spec.worker_count
-                scheduler_cells.append(
-                    exact_pool.make_cell(cell_id, worker_count=workload.spec.worker_count).model_copy(
-                        update={"state": CellState.READY}
-                    )
-                )
+                scheduler_cells.append(virtual_cell)
 
         for pool in pools:
             if not pool.enabled:
@@ -836,11 +904,12 @@ class CapacitySimulation:
                     continue
                 for member in range(workload.spec.cell_group_count):
                     cell_id = stable_id("virtual_cell", pool.id, "generic", workload.id, member)
+                    virtual_cell = _virtual_pool_cell(pool, cell_id, worker_count)
+                    if virtual_cell is None or not eligible(workload, pool, worker_count):
+                        continue
                     pool_by_cell_id[cell_id] = pool.id
                     virtual_worker_count_by_cell_id[cell_id] = worker_count
-                    scheduler_cells.append(
-                        pool.make_cell(cell_id, worker_count=worker_count).model_copy(update={"state": CellState.READY})
-                    )
+                    scheduler_cells.append(virtual_cell)
 
         return cls(
             cells=tuple(scheduler_cells),
@@ -854,6 +923,7 @@ class CapacitySimulation:
             acquiring_cell_ids=acquiring_cell_ids,
             owned_pool_ids={workload_id: frozenset(pool_ids) for workload_id, pool_ids in owned_pools.items()},
             stalled_pool_ids={workload_id: frozenset(pool_ids) for workload_id, pool_ids in stalled_pools.items()},
+            policies=policies,
         )
 
     @staticmethod
@@ -863,6 +933,7 @@ class CapacitySimulation:
         *,
         free_owned_exact_supply: Counter[tuple[str, int, str]],
         free_shared_exact_supply: Counter[tuple[str, int]],
+        eligible_width: tp.Callable[[str, int], bool] | None = None,
     ) -> int:
         """Reserve warm free cells toward the workload's worker count.
 
@@ -884,6 +955,8 @@ class CapacitySimulation:
         entries.sort()
         packed = 0
         for _negated, ownership, pool_id, worker_count in entries:
+            if eligible_width is not None and not eligible_width(pool_id, worker_count):
+                continue
             if packed >= need or need - packed < worker_count:
                 continue
             if ownership == 0:
@@ -958,6 +1031,8 @@ class CapacitySimulation:
                     virtual_counts[pool_id].append(worker_count)
                     virtual_workload_ids[pool_id].append(lease.workload_id)
         if race_width > 1:
+            pools_by_id = {pool.id: pool for pool in pools}
+            policy_by_scope = {(policy.org_id, policy.project_id): policy for policy in self.policies or ()}
             self._race_alternates(
                 virtual_counts,
                 virtual_workload_ids,
@@ -967,6 +1042,16 @@ class CapacitySimulation:
                 exhausted_pool_ids=self.exhausted_pool_ids,
                 owned_pool_ids=self.owned_pool_ids,
                 stalled_pool_ids=self.stalled_pool_ids,
+                eligible_pool=(
+                    lambda workload, pool_id, width: _pool_workload_eligible(
+                        workload,
+                        pools_by_id[pool_id],
+                        width,
+                        policy_by_scope.get((workload.org_id, workload.project_id)),
+                    )
+                )
+                if self.policies is not None
+                else None,
                 seeds=tuple(race_seeds),
             )
         return {
@@ -1002,6 +1087,7 @@ class CapacitySimulation:
         exhausted_pool_ids: frozenset[str] = frozenset(),
         owned_pool_ids: tp.Mapping[str, frozenset[str]] | None = None,
         stalled_pool_ids: tp.Mapping[str, frozenset[str]] | None = None,
+        eligible_pool: tp.Callable[[WorkloadRecord, str, int], bool] | None = None,
         seeds: tuple[tuple[str, str, int], ...] = (),
     ) -> None:
         """Ask a workload's other candidate zones for capacity too.
@@ -1016,7 +1102,9 @@ class CapacitySimulation:
         Every extra request is real money, so it is bounded twice: by
         ``race_width``, and by the workload's own declared alternates -- pools
         of the same shape that the submission path already proved
-        interchangeable. Nothing here invents a candidate.
+        interchangeable. The demand path also rechecks current policy and shape
+        eligibility before taking a slot: declared interchangeability is not
+        authority to provision under a policy that has since changed.
 
         The losers are not this function's problem, and that is deliberate: a
         cell requested here carries its workload's reservation, the reservation
@@ -1051,6 +1139,7 @@ class CapacitySimulation:
                 and candidate not in exhausted_pool_ids
                 and candidate not in owned
                 and candidate not in stalled
+                and (eligible_pool is None or eligible_pool(workload, candidate, worker_count))
             ]
             # The width counts zones being asked, the ones already asked
             # included, so an ongoing race tops up rather than grows.
@@ -1172,6 +1261,28 @@ class CapacityPlanner:
         }
 
     def _intent(self, pool: CapacityPoolRecord, demand: PoolDemand) -> PoolScaleIntent:
+        # A shape refused by the pool/backend cannot become feasible by draining
+        # inventory. Demand can also arrive through race expansion, bypassing
+        # virtual candidate creation. Check both boundaries and preserve all
+        # parallel workload metadata when discarding an impossible shape.
+        feasible = tuple(
+            index
+            for index, width in enumerate(demand.virtual_worker_counts)
+            if _virtual_pool_cell(pool, stable_id("virtual_cell", pool.id, "intent", index), width) is not None
+        )
+        if len(feasible) != len(demand.virtual_worker_counts):
+            demand = PoolDemand(
+                real_cell_ids=demand.real_cell_ids,
+                virtual_worker_counts=tuple(demand.virtual_worker_counts[index] for index in feasible),
+                virtual_workload_ids=tuple(demand.virtual_workload_ids[index] for index in feasible),
+                virtual_priorities=tuple(demand.virtual_priorities[index] for index in feasible)
+                if demand.virtual_priorities
+                else (),
+                virtual_pending_seconds=tuple(demand.virtual_pending_seconds[index] for index in feasible)
+                if demand.virtual_pending_seconds
+                else (),
+                real_cell_priorities=demand.real_cell_priorities,
+            )
         managed = tuple(sorted(self._cells_by_pool[pool.id], key=lambda cell: cell.id))
         live = tuple(cell for cell in managed if cell.state is not CellState.DELETED)
         matching = tuple(cell for cell in live if cell_provides_pool_supply(cell, pool, self._now))
@@ -1233,7 +1344,10 @@ class CapacityPlanner:
             requested.append(worker_count)
             available_units -= worker_count
         requested_exact_count = len(requested)
-        floor_deficit = max(target - matching_units - sum(requested), 0)
+        # Only an explicit warm/initial floor permits unowned singleton cells.
+        # Pending exact demand must wait for its shape, not fill a clamped target
+        # with placeholders that the next pass immediately reclaims.
+        floor_deficit = max(floor - matching_units - sum(requested), 0)
         while floor_deficit and available_units and len(requested) < rate_limit:
             requested.append(1)
             floor_deficit -= 1

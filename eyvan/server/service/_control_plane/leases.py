@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from eyvan.records import CellStageState
 from eyvan.server.service._control_plane.shared import (
     ACTIVE_LEASE_STATES,
     AuditEvent,
@@ -21,6 +22,8 @@ from eyvan.server.service._control_plane.shared import (
     Permission,
     PlacementMode,
     Principal,
+    RepositorySession,
+    WorkloadRecord,
     WorkloadState,
     _fingerprint,
     _new_id,
@@ -37,6 +40,20 @@ from eyvan.server.service._control_plane.shared import (
 
 class LeasesMixin:
     """Transactional leases operations."""
+
+    @staticmethod
+    async def _require_no_asset_eviction(tx: RepositorySession, workload: WorkloadRecord, cell: CellRecord) -> None:
+        """Refuse use of an asset with an unresolved same-host deletion.
+
+        Call only after locking the cell through ``get_cell`` in this transaction:
+        eviction marking takes that same lock before checking live holders.
+        Missing/ordinary unknown stages remain cache misses, not admission gates.
+        """
+
+        for asset in sorted(set(workload.spec.named_assets)):
+            stage = await tx.get_cell_stage(cell.id, asset)
+            if stage is not None and stage.cell_generation == cell.generation and stage.state is CellStageState.EVICTING:
+                raise ConflictError(f"cell {cell.id!r} has an unresolved asset eviction")
 
     async def create_lease(
         self, principal: Principal, lease: LeaseRecord, *, idempotency_key: str
@@ -76,6 +93,7 @@ class LeasesMixin:
                     f"lease cell generation {lease.cell_generation} does not match cell generation {cell.generation}"
                 )
             self._require_autoscale_request_ownership(cell, workload.id)
+            await self._require_no_asset_eviction(tx, workload, cell)
             if self.scheduler is not None:
                 policy = await tx.get_policy(workload.org_id, workload.project_id)
                 if policy is not None:
@@ -97,6 +115,13 @@ class LeasesMixin:
                     budgets=() if budget is None else (budget,),
                     quotas=await tx.list_quotas(org_id=workload.org_id),
                     policies=() if policy is None else (policy,),
+                    # The plan pass tightens a grantee plane's limits through its
+                    # grants; revalidation must re-derive with the same inputs,
+                    # or the authoritative check enforces weaker limits than
+                    # the decision it is confirming.
+                    grants=await tx.list_budget_grants() if self.plane_id else [],
+                    quota_grants=await tx.list_quota_grants() if self.plane_id else [],
+                    plane_id=self.plane_id,
                 )
                 placement = next(
                     (candidate for candidate in validation.placements if candidate.workload_id == workload.id),
@@ -233,11 +258,31 @@ class LeasesMixin:
                 workload = await tx.get_workload(existing.resource_id)
                 if workload is None:
                     raise ConflictError("idempotency record points to a missing workload")
-                existing_ids = workload.lease_ids or (() if workload.lease_id is None else (workload.lease_id,))
-                stored = tuple([await tx.get_lease(lease_id) for lease_id in existing_ids])
-                if len(stored) != len(members) or any(member is None for member in stored):
-                    raise ConflictError("idempotency record points to an incomplete lease group")
-                return tuple(member for member in stored if member is not None), True
+                # The fingerprint binds this request's original identities; the
+                # workload's current membership can belong to a later retry.
+                identity_fields = (
+                    "id",
+                    "workload_id",
+                    "org_id",
+                    "project_id",
+                    "group_id",
+                    "group_index",
+                    "generation",
+                    "cell_id",
+                    "cell_generation",
+                    "fencing_token",
+                )
+                stored: list[LeaseRecord] = []
+                for member in members:
+                    original = await tx.get_lease(member.id)
+                    if original is None:
+                        raise ConflictError("idempotency record points to an incomplete original lease group")
+                    if existing.resource_id != member.workload_id or any(
+                        getattr(original, field) != getattr(member, field) for field in identity_fields
+                    ):
+                        raise ConflictError("idempotency record does not match the original lease group")
+                    stored.append(original)
+                return tuple(stored), True
 
             workload = await self._require_workload(tx, leader.workload_id)
             await self._lock_admission_scope(tx, workload.org_id, workload.project_id)
@@ -265,6 +310,7 @@ class LeasesMixin:
                         f"cell generation {cell.generation}"
                     )
                 self._require_autoscale_request_ownership(cell, workload.id)
+                await self._require_no_asset_eviction(tx, workload, cell)
                 cells[cell.id] = cell
 
             if workload.spec.placement is PlacementMode.ELASTIC:
@@ -298,6 +344,13 @@ class LeasesMixin:
                     budgets=() if budget is None else (budget,),
                     quotas=await tx.list_quotas(org_id=workload.org_id),
                     policies=() if policy is None else (policy,),
+                    # The plan pass tightens a grantee plane's limits through its
+                    # grants; revalidation must re-derive with the same inputs,
+                    # or the authoritative check enforces weaker limits than
+                    # the decision it is confirming.
+                    grants=await tx.list_budget_grants() if self.plane_id else [],
+                    quota_grants=await tx.list_quota_grants() if self.plane_id else [],
+                    plane_id=self.plane_id,
                 )
                 placement = next(
                     (candidate for candidate in validation.placements if candidate.workload_id == workload.id),

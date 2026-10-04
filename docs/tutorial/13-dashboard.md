@@ -28,10 +28,35 @@ the server needs no per-page rewrite rules (Part 9).
 ## Authentication and authorization
 
 `AuthGate` absorbs a loopback credential from the URL fragment, loads
-`/api/v1/dashboard/config` when baked OIDC settings are incomplete, and attempts
-OIDC PKCE completion before rendering `App`. Tokens, PKCE verifier/nonce, and
-expiry live in session storage (`auth/oidc.ts`); discovery comes from the
-configured issuer.
+`/api/v1/dashboard/config` when baked OIDC settings are incomplete, and asks
+`/api/v1/session` whether a server session exists before rendering `App`.
+OIDC sign-in uses a backend-for-frontend (BFF), server-side authorization-code/PKCE
+flow: `auth/oidc.ts` navigates to `/api/v1/dashboard/auth/login`, and the server
+performs discovery with the configured issuer and creates the login transaction.
+The identity provider returns the browser to `/api/v1/dashboard/auth/callback`;
+the server exchanges the authorization code and opens the session. OIDC access/ID
+tokens, PKCE verifier/nonce, and expiry stay server-side. The browser holds an
+`__Host-eyvan_session` cookie (HttpOnly, Secure, SameSite=Lax), not OIDC tokens.
+The temporary login-transaction cookie is `__Host-eyvan_oidc_tx`; both cookies
+use `Path=/` and no `Domain`. Their `__Host-` prefix prevents sibling-subdomain
+parent-domain cookie planting; legacy unprefixed cookies are not accepted, so
+existing browsers must sign in again.
+Only the loopback development credential lives in `sessionStorage`; it is removed
+from the URL fragment when absorbed.
+
+Deploy OIDC behind HTTPS (TLS may terminate at the reverse proxy): the cookies
+are unconditionally Secure. Set `EYVAN_PUBLIC_URL` to the browser-facing HTTPS
+URL; the callback URI and cookie-write Origin checks use this configuration,
+not Host or forwarded headers. A proxy must preserve the browser's Origin and
+cookies, and must route the login and callback paths to the API, not to the
+dashboard SPA. Proxy headers do not override the configured public origin or
+waive the network listener's explicit plaintext acknowledgement requirement;
+see `docs/security.md` for that separate boundary.
+Login transactions and sessions use an in-process store;
+with multiple API replicas, sticky sessions must keep login, callback, and
+subsequent API requests on the same process. Cookie-authenticated writes require
+an Origin matching the configured public URL. See `docs/security.md` for the
+session lifetime, store limits, and CSRF boundary.
 
 The server's `/session` response is authoritative for subject, scopes, roles,
 permissions, and `accepts_new_work`. The UI derives presentation capabilities from

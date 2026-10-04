@@ -40,6 +40,7 @@ interface FleetPageProps {
   onStopFleet?: (fleetName: string) => Promise<void>;
   /** The pools registered for this scope, running or not. */
   loadPools?: (signal: AbortSignal) => Promise<CapacityPoolSummary[]>;
+  refreshRevision?: number;
 }
 
 export function FleetPage({
@@ -52,6 +53,7 @@ export function FleetPage({
   loadBilling,
   loadLaunchLatency,
   onDrainCell,
+  refreshRevision = 0,
 }: FleetPageProps) {
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
@@ -64,6 +66,9 @@ export function FleetPage({
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [pools, setPools] = useState<CapacityPoolSummary[]>([]);
   const [poolsError, setPoolsError] = useState<string | null>(null);
+  const [poolsLoading, setPoolsLoading] = useState(Boolean(loadPools));
+  const [poolRetryRevision, setPoolRetryRevision] = useState(0);
+  const [stopError, setStopError] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
   const [refreshed, setRefreshed] = useState(false);
@@ -114,6 +119,10 @@ export function FleetPage({
 
   useEffect(() => {
     const controller = new AbortController();
+    // A later successful load must clear an earlier failure, or a transient
+    // error sticks above fresh data forever (BillingPage resets the same way).
+    setCostError(null);
+    setLatencyError(null);
     Promise.all([loadWarmth(controller.signal), loadBilling(controller.signal)])
       .then(([warmthReport, billingReport]) => {
         if (controller.signal.aborted) return;
@@ -141,19 +150,26 @@ export function FleetPage({
         }
       });
     return () => controller.abort();
-  }, [loadBilling, loadLaunchLatency, loadWarmth]);
+  }, [loadBilling, loadLaunchLatency, loadWarmth, refreshRevision]);
 
   useEffect(() => {
     if (!loadPools) return;
     const controller = new AbortController();
+    setPoolsError(null);
+    setPoolsLoading(true);
     loadPools(controller.signal)
-      .then((value) => setPools(value))
+      .then((value) => {
+        if (!controller.signal.aborted) setPools(value);
+      })
       .catch((error) => {
         if (controller.signal.aborted) return;
         setPoolsError(error instanceof Error ? error.message : "Could not read capacity pools");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPoolsLoading(false);
       });
     return () => controller.abort();
-  }, [loadPools, stopping]);
+  }, [loadPools, stopping, refreshRevision, poolRetryRevision]);
 
   const fleets = useMemo(() => {
     const grouped = new Map<
@@ -179,6 +195,8 @@ export function FleetPage({
   }, [pools]);
 
   const warmHourlyCost = (warmth?.pools ?? []).reduce((total, pool) => total + pool.hourly_cost, 0);
+  const unpriced = (billing?.unpriced_cells ?? 0) > 0;
+  const everyCellUnpriced = billing !== null && billing.cells > 0 && billing.unpriced_cells >= billing.cells;
 
   return (
     <div className="page-stack">
@@ -233,10 +251,28 @@ export function FleetPage({
         )}
         {billing && (
           <div className="resource-row-detail">
-            <span>{formatMoney(billing.accrued_cost)} accrued</span>
-            <span>{formatMoney(billing.idle_cost)} idle</span>
-            <span>{formatMoney(warmHourlyCost)}/h held warm</span>
+            <span>
+              {everyCellUnpriced
+                ? "Accrued: Not costed"
+                : `${formatMoney(billing.accrued_cost)} accrued${unpriced ? " (priced cells only)" : ""}`}
+            </span>
+            <span>
+              {everyCellUnpriced
+                ? "Idle: Not costed"
+                : `${formatMoney(billing.idle_cost)} idle${unpriced ? " (priced cells only)" : ""}`}
+            </span>
+            <span>
+              {formatMoney(warmHourlyCost)}/h held warm{unpriced ? " (declared prices only)" : ""}
+            </span>
           </div>
+        )}
+        {billing && unpriced && (
+          <p className="panel-note">
+            {billing.unpriced_cells} of {billing.cells} cell(s) have no declared unit price; their cost is unknown, not
+            free. {(billing.billed_seconds / 3600).toFixed(1)}h billed, {(billing.idle_seconds / 3600).toFixed(1)}h idle
+            are measured across all cells. Declare <code>unit_prices</code>, including zero for known-free capacity, to
+            cost them.
+          </p>
         )}
         {warmth && warmth.pools.length > 0 && (
           <dl className="definition-grid">
@@ -304,7 +340,7 @@ export function FleetPage({
         )}
       </section>
 
-      {fleets.length > 0 && (
+      {loadPools && (
         <section className="panel data-panel" aria-label="Applied fleets">
           <div className="panel-header">
             <div>
@@ -313,57 +349,75 @@ export function FleetPage({
             </div>
             <Layers size={18} aria-hidden="true" />
           </div>
-          <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Fleet</th>
-                  <th>Pools</th>
-                  <th>Shapes</th>
-                  <th>Zone</th>
-                  {onStopFleet && <th aria-label="Actions" />}
-                </tr>
-              </thead>
-              <tbody>
-                {fleets.map((fleet) => (
-                  <tr key={fleet.name}>
-                    <td>
-                      <span className="resource-cell">
-                        <strong>{fleet.name}</strong>
-                        {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
-                      </span>
-                    </td>
-                    <td>{fleet.pools.length}</td>
-                    <td>
-                      <span className="resource-cell">
-                        <strong>{summarizeShapes(fleet.shapes)}</strong>
-                      </span>
-                    </td>
-                    <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
-                    {onStopFleet && (
-                      <td>
-                        <button
-                          className="button button-secondary"
-                          type="button"
-                          disabled={stopping === fleet.name}
-                          onClick={() => setConfirmStop(fleet.name)}
-                        >
-                          {stopping === fleet.name ? "Stopping" : "Stop"}
-                        </button>
-                      </td>
-                    )}
+          {poolsLoading && <p className="panel-note">Reading capacity pools…</p>}
+          {!poolsLoading && !poolsError && fleets.length === 0 && <p className="panel-note">No fleets are applied.</p>}
+          {fleets.length > 0 && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Fleet</th>
+                    <th>Pools</th>
+                    <th>Shapes</th>
+                    <th>Zone</th>
+                    {onStopFleet && <th aria-label="Actions" />}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {fleets.map((fleet) => (
+                    <tr key={fleet.name}>
+                      <td>
+                        <span className="resource-cell">
+                          <strong>{fleet.name}</strong>
+                          {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
+                        </span>
+                      </td>
+                      <td>{fleet.pools.length}</td>
+                      <td>
+                        <span className="resource-cell">
+                          <strong>{summarizeShapes(fleet.shapes)}</strong>
+                        </span>
+                      </td>
+                      <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
+                      {onStopFleet && (
+                        <td>
+                          <button
+                            className="button button-secondary"
+                            type="button"
+                            disabled={stopping === fleet.name}
+                            onClick={() => setConfirmStop(fleet.name)}
+                          >
+                            {stopping === fleet.name ? "Stopping" : "Stop"}
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           {poolsError && (
             <div className="inline-error" role="alert">
               <AlertTriangle size={16} aria-hidden="true" />
               {poolsError}
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => setPoolRetryRevision((revision) => revision + 1)}
+              >
+                Retry pool listing
+              </button>
             </div>
           )}
         </section>
+      )}
+
+      {stopError && (
+        <div className="inline-error" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          {stopError}
+        </div>
       )}
 
       {confirmStop && onStopFleet && (
@@ -377,15 +431,15 @@ export function FleetPage({
           confirmLabel="Stop fleet"
           destructive
           busy={stopping === confirmStop}
-          error={poolsError}
+          error={stopError}
           onCancel={() => setConfirmStop(null)}
           onConfirm={() => {
             const name = confirmStop;
             setConfirmStop(null);
             setStopping(name);
-            setPoolsError(null);
+            setStopError(null);
             void onStopFleet(name)
-              .catch((error) => setPoolsError(error instanceof Error ? error.message : "Could not stop the fleet"))
+              .catch((error) => setStopError(error instanceof Error ? error.message : "Could not stop the fleet"))
               .finally(() => setStopping(null));
           }}
         />
@@ -515,7 +569,7 @@ export function FleetPage({
                   </span>
                   <span>
                     <Cpu size={15} />
-                    <small>Workloads</small>
+                    <small>Selected-project workloads</small>
                     <strong>{cell.activeWorkloads} active</strong>
                   </span>
                 </div>
@@ -662,15 +716,13 @@ export function FleetPage({
               The scheduler stops placing new work on <strong>{draining?.name}</strong>. Its agent begins releasing
               capacity, and the cell is released once every lease has left it.
             </p>
-            {/* The number that decides whether this is routine or an
-                interruption, and the reason the count is on the card at all.
-                An operator draining a bad host needs to know it is holding
-                someone's gang before they find out from the job's owner. */}
+            {/* Lease-derived counts cover only the selected project, not the global fleet. */}
             <p>
               {draining?.activeWorkloads
-                ? `${draining.activeWorkloads} workload${draining.activeWorkloads === 1 ? "" : "s"} currently hold capacity here. Their leases end when this cell releases, and each one reschedules elsewhere if its retry budget allows.`
-                : "No workload currently holds capacity here."}
+                ? `${draining.activeWorkloads} selected-project workload${draining.activeWorkloads === 1 ? "" : "s"} currently hold capacity here. Their leases end when this cell releases, and each one reschedules elsewhere if its retry budget allows.`
+                : "No selected-project workloads currently hold capacity here."}
             </p>
+            <p>Other-project occupancy is unknown. Draining this cell may also interrupt their workloads.</p>
           </>
         }
         onConfirm={() => void drainConfirmed()}

@@ -5,7 +5,7 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiClient } from "../api/client";
@@ -357,6 +357,43 @@ describe("the quota page", () => {
     expect(calls[1]).toEqual({ refresh: true });
   });
 
+  it("keeps a refreshed quota when an earlier scope's request completes last", async () => {
+    let resolveOld!: (value: TpuQuotaSnapshot) => void;
+    let resolveRefresh!: (value: TpuQuotaSnapshot) => void;
+    const page = render(
+      <CapacityPage loadQuota={() => new Promise<TpuQuotaSnapshot>((resolve) => (resolveOld = resolve))} />,
+    );
+    page.rerender(
+      <CapacityPage
+        loadQuota={(_signal, options) =>
+          options?.refresh
+            ? new Promise<TpuQuotaSnapshot>((resolve) => (resolveRefresh = resolve))
+            : Promise.resolve(snapshot({ entries: [entry({ zone: "new-scope-zone" })] }))
+        }
+      />,
+    );
+    await screen.findByText("new-scope-zone");
+
+    fireEvent.click(screen.getByRole("button", { name: /Re-read provider/ }));
+    await act(async () => resolveOld(snapshot({ entries: [entry({ zone: "old-zone" })] })));
+    expect(screen.queryByText("old-zone")).toBeNull();
+    await act(async () => resolveRefresh(snapshot({ entries: [entry({ zone: "fresh-zone" })] })));
+    expect(screen.getByText("fresh-zone")).toBeTruthy();
+    expect(screen.queryByText("old-zone")).toBeNull();
+  });
+
+  it("hides an earlier scope's quota while its replacement read is pending", async () => {
+    const page = render(
+      <CapacityPage loadQuota={async () => snapshot({ entries: [entry({ zone: "old-project-zone" })] })} />,
+    );
+    await screen.findByText("old-project-zone");
+
+    page.rerender(<CapacityPage loadQuota={() => new Promise<TpuQuotaSnapshot>(() => {})} />);
+
+    expect(screen.queryByText("old-project-zone")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Free capacity by zone" })).toBeNull();
+  });
+
   it("keeps an unlimited quota out of the free totals it has no number for", async () => {
     renderPage(
       snapshot({
@@ -483,6 +520,43 @@ describe("what each zone has been doing", () => {
     renderZones([cell()], new Error("Eyvan API request failed with 403"));
 
     expect(await screen.findByText(/403/)).toBeTruthy();
+  });
+
+  it("drops old fleet history immediately when its permission or loader changes", async () => {
+    const history: AuditEvent[] = [
+      {
+        id: "history-old",
+        timestamp: "2026-08-17T09:00:00Z",
+        action: "capacity.granted",
+        actor: "operator",
+        target: "old-fleet-cell",
+        category: "capacity",
+        severity: "info",
+        detail: "",
+      },
+    ];
+    const quota = async () => snapshot({ status: "unconfigured", entries: [] });
+    const page = render(<CapacityPage loadQuota={quota} loadCapacityEvents={async () => history} />);
+    await screen.findByText("old-fleet-cell");
+
+    page.rerender(<CapacityPage loadQuota={quota} />);
+    expect(screen.queryByText("old-fleet-cell")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Zone capacity history" })).toBeNull();
+
+    page.rerender(<CapacityPage loadQuota={quota} loadCapacityEvents={() => new Promise<AuditEvent[]>(() => {})} />);
+    expect(screen.queryByText("old-fleet-cell")).toBeNull();
+    expect(screen.queryByText("No capacity has been granted or released recently.")).toBeNull();
+
+    page.rerender(
+      <CapacityPage
+        loadQuota={quota}
+        loadCapacityEvents={async () => {
+          throw new Error("new fleet history unavailable");
+        }}
+      />,
+    );
+    await screen.findByText("new fleet history unavailable");
+    expect(screen.queryByText("old-fleet-cell")).toBeNull();
   });
 
   it("says a fleet has been quiet only when the read succeeded", async () => {

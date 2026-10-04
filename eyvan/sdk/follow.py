@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.records import WorkloadRecord, WorkloadState
+from eyvan.sdk.client.sync import UNREACHABLE_GRACE_S
+from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.job_receipt import JobLifecycleUpdate, JobTerminalOutput
 from eyvan.sdk.lifecycle import TERMINAL_STATES, workload_lifecycle_update
 from eyvan.worker.runtime.log_records import routine_unit_chatter
@@ -59,6 +61,9 @@ class _LogWindow:
     expected_ranks: int | None = None
     detail: str = ""
     unavailable: bool = False
+    #: Exhaustion is about the raw page, not the transcript after filtering.
+    raw_record_count: int = 0
+    truncated_ranks: tuple[int, ...] = ()
 
     @classmethod
     def parse(cls, payload: JsonValue) -> _LogWindow:
@@ -94,6 +99,16 @@ class _LogWindow:
         cursor = payload.get("next_cursor")
         expected = payload.get("expected_ranks")
         detail = payload.get("detail")
+        truncated = payload.get("truncated_ranks")
+        ranks = (
+            tuple(
+                sorted(
+                    {rank for rank in truncated if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0}
+                )
+            )
+            if isinstance(truncated, list)
+            else ()
+        )
         return cls(
             lines=tuple(lines),
             provenance=tuple(provenance),
@@ -102,6 +117,8 @@ class _LogWindow:
             expected_ranks=expected if isinstance(expected, int) and not isinstance(expected, bool) else None,
             detail=detail if isinstance(detail, str) else "",
             unavailable=bool(payload.get("unavailable")),
+            raw_record_count=len(raw) if isinstance(raw, list) else 0,
+            truncated_ranks=ranks,
         )
 
 
@@ -214,6 +231,7 @@ class WorkloadFollower:
     _cursor: str = ""
     _last_update: JobLifecycleUpdate | None = None
     _rank_prefixes: bool = False
+    _reported_notes: set[str] = field(default_factory=set)
 
     def follow(self, workload_id: str) -> FollowOutcome:
         """Stream one workload to completion and report how it ended."""
@@ -235,12 +253,15 @@ class WorkloadFollower:
     def _follow(self, workload_id: str) -> FollowOutcome:
         while True:
             workload = self._workload(workload_id)
-            self._drain(workload_id)
-            if workload is not None and workload.state in TERMINAL_STATES:
+            terminal = workload is not None and workload.state in TERMINAL_STATES
+            # Live polls are fair to lifecycle updates; terminal and one-shot
+            # reads have no later poll to recover output left behind a budget.
+            self._drain(workload_id, bounded=not terminal)
+            if terminal:
+                assert workload is not None
                 # Settlement archives this attempt's remaining output *before*
-                # it commits the terminal state, so everything the job produced
-                # is readable by the time that state is visible here.
-                self._drain(workload_id)
+                # it commits the terminal state, so drain the available archive
+                # to exhaustion before reporting its durable outcome.
                 self._emit(workload)
                 return FollowOutcome(state=workload.state, exit_code=_EXIT_STATUS[workload.state])
             if workload is not None:
@@ -255,7 +276,7 @@ class WorkloadFollower:
         are the reason to be here and they are still readable.
         """
 
-        payload = self.client.request("GET", f"/api/v1/workloads/{workload_id}")
+        payload = self._request(f"/api/v1/workloads/{workload_id}")
         if not is_json_object(payload):
             return None
         try:
@@ -263,13 +284,23 @@ class WorkloadFollower:
         except Exception:
             return None
 
-    def _drain(self, workload_id: str) -> None:
-        """Print every line this follower has not shown yet."""
+    def _drain(self, workload_id: str, *, bounded: bool = False) -> bool:
+        """Read available output, returning whether the page stream was exhausted.
 
-        for _page in range(self.max_pages_per_poll):
+        The one-shot CLI caller uses an exhaustive drain by default. Live
+        following explicitly bounds each batch so progress is still polled.
+        """
+
+        pages = 0
+        seen_cursors: set[str] = set()
+        while not bounded or pages < self.max_pages_per_poll:
+            if self._cursor in seen_cursors:
+                self._note("log reading stopped because its cursor did not advance; output may be incomplete")
+                return False
+            seen_cursors.add(self._cursor)
+            pages += 1
             window = _LogWindow.parse(
-                self.client.request(
-                    "GET",
+                self._request(
                     f"/api/v1/workloads/{workload_id}/log-page",
                     params={"after": self._cursor, "limit": self.page_limit},
                 )
@@ -280,6 +311,18 @@ class WorkloadFollower:
                 # boundary is announced rather than papered over: the lines
                 # after it are a different run of the same job.
                 self.output.note("the job restarted; following the new attempt from its first line")
+                # The new attempt's first page may carry no cursor at all;
+                # keeping the previous attempt's position would resend it every
+                # poll and re-announce the restart forever.
+                self._cursor = ""
+            # Never echo arbitrary server detail: it can contain credentials or
+            # terminal controls. Structured gap metadata is safe to describe.
+            if window.unavailable:
+                self._note("job logs are unavailable; output may be incomplete")
+            if window.truncated_ranks:
+                ranks = ", ".join(str(rank) for rank in window.truncated_ranks[:20])
+                suffix = f" (and {len(window.truncated_ranks) - 20} more)" if len(window.truncated_ranks) > 20 else ""
+                self._note(f"job logs are incomplete for ranks: {ranks}{suffix}")
             if window.expected_ranks is not None and window.expected_ranks > 1:
                 self._rank_prefixes = True
             if not self._rank_prefixes and any(rank for rank, _message, _at in window.lines):
@@ -301,8 +344,41 @@ class WorkloadFollower:
                     self.write(message)
             if window.cursor:
                 self._cursor = window.cursor
-            if not window.lines:
-                return
+            if not window.raw_record_count:
+                return not window.unavailable
+        return False
+
+    def _request(
+        self, path: str, *, params: tp.Mapping[str, str | int | float | bool | None] | None = None
+    ) -> JsonValue:
+        """Give each durable read the SDK wait's bounded transport-outage grace.
+
+        Retry the same request/cursor without replaying already printed output.
+        Only unavailability is forgiven: authorization and missing records are
+        authoritative refusals, not a control-plane restart. A successful read
+        ends this outage, so the next read receives a fresh grace window.
+        """
+
+        unreachable_since: float | None = None
+        while True:
+            try:
+                return self.client.request("GET", path, params=params)
+            except EyvanUnavailableError:
+                now = time.monotonic()
+                if unreachable_since is None:
+                    unreachable_since = now
+                remaining = UNREACHABLE_GRACE_S - (now - unreachable_since)
+                if remaining <= 0:
+                    raise
+                self.sleep(min(self.poll_interval, remaining))
+
+    def _note(self, message: str) -> None:
+        """Show a credential-safe log-read diagnostic once per attachment."""
+
+        if message not in self._reported_notes:
+            self._settle_output()
+            self.output.note(message)
+            self._reported_notes.add(message)
 
     def _settle_output(self) -> None:
         """Stop any in-place status the output is drawing, if it draws one.

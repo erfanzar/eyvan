@@ -251,11 +251,11 @@ BROKEN_PROVIDERS: tuple[tuple[type[OnPremSshCapacityDriver], tuple[str, ...]], .
     ),
     (
         ForgetsToClaim,
-        # Three, and all of them honest: a driver that never touches the
-        # substrate fails every check that reads it.
+        # A fabricated claim also hides an unreachable provider during apply.
         (
             "apply-publishes-a-fenced-incarnation",
             "apply-is-idempotent-under-replay",
+            "unreachable-provider-does-not-fake-capacity",
             "permanent-failure-is-conclusive",
         ),
     ),

@@ -123,7 +123,7 @@ def _scan_report(*, findings: list[dict[str, object]] | None = None, image: str 
         "ArtifactName": image,
         "ArtifactType": "container_image",
         "CreatedAt": NOW,
-        "Results": [{"Target": "fixture", "Vulnerabilities": findings or []}],
+        "Results": [{"Class": "os-pkgs", "Target": "fixture", "Type": "alpine", "Vulnerabilities": findings or []}],
         "SchemaVersion": 2,
     }
 
@@ -700,6 +700,38 @@ def test_allowlist_rejects_stale_long_or_wildcard_entries(
     assert message in result.stderr
 
 
+@pytest.mark.parametrize("target_class,target_type", [("os-pkgs", "alpine"), ("lang-pkgs", "python-pkg")])
+@pytest.mark.parametrize("severity", [None, "HIGH", "CRITICAL"])
+def test_os_and_library_scans_keep_the_high_critical_gate(
+    tmp_path: Path, target_class: str, target_type: str, severity: str | None
+) -> None:
+    findings = []
+    if severity is not None:
+        finding = _high_finding()
+        finding["Severity"] = severity
+        if target_class == "lang-pkgs":
+            finding.update(
+                InstalledVersion="1.2.3",
+                PkgIdentifier={"PURL": "pkg:pypi/fixture-library@1.2.3"},
+                PkgName="fixture-library",
+            )
+        findings.append(finding)
+    report = _scan_report(findings=findings)
+    report["Results"][0].update({"Class": target_class, "Type": target_type})
+    result, output = _gate_scan(tmp_path, report=report)
+    assert result.returncode == (0 if severity is None else 1), result.stderr
+    disposition = json.loads(output.read_text())
+    assert disposition["status"] == ("pass" if severity is None else "fail")
+    assert disposition["counts"] == {
+        "allowed": 0,
+        "critical": int(severity == "CRITICAL"),
+        "high": int(severity == "HIGH"),
+        "unmatched": int(severity is not None),
+    }
+    if severity is not None:
+        assert "unmatched High/Critical" in result.stderr
+
+
 def test_clean_trivy_report_emits_canonical_passing_disposition(tmp_path: Path) -> None:
     result, output = _gate_scan(tmp_path, report=_scan_report())
     assert result.returncode == 0, result.stderr
@@ -850,6 +882,21 @@ def test_image_metadata_checks_labels_platform_entrypoint_and_oidc(tmp_path: Pat
     )
     assert result.returncode == 1
     assert "environment-specific OIDC" in result.stderr
+
+
+@pytest.mark.parametrize("text", ["", "null\n", "- string\n", "plain string\n", "key: [unterminated\n"])
+def test_render_rejects_empty_non_mapping_and_invalid_yaml_without_traceback(tmp_path: Path, text: str) -> None:
+    render = tmp_path / "invalid-root.yaml"
+    render.write_text(text)
+    arguments: list[str | Path] = ["verify-rendered-digest-refs", "--render", render]
+    for index, role in enumerate(ROLES, 1):
+        reference = f"registry.example/eyvan-{role}@sha256:{str(index) * 64}"
+        arguments.extend(("--reference", f"{role}={reference}"))
+    result = _run(*arguments)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.startswith("error: ")
+    assert "Traceback" not in result.stderr
+    assert "verified" not in result.stdout
 
 
 def test_render_accepts_only_the_three_exact_distinct_digest_refs(tmp_path: Path) -> None:

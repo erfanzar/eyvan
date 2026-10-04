@@ -274,7 +274,12 @@ def test_a_workload_naming_no_pool_is_not_offered_a_zone_that_denied_it() -> Non
         id="wl-1",
         org_id="acme",
         project_id="research",
-        spec=WorkloadDefinition(name="batch-0", execution=CommandExecution(command="true")),
+        spec=WorkloadDefinition(
+            name="batch-0",
+            execution=CommandExecution(command="true"),
+            capacity_class="spot",
+            gang={"replicas": 1, "per_replica": {"cpu": 0, "memory_gib": 0, "tpu": 8}},
+        ),
         state=WorkloadState.PENDING,
         created_by="alice",
     )

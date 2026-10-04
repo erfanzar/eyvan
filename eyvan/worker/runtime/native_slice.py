@@ -55,10 +55,12 @@ from __future__ import annotations
 import concurrent.futures
 import copy
 import logging
+import threading
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, replace
+from time import monotonic
 from urllib.parse import urlparse
 
 import httpx
@@ -93,7 +95,7 @@ from eyvan.worker.runtime.log_records import (
     join_log_cursor,
     merge_pages,
 )
-from eyvan.worker.runtime.native_remote import NativeRemoteExecutor
+from eyvan.worker.runtime.native_remote import _EXEC_HTTP_TIMEOUT_MARGIN_S, NativeRemoteExecutor
 from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageResult, AssetStageVerdict
 from eyvan.worker.runtime.systemd_transient import _rank_checkpoint_uri
 
@@ -136,6 +138,65 @@ _StageAction: tp.TypeAlias = tp.Literal["measure", "stage", "evict"]
 StageFence: tp.TypeAlias = tp.Callable[[], int]
 
 logger = logging.getLogger(__name__)
+
+# A wide cell must not create one OS thread per rank. Queued commands share
+# the original deadline, rather than starting a fresh budget in each wave.
+_EXEC_CONCURRENCY_LIMIT = 16
+
+
+def _exec_fanout(
+    workers: tp.Sequence[tuple[int, str, NativeRemoteExecutor]],
+    remote_id: str,
+    command: tp.Sequence[str],
+    *,
+    timeout_s: float,
+) -> list[JsonValue]:
+    """Run bounded diagnostic requests with one command deadline and rank order.
+
+    NativeRemoteExecutor's HTTP timeout is the remaining command budget plus
+    its existing 30-second response margin, matching the outer agent hop. On
+    cancellation, stop queued dispatch and drain in-flight bounded HTTP calls:
+    Python threads cannot safely be killed, and abandoning them leaks work.
+    """
+
+    cancelled = threading.Event()
+    deadline = monotonic() + timeout_s
+
+    def run(rank: int, endpoint: str, worker: NativeRemoteExecutor, *, single: bool = False) -> JsonObject:
+        remaining = timeout_s if single else deadline - monotonic()
+        if cancelled.is_set() or remaining <= 0:
+            result: JsonValue = {"observed": False, "detail": "exec deadline expired or dispatch cancelled"}
+        else:
+            try:
+                result = worker.exec_in_workload(remote_id, list(command), timeout_s=remaining)
+                if not single and monotonic() > deadline + _EXEC_HTTP_TIMEOUT_MARGIN_S:
+                    result = {"observed": False, "detail": "exec response arrived after the shared deadline"}
+            except httpx.TransportError as exc:
+                result = {"observed": False, "detail": f"native worker is unreachable: {type(exc).__name__}: {exc}"}
+            except (httpx.HTTPStatusError, RuntimeError, ValueError) as exc:
+                result = {"observed": False, "detail": f"exec failed: {type(exc).__name__}: {exc}"}
+            except BaseException:
+                cancelled.set()
+                raise
+        return {"rank": rank, "endpoint": endpoint, "result": result}
+
+    if len(workers) == 1:
+        # Keep an exact-rank/one-host command's full budget and caller thread.
+        return [run(*workers[0], single=True)]
+    results: list[JsonValue] = [None] * len(workers)
+    pool = ThreadPoolExecutor(max_workers=min(len(workers), _EXEC_CONCURRENCY_LIMIT), thread_name_prefix="eyvan-exec")
+    futures: dict[concurrent.futures.Future[JsonObject], int] = {}
+    try:
+        for index, worker in enumerate(workers):
+            futures[pool.submit(copy_context().run, run, *worker)] = index
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+    except BaseException:
+        cancelled.set()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return results
 
 
 class JaxClusterDetectionMode(StrEnum):
@@ -1204,7 +1265,7 @@ class NativeSliceExecutor:
             for rank, worker, remote_ids in reversed(attempted):
                 for attempted_remote_id in sorted(remote_ids):
                     try:
-                        worker.retire(attempted_remote_id, context)
+                        worker.retire(attempted_remote_id, rollback_context(context))
                     except Exception as exc:
                         retire_failures.append(f"rank {rank} ({worker.endpoint}): {type(exc).__name__}")
             if retire_failures:
@@ -1317,12 +1378,20 @@ class NativeSliceExecutor:
             ranks.append({"rank": rank, "endpoint": endpoint, "status": detail})
         return {"remote_id": remote_id, "ranks": ranks}
 
+    def exec_in_workload_rank(
+        self, remote_id: str, command: tp.Sequence[str], *, timeout_s: float, runtime_rank: int
+    ) -> JsonObject:
+        """Address exactly one inner runtime without contacting other hosts."""
+
+        return self.exec_in_workload(remote_id, command, timeout_s=timeout_s, runtime_rank=runtime_rank)
+
     def exec_in_workload(
         self,
         remote_id: str,
         command: tp.Sequence[str],
         *,
         timeout_s: float = 30.0,
+        runtime_rank: int | None = None,
     ) -> JsonObject:
         """Run one diagnostic command beside this workload on every host.
 
@@ -1336,16 +1405,18 @@ class NativeSliceExecutor:
         qualified against on 2026-08-13.
         """
 
-        ranks: list[JsonValue] = []
-        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
-            try:
-                result: JsonValue = worker.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
-            except httpx.TransportError as exc:
-                result = {"observed": False, "detail": f"native worker is unreachable: {type(exc).__name__}: {exc}"}
-            except (httpx.HTTPStatusError, RuntimeError, ValueError) as exc:
-                result = {"observed": False, "detail": f"exec failed: {type(exc).__name__}: {exc}"}
-            ranks.append({"rank": rank, "endpoint": endpoint, "result": result})
-        return {"remote_id": remote_id, "ranks": ranks}
+        if runtime_rank is not None and (
+            isinstance(runtime_rank, bool)
+            or not isinstance(runtime_rank, int)
+            or not 0 <= runtime_rank < len(self._workers)
+        ):
+            raise ValueError("runtime rank does not belong to this slice")
+        workers = [
+            (rank, endpoint, worker)
+            for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True))
+            if runtime_rank is None or rank == runtime_rank
+        ]
+        return {"remote_id": remote_id, "ranks": _exec_fanout(workers, remote_id, command, timeout_s=timeout_s)}
 
     def close(self) -> None:
         """Close internally owned native-worker clients."""

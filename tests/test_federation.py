@@ -17,8 +17,8 @@ total is bounded by construction and no plane consults another at admission time
 
 The properties asserted here are the ones that make that argument hold:
 the home plane cannot over-issue, local spend counts against the same limit,
-re-issuing replaces rather than accumulates, a grant expires without anyone
-acting, and reported spend never walks backwards.
+re-issuing retires admission rights without refunding issued authority, a grant
+expires without anyone acting, and reported spend never walks backwards.
 """
 
 from __future__ import annotations
@@ -111,28 +111,32 @@ def test_issuable_headroom_counts_both_grants_and_local_spend() -> None:
     assert issuable_amount(1000.0, grants, now=now, local_spent=900.0) == 0.0, "never negative"
 
 
-def test_an_expired_grant_frees_its_headroom() -> None:
+def test_an_expired_grant_retains_its_headroom() -> None:
     now = utcnow()
     stale = _grant(amount=400.0, issued_at=now - timedelta(days=30), expires_at=now - timedelta(days=1))
 
-    assert issuable_amount(1000.0, [stale], now=now) == 1000.0
-    assert outstanding_total([stale], now=now) == 0.0
+    assert not stale.active_at(now)
+    assert issuable_amount(1000.0, [stale], now=now) == 600.0
+    assert outstanding_total([stale], now=now) == 400.0
 
 
-def test_a_revoked_grant_frees_its_headroom() -> None:
+def test_a_revoked_grant_retains_its_headroom() -> None:
     now = utcnow()
+    revoked = _grant(amount=400.0, state=GrantState.REVOKED)
 
-    assert issuable_amount(1000.0, [_grant(amount=400.0, state=GrantState.REVOKED)], now=now) == 1000.0
+    assert not revoked.active_at(now)
+    assert issuable_amount(1000.0, [revoked], now=now) == 600.0
+    assert outstanding_total([revoked], now=now) == 400.0
 
 
-def test_replacing_a_grant_is_measured_without_it() -> None:
-    """Otherwise raising a peer's slice is impossible: its own grant blocks it."""
+def test_replacing_a_grant_does_not_exclude_its_retained_authority() -> None:
+    """Replacement is not proof that the peer finished using the old slice."""
 
     now = utcnow()
     grants = [_grant(id="bgr-1", amount=900.0)]
 
     assert issuable_amount(1000.0, grants, now=now) == 100.0
-    assert issuable_amount(1000.0, grants, now=now, replacing="bgr-1") == 1000.0
+    assert issuable_amount(1000.0, grants, now=now, replacing="bgr-1") == 100.0
 
 
 def test_federated_spend_sums_local_and_reported() -> None:
@@ -240,8 +244,8 @@ async def test_local_spend_reduces_what_can_be_granted_away() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reissuing_replaces_rather_than_accumulates() -> None:
-    """A peer's authority must be one number an operator can read."""
+async def test_reissuing_replaces_admission_but_retains_both_monetary_slices() -> None:
+    """A replacement uses remaining headroom, not unproven released rights."""
 
     service = await _service()
     await _seed(service, limit=1000.0)
@@ -256,19 +260,39 @@ async def test_reissuing_replaces_rather_than_accumulates() -> None:
         idempotency_key="grant-1",
     )
 
+    with pytest.raises(InputError, match="exceeds"):
+        await service.issue_budget_grant(
+            _admin(),
+            org_id="acme",
+            project_id="research",
+            grantee_plane_id=_PEER,
+            amount=900.0,
+            expires_at=expires,
+            idempotency_key="grant-2",
+        )
+    async with service.repository.transaction() as tx:
+        retained = await tx.get_budget_grant(first.id)
+    assert retained is not None and retained.state is GrantState.ACTIVE
+
     second = await service.issue_budget_grant(
         _admin(),
         org_id="acme",
         project_id="research",
         grantee_plane_id=_PEER,
-        amount=900.0,
+        amount=600.0,
         expires_at=expires,
         idempotency_key="grant-2",
     )
 
     assert second.id != first.id
+    assert second.amount == 600.0
+    async with service.repository.transaction() as tx:
+        retained = await tx.get_budget_grant(first.id)
+        grants = await tx.list_budget_grants(org_id="acme", project_id="research")
+    assert retained is not None and retained.state is GrantState.REVOKED
+    assert issuable_amount(1000.0, grants, now=utcnow()) == 0.0
     status = await service.federated_budget_status(_admin(), org_id="acme", project_id="research")
-    assert status.granted_away == 900.0, "not 1300; the first grant was replaced"
+    assert status.granted_away == 1000.0
     assert status.active_grants == 1
 
 
@@ -455,11 +479,11 @@ async def test_the_expiry_sweep_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_expired_grant_frees_headroom_for_a_new_one() -> None:
+async def test_an_expired_grant_only_allows_a_new_slice_within_retained_headroom() -> None:
     service = await _service()
     await _seed(service, limit=1000.0)
     now = utcnow()
-    await service.issue_budget_grant(
+    first = await service.issue_budget_grant(
         _admin(),
         org_id="acme",
         project_id="research",
@@ -471,18 +495,37 @@ async def test_an_expired_grant_frees_headroom_for_a_new_one() -> None:
     )
     later = now + timedelta(hours=2)
 
+    with pytest.raises(InputError, match="exceeds"):
+        await service.issue_budget_grant(
+            _admin(),
+            org_id="acme",
+            project_id="research",
+            grantee_plane_id=_PEER,
+            amount=900.0,
+            expires_at=later + timedelta(days=7),
+            idempotency_key="grant-2",
+            now=later,
+        )
     replacement = await service.issue_budget_grant(
         _admin(),
         org_id="acme",
         project_id="research",
         grantee_plane_id=_PEER,
-        amount=900.0,
+        amount=100.0,
         expires_at=later + timedelta(days=7),
         idempotency_key="grant-2",
         now=later,
     )
 
-    assert replacement.amount == 900.0
+    assert replacement.amount == 100.0
+    async with service.repository.transaction() as tx:
+        retained = await tx.get_budget_grant(first.id)
+        grants = await tx.list_budget_grants(org_id="acme", project_id="research")
+    assert retained is not None and not retained.active_at(later)
+    assert issuable_amount(1000.0, grants, now=later) == 0.0
+    status = await service.federated_budget_status(_admin(), org_id="acme", project_id="research", now=later)
+    assert status.granted_away == 1000.0
+    assert status.active_grants == 1
 
 
 @pytest.mark.asyncio
@@ -510,7 +553,7 @@ async def test_registering_a_peer_twice_preserves_its_creation_time() -> None:
 # --------------------------------------------------------------------------- reachability
 
 
-def test_a_deployed_plane_takes_its_identity_from_its_settings() -> None:
+def test_a_deployed_plane_takes_its_identity_from_its_settings(tmp_path) -> None:
     """The seam that made all of the above true and none of it real.
 
     ``EyvanSettings.plane_id`` existed and was read from ``EYVAN_PLANE_ID``; the
@@ -526,7 +569,13 @@ def test_a_deployed_plane_takes_its_identity_from_its_settings() -> None:
     from eyvan.config import EyvanSettings
     from eyvan.server.api.app import create_app
 
-    app = create_app(settings=EyvanSettings(artifact_token_key="k" * 32, plane_id="us-plane"))
+    app = create_app(
+        settings=EyvanSettings(
+            artifact_token_key="k" * 32,
+            artifact_store_uri=str(tmp_path / "managed-artifacts"),
+            plane_id="us-plane",
+        )
+    )
 
     assert app.state.service.plane_id == "us-plane"
 

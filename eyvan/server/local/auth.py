@@ -11,6 +11,7 @@ import base64
 import os
 import secrets
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -166,24 +167,31 @@ class LocalDevelopmentCredentialStore:
 
         credential = LocalDevelopmentCredential(_encode_credential(secrets.token_bytes(_CREDENTIAL_BYTES)))
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-        except FileExistsError:
-            return self.load()
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         except OSError as exc:
             raise LocalDevelopmentCredentialError(
                 f"could not create local Eyvan development credential {self.path}: {exc}"
             ) from exc
+        temporary = Path(temporary_name)
         try:
-            self._write_credential(descriptor, credential.value.encode("ascii"))
-            self._validate_file_metadata(os.fstat(descriptor))
+            try:
+                self._write_credential(descriptor, credential.value.encode("ascii"))
+                self._validate_file_metadata(os.fstat(descriptor))
+            finally:
+                os.close(descriptor)
+            try:
+                # A hard link publishes complete bytes without replacing a concurrent winner.
+                os.link(temporary, self.path)
+            except FileExistsError:
+                return self.load()
+            except OSError as exc:
+                raise LocalDevelopmentCredentialError(
+                    f"could not create local Eyvan development credential {self.path}: {exc}"
+                ) from exc
+            self._fsync_parent_directory()
+            return credential
         finally:
-            os.close(descriptor)
-        self._fsync_parent_directory()
-        return credential
+            temporary.unlink(missing_ok=True)
 
     def _validate_file_metadata(self, metadata: os.stat_result) -> None:
         """Reject credential files that could be observed or replaced by another user."""

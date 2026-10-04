@@ -16,7 +16,12 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from eyvan.config import EyvanSettings
-from eyvan.server.api.dashboard_sessions import DashboardSessionStore, register_dashboard_auth_routes
+from eyvan.server.api.dashboard_sessions import (
+    SESSION_COOKIE,
+    TRANSACTION_COOKIE,
+    DashboardSessionStore,
+    register_dashboard_auth_routes,
+)
 
 
 def _app(*, issuer: str, store: DashboardSessionStore, provider) -> tuple[FastAPI, httpx.AsyncClient]:
@@ -88,14 +93,14 @@ def test_discovery_rejects_unsafe_token_endpoint_before_callback_exchange() -> N
     app, provider_client = _app(issuer=issuer, store=store, provider=provider)
     try:
         with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback",
                 params={"code": "code", "state": state},
                 follow_redirects=False,
             )
         assert response.status_code == 502
-        assert "eyvan_session=" not in response.headers.get("set-cookie", "")
+        assert SESSION_COOKIE not in response.cookies
     finally:
         asyncio.run(provider_client.aclose())
 
@@ -138,14 +143,14 @@ def test_invalid_provider_lifetime_fails_closed(expires_in) -> None:
     app, provider_client = _app(issuer=issuer, store=store, provider=provider)
     try:
         with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback",
                 params={"code": "code", "state": state},
                 follow_redirects=False,
             )
         assert response.status_code == 502, response.text
-        assert "eyvan_session=" not in response.headers.get("set-cookie", "")
+        assert SESSION_COOKIE not in response.cookies
     finally:
         asyncio.run(provider_client.aclose())
 
@@ -187,14 +192,14 @@ def test_fractional_provider_lifetime_is_preserved() -> None:
     app, provider_client = _app(issuer=issuer, store=store, provider=provider)
     try:
         with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback",
                 params={"code": "code", "state": state},
                 follow_redirects=False,
             )
         assert response.status_code == 303, response.text
-        session_token = response.cookies.get("eyvan_session")
+        session_token = response.cookies.get(SESSION_COOKIE)
         assert session_token
         session = store.resolve(session_token)
         assert session is not None
@@ -235,14 +240,14 @@ def test_absent_provider_lifetime_uses_server_cap() -> None:
     app, provider_client = _app(issuer=issuer, store=store, provider=provider)
     try:
         with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback",
                 params={"code": "code", "state": state},
                 follow_redirects=False,
             )
         assert response.status_code == 303, response.text
-        session_token = response.cookies.get("eyvan_session")
+        session_token = response.cookies.get(SESSION_COOKIE)
         assert session_token
         session = store.resolve(session_token)
         assert session is not None

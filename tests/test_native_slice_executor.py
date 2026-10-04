@@ -267,6 +267,51 @@ def test_native_slice_retires_started_workers_when_a_fanout_submission_fails() -
             client.close()
 
 
+def test_native_slice_checkpoint_cleanup_rolls_back_under_its_own_key() -> None:
+    first_requests: list[httpx.Request] = []
+
+    def first_worker(request: httpx.Request) -> httpx.Response:
+        first_requests.append(request)
+        if request.url.path.endswith("/checkpoint"):
+            return httpx.Response(200, json={"remote_id": "ckpt-1"})
+        assert request.url.path == "/api/v1/workloads/ckpt-1/retire"
+        return httpx.Response(200, json={})
+
+    def second_worker(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/checkpoint")
+        # The second rank fails after the first rank's hook already launched:
+        # cleanup must retire rank 0 under a key that is not the checkpoint's
+        # own, or the cleanup cannot be told apart from a checkpoint replay.
+        return httpx.Response(503, json={"detail": "worker unavailable"})
+
+    clients = [
+        _client("http://worker-a:8100", first_worker),
+        _client("http://worker-b:8100", second_worker),
+    ]
+    try:
+        executor = NativeSliceExecutor(
+            ("http://worker-a:8100", "http://worker-b:8100"),
+            secret="worker-secret",
+            clients=clients,
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            executor.checkpoint("slice-x", hook="python hook.py", output_uri=None, context=_context(key="ckpt-1"))
+
+        assert [request.url.path for request in first_requests] == [
+            "/api/v1/workloads/slice-x/checkpoint",
+            "/api/v1/workloads/ckpt-1/retire",
+        ]
+        mutation = _payload(first_requests[1])["mutation"]
+        # The fence is the checkpoint's; the key is the rollback's own.
+        assert (mutation["generation"], mutation["fencing_token"]) == (1, "token-1")
+        assert mutation["idempotency_key"].startswith("rollback:")
+        assert mutation["idempotency_key"].endswith(":ckpt-1")
+    finally:
+        for client in clients:
+            client.close()
+
+
 def test_native_slice_surfaces_retire_failures_and_still_retires_remaining_ranks() -> None:
     retire_attempts: list[str] = []
 

@@ -26,6 +26,9 @@ from eyvan._version import __version__ as _VERSION
 CLIENT_VERSION_HEADER = "X-Eyvan-Client-Version"
 
 _MAX_VERSION_SEGMENTS = 8
+# Bound untrusted header parsing below Python's smallest nonzero integer-string
+# conversion limit (640 digits), including when the operator changes that limit.
+_MAX_VERSION_LENGTH = 512
 
 
 def client_version() -> str:
@@ -47,12 +50,13 @@ def client_version() -> str:
 def parse_version(raw: str | None) -> tuple[int, ...] | None:
     """Parse a dotted numeric version into a comparable tuple.
 
-    Returns ``None`` for anything that is not purely dotted integers so an
-    unrecognized version is treated as unknown rather than silently ordered
-    against the floor.
+    Accepts at most 512 characters (including surrounding whitespace) and eight
+    decimal integer segments. Returns ``None`` for oversized or unrecognized
+    input so it stays unknown rather than being silently ordered against the
+    floor. Unicode decimal digits remain supported.
     """
 
-    if not isinstance(raw, str):
+    if not isinstance(raw, str) or len(raw) > _MAX_VERSION_LENGTH:
         return None
     candidate = raw.strip()
     if not candidate:
@@ -62,9 +66,12 @@ def parse_version(raw: str | None) -> tuple[int, ...] | None:
         return None
     numbers: list[int] = []
     for segment in segments:
-        if not segment.isdigit():
+        if not segment.isdecimal():
             return None
-        numbers.append(int(segment))
+        try:
+            numbers.append(int(segment))
+        except ValueError:
+            return None
     return tuple(numbers)
 
 

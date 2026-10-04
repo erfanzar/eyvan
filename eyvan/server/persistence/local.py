@@ -20,7 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from eyvan._internal.json_types import is_json_object
 from eyvan._internal.workspace import create_private_directory
@@ -735,6 +735,27 @@ class LocalControlPlaneStore:
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
             raise
+        except ValidationError as exc:
+            # Input values, arbitrary dictionary keys in locations, and nested
+            # validator messages can contain durable signing keys or credentials.
+            # Keep only schema-owned collection names and error types. Our root
+            # document validators have fixed, value-free identity diagnostics.
+            errors = exc.errors(include_input=False, include_context=False, include_url=False)
+            details: list[str] = []
+            for error in errors[:8]:
+                location = error["loc"]
+                if not location and error["msg"].startswith("Value error, local control-plane "):
+                    details.append(error["msg"])
+                else:
+                    collection = location[0] if location and location[0] in models[version].model_fields else "document"
+                    details.append(f"{collection}: {error['type']}")
+            detail = "; ".join(details)
+            if len(errors) > 8:
+                detail += f"; {len(errors) - 8} further validation errors"
+            # Suppress the original input-bearing exception in ordinary startup
+            # tracebacks as well as in the public exception's string/repr.
+            message = f"could not read local Eyvan control-plane state {self.path}: {detail}"
+            raise LocalControlPlaneSchemaError(message) from None
         except (OSError, ValueError, RecursionError) as exc:
             detail = str(exc)
             if len(detail) > 2048:
@@ -1153,6 +1174,14 @@ class LocalJsonRepository(StateRepository):
             except BaseException:
                 self._lease.release()
                 raise
+
+    async def ping(self) -> None:
+        """Check readiness without reopening the store or clearing an ambiguous commit."""
+
+        async with self._lifecycle_lock:
+            self.store._raise_if_ambiguous_commit()
+            if not self._opened:
+                raise LocalControlPlaneError("local Eyvan control-plane repository is not open")
 
     async def _acquire_lease(self) -> None:
         """Wait out a previous owner's graceful shutdown before reporting the state as owned.

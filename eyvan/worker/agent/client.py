@@ -184,9 +184,11 @@ def _raise_for_status(response: httpx.Response) -> None:
         try:
             failure = CapacityProviderFailure.model_validate_json(response.content)
         except (ValidationError, ValueError):
-            response.raise_for_status()
-            return
-        raise CellAgentCapacityProviderError(failure.detail, code=failure.code)
+            # A proxy's Bad Gateway is not a statement about the provider.
+            # Only a validated agent failure may bypass the unavailable branch.
+            pass
+        else:
+            raise CellAgentCapacityProviderError(failure.detail, code=failure.code)
     if response.status_code >= 500:
         # Everything the agent says deliberately has already been handled above,
         # so anything left in the 5xx range is the agent failing to answer.
@@ -457,6 +459,7 @@ class CellAgentClient:
         command: tp.Sequence[str],
         *,
         timeout_s: float = 30.0,
+        runtime_rank: int | None = None,
     ) -> JsonObject:
         """Run one diagnostic command beside a live workload on one cell.
 
@@ -466,10 +469,13 @@ class CellAgentClient:
         made the observation record a rank error for a rank still running.
         """
 
+        document: JsonObject = {"command": list(command), "timeout_s": timeout_s}
+        if runtime_rank is not None:
+            document["runtime_rank"] = runtime_rank
         response = self._send(
             "POST",
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/exec",
-            json={"command": list(command), "timeout_s": timeout_s},
+            json=document,
             timeout=min(timeout_s + _EXEC_HTTP_TIMEOUT_MARGIN_S, _EXEC_HTTP_TIMEOUT_MAX_S),
         )
         payload = response.json()

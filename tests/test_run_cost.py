@@ -15,6 +15,7 @@ about saying *unknown* out loud.
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -22,6 +23,8 @@ from click.testing import CliRunner
 from eyvan.records import (
     CapacityClass,
     CapacityPoolRecord,
+    CellRecord,
+    CellState,
     CommandExecution,
     LeaseRecord,
     LeaseState,
@@ -40,6 +43,15 @@ from eyvan.sdk.spend import render, spend_of
 from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.errors import AuthorizationError
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cli_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """CLI cost rendering must not read or write the developer's saved context."""
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "artifacts"))
+
 
 SPOT_POOL = {
     "id": "pool-spot",
@@ -270,6 +282,7 @@ async def _plane_with(
     settled: float = 9.6,
     hours: float = 8.0,
     pool_id: str = "pool-spot",
+    hourly_cost: float | None = None,
 ) -> ControlPlaneService:
     """A plane holding one finished run that used ``pool_id``."""
 
@@ -290,10 +303,33 @@ async def _plane_with(
         state=WorkloadState.SUCCEEDED,
         created_by="alice",
     )
+    pool = next((pool for pool in pools if pool.id == pool_id), None)
+    cell = (
+        CellRecord(
+            id="cell-a",
+            provider=pool.provider,
+            capacity_backend=pool.capacity_backend,
+            provider_project=pool.provider_project,
+            region=pool.region,
+            zone=pool.zone,
+            state=CellState.READY,
+            capacity=pool.capacity,
+            allocatable=pool.allocatable,
+            accelerator_type=pool.accelerator_type,
+            capacity_class=pool.capacity_class,
+            pool_id=pool.id,
+            unit_prices=pool.unit_prices,
+        )
+        if pool is not None
+        else None
+    )
+    frozen_hourly = cell.hourly_cost() if cell is not None else 0.0
     lease = LeaseRecord(
         id="lease-a",
         workload_id="wl-1",
         cell_id="cell-a",
+        cell_generation=cell.generation if cell is not None else 1,
+        hourly_cost=frozen_hourly if hourly_cost is None else hourly_cost,
         org_id="acme",
         project_id="research",
         state=LeaseState.RELEASED,
@@ -310,6 +346,8 @@ async def _plane_with(
     async with repository.transaction() as transaction:
         await transaction.put_workload(workload)
         await transaction.put_lease(lease)
+        if cell is not None:
+            await transaction.put_cell(cell)
         for pool in pools:
             await transaction.put_capacity_pool(pool)
     return service
@@ -366,6 +404,20 @@ async def test_an_unpriced_pool_reports_unknown_rather_than_free() -> None:
 
     assert not spend.priced
     # Measured, so still known: the hours are real even when the money is not.
+    assert spend.accelerator_hours == {"tpu": 8.0}
+
+
+@pytest.mark.asyncio
+async def test_a_current_pool_price_cannot_price_a_legacy_lease() -> None:
+    service = await _plane_with(
+        _pool("pool-spot", capacity_class=CapacityClass.SPOT, prices={"tpu": 1.2}),
+        hourly_cost=0.0,
+    )
+
+    spend = await service.workload_cost(_principal(Role.PROJECT_OPERATOR), "wl-1")
+
+    assert not spend.priced
+    assert spend.shape == "v5p-8"
     assert spend.accelerator_hours == {"tpu": 8.0}
 
 

@@ -50,7 +50,7 @@ from eyvan.capacity.drivers.base import (
 from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS
 from eyvan.capacity.fleet_state import FleetStateStore, StaleFenceError
 from eyvan.config import EyvanSettings
-from eyvan.identity.mtls import MutualTlsFiles
+from eyvan.identity.mtls import MutualTlsConfigurationError, MutualTlsFiles
 from eyvan.worker.agent.models import (
     AgentCapabilities,
     AgentObservation,
@@ -73,6 +73,7 @@ from eyvan.worker.runtime.registry import (
     ExecCapableExecutionDriver,
     IntrospectableExecutionDriver,
     NativeGangCell,
+    RankedExecCapableExecutionDriver,
     StructuredLogExecutionDriver,
 )
 from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
@@ -224,6 +225,51 @@ def _workload_observation(report: ExecutionWorkloadReport) -> WorkloadObservatio
         status=report["status"],
         message=report["message"],
     )
+
+
+#: Statuses that prove an execution reached a terminal state.
+_TERMINAL_RETIRE_STATUSES = frozenset(
+    {
+        ExecutionWorkloadStatus.SUCCEEDED,
+        ExecutionWorkloadStatus.FAILED,
+        ExecutionWorkloadStatus.STOPPED,
+        ExecutionWorkloadStatus.LOST,
+    }
+)
+
+#: Retirement must positively establish quiescence before a successor launches.
+#: An absent execution is also safe; INDETERMINATE proves neither running nor stopped.
+_QUIESCENT_RETIRE_STATUSES = _TERMINAL_RETIRE_STATUSES | {ExecutionWorkloadStatus.NOT_FOUND}
+
+
+def _retire_observation(report: ExecutionWorkloadReport) -> WorkloadObservation:
+    """Project the post-retire read-back without inventing a terminal state.
+
+    A retire call returning is not proof that a rank stopped: the historical
+    systemd replay path returns early with the durable record still
+    non-terminal, and a remote worker's verdict was previously discarded on
+    the way back. Report what the record now says. Only an absent record
+    collapses to STOPPED -- nothing left behind can run.
+    """
+
+    observation = _workload_observation(report)
+    # Distributed workload viability is not retirement evidence: FAILED or
+    # LOST can describe a slice with another rank still running or unobserved.
+    # Check supplied rank evidence before projecting it away for the wire.
+    if not isinstance(report, ExecutionWorkloadObservation) and any(
+        worker["status"] not in _QUIESCENT_RETIRE_STATUSES for worker in report.get("workers", [])
+    ):
+        return observation.model_copy(
+            update={
+                "status": ExecutionWorkloadStatus.INDETERMINATE,
+                "message": f"retirement not confirmed for every rank; {observation.message}",
+            }
+        )
+    if observation.status is ExecutionWorkloadStatus.NOT_FOUND:
+        return observation.model_copy(
+            update={"status": ExecutionWorkloadStatus.STOPPED, "message": "retired; execution record absent"}
+        )
+    return observation
 
 
 class CellAgentService:
@@ -479,6 +525,21 @@ class CellAgentService:
                         f"{exc}; launched execution {launched_remote_id!r} could not be retired after lease loss"
                     ) from cleanup_exc
             raise StaleMutationError(str(exc)) from exc
+        except BaseException as exc:
+            # The launch already happened; every later failure in this window
+            # must roll the launch back, not only fence losses -- otherwise a
+            # response lost after the remote accepted the job leaves an orphan
+            # holding the fence. The original error stays the one the caller
+            # sees unless the cleanup itself fails too.
+            if submitted_executor is not None and launched_remote_id is not None:
+                try:
+                    submitted_executor.retire(launched_remote_id, rollback_context(context))
+                except BaseException as cleanup_exc:
+                    raise RuntimeError(
+                        f"{exc}; launched execution {launched_remote_id!r} could not be retired "
+                        f"after {type(exc).__name__}"
+                    ) from cleanup_exc
+            raise
         return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.SUBMITTED)
 
     @staticmethod
@@ -518,8 +579,8 @@ class CellAgentService:
     def _gang_member_payload(cls, members: tp.Sequence[GangWorkloadMember]) -> tuple[JsonObject, ...]:
         return tuple(model_json(member) for member in cls._ordered_gang_members(members))
 
-    def _gang_executor(self, members: tp.Sequence[GangWorkloadMember]) -> GangExecutionDriver:
-        """Resolve direct native-worker clients for every cell in one gang."""
+    def _gang_cells(self, members: tp.Sequence[GangWorkloadMember]) -> tuple[NativeGangCell, ...]:
+        """Capture the endpoints and fences used to launch or retire one gang."""
 
         if not isinstance(self.executors, GangExecutionResolver):
             raise ValueError(f"execution backend {self.execution_backend!r} does not support native workload gangs")
@@ -541,7 +602,24 @@ class CellAgentService:
                     context=_context(WorkloadMutationRequest(mutation=member.mutation)),
                 )
             )
-        return self.executors.resolve_gang(tuple(cells))
+        return tuple(cells)
+
+    def _gang_executor(self, members: tp.Sequence[GangWorkloadMember]) -> GangExecutionDriver:
+        """Resolve direct native-worker clients for every cell in one gang."""
+
+        cells = self._gang_cells(members)
+        return tp.cast(GangExecutionResolver, self.executors).resolve_gang(cells)
+
+    def _rollback_gang(self, cells: tuple[NativeGangCell, ...], remote_id: str) -> None:
+        """Retire a launch without rereading failed storage or replaying submission keys."""
+
+        executor = tp.cast(GangExecutionResolver, self.executors).resolve_gang(
+            tuple(replace(cell, context=rollback_context(cell.context)) for cell in cells)
+        )
+        try:
+            executor.retire(remote_id)
+        finally:
+            self._close_gang_executor(executor)
 
     @staticmethod
     def _close_gang_executor(executor: GangExecutionDriver) -> None:
@@ -624,6 +702,9 @@ class CellAgentService:
         executor = self._gang_executor(retire_members)
         try:
             executor.retire(remote_id)
+            status = _retire_observation(executor.status(remote_id)).status
+            if status not in _QUIESCENT_RETIRE_STATUSES:
+                raise RuntimeError(f"predecessor gang {remote_id!r} still reports {status} after retirement")
         finally:
             self._close_gang_executor(executor)
 
@@ -662,7 +743,8 @@ class CellAgentService:
                     self.state.require_lease()
                 self.state.clear_gang_workload_predecessors(workload_id, members=member_payload)
                 self.state.require_lease()
-                submitted_executor = self._gang_executor(members)
+                launch_cells = self._gang_cells(members)
+                submitted_executor = tp.cast(GangExecutionResolver, self.executors).resolve_gang(launch_cells)
                 remote_id = submitted_executor.submit(request.spec)
                 launched_remote_id = remote_id
                 if remote_id != expected_remote_id:
@@ -670,6 +752,9 @@ class CellAgentService:
                     # or raise after retiring its partial launch, so this branch
                     # is defensive. Retire the fully launched gang before
                     # surfacing the mismatch so no rank is left running.
+                    # This branch already owns cleanup; do not retire twice in
+                    # the general post-launch exception handler below.
+                    launched_remote_id = None
                     try:
                         submitted_executor.retire(remote_id)
                     except BaseException as cleanup_exc:
@@ -691,6 +776,16 @@ class CellAgentService:
                         f"{exc}; launched gang execution {launched_remote_id!r} could not be retired after lease loss"
                     ) from cleanup_exc
             raise StaleMutationError(str(exc)) from exc
+        except BaseException as exc:
+            if submitted_executor is not None and launched_remote_id is not None:
+                try:
+                    self._rollback_gang(launch_cells, launched_remote_id)
+                except BaseException as cleanup_exc:
+                    raise RuntimeError(
+                        f"{exc}; launched gang execution {launched_remote_id!r} could not be retired "
+                        f"after {type(exc).__name__}"
+                    ) from cleanup_exc
+            raise
         finally:
             if submitted_executor is not None:
                 self._close_gang_executor(submitted_executor)
@@ -738,9 +833,10 @@ class CellAgentService:
         executor = self._gang_executor(members)
         try:
             executor.retire(remote_id)
+            report = executor.status(remote_id)
         finally:
             self._close_gang_executor(executor)
-        return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.STOPPED)
+        return _retire_observation(report)
 
     def checkpoint_gang(
         self,
@@ -807,14 +903,12 @@ class CellAgentService:
         a warm-up round trip silently take ownership away from the lifecycle
         command that actually owns the host.
 
-        Fenced before the hop, never after. For ``eyvan-native`` the executor is
-        on another machine, so the check has to happen on the way out: a request
-        forwarded first and fenced afterwards would already have written bytes
-        to a host it does not own. A cell with several machines is fenced here
-        once, before any of them is contacted, and then again between hosts by
-        the view :meth:`_remote_stager` binds -- a fetch is minutes long, and a
-        fan-out that began under a generation this agent no longer owns must
-        stop rather than finish writing to somebody else's machines.
+        Fenced before the hop and before confirming a successful result. For
+        ``eyvan-native`` the executor is on another machine, so the first check
+        must happen before sending the request; the second cannot undo a remote
+        write, but prevents claiming a confirmed placement on a replaced host.
+        A multi-host view also checks between hosts so it can stop fan-out
+        after a generation change.
 
         Raises:
             UnsupportedCapabilityError: There is no executor for this cell's
@@ -844,6 +938,15 @@ class CellAgentService:
             result = stager.stage(cell_id, request.asset, max_bytes=request.max_bytes)
         else:
             result = stager.evict(cell_id, request.asset)
+        # A measurement is advisory; another stage request fences again before
+        # writing. Successful writes/evictions must not claim an old host.
+        if request.action is not CellStageAction.MEASURE and result.verdict is AssetStageVerdict.OK:
+            current_generation = self._staging_fence(cell_id)
+            if current_generation != request.mutation.generation:
+                raise StaleMutationError(
+                    f"staging generation {request.mutation.generation} no longer owns cell {cell_id!r} "
+                    f"generation {current_generation}"
+                )
         return CellStageActionResult(
             asset=request.asset,
             action=request.action,
@@ -956,7 +1059,11 @@ class CellAgentService:
                 ),
             )
             return
-        self._executor(cell_id).retire(remote_id, predecessor_context)
+        executor = self._executor(cell_id)
+        executor.retire(remote_id, predecessor_context)
+        status = _retire_observation(executor.status(remote_id)).status
+        if status not in _QUIESCENT_RETIRE_STATUSES:
+            raise RuntimeError(f"predecessor {remote_id!r} on cell {cell_id!r} still reports {status} after retirement")
 
     def _retire_on_source_agent(
         self,
@@ -983,15 +1090,28 @@ class CellAgentService:
             raise RuntimeError(f"cell {cell_id!r} has no agent endpoint for remote retirement")
         from eyvan.worker.agent.client import CellAgentClient
 
-        client = CellAgentClient(endpoint, token=self.settings.agent_shared_secret)
+        if self.settings.mutual_tls_client_enabled:
+            mtls = self.settings.mutual_tls_files()
+            if not mtls.has_trust_anchor or not mtls.has_identity:
+                raise MutualTlsConfigurationError(
+                    "an enabled mutual TLS client requires a trust bundle, certificate and private key"
+                )
+            client = CellAgentClient(endpoint, token=self.settings.agent_shared_secret, mtls=mtls)
+        else:
+            client = CellAgentClient(endpoint, token=self.settings.agent_shared_secret)
         try:
-            client.retire(cell_id, remote_id, request)
+            report = client.retire(cell_id, remote_id, request)
         finally:
             client.close()
+        if report.status not in _QUIESCENT_RETIRE_STATUSES:
+            raise RuntimeError(
+                f"cell {cell_id!r} still reports workload {remote_id!r} as {report.status} after retirement"
+            )
 
     def retire(self, cell_id: str, remote_id: str, request: WorkloadMutationRequest) -> WorkloadObservation:
-        self._executor(cell_id).retire(remote_id, _context(request))
-        return WorkloadObservation(remote_id=remote_id, status=ExecutionWorkloadStatus.STOPPED)
+        executor = self._executor(cell_id)
+        executor.retire(remote_id, _context(request))
+        return _retire_observation(executor.status(remote_id))
 
     def workload(self, cell_id: str, remote_id: str) -> WorkloadObservation:
         return _workload_observation(self._executor(cell_id).status(remote_id))
@@ -1024,6 +1144,7 @@ class CellAgentService:
         command: tp.Sequence[str],
         *,
         timeout_s: float = 30.0,
+        runtime_rank: int | None = None,
     ) -> JsonObject:
         """Run one diagnostic command beside a live workload.
 
@@ -1046,6 +1167,14 @@ class CellAgentService:
             )
         if not command:
             raise InvalidWorkloadRequestError("exec requires a command")
+        if runtime_rank is not None:
+            if isinstance(executor, RankedExecCapableExecutionDriver):
+                return executor.exec_in_workload_rank(
+                    remote_id, list(command), timeout_s=timeout_s, runtime_rank=runtime_rank
+                )
+            # Backends without an exact-rank capability must not turn a selected
+            # host into a fan-out, including rank zero on an unknown topology.
+            raise UnsupportedCapabilityError("execution backend cannot select an exact runtime rank")
         return executor.exec_in_workload(remote_id, list(command), timeout_s=timeout_s)
 
     def log_page(self, cell_id: str, remote_id: str, *, after: str = "", limit: int = 200) -> JsonObject:

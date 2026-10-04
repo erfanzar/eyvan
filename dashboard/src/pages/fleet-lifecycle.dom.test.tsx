@@ -5,7 +5,7 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FleetPage } from "./FleetPage";
@@ -137,6 +137,30 @@ describe("applied fleets", () => {
     fireEvent.click(screen.getByRole("button", { name: "Stop fleet" }));
 
     await waitFor(() => expect(screen.getByText(/may not manage fleet capacity/)).toBeTruthy());
+  });
+
+  it("keeps a deferred stop rejection visible after a successful pool reload", async () => {
+    let rejectStop!: (reason: Error) => void;
+    const stopping = new Promise<void>((_resolve, reject) => {
+      rejectStop = reject;
+    });
+    const loadPools = vi.fn(async () => POOLS);
+    renderPage({ onStopFleet: () => stopping, loadPools });
+    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(1));
+    fireEvent.click(within(appliedFleets()).getAllByRole("button", { name: "Stop" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Stop fleet" }));
+    await screen.findByRole("button", { name: "Stopping" });
+    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(2));
+
+    await act(async () => rejectStop(new Error("DELETE was rejected; fleet still enabled")));
+    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert").textContent).toContain("DELETE was rejected; fleet still enabled");
+    expect(within(appliedFleets()).queryByText(/pool\(s\) disabled/)).toBeNull();
+    expect(screen.queryByText(/inventory reloaded/)).toBeNull();
   });
 
   it.each(["provider_error", undefined])(

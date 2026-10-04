@@ -5,7 +5,7 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { BillingPage } from "./BillingPage";
@@ -45,6 +45,42 @@ function renderPage(billing: BillingReport, usage: ProjectUsage = USAGE) {
 }
 
 describe("the billing page", () => {
+  it("does not display a previous project's late response after switching projects", async () => {
+    let resolveOld!: (billing: BillingReport) => void;
+    const oldBilling = new Promise<BillingReport>((resolve) => {
+      resolveOld = resolve;
+    });
+    const page = render(<BillingPage loadBilling={() => oldBilling} loadUsage={async () => USAGE} />);
+    page.rerender(
+      <BillingPage
+        loadBilling={async () => ({ ...PRICED, accrued_cost: 8 })}
+        loadUsage={async () => ({ ...USAGE, subjects: [] })}
+      />,
+    );
+    await screen.findByText("$8.00");
+    await act(async () => resolveOld(PRICED));
+
+    expect(screen.getByText("$8.00")).toBeTruthy();
+    expect(screen.queryByText("$42.50")).toBeNull();
+    expect(screen.getByText("Nobody has submitted work yet")).toBeTruthy();
+  });
+
+  it("hides previous project metrics while the newly selected project is loading", async () => {
+    let resolveNext!: (billing: BillingReport) => void;
+    const nextBilling = new Promise<BillingReport>((resolve) => {
+      resolveNext = resolve;
+    });
+    const page = renderPage(PRICED);
+    await screen.findByText("$42.50");
+
+    page.rerender(<BillingPage loadBilling={() => nextBilling} loadUsage={async () => ({ ...USAGE, subjects: [] })} />);
+    expect(screen.queryByText("$42.50")).toBeNull();
+    expect(screen.getByRole("status")).toBeTruthy();
+
+    await act(async () => resolveNext({ ...PRICED, accrued_cost: 8 }));
+    expect(screen.getByText("$8.00")).toBeTruthy();
+  });
+
   it("reports measured hours even when nothing is costed", async () => {
     // The hours are real whether or not a price exists, and hiding them would
     // make an uncosted fleet look like an idle one.

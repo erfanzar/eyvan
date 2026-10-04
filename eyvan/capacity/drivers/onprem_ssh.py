@@ -33,7 +33,20 @@ process is started: either it is already running under systemd (the common
 on-prem case, and the default here), or a ``start_command``/``stop_command``
 argv is declared per pool and this driver runs it after claiming and before
 releasing. Eyvan deliberately does not install software on a host it does not
-own.
+own. Claim publication and lifecycle commands share a host-local marker lock;
+stop/removal requires the exact cell, management UID, provider generation and
+fence. A foreign, unreadable or missing marker never authorizes a stop.
+
+**Replacement and crash recovery.** Live host inventories and ``state_dir``
+cannot be replaced: explicitly release the cell before applying a different
+inventory. Interrupted incarnation changes retain exact predecessor cleanup
+identities until every host has the successor marker. Marker locks are never
+stolen or expired, because a disconnected SSH command or its lifecycle child
+may still be running. A host crash or killed shell may leave
+``eyvan-cell.marker.lock`` behind; mutations then fail closed with a retryable
+error. The operator must quiesce all marker commands and lifecycle children on
+that host before removing an abandoned lock. Lifecycle commands must complete
+synchronously; backgrounding destructive work escapes this arbitration.
 
 **What is and is not covered by host tests.** The driver logic, the fence
 comparisons, and the failure classification are exercised by the conformance
@@ -101,6 +114,8 @@ _EXIT_CLAIMED_ELSEWHERE = 3
 _EXIT_NO_MARKER = 4
 _EXIT_HOST_IO = 5
 _EXIT_USAGE = 6
+_EXIT_BUSY = 7
+_EXIT_LIFECYCLE = 8
 
 #: The whole remote protocol. Sent on stdin to ``sh -s`` so no value is ever
 #: interpolated into a command string, and shipped as one constant so the
@@ -113,7 +128,25 @@ cell=$3
 uid=$4
 generation=$5
 fence=$6
+shift 6
 directory=$(dirname "$marker")
+
+# mkdir is the host-local arbitration primitive, independent of fleet stores.
+# Never expire/steal a lock: an old SSH command or its child may still be alive.
+# SIGKILL/host failure leaves the lock fail-closed. An operator may remove it
+# only after quiescing all marker commands and lifecycle children on this host.
+case "$action" in
+  claim|release)
+    mkdir -p "$directory" || exit 5
+    lock="$marker.lock"
+    mkdir "$lock" 2>/dev/null || exit 7
+    trap 'rmdir "$lock" 2>/dev/null' 0
+    # Do not unlock while a lifecycle child is running on transport disconnect.
+    trap '' HUP INT TERM
+    ;;
+  observe) ;;
+  *) exit 6 ;;
+esac
 
 field() {
   sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1
@@ -136,28 +169,38 @@ case "$action" in
     if [ -f "$marker" ]; then
       current_cell=$(field cell_id "$marker")
       current_generation=$(field provider_generation "$marker")
-      [ "$current_cell" = "$cell" ] || exit 3
+      current_uid=$(field management_uid "$marker")
+      current_fence=$(field fence "$marker")
+      [ "$current_cell" = "$cell" ] && [ "$current_uid" = "$uid" ] || exit 3
       case "$current_generation" in
         ''|*[!0-9]*) exit 3 ;;
       esac
       [ "$current_generation" -le "$generation" ] || exit 3
+      if [ "$current_generation" -eq "$generation" ]; then
+        [ "$current_fence" = "$fence" ] || exit 3
+      fi
     fi
-    mkdir -p "$directory" || exit 5
     temporary="$marker.claim.$$"
     emit "$cell" "$uid" "$generation" "$fence" > "$temporary" || exit 5
     mv "$temporary" "$marker" || exit 5
+    if [ "$#" -gt 0 ]; then
+      "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
+    fi
     emit "$cell" "$uid" "$generation" "$fence"
     ;;
   release)
     if [ -f "$marker" ]; then
       current_cell=$(field cell_id "$marker")
+      current_uid=$(field management_uid "$marker")
       current_generation=$(field provider_generation "$marker")
-      [ "$current_cell" = "$cell" ] || exit 3
-      case "$current_generation" in
-        ''|*[!0-9]*) rm -f "$marker" || exit 5 ;;
-        *) [ "$current_generation" -le "$generation" ] || exit 3
-           rm -f "$marker" || exit 5 ;;
-      esac
+      current_fence=$(field fence "$marker")
+      # Release is destructive: only the exact observed incarnation may stop.
+      [ "$current_cell" = "$cell" ] && [ "$current_uid" = "$uid" ] &&
+        [ "$current_generation" = "$generation" ] && [ "$current_fence" = "$fence" ] || exit 3
+      if [ "$#" -gt 0 ]; then
+        "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
+      fi
+      rm -f "$marker" || exit 5
     fi
     ;;
   *)
@@ -239,7 +282,9 @@ class OpenSshCommandRunner:
             *self.options,
             host,
             "--",
-            *argv,
+            # SSH joins remote words into a shell command, even though the
+            # local subprocess uses argv. Quote once at that actual boundary.
+            shlex.join(argv),
         ]
         try:
             completed = subprocess.run(
@@ -581,8 +626,9 @@ class OnPremSshCapacityDriver:
         management_uid: str,
         provider_generation: int,
         fence: str,
+        command: tp.Sequence[str] = (),
     ) -> RemoteResult:
-        """Run one marker action, mapping transport failure to inconclusive."""
+        """Run ownership arbitration and any lifecycle action in one host lock."""
 
         argv = (
             "sh",
@@ -594,9 +640,23 @@ class OnPremSshCapacityDriver:
             _safe_value("management_uid", management_uid),
             str(provider_generation),
             _safe_value("fence", fence),
+            *command,
         )
         try:
-            return self.runner.run(host, argv, stdin=MARKER_SCRIPT, timeout_s=self.command_timeout_s)
+            result = self.runner.run(host, argv, stdin=MARKER_SCRIPT, timeout_s=self.command_timeout_s)
+            if result.exit_code == _EXIT_BUSY:
+                raise self._unavailable(
+                    f"on-premises host {host} has an active or abandoned marker lock; "
+                    "retry, or quiesce remote marker/lifecycle processes before operator lock recovery"
+                )
+            if result.exit_code == _EXIT_LIFECYCLE:
+                raise CapacityProviderError(
+                    f"on-premises {action} lifecycle command failed on {host}: "
+                    f"{result.stderr.strip() or 'no diagnostic'}",
+                    code=CapacityProviderFailureCode.PROVIDER_ERROR,
+                    retryable=False,
+                )
+            return result
         except RemoteTransportError as exc:
             raise self._unavailable(f"on-premises host {host} could not be reached: {exc}") from exc
 
@@ -609,8 +669,9 @@ class OnPremSshCapacityDriver:
         management_uid: str,
         provider_generation: int,
         fence: str,
+        command: tp.Sequence[str] = (),
     ) -> HostMarker:
-        """Claim one host for this incarnation, idempotently."""
+        """Claim one host and optionally start its worker under the same lock."""
 
         result = self._run_marker(
             host,
@@ -620,6 +681,7 @@ class OnPremSshCapacityDriver:
             management_uid=management_uid,
             provider_generation=provider_generation,
             fence=fence,
+            command=command,
         )
         if result.exit_code == _EXIT_CLAIMED_ELSEWHERE:
             raise self._configuration(
@@ -688,8 +750,9 @@ class OnPremSshCapacityDriver:
         management_uid: str,
         provider_generation: int,
         fence: str,
+        command: tp.Sequence[str] = (),
     ) -> None:
-        """Remove this cell's claim from one host."""
+        """Stop and release only this exact host incarnation, under one lock."""
 
         result = self._run_marker(
             host,
@@ -699,6 +762,7 @@ class OnPremSshCapacityDriver:
             management_uid=management_uid,
             provider_generation=provider_generation,
             fence=fence,
+            command=command,
         )
         if result.exit_code == _EXIT_CLAIMED_ELSEWHERE:
             # Someone else owns the host now. Deleting their marker would be the
@@ -707,23 +771,6 @@ class OnPremSshCapacityDriver:
         if result.exit_code != _EXIT_OK:
             raise CapacityProviderError(
                 f"on-premises host {host} could not release its Eyvan claim (exit {result.exit_code}): "
-                f"{result.stderr.strip() or 'no diagnostic'}",
-                code=CapacityProviderFailureCode.PROVIDER_ERROR,
-                retryable=False,
-            )
-
-    def _run_lifecycle_command(self, host: str, argv: tp.Sequence[str], *, phase: str) -> None:
-        """Run an operator-declared start/stop command on one host."""
-
-        if not argv:
-            return
-        try:
-            result = self.runner.run(host, tuple(argv), timeout_s=self.command_timeout_s)
-        except RemoteTransportError as exc:
-            raise self._unavailable(f"on-premises host {host} could not be reached to {phase}: {exc}") from exc
-        if result.exit_code != _EXIT_OK:
-            raise CapacityProviderError(
-                f"on-premises {phase} command {shlex.join(argv)} failed on {host} (exit {result.exit_code}): "
                 f"{result.stderr.strip() or 'no diagnostic'}",
                 code=CapacityProviderFailureCode.PROVIDER_ERROR,
                 retryable=False,
@@ -867,6 +914,44 @@ class OnPremSshCapacityDriver:
 
     # ---- lifecycle ----------------------------------------------------------
 
+    def _claim_cleanup(self, record: FleetCellRecord) -> JsonObject:
+        """Capture the exact remote claim, independently of later durable fences."""
+
+        return {
+            "hosts": list(self._record_hosts(record)),
+            "state_dir": self._record_string(record, "state_dir", self.native_worker_state_dir),
+            "management_uid": self._record_string(record, "management_uid", stable_id("onprem-ssh", record.name)),
+            "provider_generation": record.provider_generation,
+            "fence": self._record_string(record, "claim_fence", marker_fingerprint(record.fencing_token or "unknown")),
+            "stop_command": record.metadata.get("stop_command", []),
+        }
+
+    def _retain_predecessor_claim(self, record: FleetCellRecord) -> None:
+        """Keep interrupted replacements releasable without loosening remote fencing."""
+
+        if not self._record_hosts(record):
+            return
+        previous = record.metadata.get("predecessor_claims", [])
+        if not isinstance(previous, list) or not all(is_json_object(item) for item in previous):
+            raise self._configuration(f"cell {record.name!r} has malformed predecessor claims")
+        if len(previous) >= 64:
+            raise self._configuration("too many unfinished on-premises replacements; release this cell before retrying")
+        record.metadata["predecessor_claims"] = [*previous, self._claim_cleanup(record)]
+
+    def _settle_claims(self, cell_id: str, record: FleetCellRecord) -> None:
+        """Drop predecessor identities only after every host has the current claim."""
+
+        def settle(current: FleetCellRecord) -> None:
+            if (
+                current.generation != record.generation
+                or current.fencing_token != record.fencing_token
+                or current.provider_generation != record.provider_generation
+            ):
+                raise StaleMutationError(f"cell {cell_id!r} changed ownership before settling claims")
+            current.metadata.pop("predecessor_claims", None)
+
+        self.state.mutate_record(cell_id, settle, generation=record.generation)
+
     def apply_capacity(
         self,
         cell_id: str,
@@ -893,9 +978,21 @@ class OnPremSshCapacityDriver:
                 captured: dict[str, int] = {}
 
                 def mutate(record: FleetCellRecord) -> None:
-                    if not self._accept_mutation(record, context):
+                    accepted = self._accept_mutation(record, context)
+                    # The persisted inventory is also the only cleanup identity.
+                    # Refuse replacement (including changed replay payloads)
+                    # before losing any previously claimed host or marker path.
+                    if self._record_hosts(record) and (
+                        set(self._record_hosts(record)) != set(hosts)
+                        or self._record_string(record, "state_dir", self.native_worker_state_dir) != state_dir
+                    ):
+                        raise self._configuration(
+                            "on-premises hosts and state_dir cannot change on a live cell; release it before replacement"
+                        )
+                    if not accepted:
                         captured["provider_generation"] = record.provider_generation
                         return
+                    self._retain_predecessor_claim(record)
                     record.zone = tp.cast(str | None, validated["zone"])
                     record.accelerator_type = str(validated["accelerator_type"])
                     record.capacity_class = str(validated["capacity_class"])
@@ -911,6 +1008,8 @@ class OnPremSshCapacityDriver:
                     record.metadata["state_dir"] = state_dir
                     record.metadata["start_command"] = list(start_command)
                     record.metadata["stop_command"] = validated["stop_command"]
+                    # Host identity survives a drain changing the durable fence.
+                    record.metadata["claim_fence"] = marker_fingerprint(context.fencing_token)
                     # Derived, not random: re-applying the same cell reproduces
                     # the same UID so the per-cell worker token stays stable and
                     # already-running workers keep authenticating.
@@ -948,11 +1047,24 @@ class OnPremSshCapacityDriver:
                     revalidate(f"after claiming {host}")
                 for host in self._record_hosts(record):
                     revalidate(f"before starting the worker on {host}")
-                    self._run_lifecycle_command(host, start_command, phase="start")
+                    # Recheck the marker and start within the same remote lock:
+                    # durable revalidation alone cannot protect a reused host.
+                    if start_command:
+                        self._claim(
+                            host,
+                            state_dir=state_dir,
+                            cell_id=cell_id,
+                            management_uid=management_uid,
+                            provider_generation=provider_generation,
+                            fence=fence,
+                            command=start_command,
+                        )
                     revalidate(f"after starting the worker on {host}")
                 revalidate("before the final on-premises observation")
                 observation = self.observe(cell_id)
                 revalidate("after the final on-premises observation")
+                if observation.state is CapacityStatus.HEALTHY:
+                    self._settle_claims(cell_id, record)
                 return observation
         except StaleFenceError as exc:
             raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease during apply") from exc
@@ -975,6 +1087,17 @@ class OnPremSshCapacityDriver:
                 def stamp(current: FleetCellRecord) -> None:
                     if not self._accept_mutation(current, context):
                         return
+                    if current.desired_state == "up":
+                        previous_fence = self._record_string(
+                            current, "claim_fence", marker_fingerprint(current.fencing_token or "unknown")
+                        )
+                        next_fence = marker_fingerprint(context.fencing_token)
+                        if previous_fence != next_fence:
+                            # Equal remote generations cannot change identity.
+                            # Persist the new intent before superseding markers.
+                            self._retain_predecessor_claim(current)
+                            current.provider_generation += 1
+                        current.metadata["claim_fence"] = next_fence
                     self._stamp(current, context)
 
                 try:
@@ -1019,7 +1142,11 @@ class OnPremSshCapacityDriver:
                     )
                     revalidate(f"after re-claiming {host}")
                 revalidate("before the on-premises reconcile observation")
-                return self.observe(cell_id)
+                observation = self.observe(cell_id)
+                revalidate("after the on-premises reconcile observation")
+                if observation.state is CapacityStatus.HEALTHY:
+                    self._settle_claims(cell_id, record)
+                return observation
         except StaleFenceError as exc:
             raise StaleMutationError(f"cell {cell_id!r} lost its fleet mutation lease during reconcile") from exc
 
@@ -1039,6 +1166,8 @@ class OnPremSshCapacityDriver:
 
             def mutate(record: FleetCellRecord) -> None:
                 self._accept_mutation(record, context)  # raises when this fence no longer owns the cell
+                if record.fencing_token:
+                    record.metadata.setdefault("claim_fence", marker_fingerprint(record.fencing_token))
                 record.desired_state = "down"
                 record.state = CapacityStatus.DRAINING
                 self._stamp(record, context)
@@ -1105,7 +1234,23 @@ class OnPremSshCapacityDriver:
         *,
         revalidate: tp.Callable[[str], None],
     ) -> None:
-        """Run the stop command and remove this incarnation's marker everywhere."""
+        """Release current and interrupted predecessor claims with exact identities."""
+
+        predecessors = cleanup.get("predecessor_claims", [])
+        if not isinstance(predecessors, list) or not all(is_json_object(item) for item in predecessors):
+            raise self._configuration(f"cell {cell_id!r} has malformed predecessor release identities")
+        self._release_identity_hosts(cell_id, cleanup, revalidate=revalidate)
+        for predecessor in predecessors:
+            self._release_identity_hosts(cell_id, tp.cast(JsonObject, predecessor), revalidate=revalidate)
+
+    def _release_identity_hosts(
+        self,
+        cell_id: str,
+        cleanup: tp.Mapping[str, JsonValue],
+        *,
+        revalidate: tp.Callable[[str], None],
+    ) -> None:
+        """Run fenced stop/removal for one durably captured remote incarnation."""
 
         hosts = [host for host in tp.cast(list, cleanup.get("hosts", [])) if isinstance(host, str)]
         state_dir = cleanup.get("state_dir")
@@ -1122,9 +1267,7 @@ class OnPremSshCapacityDriver:
             raise self._configuration(f"cell {cell_id!r} has an incomplete on-premises release identity")
         stop_command = tuple(part for part in tp.cast(list, cleanup.get("stop_command", [])) if isinstance(part, str))
         for host in hosts:
-            revalidate(f"before stopping the worker on {host}")
-            self._run_lifecycle_command(host, stop_command, phase="stop")
-            revalidate(f"before releasing {host}")
+            revalidate(f"before stopping and releasing {host}")
             self._release_host(
                 host,
                 state_dir=state_dir,
@@ -1132,6 +1275,7 @@ class OnPremSshCapacityDriver:
                 management_uid=management_uid,
                 provider_generation=provider_generation,
                 fence=fence,
+                command=stop_command,
             )
             revalidate(f"after releasing {host}")
 
@@ -1169,7 +1313,11 @@ class OnPremSshCapacityDriver:
                         raise StaleMutationError(f"cell {cell_id!r} has no durable on-premises ownership fence")
                     captured["generation"] = current.generation
                     captured["fencing_token"] = current.fencing_token
+                    captured["claim_fence"] = self._record_string(
+                        current, "claim_fence", marker_fingerprint(current.fencing_token)
+                    )
                     captured["provider_generation"] = current.provider_generation
+                    captured["predecessor_claims"] = current.metadata.get("predecessor_claims", [])
                     captured["hosts"] = list(self._record_hosts(current))
                     captured["state_dir"] = self._record_string(current, "state_dir", self.native_worker_state_dir)
                     captured["management_uid"] = self._record_string(
@@ -1197,7 +1345,8 @@ class OnPremSshCapacityDriver:
                     "management_uid": captured["management_uid"],
                     "stop_command": captured["stop_command"],
                     "provider_generation": provider_generation,
-                    "fence": marker_fingerprint(fencing_token),
+                    "fence": captured["claim_fence"],
+                    "predecessor_claims": captured["predecessor_claims"],
                 }
 
                 def revalidate(phase: str) -> None:

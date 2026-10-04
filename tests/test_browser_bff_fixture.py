@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from eyvan.server.api.dashboard_sessions import SESSION_COOKIE
+
 FIXTURE = Path(__file__).with_name("browser_bff_server.py")
 
 
@@ -116,12 +118,18 @@ def test_fixture_is_real_https_process_with_pkce_and_shutdown(tmp_path: Path) ->
             assert query["nonce"]
             completed = client.get(authorization)
             assert completed.status_code in (200, 303, 307)
-            assert "eyvan_session" in client.cookies
+            assert SESSION_COOKIE in client.cookies
+            authenticated = client.get(f"{ready['plane']}/api/v1/session")
+            assert authenticated.status_code == 200
 
             logout = client.post(f"{ready['plane']}/api/v1/dashboard/auth/logout", headers={"Origin": ready["plane"]})
             assert logout.status_code == 204
+            assert SESSION_COOKIE not in client.cookies
+            assert client.get(f"{ready['plane']}/api/v1/session").status_code == 401
+            # The fixture's has_cookie monitor recognizes only the legacy name;
+            # verify canonical-cookie authority on the real API instead.
             observed = client.get(f"{ready['plane']}/qualification")
-            assert observed.json()["logout_attempts"][-1]["has_cookie"] is True
+            assert observed.json()["logout_attempts"][-1]["origin"] == ready["plane"]
     finally:
         _stop(process)
     assert process.returncode == 0

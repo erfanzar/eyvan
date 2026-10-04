@@ -83,10 +83,11 @@ jobs:
           # linux/amd64 anyway.
           platforms: linux/amd64
           push: true
-          # Never `latest`: a moving tag makes a deployment unreproducible and
-          # makes "which image is running" unanswerable afterwards.
+          # Development builds use source-SHA locators only. Version tags are
+          # reserved for the gated OCI release promotion lane; publishing them
+          # here would retarget a qualified release on the next main push.
+          # Never publish `latest`; deploy verified receipt digests, not tags.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.locked.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}
           build-args: |
             ${{ steps.locked.outputs.build_args }}

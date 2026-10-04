@@ -36,6 +36,7 @@ watching a fleet for a month.
 
 from __future__ import annotations
 
+import math
 import typing as tp
 from dataclasses import dataclass
 
@@ -76,6 +77,8 @@ class PredictiveConfig:
     def __post_init__(self) -> None:
         if self.hourly_budget_usd < 0:
             raise ValueError("a predictive budget cannot be negative")
+        if not math.isfinite(self.hourly_budget_usd):
+            raise ValueError("a predictive budget must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,16 +149,18 @@ def predict_demand(
         # A free cell is not evidence of a working price; it is evidence of an
         # unpriced pool, and dividing a budget by it would warm the whole fleet.
         return Prediction(0, "this pool has no hourly cost, so a budget cannot bound the prediction")
+    if not math.isfinite(cell_hourly_cost):
+        # An infinite or NaN pool price cannot bound anything: refuse the pool
+        # with a reason instead of crashing in int() on the ratio below.
+        return Prediction(0, "this pool has no finite hourly cost, so a budget cannot bound the prediction")
     budget, cost = money(config.hourly_budget_usd), money(cell_hourly_cost)
-    if budget.is_finite() and cost.is_finite():
-        # Integer ratios retain decimal dollars without rounding the quotient or
-        # depending on the process-wide Decimal precision for very small prices.
-        budget_numerator, budget_denominator = budget.as_integer_ratio()
-        cost_numerator, cost_denominator = cost.as_integer_ratio()
-        affordable = (budget_numerator * cost_denominator) // (budget_denominator * cost_numerator)
-    else:
-        # Preserve nonfinite-input behavior, including an unaffordable +inf cost.
-        affordable = int(config.hourly_budget_usd // cell_hourly_cost)
+    # The budget is validated finite at construction, and the cost was checked
+    # just above, so both integer ratios are well defined. Integer ratios
+    # retain decimal dollars without rounding the quotient or depending on the
+    # process-wide Decimal precision for very small prices.
+    budget_numerator, budget_denominator = budget.as_integer_ratio()
+    cost_numerator, cost_denominator = cost.as_integer_ratio()
+    affordable = (budget_numerator * cost_denominator) // (budget_denominator * cost_numerator)
     cells = min(affordable, max_cells)
     if cells <= 0:
         return Prediction(0, f"the budget affords no cell at {cell_hourly_cost}/h")

@@ -209,6 +209,7 @@ class _ControllerSettlement:
         action: str,
         *,
         failure_reason: str | None = None,
+        expected_dispatch_command: OutboxRecord | None = None,
     ) -> None:
         if workload.lease_id != lease.id:
             raise StaleOutboxCommand(f"lease {lease.id!r} no longer owns workload {workload.id!r}")
@@ -236,6 +237,7 @@ class _ControllerSettlement:
             expected_generation=workload.generation,
             expected_lease_id=lease.id,
             expected_state=workload.state,
+            expected_dispatch_command=expected_dispatch_command,
         )
 
     async def _archive_terminal_logs(self, workload: WorkloadRecord) -> None:
@@ -708,6 +710,9 @@ class _ControllerSettlement:
                     "state": CellState.UNAVAILABLE,
                     "provider_phase": CapacityStatus.PROVIDER_ERROR,
                     "provider_failure_code": failure_code,
+                    "provider_failure_occurred_at": observed_at if failure_code is not None else None,
+                    "provider_failure_event_id": command.id if failure_code is not None else None,
+                    "provider_failure_generation": cell.generation if failure_code is not None else None,
                     "provider_phase_started_at": _provider_phase_start(
                         cell,
                         CapacityStatus.PROVIDER_ERROR,
@@ -831,6 +836,10 @@ class _ControllerSettlement:
                 zone=zone,
                 accelerator_type=accelerator_type,
                 capacity_class=cell.capacity_class,
+                occurred_at=(
+                    cell.provider_failure_occurred_at if cell.provider_failure_generation == cell.generation else None
+                ),
+                event_id=cell.provider_failure_event_id,
             )
         )
         await self.service._transition_workload(
@@ -1344,10 +1353,8 @@ class _ControllerSettlement:
             }
         )
         try:
-            await self.service.submit_child_workload(
-                parent=service.model_copy(
-                    update={"spec": service.spec.model_copy(update={"can_submit_children": True})}
-                ),
+            await self.service._submit_service_replica(
+                parent=service,
                 spec=spec,
                 # Deterministic per revision and per slot, so a crash between
                 # the submit and the commit does not start two replicas: two

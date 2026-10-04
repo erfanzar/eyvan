@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import click
 from rich import box
@@ -164,10 +165,11 @@ class FleetStatusView:
 
     status: FleetStatusResponse
     cells_by_pool: dict[str, tuple[CellRecord, ...]]
+    now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @classmethod
     def build(cls, status: FleetStatusResponse) -> FleetStatusView:
-        """Index fleet cells once for deterministic pool aggregation."""
+        """Index cells and capture one timestamp for consistent warm floors."""
 
         indexed: dict[str, list[CellRecord]] = {pool.id: [] for pool in status.pools}
         for cell in status.cells:
@@ -185,13 +187,12 @@ class FleetStatusView:
 
         return self.cells_by_pool[pool.id]
 
-    @staticmethod
-    def pool_target(pool: CapacityPoolRecord) -> int:
-        """Return the autoscaler's current warm or first-apply worker floor."""
+    def pool_target(self, pool: CapacityPoolRecord) -> int:
+        """Return the autoscaler's warm or first-apply floor at the view timestamp."""
 
         if not pool.enabled:
             return 0
-        return pool.initial_target if pool.initialized_at is None else pool.min_cells
+        return pool.initial_target if pool.initialized_at is None else pool.warm_floor(self.now)
 
     @property
     def active_cells(self) -> tuple[CellRecord, ...]:

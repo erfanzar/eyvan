@@ -87,6 +87,7 @@ def _replica(
         state=state,
         generation=generation,
         lease_id=lease_id,
+        service_endpoint="http://10.0.0.1:8080",
         created_by="alice",
     )
 

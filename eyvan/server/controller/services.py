@@ -30,7 +30,10 @@ it did before it.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import socket
 import typing as tp
+from datetime import datetime
 
 import httpx
 
@@ -85,6 +88,70 @@ def health_probe_url(endpoint: str, path: str) -> str:
     return f"{endpoint.rstrip('/')}/{path.lstrip('/')}"
 
 
+def _checked_probe_address(value: str) -> str:
+    """Normalize mapped IPv4 before applying the registered-endpoint policy."""
+
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_unspecified:
+        raise ValueError("service endpoint must not resolve to an unspecified address")
+    if (
+        address.is_loopback
+        or address.is_link_local
+        or (address.version == 6 and address in ipaddress.ip_network("fc00::/7"))
+    ):
+        raise ValueError("service endpoint must not resolve to a loopback, link-local, or unique-local address")
+    return str(address)
+
+
+class _PinnedHealthTransport(httpx.AsyncHTTPTransport):
+    """Resolve once, validate every answer, and give HTTPX only a numeric host.
+
+    Merely checking DNS before a normal HTTPX request leaves a second lookup
+    free to rebind the name. Pinning the URL's host prevents that lookup; the
+    original Host header and TLS SNI/verification hostname remain unchanged.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        async def pinned_request() -> httpx.Response:
+            host = request.url.host
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                resolved = await asyncio.get_running_loop().getaddrinfo(host, request.url.port, type=socket.SOCK_STREAM)
+                addresses = [_checked_probe_address(entry[4][0]) for entry in resolved]
+            else:
+                addresses = [_checked_probe_address(host)]
+            addresses = list(dict.fromkeys(addresses))
+            if not addresses:
+                raise OSError("service endpoint DNS returned no addresses")
+            # HTTPX already built Host from the original URL. httpcore uses
+            # sni_hostname for both SNI and certificate hostname verification.
+            for index, address in enumerate(addresses):
+                pinned = httpx.Request(
+                    request.method,
+                    request.url.copy_with(host=address),
+                    headers=request.headers,
+                    stream=request.stream,
+                    extensions={**request.extensions, "sni_hostname": host},
+                )
+                try:
+                    return await super(_PinnedHealthTransport, self).handle_async_request(pinned)
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    if index == len(addresses) - 1:
+                        raise
+            raise OSError("service endpoint DNS returned no addresses")  # pragma: no cover
+
+        timeout = request.extensions.get("timeout", {}).get("connect")
+        try:
+            # Include DNS in the connection budget instead of allowing a slow
+            # resolver to stall a complete health pass indefinitely.
+            return await asyncio.wait_for(pinned_request(), timeout=timeout)
+        except TimeoutError as exc:
+            raise httpx.ConnectTimeout("service endpoint resolution/connection timed out", request=request) from exc
+
+
 class HttpServiceHealthProbe:
     """Ask one replica over HTTP whether it is serving.
 
@@ -116,10 +183,29 @@ class HttpServiceHealthProbe:
 
         url = health_probe_url(endpoint, path)
         try:
-            async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
-                async with client.stream("GET", url) as response:
-                    status = response.status_code
-                    body = await _bounded_body(response)
+            # Check the actual HTTPX URL, not only the registration-time parser.
+            # This guard also applies when deployments inject a custom transport.
+            target = httpx.URL(url)
+            try:
+                ipaddress.ip_address(target.host)
+            except ValueError:
+                pass
+            else:
+                _checked_probe_address(target.host)
+            # HTTPX timeouts apply per I/O. A peer trickling bytes must not
+            # extend the total leader budget through an unbounded body read.
+            async with asyncio.timeout(timeout_s):
+                async with httpx.AsyncClient(
+                    timeout=timeout_s,
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=_PinnedHealthTransport(trust_env=False),
+                ) as client:
+                    async with client.stream("GET", target) as response:
+                        status = response.status_code
+                        body = await _bounded_body(response)
+        except TimeoutError:
+            return probe_unreachable(f"TimeoutError: health probe exceeded total deadline of {timeout_s}s")
         except (httpx.HTTPError, OSError, ValueError) as exc:
             return probe_unreachable(f"{type(exc).__name__}: {exc}")
         return probe_from_response(status, body)
@@ -149,6 +235,7 @@ class _PlannedProbe(tp.NamedTuple):
     replica_id: str
     generation: int
     endpoint: str
+    authority_updated_at: datetime
 
 
 class _ControllerServices:
@@ -370,7 +457,12 @@ class _ControllerServices:
         if not policy.health_path:
             return 0
         planned = [
-            _PlannedProbe(replica_id=child.id, generation=child.generation, endpoint=child.service_endpoint)
+            _PlannedProbe(
+                replica_id=child.id,
+                generation=child.generation,
+                endpoint=child.service_endpoint,
+                authority_updated_at=child.updated_at,
+            )
             # RUNNING says a process started; a registered endpoint says it
             # answered. Probing an address nobody published would make every
             # replica unknown for the whole of its startup and call that a fact.
@@ -401,11 +493,13 @@ class _ControllerServices:
         """
 
         try:
-            return await self.service_health_probe(
-                endpoint=target.endpoint,
-                path=policy.health_path,
-                timeout_s=policy.health_timeout_s,
-            )
+            # Bound custom probes as well as the shipped HTTP implementation.
+            async with asyncio.timeout(policy.health_timeout_s):
+                return await self.service_health_probe(
+                    endpoint=target.endpoint,
+                    path=policy.health_path,
+                    timeout_s=policy.health_timeout_s,
+                )
         except Exception as exc:  # a probe transport may raise anything at all
             logger.debug("health probe of replica %s raised", target.replica_id, exc_info=True)
             return probe_unreachable(f"the health probe raised {type(exc).__name__}: {exc}")
@@ -443,7 +537,14 @@ class _ControllerServices:
                 replica = await transaction.get_workload(target.replica_id)
                 if replica is None or replica.parent_workload_id != service_id:
                     continue
-                if replica.generation != target.generation or replica.state in TERMINAL_WORKLOAD_STATES:
+                if (
+                    replica.generation != target.generation
+                    or replica.state in TERMINAL_WORKLOAD_STATES
+                    or replica.service_endpoint != target.endpoint
+                    # updated_at is a conservative authority fence: it also
+                    # detects an endpoint that changed away and back (ABA).
+                    or replica.updated_at != target.authority_updated_at
+                ):
                     continue
                 await transaction.put_service_replica_health(
                     apply_probe(

@@ -16,7 +16,12 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from eyvan.config import EyvanSettings
-from eyvan.server.api.dashboard_sessions import DashboardSessionStore, register_dashboard_auth_routes
+from eyvan.server.api.dashboard_sessions import (
+    SESSION_COOKIE,
+    TRANSACTION_COOKIE,
+    DashboardSessionStore,
+    register_dashboard_auth_routes,
+)
 
 
 @pytest.mark.parametrize("phase", ["discovery", "token"])
@@ -52,7 +57,7 @@ def test_invalid_provider_documents_return_bad_gateway(phase, body) -> None:
                 response = client.get("/api/v1/dashboard/auth/login", follow_redirects=False)
             else:
                 transaction, state, _, _ = store.begin_transaction()
-                client.cookies.set("eyvan_oidc_tx", transaction)
+                client.cookies.set(TRANSACTION_COOKIE, transaction)
                 response = client.get("/api/v1/dashboard/auth/callback", params={"code": "test", "state": state})
             assert response.status_code == 502
             assert "identity provider" in response.json()["detail"].lower()
@@ -148,14 +153,14 @@ def test_callback_requires_bound_valid_id_token_claims(case) -> None:
     app.state.dashboard_http_client = provider_client
     try:
         with TestClient(app, base_url="https://plane.example.com", raise_server_exceptions=False) as client:
-            client.cookies.set("eyvan_oidc_tx", transaction)
+            client.cookies.set(TRANSACTION_COOKIE, transaction)
             response = client.get(
                 "/api/v1/dashboard/auth/callback", params={"code": "test", "state": state}, follow_redirects=False
             )
         accepted_cases = {"valid", "multi-audience"}
         assert response.status_code == (303 if case in accepted_cases else 502)
         if case not in accepted_cases:
-            assert "eyvan_session=" not in response.headers.get("set-cookie", "")
+            assert SESSION_COOKIE not in response.cookies
     finally:
         asyncio.run(provider_client.aclose())
 

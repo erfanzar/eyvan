@@ -42,7 +42,7 @@ _DECLARED_PYTHON_MAJOR_MINOR = re.compile(r"\d+\.\d+")
 #: running cells only when they are recreated. This is deliberate: pushing a
 #: new script under a running cell would re-run provisioning steps with no
 #: fence, and the driver has no way to know what the old script already did.
-NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-08-23.7"
+NATIVE_WORKER_BOOTSTRAP_REVISION = "2026-09-26.1"
 
 
 def _required(value: str, name: str) -> str:
@@ -347,7 +347,10 @@ def build_native_worker_startup_script(
         ).decode()
         quoted_environment_path = shlex.quote(_WORKLOAD_RUNTIME_ENVIRONMENT)
         runtime_environment_lines = (
-            f"printf '%s' {shlex.quote(encoded_environment)} | base64 --decode > {quoted_environment_path}",
+            # Create the file private: there is a window between the shell
+            # redirect and the chmod below in which the file would otherwise be
+            # world-readable, so the redirect itself runs under a private umask.
+            f"(umask 077; printf '%s' {shlex.quote(encoded_environment)} | base64 --decode > {quoted_environment_path})",
             f"chmod 0600 {quoted_environment_path}",
         )
     runtime_container_lines: tuple[str, ...] = ()
@@ -357,7 +360,8 @@ def build_native_worker_startup_script(
         ).decode()
         quoted_container_path = shlex.quote(_WORKLOAD_CONTAINER_RUNTIME)
         runtime_container_lines = (
-            f"printf '%s' {shlex.quote(encoded_container)} | base64 --decode > {quoted_container_path}",
+            # Same private-at-creation window as the environment file above.
+            f"(umask 077; printf '%s' {shlex.quote(encoded_container)} | base64 --decode > {quoted_container_path})",
             f"chmod 0600 {quoted_container_path}",
         )
     runtime_setup_lines: tuple[str, ...] = ()

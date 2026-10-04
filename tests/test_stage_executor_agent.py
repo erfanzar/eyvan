@@ -27,8 +27,10 @@ and would block assets permanently on evidence about the control plane.
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
@@ -350,6 +352,41 @@ async def test_a_stale_generation_cannot_evict(tmp_path: Path) -> None:
     assert stored.state is CellStageState.STAGED
     assert stored.cell_generation == 1
     assert [path.read_bytes() for path in (tmp_path / "stage").rglob("assets/*")] == [payload]
+
+
+def test_inflight_single_host_staging_does_not_confirm_a_replaced_cell(tmp_path: Path) -> None:
+    """A completed remote write cannot prove placement after the cell has moved."""
+
+    from eyvan.worker.agent.models import CellStageAction, CellStageActionRequest, MutationModel
+    from eyvan.worker.agent.service import StaleMutationError
+
+    entered = Event()
+    resume = Event()
+
+    class _SlowStage:
+        def stage(self, _cell_id: str, _asset: str, *, max_bytes: int) -> AssetStageResult:
+            entered.set()
+            if not resume.wait(5):
+                raise TimeoutError("stage test barrier not released")
+            return AssetStageResult(verdict=AssetStageVerdict.OK, size_bytes=4)
+
+    capacity = _Capacity(generation=1)
+    service, _client = _agent(tmp_path, capacity=capacity, stager=_SlowStage())
+    request = CellStageActionRequest(
+        mutation=MutationModel(idempotency_key="stage-1", generation=1, fencing_token="cell:cell-a:1"),
+        action=CellStageAction.STAGE,
+        asset="/data/asset",
+        max_bytes=100,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(service.stage_asset, "cell-a", request)
+        try:
+            assert entered.wait(5)
+            capacity.generation = 2
+        finally:
+            resume.set()
+        with pytest.raises(StaleMutationError):
+            future.result(timeout=5)
 
 
 async def test_the_agent_refuses_a_generation_it_does_not_own(tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ from eyvan.server.service._control_plane.shared import (
     AuditEvent,
     BatchRequest,
     CellState,
+    ConflictError,
     CoordinationKind,
     DagNode,
     ExpansionAdmissionRecord,
@@ -646,6 +647,15 @@ class ExpansionMixin:
                 # All or nothing. Returning here writes nothing, so a group that
                 # cannot be placed whole holds no cell at all.
                 return ()
+            # Eviction marking locks the host before checking active holders.
+            # Take those same locks in stable order and refuse a changed planning
+            # snapshot before inspecting its stage rows or publishing any lease.
+            chosen_cells = {candidate.cell_id for member in members for candidate in placements[member.id].all_leases}
+            for cell_id in sorted(chosen_cells):
+                current = await tx.get_cell(cell_id)
+                if current is None or current != cells.get(cell_id):
+                    return ()
+                cells[cell_id] = current
             now = utcnow()
             # Every member's leases are built before any of them is written. A
             # loop that wrote as it went and then found the next member's cell
@@ -661,6 +671,10 @@ class ExpansionMixin:
                 for index, candidate in enumerate(proposed):
                     cell = cells.get(candidate.cell_id)
                     if cell is None or cell.state is not CellState.READY:
+                        return ()
+                    try:
+                        await self._require_no_asset_eviction(tx, member, cell)
+                    except ConflictError:
                         return ()
                     self._require_autoscale_request_ownership(cell, member.id)
                     records.append(

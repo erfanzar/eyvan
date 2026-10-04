@@ -75,7 +75,7 @@ def _workload(identifier, spec, state=WorkloadState.PENDING, **kwargs):
     )
 
 
-async def _preemption(repository, *, correlation_enabled=False):
+async def _preemption(repository, *, correlation_enabled=False, checkpointable=False, remote_id=None):
     scheduler = CoreSchedulingService()
     controller = EyvanController(
         repository,
@@ -92,8 +92,13 @@ async def _preemption(repository, *, correlation_enabled=False):
         capacity_class=CapacityClass.SPOT,
         priority_band=PriorityBand.BATCH,
         cell_group_count=2,
+        checkpointable=checkpointable,
+        checkpoint_hook="python checkpoint.py" if checkpointable else None,
+        checkpoint_output_uri="gs://checkpoints/gang" if checkpointable else None,
     )
     victim = _workload("victim", spec, WorkloadState.RUNNING, lease_id="lease-a", lease_ids=("lease-a", "lease-b"))
+    if remote_id:
+        victim = victim.model_copy(update={"remote_id": remote_id})
     target = _workload(
         "priority", spec.model_copy(update={"cell_group_count": 1, "priority_band": PriorityBand.PRODUCTION})
     )

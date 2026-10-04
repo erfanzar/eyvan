@@ -64,9 +64,7 @@ from eyvan.capacity.providers.gcp.quota_discovery import (
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.identity.rotation import (
-    MINIMUM_CREDENTIAL_BYTES,
-    CredentialRotationError,
-    CredentialRotationState,
+    CredentialRotationBlocked,
     RotatingCredential,
 )
 from eyvan.records import (
@@ -210,7 +208,6 @@ from eyvan.server.service.control_plane import (
 from eyvan.server.service.credential_rotation import (
     SECRET_CAPABILITY_CREDENTIAL,
     CredentialRotationService,
-    new_rotation_fence,
 )
 from eyvan.server.service.dag import DagNode
 from eyvan.server.service.errors import (
@@ -280,9 +277,9 @@ TPU_QUOTA_READ_DEADLINE_S = 25.0
 class SecretRotationRequest(BaseModel):
     """Body of the signed-credential rotation route.
 
-    Deliberately materialless, and the only field is the overlap: the replica
-    mints the new signing material itself and installs it in its own keyring, so
-    no key is ever a request field a proxy log could carry.
+    Kept materialless for wire compatibility. The route refuses rotation until
+    protected shared credential distribution and startup recovery exist; an
+    overlap alone cannot make a process-local key replacement deployment-wide.
     """
 
     #: Seconds the superseded generation keeps verifying. Unset means one secret
@@ -711,6 +708,24 @@ def create_app(
         if engine is not None and settings.auto_create_schema:
             await create_schema(engine)
         await repository.open()
+        try:
+            historical_rotation = await credential_rotation.current(SECRET_CAPABILITY_CREDENTIAL)
+            if historical_rotation is not None:
+                # The old endpoint persisted a ledger but not its randomly
+                # generated key. Even a committed row cannot restore the key,
+                # and an abandoned latest row does not prove earlier keys were
+                # never replaced. Refuse before serving or starting dispatch;
+                # do not resurrect a retired key or ignore an uncertain epoch.
+                raise CredentialRotationBlocked(
+                    "secret credential rotation history cannot be recovered without protected shared "
+                    "credential versions; operator recovery is required before this replica can start"
+                )
+        except BaseException:
+            await controller.close()
+            await repository.close()
+            if engine is not None:
+                await engine.dispose()
+            raise
         stop = asyncio.Event()
         task = (
             asyncio.create_task(controller.run(stop), name="eyvan-controller") if settings.controller_enabled else None
@@ -763,10 +778,8 @@ def create_app(
     app.state.grant_resolver = service.active_grants_for
     app.state.workload_capability = workload_capability
     app.state.secret_capability = secret_capability
-    # The signing material itself still never crosses this API: a route would
-    # make every proxy log, every access log and every error path a place a key
-    # can appear. ``POST /api/v1/secrets/rotate`` drives the fenced ledger and
-    # this keyring together while the material is minted here and stays here.
+    # Material never crosses the API. The rotation route is deliberately a
+    # refusal: a durable fence alone cannot distribute or recover the keyring.
     app.state.secret_capability_credential = secret_capability_credential
     app.state.credential_rotation = credential_rotation
     app.state.metrics = metrics
@@ -813,18 +826,23 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        """CSP and companion headers on HTML responses — the dashboard itself.
+        """Keep dashboard HTML strict and scope the framework docs separately.
 
-        Scoped to text/html so the policy cannot surprise API or streaming
-        clients; the dashboard is the only HTML this plane serves, and its
-        bundle needs no script from anywhere but itself. Google Fonts stay
-        allowed because the shipped index.html loads them; style attributes
-        keep 'unsafe-inline' because React renders them.
+        FastAPI documentation uses CDN assets and inline initialization; those
+        exceptions apply only to its registered documentation routes, never to
+        the dashboard bundle or a catch-all HTML fallback.
         """
 
         response = await call_next(request)
         content_type = response.headers.get("Content-Type", "")
         if content_type.startswith("text/html"):
+            documentation_endpoints = {
+                route.endpoint
+                for route in app.routes
+                if getattr(route, "name", None) in {"swagger_ui_html", "redoc_html", "swagger_ui_redirect"}
+                and getattr(route, "path", None) in {app.docs_url, app.redoc_url, app.swagger_ui_oauth2_redirect_url}
+            }
+            is_documentation = request.scope.get("endpoint") in documentation_endpoints
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
                 "script-src 'self'; "
@@ -837,6 +855,19 @@ def create_app(
                 "form-action 'self'; "
                 "frame-ancestors 'none'"
             )
+            if is_documentation:
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; "
+                    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+                    "font-src 'self' https://fonts.gstatic.com; "
+                    "img-src 'self' data: https://fastapi.tiangolo.com; "
+                    "connect-src 'self'; "
+                    "object-src 'none'; "
+                    "base-uri 'self'; "
+                    "form-action 'self'; "
+                    "frame-ancestors 'none'"
+                )
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "no-referrer"
@@ -1260,14 +1291,22 @@ def create_app(
                 workload_id=workload_id,
             )
         except AuthorizationError:
-            await service.record_artifact_access(
-                org_id=org_id,
-                project_id=project_id,
-                workload_id=workload_id,
-                kind=kind,
-                object_id=uri,
-                action="artifact.read_denied",
-            )
+            # Record the denial against the WORKLOAD's durable scope: the
+            # caller here is unauthenticated by definition, so their claimed
+            # org/project must never choose which tenant's audit ledger an
+            # event lands in. A workload id that does not resolve records
+            # nothing -- there is no owner to attribute the event to.
+            async with repository.transaction() as transaction:
+                workload = await transaction.get_workload(workload_id)
+            if workload is not None:
+                await service.record_artifact_access(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    workload_id=workload_id,
+                    kind=kind,
+                    object_id=uri,
+                    action="artifact.read_denied",
+                )
             raise
 
     async def current_result_uri(workload_id: str) -> str:
@@ -1866,14 +1905,22 @@ def create_app(
                 workload_id=workload_id,
             )
         except AuthorizationError:
-            await service.record_artifact_access(
-                org_id=org_id,
-                project_id=project_id,
-                workload_id=workload_id,
-                kind="results",
-                object_id=uri,
-                action="artifact.write_denied",
-            )
+            # Same durable-scope rule as the read path: the caller here is
+            # unauthenticated by definition, so their claimed org/project must
+            # never choose which tenant's audit ledger an event lands in. A
+            # workload id that does not resolve records nothing -- there is no
+            # owner to attribute the event to.
+            async with repository.transaction() as transaction:
+                workload = await transaction.get_workload(workload_id)
+            if workload is not None:
+                await service.record_artifact_access(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    workload_id=workload_id,
+                    kind="results",
+                    object_id=uri,
+                    action="artifact.write_denied",
+                )
             raise
         await authorize_current_result_target(
             uri,
@@ -1987,74 +2034,21 @@ def create_app(
         request: SecretRotationRequest,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> CredentialRotationRecord:
-        """Rotate the capability-signing credential without a restart.
+        """Refuse unsupported deployment-wide signing credential rotation.
 
-        Drives the fenced lifecycle its ledger documents: ``begin`` commits the
-        claim and returns, this replica installs freshly minted material in its
-        own keyring holding no lock, and ``commit`` opens a second short
-        transaction to record the outcome and the instant the superseded
-        generation stops verifying. Material outstanding when the rotation lands
-        keeps verifying for the overlap, so nothing in flight is invalidated --
-        which is what makes rotating survivable at all.
-
-        The material is minted here and never returned. The response is the
-        ledger row, whose ``fence`` is what resolves the rotation if it ever has
-        to be recorded as inconclusive.
+        No protected shared credential-version store or startup hydration exists
+        yet. Installing random material in this process would strand dispatches
+        on other replicas and resurrect retired keys on restart. A ledger commit
+        cannot repair that, and an uncertain commit must not leave a signer live.
+        Keep the authorized route discoverable, but change neither key nor ledger.
         """
 
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
-        overlap_s = request.overlap_s if request.overlap_s is not None else float(settings.secret_token_ttl_s)
-        fence = new_rotation_fence()
-        try:
-            begun = await credential_rotation.begin(
-                credential=SECRET_CAPABILITY_CREDENTIAL,
-                fence=fence,
-                overlap_s=overlap_s,
-            )
-        except CredentialRotationError as exc:
-            raise ConflictError(str(exc)) from exc
-        try:
-            secret_capability_credential.begin(fence)
-            secret_capability_credential.commit(
-                fence,
-                secrets.token_bytes(MINIMUM_CREDENTIAL_BYTES),
-                overlap_s=overlap_s,
-            )
-        except CredentialRotationError as exc:
-            # The keyring refused, so nothing was installed: the established
-            # not-happened ``abandon`` exists for. Its own begin either never ran
-            # or left it untouched, and a begin whose commit failed is closed too,
-            # so neither half is left claiming a rotation in flight.
-            if secret_capability_credential.rotation_state is CredentialRotationState.PENDING:
-                secret_capability_credential.abandon(fence)
-            await credential_rotation.abandon(
-                credential=SECRET_CAPABILITY_CREDENTIAL,
-                generation=begun.generation,
-                fence=fence,
-                detail="the signing keyring refused the new generation",
-            )
-            raise ConflictError(str(exc)) from exc
-        try:
-            return await credential_rotation.commit(
-                credential=SECRET_CAPABILITY_CREDENTIAL,
-                generation=begun.generation,
-                fence=fence,
-            )
-        except Exception:
-            # The material IS installed, but the durable outcome did not land.
-            # Unobserved is recorded as unobserved: the row holds future
-            # rotations until a human resolves it rather than this process
-            # claiming an outcome it could not see.
-            try:
-                await credential_rotation.record_inconclusive(
-                    credential=SECRET_CAPABILITY_CREDENTIAL,
-                    generation=begun.generation,
-                    fence=fence,
-                    detail="the ledger commit failed after the keyring was updated",
-                )
-            except Exception:
-                pass  # The row is not ours to close; surface the commit failure.
-            raise
+        del request
+        raise UnavailableError(
+            "secret credential rotation is unavailable until protected shared credential distribution "
+            "and startup recovery are implemented; no signing material or rotation ledger was changed"
+        )
 
     @app.get("/metrics", include_in_schema=False)
     async def prometheus_metrics(raw_request: Request) -> Response:
@@ -2075,9 +2069,24 @@ def create_app(
         if expected:
             authorization = raw_request.headers.get("Authorization", "")
             scheme, _, presented = authorization.partition(" ")
-            if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected):
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="metrics token required")
-        return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+            # Byte comparison: compare_digest rejects non-ASCII str input with
+            # a TypeError, and a garbage bearer must answer 401, not 500.
+            token_matches = hmac.compare_digest(
+                presented.encode("utf-8"),
+                expected.encode("utf-8"),
+            )
+            if scheme.lower() != "bearer" or not token_matches:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="metrics token required",
+                    headers={"Cache-Control": "no-store"},
+                )
+        # The exposition is labelled by tenant and carries spend figures.
+        return Response(
+            generate_latest(registry),
+            media_type=CONTENT_TYPE_LATEST,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/dashboard/config", tags=["system"])
     async def dashboard_config() -> dict[str, str | None]:
@@ -3864,13 +3873,11 @@ def create_app(
         service.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
 
         async def event_source() -> tp.AsyncIterator[str]:
-            # An audit `sequence` is a BIGSERIAL allocated at flush, but rows
-            # become visible at commit. Two overlapping transactions can
-            # therefore commit out of sequence order, and a follower that only
-            # ever advances `sequence > cursor` would skip the lower one
-            # forever. Re-scan a bounded window behind the cursor and suppress
-            # ids already delivered, so a late commit is still emitted exactly
-            # once. The window is bounded so memory stays flat on a long stream.
+            # Repositories serialize audit allocation through commit/rollback:
+            # a higher visible sequence cannot hide a later lower commit.
+            # Retain the existing bounded lookback/reconnect wire behavior for
+            # compatibility, but completeness now comes from that repository
+            # contract, not from a finite lookback. Rollback gaps need no resync.
             cursor = after_sequence
             delivered: collections.OrderedDict[str, None] = collections.OrderedDict()
 
@@ -3926,6 +3933,7 @@ def create_app(
         last_event_id: tp.Annotated[str | None, Header(alias="Last-Event-ID")] = None,
         follow: bool = True,
         limit: int = Query(default=200, ge=1, le=1000),
+        include_status: bool = False,
     ) -> StreamingResponse:
         """Follow one workload's structured logs as they are produced.
 
@@ -3937,6 +3945,11 @@ def create_app(
         ``Last-Event-ID`` is the same ``"{attempt}:{rank}=cursor|..."`` the
         paged route returns, so a browser reconnecting resumes every rank where
         it left off rather than replaying from the tail.
+
+        ``include_status=true`` opts into bounded ``log.page_status`` events,
+        including on empty pages, distinguishing unavailable, suppressed or
+        incomplete output from healthy silence. Unchanged status is not repeated.
+        The default retains the legacy record-only wire format during rollout.
 
         Authorization happens here, before the generator exists. A check inside
         it would run after the response was committed, and the caller would see
@@ -3956,6 +3969,7 @@ def create_app(
 
         async def log_source() -> tp.AsyncIterator[str]:
             position = cursor
+            previous_status: JsonObject | None = None
             while True:
                 page = await controller.workload_log_page(workload_id, after=position, limit=limit)
                 records = page.get("records")
@@ -3969,6 +3983,38 @@ def create_app(
                     frames.append(({"attempt": page.get("attempt")}, "log.attempt_changed"))
                 if isinstance(records, list) and records:
                     frames.extend((record, "log.record") for record in records)
+                if include_status:
+                    status_document: JsonObject = {
+                        field: page.get(field)
+                        for field in (
+                            "attempt",
+                            "unavailable",
+                            "detail",
+                            "truncated_ranks",
+                            "topology_state",
+                            "topology",
+                            "expected_ranks",
+                            "missing_ranks",
+                            "completeness_unknown",
+                        )
+                    }
+                    # Status is a bounded diagnostic, not another log page.
+                    # State whether lists/text were clipped so clipping itself
+                    # cannot make a partial diagnostic look complete.
+                    status_truncated = False
+                    for field in ("truncated_ranks", "missing_ranks"):
+                        ranks = status_document[field]
+                        if isinstance(ranks, list) and len(ranks) > 1000:
+                            status_document[field] = ranks[:1000]
+                            status_truncated = True
+                    detail = status_document["detail"]
+                    if isinstance(detail, str) and len(detail) > 1024:
+                        status_document["detail"] = detail[:1024]
+                        status_truncated = True
+                    status_document["status_truncated"] = status_truncated
+                    if status_document != previous_status:
+                        frames.append((status_document, "log.page_status"))
+                        previous_status = status_document
                 # The id a reconnecting reader hands back as ``Last-Event-ID``.
                 # This route reads that header and resumes from it, so without
                 # writing it the resume was half a protocol: every drop replayed

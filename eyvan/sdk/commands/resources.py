@@ -41,6 +41,7 @@ class Resource:
         summary: One line, shown when the vocabulary is listed.
         filters: Query parameters this kind accepts through ``--filter``.
         aliases: Other spellings accepted for ``name``.
+        org_scoped: Whether reading requires only an org, not a project.
     """
 
     name: str
@@ -50,6 +51,7 @@ class Resource:
     summary: str
     filters: tuple[str, ...] = ()
     aliases: tuple[str, ...] = field(default_factory=tuple)
+    org_scoped: bool = False
 
 
 #: Every resource this surface reads. Each entry is a route that already exists
@@ -114,7 +116,9 @@ RESOURCES: tuple[Resource, ...] = (
         get_path=None,
         scoped=False,
         summary="declared limits per scope",
+        filters=("project_id", "principal_id"),
         aliases=("quota",),
+        org_scoped=True,
     ),
     Resource(
         name="budgets",
@@ -123,6 +127,7 @@ RESOURCES: tuple[Resource, ...] = (
         scoped=False,
         summary="declared spend ceilings per scope",
         aliases=("budget",),
+        org_scoped=True,
     ),
 )
 
@@ -171,10 +176,7 @@ LISTING_COLUMNS: dict[str, tuple[Column, ...]] = {
         Column("target", at("entity_id")),
         Column("at", at("recorded_at")),
     ),
-    "fleets": (
-        Column("name", at("name")),
-        Column("zone", at("zone")),
-    ),
+    "fleets": (Column("name", at("name")),),
 }
 
 
@@ -213,6 +215,12 @@ def _params(
         scope = session.workload_scope(org_id=org_id, project_id=project_id)
         params["org_id"] = scope.org_id
         params["project_id"] = scope.project_id
+    elif resource.org_scoped:
+        params["org_id"] = session.workload_scope(org_id=org_id).org_id
+        # Organization listings must not implicitly narrow to the session's
+        # project. Only routes with an optional project query accept --project.
+        if project_id is not None and "project_id" in resource.filters:
+            params["project_id"] = project_id
     for key, value in filters.items():
         if key not in resource.filters:
             accepted = ", ".join(resource.filters) if resource.filters else "none"
@@ -274,6 +282,10 @@ def list_resource(
     if as_json or columns is None or not isinstance(payload, list):
         JsonRenderer().emit(payload)
         return
+    if resource.name == "fleets":
+        # The submit-fleet endpoint returns names, not fleet-status objects.
+        # Normalize only the human view; --json retains the original list[str].
+        payload = [{"name": item} if isinstance(item, str) else item for item in payload]
     for line in render(payload, columns, empty=f"No {resource.name} match." if filters else f"No {resource.name}."):
         click.echo(line)
 

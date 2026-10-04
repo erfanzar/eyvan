@@ -379,13 +379,15 @@ def test_every_capability_authenticated_transfer_is_audited(tmp_path) -> None:
 
 
 def test_a_refused_transfer_token_is_audited_too(tmp_path) -> None:
-    """A rejected token is the signal that one leaked or outlived its attempt.
+    """A rejection is audited in the target workload's durable tenant scope.
 
-    Recording only successes makes exactly the interesting case invisible.
+    The unauthenticated request cannot supply its own audit-ledger scope, so
+    the fixture must contain the workload whose transfer is being refused.
     """
 
     app = _app(tmp_path)
     client = TestClient(app)
+    _register_result_target(app, "wl-audit", result_uri("call-denial-audit"))
     payload = b"serialized callable"
     digest = hashlib.sha256(payload).hexdigest()
     client.put(

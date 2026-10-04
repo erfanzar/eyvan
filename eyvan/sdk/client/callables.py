@@ -154,7 +154,7 @@ class _CallableProgressRenderer:
         if terminal:
             # Settlement archives remaining output before the terminal state is
             # visible; drain first so the job's last lines precede its verdict.
-            self._drain_output(workload.id)
+            self._drain_output(workload.id, terminal=True)
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
             self._emit(self._terminal_workload_update(workload))
@@ -200,17 +200,25 @@ class _CallableProgressRenderer:
         if update.diagnostic is not None:
             self._last_diagnostic = update.diagnostic
 
-    def _drain_output(self, workload_id: str) -> None:
-        """Print every produced output line this renderer has not shown yet.
+    def _drain_output(self, workload_id: str, *, terminal: bool = False) -> None:
+        """Print produced output this renderer has not shown yet.
 
         The control-plane log page is the same surface ``eyvan workload logs
         --follow`` reads; polling it here makes a blocking callable wait tail
-        its job like ``ray job submit`` does. Reading is best-effort: an
-        unreachable plane or an attempt that is still archiving must never
-        break the wait that owns it.
+        its job like ``ray job submit`` does. Live polls are bounded, but a
+        terminal observation has no later poll to recover an unread tail.
+        Reading is best-effort: an unreachable plane or an attempt that is
+        still archiving must never break the wait that owns it.
         """
 
-        for _page in range(16):
+        pages = 0
+        seen_cursors: set[str] = set()
+        attempt_restarted = False
+        while terminal or pages < 16:
+            if self._log_cursor in seen_cursors:
+                return
+            seen_cursors.add(self._log_cursor)
+            pages += 1
             try:
                 payload = self._client.workload_log_page(workload_id, after=self._log_cursor, limit=200)
             except (EyvanUnavailableError, EyvanHTTPError):
@@ -219,10 +227,17 @@ class _CallableProgressRenderer:
             if window.attempt_changed:
                 # A preemption retry started a new attempt; its output begins
                 # at a fresh cursor and the retired attempt's pages are gone.
+                # Permit one restart, not an endless sequence of reset pages.
+                if attempt_restarted:
+                    return
+                attempt_restarted = True
+                seen_cursors.clear()
                 self._log_cursor = ""
                 continue
             self._emit_page(window)
-            if not window.cursor or not window.lines:
+            # Display filtering can hide every line on an advancing raw page.
+            # Only cursor exhaustion/non-progress proves this drain is done.
+            if not window.cursor or window.cursor == self._log_cursor:
                 self._log_cursor = window.cursor or self._log_cursor
                 return
             self._log_cursor = window.cursor

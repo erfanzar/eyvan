@@ -10,11 +10,22 @@ from dataclasses import replace
 import httpx
 import pytest
 from starlette.testclient import TestClient
-from test_group_lease_lifecycle import repository as repository
+from test_group_lease_lifecycle import repository as _repository_fixture
 
 from eyvan._internal.platform import EyvanPlatformConfig
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.server.api.app import create_app
+
+repository = _repository_fixture
+
+
+@pytest.fixture(autouse=True)
+def _isolated_api_home(monkeypatch, tmp_path) -> None:
+    """Keep API startup out of the operator's artifact and credential state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "managed-artifacts"))
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -32,7 +43,7 @@ async def test_failed_authentication_is_audited_without_claimed_tenant_or_creden
         dev_auth_enabled=False,
         oidc_issuer=None,
         bootstrap_token="fixture-admin",
-        artifact_store_uri=str(tmp_path),
+        artifact_store_uri=str(tmp_path / "managed-artifacts"),
         artifact_token_key="k" * 32,
     )
     app = create_app(settings=settings, repository=repository, platform_config=EyvanPlatformConfig())
@@ -66,7 +77,7 @@ def test_an_audit_store_failure_never_changes_an_authentication_denial(monkeypat
             auth_audit_enabled=True,
             bootstrap_token="fixture-admin",
             artifact_token_key="k" * 32,
-            artifact_store_uri=str(tmp_path),
+            artifact_store_uri=str(tmp_path / "managed-artifacts"),
         ),
         platform_config=EyvanPlatformConfig(),
     )

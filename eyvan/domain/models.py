@@ -653,9 +653,11 @@ class CapacityCell:
         uncharged, so a partial vector still yields a deterministic cost
         estimate -- but not a complete one, which the scheduler surfaces as
         ``cost_unknown`` so fully priced cells win cost tie-breaks. Declared
-        zeros count as covered; missing names do not (issue-register C10).
+        zeros count as covered; missing names do not (issue-register C10). A
+        zero-quantity entry in the *request* is skipped: a resource the
+        workload does not consume cannot make the cost unknown.
         """
-        return all(name in self.unit_prices for name in resources)
+        return all(name in self.unit_prices for name, quantity in resources.items() if quantity)
 
 
 @dataclass(frozen=True, slots=True)

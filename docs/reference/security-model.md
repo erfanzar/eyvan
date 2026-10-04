@@ -185,10 +185,15 @@ runtime configuration when deploying.
 
 ## 10. Known limitations and operator duties
 
-* The ordinary `uvicorn` control-plane, agent, and worker listeners do not add
-  TLS themselves. `MutualTlsMode` covers the agent/worker edges only. Put TLS
-  termination and network access controls in front of externally reachable
-  HTTP surfaces; keep default binds and development auth local.
+* The control-plane listener supports built-in TLS via `EYVAN_TLS_CERT_FILE`
+  and `EYVAN_TLS_KEY_FILE`, configured together. Separately, native agent/worker mTLS
+  uses the trust bundle, certificate, key, and rollout modes described in section 5;
+  these internal modes default to `off` and do not configure the external
+  control-plane listener. A network-bound control plane refuses plaintext HTTP
+  unless explicitly acknowledged with `EYVAN_INSECURE_PLAINTEXT_BIND=1` or
+  `eyvan-server --insecure-plaintext`, including behind external TLS termination.
+  External TLS termination and network access controls remain a deployment
+  alternative; protect any plaintext hop and keep development auth local.
 * Artifact capability transfer over plain HTTP is refused unless the operator
   explicitly enables `allow_insecure_artifact_http`. Enabling it exposes
   bearer-like capability tokens to the transport and is an operator risk, not
@@ -207,6 +212,8 @@ runtime configuration when deploying.
 ## Source index
 
 Primary implementation references: `eyvan/server/api/auth.py`,
+`eyvan/server/api/server_bind.py`, `eyvan/server/api/server_startup.py`,
+`eyvan/worker/agent/cli.py`, `eyvan/worker/runtime/native_worker.py`,
 `eyvan/records.py`, `eyvan/server/service/authz.py`,
 `eyvan/artifacts/_capability_tokens.py`, `eyvan/artifacts/managed.py`,
 `eyvan/secrets.py`, `eyvan/identity/mtls.py`, `eyvan/identity/rotation.py`,

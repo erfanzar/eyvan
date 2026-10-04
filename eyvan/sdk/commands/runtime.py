@@ -831,14 +831,23 @@ def _restart_native_runtime(
     control_plane = control_plane_supervisor.restart(endpoint, runtime_profile_path=profile_store.path)
     try:
         agent = LocalAgentSupervisor().restart(profile_store.path, profile)
-    except Exception as agent_error:
+    except BaseException as agent_error:
         try:
             control_plane_supervisor.stop_started(control_plane, runtime_profile_path=profile_store.path)
-        except LocalDaemonError as cleanup_error:
-            raise GcpRuntimeRestartError(
-                "Eyvan could not restart its local GCP cell agent and could not stop the newly restarted control "
-                f"plane: {cleanup_error}"
-            ) from agent_error
+        except BaseException as cleanup_error:
+            if isinstance(agent_error, Exception):
+                if isinstance(cleanup_error, LocalDaemonError):
+                    raise GcpRuntimeRestartError(
+                        "Eyvan could not restart its local GCP cell agent and could not stop the newly restarted "
+                        f"control plane: {cleanup_error}"
+                    ) from agent_error
+                raise
+            # Cancellation still belongs to the caller even if rollback fails.
+            # Keep its identity and disclose cleanup failure without masking it.
+            agent_error.add_note(
+                "Eyvan could not stop the newly restarted control plane during runtime interruption "
+                f"({type(cleanup_error).__name__})."
+            )
         raise
     return RuntimeRestartResult(
         trusted_callable_projects=replacement_trusted_callable_projects(),

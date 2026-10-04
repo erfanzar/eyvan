@@ -9,7 +9,7 @@ The dashboard used to run the whole OIDC flow in the browser: it stored the
 access token, the ID token and their expiry in ``sessionStorage``, where any
 cross-site script could read them, and sent the access token to the plane as a
 bearer header. This module is the replacement: the browser holds one
-``eyvan_session`` cookie — HttpOnly, Secure, SameSite=Lax, unreachable from
+``__Host-eyvan_session`` cookie — HttpOnly, Secure, SameSite=Lax, unreachable from
 JavaScript — and the tokens live only in this process. Sign-in is three server
 endpoints:
 
@@ -47,7 +47,7 @@ import threading
 import time
 import typing as tp
 from contextlib import asynccontextmanager
-from urllib.parse import SplitResult, urlencode, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
@@ -55,8 +55,12 @@ from fastapi.responses import RedirectResponse
 
 from eyvan.config import EyvanSettings
 
-SESSION_COOKIE = "eyvan_session"
-TRANSACTION_COOKIE = "eyvan_oidc_tx"
+# Browsers reject a sibling's parent-domain cookie under these names. Keep
+# Secure, no Domain and Path=/ on both issuance and deletion for __Host-.
+# Legacy unprefixed cookies are deliberately not accepted: existing browsers
+# must sign in again rather than retain a sibling-plantable authentication path.
+SESSION_COOKIE = "__Host-eyvan_session"
+TRANSACTION_COOKIE = "__Host-eyvan_oidc_tx"
 
 _CALLBACK_PATH = "/api/v1/dashboard/auth/callback"
 
@@ -354,7 +358,7 @@ def _transaction_cookie(token: str, max_age_s: int) -> dict[str, tp.Any]:
         "httponly": True,
         "secure": True,
         "samesite": "lax",
-        "path": _CALLBACK_PATH,
+        "path": "/",
     }
 
 
@@ -404,21 +408,27 @@ def register_dashboard_auth_routes(
             discovery = await _discover(issuer, client)
         token, state, nonce, verifier = store.begin_transaction()
         challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        query = urlencode(
-            {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": _redirect_uri(),
-                "scope": "openid profile email",
-                "audience": settings.oidc_audience,
-                "state": state,
-                "nonce": nonce,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-            }
-        )
+        parameters = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": _redirect_uri(),
+            "scope": "openid profile email",
+            "audience": settings.oidc_audience,
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        endpoint = urlsplit(discovery["authorization_endpoint"])
+        # Preserve provider-specific parameters (including repeated/blank ones),
+        # but never permit discovery to override or duplicate this transaction's
+        # OIDC parameters.
+        provider_parameters = [
+            (key, value) for key, value in parse_qsl(endpoint.query, keep_blank_values=True) if key not in parameters
+        ]
+        query = urlencode([*provider_parameters, *parameters.items()])
         response = RedirectResponse(
-            f"{discovery['authorization_endpoint']}?{query}",
+            endpoint._replace(query=query).geturl(),
             status_code=status.HTTP_307_TEMPORARY_REDIRECT,
         )
         response.set_cookie(**_transaction_cookie(token, store.transaction_ttl_s))
@@ -454,7 +464,10 @@ def register_dashboard_auth_routes(
                 else "sign-in failed at the identity provider; please try again"
             )
             response = RedirectResponse(f"/?{urlencode({'auth_error': detail})}")
-            response.delete_cookie(key=TRANSACTION_COOKIE, path=_CALLBACK_PATH)
+            # Match the set-time flags: browsers refuse a non-Secure
+            # Set-Cookie overwrite of a Secure cookie, so an asymmetric
+            # deletion would leave the transaction cookie in place.
+            response.delete_cookie(key=TRANSACTION_COOKIE, path="/", httponly=True, secure=True, samesite="lax")
             return response
 
         issuer, client_id = _require_oidc()
@@ -528,7 +541,7 @@ def register_dashboard_auth_routes(
         )
         response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
         response.set_cookie(**_session_cookie(session_token, store.session_ttl_s))
-        response.delete_cookie(key=TRANSACTION_COOKIE, path=_CALLBACK_PATH)
+        response.delete_cookie(key=TRANSACTION_COOKIE, path="/", httponly=True, secure=True, samesite="lax")
         return response
 
     @app.post("/api/v1/dashboard/auth/logout", include_in_schema=False)
@@ -546,7 +559,9 @@ def register_dashboard_auth_routes(
         if token:
             store.drop(token)
         response = Response(status_code=status.HTTP_204_NO_CONTENT)
-        response.delete_cookie(key=SESSION_COOKIE, path="/")
+        # Deletion flags must mirror the session cookie's Secure/HttpOnly
+        # attributes, or a browser may refuse to apply the deletion.
+        response.delete_cookie(key=SESSION_COOKIE, path="/", httponly=True, secure=True, samesite="lax")
         return response
 
 

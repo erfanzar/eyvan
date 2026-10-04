@@ -36,6 +36,15 @@ from eyvan.worker.agent.models import AgentCapabilities
 from eyvan.worker.agent.service import InvalidWorkloadRequestError
 
 
+@pytest.fixture(autouse=True)
+def _isolated_api_home(monkeypatch, tmp_path) -> None:
+    """Keep API startup out of the operator's artifact and credential state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "managed-artifacts"))
+
+
 def _executor(tmp_path, runner):
     from eyvan.worker.runtime.systemd_transient import SystemdTransientServiceExecutor
 
@@ -401,9 +410,11 @@ async def _gang(agent):
         LeaseState,
         ResourceGang,
         ResourceVector,
+        WorkloadAttemptTopology,
         WorkloadDefinition,
         WorkloadRecord,
         WorkloadState,
+        WorkloadTopologyCell,
         utcnow,
     )
     from eyvan.server.controller import EyvanController
@@ -458,6 +469,22 @@ async def _gang(agent):
                 created_by="alice",
             )
         )
+        await transaction.put_workload_topology(
+            WorkloadAttemptTopology.freeze(
+                workload_id="wl-gang",
+                attempt=1,
+                generation=1,
+                cells=[
+                    WorkloadTopologyCell(
+                        cell_id=cell_id,
+                        generation=1,
+                        runtime_process_count=1,
+                        global_rank_offset=0,
+                    )
+                    for cell_id in ("cell-a", "cell-b")
+                ],
+            )
+        )
     return controller
 
 
@@ -506,10 +533,12 @@ async def test_a_rank_that_does_not_exist_is_refused() -> None:
 
     from eyvan.server.service.errors import ConflictError
 
-    controller = await _gang(_RankAgent())
+    agent = _RankAgent()
+    controller = await _gang(agent)
 
-    with pytest.raises(ConflictError, match="no rank 7"):
+    with pytest.raises(ConflictError, match="no frozen rank 7"):
         await controller.workload_exec("wl-gang", ["true"], rank=7)
+    assert agent.asked == []
 
 
 async def test_exec_against_a_workload_with_no_execution_is_refused() -> None:

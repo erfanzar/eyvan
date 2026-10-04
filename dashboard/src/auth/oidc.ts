@@ -234,9 +234,32 @@ export function isOidcConfigured(): boolean {
 
 let sessionNotice: string | undefined;
 
+/**
+ * Monotonic counter of auth-surface changes in this tab.
+ *
+ * Every place that clears or retires identity -- a rejected session, a
+ * refused local credential, a sign-out -- bumps this and fires
+ * {@link AUTH_CHANGED_EVENT}. The gate captures the value before an async
+ * auth probe starts and discards the probe's result if the value moved,
+ * because a probe that began under a live session can resolve after that
+ * session was revoked, and its answer then describes a session that no
+ * longer exists.
+ */
+let authChangeCounter = 0;
+
+/** The current auth revision; compare before applying async auth results. */
+export function authRevision(): number {
+  return authChangeCounter;
+}
+
+function emitAuthChanged(): void {
+  authChangeCounter += 1;
+  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+}
+
 function endSession(notice: string): void {
   sessionNotice = notice;
-  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  emitAuthChanged();
 }
 
 export function consumeSessionNotice(): string | undefined {
@@ -278,7 +301,7 @@ export function invalidateRefusedLocalCredential(refusalDetail: string): boolean
   const store = storage();
   if (!store?.getItem(LOCAL_CREDENTIAL_KEY)) return false;
   store.removeItem(LOCAL_CREDENTIAL_KEY);
-  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  emitAuthChanged();
   return true;
 }
 
@@ -442,6 +465,6 @@ export async function logout(fetchImpl: typeof fetch = fetch): Promise<void> {
     }
     endSession("You have been signed out.");
   }
-  if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  emitAuthChanged();
   globalThis.location.assign("/");
 }

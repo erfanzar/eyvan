@@ -621,8 +621,9 @@ async def test_an_eviction_that_misses_one_host_does_not_delete_the_row(tmp_path
     stored = (await _stages(repository))[0]
 
     assert [victim.asset for victim in plans[0].victims] == [_ASSET]
-    assert stored.state is CellStageState.UNKNOWN
+    assert stored.state is CellStageState.EVICTING
     assert stored.reserved_bytes == len(payload)
+    assert charged_bytes([stored], cell=_cell()) == len(payload)
     assert "3 of 4 hosts confirmed removal" in (stored.detail or "")
     # The bytes really are still on the host that did not answer.
     assert [host.staged_files() for host in hosts] == [[], [], [], [payload]]
@@ -649,13 +650,10 @@ async def test_an_eviction_every_host_confirms_deletes_the_row(tmp_path: Path) -
 
 
 async def test_an_eviction_that_can_never_finish_stops_being_retried(tmp_path: Path) -> None:
-    """A host that never comes back must not hold an eviction open forever.
+    """An unresolved remote delete stays excluded and charged, without retries.
 
-    An unproven eviction is retried while its attempt budget lasts and is then
-    blocked, which is where the control plane stops taking automatic action. The
-    bound matters more here than anywhere: a row stuck mid-eviction is planned
-    again on every pass, and every pass is a round trip to a machine that is not
-    going to answer.
+    A lost response does not prove a delete stopped. Neither another eviction
+    nor a new fetch may supersede that reservation while its outcome is unknown.
     """
 
     payload = b"stranded" * 128
@@ -672,26 +670,26 @@ async def test_an_eviction_that_can_never_finish_stops_being_retried(tmp_path: P
     states: list[CellStageState] = []
     victims: list[int] = []
     shortfalls: list[int] = []
+    host_call_counts: list[tuple[int, ...]] = []
     for minute in range(5):
         plans = await shrunk.evict_cell_stages_once(dry_run=False, now=NOW + timedelta(minutes=minute))
         victims.append(len(plans[0].victims))
         shortfalls.append(plans[0].shortfall_bytes)
         states.append((await _stages(repository))[0].state)
+        host_call_counts.append(tuple(len(host.calls) for host in hosts))
+    assert host_call_counts == [host_call_counts[0]] * 5
 
-    # Three attempts end without an answer, and the fourth pass has stopped
-    # asking -- the row is still charged, and it is no longer a victim.
-    assert states == [
-        CellStageState.UNKNOWN,
-        CellStageState.UNKNOWN,
-        CellStageState.BLOCKED,
-        CellStageState.BLOCKED,
-        CellStageState.BLOCKED,
-    ]
-    assert victims == [1, 1, 1, 0, 0]
-    assert (await _stages(repository))[0].reserved_bytes == len(payload)
+    # Only the first pass may ask hosts: an unresolved delete remains protected
+    # on every following pass, without pretending it finished or was cancelled.
+    assert states == [CellStageState.EVICTING] * 5
+    assert victims == [1, 0, 0, 0, 0]
+    stored = (await _stages(repository))[0]
+    assert stored.reserved_bytes == len(payload)
+    assert charged_bytes([stored], cell=_cell()) == len(payload)
+    assert [host.staged_files() for host in hosts] == [[], [payload]]
     # The cell stays over budget and says so, rather than reclaiming itself by
     # deleting a row whose bytes are still on a machine that will not answer.
-    assert shortfalls[-1] > 0
+    assert shortfalls[1:] == [len(payload) - 8] * 4
 
 
 async def test_the_shipped_default_stages_nothing_and_contacts_no_host(tmp_path: Path) -> None:
@@ -750,8 +748,9 @@ async def test_a_host_that_loses_its_staging_route_mid_eviction_leaves_the_row_u
     await shrunk.evict_cell_stages_once(dry_run=False, now=NOW + timedelta(hours=1))
     stored = (await _stages(repository))[0]
 
-    assert stored.state is CellStageState.UNKNOWN
+    assert stored.state is CellStageState.EVICTING
     assert stored.reserved_bytes == len(payload)
+    assert charged_bytes([stored], cell=_cell()) == len(payload)
     assert "has no staging executor" in (stored.detail or "")
     # The two stop shapes stay distinct: here one host of three never answered,
     # so the row may say hosts were not asked -- which is exactly what the

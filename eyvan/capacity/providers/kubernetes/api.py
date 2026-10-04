@@ -322,6 +322,15 @@ def capacity_state(status: JobStatus, *, provisioning: bool = True) -> tuple[Cap
     return CapacityStatus.PROVISIONING, f"{status.ready}/{status.parallelism or '?'} workers ready"
 
 
+class KubernetesCreateRejected(CapacityProviderError):
+    """A completed POST response proves that Kubernetes refused the create.
+
+    Generic configuration and transport errors do not establish this fact. Only
+    the explicitly recognized authorization/validation refusals from ``create``
+    use this signal; other errors retain indeterminate completion semantics.
+    """
+
+
 class KubernetesApi:
     """Thin request wrapper over the in-cluster Kubernetes API."""
 
@@ -412,10 +421,12 @@ class KubernetesApi:
         if response.status_code == 404:
             return ApiObservation(payload=None, readable=True)
         if response.status_code >= 400:
+            # Upstream error bodies can echo Secret values. Keep only the HTTP
+            # status in operator-visible observations, never arbitrary body text.
             return ApiObservation(
                 payload=None,
                 readable=False,
-                reason=f"HTTP {response.status_code}: {response.text[:200]}",
+                reason=f"HTTP {response.status_code}: Kubernetes API request failed",
             )
         try:
             payload = response.json()
@@ -487,7 +498,15 @@ class KubernetesApi:
         response = self.request("POST", path, json=manifest)
         if response.status_code == 409:
             return False
-        self._decode(response)
+        try:
+            self._decode(response)
+        except CapacityProviderError as exc:
+            # A completed authorization/validation refusal cannot store this
+            # object later. Do not infer that from generic nonretryable errors,
+            # timeouts, throttling or server failures, whose outcome is unknown.
+            if response.status_code not in {403, 422}:
+                raise
+            raise KubernetesCreateRejected(str(exc), code=exc.code, retryable=exc.retryable) from exc
         return True
 
     def delete(
@@ -525,8 +544,10 @@ class KubernetesApi:
     def _decode(response: httpx.Response) -> object:
         if response.status_code >= 400:
             retryable = response.status_code >= 500 or response.status_code == 429
+            # Admission webhooks may echo submitted credentials in any error
+            # field. Body truncation or selecting a reason is not redaction.
             raise CapacityProviderError(
-                f"Kubernetes API returned {response.status_code}: {response.text[:400]}",
+                f"Kubernetes API returned HTTP {response.status_code}",
                 code=(
                     CapacityProviderFailureCode.PROVIDER_UNAVAILABLE
                     if retryable
@@ -549,6 +570,7 @@ __all__ = (
     "ApiObservation",
     "JobStatus",
     "KubernetesApi",
+    "KubernetesCreateRejected",
     "capacity_state",
     "interpret_job",
     "local_queue_cluster_queue",

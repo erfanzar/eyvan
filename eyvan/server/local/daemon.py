@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import ipaddress
 import json
 import os
-import shlex
 import signal
 import stat
 import subprocess
@@ -609,27 +609,79 @@ def process_is_alive(pid: int) -> bool:
     return not completed.stdout.strip().startswith(("Z", "z"))
 
 
-def _read_process_arguments(pid: int) -> tuple[str, ...] | None:
-    """Read one process command without invoking a shell or exposing it to users."""
+def _parse_darwin_process_arguments(data: bytes) -> tuple[str, ...] | None:
+    """Decode KERN_PROCARGS2's argc, executable, padding, and NUL-delimited argv."""
+
+    integer_size = ctypes.sizeof(ctypes.c_int)
+    if len(data) <= integer_size:
+        return None
+    argc = int.from_bytes(data[:integer_size], sys.byteorder, signed=True)
+    if argc <= 0 or argc > len(data):
+        return None
+    executable_end = data.find(b"\0", integer_size)
+    if executable_end < 0:
+        return None
+    offset = executable_end + 1
+    while offset < len(data) and data[offset] == 0:
+        offset += 1
+    arguments: list[str] = []
+    for _ in range(argc):
+        end = data.find(b"\0", offset)
+        if end < 0:
+            return None
+        arguments.append(os.fsdecode(data[offset:end]))
+        offset = end + 1
+    return tuple(arguments)
+
+
+def _read_darwin_process_arguments(pid: int) -> tuple[str, ...] | None:
+    """Read argv through macOS sysctl, not ps's ambiguous display string."""
 
     try:
-        completed = subprocess.run(
-            ("ps", "-ww", "-p", str(pid), "-o", "command="),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        sysctl = ctypes.CDLL(None, use_errno=True).sysctl
+        sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctl.restype = ctypes.c_int
+        # CTL_KERN, KERN_ARGMAX supplies the buffer bound for KERN_PROCARGS2.
+        argmax = ctypes.c_int()
+        size = ctypes.c_size_t(ctypes.sizeof(argmax))
+        if sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+            return None
+        if argmax.value <= 0:
+            return None
+        buffer = ctypes.create_string_buffer(argmax.value)
+        size = ctypes.c_size_t(len(buffer))
+        # CTL_KERN, KERN_PROCARGS2, pid returns argc followed by argv and env.
+        if sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        return _parse_darwin_process_arguments(buffer.raw[: size.value])
+    except (AttributeError, OSError, ValueError):
         return None
-    if completed.returncode != 0:
+
+
+def _read_process_arguments(pid: int) -> tuple[str, ...] | None:
+    """Read true process argv; refuse ownership when the OS cannot supply it."""
+
+    if pid <= 0:
         return None
-    command = completed.stdout.strip()
-    if not command:
-        return None
-    try:
-        return tuple(shlex.split(command))
-    except ValueError:
-        return None
+    if sys.platform == "darwin":
+        return _read_darwin_process_arguments(pid)
+    if sys.platform.startswith("linux"):
+        try:
+            data = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        if not data or not data.endswith(b"\0"):
+            return None
+        return tuple(os.fsdecode(argument) for argument in data[:-1].split(b"\0"))
+    # Never recover argument boundaries by interpreting a display as a shell.
+    return None
 
 
 def _terminate_process(pid: int) -> None:
@@ -882,42 +934,46 @@ class LocalDaemonSupervisor:
             #
             # Losing the race is not an error. The other process is a control
             # plane at the endpoint this one wanted, so stop and adopt it.
-            claimed = read_owner_only_record(record_path)
-            if claimed is not None and claimed.pid != process.pid and process_is_alive(claimed.pid):
-                stop_owned_process(process)
-                if claimed.endpoint == configured_endpoint and claimed.runtime_profile_path == profile_identifier:
-                    # Adopted on the record, not on a fresh health probe. The
-                    # record is owner-only, names this endpoint and this runtime
-                    # profile, and its PID is running: that is ownership, and it
-                    # is the same evidence the live-PID branch of
-                    # ``_existing_result`` accepts.
-                    #
-                    # Re-probing here made the outcome depend on whether the
-                    # winner answered within one timeout while it was still
-                    # finishing its own startup -- and when it did not, this
-                    # raised at a plane that was healthy seconds later. A
-                    # supervisor that has just lost a race must not also have to
-                    # win a race with the winner's boot.
-                    return LocalDaemonResult(
-                        endpoint=configured_endpoint,
-                        state=LocalDaemonState.REUSED,
-                        pid=claimed.pid,
-                        log_path=log_path,
-                    )
-                raise LocalDaemonStartupError(
-                    configured_endpoint,
-                    log_path,
-                    f"another Eyvan control plane claimed {configured_endpoint.url} while this one was "
-                    f"starting, under runtime profile {claimed.runtime_profile_path}",
-                )
+            read_owner_only_record(record_path)
             try:
                 # A record already published by this child is authoritative,
                 # including its independently computed source digest. The parent
                 # cannot vouch for the child's build from its own cached identity.
-                # Re-read under the lock the child publishes under: ``claimed`` is
-                # an earlier snapshot the child may have overtaken since.
+                # Re-read under the lock the child publishes under: the earlier
+                # record validation may have been overtaken by the child since.
                 with record_publication_lock(record_path):
                     current = read_owner_only_record(record_path)
+                    if (
+                        current is not None
+                        and current.pid != process.pid
+                        and self.process_liveness(current.pid)
+                        and _matches_local_daemon_process(
+                            self.process_argument_reader(current.pid),
+                            target,
+                            runtime_profile_path=current.runtime_profile_path,
+                            require_local_daemon=True,
+                        )
+                    ):
+                        # A live PID alone may be a recycled unrelated process.
+                        # Only a verified daemon can win this race. It need not
+                        # answer another health probe while it is still booting.
+                        stop_owned_process(process)
+                        if (
+                            current.endpoint == configured_endpoint
+                            and current.runtime_profile_path == profile_identifier
+                        ):
+                            return LocalDaemonResult(
+                                endpoint=configured_endpoint,
+                                state=LocalDaemonState.REUSED,
+                                pid=current.pid,
+                                log_path=log_path,
+                            )
+                        raise LocalDaemonStartupError(
+                            configured_endpoint,
+                            log_path,
+                            f"another Eyvan control plane claimed {configured_endpoint.url} while this one was "
+                            f"starting, under runtime profile {current.runtime_profile_path}",
+                        )
                     if current is None or current.pid != process.pid:
                         write_owner_only_record(
                             record_path,

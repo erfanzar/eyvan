@@ -20,8 +20,19 @@ this page is the cross-reference. For background read
 |---|---|---|
 | `cells` shows `unavailable` and recreate loops | usually the plane cannot reach its agent (401 loop) or the provider resource is in `PROVIDER_ERROR` | read both logs; restart the plane **with** `EYVAN_AGENT_SHARED_SECRET` from the runtime profile |
 | cell `draining` for a long time | provider deletion pending or wedged | `eyvan cell-drain` / check the provider console; `eyvan cells` shows the stage |
-| cells exist that nothing claims | leftovers after a crash | the controller reaps on reconcile passes; a restarted plane reconciles from durable state first |
+| known control-plane cells remain after a crash | durable records still describe capacity this plane manages | restart with the intended durable state configuration; the controller reconciles those records and pool reconciliation can delete draining cells once their leases are gone |
+| agent/provider cells exist that this plane does not claim | durable agent inventory outlived a lost or replaced control-plane database, or belongs to another plane | inspect the read-only `eyvan capacity orphans --json` report; unknown inventory is not automatically adopted or deleted |
 | capacity billing and no tenant is charged | a leased cell whose workload is gone | cancel the workload, drain the fleet config (`eyvan down <config> -y`) |
+
+The orphan report only scans endpoints from known, nondeleted cells. Check
+`scanned_endpoints` and `unreachable`: an empty database can produce an empty
+orphan list without scanning any agent, and an unreachable agent has not proved
+that it holds no capacity. Recover the intended durable state configuration or
+inspect the relevant agent's inventory directly; an empty report is not proof of
+provider absence. Agents may be shared by multiple control planes. Establish
+ownership and explicitly authorize cleanup before releasing any agent/provider
+record or resource; do not delete potentially foreign capacity or wait for an
+automatic orphan-reap pass.
 
 ## The plane and the agent
 

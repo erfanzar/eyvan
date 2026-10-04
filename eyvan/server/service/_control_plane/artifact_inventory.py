@@ -356,6 +356,13 @@ class ArtifactInventoryMixin:
         """
 
         self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
+        if expires_at is not None and expires_at.utcoffset() is None:
+            raise InputError("artifact hold expiry must include a timezone")
+        if expires_at is not None and expires_at <= utcnow():
+            # A hold whose expiry is already past protects nothing: the
+            # collector could claim the artifact immediately, while the audit
+            # log claimed a human had said no.
+            raise InputError("artifact hold expiry must be in the future")
         async with self.repository.transaction() as tx:
             record = await tx.get_managed_artifact(org_id, project_id, uri)
             if record is None:

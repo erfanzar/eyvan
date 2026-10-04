@@ -27,6 +27,7 @@ the one thing this must not be.
 
 from __future__ import annotations
 
+import shlex
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -59,6 +60,9 @@ class PlaneTarget:
         reachable: Whether something answered. ``False`` is never rendered as
             absence: a stopped head is a head, and hiding it is how somebody
             creates a second one beside it.
+        project: GCP project queried during discovery, not a gcloud default.
+        instance: Discovered VM name, independent of the display label.
+        zone: Discovered VM zone, used to scope recovery commands.
     """
 
     kind: str
@@ -67,6 +71,9 @@ class PlaneTarget:
     url: str | None = None
     fleet: str | None = None
     reachable: bool = False
+    project: str | None = None
+    instance: str | None = None
+    zone: str | None = None
 
 
 @dataclass
@@ -85,6 +92,7 @@ def plan_targets(
     *,
     local_reachable: bool,
     local_url: str = LOCAL_URL,
+    project: str | None = None,
 ) -> list[PlaneTarget]:
     """Turn what was found into the choices offered, in the order they matter.
 
@@ -106,6 +114,9 @@ def plan_targets(
             url=head.url,
             fleet=head.fleet,
             reachable=head.url is not None,
+            project=project,
+            instance=head.instance,
+            zone=head.zone,
         )
         for head in running
     ]
@@ -128,6 +139,9 @@ def plan_targets(
             detail=f"{head.zone} · {head.status.lower()}, start it before connecting",
             fleet=head.fleet,
             reachable=False,
+            project=project,
+            instance=head.instance,
+            zone=head.zone,
         )
         for head in stopped
     )
@@ -174,14 +188,13 @@ def python_snippet(url: str, fleet: str | None, accelerator: str = "v5p-8") -> s
     Python" and a file somebody can run is where a first session usually ends,
     and it is four lines wide.
 
-    ``init`` rather than ``os.environ["EYVAN_URL"]``: setting the environment
-    from inside the process that reads it is a detour, and the earlier version
-    of this snippet taught it even when the URL it set was already the default.
-    A local plane therefore gets a bare ``eyvan.init()``, and only a real head
-    is named -- so the argument in the snippet is always one that matters.
+    ``init`` rather than ``os.environ["EYVAN_URL"]``: pin the selected endpoint
+    without changing the user's environment. Even a local plane needs an
+    explicit address, since environment and saved-context defaults can name a
+    different plane.
     """
 
-    address = "" if url == LOCAL_URL else f'"{url}"'
+    address = f'"{url}"'
     arguments = ", ".join(part for part in (address, f'fleet="{fleet}"' if fleet else "") if part)
     return (
         f"import eyvan\n"
@@ -234,6 +247,7 @@ def discover(
         outcome.heads,
         local_reachable=outcome.local_reachable,
         local_url=local_url,
+        project=outcome.project,
     )
     return outcome
 
@@ -253,9 +267,26 @@ def _next_steps(target: PlaneTarget) -> list[tuple[str, str]]:
             ("eyvan start", "come back here; it will be listed"),
         ]
     if not target.reachable:
+        if not (target.project and target.instance and target.zone):
+            return [("eyvan start", "rediscover the head's project, instance, and zone before starting it")]
         return [
-            (f"gcloud compute instances start {target.label.split('—')[-1].strip()}", "start the head that exists"),
-            ("eyvan start", "connect once it is running"),
+            (
+                shlex.join(
+                    [
+                        "gcloud",
+                        "compute",
+                        "instances",
+                        "start",
+                        target.instance,
+                        "--project",
+                        target.project,
+                        "--zone",
+                        target.zone,
+                    ]
+                ),
+                "start the head that exists",
+            ),
+            (shlex.join(["eyvan", "start", "--project", target.project]), "connect once it is running"),
         ]
     fleet = target.fleet or "FLEET"
     return [

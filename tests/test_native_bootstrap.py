@@ -157,6 +157,9 @@ def test_compute_bootstrap_writes_the_declarative_runtime_environment_for_worklo
 
     assert "/etc/eyvan-native/workload-runtime.json" in script
     assert "--runtime-env-file /etc/eyvan-native/workload-runtime.json" in script
+    # The file must be created private: the redirect itself runs under a
+    # private umask, not only the chmod line that follows it.
+    assert "(umask 077; printf" in script
     assert script.index("workload-runtime.json") < script.index("eyvan.worker.runtime.native_worker --host 0.0.0.0")
 
 
@@ -179,7 +182,7 @@ def test_compute_bootstrap_writes_a_typed_oci_runtime_for_the_native_worker() ->
     )
 
     payload_line = next(line for line in script.splitlines() if "container-runtime.json" in line and "base64" in line)
-    encoded_payload = shlex.split(payload_line)[2]
+    encoded_payload = max(shlex.split(payload_line), key=len)
     payload = json.loads(base64.b64decode(encoded_payload))
 
     assert payload == {
@@ -187,6 +190,7 @@ def test_compute_bootstrap_writes_a_typed_oci_runtime_for_the_native_worker() ->
         "container": container.model_dump(mode="json"),
     }
     assert "--container-runtime-file /etc/eyvan-native/container-runtime.json" in script
+    assert "(umask 077; printf" in script
     assert "docker version >/dev/null 2>&1" in script
     assert script.index("container-runtime.json") < script.index("eyvan.worker.runtime.native_worker --host 0.0.0.0")
 

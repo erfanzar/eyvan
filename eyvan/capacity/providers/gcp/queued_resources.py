@@ -606,10 +606,10 @@ class GcloudTpuProvider:
             raise GcloudError((result.stderr or result.stdout).strip() or f"could not describe TPU node {node_id}")
         return decode_gcloud_object(result.stdout, resource=f"TPU node {node_id!r}")
 
-    def create(self, spec: QueuedResourceSpec, *, qr_id: str) -> QueuedResource:
+    def create(self, spec: QueuedResourceSpec, *, qr_id: str, recorded_qr_id: str | None = None) -> QueuedResource:
         existing = self.describe_qr(qr_id, project=spec.project, zone=spec.zone)
         if existing is not None:
-            self._validate_qr(existing, spec)
+            self._validate_qr(existing, spec, recorded_qr_id=recorded_qr_id)
             return existing
         try:
             if spec.startup_script:
@@ -624,13 +624,13 @@ class GcloudTpuProvider:
             # same re-check a failed command gets before surfacing the failure.
             existing = self.describe_qr(qr_id, project=spec.project, zone=spec.zone)
             if existing is not None:
-                self._validate_qr(existing, spec)
+                self._validate_qr(existing, spec, recorded_qr_id=recorded_qr_id)
                 return existing
             raise
         if result.returncode != 0:
             existing = self.describe_qr(qr_id, project=spec.project, zone=spec.zone)
             if existing is not None:
-                self._validate_qr(existing, spec)
+                self._validate_qr(existing, spec, recorded_qr_id=recorded_qr_id)
                 return existing
             diagnostic = (result.stderr or result.stdout).strip() or f"could not create {qr_id}"
             if self._is_queue_admission_denied(diagnostic):
@@ -642,7 +642,7 @@ class GcloudTpuProvider:
         created = self.describe_qr(qr_id, project=spec.project, zone=spec.zone)
         if created is None:
             raise GcloudError(f"queued resource {qr_id!r} was not visible after creation")
-        self._validate_qr(created, spec)
+        self._validate_qr(created, spec, recorded_qr_id=recorded_qr_id)
         return created
 
     @staticmethod
@@ -961,6 +961,11 @@ class GcloudTpuProvider:
         if qr is not None:
             self._validate_qr(qr, spec, recorded_qr_id=record.qr_id)
         if qr is None:
+            # A previously observed allocation disappeared. Its credential may
+            # already have been exposed: let the driver's fenced replacement
+            # advance the provider generation and bootstrap before provisioning.
+            if record.state not in {CapacityStatus.UNOBSERVED, CapacityStatus.RECREATING}:
+                return ProviderObservation(CapacityStatus.NEEDS_RECREATE, "queued resource is absent")
             # A same-named singleton TPU VM without a queued resource is not
             # ours to adopt. Multi-slice node names are generated from the QR
             # prefix, so the QR ownership label is its only safe authority.
@@ -968,8 +973,13 @@ class GcloudTpuProvider:
                 node_id = spec.node_id or spec.name
                 if self.describe_node(node_id, project=record.project, zone=record.zone) is not None:
                     raise GcloudError(f"TPU node {node_id!r} exists without its owned queued resource")
-            qr = self.create(spec, qr_id=qr_id)
+            qr = self.create(spec, qr_id=qr_id, recorded_qr_id=record.qr_id)
             return self._queued_resource_observation(qr, created=True)
+        # Allocation lifecycle is authoritative even while its children still
+        # appear READY. Never publish endpoints from a terminating QR, and keep
+        # its provider failure diagnostic/classification for the replacement.
+        if qr.terminal:
+            return self._queued_resource_observation(qr)
         node_ids = qr.node_ids
         if not node_ids and spec.node_count == 1:
             node_ids = (spec.node_id or spec.name,)
@@ -978,7 +988,7 @@ class GcloudTpuProvider:
             node = self.describe_node(node_id, project=record.project, zone=record.zone)
             if node is None:
                 continue
-            self._validate_node(node, record, management_uid)
+            self._validate_node(node, record, management_uid, owned_qr_node=node_id in qr.node_ids)
             nodes.append(self._observe_node(node_id, node, record, endpoint_mode=endpoint_mode))
         if qr.state is GcpQueuedResourceState.ACTIVE and len(nodes) < spec.node_count:
             return ProviderObservation(
@@ -1117,13 +1127,25 @@ class GcloudTpuProvider:
         return ProviderObservation(CapacityStatus.UNAVAILABLE, f"{prefix}GCP reports queued resource {qr.state}")
 
     @staticmethod
-    def _validate_node(node: JsonObject, record: FleetCellRecord, management_uid: str) -> None:
-        labels = node.get("labels") or {}
-        metadata = node.get("metadata") or {}
-        owned = (is_json_object(labels) and labels.get("eyvan-uid") == management_uid) or (
-            is_json_object(metadata) and metadata.get("eyvan-uid") == management_uid
-        )
-        if not owned:
+    def _validate_node(
+        node: JsonObject, record: FleetCellRecord, management_uid: str, *, owned_qr_node: bool = False
+    ) -> None:
+        owned = False
+        for marks in (node.get("labels"), node.get("metadata")):
+            if marks is None:
+                continue
+            if not is_json_object(marks):
+                raise GcloudError(f"TPU node {record.name!r} is not owned by this Eyvan cell")
+            if "eyvan-uid" in marks:
+                if marks["eyvan-uid"] != management_uid:
+                    raise GcloudError(f"TPU node {record.name!r} is not owned by this Eyvan cell")
+                owned = True
+            if "eyvan-cell" in marks and marks["eyvan-cell"] != record.name.replace("_", "-").lower():
+                raise GcloudError(f"TPU node {record.name!r} is not owned by this Eyvan cell")
+        # An already validated QR can authorize only its explicit children.
+        # A same-named fallback node is not membership evidence. When provider
+        # marks are omitted, require the child's accelerator shape as well.
+        if not owned and not (owned_qr_node and node.get("acceleratorType") == record.accelerator_type):
             raise GcloudError(f"TPU node {record.name!r} is not owned by this Eyvan cell")
         accelerator_type = node.get("acceleratorType")
         if accelerator_type is not None and not isinstance(accelerator_type, str):

@@ -158,8 +158,13 @@ def _validate_document(value: JsonValue) -> JsonObject:
             f"unsupported Eyvan fleet-state version {value.get('version')!r}; expected {SCHEMA_VERSION}"
         )
     for field_name in ("cells", "cell_tombstones", "workload_fences"):
-        if not isinstance(value.get(field_name), dict):
+        entries = value.get(field_name)
+        if not isinstance(entries, dict):
             raise FleetStateSchemaError(f"Eyvan fleet-state field {field_name!r} must be an object")
+        # A present but unreadable entry is unknown, never missing capacity or
+        # unclaimed ownership. Reject before any read or mutation can skip it.
+        if any(not isinstance(entry, dict) for entry in entries.values()):
+            raise FleetStateSchemaError(f"Eyvan fleet-state field {field_name!r} entries must be objects")
     if value.get("lease") is not None and not isinstance(value.get("lease"), dict):
         raise FleetStateSchemaError("Eyvan fleet-state field 'lease' must be an object or null")
     return value
@@ -807,6 +812,14 @@ class FleetStateStore:
         remote_id: str,
         cell_id: str,
     ) -> JsonObject:
+        """Claim a single execution without discarding unresolved gang ownership.
+
+        Single submission cannot retire gang ranks. Refuse both a current gang
+        and an inherited gang predecessor, even for a newer generation, before
+        changing the fence. Recovery must use the gang submission path, which
+        preserves every member and positively verifies retirement quiescence.
+        """
+
         claimed: dict[str, JsonObject] = {}
 
         def update(document: JsonObject) -> None:
@@ -818,12 +831,14 @@ class FleetStateStore:
                     raise StaleFenceError(
                         f"generation {generation} is older than workload {workload_id!r} generation {current_generation}"
                     )
+                if current.get("kind") == "gang" or any(
+                    predecessor.get("kind") == "gang" for predecessor in _predecessors(current)
+                ):
+                    raise StaleFenceError(
+                        f"single-cell submission does not own gang workload {workload_id!r} "
+                        f"generation {current_generation}; use gang submission to retire its ranks"
+                    )
                 if generation == current_generation:
-                    if current.get("kind") == "gang":
-                        raise StaleFenceError(
-                            f"single-cell submission does not own gang workload {workload_id!r} "
-                            f"generation {current_generation}"
-                        )
                     if current.get("fencing_token") != fencing_token:
                         raise StaleFenceError(
                             f"fencing token does not own workload {workload_id!r} generation {current_generation}"

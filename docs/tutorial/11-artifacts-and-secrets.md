@@ -85,8 +85,11 @@ holds the rotation and mTLS machinery.
 
 - A callable may: use its leased hardware, read its inputs from the artifact store
   by digest, and write its result manifest.
-- It may not: name other tenants' artifacts (the scoped identity forbids it), hold
-  plane credentials, or outlive its lease silently — cells are reaped on the
-  fleet's idle timeout regardless of what the workload believes.
+- It may not: name other tenants' artifacts (the scoped identity forbids it) or
+  hold plane credentials. The fleet's idle timeout governs eligible unleased
+  surplus capacity, subject to demand, protection, and minimum-capacity policy;
+  it is not a workload runtime or cost deadline. Active lease expiry/quarantine
+  and fenced retirement are separate lifecycle controls. Use explicit workload
+  cancellation to request termination of a valid leased workload.
 - Old clients receive `426` on the scoped artifact API — the transition to scoped
   identity was forced, not silently widened.

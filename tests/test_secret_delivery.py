@@ -27,6 +27,7 @@ import time
 from datetime import timedelta
 
 import pytest
+from test_secret_dispatch_transactions import repository as _dispatch_repository_fixture
 
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken, sign_claims
 from eyvan.artifacts.secret_capability import (
@@ -44,6 +45,7 @@ from eyvan.worker.runtime.secret_materialization import (
 
 SECRET = b"k" * 32
 DISPATCH_FENCE = "dispatch_test_fence"
+dispatch_repository = _dispatch_repository_fixture
 
 
 def _signer(*, ttl_seconds: float = 3600, clock=time.time) -> SecretCapabilitySigner:
@@ -244,6 +246,48 @@ async def test_dispatch_records_which_mounts_were_granted(tmp_path) -> None:
     assert len(issued) == 1
     assert issued[0].payload["names"] == ["HF_TOKEN"]
     assert issued[0].payload["attempt"] == workload.attempt
+
+
+@pytest.mark.parametrize("dispatch_repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+async def test_accepted_but_unobserved_dispatch_keeps_its_secret_readable(dispatch_repository, tmp_path, gang):
+    """A lost response is not evidence that the admitted worker stopped.
+
+    No absence observation is invented: the worker still owns the accepted
+    execution while the outbox is FAILED and its delivery claim is released.
+    """
+    from test_secret_dispatch_transactions import _plane as dispatch_plane
+    from test_secret_dispatch_transactions import _seed_dispatch, _snapshot
+
+    from eyvan.records import LeaseState, OutboxState, WorkloadState
+    from eyvan.server.persistence.local import LocalJsonRepository
+
+    service, signer, agent, controller = await dispatch_plane(dispatch_repository, tmp_path, fail=True)
+    seeded, _leases, _command = await _seed_dispatch(dispatch_repository, gang=gang)
+    assert await controller.dispatch_outbox_once() == 1
+    workload, leases, commands, events = await _snapshot(dispatch_repository, seeded.id)
+    assert workload.state is WorkloadState.LEASED and workload.remote_id is None
+    assert workload.dispatch_reservation is not None
+    assert all(lease.state is LeaseState.PENDING for lease in leases)
+    dispatch = next(command for command in commands if command.topic == "workload.dispatch")
+    assert dispatch.state is OutboxState.FAILED
+    assert dispatch.claimed_by is None and dispatch.claimed_until is None
+    assert len(agent.executions) == len(agent.values) == 1
+    assert not any(event.action == "workload.dispatch_reservation_failed" for event in events)
+    if isinstance(dispatch_repository, LocalJsonRepository):
+        await dispatch_repository.close()
+        await dispatch_repository.open()
+    claims = signer.verify(agent.tokens[0], workload_id=seeded.id, org_id="acme", project_id="research")
+    assert claims.dispatch_fence == workload.dispatch_reservation.fence
+    assert await service.authorize_secret_mount(
+        org_id="acme",
+        project_id="research",
+        workload_id=seeded.id,
+        attempt=claims.attempt,
+        generation=claims.generation,
+        dispatch_fence=claims.dispatch_fence,
+        name=claims.name,
+    ) == ("file:///operator/secrets/hf-token", "file:///operator/secrets")
 
 
 # --------------------------------------------------------------------------- the cell
@@ -468,12 +512,6 @@ def test_the_systemd_launcher_writes_resolved_values_and_not_capabilities(tmp_pa
         "materialize_secrets",
         lambda environment: {"HF_TOKEN": "hf_resolved"} if environment.get("EYVAN_SECRET_COUNT") else {},
     )
-    written: dict[str, str] = {}
-    monkeypatch.setattr(
-        systemd_transient,
-        "_write_environment_file",
-        lambda _path, environment: written.update(environment),
-    )
     executor = systemd_transient.SystemdTransientServiceExecutor(
         tmp_path,
         command_runner=lambda *_args, **_kwargs: None,
@@ -493,9 +531,12 @@ def test_the_systemd_launcher_writes_resolved_values_and_not_capabilities(tmp_pa
         },
     )
 
-    assert written["HF_TOKEN"] == "hf_resolved"
-    assert not [key for key in written if key.startswith("EYVAN_SECRET_")]
-    assert written["EYVAN_WORKLOAD_ID"] == "wl-1"
+    environment_file = executor._environment_file_path("eyvan-wl-1")
+    written = environment_file.read_text(encoding="utf-8")
+    assert "HF_TOKEN=hf_resolved\n" in written
+    assert "EYVAN_WORKLOAD_ID=wl-1\n" in written
+    assert "EYVAN_SECRET_" not in written and "eyvs1.a.b" not in written
+    assert environment_file.stat().st_mode & 0o777 == 0o600
 
 
 # --------------------------------------------------------------------------- helpers

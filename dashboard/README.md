@@ -14,26 +14,40 @@ launcher and fails with a source-checkout message when those files are absent.
 
 ## Browser authentication
 
-Production uses an OIDC public client with authorization-code PKCE. The hosted
-bundle reads issuer and client ID from `/api/v1/dashboard/config`, populated by
-`EYVAN_OIDC_ISSUER` and `EYVAN_OIDC_DASHBOARD_CLIENT_ID` on the control plane.
-This keeps one signed image digest promotable between environments. Optional
-`VITE_EYVAN_*` build settings still override runtime discovery for an intentional
-custom build:
+Production uses a backend-for-frontend (BFF) with an OIDC public client and
+authorization-code PKCE. Configure these settings on the control plane, not
+in the dashboard build:
 
 ```bash
-VITE_EYVAN_OIDC_ISSUER=https://identity.example.com \
-VITE_EYVAN_OIDC_CLIENT_ID=eyvan-dashboard \
-VITE_EYVAN_OIDC_AUDIENCE=eyvan-api \
-VITE_EYVAN_OIDC_REDIRECT_URI=https://eyvan.example.com/ \
-  npm run build
+EYVAN_PUBLIC_URL=https://eyvan.example.com
+EYVAN_OIDC_ISSUER=https://identity.example.com
+EYVAN_OIDC_DASHBOARD_CLIENT_ID=eyvan-dashboard
+EYVAN_OIDC_AUDIENCE=eyvan-api
 ```
 
-`VITE_EYVAN_OIDC_SCOPE` defaults to `openid profile email`. The identity
-provider must register the redirect URI, allow authorization-code PKCE for a
-public browser client, and permit browser access to discovery and token
-endpoints. Access and ID tokens are held in `sessionStorage`; no client secret
-or static bearer token is compiled into the dashboard.
+The identity provider must register the exact redirect URI
+`<EYVAN_PUBLIC_URL>/api/v1/dashboard/auth/callback` (with no trailing slash on
+`EYVAN_PUBLIC_URL`). For the example above, register
+`https://eyvan.example.com/api/v1/dashboard/auth/callback`, **not** the dashboard
+root URL. Allow authorization-code PKCE for this public client with the
+`openid profile email` scopes. The control plane must be able to access the
+provider's discovery and token endpoints; the browser does not perform the
+code exchange.
+
+Sign in navigates to `/api/v1/dashboard/auth/login`. The server constructs the
+provider redirect from its configuration, exchanges the returned code at the
+callback, and redirects back to `/`. Access and ID tokens stay server-side;
+the browser carries only an HttpOnly, Secure, SameSite=Lax session cookie for
+OIDC authentication. No client secret or static bearer token is compiled into
+the dashboard.
+
+The hosted bundle reads issuer, client ID and audience from
+`/api/v1/dashboard/config`. This keeps one signed image digest promotable
+between environments. Optional `VITE_EYVAN_OIDC_ISSUER`,
+`VITE_EYVAN_OIDC_CLIENT_ID` and `VITE_EYVAN_OIDC_AUDIENCE` settings override that
+discovery for an intentional custom build, but do not configure the server's
+sign-in request or callback. Keep any such overrides aligned with the control
+plane settings.
 
 Set `VITE_EYVAN_ORG` and `VITE_EYVAN_PROJECT` to select the API scope; they
 default to `acme` and `research` for local development.

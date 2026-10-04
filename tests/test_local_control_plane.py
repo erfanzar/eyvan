@@ -231,6 +231,28 @@ def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> Non
         paths=paths,
         launcher=type("L", (), {"start": lambda self, command: _Loser()})(),
         health_probe=_never_answers,
+        # A live PID is not sufficient proof: model the winning daemon's exact
+        # argv rather than asking the supervisor to trust this pytest process.
+        process_liveness=lambda pid: pid == winner_pid,
+        process_argument_reader=lambda pid: (
+            (
+                "python",
+                "-m",
+                "eyvan.server.api.app",
+                "--host",
+                target.host,
+                "--port",
+                str(target.port),
+                "--local-daemon",
+                "--runtime-profile",
+                profile,
+            )
+            if pid == winner_pid
+            else None
+        ),
+        startup_timeout_s=0.01,
+        clock=iter([0.0, 0.0, 1.0, 2.0]).__next__,
+        sleeper=lambda _seconds: None,
     )
 
     result = supervisor.ensure(endpoint, runtime_profile_path=Path(profile))
@@ -239,6 +261,7 @@ def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> Non
     surviving = read_owner_only_record(record_path)
     assert surviving is not None, "the winner's record was deleted by the loser"
     assert surviving.pid == winner_pid, "the loser stamped its own pid over the winner's record"
+    assert stopped == [_Loser.pid], "the losing process must be stopped, not the verified winner"
 
 
 def test_stop_ends_a_plane_this_supervisor_started(tmp_path) -> None:

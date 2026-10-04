@@ -32,6 +32,15 @@ from eyvan.worker.runtime.log_records import LogPage, LogRecord, merge_pages, pa
 from eyvan.worker.runtime.registry import StructuredLogExecutionDriver
 
 
+@pytest.fixture(autouse=True)
+def _isolated_api_home(monkeypatch, tmp_path) -> None:
+    """Keep API startup out of the operator's artifact and credential state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "managed-artifacts"))
+
+
 def _journal(*entries: dict) -> str:
     return "\n".join(json.dumps(entry) for entry in entries)
 
@@ -658,7 +667,11 @@ async def test_secret_bearing_workload_output_is_not_streamed_or_archived(tmp_pa
     assert page["unavailable"] is True
     assert marker not in json.dumps(page)
     assert agent.calls == []
-    assert not any((tmp_path / "artifacts").rglob("*"))
+    # Store initialization may create lock metadata, but never log objects or
+    # secret-bearing payloads for a workload whose output is suppressed.
+    root = tmp_path / "artifacts"
+    assert not any(path.is_file() for path in (root / "scopes").rglob("*"))
+    assert all(marker.encode() not in path.read_bytes() for path in root.rglob("*") if path.is_file())
 
 
 async def test_logs_survive_the_cell_that_produced_them(tmp_path) -> None:

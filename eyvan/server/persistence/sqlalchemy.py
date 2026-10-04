@@ -31,7 +31,10 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     and_,
+    case,
+    cast,
     func,
+    inspect,
     or_,
     select,
     text,
@@ -73,6 +76,7 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.persistence.base import (
+    ArtifactProtectionCounts,
     ReadOnlyQueryResult,
     ReadOnlyQueryUnsupported,
     SchemaRevisionMismatch,
@@ -440,13 +444,33 @@ def _managed_artifact_row_matches(row: ManagedArtifactRow, record: ManagedArtifa
     )
 
 
+def _validation_fields(model: type[BaseModel], error: ValidationError) -> list[str]:
+    """Expose only declared top-level fields, never input, custom messages or keys."""
+
+    fields: set[str] = set()
+    for detail in error.errors(include_input=False, include_context=False, include_url=False):
+        location = detail["loc"]
+        if not location:
+            fields.add("<record>")
+        elif location[0] in model.model_fields:
+            fields.add(str(location[0]))
+        else:
+            # Extra/nested mapping keys can themselves contain credentials.
+            fields.add("<extra>")
+    return sorted(fields)
+
+
 def _decode_managed_artifact_rows(rows: tp.Iterable[ManagedArtifactRow]) -> list[ManagedArtifactRecord]:
     records: list[ManagedArtifactRecord] = []
     for row in rows:
         try:
             record = ManagedArtifactRecord.model_validate(row.data)
-        except ValidationError:
-            logger.exception("skipping unreadable managed_artifacts row %r", row.uri)
+        except ValidationError as error:
+            logger.error(
+                "skipping unreadable managed_artifacts row %r; invalid fields=%s",
+                row.uri,
+                _validation_fields(ManagedArtifactRecord, error),
+            )
             continue
         if not _managed_artifact_row_matches(row, record):
             logger.error("skipping managed_artifacts row %r with mismatched typed lifecycle", row.uri)
@@ -549,21 +573,24 @@ def _decode_rows(model: type[_Record], rows: tp.Iterable[tp.Any], *, table: str)
     own workload. Every new persisted field makes that more likely, because a
     rollback to a build that predates the field leaves rows the old code cannot read.
 
-    Skipping is the strictly better failure mode in every caller: one workload
+    Informational listings can contain the failure this way: one workload
     invisible beats nothing scheduling, one command undelivered beats no command
-    delivered. It is deliberately loud -- a skipped row is logged with its identity at
-    error level, because a silently shrinking list is its own kind of outage.
+    delivered. Destructive safety checks must not use such lossy lists to prove
+    absence; active artifact reference reads instead refuse unreadable rows.
+    A skipped row is logged with its identity and safe field diagnostics at error
+    level, because a silently shrinking list is its own kind of outage.
     """
 
     decoded: list[_Record] = []
     for row in rows:
         try:
             decoded.append(model.model_validate(row.data))
-        except ValidationError:
-            logger.exception(
-                "skipping unreadable %s row %r; it is invisible to this process until repaired",
+        except ValidationError as error:
+            logger.error(
+                "skipping unreadable %s row %r; invalid fields=%s; it is invisible to this process until repaired",
                 table,
                 getattr(row, "id", "<unknown>"),
+                _validation_fields(model, error),
             )
     return decoded
 
@@ -1328,6 +1355,128 @@ class SqlAlchemySession:
             and (updated_before is None or record.updated_at <= updated_before)
         ]
 
+    async def list_collectable_managed_artifacts(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+        limit: int = 100,
+    ) -> list[ManagedArtifactRecord]:
+        data = ManagedArtifactRow.data
+        postgres = self.session.get_bind().dialect.name == "postgresql"
+
+        def timestamp(value):
+            # Parse instants, not lexicographic ISO strings (offsets differ).
+            return cast(value, DateTime(timezone=True)) if postgres else func.julianday(value)
+
+        created = timestamp(data["created_at"].as_string())
+        activated = func.coalesce(timestamp(data["activated_at"].as_string()), created)
+        uploaded = func.coalesce(timestamp(data["upload_started_at"].as_string()), created)
+        expiry = timestamp(data["hold"]["expires_at"].as_string())
+
+        def aged(window: float) -> ColumnElement[bool]:
+            cutoff = now - timedelta(seconds=window)
+            bound = cutoff if postgres else func.julianday(cutoff)
+            return and_(activated <= bound, uploaded <= bound)
+
+        windows = [
+            and_(ManagedArtifactRow.kind == kind, aged(window))
+            for kind, window in retention_by_kind.items()
+            if window is not None
+        ]
+        default_kind = ManagedArtifactRow.kind.not_in(tuple(retention_by_kind))
+        windows.append(and_(default_kind, aged(grace_period_s)))
+        # A live typed reference is a safety barrier even if its JSON is
+        # unreadable. Scope every identity field before proving absence.
+        live_reference = (
+            select(ArtifactReferenceRow.uri)
+            .where(
+                ArtifactReferenceRow.org_id == ManagedArtifactRow.org_id,
+                ArtifactReferenceRow.project_id == ManagedArtifactRow.project_id,
+                ArtifactReferenceRow.uri == ManagedArtifactRow.uri,
+                ArtifactReferenceRow.released_at.is_(None),
+            )
+            .exists()
+        )
+        statement = (
+            select(ManagedArtifactRow)
+            .where(
+                ManagedArtifactRow.org_id == org_id,
+                ManagedArtifactRow.project_id == project_id,
+                ManagedArtifactRow.state == ManagedArtifactState.ACTIVE.value,
+                or_(data["hold"].as_string().is_(None), expiry <= (now if postgres else func.julianday(now))),
+                ~live_reference,
+                or_(*windows),
+            )
+            .order_by(ManagedArtifactRow.updated_at, ManagedArtifactRow.uri)
+            .limit(limit)
+        )
+        rows = (await self.session.scalars(statement)).all()
+        return _decode_managed_artifact_rows(rows)
+
+    async def count_managed_artifact_protections(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        now: datetime,
+        grace_period_s: float,
+        retention_by_kind: tp.Mapping[str, float | None],
+    ) -> ArtifactProtectionCounts:
+        data = ManagedArtifactRow.data
+        postgres = self.session.get_bind().dialect.name == "postgresql"
+
+        def timestamp(value):
+            return cast(value, DateTime(timezone=True)) if postgres else func.julianday(value)
+
+        created = timestamp(data["created_at"].as_string())
+        activated = func.coalesce(timestamp(data["activated_at"].as_string()), created)
+        uploaded = func.coalesce(timestamp(data["upload_started_at"].as_string()), created)
+        expiry = timestamp(data["hold"]["expires_at"].as_string())
+        held = and_(
+            data["hold"].as_string().is_not(None),
+            or_(expiry.is_(None), expiry > (now if postgres else func.julianday(now))),
+        )
+        # EXISTS counts artifacts, not workloads, and trusts the same scoped
+        # typed safety barrier as eligibility, never a lossy JSON reference list.
+        live_reference = (
+            select(ArtifactReferenceRow.uri)
+            .where(
+                ArtifactReferenceRow.org_id == ManagedArtifactRow.org_id,
+                ArtifactReferenceRow.project_id == ManagedArtifactRow.project_id,
+                ArtifactReferenceRow.uri == ManagedArtifactRow.uri,
+                ArtifactReferenceRow.released_at.is_(None),
+            )
+            .exists()
+        )
+
+        def young(window: float) -> ColumnElement[bool]:
+            cutoff = now - timedelta(seconds=window)
+            bound = cutoff if postgres else func.julianday(cutoff)
+            return or_(activated > bound, uploaded > bound)
+
+        windows = [
+            ManagedArtifactRow.kind == kind if window is None else and_(ManagedArtifactRow.kind == kind, young(window))
+            for kind, window in retention_by_kind.items()
+        ]
+        windows.append(and_(ManagedArtifactRow.kind.not_in(tuple(retention_by_kind)), young(grace_period_s)))
+        statement = select(
+            func.count(case((held, 1))),
+            func.count(case((and_(~held, live_reference), 1))),
+            func.count(case((and_(~held, ~live_reference, or_(*windows)), 1))),
+        ).where(
+            ManagedArtifactRow.org_id == org_id,
+            ManagedArtifactRow.project_id == project_id,
+            ManagedArtifactRow.state == ManagedArtifactState.ACTIVE.value,
+        )
+        # Only three integers cross the database boundary, irrespective of the
+        # protected inventory's size. No managed/reference rows are decoded.
+        counts = (await self.session.execute(statement)).one()
+        return ArtifactProtectionCounts(int(counts[0]), int(counts[1]), int(counts[2]))
+
     async def sum_managed_artifact_bytes(self, *, org_id: str, project_id: str | None = None) -> int:
         statement = select(func.coalesce(func.sum(ManagedArtifactRow.size_bytes), 0)).where(
             ManagedArtifactRow.org_id == org_id,
@@ -1395,6 +1544,26 @@ class SqlAlchemySession:
             statement = statement.where(ArtifactReferenceRow.released_at.is_(None))
         statement = statement.order_by(ArtifactReferenceRow.created_at, ArtifactReferenceRow.id)
         rows = (await self.session.scalars(statement)).all()
+        if active_only:
+            # A live typed row is a deletion safety barrier, even if its JSON
+            # belongs to a newer build or has been damaged. Never let lossy
+            # informational decoding turn that barrier into proof of absence.
+            records = []
+            for row in rows:
+                try:
+                    record = ArtifactReferenceRecord.model_validate(row.data)
+                except ValidationError:
+                    raise RuntimeError("unreadable active artifact reference; refusing to prove absence") from None
+                if (record.org_id, record.project_id, record.uri, record.workload_id, record.released_at) != (
+                    row.org_id,
+                    row.project_id,
+                    row.uri,
+                    row.workload_id,
+                    None,
+                ):
+                    raise RuntimeError("inconsistent active artifact reference; refusing to prove absence")
+                records.append(record)
+            return records
         records = _decode_rows(ArtifactReferenceRecord, rows, table="artifact_references")
         return [record for record in records if record.org_id == org_id and record.project_id == project_id]
 
@@ -1447,12 +1616,26 @@ class SqlAlchemySession:
             )
         )
 
-    async def list_outbox(self, *, state: OutboxState | None = None, limit: int = 100) -> list[OutboxRecord]:
+    async def list_outbox(
+        self, *, state: OutboxState | None = None, limit: int = 100, created_before: datetime | None = None
+    ) -> list[OutboxRecord]:
         statement = select(OutboxRow)
         if state is not None:
             statement = statement.where(OutboxRow.state == state.value)
-        rows = (await self.session.scalars(statement.order_by(OutboxRow.available_at, OutboxRow.id).limit(limit))).all()
-        return _decode_rows(OutboxRecord, rows, table="outbox")
+        order = (OutboxRow.available_at, OutboxRow.id)
+        if created_before is not None:
+            raw_created = OutboxRow.data["created_at"].as_string()
+            if self.session.get_bind().dialect.name == "sqlite":
+                created = func.julianday(raw_created)
+                cutoff = func.julianday(created_before.isoformat())
+            else:
+                created = cast(raw_created, DateTime(timezone=True))
+                cutoff = created_before
+            statement = statement.where(created < cutoff)
+            order = (created, OutboxRow.id)
+        rows = (await self.session.scalars(statement.order_by(*order).limit(limit))).all()
+        records = _decode_rows(OutboxRecord, rows, table="outbox")
+        return [record for record in records if created_before is None or record.created_at < created_before]
 
     async def list_outbox_for_aggregates(
         self,
@@ -1511,28 +1694,27 @@ class SqlAlchemySession:
         return removed
 
     async def prune_events(self, *, before: datetime, limit: int = 1000) -> int:
-        """Delete audit events emitted before ``before``, oldest first."""
+        """Delete audit events emitted before ``before``, oldest first.
 
-        statement = select(AuditEventRow).order_by(AuditEventRow.sequence).limit(limit)
+        The cutoff is pushed into the SQL filter, so the LIMIT counts only
+        prunable rows: recent events at the sequence front would otherwise
+        consume every page and return 0 deletions forever -- the same
+        starvation ``prune_outbox``/``prune_idempotency`` already fixed.
+        """
+
+        statement = (
+            select(AuditEventRow)
+            .where(AuditEventRow.occurred_at.is_not(None), AuditEventRow.occurred_at < before)
+            .order_by(AuditEventRow.sequence)
+            .limit(limit)
+        )
         removed = 0
         for row in (await self.session.scalars(statement)).all():
-            try:
-                timestamp = AuditEvent.model_validate(row.data).timestamp
-            except ValidationError:
-                # Skipped rather than fatal, for the reason ``_decode_rows``
-                # already gives: one unreadable row must not stop the whole call.
-                # It is worse here than anywhere else, because this page is
-                # ordered oldest-first -- so an unparseable row sits permanently
-                # at the front and every event behind it becomes unprunable.
-                # Retention then stops silently, and the table grows forever.
-                logger.exception(
-                    "skipping unreadable audit_events row %r during retention; it will not be pruned until repaired",
-                    getattr(row, "sequence", None),
-                )
-                continue
-            if timestamp < before:
-                await self.session.delete(row)
-                removed += 1
+            # The indexed, typed timestamp is the retention authority. A
+            # forward-versioned or malformed JSON payload must not consume the
+            # same oldest-first page forever and starve healthy expired events.
+            await self.session.delete(row)
+            removed += 1
         return removed
 
     async def prune_idempotency(self, *, before: datetime, limit: int = 1000) -> int:
@@ -1558,6 +1740,20 @@ class SqlAlchemySession:
         return removed
 
     async def append_event(self, event: AuditEvent) -> AuditEvent:
+        if self.session.get_bind().dialect.name == "postgresql":
+            # BIGSERIAL alone orders allocation, not commit visibility. Hold this
+            # database-wide transaction lock from BEFORE allocation through the
+            # enclosing commit/rollback, so a visible higher cursor proves no
+            # lower allocation can still commit. Rollback gaps remain legitimate.
+            # Never wait here: callers may already hold domain/idempotency row
+            # locks. A waiter could invert that lock order against the owner;
+            # aborting the whole unit with the existing retryable error cannot.
+            acquired = await self.session.scalar(
+                text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": "eyvan:audit-event-sequence"},
+            )
+            if not acquired:
+                raise TransientRepositoryError("audit sequence allocation is busy; retry the transaction")
         data = _dump(event)
         data["sequence"] = 0
         sequence: int | None = None
@@ -1631,10 +1827,10 @@ class SqlAlchemyRepository:
         self.engine = engine.execution_options(isolation_level="SERIALIZABLE")
         self._sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         # Outbox claiming runs at READ COMMITTED, alone among the repository's
-        # writes. ``FOR UPDATE SKIP LOCKED`` *is* the serialization here: each
-        # row is locked before it is updated and rows another claimer holds are
-        # skipped, so two workers cannot claim one command. Layering
-        # SERIALIZABLE on top adds no safety and does add spurious 40001s that
+        # writes. ``FOR UPDATE SKIP LOCKED`` protects individual commands;
+        # aggregate advisory locks plus a fresh eligibility query protect
+        # siblings across replicas. Rows/aggregates another claimer holds are
+        # skipped. Layering SERIALIZABLE on top adds spurious 40001s that
         # scale with replica count -- measured against PostgreSQL 17, four
         # concurrent claimers failed on the first try. Active-active delivery is
         # the entire point of the claim, so making it fail more often the more
@@ -1717,15 +1913,20 @@ class SqlAlchemyRepository:
     async def _stamped_revision(connection: AsyncConnection) -> str | None:
         """Return the database's own record of its schema revision, if it has one."""
 
-        for statement in (
-            text("SELECT version_num FROM alembic_version LIMIT 1"),
-            text("SELECT revision FROM schema_revisions LIMIT 1"),
+        for table, statement in (
+            ("alembic_version", text("SELECT version_num FROM alembic_version LIMIT 1")),
+            ("schema_revisions", text("SELECT revision FROM schema_revisions LIMIT 1")),
         ):
-            try:
-                revision = (await connection.execute(statement)).scalar_one_or_none()
-            except DBAPIError:
-                # The table does not exist on this database; try the next source.
+            # A missing optional table must not abort PostgreSQL's transaction
+            # before the legacy probe. Only proven absence is optional: a
+            # permissions, connectivity or malformed-schema failure must refuse
+            # startup, not masquerade as an unstamped fresh database.
+            exists = await connection.run_sync(
+                lambda sync_connection, table_name: inspect(sync_connection).has_table(table_name), table
+            )
+            if not exists:
                 continue
+            revision = (await connection.execute(statement)).scalar_one_or_none()
             if revision is not None:
                 return str(revision)
         return None
@@ -1903,9 +2104,39 @@ class SqlAlchemyRepository:
         claimed: list[OutboxRecord] = []
         try:
             async with self._claim_sessions.begin() as session:
+                if session.get_bind().dialect.name == "postgresql":
+                    # Nested OptionEngine connect hooks can restore inherited
+                    # SERIALIZABLE after the claim engine requests READ COMMITTED.
+                    # Set the actual connection before its first SQL statement;
+                    # eligibility after the aggregate lock needs a fresh snapshot.
+                    await session.connection(execution_options={"isolation_level": "READ COMMITTED"})
                 rows = (await session.scalars(statement)).all()
+                claimed_aggregates: set[tuple[str, str]] = set()
                 for row in rows:
                     record = OutboxRecord.model_validate(row.data)
+                    aggregate = (record.aggregate_type, record.aggregate_id)
+                    if aggregate in claimed_aggregates:
+                        continue
+                    if session.get_bind().dialect.name == "postgresql":
+                        # Distinct sibling row locks do not protect NOT EXISTS
+                        # at READ COMMITTED. All claimers share this aggregate
+                        # lock until commit. Try rather than wait: batches can
+                        # hold sibling row locks in opposite orders, and busy
+                        # aggregates should not block unrelated delivery.
+                        acquired = await session.scalar(
+                            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                            {"lock_key": json.dumps(("eyvan:outbox-claim", *aggregate), separators=(",", ":"))},
+                        )
+                        if not acquired:
+                            continue
+                    # The initial SELECT's snapshot may predate a sibling's
+                    # commit. Recheck in a separate statement after locking;
+                    # its fresh READ COMMITTED snapshot observes that claim.
+                    eligible = await session.scalar(
+                        select(OutboxRow.id).where(OutboxRow.id == row.id, _claimable_outbox_clause(now))
+                    )
+                    if eligible is None:
+                        continue
                     updated = record.model_copy(
                         update={
                             "state": OutboxState.PROCESSING,
@@ -1919,6 +2150,7 @@ class SqlAlchemyRepository:
                     row.claimed_until = updated.claimed_until
                     row.data = _dump(updated)
                     claimed.append(updated)
+                    claimed_aggregates.add(aggregate)
         except DBAPIError as exc:
             # This path used to bypass the translation entirely, so a conflict
             # here reached the outbox loop as a raw DBAPIError, was swallowed by

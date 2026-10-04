@@ -57,18 +57,25 @@ class GoogleCloudStorageTransfer(GcsObjectTransfer):
     """Use the TPU VM's ADC identity without mounting host credentials."""
 
     def __init__(self) -> None:
-        try:
-            from google.cloud import storage
-        except ImportError as exc:
-            raise RuntimeError(
-                "Eyvan OCI GCS callable artifacts require google-cloud-storage in the workload image"
-            ) from exc
-        self._client = tp.cast(_GcsClient, storage.Client())
+        self._client: _GcsClient | None = None
+
+    def _storage_client(self) -> _GcsClient:
+        """Resolve the optional dependency and ADC only for a GCS transfer."""
+
+        if self._client is None:
+            try:
+                from google.cloud import storage
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Eyvan OCI GCS callable artifacts require google-cloud-storage in the workload image"
+                ) from exc
+            self._client = tp.cast(_GcsClient, storage.Client())
+        return self._client
 
     def read_object(self, bucket_name: str, object_name: str) -> bytes:
         """Download one callable artifact through Application Default Credentials."""
 
-        payload = self._client.bucket(bucket_name).blob(object_name).download_as_bytes()
+        payload = self._storage_client().bucket(bucket_name).blob(object_name).download_as_bytes()
         if not isinstance(payload, bytes):
             raise RuntimeError("GCS callable artifact download returned non-bytes data")
         return payload
@@ -76,7 +83,7 @@ class GoogleCloudStorageTransfer(GcsObjectTransfer):
     def write_object(self, bucket_name: str, object_name: str, payload: bytes) -> None:
         """Upload one result artifact through Application Default Credentials."""
 
-        self._client.bucket(bucket_name).blob(object_name).upload_from_string(
+        self._storage_client().bucket(bucket_name).blob(object_name).upload_from_string(
             payload,
             content_type="application/octet-stream",
         )

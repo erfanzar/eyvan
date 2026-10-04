@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from eyvan.server.service._control_plane.shared import (
     _QUERY_AUDIT_STATEMENT_LIMIT,
     BudgetRecord,
@@ -97,6 +99,8 @@ class PoliciesMixin:
             budget.model_copy(
                 update={
                     "spent": 0,
+                    "settlement_period_id": None,
+                    "period_opening_spent": None,
                     "accelerator_hours_spent": {},
                     "revision": 0,
                     "updated_by": "",
@@ -121,8 +125,24 @@ class PoliciesMixin:
             stored = budget.model_copy(
                 update={
                     "spent": budget.spent if previous is None else previous.spent,
+                    # Attribution is server-owned. Configuration requests cannot
+                    # rewrite the opening ledger or forge a settlement epoch.
+                    "settlement_period_id": uuid4().hex if previous is None else previous.settlement_period_id,
+                    "period_opening_spent": budget.spent if previous is None else previous.period_opening_spent,
                     "accelerator_hours_spent": (
                         budget.accelerator_hours_spent if previous is None else previous.accelerator_hours_spent
+                    ),
+                    # Configuration edits do not restart the charged window or
+                    # re-announce thresholds that already fired within it.
+                    "period_started_at": budget.period_started_at if previous is None else previous.period_started_at,
+                    "alerted_thresholds": (
+                        budget.alerted_thresholds
+                        if previous is None
+                        else tuple(
+                            threshold
+                            for threshold in previous.alerted_thresholds
+                            if threshold in budget.alert_thresholds
+                        )
                     ),
                     "revision": 1 if previous is None else previous.revision + 1,
                     "updated_by": principal.subject,

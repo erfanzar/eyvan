@@ -14,6 +14,7 @@ from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from test_priority_preemption_properties import repository as _repository_fixture
 
 from eyvan.artifacts.managed import ArtifactTokenSigner, LocalManagedArtifactStore
 from eyvan.artifacts.secret_capability import SecretCapabilitySigner, SecretTokenClaims
@@ -40,11 +41,16 @@ from eyvan.records import (
     utcnow,
 )
 from eyvan.server.controller import EyvanController
+from eyvan.server.persistence.local import LocalJsonRepository
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.service.control_plane import ControlPlaneService
 from eyvan.server.service.errors import AuthorizationError, ConflictError
+from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 from eyvan.worker.agent.models import WorkloadObservation
 from eyvan.worker.runtime.secret_materialization import materialize_secrets
+
+repository = _repository_fixture
+
 
 _KEY = b"d" * 32
 _VALUE = b"dispatch-only-secret-value"
@@ -83,6 +89,8 @@ class _ReentrantSecretAgent:
         self.gang_submissions = 0
         self.stops: list[str] = []
         self.gang_stops: list[str] = []
+        self.requests = []
+        self.executions = {}
 
     def _await(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=2)
@@ -125,23 +133,27 @@ class _ReentrantSecretAgent:
             token = self.tokens[-1]
             raise RuntimeError(f"provider reflected {_VALUE.decode()} and {token}")
 
+    def _submit(self, request, key):
+        self.requests.append(request)
+        # The worker's durable idempotency contract is keyed by the mutation,
+        # not by delivery count. An accepted execution survives a lost response.
+        if key not in self.executions:
+            self.executions[key] = WorkloadObservation(
+                remote_id=request.spec["submission_id"],
+                status=ExecutionWorkloadStatus.SUBMITTED,
+            )
+            self._materialize(request)
+        return self.executions[key]
+
     def submit(self, cell_id, request):
         del cell_id
         self.submissions += 1
-        self._materialize(request)
-        return WorkloadObservation(
-            remote_id=request.spec["submission_id"],
-            status=ExecutionWorkloadStatus.SUBMITTED,
-        )
+        return self._submit(request, request.mutation.idempotency_key)
 
     def submit_gang(self, coordinator_cell_id, request):
         del coordinator_cell_id
         self.gang_submissions += 1
-        self._materialize(request)
-        return WorkloadObservation(
-            remote_id=request.spec["submission_id"],
-            status=ExecutionWorkloadStatus.SUBMITTED,
-        )
+        return self._submit(request, tuple(member.mutation.idempotency_key for member in request.members))
 
     def stop(self, cell_id, remote_id, request):
         del cell_id, request
@@ -327,10 +339,11 @@ async def test_reentrant_gang_dispatch_commits_every_member_atomically(tmp_path)
     await _assert_success(InMemoryRepository(), tmp_path, gang=True)
 
 
-async def test_failed_submit_revokes_the_issuance_and_retry_refences_it(tmp_path) -> None:
-    repository = InMemoryRepository()
+@pytest.mark.parametrize("repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+async def test_unknown_submit_retains_the_issuance_and_retry_reuses_its_fence(repository, tmp_path, gang) -> None:
     service, _signer, agent, controller = await _plane(repository, tmp_path, fail=True)
-    seeded, leases, _command = await _seed_dispatch(repository)
+    seeded, leases, _command = await _seed_dispatch(repository, gang=gang)
 
     assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
     failed_workload, failed_leases, commands, events = await _snapshot(repository, seeded.id)
@@ -339,64 +352,196 @@ async def test_failed_submit_revokes_the_issuance_and_retry_refences_it(tmp_path
     old_token = agent.tokens[0]
 
     assert failed_workload.state is WorkloadState.LEASED
-    assert failed_workload.dispatch_reservation is None
+    reservation = failed_workload.dispatch_reservation
+    assert reservation is not None
+    assert reservation.fence == old_claims.dispatch_fence
     assert all(lease.state is LeaseState.PENDING for lease in failed_leases)
     assert failed_command.state is OutboxState.FAILED
-    assert "dispatch_reservation" not in failed_command.payload
+    assert failed_command.payload["dispatch_reservation"] == reservation.model_dump(mode="json")
+    assert len(agent.executions) == 1
     # The message is withheld; the class and the Eyvan frame that raised it are
     # code identifiers, kept so a suppressed failure can still be located.
     assert failed_command.last_error.startswith("output suppressed for secret-bearing execution (RuntimeError in eyvan.")
     assert _VALUE.decode() not in failed_command.last_error
     assert old_token not in failed_command.last_error
-    assert "workload.dispatch_reservation_failed" in [event.action for event in events]
-    with pytest.raises(AuthorizationError):
-        await service.authorize_secret_mount(
-            org_id="acme",
-            project_id="research",
-            workload_id=seeded.id,
-            attempt=old_claims.attempt,
-            generation=old_claims.generation,
-            dispatch_fence=old_claims.dispatch_fence,
-            name=old_claims.name,
+    assert "workload.dispatch_reservation_failed" not in [event.action for event in events]
+    with pytest.raises(ConflictError, match="dispatch may have started"):
+        lease = leases[0]
+        await service.requeue_unstarted_workload(
+            _ADMIN,
+            seeded.id,
+            scheduling_reason="submit acceptance is still unknown",
+            expected_generation=seeded.generation,
+            expected_lease_id=lease.id,
+            expected_cell_generation=lease.cell_generation,
+            expected_cell_state=CellState.READY,
+            expected_unavailable_reason=None,
+            expected_cell_id=lease.cell_id,
         )
 
     durable_failure = json.dumps(
         {
+            "workload": failed_workload.model_dump(mode="json"),
+            "leases": [lease.model_dump(mode="json") for lease in failed_leases],
             "command": failed_command.model_dump(mode="json"),
             "events": [event.model_dump(mode="json") for event in events],
         }
     )
     assert _VALUE.decode() not in durable_failure
     assert old_token not in durable_failure
+    if isinstance(repository, LocalJsonRepository):
+        await repository.close()
+        await repository.open()
+        restored, restored_leases, restored_commands, _ = await _snapshot(repository, seeded.id)
+        assert restored == failed_workload
+        assert restored_leases == failed_leases
+        assert next(command for command in restored_commands if command.id == failed_command.id) == failed_command
 
     async with repository.transaction() as tx:
         current = await tx.get_outbox(failed_command.id)
         assert current is not None
         await tx.put_outbox(current.model_copy(update={"available_at": utcnow()}))
     agent.fail_after_materialization = False
-    assert await asyncio.wait_for(controller.dispatch_outbox_once(), timeout=3) == 1
+    successor = EyvanController(
+        repository,
+        service,
+        settings=controller.settings,
+        agent_factory=lambda _cell: agent,
+        artifact_access=controller.artifact_access,
+        secret_capability=controller.secret_capability,
+    )
+    assert await asyncio.wait_for(successor.dispatch_outbox_once(), timeout=3) == 1
 
     retried_workload, retried_leases, commands, events = await _snapshot(repository, seeded.id)
     assert retried_workload.state is WorkloadState.DISPATCHING
     assert all(lease.state is LeaseState.ACTIVE for lease in retried_leases)
-    assert len(agent.claims) == 2
-    assert agent.claims[1].dispatch_fence != old_claims.dispatch_fence
-    assert agent.claims[1].attempt == old_claims.attempt
-    assert agent.claims[1].generation == old_claims.generation
+    assert len(agent.claims) == len(agent.values) == 1
+    replay_claims = _signer.verify(
+        agent.requests[1].spec["environment"]["EYVAN_SECRET_0_TOKEN"],
+        workload_id=seeded.id,
+        org_id="acme",
+        project_id="research",
+    )
+    assert replay_claims.dispatch_fence == old_claims.dispatch_fence
+    assert replay_claims.attempt == old_claims.attempt
+    assert replay_claims.generation == old_claims.generation
+    assert await service.authorize_secret_mount(
+        org_id="acme",
+        project_id="research",
+        workload_id=seeded.id,
+        attempt=old_claims.attempt,
+        generation=old_claims.generation,
+        dispatch_fence=old_claims.dispatch_fence,
+        name=old_claims.name,
+    ) == (_REFERENCE, _ROOT)
+    assert len(agent.executions) == 1
+    assert len({request.spec["submission_id"] for request in agent.requests}) == 1
+    assert await successor.dispatch_outbox_once() == 0
+    issuances = [event for event in events if event.action == "secret.issued"]
+    assert [event.payload["outbox_attempt"] for event in issuances] == [1, 2]
+    assert next(command for command in commands if command.topic == "workload.dispatch").state is OutboxState.SUCCEEDED
+    assert [lease.id for lease in retried_leases] == [lease.id for lease in leases]
+
+
+@pytest.mark.parametrize("repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+async def test_definitive_preacceptance_refusal_revokes_and_settles(repository, tmp_path, gang) -> None:
+    service, signer, agent, controller = await _plane(repository, tmp_path)
+    seeded, _leases, _command = await _seed_dispatch(repository, gang=gang)
+    captured = []
+
+    def refuse(*args):
+        request = args[-1]
+        captured.append(request.spec["environment"]["EYVAN_SECRET_0_TOKEN"])
+        # Unlike an arbitrary submit exception this is the wire client's typed
+        # validation verdict, before the backend creates any execution.
+        raise CellAgentInvalidConfigurationError("launch rejected before admission")
+
+    agent.submit = refuse
+    agent.submit_gang = refuse
+    assert await controller.dispatch_outbox_once() == 1
+    workload, leases, commands, events = await _snapshot(repository, seeded.id)
+    assert workload.state is WorkloadState.FAILED
+    assert workload.dispatch_reservation is None and workload.remote_id is None
+    assert all(lease.state is LeaseState.RELEASED for lease in leases)
+    dispatch = next(command for command in commands if command.topic == "workload.dispatch")
+    assert dispatch.state is OutboxState.SUCCEEDED
+    assert "dispatch_reservation" not in dispatch.payload
+    assert not agent.executions and not agent.values
+    assert [event.action for event in events].count("workload.dispatch_reservation_failed") == 1
+    claims = signer.verify(captured[0], workload_id=seeded.id, org_id="acme", project_id="research")
     with pytest.raises(AuthorizationError):
         await service.authorize_secret_mount(
             org_id="acme",
             project_id="research",
             workload_id=seeded.id,
-            attempt=old_claims.attempt,
-            generation=old_claims.generation,
-            dispatch_fence=old_claims.dispatch_fence,
-            name=old_claims.name,
+            attempt=claims.attempt,
+            generation=claims.generation,
+            dispatch_fence=claims.dispatch_fence,
+            name=claims.name,
         )
-    issuances = [event for event in events if event.action == "secret.issued"]
-    assert [event.payload["outbox_attempt"] for event in issuances] == [1, 2]
-    assert next(command for command in commands if command.topic == "workload.dispatch").state is OutboxState.SUCCEEDED
-    assert [lease.id for lease in retried_leases] == [lease.id for lease in leases]
+    assert await controller.dispatch_outbox_once() == 0
+
+
+@pytest.mark.parametrize("repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+@pytest.mark.parametrize("refusal_stage", ["validation", "preflight", "stale_build"])
+async def test_replay_refusal_cannot_disprove_prior_unknown_acceptance(repository, tmp_path, gang, refusal_stage):
+    from eyvan.server.controller.workload_commands import StaleBuildDispatchRefusal, UnreachableCallbackRefusal
+
+    _service, _signer, agent, controller = await _plane(repository, tmp_path, fail=True)
+    seeded, _leases, _command = await _seed_dispatch(repository, gang=gang)
+    assert await controller.dispatch_outbox_once() == 1
+    unknown, pending, commands, _ = await _snapshot(repository, seeded.id)
+    assert unknown.dispatch_reservation is not None and len(agent.executions) == 1
+    dispatch = next(command for command in commands if command.topic == "workload.dispatch")
+    async with repository.transaction() as tx:
+        await tx.put_outbox(dispatch.model_copy(update={"available_at": utcnow()}))
+    submit, submit_gang = agent.submit, agent.submit_gang
+    preflight = controller._refuse_unreachable_callback
+    builds = controller._refuse_stale_cell_builds
+
+    async def refuse_stale_builds(cells):
+        raise StaleBuildDispatchRefusal("this replay sees a changed build", cells)
+
+    def refuse(*_args):
+        if refusal_stage == "validation":
+            raise CellAgentInvalidConfigurationError("this replay was not admitted")
+        raise UnreachableCallbackRefusal("this replica cannot render a reachable callback")
+
+    if refusal_stage == "validation":
+        agent.submit = agent.submit_gang = refuse
+    elif refusal_stage == "stale_build":
+        controller._refuse_stale_cell_builds = refuse_stale_builds
+    else:
+        controller._refuse_unreachable_callback = refuse
+    assert await controller.dispatch_outbox_once() == 1
+    still_unknown, retained_leases, commands, _ = await _snapshot(repository, seeded.id)
+    dispatch = next(command for command in commands if command.id == dispatch.id)
+    assert still_unknown.state is WorkloadState.LEASED
+    assert still_unknown.remote_id is None
+    assert still_unknown.dispatch_reservation is not None
+    assert still_unknown.dispatch_reservation.fence == unknown.dispatch_reservation.fence
+    assert retained_leases == pending
+    assert dispatch.state is OutboxState.FAILED
+    assert dispatch.payload["dispatch_reservation"] == still_unknown.dispatch_reservation.model_dump(mode="json")
+    assert len(agent.executions) == 1
+    assert not any(command.topic == "capacity.drain" for command in commands)
+    async with repository.transaction() as tx:
+        assert all(cell.state is CellState.READY for cell in await tx.list_cells())
+    agent.submit, agent.submit_gang = submit, submit_gang
+    agent.fail_after_materialization = False
+    controller._refuse_unreachable_callback = preflight
+    controller._refuse_stale_cell_builds = builds
+    async with repository.transaction() as tx:
+        await tx.put_outbox(dispatch.model_copy(update={"available_at": utcnow()}))
+    assert await controller.dispatch_outbox_once() == 1
+    recovered, active, commands, _ = await _snapshot(repository, seeded.id)
+    assert recovered.state is WorkloadState.DISPATCHING
+    assert recovered.dispatch_reservation.fence == unknown.dispatch_reservation.fence
+    assert all(lease.state is LeaseState.ACTIVE for lease in active)
+    assert len(agent.executions) == len(agent.values) == 1
+    assert next(command for command in commands if command.id == dispatch.id).state is OutboxState.SUCCEEDED
 
 
 async def test_failed_gang_submit_keeps_every_member_pending(tmp_path) -> None:
@@ -409,12 +554,108 @@ async def test_failed_gang_submit_keeps_every_member_pending(tmp_path) -> None:
     workload, leases, commands, events = await _snapshot(repository, seeded.id)
     dispatch = next(command for command in commands if command.topic == "workload.dispatch")
     assert workload.state is WorkloadState.LEASED
-    assert workload.dispatch_reservation is None
+    assert workload.dispatch_reservation is not None
     assert [lease.state for lease in leases] == [LeaseState.PENDING, LeaseState.PENDING]
     assert dispatch.state is OutboxState.FAILED
-    assert "dispatch_reservation" not in dispatch.payload
+    assert dispatch.payload["dispatch_reservation"] == workload.dispatch_reservation.model_dump(mode="json")
+    assert len(agent.executions) == 1
     assert agent.gang_submissions == 1
     assert [event.action for event in events].count("lease.activated") == 0
+
+
+@pytest.mark.parametrize("repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+async def test_cancellation_waits_for_unknown_acceptance_then_stops_recovered_execution(repository, tmp_path, gang):
+    service, _signer, agent, controller = await _plane(repository, tmp_path, fail=True)
+    seeded, _leases, dispatch = await _seed_dispatch(repository, gang=gang)
+    assert await controller.dispatch_outbox_once() == 1
+    failed, pending, commands, _ = await _snapshot(repository, seeded.id)
+    assert failed.dispatch_reservation is not None and failed.remote_id is None
+    assert all(lease.state is LeaseState.PENDING for lease in pending)
+    async with repository.transaction() as tx:
+        current = next(command for command in commands if command.id == dispatch.id)
+        await tx.put_outbox(current.model_copy(update={"available_at": utcnow() + timedelta(hours=1)}))
+    await service.cancel_workload(_OPERATOR, seeded.id, idempotency_key="cancel-unknown-admission")
+    successor = EyvanController(
+        repository,
+        service,
+        settings=controller.settings,
+        agent_factory=lambda _cell: agent,
+        artifact_access=controller.artifact_access,
+        secret_capability=controller.secret_capability,
+    )
+    assert await successor.dispatch_outbox_once() == 1
+    waiting, pending, commands, _ = await _snapshot(repository, seeded.id)
+    cancel = next(command for command in commands if command.topic == "workload.cancel")
+    assert cancel.state is OutboxState.FAILED
+    assert waiting.state is WorkloadState.CANCELLING
+    assert waiting.dispatch_reservation == failed.dispatch_reservation
+    assert all(lease.state is LeaseState.PENDING for lease in pending)
+    assert not agent.stops and not agent.gang_stops
+    agent.fail_after_materialization = False
+    async with repository.transaction() as tx:
+        current = await tx.get_outbox(dispatch.id)
+        await tx.put_outbox(current.model_copy(update={"available_at": utcnow()}))
+    assert await successor.dispatch_outbox_once() == 1
+    recovered, active, commands, _ = await _snapshot(repository, seeded.id)
+    assert recovered.state is WorkloadState.CANCELLING
+    assert recovered.remote_id == next(iter(agent.executions.values())).remote_id
+    assert recovered.dispatch_reservation.fence == failed.dispatch_reservation.fence
+    assert all(lease.state is LeaseState.ACTIVE for lease in active)
+    async with repository.transaction() as tx:
+        current = await tx.get_outbox(cancel.id)
+        await tx.put_outbox(current.model_copy(update={"available_at": utcnow()}))
+    assert await successor.dispatch_outbox_once() == 1
+    cancelled, released, commands, _ = await _snapshot(repository, seeded.id)
+    assert cancelled.state is WorkloadState.CANCELLED and cancelled.dispatch_reservation is None
+    assert all(lease.state is LeaseState.RELEASED for lease in released)
+    assert agent.gang_stops == ([recovered.remote_id] if gang else [])
+    assert agent.stops == ([] if gang else [recovered.remote_id])
+    assert len(agent.executions) == len(agent.values) == 1
+    assert all(command.state is OutboxState.SUCCEEDED for command in commands)
+    assert await successor.dispatch_outbox_once() == 0
+
+
+@pytest.mark.parametrize("repository", ["memory", "postgres", "local"], indirect=True)
+@pytest.mark.parametrize("gang", [False, True])
+async def test_successor_claim_fences_a_late_submit_response_without_refencing_secrets(repository, tmp_path, gang):
+    service, _signer, agent, controller = await _plane(repository, tmp_path, block=True)
+    seeded, _leases, dispatch = await _seed_dispatch(repository, gang=gang)
+    first_delivery = asyncio.create_task(controller.dispatch_outbox_once())
+    try:
+        assert await asyncio.to_thread(agent.materialized.wait, 2)
+        inflight, pending, commands, _ = await _snapshot(repository, seeded.id)
+        assert inflight.dispatch_reservation is not None
+        assert all(lease.state is LeaseState.PENDING for lease in pending)
+        async with repository.transaction() as tx:
+            current = next(command for command in commands if command.id == dispatch.id)
+            await tx.put_outbox(current.model_copy(update={"claimed_until": utcnow() - timedelta(seconds=1)}))
+        successor = EyvanController(
+            repository,
+            service,
+            settings=controller.settings,
+            agent_factory=lambda _cell: agent,
+            artifact_access=controller.artifact_access,
+            secret_capability=controller.secret_capability,
+        )
+        assert await successor.dispatch_outbox_once() == 1
+        finalized = await _snapshot(repository, seeded.id)
+        workload, active, commands, _ = finalized
+        assert workload.state is WorkloadState.DISPATCHING
+        assert workload.dispatch_reservation.fence == inflight.dispatch_reservation.fence
+        assert workload.dispatch_reservation.outbox_attempt == 2
+        assert all(lease.state is LeaseState.ACTIVE for lease in active)
+        assert next(command for command in commands if command.id == dispatch.id).state is OutboxState.SUCCEEDED
+        agent.release.set()
+        assert await asyncio.wait_for(first_delivery, timeout=3) == 1
+        # A late response owned by attempt 1 must not rewrite attempt 2's
+        # workload/outbox, timestamps, lease activation or issuance events.
+        assert await _snapshot(repository, seeded.id) == finalized
+        assert len(agent.executions) == len(agent.values) == len(agent.claims) == 1
+        assert await successor.dispatch_outbox_once() == 0
+    finally:
+        agent.release.set()
+        await asyncio.wait_for(first_delivery, timeout=3)
 
 
 async def test_cancellation_and_requeue_cannot_overtake_an_inflight_submit(tmp_path) -> None:

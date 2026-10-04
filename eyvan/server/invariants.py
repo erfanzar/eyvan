@@ -408,15 +408,16 @@ async def check_fleet(
         leases = await tx.list_leases()
         pools = await tx.list_capacity_pools()
         budgets = await tx.list_budgets()
-        pending_outbox = await tx.list_outbox(state=OutboxState.PENDING, limit=1000)
-        processing_outbox = await tx.list_outbox(state=OutboxState.PROCESSING, limit=1000)
+        outbox_cutoff = moment - timedelta(seconds=STUCK_OUTBOX_AFTER_S)
+        pending_outbox = await tx.list_outbox(state=OutboxState.PENDING, limit=1000, created_before=outbox_cutoff)
+        processing_outbox = await tx.list_outbox(state=OutboxState.PROCESSING, limit=1000, created_before=outbox_cutoff)
         # FAILED is where a command that keeps failing actually sits. Between
         # attempts it is settled to FAILED with `available_at` in the future, so
         # a command retrying forever is PENDING or PROCESSING only for the
         # instant it is being tried -- and this check, which looked at those two
         # states alone, reported a healthy fleet while a v5p-16 was pinned by a
         # cancel the worker answered 500 to twenty-four times.
-        failed_outbox = await tx.list_outbox(state=OutboxState.FAILED, limit=1000)
+        failed_outbox = await tx.list_outbox(state=OutboxState.FAILED, limit=1000, created_before=outbox_cutoff)
         oldest_events = await tx.list_events(limit=1)
 
     violations: list[Violation] = []
@@ -497,14 +498,20 @@ async def check_fleet(
                 )
             )
 
-    settled_by_scope: dict[tuple[str, str], float] = {}
+    settled_by_period: dict[tuple[str, str, str], float] = {}
     for lease in leases:
-        if lease.settled_at is None:
+        if lease.settled_at is None or lease.settlement_budget_period_id is None:
             continue
-        key = (lease.org_id, lease.project_id)
-        settled_by_scope[key] = settled_by_scope.get(key, 0.0) + lease.settled_cost
+        key = (lease.org_id, lease.project_id, lease.settlement_budget_period_id)
+        settled_by_period[key] = settled_by_period.get(key, 0.0) + lease.settled_cost
     for budget in budgets:
-        settled = settled_by_scope.get((budget.org_id, budget.project_id), 0.0)
+        if budget.settlement_period_id is None or budget.period_opening_spent is None:
+            # Legacy spend has no trustworthy opening/reset attribution. It is
+            # unknown, not a proven discrepancy with the retained lifetime ledger.
+            continue
+        settled = budget.period_opening_spent + settled_by_period.get(
+            (budget.org_id, budget.project_id, budget.settlement_period_id), 0.0
+        )
         # Tolerance rather than equality: costs accumulate through binary
         # floating point, and an invariant that fires on the last bit would fire
         # constantly while saying nothing about correctness.

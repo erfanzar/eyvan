@@ -254,14 +254,10 @@ def test_the_snippet_points_at_the_plane_that_was_chosen() -> None:
     assert "os.environ" not in snippet, "setting the environment from the process that reads it is a detour"
 
 
-def test_the_snippet_names_no_address_for_the_plane_that_is_already_the_default() -> None:
-    """An argument that changes nothing teaches that it is required.
-
-    The loopback URL is what init resolves to with no argument at all, so
-    printing it turns the one-line form into a two-line one for no reason.
-    """
+def test_the_local_snippet_pins_the_selected_plane_over_saved_defaults() -> None:
+    """A saved context or environment can name a different plane, even locally."""
 
     snippet = python_snippet(LOCAL_URL, None)
 
-    assert "eyvan.init()" in snippet
-    assert LOCAL_URL not in snippet
+    assert f'eyvan.init("{LOCAL_URL}")' in snippet
+    assert "eyvan.init()" not in snippet

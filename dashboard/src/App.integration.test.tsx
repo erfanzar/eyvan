@@ -22,7 +22,9 @@ import {
 } from "./api/mockData";
 import { NO_AUTH_CAPABILITIES, type AuthIdentity, type AuthScope } from "./auth/oidc";
 import type {
+  CapacityPoolSummary,
   EffectiveProjectScope,
+  ProjectUsage,
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
@@ -186,7 +188,8 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     // The fleet page reads registered pools, which is a different question
     // from which cells exist: a fleet with twenty pools and nothing running
     // is the ordinary case and used to be indistinguishable from no fleet.
-    listCapacityPools: vi.fn(async () => []),
+    listCapacityPools: vi.fn(async (): Promise<CapacityPoolSummary[]> => []),
+    getProjectUsage: vi.fn(async (): Promise<ProjectUsage> => ({ orgId: "acme", projectId: "research", subjects: [] })),
     listAuditEvents: vi.fn(async () => mockAuditEvents.slice(0, 1)),
     followEvents: vi.fn(
       overrides.followEvents ??
@@ -293,6 +296,97 @@ afterEach(() => {
 });
 
 describe("App composes server session authority", () => {
+  it.each(["project_viewer", "project_operator", "project_admin", "org_admin"])(
+    "does not mount fleet-wide billing for a %s deep link",
+    async (role) => {
+      window.location.hash = "#/billing";
+      const { client, calls } = fakeClient(authority(role));
+      renderApp(client);
+
+      await screen.findByRole("button", { name: "Sign out Alice" });
+      expect(screen.queryByRole("button", { name: "Billing" })).toBeNull();
+      await screen.findByRole("region", { name: "Operations metrics" });
+      expect(calls.getBilling).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refreshes same-scope billing and usage without refetching on unrelated renders", async () => {
+    const { client, calls } = fakeClient(authority("fleet_admin"));
+    calls.getBilling.mockResolvedValue({
+      observed_at: "2026-01-01T00:00:00Z",
+      accrued_cost: 12,
+      idle_cost: 0,
+    });
+    const page = renderApp(client);
+    await showPanel("Billing");
+    await screen.findByText("$12.00");
+    await screen.findByText("Nobody has submitted work yet");
+    const initialBilling = calls.getBilling.mock.calls.length;
+    const initialUsage = calls.getProjectUsage.mock.calls.length;
+    page.rerender(<App client={client} identityProvider={identity} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(calls.getBilling).toHaveBeenCalledTimes(initialBilling);
+    expect(calls.getProjectUsage).toHaveBeenCalledTimes(initialUsage);
+
+    calls.getBilling.mockResolvedValue({ observed_at: "2026-01-01T00:00:01Z", accrued_cost: 24, idle_cost: 0 });
+    calls.getProjectUsage.mockResolvedValue({
+      orgId: "acme",
+      projectId: "research",
+      subjects: [
+        {
+          subject: "new-researcher",
+          workloads: 1,
+          settledWorkloads: 1,
+          leases: 1,
+          acceleratorHours: 1,
+          runningSeconds: 3600,
+          settledCost: 24,
+          unpricedLeases: 0,
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(calls.getSessionAuthority.mock.calls.length).toBeGreaterThan(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(within(screen.getByRole("region", { name: "What the fleet has run" })).getByText("$24.00")).toBeTruthy();
+    expect(screen.getByText("new-researcher")).toBeTruthy();
+    expect(screen.queryByText("Nobody has submitted work yet")).toBeNull();
+  });
+
+  it("refreshes same-scope applied pools from the visible inventory action", async () => {
+    const { client, calls } = fakeClient(authority("fleet_admin"));
+    const pool: CapacityPoolSummary = {
+      id: "pool-1",
+      fleetName: "refreshed-research-fleet",
+      acceleratorType: "v6e-8",
+      capacityClass: "spot",
+      zone: "us-east5-a",
+      region: "us-east5",
+      maxCells: 1,
+      minCells: 0,
+      enabled: true,
+    };
+    calls.listCapacityPools.mockResolvedValue([pool]);
+    const page = renderApp(client);
+    await showPanel("Fleet");
+    await screen.findByText(pool.fleetName);
+    const initialReads = calls.listCapacityPools.mock.calls.length;
+    page.rerender(<App client={client} identityProvider={identity} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(calls.listCapacityPools).toHaveBeenCalledTimes(initialReads);
+
+    calls.listCapacityPools.mockResolvedValue([{ ...pool, enabled: false, maxCells: 0 }]);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
+    await screen.findByText("Fleet inventory reloaded from Eyvan.");
+    await screen.findByText("1 pool(s) disabled");
+  });
+
   it("offers sign-out for a server-resolved OIDC identity without browser tokens", async () => {
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://issuer.example.com");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "dashboard");

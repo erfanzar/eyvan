@@ -347,7 +347,7 @@ def test_generation_service_invalidates_an_observed_empty_zone_without_removing_
     assert [entry.config.name for entry in cache.list()] == ["research-us-east5-b"]
 
 
-def test_a_denial_filtered_zone_keeps_its_cached_fleet_until_the_denial_expires(tmp_path) -> None:
+def test_a_denial_filtered_zone_keeps_its_cached_fleet_until_the_denial_expires(tmp_path, monkeypatch) -> None:
     """A cached denial expires; a plain ``up`` never regenerates.
 
     Deleting a zone whose every row the denial skipped would strand it past
@@ -376,13 +376,14 @@ def test_a_denial_filtered_zone_keeps_its_cached_fleet_until_the_denial_expires(
     assert [candidate.reason for candidate in result.skipped] == [AutoscaleSkipReason.CACHED_QUEUE_ADMISSION_DENIAL]
     assert [entry.config.name for entry in cache.list()] == ["research-us-east5-a"]
 
-    cache.record_queue_admission_denial(
-        project="project-a",
-        zone="us-east5-a",
-        accelerator_type="v5p-16",
-        capacity_class=CapacityClass.SPOT,
-        observed_at=datetime.now(UTC) - timedelta(hours=25),
-    )
+    expired_at = datetime.now(UTC) + timedelta(hours=24)
+
+    class AdvancedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return expired_at
+
+    monkeypatch.setattr("eyvan.capacity.autoscale.cache.datetime", AdvancedClock)
 
     assert [entry.config.name for entry in cache.list_eligible()] == ["research-us-east5-a"]
 

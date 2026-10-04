@@ -637,7 +637,11 @@ def capacity_fit(
     four-accelerator cell that fits in neither.
 
     ``admits`` is always a lower bound on the truth, and ``exact`` says whether
-    it is also an upper bound. Only an exact zero means "full".
+    it is also an upper bound. Only an exact zero means "full". The fit uses the
+    best single flavor per group. If multiple flavors can each host a cell,
+    different cells may use different flavors, so that fit is not an exact
+    multi-cell ceiling. Keep it inexact rather than pooling resources across
+    flavors or claiming a batch allocation that this observation does not make.
 
     Args:
         capacity: An observed or unknown ClusterQueue reading.
@@ -689,14 +693,20 @@ def capacity_fit(
         candidates = [flavor] if flavor and flavor in flavors_by_group[group] else sorted(flavors_by_group[group])
         best = -1
         best_resource = ""
+        fitting_flavors = 0
         for candidate in candidates:
             count, count_resource, count_exact = _flavor_group_fit(capacity, wanted, resources, group, candidate)
             if count is None:
                 continue
             exact = exact and count_exact
+            if count > 0:
+                fitting_flavors += 1
             if count > best:
                 best = count
                 best_resource = count_resource
+        # Separate cells may fit in separate flavors. The best single-flavor
+        # count is then only a lower bound, never a batch capacity ceiling.
+        exact = exact and fitting_flavors <= 1
         if best < 0:
             return CapacityFit(
                 state=ClusterCapacityState.UNKNOWN,

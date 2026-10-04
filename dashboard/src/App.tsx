@@ -230,6 +230,7 @@ export interface AppProps {
 export default function App({ client = apiClient, identityProvider = currentIdentity }: AppProps) {
   const [route, setRoute] = useState<Route>(() => parseRoute());
   const [snapshot, setSnapshot] = useState<AppSnapshot>({ authority: null, selectedScope: null, data: null });
+  const [auxiliaryRefreshRevision, setAuxiliaryRefreshRevision] = useState(0);
   const [selectedWorkload, setSelectedWorkload] = useState<WorkloadDetail | null>(null);
   const [detailAuthority, setDetailAuthority] = useState<SessionAuthority | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -358,6 +359,48 @@ export default function App({ client = apiClient, identityProvider = currentIden
           }
           const permissions = permissionsForResource(session, selected.orgId, selected.projectId);
           const capabilities = capabilitiesForResource(session, selected.orgId, selected.projectId);
+          const previous = snapshotRef.current;
+          const scopeChanged =
+            previous.selectedScope === null || scopeKey(previous.selectedScope) !== scopeKey(selected);
+          const authorityChanged =
+            previous.authority === null || authorityFingerprint(previous.authority) !== authorityFingerprint(session);
+          if (scopeChanged || authorityChanged) {
+            const pendingDetailFailure = detailFailureRef.current;
+            const preserveDetailFailure =
+              pendingDetailFailure !== null && pendingDetailFailure.workloadId === detailRouteIdRef.current;
+            invalidateScopeOperations();
+            // /session is authoritative before the data sweep settles. Never
+            // let a slow or failed read prolong a contradicted grant or form.
+            setSelectedWorkload(null);
+            setDetailAuthority(null);
+            setLoadingDetail(false);
+            updateDetailFailure(preserveDetailFailure ? pendingDetailFailure : null);
+            closeSubmitInteraction();
+            setSubmissionAcknowledgement(null);
+            setMobileNavigationOpen(false);
+            setToast(null);
+            let retainedData = !scopeChanged && permissions.includes("read") ? previous.data : null;
+            if (retainedData && !capabilities.manageFleet) {
+              // Project history may remain stale, but fleet inventory cannot
+              // survive revocation of the separate fleet-wide read capability.
+              retainedData = {
+                ...retainedData,
+                cells: [],
+                overview: computeOverview(
+                  retainedData.workloads,
+                  [],
+                  retainedData.budgets,
+                  retainedData.overview.queueTrend,
+                ),
+                access: { ...retainedData.access, fleetInventory: false },
+              };
+            }
+            desiredScopeRef.current = scopeSnapshot(selected);
+            const authoritative = { authority: session, selectedScope: selected, data: retainedData };
+            snapshotRef.current = authoritative;
+            setSnapshot(authoritative);
+            setRefreshWarning(retainedData ? "Refreshing dashboard data; showing the last successful snapshot." : null);
+          }
           try {
             data = await loadDashboardData(
               client,
@@ -383,32 +426,14 @@ export default function App({ client = apiClient, identityProvider = currentIden
         }
         if (!session || !selected || !data || !currentRequest()) return false;
 
-        const previous = snapshotRef.current;
-        const scopeChanged = previous.selectedScope === null || scopeKey(previous.selectedScope) !== scopeKey(selected);
-        const authorityChanged =
-          previous.authority === null || authorityFingerprint(previous.authority) !== authorityFingerprint(session);
-        if (scopeChanged || authorityChanged) {
-          const pendingDetailFailure = detailFailureRef.current;
-          const preserveDetailFailure =
-            pendingDetailFailure !== null && pendingDetailFailure.workloadId === detailRouteIdRef.current;
-          invalidateScopeOperations();
-          // Resource-scoped authority is a separate server snapshot. Never let
-          // an old detail grant or any open scope-bound interaction outlive a
-          // durable session change. A typed detail denial is inert route state
-          // and remains visible after the one reconciliation it requested.
-          setSelectedWorkload(null);
-          setDetailAuthority(null);
-          setLoadingDetail(false);
-          updateDetailFailure(preserveDetailFailure ? pendingDetailFailure : null);
-          closeSubmitInteraction();
-          setSubmissionAcknowledgement(null);
-          setMobileNavigationOpen(false);
-          setToast(null);
-        }
         desiredScopeRef.current = scopeSnapshot(selected);
         const next = { authority: session, selectedScope: selected, data };
         snapshotRef.current = next;
         setSnapshot(next);
+        // Stable scope-bound loaders do not change on a successful same-scope
+        // refresh. Advance their explicit trigger only after this fenced sweep
+        // commits, never for an unrelated render or rejected stale response.
+        setAuxiliaryRefreshRevision((revision) => revision + 1);
         setError(null);
         setRefreshWarning(null);
         return true;
@@ -596,6 +621,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
     // Provider quota is a property of the cloud project this fleet's pools
     // declare, so it is gated by the same authority that can read those pools.
     capacity: capabilities.manageFleet,
+    // Billing reads fleet-wide costs, not just the selected project's usage.
+    billing: capabilities.manageFleet,
     audit: canReadSelectedScope,
   };
   const routed = accessibleRoute(route, sectionAvailability);
@@ -676,8 +703,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     submitInteractionRef.current = interaction;
     setSubmitInteraction(interaction);
     setAvailableShapes({ shapes: [], loading: true, error: null });
-    client
-      .listAvailableShapes(immutableScope, scopeOperationAbortRef.current.signal)
+    withAuthorityRefresh(() => client.listAvailableShapes(immutableScope, scopeOperationAbortRef.current.signal))
       .then((shapes) => {
         // Discarded when the scope moved under it. Offering another project's
         // hardware would submit against a fleet this scope may not use, and the
@@ -803,7 +829,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     if (!capabilitiesForResource(snapshotRef.current.authority, fleetScope.orgId, fleetScope.projectId).manageFleet) {
       throw new ApiError("This session may not manage fleet capacity", 403);
     }
-    await client.drainCell(cellId, scopeOperationAbortRef.current.signal);
+    await withAuthorityRefresh(() => client.drainCell(cellId, scopeOperationAbortRef.current.signal));
     // Inventory rather than the one record: a cell's rendered shape is a join
     // against its live leases, and reconstructing that here would put a figure
     // on the page the next refresh disagrees with.
@@ -816,7 +842,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     if (!capabilitiesForResource(snapshotRef.current.authority, fleetScope.orgId, fleetScope.projectId).manageFleet) {
       throw new ApiError("This session may not manage fleet capacity", 403);
     }
-    await client.disableFleet(fleetName, scopeOperationAbortRef.current.signal);
+    await withAuthorityRefresh(() => client.disableFleet(fleetName, scopeOperationAbortRef.current.signal));
     await refreshFleet();
     await refreshDashboard(desiredScopeRef.current);
   };
@@ -911,13 +937,16 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const fleetScope = selectedScope ? scopeSnapshot(selectedScope) : configuredScope();
 
   const loadUsage = useCallback(
-    (signal: AbortSignal) => client.getProjectUsage(fleetScope, signal),
-    [client, fleetScope],
+    (signal: AbortSignal) => withAuthorityRefresh(() => client.getProjectUsage(fleetScope, signal)),
+    // Primitive scope fields, not the object: fleetScope is rebuilt on every
+    // parent render, and object identity here re-ran the effect (abort +
+    // reset + refetch) on every poll tick. Same shape as the loaders below.
+    [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
 
   const loadPools = useCallback(
-    (signal: AbortSignal) => client.listCapacityPools(fleetScope, signal),
-    [client, fleetScope],
+    (signal: AbortSignal) => withAuthorityRefresh(() => client.listCapacityPools(fleetScope, signal)),
+    [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
 
   const loadWarmth = useCallback(
@@ -1062,6 +1091,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
             onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
             loadPools={loadPools}
+            refreshRevision={auxiliaryRefreshRevision}
           />
         );
         break;
@@ -1078,7 +1108,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
         );
         break;
       case "billing":
-        content = <BillingPage loadBilling={loadBilling} loadUsage={loadUsage} />;
+        content = (
+          <BillingPage loadBilling={loadBilling} loadUsage={loadUsage} refreshRevision={auxiliaryRefreshRevision} />
+        );
         break;
       case "budgets":
         content = (

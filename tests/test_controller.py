@@ -2450,6 +2450,38 @@ async def test_manual_reconcile_is_rejected_on_a_follower() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lost_leader_does_not_replace_a_pending_workloads_newer_reason() -> None:
+    """A stale scheduling snapshot must not overwrite a successor's status."""
+
+    class Follower:
+        async def acquire(self) -> bool:
+            return False
+
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(repository, service, leader=Follower())
+    workload = WorkloadRecord(
+        id="wl-pending",
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(name="pending", execution=CommandExecution(command="echo pending")),
+        state=WorkloadState.PENDING,
+        created_by="alice",
+        scheduling_reason="newer leader reason",
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_workload(workload)
+
+    result = await controller.reconcile_once()
+
+    assert result.infeasibilities
+    async with repository.transaction() as transaction:
+        current = await transaction.get_workload(workload.id)
+    assert current is not None
+    assert current.scheduling_reason == "newer leader reason"
+
+
+@pytest.mark.asyncio
 async def test_the_daemon_stops_mid_cycle_when_it_loses_leadership() -> None:
     """A full leader cycle spans many provider round trips.
 
@@ -2696,7 +2728,7 @@ async def test_metadata_update_preserves_provider_observed_runtime_process_count
 
     updated, _ = await service.upsert_cell(
         principal(Role.FLEET_ADMIN),
-        original.model_copy(update={"unit_prices": {"tpu": 2.0}}),
+        original.model_copy(update={"labels": {"team": "research"}}),
         idempotency_key="cell-v2",
     )
 

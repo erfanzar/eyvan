@@ -26,7 +26,14 @@ database/object-store backups.
 5. Physical inventory is bounded, scope-explicit, current-object-only, and
    report-only by default. Reconciliation exact-reads each object before
    activating a row. It is additive and never treats a listing, size, or URI
-   alone as proof for deletion.
+   alone as proof for deletion. GCS orders filenames differently from logical
+   URIs when result IDs have punctuation or prefix relationships. Each public
+   GCS inventory call therefore scans the exact live scope with at most 32
+   provider requests, each limited to 1,000 objects and a 2 MiB response, retaining
+   only the smallest `limit+1` logical candidates after the cursor. It fails
+   inconclusively if that budget is exhausted or provider pages do not advance;
+   no partial result is returned. Repeated public pages repeat this bounded
+   scan, rather than translating the logical cursor to a physical filename.
 6. Recovery scans lifecycle rows and artifact-owned scopes with explicit
    caps. It resumes stranded uploads/deletions, quarantines contradictions,
    and reports when its finite scan was capped. Destructive collection
@@ -37,6 +44,14 @@ database/object-store backups.
    root. It never pathname-unlinks a generation while validation/deletion is
    active; bounded crash receipts are durably retired only after
    cleanup-safe completion, while unvalidated payload evidence is retained.
+   Fresh local roots use the versioned `layout-v2` control namespace with at most
+   16 permanent mutation stripe locks, shared across processes. These lock files
+   are never unlinked by collection. Successful mutations retire an empty
+   per-object generation directory only after closing its descriptor, while
+   holding the stripe, and fsync the parent. Nonempty directories (including
+   unknown files, anchors, and incomplete receipts) remain untouched. Legacy
+   lock layouts are refused, not silently migrated; see the maintenance boundary
+   below.
    GCS uses generation preconditions for create, exact read, and delete,
    with bounded subprocess timeouts.
 8. Provider or filesystem ambiguity raises an unavailable/inconclusive
@@ -82,6 +97,25 @@ Missing bytes, physical-only objects, and size discrepancies remain evidence
 to reconcile, not permission to delete. Recovery is exact lifecycle replay,
 additive metadata repair, a forward code/database repair, or restoration
 from matching snapshots — not mutation based on inference.
+
+## Local lock-layout maintenance boundary
+
+The bounded stripe protocol is initialized automatically **only for an empty
+local artifact root**. A populated root without `.locks/layout-v2`, an
+unversioned `.locks` directory (even if empty), or unexpected entries in the
+versioned lock directory is refused with a quiesced-maintenance error. Existing
+operator files and legacy per-object lock files are preserved. An interrupted
+initialization before the version directory is durable is likewise refused.
+
+Do not create the version marker over legacy locks, remove live locks, or run
+old and new local-store binaries against the same root. That would split the
+cross-process flock domain; a marker alone is not a safe migration. All old
+artifact readers/writers and controllers must be stopped before any cutover,
+and remain stopped until an explicitly reviewed migration/restore procedure
+and matching backups have been validated. This repair supplies no automatic
+cutover or operator-data cleanup command and does not authorize one. Existing
+roots therefore need a separately approved, rehearsed maintenance procedure;
+fresh disposable roots exercise the new protocol without migrating data.
 
 ## Migrations and API transitions
 

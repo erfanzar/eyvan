@@ -173,17 +173,14 @@ def test_a_soft_local_budget_becomes_hard_under_a_grant() -> None:
     assert _limit(budgets) == 100.0
 
 
-def test_a_grantee_with_no_local_budget_record_still_gets_a_limit() -> None:
-    """Without this, the plane with the least local configuration has no ceiling.
-
-    Which is exactly backwards: a peer that was handed a slice and never
-    configured a budget of its own is the one most likely to run unbounded.
-    """
+def test_a_grantee_without_durable_budget_accounting_has_zero_authority() -> None:
+    """A grant cannot replace the ledger that accumulates consumption."""
 
     budgets = federated_budgets([], [_grant(100.0)], plane_id="plane-b", now=NOW)
 
-    assert _limit(budgets) == 100.0
+    assert _limit(budgets) == 0.0
     assert budgets[0].hard_limit is True
+    assert budgets[0].spent == 0.0
 
 
 # --------------------------------------------------------------------------- lapsing
@@ -195,7 +192,8 @@ def test_an_expired_grant_authorizes_nothing() -> None:
 
     budgets = federated_budgets([], [_grant(100.0, hours=-2)], plane_id="plane-b", now=NOW)
 
-    assert budgets == []
+    assert _limit(budgets) == 0.0
+    assert budgets[0].hard_limit is True
 
 
 def test_a_revoked_grant_authorizes_nothing() -> None:
@@ -203,19 +201,18 @@ def test_a_revoked_grant_authorizes_nothing() -> None:
 
     budgets = federated_budgets([], [_grant(100.0, state=GrantState.REVOKED)], plane_id="plane-b", now=NOW)
 
-    assert budgets == []
+    assert _limit(budgets) == 0.0
+    assert budgets[0].hard_limit is True
 
 
-def test_an_expired_grant_leaves_a_local_budget_alone() -> None:
-    """Lapsing must not silently *widen* a limit either.
+def test_an_expired_grant_closes_even_a_funded_local_budget() -> None:
+    """Inactive inbound history must not fall back to independent local rights."""
 
-    A grantee whose grant expired falls back to its local record, which is the
-    conservative reading -- and the local record is what its own operator set.
-    """
+    budgets = federated_budgets([_budget(40.0, spent=10.0)], [_grant(100.0, hours=-2)], plane_id="plane-b", now=NOW)
 
-    budgets = federated_budgets([_budget(40.0)], [_grant(100.0, hours=-2)], plane_id="plane-b", now=NOW)
-
-    assert _limit(budgets) == 40.0
+    assert _limit(budgets) == 0.0
+    assert budgets[0].hard_limit is True
+    assert budgets[0].spent == 10.0
 
 
 # --------------------------------------------------------------------------- end to end

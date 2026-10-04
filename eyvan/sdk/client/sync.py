@@ -37,7 +37,7 @@ from eyvan.sdk.client.requests import (
     pool_workload_request,
     workload_list_params,
 )
-from eyvan.sdk.client.transport import EyvanUnavailableError, SyncApiTransport
+from eyvan.sdk.client.transport import EyvanUnavailableError, SyncApiTransport, read_deadline
 from eyvan.sdk.client.types import HeaderMap, QueryParams
 from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadEstimateRequest, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
@@ -379,28 +379,44 @@ class EyvanClient:
         # reported rather than waited on forever. Only transport failures are
         # forgiven; a 404 or a 403 is an answer and is raised at once.
         unreachable_since: float | None = None
-        while True:
-            try:
-                workload = self.get_workload(workload_id)
-            except EyvanUnavailableError:
-                now = time.monotonic()
-                if unreachable_since is None:
-                    unreachable_since = now
-                elif now - unreachable_since >= UNREACHABLE_GRACE_S:
-                    raise
-                if deadline is not None and now >= deadline:
-                    raise
-                time.sleep(min(poll_interval, max((deadline - now) if deadline is not None else poll_interval, 0)))
-                continue
-            unreachable_since = None
-            if on_update is not None:
-                on_update(workload)
-            if workload.state in TERMINAL_WORKLOAD_STATES:
-                return workload
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds")
-            delay = poll_interval if deadline is None else min(poll_interval, max(deadline - time.monotonic(), 0))
-            time.sleep(delay)
+        # Zero retains its historical single-observation behavior. Positive
+        # deadlines also cover SDK reads performed by the progress observer.
+        with read_deadline(deadline if timeout else None):
+            while True:
+                if timeout and deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds")
+                try:
+                    workload = self.get_workload(workload_id)
+                except TimeoutError as exc:
+                    if not timeout or deadline is None or time.monotonic() < deadline:
+                        raise
+                    raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds") from exc
+                except EyvanUnavailableError as exc:
+                    now = time.monotonic()
+                    if unreachable_since is None:
+                        unreachable_since = now
+                    elif now - unreachable_since >= UNREACHABLE_GRACE_S:
+                        raise
+                    if deadline is not None and now >= deadline:
+                        raise TimeoutError(
+                            f"workload {workload_id!r} did not finish within {timeout:g} seconds "
+                            "and the control plane is currently unreachable"
+                        ) from exc
+                    time.sleep(min(poll_interval, max((deadline - now) if deadline is not None else poll_interval, 0)))
+                    continue
+                unreachable_since = None
+                if timeout and deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds")
+                if on_update is not None:
+                    on_update(workload)
+                if timeout and deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds")
+                if workload.state in TERMINAL_WORKLOAD_STATES:
+                    return workload
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"workload {workload_id!r} did not finish within {timeout:g} seconds")
+                delay = poll_interval if deadline is None else min(poll_interval, max(deadline - time.monotonic(), 0))
+                time.sleep(delay)
 
     def workload_action(
         self,

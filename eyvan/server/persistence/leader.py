@@ -58,9 +58,11 @@ class PostgresAdvisoryLeader:
                     still_owned = bool(
                         await self._connection.scalar(text(_LOCK_OWNERSHIP_SQL), {"lock_id": self.lock_id})
                     )
-                except Exception:
+                except BaseException as error:
                     connection, self._connection = self._connection, None
-                    await connection.close()
+                    await self._discard_uncertain_connection(connection)
+                    if not isinstance(error, Exception):
+                        raise
                 else:
                     if still_owned:
                         return True
@@ -70,13 +72,13 @@ class PostgresAdvisoryLeader:
                     connection, self._connection = self._connection, None
                     await connection.close()
             connection = await self.engine.connect()
-            connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
             try:
+                connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
                 acquired = bool(
                     await connection.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": self.lock_id})
                 )
-            except Exception:
-                await connection.close()
+            except BaseException:
+                await self._discard_uncertain_connection(connection)
                 raise
             if not acquired:
                 await connection.close()
@@ -91,5 +93,33 @@ class PostgresAdvisoryLeader:
             connection, self._connection = self._connection, None
             try:
                 await connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": self.lock_id})
-            finally:
+            except BaseException:
+                await self._discard_uncertain_connection(connection)
+                raise
+            else:
                 await connection.close()
+
+    @staticmethod
+    async def _discard_uncertain_connection(connection: AsyncConnection) -> None:
+        """End the physical session before returning an uncertain checkout.
+
+        Pool rollback/close does not release session advisory locks. A failed
+        statement may leave a healthy backend owning the lock, including when
+        acquisition succeeded on PostgreSQL but its result was lost.
+        """
+
+        async def discard() -> None:
+            await connection.invalidate()
+            await connection.close()
+
+        cleanup = asyncio.create_task(discard())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Finish invalidation even if shutdown cancels cleanup again.
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError

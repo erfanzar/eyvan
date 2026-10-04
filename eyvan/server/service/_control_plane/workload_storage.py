@@ -142,10 +142,15 @@ class WorkloadStorageMixin:
         as free to reuse.
         """
 
+        # A spec-level workspace is shared by all execution kinds. Claim it
+        # before considering callable-only fields so commands get the same
+        # admission lifecycle checks and retry/terminal reference accounting.
+        candidates: tuple[str | None, ...] = (spec.workspace.uri,) if spec.workspace is not None else ()
         execution = spec.execution
-        if not isinstance(execution, CallableExecution):
-            return ()
-        candidates = (execution.artifact_uri, execution.workspace_uri, execution.result_uri)
+        if isinstance(execution, CallableExecution):
+            # Keep legacy claims too: older durable specs and callable renderers
+            # can still consume the execution-level workspace.
+            candidates += (execution.artifact_uri, execution.workspace_uri, execution.result_uri)
         return tuple(dict.fromkeys(uri for uri in candidates if uri and is_managed_uri(uri)))
 
     async def _put_workload_keeping_references(self, tx: RepositorySession, workload: WorkloadRecord) -> None:

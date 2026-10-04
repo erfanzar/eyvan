@@ -131,10 +131,20 @@ class SubmissionMixin:
                 "metadata": dict(metadata or {}),
                 "max_retries": max_retries,
                 "max_failure_retries": max_failure_retries,
+                "max_preemption_retries": max_preemption_retries,
+                "checkpointable": checkpointable,
+                "checkpoint_hook": checkpoint_hook,
+                "checkpoint_output_uri": checkpoint_output_uri,
+                "can_submit_children": can_submit_children,
+                "priority_band": priority_band.value,
+                "intra_band_priority": intra_band_priority,
+                "checkpoint_grace_seconds": checkpoint_grace_seconds,
+                "estimated_duration_seconds": estimated_duration_seconds,
+                "named_assets": list(named_assets),
                 # Part of the fingerprint: the same command against a different
                 # working tree is a different submission, and a replay that
                 # ignored the tree would silently run yesterday's code.
-                "workspace": workspace.sha256 if workspace is not None else None,
+                "workspace": workspace.model_dump(mode="json") if workspace is not None else None,
                 # Part of what was asked for: the same command with a different
                 # dependency set is a different job, and a replay that ignored
                 # them would hand back a run built against yesterday's packages.

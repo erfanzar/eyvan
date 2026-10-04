@@ -250,7 +250,25 @@ class AutoscaleGenerationService:
                     )
                 )
                 continue
-            entries.append(cache.store(generated) if request.persist else cache.preview(generated))
+            entries.append(
+                cache.store(
+                    generated,
+                    refresh_generations=request.generations,
+                    preserve_types=tuple(
+                        row.accelerator_type
+                        for row in quota_rows
+                        if row.zone == zone
+                        and cache.blocks_queue_admission_denial(
+                            project=project,
+                            zone=zone,
+                            accelerator_type=row.accelerator_type,
+                            capacity_class=CapacityClass.SPOT,
+                        )
+                    ),
+                )
+                if request.persist
+                else cache.preview(generated)
+            )
             eligible_quotas.extend(candidate.availability for candidate in candidates)
 
         emitted_zones = {entry.config.provider.zone for entry in entries if entry.config.provider.zone is not None}

@@ -361,6 +361,10 @@ def server_ssl_options(mode: MutualTlsMode, files: MutualTlsFiles) -> dict[str, 
         "ssl_keyfile": files.private_key,
         "ssl_ca_certs": files.trust_bundle,
         "ssl_cert_reqs": int(ssl.CERT_REQUIRED if mode is MutualTlsMode.REQUIRED else ssl.CERT_OPTIONAL),
+        # Uvicorn builds SSLContext(ssl_version). On our supported Python >=3.11,
+        # PROTOCOL_TLS_SERVER defaults to a TLS 1.2 minimum while allowing TLS 1.3.
+        # ssl_version is supported by Uvicorn >=0.32; ssl_minimum_version is not.
+        "ssl_version": int(ssl.PROTOCOL_TLS_SERVER),
     }
 
 

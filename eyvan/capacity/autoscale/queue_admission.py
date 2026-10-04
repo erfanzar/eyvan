@@ -49,13 +49,19 @@ class QueueAdmissionDenialRecorder:
                 zone=zone,
                 accelerator_type=accelerator_type,
                 capacity_class=cell.capacity_class,
+                occurred_at=(
+                    cell.provider_failure_occurred_at if cell.provider_failure_generation == cell.generation else None
+                ),
+                event_id=cell.provider_failure_event_id,
             )
         )
 
     def _record_target(self, target: GcpQueueAdmissionDenialTarget | None) -> None:
         """Write one cache-compatible Spot target while treating the cache as optional."""
 
-        if target is None or target.capacity_class is not CapacityClass.SPOT:
+        if target is None or target.capacity_class is not CapacityClass.SPOT or target.occurred_at is None:
+            # Legacy status has no trustworthy event clock. It remains a durable
+            # denial, but a local reread cannot turn it into a new occurrence.
             return
         try:
             self._cache.record_queue_admission_denial(
@@ -63,6 +69,7 @@ class QueueAdmissionDenialRecorder:
                 zone=target.zone,
                 accelerator_type=target.accelerator_type,
                 capacity_class=target.capacity_class,
+                observed_at=target.occurred_at,
             )
         except (OSError, ValueError):
             # The provider's durable denial must remain visible when a local cache is unavailable or malformed.

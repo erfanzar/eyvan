@@ -71,6 +71,10 @@ IMAGE_REF_RE = re.compile(
     r"@(?P<digest>sha256:[0-9a-f]{64})\Z"
 )
 FORBIDDEN_WILDCARD_RE = re.compile(r"[*?\[\]{}]")
+# Match the release asset downloader's per-artifact hard limit. DSSE statements
+# are artifact data, not small metadata strings; base64 adds one third in size.
+MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+MAX_DSSE_PAYLOAD_BYTES = 192 * 1024 * 1024
 
 
 class VerificationError(ValueError):
@@ -94,9 +98,12 @@ def _reject_constant(value: str) -> NoReturn:
     _fail(f"non-finite JSON number is forbidden: {value}")
 
 
-def _load_json(path: Path, *, canonical: bool = False) -> Any:
+def _load_json(path: Path, *, canonical: bool = False, maximum: int | None = None) -> Any:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read() if maximum is None else handle.read(maximum + 1)
+        if maximum is not None and len(raw) > maximum:
+            _fail(f"{path} exceeds the {maximum}-byte limit")
     except OSError as error:
         _fail(f"cannot read {path}: {error}")
     try:
@@ -729,14 +736,24 @@ def _gate_scan(args: argparse.Namespace) -> None:
     high = critical = allowed = 0
     seen_findings: set[tuple[str, str, str, str, str]] = set()
     for result_index, result_value in enumerate(results):
-        result = _mapping(result_value, f"Trivy report Results[{result_index}]")
+        result_context = f"Trivy report Results[{result_index}]"
+        result = _mapping(result_value, result_context)
+        _string(result.get("Target"), f"{result_context}.Target")
+        # The locked workflow runs `trivy image --scanners vuln`: only OS and
+        # language-package targets establish a supported vulnerability analysis.
+        target_class = _string(result.get("Class"), f"{result_context}.Class")
+        if target_class not in {"os-pkgs", "lang-pkgs"}:
+            _fail(f"{result_context}.Class must identify an OS or language-package target")
+        _string(result.get("Type"), f"{result_context}.Type")
         vulnerabilities = result.get("Vulnerabilities")
         if vulnerabilities is None:
             continue
         for finding_index, finding_value in enumerate(_sequence(vulnerabilities, "Trivy vulnerabilities")):
             context = f"Trivy report Results[{result_index}].Vulnerabilities[{finding_index}]"
             finding = _mapping(finding_value, context)
-            severity = _string(finding.get("Severity"), f"{context}.Severity").upper()
+            severity = _string(finding.get("Severity"), f"{context}.Severity")
+            if severity not in {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+                _fail(f"{context}.Severity is not a supported Trivy severity")
             if severity not in {"HIGH", "CRITICAL"}:
                 continue
             vulnerability, package, purl, version = _finding_identity(finding, context)
@@ -832,6 +849,150 @@ def _verify_image_metadata(args: argparse.Namespace) -> None:
     print(f"{args.role}: image metadata and linux/amd64 platform verified")
 
 
+def _rendered_image_values(text: str) -> list[str]:
+    """Read image fields in block-style Helm YAML, refusing unsupported syntax.
+
+    This standalone stdlib verifier is deliberately not a general YAML parser.
+    Flow mappings, aliases, tags and multiline quoted scalars must be expanded
+    to block mappings before verification. Scalar flow lists used for command
+    arguments are supported; block-scalar data is never deployment evidence.
+    Known workload kinds must precede their pod specs; workload Lists and
+    duplicate mapping keys are refused rather than ambiguously interpreted.
+    """
+    found: list[str] = []
+    stack: list[tuple[int, str]] = []
+    seen_keys: set[tuple[int, tuple[str, ...], str]] = set()
+    block_indent: int | None = None
+    worker_env: tuple[int, bool] | None = None
+    kind: str | None = None
+    container_keys = {"containers", "initContainers", "ephemeralContainers"}
+    pod_spec_paths = {
+        "Pod": ("spec",),
+        "PodTemplate": ("template", "spec"),
+        "Deployment": ("spec", "template", "spec"),
+        "DaemonSet": ("spec", "template", "spec"),
+        "StatefulSet": ("spec", "template", "spec"),
+        "ReplicaSet": ("spec", "template", "spec"),
+        "ReplicationController": ("spec", "template", "spec"),
+        "Job": ("spec", "template", "spec"),
+        "CronJob": ("spec", "jobTemplate", "spec", "template", "spec"),
+    }
+
+    def scalar(value: str) -> str:
+        match = re.fullmatch(r'("(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\'|[^\s].*?)(?:\s+#.*)?', value)
+        if match is None:
+            _fail("unsupported rendered YAML scalar; use single-line block mapping values")
+        value = match[1]
+        if value.startswith('"'):
+            try:
+                decoded = json.loads(value)
+            except ValueError:
+                _fail("unsupported rendered YAML quoted scalar")
+            return _string(decoded, "rendered YAML scalar", minimum=0)
+        if value.startswith("'"):
+            return value[1:-1].replace("''", "'")
+        if value[0] in "[{}&*!>|%@`" or ": " in value:
+            _fail("unsupported rendered YAML syntax; expand flow mappings, aliases and tags to block mappings")
+        return value
+
+    for line_number, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if not stripped or stripped.startswith("#"):
+            continue
+        if block_indent is not None:
+            if indent > block_indent:
+                continue
+            block_indent = None
+        if "\t" in line[: indent + 1]:
+            _fail(f"unsupported rendered YAML indentation at line {line_number}")
+        if stripped in {"---", "..."}:
+            if worker_env is not None and not worker_env[1]:
+                _fail("native-worker image environment must have a literal value")
+            stack.clear()
+            seen_keys.clear()
+            worker_env = None
+            kind = None
+            continue
+        sequence_item = stripped.startswith("- ")
+        if sequence_item:
+            stripped = stripped[2:].lstrip()
+            indent += 2
+            # Each sequence item is a fresh mapping, not a duplicate of the
+            # preceding container/env/port item at the same indentation.
+            seen_keys = {identity for identity in seen_keys if identity[0] < indent}
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = [key for _, key in stack]
+        pod_spec_path = pod_spec_paths.get(kind or "")
+        in_container = (
+            pod_spec_path is not None
+            and tuple(path[: len(pod_spec_path)]) == pod_spec_path
+            and len(path) > len(pod_spec_path)
+            and path[len(pod_spec_path)] in container_keys
+        )
+        in_env = in_container and len(path) == len(pod_spec_path) + 2 and path[-1] == "env"
+        if worker_env is not None and (not in_env or sequence_item):
+            if not worker_env[1]:
+                _fail("native-worker image environment must have a literal value")
+            worker_env = None
+        match = re.fullmatch(r'("(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\'|[A-Za-z0-9_.-]+):(?:\s+(.*)|\s*)', stripped)
+        if match is None:
+            # Plain scalar sequence entries (e.g. tolerations/arguments) cannot
+            # introduce hidden container mappings. Anything else is refused.
+            if not sequence_item or in_env or (path and path[-1] in container_keys):
+                _fail(f"unsupported rendered YAML mapping at line {line_number}")
+            scalar(stripped)
+            continue
+        key = scalar(match[1])
+        identity = (indent, tuple(path), key)
+        if identity in seen_keys:
+            _fail(f"duplicate rendered YAML mapping key at line {line_number}: {key!r}")
+        seen_keys.add(identity)
+        value = (match[2] or "").strip()
+        if key in container_keys and tuple(path) != pod_spec_path and kind not in {"ConfigMap", "Secret"}:
+            _fail("unsupported rendered container location; use a known workload kind before its block-style pod spec")
+        if not value or value.startswith("#"):
+            if in_env and key == "valueFrom" and worker_env is not None:
+                _fail("native-worker image environment must have a literal value")
+            stack.append((indent, key))
+            continue
+        if re.fullmatch(r"[|>][+-]?(?:\s+#.*)?", value):
+            if (key == "image" and in_container) or (in_env and key == "value"):
+                _fail("deployment image references must be single-line literal scalars")
+            block_indent = indent
+            continue
+        if value in {"{}", "[]"}:
+            continue
+        if value.startswith("["):
+            try:
+                items = json.loads(value)
+            except ValueError:
+                _fail("unsupported rendered YAML flow syntax; use block mappings")
+            if (
+                key in container_keys
+                or not isinstance(items, list)
+                or any(isinstance(item, (dict, list)) for item in items)
+            ):
+                _fail("unsupported rendered YAML flow mappings; use block mappings")
+            continue
+        parsed = scalar(value)
+        if indent == 0 and key == "kind":
+            if kind is not None or parsed.endswith("List"):
+                _fail("unsupported duplicate kind or workload list; render separate block-style documents")
+            kind = parsed
+        if in_container and len(path) == len(pod_spec_path) + 1 and key == "image":
+            found.append(parsed)
+        if in_env and key == "name" and parsed == "EYVAN_KUBERNETES_WORKER_IMAGE":
+            worker_env = (indent, False)
+        elif in_env and key == "value" and worker_env is not None and worker_env[0] == indent:
+            found.append(parsed)
+            worker_env = (indent, True)
+    if worker_env is not None and not worker_env[1]:
+        _fail("native-worker image environment must have a literal value")
+    return found
+
+
 def _verify_rendered_refs(args: argparse.Namespace) -> None:
     expected: dict[str, str] = {}
     for value in args.reference:
@@ -850,20 +1011,7 @@ def _verify_rendered_refs(args: argparse.Namespace) -> None:
     except OSError as error:
         _fail(f"cannot read rendered Helm output: {error}")
 
-    def scalar_values(key: str) -> list[str]:
-        pattern = re.compile(
-            rf"^\s*(?:-\s*)?{key}:\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s#]+))\s*(?:#.*)?$",
-            re.MULTILINE,
-        )
-        return [next(group for group in match.groups() if group is not None) for match in pattern.finditer(text)]
-
-    found = scalar_values("image")
-    repositories = [reference.rsplit("@", 1)[0] for reference in expected.values()]
-    for value in scalar_values("value"):
-        if any(
-            value == repository or value.startswith((f"{repository}@", f"{repository}:")) for repository in repositories
-        ):
-            found.append(value)
+    found = _rendered_image_values(text)
     if not found:
         _fail("rendered Helm output contains no deployment image references")
     mutable = sorted({item for item in found if "@sha256:" not in item or ":latest" in item.lower()})
@@ -949,7 +1097,7 @@ def _attestation_predicate_from_bundle(
     predicate_type: str,
     context: str,
 ) -> Any:
-    bundle = _mapping(_load_json(path), context)
+    bundle = _mapping(_load_json(path, maximum=MAX_ARTIFACT_BYTES), context)
     if bundle.get("mediaType") != "application/vnd.dev.sigstore.bundle.v0.3+json":
         _fail(f"{context} must use the Sigstore bundle v0.3 media type")
     envelope = _exact_keys(
@@ -967,10 +1115,18 @@ def _attestation_predicate_from_bundle(
             base64.b64decode(encoded_signature, validate=True)
         except (ValueError, base64.binascii.Error) as error:
             _fail(f"{context} DSSE signature is not valid base64: {error}")
-    encoded_payload = _string(envelope["payload"], f"{context} DSSE payload")
+    encoded_payload = _string(
+        envelope["payload"], f"{context} DSSE payload", maximum=4 * ((MAX_DSSE_PAYLOAD_BYTES + 2) // 3)
+    )
     try:
         payload = base64.b64decode(encoded_payload, validate=True)
-        statement = json.loads(payload.decode("utf-8", errors="strict"), object_pairs_hook=_pairs_no_duplicates)
+        if len(payload) > MAX_DSSE_PAYLOAD_BYTES:
+            _fail(f"{context} DSSE payload exceeds the {MAX_DSSE_PAYLOAD_BYTES}-byte limit")
+        statement = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_pairs_no_duplicates,
+            parse_constant=_reject_constant,
+        )
     except (ValueError, UnicodeError, json.JSONDecodeError, base64.binascii.Error) as error:
         _fail(f"{context} DSSE payload is not strict base64-encoded JSON: {error}")
     statement = _exact_keys(
@@ -995,7 +1151,7 @@ def _attestation_predicate_from_bundle(
 
 
 def _rekor_from_bundle(path: Path) -> dict[str, Any]:
-    bundle = _mapping(_load_json(path), "Sigstore bundle")
+    bundle = _mapping(_load_json(path, maximum=MAX_ARTIFACT_BYTES), "Sigstore bundle")
     verification = bundle.get("verificationMaterial")
     if isinstance(verification, dict):
         if bundle.get("mediaType") != "application/vnd.dev.sigstore.bundle.v0.3+json":
@@ -1264,8 +1420,13 @@ def _validate_receipt(value: Any, lock: dict[str, Any]) -> dict[str, Any]:
     wheel = _artifact(packages["wheel"], "receipt packages.wheel")
     sdist = _artifact(packages["sdist"], "receipt packages.sdist")
     normalized_version = version.replace("-", "_")
-    if not wheel["name"].startswith(f"eyvan-{normalized_version}") or not wheel["name"].endswith(".whl"):
-        _fail("receipt wheel filename does not match the release version")
+    compatibility_tag = r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*"
+    wheel_pattern = (
+        rf"eyvan-{re.escape(normalized_version)}-(?:[0-9][A-Za-z0-9_]*-)?"
+        rf"{compatibility_tag}-{compatibility_tag}-{compatibility_tag}\.whl"
+    )
+    if re.fullmatch(wheel_pattern, wheel["name"]) is None:
+        _fail("receipt wheel filename does not match the release version and wheel field structure")
     if sdist["name"] != f"eyvan-{version}.tar.gz":
         _fail("receipt sdist filename does not match the release version")
 

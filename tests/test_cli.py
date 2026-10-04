@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import typing as tp
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -41,7 +42,7 @@ from eyvan.capacity.autoscale import (
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.config import EyvanSettings
-from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState
+from eyvan.records import CapacityClass, CapacityPoolRecord, CellRecord, CellState, utcnow
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.commands import workloads as workload_commands
 from eyvan.sdk.contexts import get_active_context
@@ -609,8 +610,11 @@ def test_applying_a_fleet_does_not_borrow_the_active_fleets_endpoint(monkeypatch
     assert saved.exit_code == 0, saved.output
     assert other.exit_code == 0, other.output
 
-    applied = _invoke(monkeypatch, tmp_path, FakeClient(), "up")
-    assert applied.exit_code == 0, applied.output
+    fake = FakeClient()
+    applied = _invoke(monkeypatch, tmp_path, fake, "up")
+    assert applied.exit_code == 1, applied.output
+    assert "different saved control-plane endpoint" in applied.output
+    assert fake.calls == [], "an implicit apply must not write to the active fleet's unrelated plane"
 
     stored = json.loads((tmp_path / "eyvan-config.json").read_text())
 
@@ -1488,6 +1492,9 @@ def test_status_backfills_a_gcp_queue_admission_denial_into_autoscale_cache(monk
     denied = pool.make_cell("dev-fleet-v6e-8-0001").model_copy(
         update={
             "provider_failure_code": CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED,
+            "provider_failure_occurred_at": utcnow(),
+            "provider_failure_event_id": "queue-denial-dev-fleet-v6e-8-0001",
+            "provider_failure_generation": 1,
             "state": CellState.UNAVAILABLE,
         }
     )
@@ -1521,8 +1528,9 @@ def test_status_keeps_the_server_response_when_local_denial_cache_is_invalid(mon
             zone: str,
             accelerator_type: str,
             capacity_class: CapacityClass,
+            observed_at: datetime | None = None,
         ) -> None:
-            del project, zone, accelerator_type, capacity_class
+            del project, zone, accelerator_type, capacity_class, observed_at
             type(self).calls += 1
             raise ValueError("invalid local denial cache")
 
@@ -1530,6 +1538,9 @@ def test_status_keeps_the_server_response_when_local_denial_cache_is_invalid(mon
     denied = pool.make_cell("dev-fleet-v6e-8-0001").model_copy(
         update={
             "provider_failure_code": CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED,
+            "provider_failure_occurred_at": utcnow(),
+            "provider_failure_event_id": "queue-denial-dev-fleet-v6e-8-0001",
+            "provider_failure_generation": 1,
             "state": CellState.UNAVAILABLE,
         }
     )
@@ -1551,6 +1562,9 @@ def test_status_uses_the_active_context_autoscale_cache_directory(monkeypatch, t
     denied = pool.make_cell("dev-fleet-v6e-8-0001").model_copy(
         update={
             "provider_failure_code": CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED,
+            "provider_failure_occurred_at": utcnow(),
+            "provider_failure_event_id": "queue-denial-dev-fleet-v6e-8-0001",
+            "provider_failure_generation": 1,
             "state": CellState.UNAVAILABLE,
         }
     )
@@ -1974,7 +1988,7 @@ def test_workload_list_uses_the_active_scope_without_duplicate_flags(monkeypatch
 
 
 def test_workload_subcommand_scope_updates_real_development_auth_headers(monkeypatch, tmp_path) -> None:
-    app = create_app(settings=EyvanSettings(dev_auth_enabled=True))
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_store_uri=str(tmp_path / "artifacts")))
     config_path = tmp_path / "context.json"
     monkeypatch.setenv("EYVAN_CONFIG_FILE", str(config_path))
 

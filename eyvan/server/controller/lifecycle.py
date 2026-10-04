@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
+import threading
 import typing as tp
 import uuid
 import weakref
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -46,6 +48,10 @@ from eyvan.worker.agent.models import (
     MutationModel,
 )
 from eyvan.worker.runtime.node_health import HostReplacementBudget, host_replacement_budget_from_settings
+
+# Bound idle transport retention independently of historical fleet churn. Live
+# callers may retain evicted clients until their operations finish.
+_AGENT_CLIENT_CACHE_SIZE = 128
 
 
 class _ControllerLifecycle:
@@ -89,7 +95,9 @@ class _ControllerLifecycle:
         self.leader = leader or SingleProcessLeader()
         self.worker_id = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
         self._principal = _system_principal()
-        self._agent_clients: dict[str, CellAgentClient] = {}
+        self._agent_clients: OrderedDict[str, CellAgentClient] = OrderedDict()
+        self._live_agent_clients: weakref.WeakValueDictionary[str, CellAgentClient] = weakref.WeakValueDictionary()
+        self._agent_clients_lock = threading.Lock()
         # When each (workload, generation) was first observed unreadable. Held in
         # memory on purpose: losing it on a leader change only restarts the
         # grace period, which delays an escalation rather than triggering one
@@ -130,7 +138,10 @@ class _ControllerLifecycle:
         """Release cached HTTP pools and scheduler leadership."""
 
         if self._owns_agent_clients:
-            clients, self._agent_clients = list(self._agent_clients.values()), {}
+            with self._agent_clients_lock:
+                clients = list(self._live_agent_clients.values())
+                self._agent_clients.clear()
+                self._live_agent_clients.clear()
             for client in clients:
                 await asyncio.to_thread(client.close)
         await self.leader.release()
@@ -139,21 +150,35 @@ class _ControllerLifecycle:
         if not cell.endpoint:
             raise RuntimeError(f"cell {cell.id!r} has no cell-agent endpoint")
         key = f"{cell.endpoint}\0{self.settings.agent_shared_secret or ''}"
-        if key not in self._agent_clients:
-            if self.settings.mutual_tls_client_enabled:
-                mtls = self.settings.mutual_tls_files()
-                if not mtls.has_trust_anchor or not mtls.has_identity:
-                    raise MutualTlsConfigurationError(
-                        "an enabled mutual TLS client requires a trust bundle, certificate and private key"
+        with self._agent_clients_lock:
+            client = self._live_agent_clients.get(key)
+            if client is None:
+                if self.settings.mutual_tls_client_enabled:
+                    mtls = self.settings.mutual_tls_files()
+                    if not mtls.has_trust_anchor or not mtls.has_identity:
+                        raise MutualTlsConfigurationError(
+                            "an enabled mutual TLS client requires a trust bundle, certificate and private key"
+                        )
+                    client = CellAgentClient(
+                        cell.endpoint,
+                        token=self.settings.agent_shared_secret,
+                        mtls=mtls,
                     )
-                self._agent_clients[key] = CellAgentClient(
-                    cell.endpoint,
-                    token=self.settings.agent_shared_secret,
-                    mtls=mtls,
-                )
-            else:
-                self._agent_clients[key] = CellAgentClient(cell.endpoint, token=self.settings.agent_shared_secret)
-        return self._agent_clients[key]
+                else:
+                    client = CellAgentClient(cell.endpoint, token=self.settings.agent_shared_secret)
+                # A bound agent method handed to to_thread retains its agent.
+                # Eviction therefore drops only the cache's ownership; close
+                # the owned HTTP pool once the last caller releases the agent.
+                # Retain the transport, NOT client.close (which would retain the
+                # agent forever through the finalizer). HTTPX close is idempotent
+                # if controller shutdown has already closed this pool.
+                weakref.finalize(client, client.client.close)
+                self._live_agent_clients[key] = client
+            self._agent_clients[key] = client
+            self._agent_clients.move_to_end(key)
+            if len(self._agent_clients) > _AGENT_CLIENT_CACHE_SIZE:
+                self._agent_clients.popitem(last=False)
+            return client
 
     def _fleet_capacity_gate(self, fleet_name: str) -> _FleetCapacityGate:
         """Return the admission gate for one fleet's capacity operations."""

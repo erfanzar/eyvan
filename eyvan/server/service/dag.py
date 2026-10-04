@@ -123,25 +123,21 @@ def _topological_order(nodes: tp.Sequence[DagNode]) -> tuple[str, ...]:
         for pending in remaining.values():
             pending.difference_update(ready)
 
-    depth = _longest_chain(nodes)
+    depth = _longest_chain(nodes, order)
     if depth > MAX_DAG_DEPTH:
         raise DagError(f"DAG chain is {depth} nodes deep, above the {MAX_DAG_DEPTH}-node limit")
     return tuple(order)
 
 
-def _longest_chain(nodes: tp.Sequence[DagNode]) -> int:
-    """Return the longest path length, assuming the graph is already acyclic."""
+def _longest_chain(nodes: tp.Sequence[DagNode], order: tp.Sequence[str]) -> int:
+    """Return the longest path length using the already-validated topological order."""
 
     by_name = {node.name: node for node in nodes}
-    memo: dict[str, int] = {}
-
-    def depth(name: str) -> int:
-        if name not in memo:
-            predecessors = by_name[name].depends_on
-            memo[name] = 1 + max((depth(parent) for parent in predecessors), default=0)
-        return memo[name]
-
-    return max((depth(node.name) for node in nodes), default=0)
+    depths: dict[str, int] = {}
+    for name in order:
+        predecessors = by_name[name].depends_on
+        depths[name] = 1 + max((depths[parent] for parent in predecessors), default=0)
+    return max(depths.values(), default=0)
 
 
 __all__ = ("MAX_DAG_DEPTH", "DagError", "DagNode", "validate")

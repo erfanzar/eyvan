@@ -17,7 +17,17 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from eyvan.server.persistence.sqlalchemy import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", os.getenv("EYVAN_DATABASE_URL", config.get_main_option("sqlalchemy.url")))
+# An explicitly per-invocation URL (``eyvan-migrate --database-url``) must win
+# over the ambient environment variable: the safety classification in
+# migrate.py is evaluated against the config URL, so an unconditional env
+# override here would migrate a database other than the one that was
+# classified. The env var therefore only fills in a URL that nothing else
+# provided -- the plain source-tree ``alembic`` CLI flow, where alembic.ini's
+# placeholder is the only prior value.
+if not config.attributes.get("eyvan_explicit_database_url"):
+    database_url = os.getenv("EYVAN_DATABASE_URL", config.get_main_option("sqlalchemy.url"))
+    # Escape only at the ConfigParser boundary, not in the engine's URL.
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 

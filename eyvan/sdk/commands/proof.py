@@ -256,9 +256,12 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     """P5 -- a reclaimed Spot slice is a preemption, not a provider error.
 
     The distinguishing case, and the reason the run sets ``--max-retries 0``:
-    under the old shared budget the workload would have failed outright. So a
+    under the old shared budget the workload would have failed outright. A
     surviving workload whose *preemption* budget moved and whose *failure*
-    budget did not is the entire claim.
+    budget did not establishes budget charging. Current global cell inventory
+    cannot establish run-linked provider classification or cooldown history,
+    so those dimensions remain INCONCLUSIVE rather than qualifying this run
+    from another workload's evidence.
     """
 
     checks: list[Check] = []
@@ -298,86 +301,22 @@ def evaluate_spot_preemption(workload: dict, cells: tp.Sequence[dict], pools: tp
     else:
         checks.append(_passed("charged-to-the-preemption-budget", "only preemption_count moved"))
 
-    codes = {cell.get("provider_failure_code") for cell in cells if cell.get("provider_failure_code")}
-    if not codes:
-        checks.append(_unknown("classified-as-preempted", "no cell carries a provider_failure_code"))
-    elif "preempted" in codes:
-        checks.append(_passed("classified-as-preempted", f"cells report {sorted(codes)}"))
-    else:
-        checks.append(_failed("classified-as-preempted", f"expected 'preempted'; cells report {sorted(codes)}"))
-
-    # ``INTERRUPTED`` is the one provision outcome that records no failure and
-    # sets no cooldown (eyvan/domain/availability.py:114). A stockout would have
-    # started a 60s exponential backoff and a provider error a 15s one, so a cell
-    # in cooldown after a reclamation is the misclassification this proves
-    # against -- and it is worse than a wrong label, because a cooled-down pool
-    # stops being asked and the fleet quietly shrinks.
-    #
-    # The absence of a cooldown only means something while the cell that was
-    # reclaimed is still in the report. That cell is deleted and awaiting
-    # recreation by the time this runs, so once it is reaped an unhardened
-    # reading of "no cell is cooling" would report a *pass* for a build that
-    # still sets the cooldown -- qualifying the defect by garbage collection.
-    # Passing therefore requires a witness: the reclaimed cell, present and not
-    # cooling. Without one this is inconclusive, not proven.
-    #
-    # ``provider_failure_code`` alone is too thin a witness. It reports what the
-    # provider says *now*, so a pool that recreates the cell under its own id
-    # clears it the moment the replacement is healthy -- which is exactly when
-    # the workload finishes resuming and the rest of the proof becomes settleable.
-    # The criterion would then go inconclusive precisely on the runs that went
-    # best. ``availability.interruptions`` is the durable record of the same
-    # event and is the belief this criterion is actually about, so either will do.
-    #
-    # Read on the reclaimed cells only. The claim is about how *this
-    # reclamation* was classified, and a cooldown is recorded against the cell
-    # whose provision outcome produced it -- so a sibling's backoff, from a
-    # later and separately logged cause, is evidence about that cause instead.
-    # Scoping to the pool but not to the cell fails the proof for a transient
-    # provider error on a replacement that is already recovering, which is the
-    # same way an unrelated pool's backoff would have, and how a proof turns
-    # into something people re-run until it is green.
-    #
-    # And to cells touched after this workload was submitted. A cell reclaimed by
-    # an earlier run keeps its record -- and its cooldown -- long after it is
-    # deleted, so reading the pools' whole history failed a clean rerun on the
-    # fixed build for a cooldown the old build had set an hour before
-    # (2026-09-24). A record without timestamps is still read, as before.
-    pool_ids = {pool["id"] for pool in pools}
-    submitted = _instant(workload.get("created_at"))
-    mine = [
-        cell
-        for cell in cells
-        if cell.get("pool_id") in pool_ids
-        and not (submitted is not None and (touched := _instant(cell.get("updated_at"))) and touched < submitted)
-    ]
-    reclaimed = [
-        cell
-        for cell in mine
-        if cell.get("provider_failure_code") == "preempted"
-        or _is_positive_number((cell.get("availability") or {}).get("interruptions"))
-    ]
-    cooling = [cell["id"] for cell in reclaimed if (cell.get("availability") or {}).get("cooldown_until")]
-    witnesses = [cell["id"] for cell in reclaimed]
-    if cooling:
-        checks.append(
-            _failed(
-                "no-stockout-cooldown",
-                f"a reclamation put {len(cooling)} cell(s) into cooldown: {', '.join(sorted(cooling)[:3])}; "
-                "an interruption records no failure and sets none",
-            )
+    # These payloads are current, global inventory, not workload-linked event
+    # history. A pool label or updated_at after submission cannot prove which
+    # workload experienced a cell's provider event; interruptions also include
+    # earlier runs. Neither a sibling's preempted code nor its cooldown can
+    # qualify (or fail) this run. Preserve the public input signature, but leave
+    # these dimensions unknown until an authoritative run-linked observation is
+    # available. In particular, a cleared code after recovery is not a failure.
+    checks.append(
+        _unknown(
+            "classified-as-preempted",
+            "cell inventory does not link a provider classification to this workload's reclamation",
         )
-    elif not witnesses:
-        checks.append(
-            _unknown(
-                "no-stockout-cooldown",
-                "no cell reports the reclamation any more, so no cell is left to carry a cooldown; "
-                "this settles nothing about whether one was set",
-            )
-        )
-    else:
-        witnessed = ", ".join(sorted(witnesses)[:3])
-        checks.append(_passed("no-stockout-cooldown", f"the reclaimed cell(s) {witnessed} carry no cooldown"))
+    )
+    checks.append(
+        _unknown("no-stockout-cooldown", "cell inventory does not link cooldown evidence to this workload's reclamation")
+    )
 
     state = workload.get("state")
     if state in {"running", "succeeded"}:
@@ -484,6 +423,20 @@ def evaluate_warm_window(inside: dict, outside: dict, billing: dict, *, pool_id:
 # --------------------------------------------------------------------------- P4
 
 
+def _decoded_strings(value: object) -> tp.Iterator[str]:
+    """Inspect decoded leaves and keys, not an escaped debug representation."""
+
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _decoded_strings(key)
+            yield from _decoded_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _decoded_strings(item)
+
+
 def evaluate_secret_delivery(
     events: tp.Sequence[dict],
     workload: dict,
@@ -514,46 +467,85 @@ def evaluate_secret_delivery(
             (_unknown("secret-was-used", "the ledger shows no secret event; the mount was never exercised"),),
         )
 
-    # Once *per attempt*. Counting across the whole workload made the documented
-    # P4 run -- the value re-delivered to a second attempt -- fail with "expected
-    # exactly one; found 2", so the proof refused the very behaviour it exists to
-    # establish.
-    def _attempt(event: dict) -> object:
-        return (event.get("payload") or {}).get("attempt")
+    # One issuance grants all mounts, but each mount has its own redemption.
+    # Both records carry attempt and generation; reads do not carry the outbox
+    # identity, so duplicate issuances in the same scope cannot be disambiguated
+    # and must not qualify. Legacy nameless pairs remain comparable only with
+    # other nameless pairs, never as wildcards for named mounts.
+    def scope(event: dict) -> tuple[object, object]:
+        payload = event.get("payload") or {}
+        return payload.get("attempt"), payload.get("generation")
 
-    for name, matched in (("one-issuance", issued), ("one-read", read)):
-        per_attempt: dict[object, int] = {}
-        for event in matched:
-            per_attempt[_attempt(event)] = per_attempt.get(_attempt(event), 0) + 1
-        repeated = sorted(str(attempt) for attempt, count in per_attempt.items() if count != 1)
-        action = "secret.issued" if name == "one-issuance" else "secret.read"
-        if not matched:
-            checks.append(_failed(name, f"expected exactly one {action} per attempt; found none"))
-        elif repeated:
-            checks.append(
-                _failed(name, f"expected exactly one {action} per attempt; attempt(s) {', '.join(repeated)} had more")
+    issuances: dict[tuple[object, object], int] = {}
+    expected: set[tuple[object, object, object]] = set()
+    for event in issued:
+        identity = scope(event)
+        issuances[identity] = issuances.get(identity, 0) + 1
+        names = (event.get("payload") or {}).get("names")
+        for mount in names if names is not None else (None,):
+            expected.add((*identity, mount))
+    repeated = sorted(str(identity[0]) for identity, count in issuances.items() if count != 1)
+    if not issued:
+        checks.append(_failed("one-issuance", "expected exactly one secret.issued per attempt; found none"))
+    elif repeated:
+        checks.append(
+            _failed(
+                "one-issuance",
+                f"expected exactly one secret.issued per attempt; attempt(s) {', '.join(repeated)} had more",
             )
-        else:
-            checks.append(_passed(name, f"exactly one {action} in each of {len(per_attempt)} attempt(s)"))
-
-    # A read with no issuance in the same attempt is the signal a leaked token
-    # would produce, which is why both events exist rather than just the read.
-    attempts = {event.get("payload", {}).get("attempt") for event in issued}
-    orphans = [event for event in read if event.get("payload", {}).get("attempt") not in attempts]
-    if orphans:
-        checks.append(_failed("read-matches-an-issuance", f"{len(orphans)} read(s) with no issuance in that attempt"))
+        )
     else:
-        checks.append(_passed("read-matches-an-issuance", "every read has an issuance in its attempt"))
-    read_attempts = {_attempt(event) for event in read}
-    if len(read_attempts) > 1:
+        checks.append(_passed("one-issuance", f"exactly one secret.issued in each of {len(issuances)} attempt(s)"))
+
+    redemptions: dict[tuple[object, object, object], int] = {}
+    for event in read:
+        key = (*scope(event), (event.get("payload") or {}).get("name"))
+        redemptions[key] = redemptions.get(key, 0) + 1
+    duplicates = sorted(str(key[0]) for key, count in redemptions.items() if count != 1)
+    missing = expected - redemptions.keys()
+    if duplicates:
+        checks.append(
+            _failed(
+                "one-read", f"expected exactly one secret.read per mount; attempt(s) {', '.join(duplicates)} had more"
+            )
+        )
+    elif missing:
+        detail = f"{len(missing)} issued mount(s) have no secret.read in their attempt and generation"
+        unfinished = workload.get("state") in {
+            "pending",
+            "admitted",
+            "leased",
+            "dispatching",
+            "running",
+            "checkpointing",
+            "cancelling",
+        }
+        checks.append(_unknown("one-read", detail) if unfinished else _failed("one-read", detail))
+    elif not read or not expected:
+        checks.append(_failed("one-read", "expected exactly one secret.read per issued mount; found none"))
+    else:
+        checks.append(_passed("one-read", f"exactly one secret.read per mount in each of {len(issuances)} attempt(s)"))
+
+    orphans = redemptions.keys() - expected
+    if orphans:
+        checks.append(
+            _failed(
+                "read-matches-an-issuance",
+                f"{len(orphans)} read(s) with no issuance for that mount, attempt and generation",
+            )
+        )
+    else:
+        checks.append(_passed("read-matches-an-issuance", "every read matches an issued mount, attempt and generation"))
+    read_attempts = {scope(event)[0] for event in read}
+    if len(read_attempts) > 1 and not missing and not orphans and not duplicates:
         checks.append(_passed("redelivered", f"the value was issued and read afresh in {len(read_attempts)} attempts"))
 
     leaks = []
     if secret_value in logs:
         leaks.append("the workload log")
-    if secret_value in repr(workload):
+    if any(secret_value in value for value in _decoded_strings(workload)):
         leaks.append("the workload record")
-    if any(secret_value in repr(event) for event in events):
+    if any(secret_value in value for value in _decoded_strings(list(events))):
         leaks.append("an audit payload")
     if leaks:
         checks.append(_failed("value-never-recorded", f"the secret value appears in {', '.join(leaks)}"))
@@ -791,27 +783,29 @@ def evaluate_structured_logs(page: dict, *, expected_ranks: int) -> ProofResult:
         return ProofResult("P2", (_unknown("structured-records", "the page was empty; nothing was attributed"),))
     checks.append(_passed("structured-records", f"{len(records)} record(s)"))
 
-    # The fields structured logs add over concatenated text. A page of messages
-    # with none of them is `logs()` in a different shape.
-    stamped = [r for r in records if r.get("timestamp")]
-    if stamped:
-        checks.append(_passed("records-carry-a-timestamp", f"{len(stamped)}/{len(records)} timestamped"))
-    else:
-        checks.append(
-            _failed(
-                "records-carry-a-timestamp",
-                "no record carries a timestamp; merge_pages orders by it, so multi-rank pages "
-                "collapse to rank order and interleaving is lost",
-            )
-        )
-    if any(r.get("stream") in {"stdout", "stderr"} for r in records):
-        checks.append(_passed("records-carry-a-stream", "stdout/stderr preserved"))
-    else:
-        checks.append(_failed("records-carry-a-stream", "every record reports stream 'unknown'"))
-    if any(r.get("cursor") for r in records):
-        checks.append(_passed("records-are-resumable", "records carry backend cursors"))
-    else:
-        checks.append(_failed("records-are-resumable", "no record carries a cursor, so no follower can resume"))
+    # Every producing record must preserve its metadata. One healthy host must
+    # not qualify another host's message-only output. Unavailable ranks live in
+    # truncated_ranks, not in synthetic records needing these fields.
+    required: tuple[tuple[str, tp.Callable[[dict], bool], str], ...] = (
+        ("records-carry-a-timestamp", lambda record: _instant(record.get("timestamp")) is not None, "usable timestamps"),
+        (
+            "records-carry-a-stream",
+            lambda record: record.get("stream") in {"stdout", "stderr"},
+            "stdout/stderr attribution",
+        ),
+        (
+            "records-are-resumable",
+            lambda record: isinstance(record.get("cursor"), str) and bool(record["cursor"]),
+            "backend cursors",
+        ),
+    )
+    for name, valid, detail in required:
+        missing = [record for record in records if not valid(record)]
+        if missing:
+            ranks = ", ".join(sorted({str(record.get("rank")) for record in missing}))
+            checks.append(_failed(name, f"{len(missing)} record(s) on rank(s) {ranks} lack {detail}"))
+        else:
+            checks.append(_passed(name, f"all {len(records)} records preserve {detail}"))
 
     seen = {r.get("rank") for r in records} | set(page.get("truncated_ranks") or [])
     if expected_ranks <= 1:
@@ -935,6 +929,9 @@ class _ProofRun:
         on the P5 run of 2026-08-13.
         """
 
+        if self.receipt is not None and self.evidence is not None:
+            if Path(self.receipt).resolve() == Path(self.evidence).resolve():
+                _refuse("receipt and evidence paths must be distinct; raw observations must be retained separately")
         for label, path in (("receipt", self.receipt), ("evidence", self.evidence)):
             if path is None:
                 continue
@@ -986,14 +983,27 @@ class _ProofRun:
             return None
         from eyvan.secrets import redact_secret_material
 
-        payload = json.dumps(self.observations, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+        def redact(value: object) -> object:
+            # Copy decoded leaves before serialization escapes their characters.
+            # The fetched observations stay intact for evaluation.
+            if isinstance(value, dict):
+                return {
+                    redact_secret_material(str(key), secrets=self.secrets): redact(item) for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return [redact(item) for item in value]
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            return redact_secret_material(str(value), secrets=self.secrets)
+
+        payload = json.dumps(redact(self.observations), indent=2, sort_keys=True, ensure_ascii=False)
         # Opened owner-only rather than narrowed afterwards: a plane document
         # carries fields this run has no way to exhaustively redact, and the
         # window between creating it under the umask and chmod-ing it is exactly
         # long enough for another process on a shared host to read it.
         descriptor = os.open(self.evidence, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(redact_secret_material(payload, secrets=self.secrets))
+            handle.write(payload)
         return file_evidence(self.evidence)
 
     def record(self, result: ProofResult) -> None:
@@ -1020,6 +1030,7 @@ class _ProofRun:
                 evidence=evidence,
                 fleet_builds=self._fleet_builds(),
             ),
+            replace_existing=False,
         )
 
 
@@ -1476,6 +1487,44 @@ def evaluate_receipt(
                 f"this receipt qualifies {recorded_source}, and this build is {running}",
             )
         )
+
+    # Requirements are proof-specific: P7 talks directly to Kubernetes, while
+    # P1/P6 judge plane metadata/accounting without workload execution. P2-P5
+    # also depend on the agents/workers that ran the observed workload. The CLI
+    # build alone cannot identify any of those backends.
+    proof_id = document.get("proof")
+    if proof_id in {"P1", "P2", "P3", "P4", "P5", "P6"}:
+        plane = document.get("plane")
+        plane_build = plane.get("build") if isinstance(plane, dict) else None
+        plane_source = plane_build.get("source_digest") if isinstance(plane_build, dict) else None
+        if not isinstance(plane_source, str) or not plane_source or not isinstance(running, str) or not running:
+            checks.append(_unknown("plane-current", "the plane or candidate has no source digest to compare"))
+        elif plane_source != running:
+            checks.append(_failed("plane-current", "the observed control plane ran a different candidate"))
+        else:
+            checks.append(_passed("plane-current", "the observed control plane ran this candidate"))
+
+    if proof_id in {"P2", "P3", "P4", "P5"}:
+        fleet = document.get("fleet")
+        fleet = fleet if isinstance(fleet, dict) else {}
+        agreement = fleet.get("in_agreement")
+        fleet_plane = fleet.get("plane")
+        fleet_source = fleet_plane.get("source_digest") if isinstance(fleet_plane, dict) else None
+        if agreement is False:
+            checks.append(_failed("fleet-current", "the observed fleet explicitly ran different code from its plane"))
+        elif isinstance(fleet_source, str) and fleet_source and running and fleet_source != running:
+            checks.append(_failed("fleet-current", "the fleet build sweep observed a different control-plane candidate"))
+        elif (
+            agreement is not True
+            or not isinstance(fleet_source, str)
+            or not fleet_source
+            or not running
+            or not fleet.get("agents")
+            or fleet.get("unreachable")
+        ):
+            checks.append(_unknown("fleet-current", "the receipt does not establish complete fleet build agreement"))
+        else:
+            checks.append(_passed("fleet-current", "the observed fleet agrees with this candidate's plane"))
 
     return ProofResult(f"verify:{document.get('proof')}", tuple(checks))
 

@@ -31,9 +31,11 @@ from urllib.parse import urlsplit, urlunsplit
 import click
 
 from eyvan._internal.json_types import is_json_object
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
+from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER
 
 #: What a control plane listens on when nobody says otherwise. Shared with the
 #: server's own bind so `--port` is the exception rather than the ritual.
@@ -84,8 +86,9 @@ def resolve_url(host: str, port: int | None, *, scheme: str | None = None) -> st
     # only then fall back to the default. Defaulting first would silently
     # rewrite "host:9000" to port 8080.
     resolved_port = port or split.port or DEFAULT_CONTROL_PLANE_PORT
-    netloc = f"{split.hostname}:{resolved_port}"
-    return urlunsplit((split.scheme, netloc, split.path.rstrip("/"), "", ""))
+    hostname = f"[{split.hostname}]" if ":" in split.hostname else split.hostname
+    netloc = f"{hostname}:{resolved_port}"
+    return ControlPlaneEndpoint.parse(urlunsplit((split.scheme, netloc, split.path.rstrip("/"), "", ""))).url
 
 
 def probe(
@@ -229,10 +232,16 @@ def connect(
     """Resolve a plane, and save it as the active context when one fleet is clear."""
 
     url = resolve_url(host, port)
+    headers = session.identity.headers()
+    # The root resolved its identity for the previous context, not this host.
+    # Its owner credential is machine-local even when connect chooses a remote
+    # plane; retain explicit bearer/development identity without that secret.
+    if not ControlPlaneEndpoint.parse(url).is_loopback:
+        headers.pop(LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, None)
     target = probe_plane(
         url,
         token=token,
-        headers=session.identity.headers(),
+        headers=headers,
         org_id=org_id or session.org_id or DEFAULT_ORG_ID,
         project_id=project_id or session.project_id or DEFAULT_PROJECT_ID,
     )

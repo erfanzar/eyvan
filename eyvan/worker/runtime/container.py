@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -70,13 +71,13 @@ _CONTAINER_STOP_SETTLE_POLL_S = 0.5
 
 
 def _env_seconds(name: str, default: float) -> float:
-    """Read a non-negative seconds override, falling back on any bad value."""
+    """Read a finite, non-negative seconds override, falling back on any bad value."""
 
     try:
         value = float(os.getenv(name, str(default)))
     except ValueError:
         return default
-    return value if value >= 0.0 else default
+    return value if math.isfinite(value) and value >= 0.0 else default
 
 
 _HOST_ONLY_BASE_ENVIRONMENT = frozenset({"LOGNAME", "PATH", "PYTHONHOME", "SHELL", "USER", "VIRTUAL_ENV"})

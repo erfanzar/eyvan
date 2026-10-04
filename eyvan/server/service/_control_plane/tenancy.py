@@ -348,8 +348,29 @@ class TenancyMixin:
             for grant in principal.grants
             if grant.org_id is not None and grant.role in {Role.ORG_ADMIN, Role.PROJECT_ADMIN}
         }
+        # PROJECT_ADMIN authority is project-granular: within an organization
+        # where the caller administers only some projects, sibling projects'
+        # grants are another tenant's staff directory. Org-level rows and rows
+        # in the caller's own administered projects stay visible; an ORG_ADMIN
+        # keeps org-wide visibility.
+        administered_orgs = {
+            grant.org_id for grant in principal.grants if grant.org_id is not None and grant.role is Role.ORG_ADMIN
+        }
+        administered_projects = {
+            (grant.org_id, grant.project_id)
+            for grant in principal.grants
+            if grant.org_id is not None and grant.role is Role.PROJECT_ADMIN and grant.project_id is not None
+        }
         return [
-            item for item in grants if item.grant.org_id in visible and (org_id is None or item.grant.org_id == org_id)
+            item
+            for item in grants
+            if item.grant.org_id in visible
+            and (org_id is None or item.grant.org_id == org_id)
+            and (
+                item.grant.org_id in administered_orgs
+                or item.grant.project_id is None
+                or (item.grant.org_id, item.grant.project_id) in administered_projects
+            )
         ]
 
     async def active_grants_for(self, subject: str, *, now: datetime | None = None) -> tuple[RoleGrant, ...]:

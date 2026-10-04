@@ -7,7 +7,7 @@
 
 The dashboard used to keep OIDC tokens in ``sessionStorage`` — readable by any
 cross-site script — and send them as bearer headers. The replacement keeps one
-``eyvan_session`` cookie (HttpOnly, Secure, SameSite=Lax) in the browser and
+``__Host-eyvan_session`` cookie (HttpOnly, Secure, SameSite=Lax) in the browser and
 the tokens in this process. These tests hold that contract on the wire:
 
 * login redirects to the provider with a single-use PKCE transaction and sets
@@ -96,6 +96,13 @@ def _fake_provider(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, json={"error": "not found"})
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep app-created artifacts out of the operator's persistent HOME."""
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 @pytest.fixture()
 def client() -> tp.Iterator[TestClient]:
     app = create_app(
@@ -126,7 +133,7 @@ def client() -> tp.Iterator[TestClient]:
     transport = httpx.MockTransport(provider)
     provider_client = httpx.AsyncClient(transport=transport)
     app.state.dashboard_http_client = provider_client
-    with TestClient(app) as test_client:
+    with TestClient(app, base_url="https://plane.example.com") as test_client:
         yield test_client
     asyncio.run(provider_client.aclose())
 
@@ -150,7 +157,9 @@ def _begin(client: TestClient) -> tuple[str, str]:
     assert "HttpOnly" in set_cookie
     assert "Secure" in set_cookie
     assert "SameSite=lax" in set_cookie
-    assert "Path=/api/v1/dashboard/auth/callback" in set_cookie
+    assert f"{TRANSACTION_COOKIE}=" in set_cookie
+    assert "Path=/;" in set_cookie
+    assert "Domain=" not in set_cookie
     tx_value = next(
         part.split("=", 1)[1] for part in set_cookie.split(";") if part.strip().startswith(f"{TRANSACTION_COOKIE}=")
     )
@@ -272,7 +281,7 @@ def test_the_callback_verifies_the_id_token_nonce() -> None:
 
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    with TestClient(app) as test_client:
+    with TestClient(app, base_url="https://plane.example.com") as test_client:
         store: DashboardSessionStore = app.state.dashboard_sessions
         tx_token, state, nonce, _verifier = store.begin_transaction()
 

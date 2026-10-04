@@ -77,12 +77,30 @@ control-plane contracts, not an independent source of truth.
 ## Authentication and authorization
 
 `AuthGate` (`dashboard/src/auth/AuthGate.tsx`) first absorbs a loopback
-credential from the URL fragment, loads `/api/v1/dashboard/config` when baked
-OIDC settings are incomplete, and attempts OIDC PKCE completion before allowing
-`App` to render. Tokens, PKCE state/verifier/nonce, and expiry are held in
-session storage by `dashboard/src/auth/oidc.ts`. OIDC discovery is performed
-from the configured issuer. `?demo=1` or `VITE_EYVAN_DEMO=true` enables demo
-mode; explicit development auth is controlled by `VITE_EYVAN_DEV_AUTH`.
+credential from the URL fragment and loads `/api/v1/dashboard/config` when
+baked OIDC settings are incomplete. It then calls `serverIdentity()` in
+`dashboard/src/auth/oidc.ts` to probe `/api/v1/session` before rendering `App`
+for an OIDC session; a refused or missing session shows the sign-in screen.
+
+OIDC uses a backend-for-frontend boundary. `beginLogin()` navigates to
+`/api/v1/dashboard/auth/login`; the server performs issuer discovery and
+creates the PKCE state, verifier, and nonce. The identity provider returns to
+`/api/v1/dashboard/auth/callback`, where the server validates the transaction,
+exchanges the code, and stores the access and ID tokens, session state, and
+expiry server-side (`eyvan/server/api/dashboard_sessions.py`). The browser
+receives an opaque HttpOnly, Secure, SameSite=Lax session cookie, not OIDC
+tokens; JavaScript cannot read that cookie. Same-origin API requests carry it
+automatically, and `apiAuthHeaders()` does not construct an OIDC bearer header.
+Sign-out posts to `/api/v1/dashboard/auth/logout` to remove the server session
+and clear its cookie; an unconfirmed logout is reported rather than presented
+as success.
+
+The loopback-only development credential is a separate exception, not OIDC
+token storage: `eyvan dashboard` bridges it through the URL fragment,
+`absorbLocalCredentialFromLocation()` strips it from the address bar and stores
+it in `sessionStorage` under `eyvan.local.credential`, and API requests present
+it as `X-Eyvan-Local-Credential`. `?demo=1` or `VITE_EYVAN_DEMO=true` enables
+demo mode; explicit development auth is controlled by `VITE_EYVAN_DEV_AUTH`.
 
 The server-resolved `/session` response is authoritative for subject, scopes,
 roles, permissions, enabled state, and `accepts_new_work`. The UI derives

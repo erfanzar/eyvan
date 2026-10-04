@@ -90,6 +90,11 @@ class AuditMixin:
                     (item for item in existing if item.rank == rank),
                     UserProgressReport(rank=rank, attempt=workload.attempt),
                 )
+            if attempt > workload.attempt:
+                raise InputError(
+                    f"workload {workload_id!r} is at attempt {workload.attempt}; "
+                    f"progress cannot name future attempt {attempt}"
+                )
             topology = await tx.get_workload_topology(workload_id, workload.attempt)
             if topology is not None and not topology.contains_rank(rank):
                 raise InputError(
@@ -115,11 +120,10 @@ class AuditMixin:
             workload = await self._require_workload(tx, workload_id)
             self.authorizer.require(principal, Permission.READ, org_id=workload.org_id, project_id=workload.project_id)
             reports = await tx.list_progress_reports(workload_id)
-        # Reports from a superseded attempt are withheld rather than deleted: the
-        # row is overwritten on the next report from that rank, and showing an old
-        # attempt's step beside a new one's would be the backwards-walking display
-        # the write path already refuses to create.
-        return [report for report in reports if report.attempt >= workload.attempt]
+        # Noncurrent reports are withheld rather than deleted: the row is
+        # overwritten on the next report from that rank. This also withholds
+        # future-attempt rows accepted before the write guard was deployed.
+        return [report for report in reports if report.attempt == workload.attempt]
 
     async def record_artifact_access(
         self,
@@ -294,12 +298,12 @@ class AuditMixin:
     ) -> tuple[str, str]:
         """Return ``(reference, matched policy root)`` for one issued dispatch.
 
-        A workload id and attempt are not enough: an outbox retry can mint a
-        second set of capabilities without advancing either.  The signed fence
-        must match the exact durable reservation currently attached to the
-        workload, its generation, and every lease in that reservation.  While
-        the workload is still LEASED (the synchronous submit callback window),
-        the originating outbox claim must also remain live.
+        A workload id and attempt are not enough. The signed fence must match
+        the exact durable reservation currently attached to the workload, its
+        generation, and every unexpired lease in that reservation. While still
+        LEASED, the originating retryable outbox must retain the same reservation.
+        A lost submit response leaves remote acceptance unknown; clearing or
+        reclaiming the delivery claim does not revoke the admitted execution.
         """
 
         async with self.repository.transaction() as tx:
@@ -319,10 +323,14 @@ class AuditMixin:
                 and reservation.lease_ids == lease_ids
             )
             leases = tuple([await tx.get_lease(lease_id) for lease_id in lease_ids]) if exact_reservation else ()
+            moment = utcnow()
             exact_leases = bool(
                 leases
                 and all(
-                    lease is not None and lease.workload_id == workload.id and lease.generation == workload.generation
+                    lease is not None
+                    and lease.workload_id == workload.id
+                    and lease.generation == workload.generation
+                    and lease.expires_at > moment
                     for lease in leases
                 )
             )
@@ -344,10 +352,9 @@ class AuditMixin:
                         and command.aggregate_type == "workload"
                         and command.aggregate_id == workload.id
                         and command.generation == workload.generation
-                        and command.attempts == reservation.outbox_attempt
-                        and command.state is OutboxState.PROCESSING
-                        and command.claimed_until is not None
-                        and command.claimed_until > utcnow()
+                        and command.state in {OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED}
+                        # Claim expiry, reclamation, and refunded delivery attempts
+                        # do not change the reservation of a possibly-started RPC.
                         and persisted_reservation == reservation
                         and all(
                             lease is not None and lease.state in {LeaseState.PENDING, LeaseState.QUARANTINED}

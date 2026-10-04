@@ -313,8 +313,15 @@ def cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, s
 
 
 def _cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, save):
-    """An accepted DELETE is not independent cloud-absence proof."""
+    """Disable acquisition, then wait for owned cancellation and API cell deletion.
+
+    Cancellation acceptance is not terminal completion; conflicts while preemption
+    executes remain retryable within the same 120-second cleanup budget. API cell
+    deletion is still not independent cloud-absence proof.
+    """
     import time
+
+    from eyvan.sdk.client.transport import EyvanHTTPError
 
     deadline = time.monotonic() + 120
     client, transport = DeadlineClient(client, deadline), DeadlineClient(transport, deadline)
@@ -331,6 +338,9 @@ def _cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, 
         except Exception as exc:
             error("write-receipt", exc)
 
+    cancellation_requested = set()
+    unresolved = dict(pending)
+
     def cancel(role, entry):
         try:
             if entry["id"] is None:
@@ -344,12 +354,27 @@ def _cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, 
                 persist_cleanup()
             item = _retry_cleanup(lambda: client.get_workload(entry["id"]))
             _owned_workload(plan, item, entry["request"])
-            if item.state.value not in TERMINAL:
+            if item.state.value in TERMINAL:
+                return True
+            if role not in cancellation_requested:
                 _retry_cleanup(
                     lambda: client.workload_action(item.id, "cancel", idempotency_key=plan["run_id"] + "-cancel-" + role)
                 )
+                cancellation_requested.add(role)
+            # Acceptance can mean CANCELLING, not terminal. Read back on later polls.
+            return False
+        except EyvanHTTPError as exc:
+            if exc.status_code == 409 and exc.detail == (
+                "preemption is already executing; retry cancellation after it completes"
+            ):
+                # This refusal does not bind the key. Keep the same owned request
+                # eligible after a bounded delay, even if the fleet is already empty.
+                return False
+            error("cancel-" + role, exc)
+            return True
         except Exception as exc:
             error("cancel-" + role, exc)
+            return True
 
     def disable():
         status = transport.request_checked("GET", path).json()
@@ -365,11 +390,13 @@ def _cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, 
     except Exception as exc:
         error("disable-fleet", exc)
     finally:
-        for role, entry in pending.items():
-            cancel(role, entry)
-        if cleanup["teardown_requested"]:
-            try:
-                while time.monotonic() < deadline:
+        waiting_for_cells = cleanup["teardown_requested"]
+        while True:
+            for role, entry in list(unresolved.items()):
+                if cancel(role, entry):
+                    del unresolved[role]
+            if waiting_for_cells and time.monotonic() < deadline:
+                try:
                     status = transport.request_checked("GET", path).json()
                     _owned_fleet(plan, status)
                     cells = status.get("cells")
@@ -377,12 +404,18 @@ def _cleanup_owned(plan, client, transport, pending, receipt, *, fleet_started, 
                         raise RuntimeError("cell deletion status is unavailable")
                     if all(cell.get("state") == "deleted" for cell in cells):
                         cleanup["api_cells_deleted"] = True
-                        break
-                    time.sleep(2)
-                if not cleanup["api_cells_deleted"]:
-                    error("wait-for-cell-deletion", TimeoutError())
-            except Exception as exc:
-                error("wait-for-cell-deletion", exc)
+                        waiting_for_cells = False
+                except Exception as exc:
+                    error("wait-for-cell-deletion", exc)
+                    waiting_for_cells = False
+            remaining = deadline - time.monotonic()
+            if (not unresolved and not waiting_for_cells) or remaining <= 0:
+                break
+            time.sleep(min(2, remaining))
+        for role in unresolved:
+            error("cancel-" + role, TimeoutError())
+        if waiting_for_cells:
+            error("wait-for-cell-deletion", TimeoutError())
         persist_cleanup()
 
 
@@ -558,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import httpx
 
+    from eyvan._internal.plane_tls import control_plane_httpx_options
     from eyvan.sdk.client import ControlPlaneEndpoint, SyncApiTransport, resolve_control_plane_identity
     from eyvan.sdk.client.sync import EyvanClient
 
@@ -600,7 +634,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
         flush=True,
     )
-    with termination_cleanup(), httpx.Client(base_url=endpoint.url, timeout=5, trust_env=False) as http:
+    with (
+        termination_cleanup(),
+        httpx.Client(base_url=endpoint.url, timeout=5, trust_env=False, **control_plane_httpx_options()) as http,
+    ):
         client = EyvanClient(endpoint.url, identity=identity, client=http)
         transport = SyncApiTransport(endpoint, identity=identity, client=http)
         receipt = run_workflow(plan, client, transport, source, save=save)

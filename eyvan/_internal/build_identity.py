@@ -173,15 +173,23 @@ def _digest_tree(root: Path) -> tuple[str | None, str, int]:
         files it covers.
     """
 
+    def enumeration_failed(error: OSError) -> tp.NoReturn:
+        raise error
+
     entries: list[Path] = []
-    for directory, subdirectories, filenames in os.walk(root, followlinks=False):
-        subdirectories[:] = sorted(name for name in subdirectories if name not in _IGNORED_DIRECTORIES)
-        for filename in sorted(filenames):
-            if filename.endswith(_IGNORED_SUFFIXES):
-                continue
-            entries.append(Path(directory) / filename)
-            if len(entries) > _MAX_FILES:
-                return None, f"the package tree at {root} holds more than {_MAX_FILES} files", 0
+    try:
+        for directory, subdirectories, filenames in os.walk(root, followlinks=False, onerror=enumeration_failed):
+            subdirectories[:] = sorted(name for name in subdirectories if name not in _IGNORED_DIRECTORIES)
+            for filename in sorted(filenames):
+                if filename.endswith(_IGNORED_SUFFIXES):
+                    continue
+                entries.append(Path(directory) / filename)
+                if len(entries) > _MAX_FILES:
+                    return None, f"the package tree at {root} holds more than {_MAX_FILES} files", 0
+    except OSError as error:
+        # An unscannable directory (including a missing root) must not silently
+        # disappear from the digest. Avoid exposing arbitrary exception text.
+        return None, f"the package tree could not be enumerated ({type(error).__name__})", 0
 
     digest = hashlib.sha256()
     for path in sorted(entries, key=lambda item: item.relative_to(root).as_posix()):

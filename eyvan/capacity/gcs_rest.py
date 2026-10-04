@@ -110,7 +110,15 @@ class GcsRestObject:
         """
 
         if refresh or self._token is None:
-            self._token = self.token_source()
+            # Deferred for the same provider import-cycle reason as _default_token.
+            from eyvan.capacity.providers.gcp.accelerator_catalog import AcceleratorCatalogError
+
+            try:
+                self._token = self.token_source()
+            except AcceleratorCatalogError:
+                # Token subprocess diagnostics can contain credential material.
+                # Preserve per-call fallback without forwarding those diagnostics.
+                raise GcsRestError("could not mint a GCS access token") from None
         return {"Authorization": f"Bearer {self._token}"}
 
     def read(self) -> tuple[JsonObject | None, int]:

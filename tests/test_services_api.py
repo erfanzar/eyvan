@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import typing as tp
 from dataclasses import dataclass
 
@@ -61,6 +62,13 @@ HEALTH_PATH = "/api/v1/workloads/{service_id}/service-health"
 DECISIONS_PATH = "/api/v1/workloads/{service_id}/service-decisions"
 
 
+@pytest.fixture(autouse=True)
+def _owned_artifact_store(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """All application constructors in this module use test-owned artifact storage."""
+
+    monkeypatch.setenv("EYVAN_ARTIFACT_STORE_URI", str(tmp_path / "managed-artifacts"))
+
+
 def _operator(project: str = "research") -> Principal:
     return Principal(
         subject="alice",
@@ -86,6 +94,7 @@ class Plane:
     controller: EyvanController
     record: WorkloadRecord
     operator: Principal
+    artifact_store_uri: str
     _app: FastAPI | None = None
 
     def app(self) -> FastAPI:
@@ -98,7 +107,7 @@ class Plane:
 
         if self._app is None:
             self._app = create_app(
-                settings=EyvanSettings(dev_auth_enabled=True),
+                settings=EyvanSettings(dev_auth_enabled=True, artifact_store_uri=self.artifact_store_uri),
                 repository=self.repository,
                 service=self.service,
             )
@@ -124,6 +133,7 @@ async def _plane(policy: ServicePolicy, *, name: str = "api") -> Plane:
         controller=controller,
         record=record,
         operator=operator,
+        artifact_store_uri=os.environ["EYVAN_ARTIFACT_STORE_URI"],
     )
 
 

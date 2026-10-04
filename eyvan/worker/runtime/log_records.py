@@ -449,7 +449,7 @@ def _decode_v2_log_cursor(encoded: str) -> CursorOutcome:
         document = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except _DuplicateCursorKey as exc:
         return CursorInvalid(CURSOR_DUPLICATE_KEY, f"log cursor repeats the key {exc.args[0]!r}")
-    except (ValueError, TypeError, UnicodeDecodeError):
+    except (ValueError, TypeError, UnicodeDecodeError, RecursionError):
         return CursorInvalid(CURSOR_MALFORMED, "log cursor does not contain a JSON document")
     if not isinstance(document, dict):
         return CursorInvalid(CURSOR_MALFORMED, "log cursor document is not an object")
@@ -624,7 +624,10 @@ def _decode_v1_log_cursor(
         return CursorInvalid(CURSOR_MALFORMED, "log cursor carries no attempt")
     if not _CANONICAL_DECIMAL.match(attempt_text):
         return CursorInvalid(CURSOR_INVALID_ATTEMPT, f"log cursor attempt {attempt_text!r} is not a decimal integer")
-    attempt = int(attempt_text)
+    try:
+        attempt = int(attempt_text)
+    except ValueError:
+        return CursorInvalid(CURSOR_INVALID_ATTEMPT, "log cursor attempt exceeds the decimal conversion limit")
     if not remainder:
         return CursorResume(attempt=attempt, version=1)
     if not _LEGACY_RANK_PREFIX.match(remainder):
@@ -644,7 +647,10 @@ def _decode_v1_log_cursor(
             return CursorInvalid(CURSOR_RESET_REQUIRED, f"legacy log cursor nests a cursor at rank {rank_text}")
         if _leaf_too_large(cursor):
             return CursorInvalid(CURSOR_LEAF_TOO_LARGE, "log cursor exceeds the leaf size limit")
-        rank = int(rank_text)
+        try:
+            rank = int(rank_text)
+        except ValueError:
+            return CursorInvalid(CURSOR_INVALID_RANK, "log cursor rank exceeds the decimal conversion limit")
         if rank in seen:
             return CursorInvalid(CURSOR_DUPLICATE_RANK, f"legacy log cursor names rank {rank} twice")
         seen.add(rank)
@@ -1040,7 +1046,15 @@ def resolve_archive_position(
                 detail=f"archive offset {text!r} for rank {rank} is not a decimal integer",
                 position=position,
             )
-        offset = int(text)
+        try:
+            offset = int(text)
+        except ValueError:
+            return ArchiveGap(
+                rank=rank,
+                reason=ARCHIVE_POSITION_MALFORMED,
+                detail=f"archive offset for rank {rank} exceeds the decimal conversion limit",
+                position=position,
+            )
         if offset > len(line_cursors):
             return ArchiveGap(
                 rank=rank,
@@ -1094,7 +1108,11 @@ def log_page_from_json(payload: object) -> LogPage:
     A malformed payload becomes an ``unavailable`` page rather than an
     exception, for the same reason ``log_page`` returns one: a follower polling
     every second should not have to catch an exception to learn a host answered
-    badly, and "unavailable" is the honest description of what it got.
+    badly, and "unavailable" is the honest description of what it got. A missing
+    records list or unreadable record (including a missing/non-string message)
+    refuses the whole page with no next cursor, even if some entries are valid:
+    accepting its cursor could skip unreadable output on the next poll.
+    Timezone-less timestamps retain their messages but become unknown time.
 
     An unusable ``rank`` is preserved as :data:`INVALID_LOG_RANK` rather than
     coerced to ``0``, and a malformed ``truncated_ranks`` entry is preserved
@@ -1109,15 +1127,24 @@ def log_page_from_json(payload: object) -> LogPage:
     if not isinstance(payload, dict):
         return LogPage(unavailable=True, detail="native worker returned a non-object log page")
     raw_records = payload.get("records")
+    if not isinstance(raw_records, list):
+        return LogPage(unavailable=True, detail="native worker returned a log page without a records list")
     records: list[LogRecord] = []
-    for item in raw_records if isinstance(raw_records, list) else []:
-        if not isinstance(item, dict):
-            continue
+    for item in raw_records:
+        if not isinstance(item, dict) or not isinstance(item.get("message"), str):
+            # The page cursor covers every entry, including an unreadable one.
+            # Refuse the whole page so a corrected retry cannot skip that entry.
+            return LogPage(unavailable=True, detail="native worker returned a malformed log record")
         stamp = item.get("timestamp")
         parsed: datetime | None = None
         if isinstance(stamp, str) and stamp:
             try:
                 parsed = datetime.fromisoformat(stamp)
+                # A timezone-less value has unknown time provenance. Assigning
+                # local/UTC time would invent it, and comparing it with aware
+                # records would make an otherwise readable page unmergeable.
+                if parsed.utcoffset() is None:
+                    parsed = None
             except ValueError:
                 parsed = None
         rank = item.get("rank", 0)

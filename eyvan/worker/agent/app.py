@@ -344,7 +344,11 @@ def create_agent_app(
     def exec_in_workload(cell_id: str, remote_id: str, body: ExecRequest) -> JsonObject:
         """Run one diagnostic command beside a live workload."""
 
-        return service.exec_in_workload(cell_id, remote_id, body.command, timeout_s=body.timeout_s)
+        if body.runtime_rank is None:
+            return service.exec_in_workload(cell_id, remote_id, body.command, timeout_s=body.timeout_s)
+        return service.exec_in_workload(
+            cell_id, remote_id, body.command, timeout_s=body.timeout_s, runtime_rank=body.runtime_rank
+        )
 
     @app.get(
         "/api/v1/cells/{cell_id}/workloads/{remote_id}/log-page",

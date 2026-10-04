@@ -188,15 +188,15 @@ def collect(
     """
 
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
-    body: dict = {
+    params: dict[str, str | bool | int | float] = {
         "org_id": scope.org_id,
         "project_id": scope.project_id,
         "dry_run": not apply,
         "limit": limit,
     }
     if grace_period_s is not None:
-        body["grace_period_s"] = grace_period_s
-    _emit(session.client.request("POST", "/api/v1/artifacts/collect", json=body))
+        params["grace_period_s"] = grace_period_s
+    _emit(session.client.request("POST", "/api/v1/artifacts/collect", params=params))
 
 
 @artifacts.command("hold")

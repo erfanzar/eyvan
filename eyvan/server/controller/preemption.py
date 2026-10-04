@@ -84,7 +84,11 @@ class _ControllerPreemption:
                         source = await asyncio.to_thread(agent.workload, cell.id, workload.remote_id)
                         if source.status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
                             victim_outcomes[lease.id] = self._preemption_outcome(source.status)
-                            checkpoint_uris[workload.id] = None
+                            # A gang's members share one workload id: a sibling
+                            # that checkpointed first owns the recorded URI, and
+                            # this rank only proves the workload reached a
+                            # terminal state on its own cell.
+                            checkpoint_uris.setdefault(workload.id, None)
                             continue
                     if victim.checkpoint and victim.hook and workload.remote_id:
                         mutation = MutationModel(
@@ -123,7 +127,9 @@ class _ControllerPreemption:
                             timeout_s=victim.grace_period_seconds or self.settings.checkpoint_grace_s,
                         )
                         checkpoint_uri = checkpoint.checkpoint_uri or victim.output_uri
-                    checkpoint_uris[workload.id] = checkpoint_uri
+                    # Keep a sibling's real URI: a rank that finished without
+                    # producing one must not erase what another rank saved.
+                    checkpoint_uris[workload.id] = checkpoint_uri or checkpoint_uris.get(workload.id)
                 prepared = await self._advance_preemption_to_stopping(
                     prepared,
                     checkpoint_uris,
@@ -333,6 +339,9 @@ class _ControllerPreemption:
                         budgets=() if budget is None else (budget,),
                         quotas=await transaction.list_quotas(org_id=target.org_id),
                         policies=await transaction.list_policies(),
+                        grants=await transaction.list_budget_grants() if self.service.plane_id else [],
+                        quota_grants=await transaction.list_quota_grants() if self.service.plane_id else [],
+                        plane_id=self.service.plane_id,
                     )
                     current_plan = next(
                         (candidate for candidate in refreshed.preemptions if candidate.workload_id == target.id),
@@ -749,6 +758,7 @@ class _ControllerPreemption:
                         "lease_ids": (),
                         "dispatch_reservation": None,
                         "remote_id": None,
+                        "service_endpoint": None,
                         "checkpoint_uri": checkpoint_uri,
                         "scheduling_reason": "preempted; waiting to resume",
                         "preemption_id": None,

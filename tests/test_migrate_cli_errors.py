@@ -102,7 +102,8 @@ def test_a_password_never_reaches_the_error_text(
 
     error = capsys.readouterr().err
     assert "hunter2" not in error
-    assert "eyvan:***@db.internal" in error
+    assert "postgresql+asyncpg://db.internal:5432/eyvan" in error
+    assert "eyvan:***@" not in error
 
 
 def test_the_programmatic_entry_point_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:

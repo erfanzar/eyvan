@@ -833,7 +833,8 @@ class Scheduler:
                 cells=tuple(sorted((*static_failures, *dynamic_failures), key=lambda failure: failure.cell_id)),
             )
 
-        selected = sorted(candidates, key=lambda candidate: candidate[4])[: workload.cell_group_count]
+        ordered = sorted(candidates, key=lambda candidate: candidate[4])
+        selected = ordered[: workload.cell_group_count]
         total_reserved_cost = sum((candidate[2] for candidate in selected), Decimal(0))
         total_resource_hours = ResourceVector.total(candidate[3] for candidate in selected)
         if budgets and not self._budget_allows(
@@ -843,11 +844,30 @@ class Scheduler:
             accounting,
             budgets,
         ):
-            return Infeasibility(
-                workload_id=workload.workload_id,
-                code=InfeasibilityCode.BUDGET_EXCEEDED,
-                message=f"pod group reservation cost {total_reserved_cost} exceeds an ancestor budget",
-            )
+            # Every member reserves the same resources for the same duration,
+            # so exact-cardinality groups have identical resource-hours. Keep
+            # each preferred candidate only if the cheapest remaining members
+            # can complete an affordable group. This finds the lexicographically
+            # preferred feasible sequence without enumerating combinations or
+            # turning soft preferences into hard placement constraints.
+            selected = []
+            for index, candidate in enumerate(ordered):
+                remaining_count = workload.cell_group_count - len(selected) - 1
+                completion = heapq.nsmallest(remaining_count, ordered[index + 1 :], key=lambda item: item[2])
+                if len(completion) < remaining_count:
+                    break
+                completion_cost = sum((item[2] for item in (*selected, candidate, *completion)), Decimal(0))
+                if self._budget_allows(workload.identity, completion_cost, total_resource_hours, accounting, budgets):
+                    selected.append(candidate)
+                    if len(selected) == workload.cell_group_count:
+                        break
+            if len(selected) != workload.cell_group_count:
+                return Infeasibility(
+                    workload_id=workload.workload_id,
+                    code=InfeasibilityCode.BUDGET_EXCEEDED,
+                    message=f"pod group reservation cost {total_reserved_cost} exceeds an ancestor budget",
+                )
+            total_reserved_cost = sum((candidate[2] for candidate in selected), Decimal(0))
 
         leases = tuple(
             self._make_lease(workload, requested, cell, hourly_cost, reserved_cost, resource_hours)
@@ -1139,11 +1159,7 @@ class Scheduler:
         remaining = _EMPTY_RESOURCES if exclusive_busy else accounting.remaining(cell)
         deficit = self._deficit(requested, remaining)
         lower_priority = [lease for lease in cell_leases if lease.priority < workload.priority and lease.revocable]
-        eligible = [
-            lease
-            for lease in lower_priority
-            if lease.checkpoint_policy.checkpointable or lease.checkpoint_policy.allow_forced_termination
-        ]
+        eligible = [lease for lease in lower_priority if self._victim_eligible(lease, workload.priority)]
         eligible.sort(key=lambda lease: self._victim_sort_key(lease, deficit))
 
         reclaimed = ResourceVector()
@@ -1152,13 +1168,16 @@ class Scheduler:
         for lease in eligible:
             if lease.lease_id in chosen_ids:
                 continue
-            # A workload holding leases on several cells is one gang: stopping a
-            # strict subset leaves the survivors running a job that can no longer
-            # complete, holding accelerators nobody can reclaim. Take every
-            # sibling with it.
-            siblings = accounting.leases_for_workload(lease.workload_id)
-            victims = siblings if len(siblings) > 1 else (lease,)
-            if any(not victim.revocable for victim in victims):
+            # One workload attempt holding several cells is one gang: stopping
+            # a strict subset strands its surviving members. Other attempts are
+            # separate executions, not siblings. All members must independently
+            # satisfy the same priority and safe-stop policy as local victims.
+            victims = tuple(
+                sibling
+                for sibling in accounting.leases_for_workload(lease.workload_id)
+                if sibling.attempt == lease.attempt
+            )
+            if any(not self._victim_eligible(victim, workload.priority) for victim in victims):
                 continue
             for victim in victims:
                 if victim.lease_id in chosen_ids:
@@ -1253,6 +1272,14 @@ class Scheduler:
                 victim_count=len(selected),
             ),
             False,
+        )
+
+    @staticmethod
+    def _victim_eligible(lease: CapacityLease, priority: PriorityBand) -> bool:
+        return (
+            lease.priority < priority
+            and lease.revocable
+            and (lease.checkpoint_policy.checkpointable or lease.checkpoint_policy.allow_forced_termination)
         )
 
     @staticmethod

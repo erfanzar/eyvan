@@ -144,6 +144,7 @@ _MAX_GCS_OBJECT_NAME_BYTES = 1024
 _MAX_GCS_INVENTORY_URL_BYTES = 16 * 1024
 _MAX_GCS_INVENTORY_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_GCS_INTEGER_DIGITS = 20
+_MAX_GCS_INVENTORY_SCAN_PAGES = 32
 
 
 class InvalidArtifactToken(ValueError):
@@ -934,11 +935,40 @@ class LocalManagedArtifactStore:
     """
 
     _LOCK_DIRECTORY = ".locks"
+    _LOCK_LAYOUT_DIRECTORY = "layout-v2"
+    _LOCK_STRIPES = 16
     _GENERATION_DIRECTORY = ".generations"
 
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root).expanduser().resolve()
         create_private_directory(self.root)
+        self._ensure_lock_layout()
+
+    def _ensure_lock_layout(self) -> None:
+        """Initialize empty roots only; never migrate a legacy flock domain."""
+
+        maintenance_error = "local artifact lock layout requires quiesced operator maintenance; legacy files preserved"
+        try:
+            with self._open_directory((self._LOCK_DIRECTORY, self._LOCK_LAYOUT_DIRECTORY), create=False) as descriptor:
+                self._validate_control_directory(descriptor)
+        except FileNotFoundError:
+            with self._open_directory((), create=False) as root_fd:
+                with os.scandir(root_fd) as entries:
+                    if next(entries, None) is not None:
+                        raise InvalidManagedArtifactURI(maintenance_error) from None
+                # A concurrent constructor may see this incomplete initialization
+                # and refuse. It must never infer a legacy directory is safe.
+                os.mkdir(self._LOCK_DIRECTORY, mode=0o700, dir_fd=root_fd)
+                os.fsync(root_fd)
+            with self._open_control_directory(self._LOCK_DIRECTORY, create=False) as lock_fd:
+                os.mkdir(self._LOCK_LAYOUT_DIRECTORY, mode=0o700, dir_fd=lock_fd)
+                os.fsync(lock_fd)
+        allowed = {self._LOCK_LAYOUT_DIRECTORY, *(f"stripe-{index:02x}.lock" for index in range(self._LOCK_STRIPES))}
+        with self._open_control_directory(self._LOCK_DIRECTORY, create=False) as lock_fd:
+            with os.scandir(lock_fd) as entries:
+                for entry in entries:
+                    if entry.name not in allowed:
+                        raise InvalidManagedArtifactURI(maintenance_error)
 
     @staticmethod
     def _directory_open_flags() -> int:
@@ -1022,10 +1052,25 @@ class LocalManagedArtifactStore:
     @contextlib.contextmanager
     def _open_generation_directory(self, relative: Path, *, create: bool) -> tp.Iterator[int]:
         key = self._object_key(relative)
-        with self._open_control_directory(self._GENERATION_DIRECTORY, create=create):
+        with self._open_control_directory(self._GENERATION_DIRECTORY, create=create) as parent_fd:
             with self._open_directory((self._GENERATION_DIRECTORY, key), create=create) as descriptor:
                 self._validate_control_directory(descriptor)
+                identity = os.fstat(descriptor)
                 yield descriptor
+            # Mutation callers hold the stable stripe through descriptor close
+            # and directory retirement. Read-only anchor lookups never retire.
+            # rmdir itself proves emptiness; unknown receipts/anchors are kept.
+            if create:
+                current = os.stat(key, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
+                    raise ManagedArtifactDeleteInconclusiveError("local generation directory identity changed")
+                try:
+                    os.rmdir(key, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                        raise
+                else:
+                    os.fsync(parent_fd)
 
     def _relative_object(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> Path:
         return _relative_object_path(reference, org_id, project_id)
@@ -1040,7 +1085,8 @@ class LocalManagedArtifactStore:
         """Serialize cooperating writers while pathname safety remains independent."""
 
         relative = self._relative_object(reference, org_id, project_id).as_posix().encode("ascii")
-        lock_name = f"{hashlib.sha256(relative).hexdigest()}.lock"
+        stripe = int(hashlib.sha256(relative).hexdigest(), 16) % self._LOCK_STRIPES
+        lock_name = f"stripe-{stripe:02x}.lock"
         with self._open_control_directory(self._LOCK_DIRECTORY, create=True) as lock_directory_fd:
             common_flags = (
                 os.O_RDWR
@@ -1282,37 +1328,100 @@ class LocalManagedArtifactStore:
             )
         return ManagedArtifactWrite(metadata=existing.metadata, created=created)
 
+    def _recover_generation_stage(self, generation_fd: int, filename: str, payload: bytes) -> None:
+        """Remove only positively unpublished staging links under the object lock."""
+
+        staging_name = f".pending-{filename}.tmp"
+        try:
+            descriptor = self._open_object(generation_fd, staging_name)
+        except FileNotFoundError:
+            return
+        try:
+            metadata = self._regular_stat(descriptor, conflict_on_non_file=True)
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise ManagedArtifactWriteInconclusiveError("managed artifact staging ownership is unsafe")
+            if metadata.st_nlink == 2:
+                # Publication may have committed just before process death. The
+                # other link must be the complete digest anchor, not an alias.
+                anchor = self._open_object(generation_fd, filename)
+                try:
+                    anchored_payload, digest, anchored = self._read_regular_descriptor(
+                        anchor, retain_payload=True, conflict_on_non_file=True
+                    )
+                finally:
+                    os.close(anchor)
+                if (
+                    not self._same_inode(metadata, anchored)
+                    or filename != f"{digest}.artifact"
+                    or anchored_payload != payload
+                ):
+                    raise ManagedArtifactWriteInconclusiveError("managed artifact staging publication is ambiguous")
+            elif metadata.st_nlink != 1:
+                raise ManagedArtifactWriteInconclusiveError("managed artifact staging has unexpected hard links")
+            current = os.stat(staging_name, dir_fd=generation_fd, follow_symlinks=False)
+            if self._stable_stat_identity(current) != self._stable_stat_identity(metadata):
+                raise ManagedArtifactWriteInconclusiveError("managed artifact staging was replaced during recovery")
+            os.unlink(staging_name, dir_fd=generation_fd)
+            os.fsync(generation_fd)
+        finally:
+            os.close(descriptor)
+
     def _open_or_create_generation(
         self,
         generation_fd: int,
         filename: str,
         payload: bytes,
     ) -> tuple[int, bool]:
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOCTTY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
+        self._recover_generation_stage(generation_fd, filename, payload)
         created = False
         try:
-            descriptor = os.open(filename, flags, 0o600, dir_fd=generation_fd)
-            created = True
+            descriptor = self._open_object(generation_fd, filename)
+        except FileNotFoundError:
+            staging_name = f".pending-{filename}.tmp"
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOCTTY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            try:
+                descriptor = os.open(staging_name, flags, 0o600, dir_fd=generation_fd)
+            except OSError as exc:
+                self._translate_unsafe_path(exc)
             try:
                 self._write_descriptor(descriptor, payload)
                 os.fchmod(descriptor, 0o400)
                 os.fsync(descriptor)
-                os.fsync(generation_fd)
-            except Exception:
+                try:
+                    os.link(
+                        staging_name,
+                        filename,
+                        src_dir_fd=generation_fd,
+                        dst_dir_fd=generation_fd,
+                        follow_symlinks=False,
+                    )
+                    created = True
+                    os.fsync(generation_fd)
+                except FileExistsError:
+                    existing = self._open_object(generation_fd, filename)
+                    os.close(descriptor)
+                    descriptor = existing
+                self._recover_generation_stage(generation_fd, filename, payload)
+            except BaseException:
                 os.close(descriptor)
+                try:
+                    self._recover_generation_stage(generation_fd, filename, payload)
+                except (
+                    OSError,
+                    ManagedArtifactOperationInconclusiveError,
+                    ManagedArtifactConflictError,
+                    InvalidManagedArtifactURI,
+                ):
+                    pass
                 raise
-        except FileExistsError:
-            descriptor = self._open_object(generation_fd, filename)
-        except OSError as exc:
-            self._translate_unsafe_path(exc)
         try:
             observed_payload, observed_digest, metadata = self._read_regular_descriptor(
                 descriptor,
@@ -1327,7 +1436,7 @@ class LocalManagedArtifactStore:
             if metadata.st_nlink not in {1, 2}:
                 raise ManagedArtifactConflictError("managed artifact generation has unexpected hard links")
             return descriptor, created
-        except Exception:
+        except BaseException:
             os.close(descriptor)
             raise
 
@@ -1505,41 +1614,35 @@ class LocalManagedArtifactStore:
         parse_managed_uri(uri)
         return self.stat(uri, org_id=org_id, project_id=project_id) is not None
 
-    def _inventory_scope_directory(self, org_id: str, project_id: str) -> Path | None:
-        """Return one known scope directory without following directory links."""
+    @contextlib.contextmanager
+    def _inventory_scope_directory(self, org_id: str, project_id: str) -> tp.Iterator[int | None]:
+        """Pin one root-confined scope directory until inventory finishes."""
 
-        relative = Path("scopes", storage_scope(org_id, project_id))
-        current = self.root
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise ManagedArtifactInventoryError(f"could not stat managed artifact root: {exc}") from exc
-        if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
-            raise ManagedArtifactInventoryError("managed artifact root must remain a real directory")
-        for component in relative.parts:
-            current /= component
+        with contextlib.ExitStack() as stack:
             try:
-                metadata = current.lstat()
+                descriptor = stack.enter_context(
+                    self._open_directory(("scopes", storage_scope(org_id, project_id)), create=False)
+                )
             except FileNotFoundError:
-                return None
-            except OSError as exc:
-                raise ManagedArtifactInventoryError(f"could not stat managed artifact inventory scope: {exc}") from exc
-            if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
+                yield None
+                return
+            except (OSError, InvalidManagedArtifactURI) as exc:
                 raise ManagedArtifactInventoryError(
                     "managed artifact inventory scope must contain only real directories"
-                )
-        return current
+                ) from exc
+            yield descriptor
 
     def _local_inventory_metadata(
         self,
-        target: Path,
+        directory_fd: int,
+        filename: str,
         uri: str,
         relative: Path,
     ) -> ManagedArtifactObjectMetadata | None:
-        """Observe digest, size, and identity from one nonblocking descriptor."""
+        """Observe metadata relative to a pinned, no-follow kind directory."""
 
         try:
-            descriptor = os.open(target, self._object_open_flags())
+            descriptor = os.open(filename, self._object_open_flags(), dir_fd=directory_fd)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -1581,44 +1684,52 @@ class LocalManagedArtifactStore:
         """List a bounded page from exactly one explicitly supplied local scope."""
 
         cursor = _validate_inventory_page_request(cursor, limit)
-        scope = self._inventory_scope_directory(org_id, project_id)
-        if scope is None:
-            return ManagedArtifactInventoryPage(objects=())
         known = {kind.value: kind for kind in ManagedArtifactKind}
 
-        def observed() -> tp.Iterator[ManagedArtifactObjectMetadata]:
+        def observed(scope_fd: int) -> tp.Iterator[ManagedArtifactObjectMetadata]:
             try:
-                entries = tuple(os.scandir(scope))
+                with os.scandir(scope_fd) as entries:
+                    kinds = tuple(entries)
             except OSError as exc:
                 raise ManagedArtifactInventoryError(f"could not list managed artifact inventory scope: {exc}") from exc
-            for entry in entries:
+            for entry in kinds:
                 if entry.name not in known or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                     raise ManagedArtifactInventoryError("managed artifact inventory scope contains an unexpected entry")
                 kind = known[entry.name]
                 try:
-                    children = os.scandir(entry.path)
+                    kind_fd = os.open(entry.name, self._directory_open_flags(), dir_fd=scope_fd)
                 except OSError as exc:
                     raise ManagedArtifactInventoryError(
-                        f"could not list managed artifact inventory kind {kind.value!r}: {exc}"
+                        f"could not open managed artifact inventory kind {kind.value!r}"
                     ) from exc
-                with children:
-                    for child in children:
-                        if child.is_symlink() or not child.is_file(follow_symlinks=False):
-                            raise ManagedArtifactInventoryError(
-                                f"managed artifact inventory kind {kind.value!r} contains a non-file entry"
-                            )
-                        reference = self._reference_from_local_entry(kind, child.name)
-                        if cursor is not None and reference.uri <= cursor:
-                            continue
-                        relative = self._relative_object(reference, org_id, project_id)
-                        metadata = self._local_inventory_metadata(Path(child.path), reference.uri, relative)
-                        if metadata is None:
-                            raise ManagedArtifactInventoryError(
-                                "managed artifact disappeared while its inventory page was being observed"
-                            )
-                        yield metadata
+                try:
+                    with os.scandir(kind_fd) as children:
+                        for child in children:
+                            if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                                raise ManagedArtifactInventoryError(
+                                    f"managed artifact inventory kind {kind.value!r} contains a non-file entry"
+                                )
+                            reference = self._reference_from_local_entry(kind, child.name)
+                            if cursor is not None and reference.uri <= cursor:
+                                continue
+                            relative = self._relative_object(reference, org_id, project_id)
+                            metadata = self._local_inventory_metadata(kind_fd, child.name, reference.uri, relative)
+                            if metadata is None:
+                                raise ManagedArtifactInventoryError(
+                                    "managed artifact disappeared while its inventory page was being observed"
+                                )
+                            yield metadata
+                except OSError as exc:
+                    raise ManagedArtifactInventoryError(
+                        f"could not list managed artifact inventory kind {kind.value!r}"
+                    ) from exc
+                finally:
+                    os.close(kind_fd)
 
-        page = heapq.nsmallest(limit + 1, observed(), key=lambda item: item.uri)
+        with self._inventory_scope_directory(org_id, project_id) as scope_fd:
+            if scope_fd is None:
+                return ManagedArtifactInventoryPage(objects=())
+            page = heapq.nsmallest(limit + 1, observed(scope_fd), key=lambda item: item.uri)
         has_more = len(page) > limit
         selected = tuple(page[:limit])
         return ManagedArtifactInventoryPage(
@@ -2400,12 +2511,16 @@ class LocalManagedArtifactStore:
                 )
                 if candidate is not None:
                     descriptor, digest, metadata = candidate
-                    if digest != intent.digest or metadata.st_nlink != required_links:
-                        os.close(descriptor)
-                        candidate = None
-                    else:
-                        self._create_transaction_marker(transaction_fd, "validated")
-                        validated = True
+                    try:
+                        if digest == intent.digest and metadata.st_nlink == required_links:
+                            self._create_transaction_marker(transaction_fd, "validated")
+                            validated = True
+                    finally:
+                        # Ownership transfers to the truncation block only after
+                        # validation is durable, including both marker fsyncs.
+                        if not validated:
+                            os.close(descriptor)
+                            candidate = None
 
             if not validated:
                 self._complete_unvalidated_transaction(
@@ -3225,57 +3340,62 @@ class GCSManagedArtifactStore:
         cursor: str | None = None,
         limit: int = MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE,
     ) -> ManagedArtifactInventoryPage:
-        """List one bounded page of current live objects from one exact scope.
+        """Return the smallest logical URIs after the public cursor, or fail closed.
 
-        The GCS JSON API receives the scope as a server-side ``prefix``, an
-        explicit ``versions=false``/``softDeleted=false``, and
-        ``maxResults=limit+1``. The public
-        cursor remains the last canonical managed URI; it resumes through a
-        strict-successor ``startOffset`` while ``nextPageToken`` is used only as
-        bounded evidence that the provider has another page. Exactly one object
-        list request is consumed per call.
+        Appending a physical suffix changes prefix/punctuation ordering, so a
+        filename-ordered provider page cannot be merged with the logical index.
+        Scan the exact live scope with a fixed request budget and retain only
+        ``limit+1`` logical candidates. No partial page escapes an exhausted or
+        nonprogressing scan. Physical names and stored generations are unchanged.
         """
 
         cursor = _validate_inventory_page_request(cursor, limit)
-        maximum = limit + 1
-        prefix = self._scope_object_name_prefix(org_id, project_id)
+        maximum = MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE
         parameters = {
-            "prefix": prefix,
+            "prefix": self._scope_object_name_prefix(org_id, project_id),
             "maxResults": str(maximum),
             "versions": "false",
             "softDeleted": "false",
             "projection": "noAcl",
             "fields": _GCS_INVENTORY_FIELDS,
         }
-        cursor_name: str | None = None
-        if cursor is not None:
-            cursor_name = self._object_name(parse_managed_uri(cursor), org_id, project_id)
-            # GCS startOffset is inclusive. ``!`` sorts before every character
-            # permitted after a canonical result ID prefix (the minimum is
-            # ``-``), but ``cursor!`` still sorts after the cursor itself. It is
-            # therefore a strict lower bound that excludes the cursor even on a
-            # short provider page without skipping a longer canonical filename.
-            parameters["startOffset"] = f"{cursor_name}!"
         bucket = quote(self._bucket, safe="")
-        url = self._json_api_url(f"b/{bucket}/o", parameters)
-        payload = self._request_inventory_json(url)
-        assert payload is not None
-        parsed, next_page_token = self._parse_gcs_list_page(
-            payload,
-            org_id=org_id,
-            project_id=project_id,
-            maximum_items=maximum,
-        )
-        if cursor_name is not None and any(name <= cursor_name for name, _metadata in parsed):
-            raise ManagedArtifactInventoryError("GCS inventory cursor did not advance monotonically")
-        has_more = len(parsed) > limit or next_page_token is not None
-        selected = tuple(metadata for _name, metadata in parsed[:limit])
-        if has_more and not selected:
-            raise ManagedArtifactInventoryError("GCS inventory page token did not advance the public cursor")
-        return ManagedArtifactInventoryPage(
-            objects=selected,
-            next_cursor=selected[-1].uri if has_more else None,
-        )
+        candidates: list[ManagedArtifactObjectMetadata] = []
+        previous_name: str | None = None
+        seen_tokens: set[str] = set()
+        for _page in range(_MAX_GCS_INVENTORY_SCAN_PAGES):
+            url = self._json_api_url(f"b/{bucket}/o", parameters)
+            payload = self._request_inventory_json(url)
+            assert payload is not None
+            parsed, next_page_token = self._parse_gcs_list_page(
+                payload,
+                org_id=org_id,
+                project_id=project_id,
+                maximum_items=maximum,
+            )
+            if parsed and previous_name is not None and parsed[0][0] <= previous_name:
+                raise ManagedArtifactInventoryError("GCS inventory page did not advance monotonically")
+            if parsed:
+                previous_name = parsed[-1][0]
+            candidates = heapq.nsmallest(
+                limit + 1,
+                (
+                    *candidates,
+                    *(metadata for _name, metadata in parsed if cursor is None or metadata.uri > cursor),
+                ),
+                key=lambda metadata: metadata.uri,
+            )
+            if next_page_token is None:
+                selected = tuple(candidates[:limit])
+                return ManagedArtifactInventoryPage(
+                    objects=selected,
+                    next_cursor=selected[-1].uri if len(candidates) > limit else None,
+                )
+            if not parsed or next_page_token in seen_tokens:
+                raise ManagedArtifactInventoryError("GCS inventory page token did not advance")
+            seen_tokens.add(next_page_token)
+            parameters["pageToken"] = next_page_token
+        raise ManagedArtifactInventoryError("GCS inventory exhausted its bounded scan budget")
 
     def stat(
         self,

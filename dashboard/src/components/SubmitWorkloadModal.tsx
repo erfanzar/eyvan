@@ -41,13 +41,20 @@ const initialForm = {
   labels: "",
 };
 
-/** Split `A=1,B=2` into a map, dropping anything that is not a pair. */
-function parsePairs(value: string): Record<string, string> {
+/** Split `A=1,B=2` at each first equals sign; refuse malformed pairs. */
+function parsePairs(value: string, field: string): Record<string, string> {
+  if (!value.trim()) return {};
   return Object.fromEntries(
-    value
-      .split(",")
-      .map((entry) => entry.trim().split("=", 2))
-      .filter((entry): entry is [string, string] => entry.length === 2 && Boolean(entry[0]) && Boolean(entry[1])),
+    value.split(",").map((entry) => {
+      const pair = entry.trim();
+      const separator = pair.indexOf("=");
+      const key = pair.slice(0, separator);
+      const pairValue = pair.slice(separator + 1);
+      if (separator < 1 || !key.trim() || !pairValue.trim()) {
+        throw new Error(`${field} must contain comma-separated key=value pairs with nonempty keys and values.`);
+      }
+      return [key, pairValue];
+    }),
   );
 }
 
@@ -62,6 +69,7 @@ export function SubmitWorkloadModal({
 }: SubmitWorkloadModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
   const [form, setForm] = useState(initialForm);
   const [selected, setSelected] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -82,6 +90,11 @@ export function SubmitWorkloadModal({
   const zones = [...new Set(chosen.map((pool) => pool.zone).filter((zone): zone is string => Boolean(zone)))].sort();
   const classes = [...new Set(chosen.map((pool) => pool.capacityClass))].sort();
 
+  // Refresh the handler without releasing this open dialog's focus ownership.
+  useEffect(() => {
+    closeRef.current = onClose;
+  }, [onClose]);
+
   // Split from the effect below, and the split is load-bearing. `onClose` is a
   // closure the parent rebuilds every render, so an effect that depends on it
   // re-runs whenever anything above this form changes -- an arriving event, the
@@ -95,7 +108,11 @@ export function SubmitWorkloadModal({
     setError(null);
     setSelected("");
     previousFocus.current = document.activeElement as HTMLElement;
-    globalThis.setTimeout(() => dialogRef.current?.querySelector<HTMLElement>("select, input")?.focus(), 0);
+    const focusTimer = globalThis.setTimeout(
+      () => dialogRef.current?.querySelector<HTMLElement>("select, input")?.focus(),
+      0,
+    );
+    return () => globalThis.clearTimeout(focusTimer);
   }, [open]);
 
   useEffect(() => {
@@ -103,7 +120,7 @@ export function SubmitWorkloadModal({
     document.body.classList.add("modal-open");
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") closeRef.current();
       if (event.key !== "Tab" || !dialogRef.current) return;
       const focusable = Array.from(
         dialogRef.current.querySelectorAll<HTMLElement>(
@@ -127,7 +144,7 @@ export function SubmitWorkloadModal({
       document.body.classList.remove("modal-open");
       previousFocus.current?.focus();
     };
-  }, [onClose, open]);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -181,8 +198,8 @@ export function SubmitWorkloadModal({
         checkpointable: form.checkpointable,
         checkpointHook: form.checkpointable ? form.checkpointHook.trim() : undefined,
         checkpointUri: form.checkpointable ? form.checkpointUri.trim() : undefined,
-        environment: parsePairs(form.environment),
-        labels: parsePairs(form.labels),
+        environment: parsePairs(form.environment, "Environment"),
+        labels: parsePairs(form.labels, "Labels"),
       });
       setForm(initialForm);
       onClose();

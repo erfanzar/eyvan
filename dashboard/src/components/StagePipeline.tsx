@@ -358,7 +358,7 @@ export function StagePipeline({
     return (
       <StageLedger
         stages={stages}
-        terminal={status === "succeeded" || status === "failed" || status === "cancelled"}
+        terminal={STATE_TO_STAGE[status] === "settled"}
         bad={status === "failed" || status === "lost_agent"}
       />
     );

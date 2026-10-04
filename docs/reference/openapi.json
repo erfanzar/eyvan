@@ -912,6 +912,18 @@
             "title": "Period",
             "type": "string"
           },
+          "period_opening_spent": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Period Opening Spent"
+          },
           "period_started_at": {
             "anyOf": [
               {
@@ -933,6 +945,19 @@
             "default": 1,
             "title": "Revision",
             "type": "integer"
+          },
+          "settlement_period_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settlement Period Id"
           },
           "spent": {
             "default": 0,
@@ -2467,6 +2492,43 @@
               }
             ]
           },
+          "provider_failure_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 192,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Failure Event Id"
+          },
+          "provider_failure_generation": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Failure Generation"
+          },
+          "provider_failure_occurred_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Failure Occurred At"
+          },
           "provider_options": {
             "additionalProperties": {
               "$ref": "#/components/schemas/JsonValue"
@@ -3208,6 +3270,31 @@
           "capacity_class": {
             "$ref": "#/components/schemas/CapacityClass"
           },
+          "event_id": {
+            "anyOf": [
+              {
+                "maxLength": 192,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
+          },
+          "occurred_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred At"
+          },
           "provider_project": {
             "title": "Provider Project",
             "type": "string"
@@ -3555,6 +3642,19 @@
             "minimum": 0.0,
             "title": "Settled Cost",
             "type": "number"
+          },
+          "settlement_budget_period_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settlement Budget Period Id"
           },
           "settlement_reason": {
             "anyOf": [
@@ -5887,7 +5987,7 @@
         "type": "object"
       },
       "SecretRotationRequest": {
-        "description": "Body of the signed-credential rotation route.\n\nDeliberately materialless, and the only field is the overlap: the replica\nmints the new signing material itself and installs it in its own keyring, so\nno key is ever a request field a proxy log could carry.",
+        "description": "Body of the signed-credential rotation route.\n\nKept materialless for wire compatibility. The route refuses rotation until\nprotected shared credential distribution and startup recovery exist; an\noverlap alone cannot make a process-local key replacement deployment-wide.",
         "properties": {
           "overlap_s": {
             "anyOf": [
@@ -12790,7 +12890,7 @@
     },
     "/api/v1/secrets/rotate": {
       "post": {
-        "description": "Rotate the capability-signing credential without a restart.\n\nDrives the fenced lifecycle its ledger documents: ``begin`` commits the\nclaim and returns, this replica installs freshly minted material in its\nown keyring holding no lock, and ``commit`` opens a second short\ntransaction to record the outcome and the instant the superseded\ngeneration stops verifying. Material outstanding when the rotation lands\nkeeps verifying for the overlap, so nothing in flight is invalidated --\nwhich is what makes rotating survivable at all.\n\nThe material is minted here and never returned. The response is the\nledger row, whose ``fence`` is what resolves the rotation if it ever has\nto be recorded as inconclusive.",
+        "description": "Refuse unsupported deployment-wide signing credential rotation.\n\nNo protected shared credential-version store or startup hydration exists\nyet. Installing random material in this process would strand dispatches\non other replicas and resurrect retired keys on restart. A ledger commit\ncannot repair that, and an uncertain commit must not leave a signer live.\nKeep the authorized route discoverable, but change neither key nor ledger.",
         "operationId": "rotate_secret_credential_api_v1_secrets_rotate_post",
         "requestBody": {
           "content": {
@@ -14011,7 +14111,7 @@
     },
     "/api/v1/workloads/{workload_id}/logs/stream": {
       "get": {
-        "description": "Follow one workload's structured logs as they are produced.\n\nA distinct route rather than a reuse of ``/events/stream``: that stream\nis scoped to (org, project) and keyed on the audit table's BIGSERIAL,\nwhile log records are per-(workload, attempt, rank) and have no global\nsequence at all. They share this module's transport and nothing else.\n\n``Last-Event-ID`` is the same ``\"{attempt}:{rank}=cursor|...\"`` the\npaged route returns, so a browser reconnecting resumes every rank where\nit left off rather than replaying from the tail.\n\nAuthorization happens here, before the generator exists. A check inside\nit would run after the response was committed, and the caller would see\n``200`` followed by silence -- indistinguishable from a quiet job.",
+        "description": "Follow one workload's structured logs as they are produced.\n\nA distinct route rather than a reuse of ``/events/stream``: that stream\nis scoped to (org, project) and keyed on the audit table's BIGSERIAL,\nwhile log records are per-(workload, attempt, rank) and have no global\nsequence at all. They share this module's transport and nothing else.\n\n``Last-Event-ID`` is the same ``\"{attempt}:{rank}=cursor|...\"`` the\npaged route returns, so a browser reconnecting resumes every rank where\nit left off rather than replaying from the tail.\n\n``include_status=true`` opts into bounded ``log.page_status`` events,\nincluding on empty pages, distinguishing unavailable, suppressed or\nincomplete output from healthy silence. Unchanged status is not repeated.\nThe default retains the legacy record-only wire format during rollout.\n\nAuthorization happens here, before the generator exists. A check inside\nit would run after the response was committed, and the caller would see\n``200`` followed by silence -- indistinguishable from a quiet job.",
         "operationId": "stream_workload_logs_api_v1_workloads__workload_id__logs_stream_get",
         "parameters": [
           {
@@ -14053,6 +14153,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_status",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Status",
+              "type": "boolean"
             }
           },
           {

@@ -7,8 +7,10 @@ Full model: `docs/security.md`. This part is the working summary.
 - The **plane** is the authority for placement, leasing, and reap.
 - **Agents** own machines and execute what the plane leases to them.
 - **Your callable** runs on worker hosts under the native runtime. It is workload
-  code, not trusted code. The posture: signed, digest-verified inputs; least
-  privilege on the worker; no plane credentials in the workload environment.
+  code, not trusted code. Standalone callable execution requires explicitly
+  trusted projects and digest-verified unsigned inputs; least privilege on the
+  worker; no plane credentials in the workload environment. A digest does not
+  authenticate a submitter or make an untrusted pickle safe.
 
 ## The secret table
 
@@ -56,8 +58,12 @@ workloads under your identity (a capability nobody asked for is a credential nob
 is watching, so it defaults off).
 
 May not: name other tenants' artifacts (scoped identity `(org_id, project_id,
-uri)` forbids it), hold plane credentials, or outlive its lease silently — cells
-are reaped on the fleet's idle timeout regardless of what the workload believes.
+uri)` forbids it) or hold plane credentials. The fleet's idle timeout governs
+eligible unleased surplus capacity, subject to demand, protection, and
+minimum-capacity policy; it is not a workload runtime or cost deadline. Active
+lease expiry/quarantine and fenced retirement are separate lifecycle controls.
+Use explicit workload cancellation to request termination of a valid leased
+workload.
 
 ## Design records with honest status
 
@@ -84,8 +90,10 @@ A few concrete places where the posture is enforced rather than hoped for:
   (Part 10).
 - Secret comparisons use `compare_digest`/`hmac.compare_digest`; non-ASCII
   bootstrap credentials yield 401, not a 500.
-- Signing keys are refused on remote planes (`reject_remote_callable_signing_key`)
-  — your secrets never leave for a plane you do not own.
+- Caller callable-signing keys and artifact signatures are refused by the
+  standalone SDK/API, including on loopback planes. Optional low-level HMAC
+  helpers require a custom producer/verifier protocol; the standalone controller
+  does not distribute callable signing keys.
 - `EYVAN_TRUSTED_CALLABLE_PROJECTS`: a pickled callable executes arbitrary code;
   empty trusts nobody — callable submissions are refused until projects are
   explicitly trusted (command workloads still run).

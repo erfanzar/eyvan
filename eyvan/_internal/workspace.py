@@ -42,6 +42,7 @@ import gzip
 import hashlib
 import io
 import os
+import stat
 import subprocess
 import tarfile
 import typing as tp
@@ -62,7 +63,9 @@ DEFAULT_WORKSPACE_EXCLUDES: frozenset[str] = frozenset(
         ".aws",
         ".env",
         ".env.local",
+        ".envrc",
         ".git",
+        ".git-credentials",
         ".gnupg",
         ".hg",
         ".ipynb_checkpoints",
@@ -88,7 +91,9 @@ DEFAULT_WORKSPACE_EXCLUDES: frozenset[str] = frozenset(
     }
 )
 
-DEFAULT_EXCLUDED_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo", ".so", ".o", ".pem", ".key", ".p12"})
+DEFAULT_EXCLUDED_SUFFIXES: frozenset[str] = frozenset(
+    {".pyc", ".pyo", ".so", ".o", ".pem", ".key", ".p12", ".pfx", ".jks", ".der", ".tfvars"}
+)
 
 #: Path *components* excluded by suffix. ``.egg-info`` is a directory, so it can
 #: only be matched here: as a file suffix it matched nothing, because the files
@@ -132,13 +137,23 @@ class WorkspaceArchive:
 
 
 def _is_excluded(relative: Path, *, excludes: frozenset[str], excluded_suffixes: frozenset[str]) -> bool:
-    if any(part in excludes for part in relative.parts):
+    # Casefold both sides: the hosts that write `.ENV`, `FOO.PEM` or
+    # `Secret.TFVARS` treat those names as case-insensitive, so excluding only
+    # the lowercase spelling would ship the file anyway.
+    folded_excludes = {name.casefold() for name in excludes}
+    folded_suffixes = {suffix.casefold() for suffix in excluded_suffixes}
+    parts = [part.casefold() for part in relative.parts]
+    if any(part in folded_excludes for part in parts):
+        return True
+    # `.env.production` / `.env.<stage>` style files are environment files
+    # whatever the stage is called.
+    if any(part.startswith(".env.") for part in parts):
         return True
     # Checked against every component, not just the filename: an excluded
     # directory must exclude what is inside it.
-    if any(part.endswith(suffix) for part in relative.parts for suffix in DEFAULT_EXCLUDED_DIRECTORY_SUFFIXES):
+    if any(part.endswith(suffix) for part in parts for suffix in DEFAULT_EXCLUDED_DIRECTORY_SUFFIXES):
         return True
-    return relative.suffix in excluded_suffixes
+    return relative.suffix.casefold() in folded_suffixes
 
 
 def _root_is_ignored(root: Path) -> bool:
@@ -201,14 +216,51 @@ def _git_tracked_paths(root: Path) -> list[Path] | None:
             timeout=_GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
-        # git missing, or a repo so large it timed out. Fall back to the walk
-        # rather than fail: shipping too much is recoverable via the size
-        # ceiling, refusing to ship at all is not.
+        _refuse_unknown_git(root)
         return None
     if result.returncode != 0:
+        _refuse_unknown_git(root)
         return None
     names = [name for name in result.stdout.split(b"\0") if name]
     return [root / os.fsdecode(name) for name in names]
+
+
+def _refuse_unknown_git(root: Path) -> None:
+    """Allow an unfiltered walk only after positively ruling out a repository.
+
+    Missing git, timeouts, dubious ownership and corrupt repository metadata
+    are unknown, not permission to include files the operator gitignored.
+    """
+
+    refusal = (
+        f"git could not enumerate tracked files for workspace {root}; refusing to package it unfiltered. "
+        "Fix the git failure, or explicitly use build_workspace(..., respect_gitignore=False) to "
+        "include gitignored files (default excludes still apply)."
+    )
+    try:
+        # A broken .git directory/file can make git claim this is not a
+        # repository. Its presence is enough to forbid the unfiltered walk.
+        for directory in (root, *root.parents):
+            try:
+                (directory / ".git").lstat()
+            except FileNotFoundError:
+                continue
+            raise WorkspaceError(refusal)
+        probe = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise WorkspaceError(refusal) from error
+    if probe.returncode == 128 and probe.stderr.strip() == (
+        "fatal: not a git repository (or any of the parent directories): .git"
+    ):
+        return
+    raise WorkspaceError(refusal)
 
 
 def _collect(
@@ -245,12 +297,42 @@ def _collect(
             continue
         if _is_excluded(relative, excludes=excludes, excluded_suffixes=excluded_suffixes):
             continue
-        if path.is_symlink() or not path.is_file():
+        if any((root / parent).is_symlink() for parent in (relative, *relative.parents)) or not path.is_file():
             continue
         members.append((relative.as_posix(), path))
         if len(members) > max_files:
             raise WorkspaceError(f"workspace contains more than {max_files} files; narrow it or add excludes")
     return members
+
+
+def _read_workspace_file(root: Path, relative: str) -> tuple[bytes, int]:
+    """Read a regular file through anchored, no-follow directory descriptors.
+
+    Checking symlinks during collection is not enough: a directory or leaf can
+    be replaced before reading. Opening each component relative to its already
+    opened parent prevents that replacement from redirecting the archive read.
+    """
+
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise WorkspaceError("cannot safely read workspace files on this platform: no no-follow directory opens")
+    descriptors: list[int] = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptors.append(os.open(root, flags))
+        parts = Path(relative).parts
+        for part in parts[:-1]:
+            descriptors.append(os.open(part, flags, dir_fd=descriptors[-1]))
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptors[-1])
+        with os.fdopen(descriptor, "rb") as handle:
+            mode = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise WorkspaceError(f"cannot safely read workspace member {relative!r}: not a regular file")
+            return handle.read(), mode
+    except OSError as error:
+        raise WorkspaceError(f"cannot safely read workspace member {relative!r}: {error}") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def build_workspace(
@@ -295,9 +377,9 @@ def build_workspace(
     # changes on every call and nothing ever deduplicates.
     with gzip.GzipFile(fileobj=raw, mode="wb", mtime=_EPOCH) as compressed:
         with tarfile.open(fileobj=compressed, mode="w") as archive:
-            for arcname, path in members:
+            for arcname, _path in members:
                 info = tarfile.TarInfo(name=arcname)
-                data = path.read_bytes()
+                data, mode = _read_workspace_file(directory, arcname)
                 info.size = len(data)
                 info.mtime = _EPOCH
                 info.uid = 0
@@ -305,7 +387,7 @@ def build_workspace(
                 info.uname = ""
                 info.gname = ""
                 info.type = tarfile.REGTYPE
-                info.mode = _EXEC_MODE if path.stat().st_mode & 0o111 else _FILE_MODE
+                info.mode = _EXEC_MODE if mode & 0o111 else _FILE_MODE
                 archive.addfile(info, io.BytesIO(data))
 
     payload = raw.getvalue()
@@ -359,17 +441,46 @@ def _create_exclusive(target: Path, mode: int) -> int:
         raise WorkspaceError(f"cannot write workspace member {target.name!r}: {exc}") from exc
 
 
+class _BoundedWorkspaceStream:
+    """Cap gzip expansion before tarfile can allocate extension metadata."""
+
+    def __init__(self, stream: gzip.GzipFile, limit: int) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.consumed = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.limit - self.consumed
+        requested = remaining + 1 if size < 0 else min(size, remaining + 1)
+        data = self.stream.read(requested)
+        self.consumed += len(data)
+        if self.consumed > self.limit:
+            raise WorkspaceError(
+                f"workspace archive decompressed stream expands beyond the {self.limit}-byte limit; refusing to continue"
+            )
+        return data
+
+
 def extract_workspace(
     payload: bytes,
     destination: str | Path,
     *,
     max_total_bytes: int = DEFAULT_MAX_WORKSPACE_BYTES * 8,
     max_files: int = DEFAULT_MAX_WORKSPACE_FILES,
+    max_stream_bytes: int | None = None,
 ) -> int:
     """Extract a workspace archive under ``destination`` and return the file count.
 
     Every member is validated before anything is written. Only regular files and
     directories are accepted; links and special files are rejected outright.
+    ``max_files`` bounds both tar members and distinct filesystem entries below
+    the destination, including implicit parent directories.
+
+    ``max_total_bytes`` still caps regular-file content. ``max_stream_bytes``
+    independently caps all gzip expansion before tar parsing, including PAX/GNU
+    metadata. Its default adds two tar blocks per permitted entry and one final
+    tar record to the content budget; callers needing larger metadata may set an
+    explicit bounded stream budget without widening the file-content ceiling.
 
     ``destination`` must be empty or absent. Extraction does not clean it, and
     reusing a populated directory would leave a file from a previous bundle
@@ -387,9 +498,18 @@ def extract_workspace(
 
     written = 0
     members = 0
+    entries: set[Path] = set()
     total = 0
+    stream_limit = (
+        max_total_bytes + max_files * tarfile.BLOCKSIZE * 2 + tarfile.RECORDSIZE
+        if max_stream_bytes is None
+        else max_stream_bytes
+    )
+    if stream_limit < 0:
+        raise WorkspaceError("workspace decompressed stream limit must not be negative")
     with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as compressed:
-        with tarfile.open(fileobj=compressed, mode="r|") as archive:
+        bounded = _BoundedWorkspaceStream(compressed, stream_limit)
+        with tarfile.open(fileobj=bounded, mode="r|") as archive:
             for info in archive:
                 if info.islnk() or info.issym():
                     raise WorkspaceError(f"workspace archive member {info.name!r} is a link, which is not allowed")
@@ -406,6 +526,19 @@ def extract_workspace(
                     raise WorkspaceError(f"workspace archive contains more than {max_files} entries")
 
                 target = _safe_member_path(info.name, root)
+                # A nested member can create many directories absent from the
+                # tar headers. Reserve its entire path before mkdir so the same
+                # ceiling also bounds filesystem entries, counting shared
+                # ancestors once and excluding the destination root itself.
+                missing: list[Path] = []
+                current = target
+                while current != root:
+                    if current not in entries:
+                        missing.append(current)
+                    current = current.parent
+                if len(entries) + len(missing) > max_files:
+                    raise WorkspaceError(f"workspace archive creates more than {max_files} entries")
+                entries.update(missing)
                 if info.isdir():
                     target.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
                     continue
@@ -425,6 +558,10 @@ def extract_workspace(
                 with os.fdopen(_create_exclusive(target, mode), "wb") as handle:
                     handle.write(extracted.read())
                 target.chmod(mode)
+        # tarfile stops at its end marker, not gzip EOF. Account for padding
+        # and trailing data too, without ever reading them into one allocation.
+        while bounded.read(64 * 1024):
+            pass
     return written
 
 

@@ -371,7 +371,55 @@ async def test_a_receiver_that_never_recovers_is_disabled_with_a_reason(monkeypa
         stored = await tx.get_webhook("wh_1")
     assert stored is not None
     assert not stored.enabled
-    assert stored.disabled_reason and "refused" in stored.disabled_reason
+    assert stored.disabled_reason and "ConnectError" in stored.disabled_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parameter", ("X-Amz-Signature", "X-Goog-Signature", "custom-credential"))
+@pytest.mark.parametrize("failure", ("status", "transport", "unexpected"))
+async def test_delivery_diagnostics_never_copy_signed_target_credentials(
+    monkeypatch, caplog, parameter, failure
+) -> None:
+    credential = "test-only-signed-query-marker"
+    url = f"https://hooks.example.com/eyvan?{parameter}={credential}"
+    repository = InMemoryRepository()
+    plane = _Plane(repository)
+    await _seed(repository, url=url)
+    sent: list[str] = []
+
+    async def post(_client, target, *, content, headers, extensions=None):
+        sent.append(target)
+        if failure == "transport":
+            raise httpx.ConnectError(f"receiver refused {target}")
+        if failure == "unexpected":
+            raise RuntimeError(f"receiver failed at {target}")
+        return httpx.Response(503, request=httpx.Request("POST", target))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    for _ in range(12):
+        assert await plane.deliver_webhooks_once() == 0
+
+    async with repository.transaction() as tx:
+        stored = await tx.get_webhook("wh_1")
+    assert stored is not None
+    assert stored.delivered_sequence == 0
+    assert credential not in caplog.text
+    if failure == "unexpected":
+        assert stored.enabled
+        assert stored.consecutive_failures == 0
+        assert len(sent) == 12
+    else:
+        assert not stored.enabled
+        assert stored.consecutive_failures == 10
+        assert len(sent) == 10
+        assert stored.disabled_reason
+        assert credential not in stored.disabled_reason
+        assert (
+            "HTTPStatusError" in stored.disabled_reason
+            if failure == "status"
+            else "ConnectError" in stored.disabled_reason
+        )
+    assert all(target == url for target in sent)
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,11 @@ _STAGE_TIMEOUTS: dict[CellStageAction, float] = {
     CellStageAction.EVICT: 240.0,
 }
 
+#: Exec waits synchronously for the command's budget (up to 600 seconds on the
+#: wire). Match the outer agent hop's response margin and bounded HTTP policy.
+_EXEC_HTTP_TIMEOUT_MARGIN_S = 30.0
+_EXEC_HTTP_TIMEOUT_MAX_S = 660.0
+
 #: What one staging verdict off the worker's wire means to this host.
 _STAGE_VERDICTS: dict[CellStageVerdict, AssetStageVerdict] = {
     CellStageVerdict.OK: AssetStageVerdict.OK,
@@ -444,13 +449,21 @@ class NativeRemoteExecutor:
         return payload
 
     def exec_in_workload(self, remote_id: str, command: tp.Sequence[str], *, timeout_s: float = 30.0) -> JsonObject:
-        """Run one diagnostic command beside a workload on this host."""
+        """Run one diagnostic command beside a workload on this host.
+
+        Owned transports wait for the command's execution budget plus response
+        overhead, rather than expiring at the default 30-second HTTP timeout.
+        Caller-supplied clients retain their own timeout policy.
+        """
 
         response = self._raise_for_status(
             self._request(
                 "POST",
                 f"/api/v1/workloads/{remote_id}/exec",
                 json={"command": list(command), "timeout_s": timeout_s},
+                timeout=min(timeout_s + _EXEC_HTTP_TIMEOUT_MARGIN_S, _EXEC_HTTP_TIMEOUT_MAX_S)
+                if self._owns_client
+                else None,
             )
         )
         payload = response.json()

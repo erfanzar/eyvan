@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import typing as tp
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -79,7 +81,9 @@ def _requirements(declared: tp.Sequence[str], path: Path | None) -> tuple[str, .
     packages = [item.strip() for item in declared if item.strip()]
     if path is not None:
         for line in path.read_text(encoding="utf-8").splitlines():
-            entry = line.split("#", 1)[0].strip()
+            # Requirements comments start a line or follow whitespace; a URL
+            # fragment belongs to the requirement (hashes and VCS subdirectories).
+            entry = re.split(r"(?:^|\s+)#", line, maxsplit=1)[0].strip()
             if not entry:
                 continue
             if entry.startswith("-"):
@@ -479,7 +483,19 @@ class WorkloadCommandService:
         scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
         record = self.session.client.request("GET", f"/api/v1/workloads/{workload_id}")
         events = self._events_about("workload", workload_id, scope=scope, limit=limit)
-        for lease_id in self._workload_lease_ids_from(record):
+        # Retry clears the aggregate's current lease references, but leaves the
+        # historical lease ledger intact. Read it in the same authorized scope.
+        leases = self.session.client.request(
+            "GET",
+            "/api/v1/leases",
+            params={"org_id": scope.org_id, "project_id": scope.project_id, "workload_id": workload_id},
+            headers=self.session.workload_headers(scope),
+        )
+        lease_ids = list(self._workload_lease_ids_from(record))
+        for lease in leases if isinstance(leases, list) else []:
+            if is_json_object(lease) and isinstance(lease.get("id"), str):
+                lease_ids.append(tp.cast(str, lease["id"]))
+        for lease_id in dict.fromkeys(lease_ids):
             events.extend(self._events_about("lease", lease_id, scope=scope, limit=limit))
         for line in render(timeline(events)):
             click.echo(line)
@@ -532,7 +548,7 @@ class WorkloadCommandService:
 
     @staticmethod
     def _workload_lease_ids_from(record: JsonValue) -> tuple[str, ...]:
-        """Return the lease ids one workload document names, current or past."""
+        """Return current lease ids explicitly named by a workload document."""
 
         if not is_json_object(record):
             return ()
@@ -614,17 +630,22 @@ class WorkloadCommandService:
         parsing, and stays behind ``--json``.
         """
 
-        response = self.session.client.request(
-            "POST",
-            f"/api/v1/workloads/{workload_id}/{action}",
-            headers={"Idempotency-Key": self.keys.create(action, idempotency_key)},
-        )
+        response = self._mutation_response(workload_id, action, idempotency_key)
         emit_result(
             self.renderer,
             response,
             f"{_ACTION_HEADLINES[action]} {workload_id}",
             as_json=as_json,
             fields=("state", "attempt", "failure_reason"),
+        )
+
+    def _mutation_response(self, workload_id: str, action: WorkloadAction, idempotency_key: str | None) -> JsonValue:
+        """Apply a mutation without rendering, for direct and batch output."""
+
+        return self.session.client.request(
+            "POST",
+            f"/api/v1/workloads/{workload_id}/{action}",
+            headers={"Idempotency-Key": self.keys.create(action, idempotency_key)},
         )
 
     def _scoped_workloads(self, scope: WorkloadScope) -> tuple[WorkloadRecord, ...]:
@@ -668,7 +689,11 @@ class WorkloadCommandService:
         because the caller is usually about to cancel something.
         """
 
-        if reference.startswith("wl_") and len(reference) > 3:
+        if (
+            reference.startswith("wl_")
+            and len(reference) == 35
+            and all(character in "0123456789abcdef" for character in reference[3:])
+        ):
             return reference
         scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
         try:
@@ -695,6 +720,8 @@ class WorkloadCommandService:
         *,
         scope: WorkloadScope,
         confirmed: bool,
+        idempotency_key: str | None = None,
+        as_json: bool = False,
     ) -> None:
         """Apply one lifecycle mutation to every workload matching ``prefix``.
 
@@ -711,11 +738,20 @@ class WorkloadCommandService:
             for workload in matches:
                 click.echo(f"  {workload.id}  {workload.state.value:<12}{workload.spec.name}", err=True)
             raise click.ClickException(f"{action} would apply to {len(matches)} workloads; pass --yes to confirm")
+        # A sweep is one operator intent, not every future action on these
+        # workloads. Explicit keys allow replay across invocations; otherwise
+        # create a fresh intent once, keeping each job's transport retries stable.
+        intent = self.keys.create(action, idempotency_key)
+        digest = hashlib.sha256(intent.encode()).hexdigest()
+        responses: list[JsonValue] = []
         for workload in matches:
-            # One key per workload, derived from the action and the id, so a
-            # retried sweep re-sends the same key per job rather than a fresh
-            # one that would be a second request for the same intent.
-            self.mutate(workload.id, action, f"{action}-{workload.id}")
+            key = f"{action}-{workload.id}-{digest}"
+            if as_json:
+                responses.append(self._mutation_response(workload.id, action, key))
+            else:
+                self.mutate(workload.id, action, key)
+        if as_json:
+            self.renderer.emit(responses)
 
 
 @click.command("run")
@@ -829,7 +865,7 @@ class WorkloadCommandService:
     help="Print the submission document and return immediately, instead of streaming the job. Use this in scripts: "
     "stdout is then the JSON record and nothing else.",
 )
-@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+@click.argument("command", nargs=-1, required=False, type=click.UNPROCESSED)
 @click.pass_obj
 def run_workload(
     session: CliSession,
@@ -888,6 +924,8 @@ def run_workload(
             command = (target, *command)
         target = next(iter(named.values()))
 
+    if not command:
+        raise click.UsageError("Missing argument 'COMMAND...'.")
     declared = _requirements(dependencies, requirements_file)
     exit_code = WorkloadCommandService(session).run(
         target_value=target,
@@ -1434,12 +1472,12 @@ def _parse_dag_nodes(document: object) -> tuple[DagNodeRequest, ...]:
                         name=name,
                         execution=CommandExecution(kind="command", command=command),
                         gang=ResourceGang(
-                            replicas=int(entry.get("replicas", 1)),
+                            replicas=entry.get("replicas", 1),
                             per_replica=ResourceVector(
                                 cpu=float(resources.get("cpu", 0.0)),
                                 memory_gib=float(resources.get("memory_gib", 0.0)),
-                                gpu=int(resources.get("gpu", 0)),
-                                tpu=int(resources.get("tpu", 0)),
+                                gpu=resources.get("gpu", 0),
+                                tpu=resources.get("tpu", 0),
                             ),
                         ),
                         capacity_class=CapacityClass(entry.get("capacity_class", CapacityClass.ON_DEMAND.value)),
@@ -1781,7 +1819,7 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
         default=False,
         help="Do not ask before applying this to more than one workload.",
     )
-    @click.option("--json", "as_json", is_flag=True)
+    @click.option("--json", "as_json", is_flag=True, help="Emit the workload record as JSON (one array for --prefix).")
     @click.pass_obj
     def command(
         session: CliSession,
@@ -1798,7 +1836,9 @@ def _workload_action_command(action: WorkloadAction) -> click.Command:
             if workload_id is not None:
                 raise click.UsageError("pass a workload id or --prefix, not both")
             scope = session.workload_scope(org_id=org_id, project_id=project_id)
-            service.mutate_prefix(prefix, action, scope=scope, confirmed=confirmed)
+            service.mutate_prefix(
+                prefix, action, scope=scope, confirmed=confirmed, idempotency_key=idempotency_key, as_json=as_json
+            )
             return
         if workload_id is None:
             raise click.UsageError("give a workload id, or --prefix to match several")

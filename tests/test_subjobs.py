@@ -266,7 +266,7 @@ async def test_traversal_refuses_an_unbounded_chain() -> None:
 # --------------------------------------------------------------------------- HTTP surfacing
 
 
-async def test_a_cross_project_parent_is_a_client_error_not_a_500() -> None:
+async def test_a_cross_project_parent_is_a_client_error_not_a_500(tmp_path) -> None:
     """``JobTreeError`` subclassed a bare ``ValueError``, so no handler matched.
 
     The API has handlers for ``EyvanServiceError``, ``RequestValidationError``,
@@ -280,7 +280,10 @@ async def test_a_cross_project_parent_is_a_client_error_not_a_500() -> None:
     from eyvan.config import EyvanSettings
     from eyvan.server.api.app import create_app
 
-    client = TestClient(create_app(settings=EyvanSettings(dev_auth_enabled=True)), raise_server_exceptions=False)
+    client = TestClient(
+        create_app(settings=EyvanSettings(dev_auth_enabled=True, artifact_store_uri=str(tmp_path / "managed"))),
+        raise_server_exceptions=False,
+    )
     headers = {
         "X-Eyvan-User": "alice",
         "X-Eyvan-Org": "acme",

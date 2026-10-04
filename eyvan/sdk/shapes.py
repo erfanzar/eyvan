@@ -42,7 +42,7 @@ def summarize_shapes(shapes: tp.Iterable[str]) -> str:
         generation, _, size = shape.rpartition("-")
         # A name that is not <generation>-<size> ("cpu") is its own group: it
         # names no family to collapse into, and inventing one would be a guess.
-        if generation and size.isdigit():
+        if generation and size.isdecimal():
             grouped.setdefault(generation, []).append(int(size))
         else:
             grouped.setdefault(shape, [])

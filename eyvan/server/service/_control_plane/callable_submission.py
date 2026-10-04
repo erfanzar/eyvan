@@ -122,6 +122,17 @@ class CallableSubmissionMixin:
                 "metadata": dict(metadata or {}),
                 "max_retries": max_retries,
                 "max_failure_retries": max_failure_retries,
+                "max_preemption_retries": max_preemption_retries,
+                "checkpointable": checkpointable,
+                "checkpoint_hook": checkpoint_hook,
+                "checkpoint_output_uri": checkpoint_output_uri,
+                "can_submit_children": can_submit_children,
+                "priority_band": priority_band.value,
+                "intra_band_priority": intra_band_priority,
+                "checkpoint_grace_seconds": checkpoint_grace_seconds,
+                "estimated_duration_seconds": estimated_duration_seconds,
+                "named_assets": list(named_assets),
+                "atomic": atomic,
                 # Part of what was asked for: the same callable against a
                 # different dependency set is a different job, and a replay
                 # ignoring them would return one built on other packages.

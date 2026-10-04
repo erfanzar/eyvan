@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import typing as tp
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -74,6 +74,9 @@ class _LocalExecutionRecord(BaseModel):
     finished_at: str | None
     log_path: str
     owner_path: str
+    command_pid: int | None = None
+    command_start_marker: str | None = None
+    group_quiescent: bool = False
 
 
 class _LogicalWorkloadFence(BaseModel):
@@ -358,6 +361,89 @@ def _tracked_worker_process_group(record: tp.Mapping[str, JsonValue]) -> int | N
         return None
 
 
+def _group_has_live_members(process_group: int) -> bool:
+    """Observe live group members; inspection failure is never quiescence.
+
+    Zombies cannot execute and need not hold up retirement. The caller retains
+    an unreaped group/session leader until signalling and observation finish.
+    """
+
+    result = subprocess.run(("ps", "-axo", "pgid=,stat="), capture_output=True, text=True, check=False, timeout=2)
+    if result.returncode != 0:
+        raise RuntimeError("native-local process-group inspection failed")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise RuntimeError("native-local process-group inspection was malformed")
+        if int(fields[0]) == process_group and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def _quiesce_process_group(process_group: int, *, grace_s: float = 0.25) -> bool:
+    """TERM/KILL an owned group and confirm no executable member remains."""
+
+    if not _group_has_live_members(process_group):
+        return True
+    for signal_number, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(process_group, signal_number)
+        except (PermissionError, ProcessLookupError):
+            return not _group_has_live_members(process_group)
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if not _group_has_live_members(process_group):
+                return True
+            time.sleep(0.01)
+    return not _group_has_live_members(process_group)
+
+
+def _owned_command_group(record: tp.Mapping[str, JsonValue]) -> int | None:
+    """Validate the gated command leader before crash/forced-stop cleanup."""
+
+    pid = record.get("command_pid")
+    marker = record.get("command_start_marker")
+    worker_pid = record.get("worker_pid")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(marker, str) or not marker:
+        return None
+    if _process_start_marker(pid) != marker:
+        return None
+    try:
+        return pid if os.getpgid(pid) == pid and os.getsid(pid) == worker_pid else None
+    except (PermissionError, ProcessLookupError):
+        return None
+
+
+def _owned_session_command_group(record: tp.Mapping[str, JsonValue], session: int) -> int | None:
+    """Recover an orphan group when an unreaped direct worker pins its session.
+
+    Init may already have reaped the command leader after the worker crashes.
+    Validate a surviving member's current group/session, never the recorded
+    group number alone. Reconstructed executors do not call this fallback.
+    """
+
+    group = record.get("command_pid")
+    if not isinstance(group, int) or group <= 0 or record.get("worker_pid") != session:
+        return None
+    result = subprocess.run(("ps", "-axo", "pid=,pgid=,stat="), capture_output=True, text=True, check=False, timeout=2)
+    if result.returncode != 0:
+        raise RuntimeError("native-local process-group ownership inspection failed")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            raise RuntimeError("native-local process-group ownership inspection was malformed")
+        if int(fields[1]) != group or fields[2].startswith("Z"):
+            continue
+        pid = int(fields[0])
+        try:
+            if os.getpgid(pid) == group and os.getsid(pid) == session:
+                return group
+        except ProcessLookupError:
+            continue
+        return None
+    return None
+
+
 def _terminate_process_group(process_group: int, *, grace_s: float = 0.25) -> None:
     """Best-effort cleanup for commands orphaned by a crashed worker."""
 
@@ -386,18 +472,31 @@ def _terminate_tracked_worker(record: tp.Mapping[str, JsonValue], *, grace_s: fl
     process_group = _tracked_worker_process_group(record)
     if process_group is None:
         return False
+    command_group = _owned_command_group(record)
+    if command_group is not None:
+        _quiesce_process_group(command_group, grace_s=grace_s)
     _terminate_process_group(process_group, grace_s=grace_s)
     return True
 
 
 def _signal_tracked_worker(record: tp.Mapping[str, JsonValue], signal_number: int) -> bool:
-    """Send one signal to the verified detached worker process group."""
+    """Signal the verified worker; it forwards stops to its command subgroup."""
 
     process_group = _tracked_worker_process_group(record)
     if process_group is None:
         return False
+    if signal_number == signal.SIGKILL and record.get("command_pid") is not None:
+        command_group = _owned_command_group(record)
+        if command_group is None or not _quiesce_process_group(command_group):
+            return False
     try:
-        os.killpg(process_group, signal_number)
+        # New workers own a separate command group and forward TERM themselves.
+        # Group signalling would also kill their transient ps inspection child,
+        # turning a normal stop into an unobservable cleanup failure.
+        if "command_pid" in record:
+            os.kill(process_group, signal_number)
+        else:
+            os.killpg(process_group, signal_number)
     except (PermissionError, ProcessLookupError):
         return False
     return True
@@ -510,58 +609,58 @@ class LocalProcessExecutor:
 
         The cell-agent normally prevents an older attempt from reaching this
         worker. Persisting the same high watermark at the execution boundary
-        closes the gap for delayed or directly replayed HTTP submissions.
+        closes the gap for delayed or directly replayed HTTP submissions. The
+        caller must hold the logical workload lock through this claim and the
+        attempt's record reservation and worker publication.
         """
 
         path = self._workload_fence_path(workload_id)
-        with _file_lock(_record_lock_path(path)):
-            current = _load_json(path)
-            predecessor: _LogicalWorkloadFence | None = None
-            if current is not None:
-                try:
-                    persisted = _LogicalWorkloadFence.model_validate(current)
-                except ValidationError as exc:
-                    raise StaleMutationError(f"logical workload {workload_id!r} has an invalid persisted fence") from exc
-                if context.generation < persisted.generation:
+        current = _load_json(path)
+        predecessor: _LogicalWorkloadFence | None = None
+        if current is not None:
+            try:
+                persisted = _LogicalWorkloadFence.model_validate(current)
+            except ValidationError as exc:
+                raise StaleMutationError(f"logical workload {workload_id!r} has an invalid persisted fence") from exc
+            if context.generation < persisted.generation:
+                raise StaleMutationError(
+                    f"generation {context.generation} is older than logical workload {workload_id!r} "
+                    f"generation {persisted.generation}"
+                )
+            if context.generation == persisted.generation:
+                if persisted.fencing_token != context.fencing_token:
                     raise StaleMutationError(
-                        f"generation {context.generation} is older than logical workload {workload_id!r} "
+                        f"fencing token does not own logical workload {workload_id!r} generation {persisted.generation}"
+                    )
+                if persisted.remote_id != remote_id:
+                    raise StaleMutationError(
+                        f"submission {remote_id!r} does not own logical workload {workload_id!r} "
                         f"generation {persisted.generation}"
                     )
-                if context.generation == persisted.generation:
-                    if persisted.fencing_token != context.fencing_token:
-                        raise StaleMutationError(
-                            f"fencing token does not own logical workload {workload_id!r} "
-                            f"generation {persisted.generation}"
-                        )
-                    if persisted.remote_id != remote_id:
-                        raise StaleMutationError(
-                            f"submission {remote_id!r} does not own logical workload {workload_id!r} "
-                            f"generation {persisted.generation}"
-                        )
-                    return
-                predecessor = persisted
+                return
+            predecessor = persisted
 
-            now = _utcnow()
-            if predecessor is not None:
-                self.retire(
-                    predecessor.remote_id,
-                    MutationContext(
-                        idempotency_key=f"supersede:{workload_id}:{context.generation}",
-                        generation=predecessor.generation,
-                        fencing_token=predecessor.fencing_token,
-                    ),
-                )
-            _atomic_write_json(
-                path,
-                {
-                    "workload_id": workload_id,
-                    "generation": context.generation,
-                    "fencing_token": context.fencing_token,
-                    "remote_id": remote_id,
-                    **({"predecessor": model_json(predecessor)} if predecessor is not None else {}),
-                    "updated_at": now,
-                },
+        now = _utcnow()
+        if predecessor is not None:
+            self.retire(
+                predecessor.remote_id,
+                MutationContext(
+                    idempotency_key=f"supersede:{workload_id}:{context.generation}",
+                    generation=predecessor.generation,
+                    fencing_token=predecessor.fencing_token,
+                ),
             )
+        _atomic_write_json(
+            path,
+            {
+                "workload_id": workload_id,
+                "generation": context.generation,
+                "fencing_token": context.fencing_token,
+                "remote_id": remote_id,
+                **({"predecessor": model_json(predecessor)} if predecessor is not None else {}),
+                "updated_at": now,
+            },
+        )
 
     @staticmethod
     def _validate_fence(
@@ -603,7 +702,7 @@ class LocalProcessExecutor:
         workload_id = self._logical_workload_id(metadata)
 
         record_path, log_path, owner_path = self._paths(remote_id)
-        with self._lock:
+        with self._lock, ExitStack() as publication_locks:
             # Reject a generation that reuses an existing attempt ID before
             # advancing the logical high watermark. Otherwise a rejected
             # request could fence out the valid running attempt.
@@ -612,6 +711,12 @@ class LocalProcessExecutor:
                 if existing is not None:
                     self._validate_fence(remote_id, existing, context)
             if workload_id is not None:
+                # A successor must not retire an absent predecessor between
+                # its logical claim and attempt publication. Hold the workload
+                # lock through reservation and launch, always before taking an
+                # attempt lock (including predecessor retirement).
+                workload_path = self._workload_fence_path(workload_id)
+                publication_locks.enter_context(_file_lock(_record_lock_path(workload_path)))
                 self._claim_logical_workload(workload_id, remote_id, context)
             with _file_lock(_record_lock_path(record_path)):
                 existing = _load_json(record_path)
@@ -677,6 +782,7 @@ class LocalProcessExecutor:
                             "message": f"failed to launch native-local worker: {exc}",
                             "finished_at": _utcnow(),
                             "updated_at": _utcnow(),
+                            "group_quiescent": True,
                         }
                     )
                     _atomic_write_json(record_path, record)
@@ -708,8 +814,19 @@ class LocalProcessExecutor:
             return None
         status = _persisted_status(remote_id, record)
         if status in _TERMINAL_STATES:
-            self._release_worker_process(remote_id)
-            return record
+            if record.get("group_quiescent") is True:
+                self._release_worker_process(remote_id)
+                return record
+
+            # Legacy terminal records observed only the direct shell. Never
+            # turn that assertion into permission for a successor to overlap
+            # descendants. An operator must quiesce ambiguous legacy attempts.
+            def legacy_ambiguous(current: JsonObject) -> None:
+                if current.get("group_quiescent") is not True:
+                    current["status"] = ExecutionWorkloadStatus.INDETERMINATE.value
+                    current["message"] = "native-local terminal record lacks process-group quiescence proof"
+
+            return _mutate_record(record_path, legacy_ambiguous) or record
         if _owner_active(owner_path):
             return record
         owned_worker = self._owned_unreaped_worker(remote_id, record)
@@ -732,6 +849,7 @@ class LocalProcessExecutor:
                     current["message"] = f"native-local worker exited before recording readiness (exit code {exit_code})"
                     current["exit_code"] = exit_code
                     current["finished_at"] = _utcnow()
+                    current["group_quiescent"] = True
 
                 finalized = _mutate_record(record_path, launch_failed) or record
                 if _persisted_status(remote_id, finalized) in _TERMINAL_STATES:
@@ -760,20 +878,30 @@ class LocalProcessExecutor:
             # briefly disappear around startup or process scheduling, but that
             # is not authority to kill an active process group.
             return record
+        quiescent = False
         if owned_worker is not None:
-            # This executor still owns an unreaped direct child, so its PID
-            # cannot have been recycled. It is safe to clean descendants.
-            _terminate_process_group(owned_worker.pid)
-            try:
-                owned_worker.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
-            self._worker_processes.pop(remote_id, None)
+            # Retain the dead direct worker (session leader) through subgroup
+            # cleanup. The gate ensures an unpublished child cannot execute.
+            command_pid = record.get("command_pid")
+            command_group = _owned_command_group(record) or _owned_session_command_group(record, owned_worker.pid)
+            if command_pid is None:
+                quiescent = _quiesce_process_group(owned_worker.pid)
+            elif command_group is not None:
+                quiescent = _quiesce_process_group(command_group)
+            elif isinstance(command_pid, int) and command_pid > 0:
+                quiescent = not _group_has_live_members(command_pid)
+            if quiescent:
+                try:
+                    owned_worker.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    quiescent = False
+                else:
+                    self._worker_processes.pop(remote_id, None)
 
         def abandon(current: JsonObject) -> None:
             if _persisted_status(remote_id, current) in _TERMINAL_STATES:
                 return
-            if owned_worker is not None:
+            if quiescent:
                 current["status"] = (
                     ExecutionWorkloadStatus.STOPPED.value
                     if bool(current.get("stop_requested"))
@@ -788,6 +916,7 @@ class LocalProcessExecutor:
                 current["status"] = ExecutionWorkloadStatus.INDETERMINATE.value
                 current["message"] = "native-local worker ownership is ambiguous; workload was not signalled"
             current["finished_at"] = _utcnow()
+            current["group_quiescent"] = quiescent
 
         return _mutate_record(record_path, abandon) or record
 

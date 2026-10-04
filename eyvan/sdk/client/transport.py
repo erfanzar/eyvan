@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import httpx
 
@@ -41,7 +44,7 @@ def _local_credential_refusal_diagnosis(url: httpx.URL) -> str:
     from eyvan.server.local.auth import DEFAULT_LOCAL_DEVELOPMENT_CREDENTIAL_PATH
     from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonPaths, LocalDaemonTarget, read_owner_only_record
 
-    endpoint = ControlPlaneEndpoint(f"http://{url.host}:{url.port or 80}")
+    endpoint = ControlPlaneEndpoint(str(url.copy_with(path="/", query=None, fragment=None)))
     record: object = None
     try:
         target = LocalDaemonTarget.from_endpoint(endpoint)
@@ -105,6 +108,11 @@ class EyvanHTTPError(httpx.HTTPStatusError):
 class EyvanUnavailableError(ConnectionError):
     """A request that could not reach the configured Eyvan control plane."""
 
+    #: The mutation's idempotency key, attached by ``mutate`` when every retry
+    #: failed: after an ambiguous admission the caller needs it to query or
+    #: cancel instead of resubmitting blind.
+    idempotency_key: str | None = None
+
     def __init__(self, endpoint: ControlPlaneEndpoint, method: str) -> None:
         self.endpoint = endpoint
         self.method = method.upper()
@@ -141,6 +149,73 @@ def raise_for_status(response: httpx.Response) -> httpx.Response:
 
 #: Methods a retry cannot duplicate the effect of.
 _SAFE_METHODS = frozenset({"GET", "HEAD"})
+_READ_DEADLINE: ContextVar[float | None] = ContextVar("eyvan_sdk_read_deadline", default=None)
+
+
+@contextmanager
+def read_deadline(deadline: float | None) -> Iterator[None]:
+    """Bound SDK reads in this execution context, including observer progress reads."""
+
+    previous = _READ_DEADLINE.get()
+    if previous is not None:
+        deadline = previous if deadline is None else min(previous, deadline)
+    token = _READ_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _READ_DEADLINE.reset(token)
+
+
+def _remaining_read_time() -> float | None:
+    deadline = _READ_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("SDK read deadline expired")
+    return remaining
+
+
+def _bounded_read_timeout(configured: httpx.Timeout, remaining: float) -> httpx.Timeout:
+    """Cap every HTTPX phase without relaxing an injected client's stricter limits."""
+
+    return httpx.Timeout(
+        **{name: remaining if value is None else min(value, remaining) for name, value in configured.as_dict().items()}
+    )
+
+
+def _read_retry_delay(delay: float) -> float:
+    remaining = _remaining_read_time()
+    return delay if remaining is None else min(delay, remaining)
+
+
+def _mutation_headers(
+    headers: HeaderMap | None,
+    idempotency_key: str | None,
+    factory: IdempotencyKeyFactory,
+) -> tuple[str, dict[str, str]]:
+    """Prefer a caller header over the argument; collapse equal keys, reject conflicts."""
+
+    # HTTPX's mapping view comma-joins duplicate fields: inspect individual
+    # values so conflicting keys cannot silently become a different key.
+    caller_items = headers.multi_items() if isinstance(headers, httpx.Headers) else list((headers or {}).items())
+    supplied = [value for name, value in caller_items if name.lower() == "idempotency-key"]
+    if supplied and any(value != supplied[0] for value in supplied[1:]):
+        raise ValueError("conflicting Idempotency-Key header values")
+    key = factory.create(supplied=supplied[0] if supplied else idempotency_key)
+    outgoing = {name: value for name, value in dict(headers or {}).items() if name.lower() != "idempotency-key"}
+    outgoing["Idempotency-Key"] = key
+    return key, outgoing
+
+
+def _merge_request_headers(injected: HeaderMap, headers: HeaderMap | None) -> HeaderMap | None:
+    """Let a request key replace injected defaults regardless of casing."""
+
+    caller_headers = dict(headers or {})
+    overridden = {name.lower() for name in caller_headers}
+    injected = {name: value for name, value in injected.items() if name.lower() not in overridden}
+    merged = {**injected, **caller_headers}
+    return merged or None
 
 
 class SyncApiTransport:
@@ -199,23 +274,30 @@ class SyncApiTransport:
     ) -> httpx.Response:
         """Send one request without applying status handling or retries."""
 
+        remaining = _remaining_read_time() if method.upper() in _SAFE_METHODS else None
+        options = {} if remaining is None else {"timeout": _bounded_read_timeout(self._client.timeout, remaining)}
         try:
-            return self._client.request(
+            response = self._client.request(
                 method,
                 path,
                 params=params,
                 json=json,
                 content=content,
                 headers=self._request_headers(headers),
+                **options,
             )
         except httpx.TransportError:
+            if remaining is not None:
+                _remaining_read_time()
             raise EyvanUnavailableError(self.endpoint, method) from None
+        if remaining is not None:
+            _remaining_read_time()
+        return response
 
     def _request_headers(self, headers: HeaderMap | None) -> HeaderMap | None:
         """Merge identity headers onto caller headers without mutating injected clients."""
 
-        merged = {**self._injected_headers, **dict(headers or {})}
-        return merged or None
+        return _merge_request_headers(self._injected_headers, headers)
 
     def request_checked(
         self,
@@ -244,7 +326,7 @@ class SyncApiTransport:
             delay = self.retry_policy.delay(status_code=response.status_code, headers=response.headers, attempt=attempt)
             if delay is None or attempt == self.retry_policy.max_attempts - 1:
                 return raise_for_status(response)
-            time.sleep(delay)
+            time.sleep(_read_retry_delay(delay))
         raise AssertionError("retry policy must allow at least one attempt")
 
     def mutate(
@@ -260,10 +342,7 @@ class SyncApiTransport:
     ) -> httpx.Response:
         """Send one mutation, retaining its idempotency key across retries."""
 
-        request_headers = {
-            **dict(headers or {}),
-            "Idempotency-Key": self.idempotency_factory.create(supplied=idempotency_key),
-        }
+        key, request_headers = _mutation_headers(headers, idempotency_key, self.idempotency_factory)
         for attempt in range(self.retry_policy.max_attempts):
             try:
                 response = self.request(
@@ -274,8 +353,12 @@ class SyncApiTransport:
                     content=content,
                     headers=request_headers,
                 )
-            except EyvanUnavailableError:
+            except EyvanUnavailableError as exc:
                 if attempt == self.retry_policy.max_attempts - 1:
+                    # The plane may have admitted the request before the
+                    # response was lost; surface the key so the caller can
+                    # query or cancel by it instead of resubmitting blind.
+                    exc.idempotency_key = key
                     raise
                 time.sleep(self.retry_policy.backoff(attempt))
                 continue
@@ -352,23 +435,31 @@ class AsyncApiTransport:
     ) -> httpx.Response:
         """Send one request without applying status handling or retries."""
 
+        remaining = _remaining_read_time() if method.upper() in _SAFE_METHODS else None
+        options = {} if remaining is None else {"timeout": _bounded_read_timeout(self._client.timeout, remaining)}
         try:
-            return await self._client.request(
-                method,
-                path,
-                params=params,
-                json=json,
-                content=content,
-                headers=self._request_headers(headers),
-            )
+            async with asyncio.timeout(remaining):
+                response = await self._client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    content=content,
+                    headers=self._request_headers(headers),
+                    **options,
+                )
         except httpx.TransportError:
+            if remaining is not None:
+                _remaining_read_time()
             raise EyvanUnavailableError(self.endpoint, method) from None
+        if remaining is not None:
+            _remaining_read_time()
+        return response
 
     def _request_headers(self, headers: HeaderMap | None) -> HeaderMap | None:
         """Merge identity headers onto caller headers without mutating injected clients."""
 
-        merged = {**self._injected_headers, **dict(headers or {})}
-        return merged or None
+        return _merge_request_headers(self._injected_headers, headers)
 
     async def request_checked(
         self,
@@ -390,7 +481,7 @@ class AsyncApiTransport:
             delay = self.retry_policy.delay(status_code=response.status_code, headers=response.headers, attempt=attempt)
             if delay is None or attempt == self.retry_policy.max_attempts - 1:
                 return raise_for_status(response)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(_read_retry_delay(delay))
         raise AssertionError("retry policy must allow at least one attempt")
 
     async def mutate(
@@ -406,10 +497,7 @@ class AsyncApiTransport:
     ) -> httpx.Response:
         """Send one mutation, retaining its idempotency key across retries."""
 
-        request_headers = {
-            **dict(headers or {}),
-            "Idempotency-Key": self.idempotency_factory.create(supplied=idempotency_key),
-        }
+        key, request_headers = _mutation_headers(headers, idempotency_key, self.idempotency_factory)
         for attempt in range(self.retry_policy.max_attempts):
             try:
                 response = await self.request(
@@ -420,8 +508,10 @@ class AsyncApiTransport:
                     content=content,
                     headers=request_headers,
                 )
-            except EyvanUnavailableError:
+            except EyvanUnavailableError as exc:
                 if attempt == self.retry_policy.max_attempts - 1:
+                    # See the synchronous twin above.
+                    exc.idempotency_key = key
                     raise
                 await asyncio.sleep(self.retry_policy.backoff(attempt))
                 continue

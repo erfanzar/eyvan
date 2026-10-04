@@ -84,8 +84,10 @@ from eyvan.capacity.fleet_state import (
     StaleFenceError,
 )
 from eyvan.capacity.providers.kubernetes.api import (
+    QUEUE_NAME_LABEL,
     JobStatus,
     KubernetesApi,
+    KubernetesCreateRejected,
     capacity_state,
     interpret_job,
     local_queue_cluster_queue,
@@ -327,6 +329,15 @@ class KubernetesCapacityDriver:
                 ready=0,
             )
         state, detail = capacity_state(status)
+        if record.desired_state != "up" and state in {
+            CapacityStatus.HEALTHY,
+            CapacityStatus.PROVISIONING,
+            CapacityStatus.WAITING,
+        }:
+            # A drain deliberately keeps the owned Job running. Provider
+            # readiness must not restore scheduling or endpoints, but actual
+            # loss/failure and unproven ownership still retain their own states.
+            state, detail = CapacityStatus.DRAINING, f"cell is draining; {detail}"
         if state is CapacityStatus.WAITING:
             # The one state whose detail restates Eyvan's own state ("suspended
             # pending kueue admission") instead of naming a cause. Every other
@@ -499,7 +510,11 @@ class KubernetesCapacityDriver:
         """
 
         declared = worker_count or int(record.metadata.get("worker_count", 1) or 1)
-        endpoints = worker_endpoints(record.name, self.namespace, declared) if declared and ready >= declared else ()
+        endpoints = (
+            worker_endpoints(record.name, self.namespace, declared)
+            if record.desired_state == "up" and declared and ready >= declared
+            else ()
+        )
         metadata: JsonObject = {
             "provider": self.provider_name,
             "capacity_backend": self.provider_name,
@@ -750,7 +765,14 @@ class KubernetesCapacityDriver:
         # If this raises without a response, the POST outcome is indeterminate.
         # The durable intent deliberately remains inflight so release refuses to
         # trust an absent preflight while the API server may still store it.
-        created = self.api.create(collection_path, desired)
+        try:
+            created = self.api.create(collection_path, desired)
+        except KubernetesCreateRejected:
+            # Only a proved completed refusal permits this acknowledgement.
+            # CAS-remove exactly this owner/request; never clear a successor's
+            # intent or use an absent GET to resolve an indeterminate POST.
+            self._transition_create_intent(ownership, intent, status=None)
+            raise
 
         settled = self._transition_create_intent(ownership, intent, status="settled")
         try:
@@ -888,6 +910,19 @@ class KubernetesCapacityDriver:
         actual_spec = observed.get("spec")
         if not is_json_object(expected_spec) or not is_json_object(actual_spec):
             return False
+        metadata = desired.get("metadata")
+        labels = metadata.get("labels") if is_json_object(metadata) else None
+        queue_name = labels.get(QUEUE_NAME_LABEL) if is_json_object(labels) else None
+        if (
+            isinstance(queue_name, str)
+            and queue_name
+            and expected_spec.get("suspend") is True
+            and actual_spec.get("suspend") is False
+        ):
+            # Kueue owns the admission transition, not the worker identity or
+            # security-critical pod spec. Compare an unsuspended, exactly owned
+            # queue-backed Job without rewriting it or relaxing any other field.
+            expected_spec = {**expected_spec, "suspend": False}
         if not cls._expected_subset(actual_spec, expected_spec):
             return False
         expected_template = expected_spec.get("template")

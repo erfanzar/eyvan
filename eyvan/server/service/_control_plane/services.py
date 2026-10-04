@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from eyvan.server.service._control_plane.shared import (
     CHILD_REVISION,
     TERMINAL_WORKLOAD_STATES,
@@ -36,6 +38,7 @@ from eyvan.server.service._control_plane.shared import (
     service_policy,
     utcnow,
 )
+from eyvan.server.service.services import ReplicaObservation, plan_replica_lifecycle
 
 
 class ServicesMixin:
@@ -123,6 +126,9 @@ class ServicesMixin:
         if workload.state in TERMINAL_WORKLOAD_STATES:
             raise ConflictError(f"workload {workload.id!r} is {workload.state.value} and cannot register an endpoint")
         async with self.repository.transaction() as tx:
+            # Match probe/replacement lock order: health rows before replica.
+            if workload.parent_workload_id is not None:
+                await tx.list_service_replica_health(workload.parent_workload_id)
             current = await tx.get_workload(workload.id)
             if current is None:
                 raise NotFoundError(f"workload {workload.id!r} was not found")
@@ -130,7 +136,16 @@ class ServicesMixin:
                 # The capability was minted for a superseded attempt. Its
                 # endpoint belongs to a process that is being replaced.
                 raise ConflictError(f"workload {workload.id!r} has moved to generation {current.generation}")
-            stored = current.model_copy(update={"service_endpoint": endpoint, "updated_at": utcnow()})
+            if current.state in TERMINAL_WORKLOAD_STATES:
+                raise ConflictError(f"workload {current.id!r} is {current.state.value} and cannot register an endpoint")
+            if current.service_endpoint == endpoint:
+                return current  # an idempotent registration preserves health
+            if current.parent_workload_id is not None:
+                await tx.delete_service_replica_health(current.parent_workload_id, current.id)
+            # Advance even if the wall clock stalls or moves backwards, so an
+            # in-flight probe of A cannot survive registration A -> B -> A.
+            updated_at = max(utcnow(), current.updated_at + timedelta(microseconds=1))
+            stored = current.model_copy(update={"service_endpoint": endpoint, "updated_at": updated_at})
             await tx.put_workload(stored)
             return stored
 
@@ -185,6 +200,10 @@ class ServicesMixin:
             if child.state in TERMINAL_WORKLOAD_STATES:
                 continue
             record = health.get(child.id)
+            if record is not None and (
+                record.replica_generation != child.generation or record.endpoint != child.service_endpoint
+            ):
+                record = None
             state = ServiceReplicaHealthState.UNKNOWN if policy is None else replica_health_state(child, record, policy)
             replicas.append(
                 {
@@ -240,7 +259,10 @@ class ServicesMixin:
         preemption requeue between observing a replica and retiring it means the
         control plane kills the *replacement* -- the record it read was at
         generation 3, the process now on the host is generation 4, and the
-        cancellation lands on the live one.
+        cancellation lands on the live one. The policy, health, lease and cell
+        evidence are also re-read here: a recovery at the same generation must
+        supersede the earlier replacement verdict. The decision retains the
+        planner's aggregate observation, but its reason is the current verdict.
 
         Returns the committed decision, or ``None`` when the fence refused --
         which is an ordinary outcome and not an error: the observation was
@@ -259,6 +281,16 @@ class ServicesMixin:
             if service is None or service.coordination_kind is not CoordinationKind.SERVICE:
                 raise NotFoundError(f"service {service_id!r} was not found")
             self.authorizer.require(principal, Permission.OPERATE, org_id=service.org_id, project_id=service.project_id)
+            declared = service_policy(service.spec.metadata)
+            if (
+                declared is None
+                or service.state in TERMINAL_WORKLOAD_STATES
+                or service.state is WorkloadState.CANCELLING
+            ):
+                return None
+            # Match the health writer's lock order: health rows before replica.
+            # Otherwise a concurrent probe commit can deadlock this retirement.
+            health = {record.replica_id: record for record in await tx.list_service_replica_health(service_id)}
             replica = await tx.get_workload(replica_id)
             if replica is None or replica.parent_workload_id != service_id:
                 return None
@@ -271,9 +303,16 @@ class ServicesMixin:
                 # Racing it would leave the plan settling a victim it no longer
                 # owns, which that path raises on rather than tolerates.
                 return None
+            lease = None if replica.lease_id is None else await tx.get_lease(replica.lease_id)
+            cell = None if lease is None else await tx.get_cell(lease.cell_id)
+            (verdict,) = plan_replica_lifecycle(
+                declared,
+                [ReplicaObservation(replica=replica, lease=lease, cell=cell, health=health.get(replica_id))],
+            )
+            if not verdict.replace:
+                return None
             await self._cancel_one(tx, principal, replica, "service.replica_replaced")
-            declared = service_policy(service.spec.metadata)
-            replicas = 0 if declared is None else declared.replicas
+            replicas = declared.replicas
             decision = await self._append_service_decision(
                 tx,
                 ServiceDecisionRecord(
@@ -284,7 +323,7 @@ class ServicesMixin:
                     to_replicas=replicas,
                     replica_id=replica_id,
                     replica_generation=expected_generation,
-                    reason=reason[:512],
+                    reason=verdict.reason[:512],
                     observed=observed,
                 ),
                 history_limit=history_limit,

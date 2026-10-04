@@ -32,8 +32,10 @@ over-spend discovered at the invoice -- is neither.
 
 from __future__ import annotations
 
+import math
 import typing as tp
 from datetime import datetime
+from decimal import Decimal, localcontext
 
 from pydantic import Field, model_validator
 
@@ -170,16 +172,63 @@ class QuotaGrantRecord(EyvanModel):
         return self.state is GrantState.ACTIVE and moment < self.expires_at
 
 
-def outstanding_quota(grants: tp.Sequence[QuotaGrantRecord], *, now: datetime) -> dict[str, float]:
-    """Return the per-dimension total currently authorized on peers."""
+# Retain the full exponent span of finite wire quantities, including canonical
+# worker/replica products, rather than erasing tiny rights at Decimal's default
+# 28-digit precision. This matches the retained monetary authority precision.
+_QUOTA_PRECISION = 2048
 
-    totals: dict[str, float] = {}
-    for grant in grants:
-        if not grant.active_at(now):
-            continue
-        for name, quantity in resource_quantities(grant.limits).items():
-            totals[name] = totals.get(name, 0.0) + quantity
+
+def _outstanding_quota_exact(grants: tp.Sequence[QuotaGrantRecord], *, now: datetime) -> dict[str, Decimal]:
+    """Return exact retained peer capacity rights, including retired grants."""
+
+    totals: dict[str, Decimal] = {}
+    with localcontext(prec=_QUOTA_PRECISION):
+        for grant in grants:
+            for name, quantity in resource_quantities(grant.limits).items():
+                totals[name] = totals.get(name, Decimal(0)) + Decimal(str(quantity))
     return totals
+
+
+def outstanding_quota(grants: tp.Sequence[QuotaGrantRecord], *, now: datetime) -> dict[str, float]:
+    """Return retained peer capacity rights, not merely new-admission rights.
+
+    Expiry/revocation cannot prove that a peer stopped its existing work. Without
+    a reliable release protocol, retired slices remain reserved on the home.
+    ``now`` remains accepted for compatibility with existing callers. Project
+    totals upward when float conversion would hide a retained positive right;
+    authoritative accounting uses the exact private helper.
+    """
+
+    projected: dict[str, float] = {}
+    for name, exact in _outstanding_quota_exact(grants, now=now).items():
+        quantity = float(exact)
+        if Decimal(str(quantity)) < exact:
+            quantity = math.nextafter(quantity, math.inf)
+        projected[name] = quantity
+    return projected
+
+
+def _quota_headroom_exact(
+    limits: ResourceLimits,
+    grants: tp.Sequence[QuotaGrantRecord],
+    *,
+    now: datetime,
+    local_usage: tp.Mapping[str, Decimal] | None = None,
+    replacing: str | None = None,
+) -> dict[str, Decimal]:
+    """Partition exact capacity between retained peer rights and local usage.
+
+    Retirement/replacement never refunds rights without reliable release proof.
+    Callers supply canonical active local usage under the admission lock.
+    """
+
+    committed = _outstanding_quota_exact(grants, now=now)
+    usage = local_usage or {}
+    with localcontext(prec=_QUOTA_PRECISION):
+        return {
+            name: max(Decimal(0), Decimal(str(quantity)) - committed.get(name, Decimal(0)) - usage.get(name, Decimal(0)))
+            for name, quantity in resource_quantities(limits).items()
+        }
 
 
 def quota_headroom(
@@ -191,19 +240,19 @@ def quota_headroom(
 ) -> dict[str, float]:
     """Return how much of each dimension the home plane may still grant away.
 
-    No ``local_spent`` analogue, and the omission is deliberate rather than an
-    oversight. A budget's ``spent`` is a durable counter of money already gone; a
-    quota's usage is whatever happens to be running right now, and subtracting it
-    would make the *same* grant issuable or not depending on which jobs were live
-    at that second. A quota is a concurrent ceiling, so the home plane keeps its
-    own full ceiling and cuts slices out of it -- the local plane simply may not
-    grant away more than it holds.
+    Callers must additionally deduct local active usage under the admission
+    lock. Replacement cannot exclude old rights: retirement is not evidence that
+    a peer released its capacity. ``replacing`` is accepted for compatibility,
+    but deliberately does not refund the old slice.
     """
 
-    committed = outstanding_quota([grant for grant in grants if replacing is None or grant.id != replacing], now=now)
-    return {
-        name: max(0.0, quantity - committed.get(name, 0.0)) for name, quantity in resource_quantities(limits).items()
-    }
+    projected: dict[str, float] = {}
+    for name, exact in _quota_headroom_exact(limits, grants, now=now, replacing=replacing).items():
+        quantity = float(exact)
+        if Decimal(str(quantity)) > exact:
+            quantity = math.nextafter(quantity, 0.0)
+        projected[name] = quantity
+    return projected
 
 
 def exceeds_quota_headroom(
@@ -225,10 +274,58 @@ def exceeds_quota_headroom(
     )
 
 
-def outstanding_total(grants: tp.Sequence[BudgetGrantRecord], *, now: datetime) -> float:
-    """Return the total currently authorized on peers."""
+# Wire amounts are finite IEEE-754 floats: their decimal exponent span fits
+# comfortably here, including cost products. The default 28-digit context can
+# silently erase a small but positive issued right next to a larger limit.
+_MONEY_PRECISION = 2048
 
-    return float(sum(grant.amount for grant in grants if grant.active_at(now)))
+
+def _sum_money(values: tp.Iterable[float | Decimal]) -> Decimal:
+    with localcontext(prec=_MONEY_PRECISION):
+        return sum((Decimal(str(value)) for value in values), Decimal(0))
+
+
+def _retained_budget_authority(grants: tp.Sequence[BudgetGrantRecord]) -> Decimal:
+    # A report is not final-consumption proof and cannot refund unused rights.
+    # Reports within the amount are already covered; excess reports increase the
+    # charge rather than being hidden by an issued amount that proved too small.
+    return _sum_money(max(Decimal(str(grant.amount)), Decimal(str(grant.reported_spend))) for grant in grants)
+
+
+def outstanding_total(grants: tp.Sequence[BudgetGrantRecord], *, now: datetime) -> float:
+    """Return full retained monetary authority, including retired grants.
+
+    No final-consumption protocol exists. Revocation, expiry, replacement and a
+    period roll therefore do not refund any issued authority. ``now`` remains
+    accepted for compatibility; it does not determine monetary finality.
+    """
+
+    return float(_retained_budget_authority(grants))
+
+
+def _issuable_amount_exact(
+    limit: float,
+    grants: tp.Sequence[BudgetGrantRecord],
+    *,
+    now: datetime,
+    local_spent: float = 0.0,
+    local_reserved: Decimal = Decimal(0),
+    replacing: str | None = None,
+) -> Decimal:
+    """Return exact headroom shared by home admission and peer issuance.
+
+    Callers supply current-period local spend and active reservations under the
+    same admission lock. All issued peer rights remain reserved until reliably
+    proven final, including when retired or replaced. Reports are covered by the
+    issued rights, not subtracted twice. ``replacing`` remains accepted for
+    compatibility but never excludes an outstanding right.
+    """
+
+    with localcontext(prec=_MONEY_PRECISION):
+        return max(
+            Decimal(0),
+            Decimal(str(limit)) - _retained_budget_authority(grants) - Decimal(str(local_spent)) - local_reserved,
+        )
 
 
 def issuable_amount(
@@ -237,23 +334,22 @@ def issuable_amount(
     *,
     now: datetime,
     local_spent: float = 0.0,
+    local_reserved: Decimal = Decimal(0),
     replacing: str | None = None,
 ) -> float:
-    """Return how much the home plane may still grant away.
+    """Return conservative headroom with the existing exported float interface.
 
-    Local spend counts against the same limit: a home plane that has itself spent
-    most of the budget cannot grant the rest away as if it were untouched, or the
-    two together would exceed the limit an operator set.
-
-    ``replacing`` excludes one existing grant, so re-issuing a peer's grant at a
-    new amount is measured against the headroom without it rather than against
-    headroom that already counts it.
+    Admission and issuance use the exact private helper. Round this public
+    projection downward if conversion would erase a retained positive right.
     """
 
-    committed = float(
-        sum(grant.amount for grant in grants if grant.active_at(now) and (replacing is None or grant.id != replacing))
+    exact = _issuable_amount_exact(
+        limit, grants, now=now, local_spent=local_spent, local_reserved=local_reserved, replacing=replacing
     )
-    return max(0.0, limit - committed - local_spent)
+    projected = float(exact)
+    if Decimal(str(projected)) > exact:
+        projected = math.nextafter(projected, 0.0)
+    return projected
 
 
 def federated_spend(

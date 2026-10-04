@@ -41,6 +41,7 @@ from eyvan.artifacts.managed import (
     workspace_uri,
 )
 from eyvan.records import (
+    ArtifactHold,
     CallableExecution,
     Principal,
     ResourceGang,
@@ -54,7 +55,7 @@ from eyvan.server.persistence import InMemoryRepository
 from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
 from eyvan.server.service.control_plane import DEFAULT_ARTIFACT_GRACE_PERIOD_S
-from eyvan.server.service.errors import InputError
+from eyvan.server.service.errors import AuthorizationError, InputError
 
 #: Content-addressed kinds verify the payload against its own URI on every write,
 #: so a test digest has to be the real hash of the bytes it names.
@@ -105,7 +106,9 @@ async def _stored(
         assert record is not None
         aged = utcnow() - age
         await tx.put_managed_artifact(
-            record.model_copy(update={"created_at": aged, "activated_at": aged, "updated_at": aged})
+            record.model_copy(
+                update={"created_at": aged, "activated_at": aged, "upload_started_at": aged, "updated_at": aged}
+            )
         )
 
 
@@ -181,8 +184,13 @@ async def test_a_freshly_uploaded_artifact_survives_the_grace_period(tmp_path) -
     result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
-    assert result.within_grace == 1
-    assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="research")
+    assert result.within_grace == 1, "scoped protection counts remain independent of the bounded candidate batch"
+    assert store.get(callable_uri(_DIGEST), org_id="acme", project_id="research") == _PAYLOAD
+    async with service.repository.transaction() as tx:
+        record = await tx.get_managed_artifact("acme", "research", callable_uri(_DIGEST))
+    assert record is not None
+    assert record.size_bytes == len(_PAYLOAD)
+    assert record.deleted_at is None
 
 
 @pytest.mark.asyncio
@@ -200,8 +208,17 @@ async def test_a_referenced_artifact_is_never_collected(tmp_path) -> None:
     result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
-    assert result.referenced == 1
-    assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="research")
+    assert result.referenced == 1, "scoped protection counts remain independent of the bounded candidate batch"
+    assert store.get(callable_uri(_DIGEST), org_id="acme", project_id="research") == _PAYLOAD
+    async with service.repository.transaction() as tx:
+        record = await tx.get_managed_artifact("acme", "research", callable_uri(_DIGEST))
+        references = await tx.list_artifact_references(
+            org_id="acme", project_id="research", uri=callable_uri(_DIGEST), active_only=True
+        )
+    assert record is not None
+    assert record.size_bytes == len(_PAYLOAD)
+    assert record.deleted_at is None
+    assert len(references) == 1
 
 
 @pytest.mark.asyncio
@@ -215,22 +232,34 @@ async def test_a_held_artifact_is_never_collected(tmp_path) -> None:
     result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
     assert result.collected_uris == ()
-    assert result.held == 1
-    assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="research")
+    assert result.held == 1, "scoped protection counts remain independent of the bounded candidate batch"
+    assert store.get(callable_uri(_DIGEST), org_id="acme", project_id="research") == _PAYLOAD
+    async with service.repository.transaction() as tx:
+        record = await tx.get_managed_artifact("acme", "research", callable_uri(_DIGEST))
+    assert record is not None
+    assert record.size_bytes == len(_PAYLOAD)
+    assert record.deleted_at is None
+    assert record.hold is not None
+    assert record.hold.reason == "under investigation"
 
 
 @pytest.mark.asyncio
 async def test_an_expired_hold_no_longer_protects(tmp_path) -> None:
     service, store = await _service(tmp_path)
     await _stored(service, store, callable_uri(_DIGEST))
-    await service.hold_artifact(
-        _principal(),
-        org_id="acme",
-        project_id="research",
-        uri=callable_uri(_DIGEST),
-        reason="for an hour",
-        expires_at=utcnow() - timedelta(minutes=1),
-    )
+    # Seeded at the record level: the API now refuses to place a hold that is
+    # already expired, and this test pins that the *collector* still ignores
+    # one that exists in stored records anyway.
+    async with service.repository.transaction() as tx:
+        record = await tx.get_managed_artifact("acme", "research", callable_uri(_DIGEST))
+        assert record is not None
+        expired = record.model_copy(
+            update={
+                "hold": ArtifactHold(reason="for an hour", held_by="alice", expires_at=utcnow() - timedelta(minutes=1)),
+                "updated_at": utcnow(),
+            }
+        )
+        await tx.put_managed_artifact(expired)
 
     result = await service.collect_artifacts_once(org_id="acme", project_id="research", dry_run=False)
 
@@ -324,8 +353,55 @@ def test_a_local_delete_removes_only_the_scoped_object(tmp_path) -> None:
 def test_the_collect_route_is_registered_on_the_api(monkeypatch, tmp_path) -> None:
     """The HTTP surface exists and is bound to the collector service call."""
 
+    from eyvan.config import EyvanSettings
     from eyvan.server.api.app import create_app
 
-    app = create_app()
+    app = create_app(settings=EyvanSettings(artifact_store_uri=str(tmp_path / "artifacts")))
     paths = {getattr(route, "path", None) for route in app.routes}
     assert "/api/v1/artifacts/collect" in paths
+
+
+@pytest.mark.asyncio
+async def test_collection_refuses_a_principal_outside_the_swept_scope(tmp_path) -> None:
+    """The sweep deletes bytes, so a caller authorizes like the holds do.
+
+    The HTTP route always supplies the authenticated principal. A principal
+    whose grants name a different org must not even enumerate another tenant's
+    reclaimable artifacts -- and with ``grace_period_s=0`` and no dry run it
+    used to be able to delete them.
+    """
+
+    service, store = await _service(tmp_path)
+    await _stored(service, store, callable_uri(_DIGEST))
+    outsider = Principal(
+        subject="mallory",
+        grants=(RoleGrant(role=Role.PROJECT_ADMIN, org_id="other", project_id="elsewhere"),),
+    )
+
+    with pytest.raises(AuthorizationError):
+        await service.collect_artifacts_once(
+            principal=outsider,
+            org_id="acme",
+            project_id="research",
+            dry_run=False,
+            grace_period_s=0,
+        )
+    assert store.exists(callable_uri(_DIGEST), org_id="acme", project_id="research"), (
+        "a refused sweep must not have deleted anything"
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_admits_an_admin_of_the_swept_scope(tmp_path) -> None:
+    service, store = await _service(tmp_path)
+    await _stored(service, store, callable_uri(_DIGEST))
+
+    result = await service.collect_artifacts_once(
+        principal=_principal(),
+        org_id="acme",
+        project_id="research",
+        dry_run=True,
+    )
+
+    assert result.dry_run is True
+    assert result.collected_uris == (callable_uri(_DIGEST),)

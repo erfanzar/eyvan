@@ -37,7 +37,7 @@ its own restart.
 
 ```
         you (SDK: init + @execute)
-                │  signed callable artifact + workload record
+                │  unsigned callable artifact + workload record
                 ▼
         eyvan-server  ── the plane: API, scheduler, capacity planner,
                 │        controller, durable state
@@ -106,8 +106,10 @@ SSH host yet. `docs/proofs.md` keeps the honest ledger per backend.
 
 1. `init(fleet=…)` resolves the plane and credentials; `@execute(TpuConfig)` wraps
    your function.
-2. Calling it dumps the bound callable, signs it, and uploads it to the
-   content-addressed artifact store (`sha256`-named object).
+2. Calling it dumps the bound callable and uploads its unsigned bytes to the
+   content-addressed artifact store (`sha256`-named object). Standalone callable
+   execution requires an explicitly trusted project; a digest checks integrity,
+   not submitter identity or pickle safety.
 3. The workload record lands `pending`; the scheduler looks for a ready cell.
 4. With none, the capacity planner asks the provider — one queued resource per
    worker, atomically. Refusals render as `blocked … retrying (attempt N)` and the

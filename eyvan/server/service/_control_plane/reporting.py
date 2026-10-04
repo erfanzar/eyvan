@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 from eyvan.server.service._control_plane.shared import (
     ACTIVE_LEASE_STATES,
     BILLABLE_CELL_STATES,
@@ -166,9 +168,14 @@ class ReportingMixin:
         this answers how a shared budget is being spent, and the people sharing
         it are exactly who should be able to see that without being made
         administrators first.
+
+        A timezone-less ``since`` cutoff is interpreted as UTC, consistent with
+        the stored workload timestamps. Offset-aware cutoffs retain their instant.
         """
 
         self.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
+        if since is not None and since.utcoffset() is None:
+            since = since.replace(tzinfo=UTC)
         async with self.repository.transaction() as tx:
             workloads = await tx.list_workloads(org_id=org_id, project_id=project_id)
             leases = await tx.list_leases(org_id=org_id, project_id=project_id)

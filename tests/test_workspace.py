@@ -79,9 +79,10 @@ def test_build_workspace_digest_changes_with_content(tmp_path: Path) -> None:
 
 
 def test_build_workspace_excludes_caches_and_vcs_by_default(tmp_path: Path) -> None:
+    import subprocess
+
     root = _tree(tmp_path / "a")
-    (root / ".git").mkdir()
-    (root / ".git" / "config").write_text("[core]\n")
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
     (root / "__pycache__").mkdir()
     (root / "__pycache__" / "train.cpython-313.pyc").write_bytes(b"\x00")
     (root / "pkg" / "compiled.pyc").write_bytes(b"\x00")

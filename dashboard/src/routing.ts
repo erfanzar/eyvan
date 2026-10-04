@@ -18,7 +18,14 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   const path = hash.replace(/^#\/?/, "");
   const [section, id] = path.split("/");
   if (section === "workloads" && id) {
-    return { section: "workloads", workloadId: decodeURIComponent(id) };
+    try {
+      return { section: "workloads", workloadId: decodeURIComponent(id) };
+    } catch (error) {
+      if (!(error instanceof URIError)) throw error;
+      // Browser hashes may come from malformed external links, not routeHash.
+      // Keep the list usable without requesting an invalid workload detail.
+      return { section: "workloads" };
+    }
   }
   // Every section the rail offers, or the rail has an item that navigates to
   // the overview. `billing` was missing here while it had a nav entry, a page,

@@ -53,27 +53,27 @@ describe("draining a cell", () => {
     expect(screen.queryByRole("button", { name: "Drain" })).toBeNull();
   });
 
-  it("says how much work is on the cell before draining it", async () => {
-    // The number that decides whether this is routine or an interruption. An
-    // operator draining a bad host should not learn it was holding somebody's
-    // gang from the job's owner afterwards.
+  it("reports selected-project work without claiming to know whole-fleet occupancy", async () => {
     renderFleet({ onDrainCell: () => Promise.resolve() });
 
     fireEvent.click(screen.getByRole("button", { name: "Drain" }));
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/2 workloads currently hold capacity here/)).toBeTruthy();
+    expect(within(dialog).getByText(/2 selected-project workloads currently hold capacity here/)).toBeTruthy();
+    expect(within(dialog).getByText(/Other-project occupancy is unknown/)).toBeTruthy();
+    expect(screen.getByText("Selected-project workloads")).toBeTruthy();
     expect(within(dialog).getAllByText(/us-east5-b-v6e-01/).length).toBeGreaterThan(0);
   });
 
-  it("says plainly when nothing is running there", async () => {
+  it("reports zero selected-project workloads without claiming the cell is empty", async () => {
     renderFleet({ cells: [cell({ activeWorkloads: 0 })], onDrainCell: () => Promise.resolve() });
 
     fireEvent.click(screen.getByRole("button", { name: "Drain" }));
 
-    expect(
-      within(await screen.findByRole("dialog")).getByText(/No workload currently holds capacity here/),
-    ).toBeTruthy();
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/No selected-project workloads currently hold capacity here/)).toBeTruthy();
+    expect(within(dialog).getByText(/Other-project occupancy is unknown/)).toBeTruthy();
+    expect(within(dialog).queryByText(/No workload currently holds capacity here/)).toBeNull();
   });
 
   it("cannot be reached by a mis-click, because a drain cannot be undone", async () => {

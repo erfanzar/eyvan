@@ -70,6 +70,7 @@ def _replica(identifier: str = "replica-1", *, generation: int = 1) -> WorkloadR
         ),
         state=WorkloadState.RUNNING,
         generation=generation,
+        service_endpoint="http://10.0.0.1:8080",
         created_by="alice",
     )
 

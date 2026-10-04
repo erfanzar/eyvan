@@ -22,7 +22,6 @@ import yaml
 from eyvan._internal.compat import UTC
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan._internal.workspace import create_private_directory
-from eyvan.capacity.autoscale.compiler import render_autoscale_yaml
 from eyvan.capacity.autoscale.models import (
     DEFAULT_AUTOSCALE_CACHE_ROOT,
     AutoscaleDefaults,
@@ -79,8 +78,14 @@ class GeneratedAutoscaleCache:
         self.index_path = self.root / "index.json"
         self.index_lock_path = self.root / ".index.lock"
 
-    def store(self, generated: GeneratedAutoscale) -> CachedAutoscaleConfig:
-        """Atomically persist one generated config and its non-secret metadata."""
+    def store(
+        self,
+        generated: GeneratedAutoscale,
+        *,
+        refresh_generations: tuple[str, ...] = (),
+        preserve_types: tuple[str, ...] = (),
+    ) -> CachedAutoscaleConfig:
+        """Persist a refresh, preserving out-of-scope pools under the index lock."""
 
         create_private_directory(self.configs_dir)
         try:
@@ -90,10 +95,71 @@ class GeneratedAutoscaleCache:
             pass
         path = self.configs_dir / f"{generated.fleet_name}.yaml"
         with _exclusive_file_lock(self.index_lock_path):
-            _atomic_write(path, render_autoscale_yaml(generated), mode=0o600)
             metadata = self._load_index()
             generated_at = datetime.now(UTC).isoformat()
-            metadata[generated.fleet_name] = _metadata_for(generated, generated_at=generated_at, path=path)
+            document = generated.document
+            info = _metadata_for(generated, generated_at=generated_at, path=path)
+            if isinstance(generated, GeneratedZoneAutoscaleConfig) and (refresh_generations or preserve_types):
+                previous, previous_document = _load_fleet_config_document(path)
+                if (
+                    previous is not None
+                    and previous_document is not None
+                    and previous.provider == generated.config.provider
+                ):
+                    previous_types = {
+                        name: pool.accelerator_type
+                        for name, pool in previous.pools.items()
+                        if isinstance(pool, TpuNodeType)
+                    }
+                    retained = {
+                        name: pool
+                        for name, pool in _document_pools(previous_document).items()
+                        if name in previous_types
+                        and (
+                            previous_types[name] in preserve_types
+                            or (
+                                refresh_generations and previous_types[name].partition("-")[0] not in refresh_generations
+                            )
+                        )
+                        and name not in _document_pools(document)
+                    }
+                    # A denial retains a flavor, not an independent historical
+                    # quota budget. Reconcile its shared group against the fresh
+                    # observation before validation or either atomic write. Groups
+                    # absent from this refresh keep their existing declarations.
+                    current_limits: dict[str, int] = {}
+                    for pool in _document_pools(document).values():
+                        group = pool.get("quota_group")
+                        limit = pool.get("quota_limit")
+                        if isinstance(group, str) and isinstance(limit, int) and not isinstance(limit, bool):
+                            current_limits[group] = min(current_limits.get(group, limit), limit)
+                    retained = {
+                        name: {**pool, "quota_limit": current_limits[group]}
+                        if isinstance(group := pool.get("quota_group"), str) and group in current_limits
+                        else pool
+                        for name, pool in retained.items()
+                    }
+                    document = {**document, "pools": {**retained, **_document_pools(document)}}
+                    validate_generated_fleet(document)
+                    info["pools"] = {
+                        name: {"max_workers": _pool_max_workers(pool)}
+                        for name, pool in _document_pools(document).items()
+                    }
+                    retained_generations = {previous_types[name].partition("-")[0] for name in retained}
+                    old_info = metadata.get(generated.fleet_name)
+                    old_quotas = old_info.get("generation_quotas") if isinstance(old_info, dict) else None
+                    new_quotas = info["generation_quotas"]
+                    if isinstance(old_quotas, list) and isinstance(new_quotas, list):
+                        new_generations = {quota.get("generation") for quota in new_quotas if isinstance(quota, dict)}
+                        info["generation_quotas"] = new_quotas + [
+                            quota
+                            for quota in old_quotas
+                            if isinstance(quota, dict)
+                            and quota.get("generation") in retained_generations
+                            and quota.get("generation") not in new_generations
+                        ]
+            _atomic_write(path, yaml.safe_dump(document, sort_keys=False), mode=0o600)
+            metadata[generated.fleet_name] = info
             _atomic_write(self.index_path, json.dumps(metadata, indent=2, sort_keys=True) + "\n", mode=0o600)
         return _cached_from_generated(generated, path=path, generated_at=generated_at)
 
@@ -248,6 +314,9 @@ class QueueAdmissionDenialCache:
         self._ensure_root()
         with _exclusive_file_lock(self.lock_path):
             entries = self._load_locked()
+            previous = entries.get(key)
+            if previous is not None and previous.observed_at >= denial.observed_at:
+                return previous
             entries[key] = denial
             self._write_locked(entries)
         return denial
@@ -376,10 +445,16 @@ class AutoscaleConfigCache:
                 pass
         return AutoscaleDefaultsRepository(target).save(defaults)
 
-    def store(self, generated: GeneratedAutoscale) -> CachedAutoscaleConfig:
+    def store(
+        self,
+        generated: GeneratedAutoscale,
+        *,
+        refresh_generations: tuple[str, ...] = (),
+        preserve_types: tuple[str, ...] = (),
+    ) -> CachedAutoscaleConfig:
         """Atomically persist one generated config and its non-secret metadata."""
 
-        return self._generated.store(generated)
+        return self._generated.store(generated, refresh_generations=refresh_generations, preserve_types=preserve_types)
 
     def preview(self, generated: GeneratedAutoscale) -> CachedAutoscaleConfig:
         """Return a cache-shaped generated entry without writing local state."""

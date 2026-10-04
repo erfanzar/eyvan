@@ -58,7 +58,7 @@ def test_positive_prediction_preserves_pattern_reason():
 def test_infinite_cost_remains_unaffordable():
     prediction = _prediction(budget=0.3, cost=float("inf"))
     assert prediction.cells == 0
-    assert "affords no cell" in prediction.reason
+    assert "no finite hourly cost" in prediction.reason
 
 
 @pytest.mark.parametrize(("budget", "cap"), [(0.1, 10), (1.0, 1)])

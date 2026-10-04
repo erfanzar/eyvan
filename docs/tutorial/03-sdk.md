@@ -42,8 +42,10 @@ exclusive. Two safety rules worth knowing:
 - On a **loopback** plane with no explicit identity, the SDK/CLI default to the
   `fleet_admin` role (it is your own dev plane). Anything naming a token or remote
   plane keeps the `operator` role.
-- A `signing_key` is refused for remote planes (`reject_remote_callable_signing_key`)
-  — your secrets never travel to a plane you do not own.
+- A `signing_key` is refused by the default standalone SDK/API submitter,
+  including on loopback (`reject_remote_callable_signing_key`). An explicit
+  custom submitter may implement its own producer/verifier protocol; the
+  standalone controller does not distribute a callable signing key.
 
 On loopback with no running plane, `init` starts one for you
 (`ensure_loopback_control_plane`), and auto-applies a cached generated fleet
@@ -86,7 +88,9 @@ result = run(epochs=3)      # blocks; live progress lines; returns your value
   before your callable imports — a research script can import its own modules with
   no image build. By default the decorated function's own directory ships;
   `workspace=False` opts out entirely.
-- The callable is pickled (cloudpickle), signed, and uploaded by content digest.
+- The standalone callable is pickled (cloudpickle) and uploaded unsigned by
+  content digest. Only explicitly trusted projects may submit callables; digest
+  verification is not signature authentication or a sandbox.
   Identical callables deduplicate to one stored artifact; concurrent identical
   submissions are safe (the loser of the upload race verifies the winner's digest
   and continues — pinned by tests in `tests/test_callable_execution.py`).

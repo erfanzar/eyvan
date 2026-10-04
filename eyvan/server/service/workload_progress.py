@@ -152,7 +152,7 @@ class WorkloadProgressResolver:
             ),
             capacity=capacity,
             retry=retry,
-            user_progress=tuple(report for report in reports if report.attempt >= workload.attempt),
+            user_progress=tuple(report for report in reports if report.attempt == workload.attempt),
         )
 
 
@@ -185,11 +185,11 @@ def _elastic_pack_candidates(
 ) -> tuple[CellRecord, ...]:
     """Return the cells an elastic placement would pack right now.
 
-    Mirrors the scheduler's greedy: cells this workload already owns or leases
-    always count, then free warm cells fill the remaining workers biggest-first
-    so the pack spans as few hardware worlds as the supply allows. A snapshot,
-    not a reservation: a warm cell stolen by another workload before the commit
-    simply stops counting on the next poll.
+    Cells this workload already owns or leases always count. Free warm cells
+    then supply the largest subset that fits the remaining workers, preferring
+    fewer cells as the scheduler does. Never overshoot: an oversized pack is
+    not dispatchable. A snapshot, not a reservation: a warm cell stolen by
+    another workload before the commit stops counting on the next poll.
     """
 
     if pool_id is None:
@@ -212,13 +212,20 @@ def _elastic_pack_candidates(
             elif cell.state is CellState.READY and cell.autoscale_request_workload_id is None:
                 warm.append(cell)
     remaining = need - sum(cell.worker_count for cell in own)
-    packed = list(own)
-    for cell in sorted(warm, key=lambda candidate: (-candidate.worker_count, candidate.id)):
-        if remaining <= 0:
-            break
-        packed.append(cell)
-        remaining -= cell.worker_count
-    return tuple(packed)
+    ordered = sorted(warm, key=lambda candidate: (-candidate.worker_count, candidate.id))
+    # Keep the fewest cells at each reachable width, just as the scheduler
+    # does. Greedy either overshoots (2+2 for three) or misses an exact subset
+    # (3+2+2 for four). Snapshot each pass so a cell is never counted twice.
+    packs: dict[int, tuple[int, ...]] = {0: ()}
+    for index, cell in enumerate(ordered):
+        for total, members in tuple(packs.items()):
+            combined = total + cell.worker_count
+            if combined > remaining:
+                continue
+            previous = packs.get(combined)
+            if previous is None or len(members) + 1 < len(previous):
+                packs[combined] = (*members, index)
+    return (*own, *(ordered[index] for index in packs[max(packs)]))
 
 
 def _capacity_summary(cells: tuple[CellRecord, ...]) -> WorkloadCapacitySummary:

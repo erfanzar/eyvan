@@ -31,11 +31,11 @@ _ARCHIVABLE_WORKLOAD_STATES = frozenset({WorkloadState.RUNNING})
 #: Rows read per page while recovering a writer's position from storage.
 _CHUNK_RECOVERY_PAGE = 256
 
-#: Pages read before recovery gives up. A million chunks would need four
-#: thousand pages; stopping well short of that bounds a cold start against a
-#: ledger that is somehow returning URIs forever, and the ceiling is reported
-#: rather than silently treated as "no chunks exist".
-_CHUNK_RECOVERY_MAX_PAGES = 64
+#: Cover the entire supported sequence space, plus an end-of-prefix probe.
+#: A smaller bound would recover an occupied next sequence for valid long runs
+#: and silently omit their later chunks on replay. Keep a finite guard against
+#: malformed ledgers, but refuse an incomplete scan rather than trust its prefix.
+_CHUNK_RECOVERY_MAX_PAGES = LOG_CHUNK_MAX_SEQUENCE // _CHUNK_RECOVERY_PAGE + 2
 
 
 class _LogChunkProgress:
@@ -276,11 +276,11 @@ class _ControllerLogArchival:
                     break
                 after = rows[-1].uri
             else:
-                logger.warning(
-                    "stopped scanning chunk archive for %s attempt %d after %d pages; later chunks are not being served",
-                    workload.id,
-                    workload.attempt,
-                    pages,
+                # Neither a writer nor a reader may treat a bounded prefix as
+                # complete: the next sequence may already exist, and replay
+                # would otherwise claim that omitted lines never existed.
+                raise RuntimeError(
+                    f"chunk archive scan incomplete for {workload.id} attempt {workload.attempt} after {pages} pages"
                 )
         return [(sequence, found[sequence]) for sequence in sorted(found)]
 

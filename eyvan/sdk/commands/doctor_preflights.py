@@ -22,15 +22,18 @@ never reported as allowed.
 
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import shutil
 import socket
 import subprocess
 from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 import httpx
 
+from eyvan._internal.plane_tls import control_plane_httpx_options
 from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.providers.gcp.compute_instances import (
     GcloudError,
@@ -136,8 +139,11 @@ def check_artifact_store(settings: EyvanSettings) -> PreflightOutcome:
 
     name = "artifact-store"
     uri = settings.artifact_store_uri
-    parsed = urlsplit(uri)
-    if parsed.scheme == "gs":
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        return (name, "fail", "configured artifact store URI is malformed", "correct EYVAN_ARTIFACT_STORE_URI")
+    if uri.startswith("gs://"):
         if shutil.which("gcloud") is None:
             return (
                 name,
@@ -154,27 +160,62 @@ def check_artifact_store(settings: EyvanSettings) -> PreflightOutcome:
             f"artifact bucket gs://{parsed.netloc} is not reachable: {output}",
             "create it (`gcloud storage buckets create gs://NAME`) or grant the active account storage.objects access",
         )
-    if parsed.scheme not in {"", "file"}:
-        return (name, "pass", f"not applicable: artifact store scheme {parsed.scheme!r} is not locally checkable", "")
-    local = pathlib.Path(parsed.path).expanduser()
-    if local.is_dir() and os.access(local, os.W_OK):
-        return (name, "pass", f"{local} exists and is writable", "")
-    # The plane creates the store directory on startup; what the preflight
-    # actually guards is that creation being possible at all.
-    parent = local
-    while not parent.exists() and parent != parent.parent:
-        parent = parent.parent
-    if parent.is_dir() and os.access(parent, os.W_OK):
+    # Match managed_artifact_store_from_uri's local URI selection without
+    # constructing a backend (construction would create the directory).
+    if parsed.scheme == "file":
+        if parsed.netloc not in ("", "localhost") or parsed.query or parsed.fragment:
+            return (
+                name,
+                "fail",
+                "file managed artifact URIs must be local paths without query or fragment",
+                "correct EYVAN_ARTIFACT_STORE_URI",
+            )
+        local_path = url2pathname(parsed.path)
+    elif parsed.scheme and not (len(parsed.scheme) == 1 and uri[1] == ":"):
         return (
             name,
-            "pass",
-            f"{local} does not exist yet and its parent is writable; the plane creates it on startup",
-            "",
+            "fail",
+            "managed artifact storage requires a gs:// URI, a file:// URI, or a local path",
+            "correct EYVAN_ARTIFACT_STORE_URI",
+        )
+    else:
+        local_path = uri
+    local = pathlib.Path(local_path).expanduser()
+    try:
+        if local.exists():
+            if local.is_dir() and os.access(local, os.W_OK | os.X_OK):
+                return (name, "pass", f"{local} exists and has write and search access", "")
+            return (
+                name,
+                "fail",
+                f"local artifact store {local} is not a directory with write and search access",
+                "correct its directory permissions or point EYVAN_ARTIFACT_STORE_URI elsewhere",
+            )
+        # The plane creates the store directory on startup; what the preflight
+        # actually guards is that creation being possible at all.
+        parent = local
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK):
+            return (
+                name,
+                "pass",
+                f"{local} does not exist yet and its parent has write and search access; "
+                "the plane creates it on startup",
+                "",
+            )
+    except OSError:
+        return (
+            name,
+            "fail",
+            f"cannot inspect local artifact store {local}; check directory search permissions and filesystem access",
+            "correct its directory permissions or point EYVAN_ARTIFACT_STORE_URI elsewhere",
         )
     return (
         name,
         "fail",
-        f"local artifact store {local} is missing and cannot be created: {parent} is not writable",
+        f"local artifact store {local} is missing and cannot be created: "
+        f"{parent} lacks directory write and search access",
         f"create it (`mkdir -p {local}`) or point EYVAN_ARTIFACT_STORE_URI elsewhere",
     )
 
@@ -249,22 +290,45 @@ def check_control_plane_port(base_url: str) -> PreflightOutcome:
             "",
         )
     family = socket.AF_INET6 if host == "::1" else socket.AF_INET
-    probe = socket.socket(family, socket.SOCK_STREAM)
-    probe.settimeout(2)
+    unknown = (name, "warn", f"could not determine whether {host}:{port} is available for a control plane to bind", "")
     try:
-        reachable = probe.connect_ex((host, port)) == 0
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2)
+            connection_result = probe.connect_ex((host, port))
     except OSError:
-        reachable = False
-    finally:
-        probe.close()
-    if not reachable:
+        return unknown
+    if connection_result in {errno.EACCES, errno.EPERM, errno.ETIMEDOUT}:
+        return unknown
+    if connection_result != 0:
+        # Refusal is not bindability: a bound socket need not be listening.
+        # Match a normal TCP server's reuse-address option, never reuse-port.
+        # This is a momentary probe, not a reservation for subsequent startup.
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as binder:
+                binder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                binder.bind((host, port))
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
+                return unknown
+            return (
+                name,
+                "fail",
+                f"{host}:{port} is occupied even though no TCP listener answered; a control plane cannot bind it",
+                f"find the holder with `lsof -i :{port}` or start the server on another port",
+            )
         return (name, "pass", f"{host}:{port} is free for a control plane to bind", "")
     authority_host = f"[{host}]" if ":" in host else host
     try:
-        health = httpx.get(f"{parsed.scheme or 'http'}://{authority_host}:{port}/api/v1/health", timeout=3.0)
+        health = httpx.get(
+            f"{parsed.scheme or 'http'}://{authority_host}:{port}/api/v1/health",
+            timeout=3.0,
+            trust_env=False,
+            **control_plane_httpx_options(),
+        )
         serving = health.status_code == 200 and '"controller"' in health.text
-    except (OSError, httpx.HTTPError):
-        serving = False
+    except (OSError, ValueError, httpx.HTTPError):
+        # An unavailable or untrusted response does not establish the holder's identity.
+        return (name, "warn", f"{host}:{port} is occupied but could not verify its control-plane health", "")
     if serving:
         return (name, "pass", f"an Eyvan control plane already answers on {host}:{port}", "")
     return (

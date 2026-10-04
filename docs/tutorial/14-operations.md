@@ -25,12 +25,28 @@ queue admission is refused.
   `~/.eyvan/control-plane.json` on 2026-08-29).
 - **Restart with credentials, or don't restart.** A bare `eyvan-server` comes up
   without the runtime profile's secrets and 401-loops against a still-running
-  agent (cells flip `unavailable` in a recreate loop). Start it with the profile:
+  agent (cells flip `unavailable` in a recreate loop). Restore the agent secret
+  from the profile, refusing startup if extraction fails:
   ```bash
-  export EYVAN_AGENT_SHARED_SECRET=$(python3 -c \
-    'import json;print(json.load(open("$HOME/.eyvan/gcp-native-runtime.json"))["agent_shared_secret"])')
-  eyvan-server --log-level info
+  if EYVAN_AGENT_SHARED_SECRET=$(python3 -c '
+  import json
+  from pathlib import Path
+  secret = json.loads((Path.home() / ".eyvan/gcp-native-runtime.json").read_text())["agent_shared_secret"]
+  if not isinstance(secret, str) or not secret:
+      raise SystemExit("Runtime profile has no nonempty agent_shared_secret")
+  print(secret)
+  '); then
+    export EYVAN_AGENT_SHARED_SECRET
+    eyvan-server --log-level info
+  else
+    printf '%s\n' 'Credential extraction failed; server was not started.' >&2
+    false
+  fi
   ```
+  This restores only the agent bearer secret, not the complete runtime profile.
+  Native-worker credentials, TLS material and callable trust still require their
+  configured restart path; do not bypass a failed extraction with a bare server
+  command.
 - **Cells cost money; the plane reaps them.** Idle cells drain after the fleet's
   idle timeout. Tearing down for the night: drain fleets first
   (`eyvan down <config> -y`).

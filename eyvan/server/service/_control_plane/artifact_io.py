@@ -109,7 +109,20 @@ class ArtifactIoMixin:
                     observed_size_bytes=current_bytes.metadata.size_bytes,
                 )
                 raise ConflictError("active managed artifact bytes disagree with their ledger")
-            return reserved
+            async with self.repository.transaction() as tx:
+                current = await tx.get_managed_artifact(org_id, project_id, uri)
+                if (
+                    current is None
+                    or current.state is not ManagedArtifactState.ACTIVE
+                    or current.record_generation != reserved.record_generation
+                    or current.object_version != reserved.object_version
+                    or current.object_version != current_bytes.metadata.object_version
+                ):
+                    raise ConflictError("managed artifact lifecycle changed during upload replay")
+                renewed_at = utcnow()
+                renewed = current.model_copy(update={"upload_started_at": renewed_at, "updated_at": renewed_at})
+                await tx.put_managed_artifact(renewed)
+                return renewed
         try:
             written = await asyncio.to_thread(
                 self.artifact_store.put_versioned,

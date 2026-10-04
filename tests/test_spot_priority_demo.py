@@ -18,6 +18,20 @@ def _module():
     return runpy.run_path(str(SCRIPT))
 
 
+def _advancing_clock(monkeypatch):
+    import time
+
+    clock = [time.monotonic()]
+
+    def sleep(seconds):
+        assert seconds > 0
+        clock[0] += seconds
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", sleep)
+    return clock
+
+
 def _arguments(**changes):
     return (
         dict(
@@ -146,7 +160,7 @@ def test_marker_parser_uses_message_json_and_exact_run_identity() -> None:
 
 @pytest.mark.parametrize("fail_save", [False, True])
 @pytest.mark.parametrize("fail_reads", [False, True])
-def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_save, fail_reads) -> None:
+def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_save, fail_reads, monkeypatch) -> None:
     from types import SimpleNamespace
 
     module = _module()
@@ -160,6 +174,7 @@ def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_
         state=SimpleNamespace(value="running"),
     )
     events = []
+    _advancing_clock(monkeypatch)
 
     class Client:
         def submit_workload(self, supplied, *, idempotency_key):
@@ -173,10 +188,15 @@ def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_
             if fail_reads and "workload-read-failed" not in events:
                 events.append("workload-read-failed")
                 raise OSError("transient read outage")
+            if item.state.value == "cancelling":
+                item.state.value = "cancelled"
+                events.append("terminal-observed")
             return item
 
         def workload_action(self, workload_id, action, *, idempotency_key):
+            assert idempotency_key == plan["run_id"] + "-cancel-batch"
             events.append((workload_id, action))
+            item.state.value = "cancelling"
 
     class Transport:
         def request_checked(self, method, path):
@@ -200,6 +220,8 @@ def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_
 
     module["cleanup_owned"](plan, Client(), Transport(), pending, receipt, fleet_started=True, save=save)
     assert "disable" in events and "reconcile" in events and ("wl_owned", "cancel") in events
+    assert events.count(("wl_owned", "cancel")) == 1
+    assert "terminal-observed" in events
     assert pending["batch"]["id"] == "wl_owned"
     assert receipt["cleanup"]["api_cells_deleted"] is True
     assert receipt["cleanup"]["provider_absence_verified"] is False
@@ -208,15 +230,13 @@ def test_cleanup_reconciles_ambiguous_admission_and_only_cancels_owned_ids(fail_
 
 @pytest.mark.parametrize("expire_cancellation", [False, True])
 def test_cleanup_still_attempts_fleet_disable_after_cancel_failure(expire_cancellation, monkeypatch) -> None:
-    import time
     from types import SimpleNamespace
 
     module = _module()
     plan = module["build_plan"](**_arguments())
     request = module["workload_request"](plan, "batch", "print('payload')")
     events = []
-    clock = [time.monotonic()]
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    clock = _advancing_clock(monkeypatch)
 
     class Client:
         def get_workload(self, workload_id):
@@ -303,7 +323,6 @@ def test_success_requires_checkpoint_attempt_and_computation_contracts() -> None
 @pytest.mark.parametrize("lose_response", [False, True, "interrupt", "timeout", "receipt"])
 def test_orchestration_and_admission_loss_with_api_doubles(lose_response, monkeypatch) -> None:
     import json
-    import time
     from types import SimpleNamespace
 
     from eyvan.records import WorkloadRecord, WorkloadState
@@ -313,8 +332,7 @@ def test_orchestration_and_admission_loss_with_api_doubles(lose_response, monkey
     records = {}
     cancellations = []
     calls = []
-    clock = [time.monotonic()]
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    clock = _advancing_clock(monkeypatch)
 
     class Client:
         submissions = 0
@@ -344,6 +362,8 @@ def test_orchestration_and_admission_loss_with_api_doubles(lose_response, monkey
         def get_workload(self, workload_id):
             role = workload_id.removeprefix("wl_")
             item = records[role]
+            if item.state == WorkloadState.CANCELLED:
+                return item
             if len(records) == 2:
                 return item.model_copy(
                     update={
@@ -372,7 +392,10 @@ def test_orchestration_and_admission_loss_with_api_doubles(lose_response, monkey
             return {"records": [{"message": json.dumps(marker | {"run_id": plan["run_id"]})}]}
 
         def workload_action(self, workload_id, action, **kwargs):
+            assert kwargs["idempotency_key"] == plan["run_id"] + "-cancel-batch"
             cancellations.append((workload_id, action))
+            role = workload_id.removeprefix("wl_")
+            records[role] = records[role].model_copy(update={"state": WorkloadState.CANCELLED})
 
     class Transport:
         def request(self, method, path):
@@ -407,6 +430,50 @@ def test_orchestration_and_admission_loss_with_api_doubles(lose_response, monkey
     else:
         assert not cancellations
         assert receipt["restored"]["matches_uninterrupted_control"] is True
+
+
+def test_cleanup_reports_deadline_when_owned_workload_never_becomes_terminal(monkeypatch):
+    from types import SimpleNamespace
+
+    module = _module()
+    plan = module["build_plan"](**_arguments())
+    request = module["workload_request"](plan, "batch", "print('payload')")
+    clock = _advancing_clock(monkeypatch)
+    started = clock[0]
+    cancellations = []
+    events = []
+
+    class Client:
+        def get_workload(self, workload_id):
+            return SimpleNamespace(
+                id=workload_id,
+                org_id=plan["org"],
+                project_id=plan["project"],
+                spec=request.spec,
+                state=SimpleNamespace(value="cancelling"),
+            )
+
+        def workload_action(self, workload_id, action, *, idempotency_key):
+            cancellations.append((workload_id, action, idempotency_key))
+
+    class Transport:
+        def request_checked(self, *args):
+            return SimpleNamespace(json=lambda: {"pools": plan["fleet_request"]["pools"], "cells": []})
+
+        def mutate(self, *args, **kwargs):
+            events.append("disable")
+            return SimpleNamespace(raise_for_status=lambda: None, status_code=200)
+
+    receipt = {}
+    module["cleanup_owned"](
+        plan, Client(), Transport(), {"batch": {"request": request, "id": "wl_owned"}}, receipt, fleet_started=True
+    )
+    assert events == ["disable"]
+    assert cancellations == [("wl_owned", "cancel", plan["run_id"] + "-cancel-batch")]
+    assert clock[0] - started == 120
+    assert receipt["cleanup"]["errors"] == [{"operation": "cancel-batch", "type": "TimeoutError"}]
+    assert receipt["cleanup"]["api_cells_deleted"] is True
+    assert receipt["cleanup"]["provider_absence_verified"] is False
 
 
 def test_log_polling_advances_cursor_and_retains_prior_markers():

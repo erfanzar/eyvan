@@ -261,6 +261,32 @@ cross-namespace scraper needs that label on both namespace and pod. `/metrics`
 and the API share TCP 8080, so NetworkPolicy cannot distinguish their paths;
 the metrics bearer and API authentication remain the authorization boundary.
 
+The monitor targets the control-plane Service directly, not the production
+Ingress. When `controlPlane.tls.existingSecret` is set, it uses HTTPS and
+rendering fails unless all three `serviceMonitor.tls` values below are non-empty.
+The CA Secret must already exist in the release namespace and its selected key
+must contain only the public CA certificate bundle, **never a private key**.
+`serverName` must match a SAN in the listener's serving certificate and identify
+the intended control plane; configure that certificate and name together. A
+public ingress hostname is not automatically the correct identity for the
+Service target. The chart never disables certificate verification.
+
+```yaml
+serviceMonitor:
+  enabled: true
+  tls:
+    caSecretName: eyvan-metrics-ca
+    caSecretKey: ca.crt
+    serverName: eyvan-control-plane.eyvan-system.svc.cluster.local
+```
+
+This example assumes that exact Service DNS name is in the serving certificate's
+SANs. The chart does not issue certificates or create the CA Secret. With the
+explicit plaintext listener (`controlPlane.insecurePlaintextBind=true` and no
+TLS Secret), the monitor uses HTTP without `tlsConfig`; ingress TLS termination
+does not encrypt this direct Service scrape. A disabled monitor requires no
+scraper trust values, even when the API listener uses TLS.
+
 ## Post-deployment checks
 
 After `helm upgrade --install` (and after any migration), do not treat

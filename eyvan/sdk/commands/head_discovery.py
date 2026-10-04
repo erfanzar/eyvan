@@ -26,6 +26,7 @@ which is exactly when you want it.
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 
 from eyvan._internal.json_types import JsonObject, is_json_object
@@ -170,6 +171,8 @@ def discover_heads(
         result = execute(action.args, stdin_text=None, timeout=timeout_s)
     except FileNotFoundError as exc:
         raise HeadCommandError(action.step, "gcloud is not installed or is not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HeadCommandError(action.step, f"gcloud instance listing timed out after {timeout_s:g} seconds") from exc
     except OSError as exc:
         raise HeadCommandError(action.step, f"could not start gcloud: {exc}") from exc
     if result.returncode != 0:
@@ -203,14 +206,15 @@ def configured_project(runner: HeadCommandRunner | None = None, *, timeout_s: fl
     """Return the project gcloud is currently configured for, if any.
 
     Returned rather than required, so a caller can offer it as a default and
-    still ask. A machine with no gcloud, or one where nobody has run
-    ``gcloud config set project``, gets ``None`` and a prompt -- never a guess.
+    still ask. A machine with no gcloud, a timed-out lookup, or one where nobody
+    has run ``gcloud config set project``, gets ``None`` and a prompt -- never a
+    guess.
     """
 
     execute = runner or _run_gcloud
     try:
         result = execute(("config", "get-value", "project"), stdin_text=None, timeout=timeout_s)
-    except (FileNotFoundError, OSError):
+    except (OSError, subprocess.TimeoutExpired):
         return None
     value = (result.stdout or "").strip()
     if result.returncode != 0 or not value or value in {"(unset)", "None"}:

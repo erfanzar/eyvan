@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from eyvan._internal.compat import UTC
@@ -56,6 +56,8 @@ from eyvan.capacity.providers.kubernetes.api import KubernetesApi, local_queue_c
 from eyvan.capacity.providers.kubernetes.kueue import (
     ClusterCapacityReading,
     ClusterCapacityState,
+    ClusterQueueCapacity,
+    capacity_fit,
     observe_cluster_capacity,
     parse_quantity,
 )
@@ -262,6 +264,11 @@ class ClusterCapacityPass:
         own would leave the freshness bound comparing two different clocks --
         which is how a signal survives its own expiry.
 
+        Exact accepted batches reserve their resource vectors in pool-id order
+        against the remaining ClusterQueue headroom. Reservations span LocalQueues
+        and preferred flavors where their resource groups share quota, and expire
+        with this pass. UNKNOWN advice still leaves the requested count untouched.
+
         Args:
             planned: ``(pool, worker_counts)`` for each pool about to launch,
                 where ``worker_counts`` is one entry per planned cell.
@@ -286,10 +293,33 @@ class ClusterCapacityPass:
             return {}
         moment = now or datetime.now(UTC)
         readings = self.read([target for _counts, target in targets], now=moment)
-        return {
-            target.pool_id: self.advise(target, counts, readings.get(target.pool_id), now=moment)
-            for counts, target in targets
-        }
+        # Match the controller's stable launch order. Quota belongs to the
+        # ClusterQueue, not the LocalQueue or the pool's preferred flavor: a
+        # CPU resource group can be shared by otherwise distinct TPU flavors.
+        reserved: dict[str, dict[tuple[str, str], float]] = {}
+        advice: dict[str, ClusterCapacityAdvice] = {}
+        for counts, target in sorted(targets, key=lambda item: item[1].pool_id):
+            reading = readings.get(target.pool_id)
+            balance = None
+            if reading is not None:
+                balance = reserved.setdefault(reading.queue.cluster_queue, {})
+                reading = replace(
+                    reading,
+                    queue=replace(
+                        reading.queue,
+                        headroom=tuple(
+                            replace(entry, reserved=entry.reserved + balance.get((entry.flavor, entry.resource), 0.0))
+                            for entry in reading.queue.headroom
+                        ),
+                    ),
+                )
+            result = self.advise(target, counts, reading, now=moment)
+            advice[target.pool_id] = result
+            if result.applied and result.allowed_cells and reading is not None and balance is not None:
+                _reserve_launches(
+                    reading.queue, target.cell_request(counts[0]), target.flavor, result.allowed_cells, balance
+                )
+        return advice
 
     def read(
         self,
@@ -402,6 +432,43 @@ class ClusterCapacityPass:
         except Exception:  # a plan input that can fail a pass is not a plan input
             logger.debug("cluster capacity could not be read for pool %s", target.pool_id, exc_info=True)
             return None
+
+
+def _reserve_launches(
+    queue: ClusterQueueCapacity,
+    request: tp.Mapping[str, float],
+    flavor: str,
+    cells: int,
+    reserved: dict[tuple[str, str], float],
+) -> None:
+    """Reserve an exact accepted batch against one whole flavor per resource group.
+
+    Use the same best-fit flavor choice as ``capacity_fit``. Reservations are
+    pass-local overlays; neither the fetched reading nor Kueue is mutated.
+    Only applied advice reaches here: unknown, stale, mixed-shape and lower-bound
+    decisions must keep their existing semantics rather than invent a shortage.
+    """
+
+    for group in sorted({entry.group for entry in queue.headroom}):
+        entries = tuple(entry for entry in queue.headroom if entry.group == group)
+        wanted = {
+            resource: amount for resource, amount in request.items() if any(e.resource == resource for e in entries)
+        }
+        if not wanted:
+            continue
+        flavors = sorted({entry.flavor for entry in entries})
+        candidates = [flavor] if flavor and flavor in flavors else flavors
+        group_queue = replace(queue, headroom=entries)
+        best = -1
+        selected = ""
+        for candidate in candidates:
+            fit = capacity_fit(group_queue, wanted, flavor=candidate)
+            if fit.admits is not None and fit.admits > best:
+                best = fit.admits
+                selected = candidate
+        for resource, amount in wanted.items():
+            key = (selected, resource)
+            reserved[key] = reserved.get(key, 0.0) + amount * cells
 
 
 def _default_api() -> KubernetesApi | None:

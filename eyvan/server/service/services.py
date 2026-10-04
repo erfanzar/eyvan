@@ -162,10 +162,12 @@ class ServicePolicy:
             # could never make progress. Refusing here beats a reconciler that
             # silently does nothing forever.
             raise InputError("a service roll requires max_unavailable or max_surge above zero")
+        if not math.isfinite(self.restart_backoff_s) or self.restart_backoff_s < 0:
+            raise InputError("a service restart backoff must be finite and nonnegative")
         if self.health_path and not self.health_path.startswith("/"):
             raise InputError("a service health path must be absolute")
-        if self.health_timeout_s <= 0:
-            raise InputError("a service health timeout must be positive")
+        if not math.isfinite(self.health_timeout_s) or self.health_timeout_s <= 0:
+            raise InputError("a service health timeout must be finite and positive")
         if self.health_failure_threshold < 1:
             # Zero would make the very first definite failure fatal, which is
             # the opposite of "a bounded run of failures".
@@ -178,16 +180,16 @@ class ServicePolicy:
             raise InputError("service replica bounds cannot be negative")
         if self.min_replicas is not None and self.max_replicas is not None and self.min_replicas > self.max_replicas:
             raise InputError("a service minimum replica count cannot exceed its maximum")
-        if self.scale_cooldown_s < 0:
-            raise InputError("a service scale cooldown cannot be negative")
+        if not math.isfinite(self.scale_cooldown_s) or self.scale_cooldown_s < 0:
+            raise InputError("a service scale cooldown must be finite and nonnegative")
         if self.scale_step < 1:
             # A cap of zero is an autoscaler that is on and can never act, which
             # reads to an operator as one that is broken.
             raise InputError("a service scale step must be at least one")
         if not 0.0 <= self.scale_in_load < self.scale_out_load <= 1.0:
             raise InputError("service scale thresholds must satisfy 0 <= scale_in < scale_out <= 1")
-        if self.load_max_age_s <= 0:
-            raise InputError("a service load observation window must be positive")
+        if not math.isfinite(self.load_max_age_s) or self.load_max_age_s <= 0:
+            raise InputError("a service load observation window must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,7 +392,18 @@ def _restart_backoff(policy: ServicePolicy, children: tp.Sequence[WorkloadRecord
     if not recent:
         return 0.0
     last = max(child.updated_at for child in recent)
-    delay = min(policy.restart_backoff_s * (2 ** (len(recent) - 1)), _MAX_BACKOFF_S)
+    delay = policy.restart_backoff_s
+    if delay > 0:
+        steps = len(recent) - 1
+        # Compare binary exponents before scaling. Even a subnormal base can
+        # need more than 1024 doublings, where constructing 2**steps and then
+        # converting it to a float overflows before the ceiling is applied.
+        _, base_exponent = math.frexp(delay)
+        _, ceiling_exponent = math.frexp(_MAX_BACKOFF_S)
+        if base_exponent + steps > ceiling_exponent:
+            delay = _MAX_BACKOFF_S
+        else:
+            delay = min(math.ldexp(delay, steps), _MAX_BACKOFF_S)
     elapsed = (now - last).total_seconds()
     return max(0.0, delay - elapsed)
 
@@ -520,7 +533,7 @@ def apply_probe(
       option that adds no evidence, which is exactly what an unknown is.
     """
 
-    if previous is not None and previous.replica_generation != replica_generation:
+    if previous is not None and (previous.replica_generation != replica_generation or previous.endpoint != endpoint):
         previous = None
     failures = 0 if previous is None else previous.consecutive_failures
     unknowns = 0 if previous is None else previous.consecutive_unknowns
@@ -569,7 +582,7 @@ def replica_health_state(
 
     if not policy.health_path:
         return ServiceReplicaHealthState.UNKNOWN
-    if health is None or health.replica_generation != replica.generation:
+    if health is None or health.replica_generation != replica.generation or health.endpoint != replica.service_endpoint:
         return ServiceReplicaHealthState.UNKNOWN
     if health.consecutive_failures >= policy.health_failure_threshold:
         return ServiceReplicaHealthState.UNHEALTHY
@@ -753,6 +766,7 @@ def service_observation(
             and health.observed_load is not None
             and health.load_observed_at is not None
             and health.replica_generation == observation.replica.generation
+            and health.endpoint == observation.replica.service_endpoint
         ):
             loads.append(health.observed_load)
             oldest = health.load_observed_at if oldest is None else min(oldest, health.load_observed_at)

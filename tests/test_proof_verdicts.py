@@ -234,17 +234,28 @@ def test_deleted_cells_do_not_decide_the_verdict() -> None:
 
 
 def _preempted(**overrides) -> dict:
-    return {"preemption_count": 1, "capacity_loss_count": 0, "state": "running", **overrides}
+    return {"id": "wl-1", "preemption_count": 1, "capacity_loss_count": 0, "state": "running", **overrides}
 
 
-def test_a_clean_reclamation_passes() -> None:
+def _assert_unattributed_preemption(result) -> None:
+    """Budget and survival are measured; current cell inventory is not event history."""
+
+    assert _check(result, "charged-to-the-preemption-budget") is Verdict.PASS
+    assert _check(result, "workload-survived") is Verdict.PASS
+    assert _check(result, "classified-as-preempted") is Verdict.INCONCLUSIVE
+    assert _check(result, "no-stockout-cooldown") is Verdict.INCONCLUSIVE
+    assert "does not link" in _detail(result, "no-stockout-cooldown")
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_clean_budget_charging_does_not_qualify_unattributed_inventory() -> None:
     result = evaluate_spot_preemption(
         _preempted(),
         [{"id": "cell-a", "pool_id": "research/v5p", "provider_failure_code": "preempted", "availability": {}}],
         [{"id": "research/v5p"}],
     )
 
-    assert result.verdict is Verdict.PASS
+    _assert_unattributed_preemption(result)
 
 
 def test_a_run_that_was_never_reclaimed_is_inconclusive() -> None:
@@ -283,13 +294,8 @@ def test_both_budgets_moving_is_also_a_failure() -> None:
     assert _check(result, "charged-to-the-preemption-budget") is Verdict.FAIL
 
 
-def test_a_cooldown_after_a_reclamation_fails() -> None:
-    """An interruption records no failure and sets no cooldown.
-
-    A cell in cooldown after a reclamation means the outcome was classified as a
-    stockout or a provider error, and the consequence is worse than a wrong
-    label: a cooled-down pool stops being asked, so the fleet quietly shrinks.
-    """
+def test_an_unattributed_cooldown_cannot_fail_this_reclamation() -> None:
+    """An inventory cooldown cannot fail a workload without event attribution."""
 
     result = evaluate_spot_preemption(
         _preempted(),
@@ -304,10 +310,10 @@ def test_a_cooldown_after_a_reclamation_fails() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL
+    _assert_unattributed_preemption(result)
 
 
-def test_a_cooldown_on_an_unrelated_pool_is_not_this_proof_s_business() -> None:
+def test_an_unrelated_pool_cooldown_cannot_qualify_this_runs_cooldown_history() -> None:
     """Another pool's backoff must not fail this proof.
 
     Otherwise any fleet with one unhealthy pool anywhere fails every preemption
@@ -323,7 +329,7 @@ def test_a_cooldown_on_an_unrelated_pool_is_not_this_proof_s_business() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+    _assert_unattributed_preemption(result)
 
 
 def test_a_reclaimed_cell_that_is_gone_cannot_vouch_for_the_absence_of_a_cooldown() -> None:
@@ -389,16 +395,11 @@ def test_a_replacement_cell_backing_off_for_its_own_reasons_is_not_this_proof_s_
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+    _assert_unattributed_preemption(result)
 
 
-def test_the_reclaimed_cell_cooling_still_fails_even_beside_a_healthy_replacement() -> None:
-    """The half that must survive the narrowing above.
-
-    Same two-cell shape, with the cooldown moved onto the cell that carries the
-    reclamation. That is the defect P5 exists to catch, and no amount of healthy
-    replacement capacity beside it makes it acceptable.
-    """
+def test_an_unattributed_reclaimed_cell_cooldown_is_unknown_beside_a_healthy_replacement() -> None:
+    """Neither the cooldown nor a healthy replacement identifies this workload's event."""
 
     result = evaluate_spot_preemption(
         _preempted(),
@@ -418,22 +419,11 @@ def test_the_reclaimed_cell_cooling_still_fails_even_beside_a_healthy_replacemen
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL
+    _assert_unattributed_preemption(result)
 
 
-def test_a_recreated_cell_still_witnesses_the_reclamation_it_recorded() -> None:
-    """The run that goes best must not be the one that settles least.
-
-    A pool that recreates the cell under its own id clears
-    ``provider_failure_code`` as soon as the replacement is healthy -- which is
-    the same moment the workload finishes resuming and ``workload-survived``
-    becomes settleable. Keyed on that field alone the criterion would go
-    inconclusive exactly on the clean runs.
-
-    ``availability.interruptions`` outlives the recreation and is the belief
-    this criterion is about, so it witnesses too. It is a time-decayed float,
-    which is why the check is not an integer one.
-    """
+def test_a_recreated_cells_interruption_count_cannot_attribute_a_workload_event() -> None:
+    """A cleared code and cumulative interruptions do not identify this run's event."""
 
     result = evaluate_spot_preemption(
         _preempted(),
@@ -448,7 +438,7 @@ def test_a_recreated_cell_still_witnesses_the_reclamation_it_recorded() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+    _assert_unattributed_preemption(result)
 
 
 def test_a_cell_that_was_never_interrupted_does_not_witness() -> None:
@@ -463,12 +453,8 @@ def test_a_cell_that_was_never_interrupted_does_not_witness() -> None:
     assert _check(result, "no-stockout-cooldown") is Verdict.INCONCLUSIVE
 
 
-def test_a_surviving_reclaimed_cell_without_a_cooldown_is_a_real_pass() -> None:
-    """The witness distinguishes this from the case above, and nothing else does.
-
-    Same fleet counters, same absence of a cooldown; the only difference is that
-    the cell which carried the reclamation is still there to be asked.
-    """
+def test_a_surviving_reclaimed_cell_without_a_cooldown_cannot_qualify_this_run() -> None:
+    """A surviving cell's current code and empty cooldown are not run-linked history."""
 
     result = evaluate_spot_preemption(
         _preempted(),
@@ -479,7 +465,7 @@ def test_a_surviving_reclaimed_cell_without_a_cooldown_is_a_real_pass() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
+    _assert_unattributed_preemption(result)
 
 
 def test_a_workload_that_failed_did_not_survive_its_preemption() -> None:
@@ -492,14 +478,14 @@ def test_a_workload_that_failed_did_not_survive_its_preemption() -> None:
     assert _check(result, "workload-survived") is Verdict.FAIL
 
 
-def test_the_wrong_failure_code_fails() -> None:
+def test_an_unattributed_wrong_failure_code_cannot_fail_this_run() -> None:
     result = evaluate_spot_preemption(
         _preempted(),
         [{"id": "cell-a", "pool_id": "p", "provider_failure_code": "provider_error", "availability": {}}],
         [{"id": "p"}],
     )
 
-    assert _check(result, "classified-as-preempted") is Verdict.FAIL
+    _assert_unattributed_preemption(result)
 
 
 # --------------------------------------------------------------------------- P6
@@ -646,7 +632,15 @@ _VALUE = "hf_secretvalue123"
 
 
 def _event(action: str, *, attempt: int = 1, **payload) -> dict:
-    return {"action": action, "payload": {"attempt": attempt, **payload}}
+    mount = {"names": ["HF_TOKEN"]} if action == "secret.issued" else {"name": "HF_TOKEN"}
+    return {
+        "action": action,
+        "entity_type": "workload",
+        "entity_id": "wl-1",
+        "org_id": "acme",
+        "project_id": "research",
+        "payload": {"attempt": attempt, "generation": 1, **mount, **payload},
+    }
 
 
 def test_a_secret_used_once_and_recorded_nowhere_passes() -> None:
@@ -1295,12 +1289,7 @@ def test_a_second_read_within_one_attempt_still_fails_when_other_attempts_are_cl
 
 
 def test_a_cooldown_left_by_an_earlier_run_does_not_decide_this_one() -> None:
-    """Found live 2026-09-24: a clean P5 rerun failed on the first run's cell.
-
-    That cell was reclaimed, cooled and deleted an hour before the rerun was
-    submitted, by a build that still set the cooldown. Its record outlives it,
-    so the proof reads only cells touched after this workload was submitted.
-    """
+    """Timestamp filtering cannot turn current inventory into run-linked event history."""
 
     workload = {**_preempted(), "created_at": "2026-09-24T17:22:00Z"}
     result = evaluate_spot_preemption(
@@ -1324,11 +1313,11 @@ def test_a_cooldown_left_by_an_earlier_run_does_not_decide_this_one() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.PASS
-    assert "this-run" in _detail(result, "no-stockout-cooldown")
+    _assert_unattributed_preemption(result)
+    assert "this-run" not in _detail(result, "no-stockout-cooldown")
 
 
-def test_a_cooldown_set_during_this_run_still_fails() -> None:
+def test_an_updated_at_during_this_run_does_not_attribute_a_cooldown() -> None:
     workload = {**_preempted(), "created_at": "2026-09-24T17:22:00Z"}
     result = evaluate_spot_preemption(
         workload,
@@ -1344,4 +1333,4 @@ def test_a_cooldown_set_during_this_run_still_fails() -> None:
         [{"id": "research/v5p"}],
     )
 
-    assert _check(result, "no-stockout-cooldown") is Verdict.FAIL
+    _assert_unattributed_preemption(result)

@@ -172,14 +172,14 @@ function formatWaited(createdIso: string): string {
   return `${rest}s`;
 }
 
-/** On-package HBM per chip, by generation prefix (v6e Trillium = 32 GB). */
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "completed"]);
 
-function hbmGb(acceleratorType: string): number {
+/** On-package HBM for the reported chips; v4/v5p suffixes count quota units, not chips. */
+function hbmGb(acceleratorType: string, chips: number | undefined): number | undefined {
   const perChip: Record<string, number> = { v4: 32, v5e: 16, v5p: 95, v5: 95, v6e: 32 };
   const generation = /^v\d+[a-z]*/.exec(acceleratorType)?.[0] ?? "";
-  const chips = Number(/-(\d+)$/.exec(acceleratorType)?.[1] ?? 0);
-  return (perChip[generation] ?? 0) * chips;
+  if (chips === undefined || !Number.isSafeInteger(chips) || chips <= 0 || !perChip[generation]) return undefined;
+  return perChip[generation] * chips;
 }
 
 export function WorkloadDetailPage({
@@ -221,6 +221,9 @@ export function WorkloadDetailPage({
   const [spend, setSpend] = useState<WorkloadSpend | null>(null);
   const [spendError, setSpendError] = useState<string | null>(null);
 
+  // App publishes a new immutable detail snapshot after each successful fenced
+  // poll/event refresh, even when state is unchanged. Follow that snapshot so
+  // capacity-only changes refresh these reads without polling on every render.
   useEffect(() => {
     const controller = new AbortController();
     setExplanation(null);
@@ -238,7 +241,7 @@ export function WorkloadDetailPage({
         }
       });
     return () => controller.abort();
-  }, [loadExplanation, workload.id]);
+  }, [loadExplanation, workload]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -256,7 +259,8 @@ export function WorkloadDetailPage({
         }
       });
     return () => controller.abort();
-  }, [loadCost, workload.id]);
+  }, [loadCost, workload]);
+  const acceleratorHbm = hbmGb(workload.resources.accelerator ?? "", workload.resources.acceleratorCount);
   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
   const cancellable = !["completed", "failed", "cancelled", "preempting"].includes(workload.status);
@@ -351,7 +355,7 @@ export function WorkloadDetailPage({
     // Assigned rather than `scrollTo`, which is a no-op or absent depending on
     // the environment; this is the property both a browser and jsdom honour.
     element.scrollTop = element.scrollHeight;
-  }, [filteredLogs.length, following]);
+  }, [filteredLogs, following]);
 
   const copyCommand = async () => {
     await navigator.clipboard.writeText(workload.command);
@@ -523,8 +527,8 @@ export function WorkloadDetailPage({
                 <div>
                   <dt>Accelerator HBM</dt>
                   <dd>
-                    {hbmGb(workload.resources.accelerator)} GB
-                    {workload.resources.slices && workload.resources.slices > 1
+                    {acceleratorHbm === undefined ? "Unknown" : `${acceleratorHbm} GB`}
+                    {acceleratorHbm !== undefined && workload.resources.slices && workload.resources.slices > 1
                       ? ` × ${workload.resources.slices}`
                       : ""}
                   </dd>
@@ -548,8 +552,7 @@ export function WorkloadDetailPage({
               <div>
                 <dt>Placement</dt>
                 <dd className="monospace">
-                  {workload.cell ??
-                    (["succeeded", "failed", "cancelled"].includes(workload.status) ? "Released" : "Pending")}
+                  {workload.cell ?? (TERMINAL_STATUSES.has(workload.status) ? "Released" : "Pending")}
                 </dd>
               </div>
               <div>

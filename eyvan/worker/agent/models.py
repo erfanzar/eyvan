@@ -219,6 +219,7 @@ class ExecRequest(AgentModel):
     #: this agent dying -- a subprocess timeout would leave the unit running
     #: with nobody waiting for it.
     timeout_s: float = Field(default=30.0, gt=0, le=600)
+    runtime_rank: int | None = Field(default=None, ge=0, le=9_999, strict=True)
 
 
 class AgentObservation(AgentModel):
