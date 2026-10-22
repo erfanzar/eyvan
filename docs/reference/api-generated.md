@@ -96,6 +96,22 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/system/invariants/soak` | Proof Scoped Fleet Invariants | 200, 422 |
 | POST | `/api/v1/system/reconcile` | Reconcile Once | 200 |
 | POST | `/api/v1/system/soak-evidence` | Record Soak Evidence | 200 |
+| GET | `/api/v1/tracking/health` | Tracking Health | 200 |
+| GET | `/api/v1/tracking/runs` | Tracking Runs | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}` | Tracking Run | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/blobs/{sha256}` | Tracking Blob | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/completions` | Tracking Completions | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/completions/stats` | Tracking Completion Stats | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/completions/{completion_id}` | Tracking Completion | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/episodes` | Tracking Episodes | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/episodes/breakdown` | Tracking Episode Breakdown | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/episodes/curve` | Tracking Episode Curve | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/histograms` | Tracking Histograms | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/media` | Tracking Media | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/rollouts` | Tracking Rollouts | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/rollouts/{rollout_id}` | Tracking Rollout | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/series` | Tracking Series | 200, 422 |
+| GET | `/api/v1/tracking/runs/{run_id}/tables` | Tracking Tables | 200, 422 |
 | GET | `/api/v1/usage` | Project Usage | 200, 422 |
 | GET | `/api/v1/webhooks` | List Webhooks | 200, 422 |
 | POST | `/api/v1/webhooks` | Create Webhook | 201, 422 |

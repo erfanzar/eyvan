@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 
 try:  # readline is unavailable on Windows and in some minimal containers.
     import readline  # Enables line editing and history for Rich prompts.
@@ -43,6 +44,7 @@ from eyvan.sdk.commands.soak_monitor import register_soak_monitor_commands
 from eyvan.sdk.commands.start import register_start_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
+from eyvan.sdk.commands.track import register_track_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
 from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
@@ -130,7 +132,14 @@ def main(
         org_id=org_id,
         project_id=project_id,
         overrides=overrides,
+        client_factory=_client_for,
     )
+
+
+def _client_for(url: str, headers: Mapping[str, str]) -> EyvanClient:
+    """Build a CLI client, resolving ``EyvanClient`` at call time for embedding and tests."""
+
+    return EyvanClient(url, headers=headers)
 
 
 for register_commands in (
@@ -157,6 +166,7 @@ for register_commands in (
     register_soak_commands,
     register_soak_monitor_commands,
     register_dashboard_commands,
+    register_track_commands,
 ):
     register_commands(main)
 

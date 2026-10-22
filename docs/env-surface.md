@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-215 variables are currently referenced. Names set on workload
+219 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -37,6 +37,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_DASHBOARD_DIR` | `eyvan` |
 | `EYVAN_DATABASE_URL` | `eyvan` |
 | `EYVAN_DEV_AUTH_ENABLED` | `eyvan` |
+| `EYVAN_DISTRIBUTED_PROCESS_ID` | `eyvan` |
 | `EYVAN_FLEET_STATE_URI` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_BUDGET` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_WINDOW_S` | `eyvan` |
@@ -66,6 +67,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_SECRET_COUNT` | `eyvan` |
 | `EYVAN_TLS_CERT_FILE` | `eyvan` |
 | `EYVAN_TLS_KEY_FILE` | `eyvan` |
+| `EYVAN_TRACKER_TOKEN` | `eyvan` |
+| `EYVAN_TRACKING_URI` | `eyvan` |
 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | `eyvan` |
 | `EYVAN_WORKLOAD_ID` | `eyvan` |
 | `EYVAN_WORKLOAD_TOKEN` | `eyvan` |
@@ -158,6 +161,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_SERVICE_RECONCILE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SERVICE_REPLICA_LIFECYCLE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SOAK_EVIDENCE_MAX_AGE_S` | `eyvan/config` |
+| `EYVAN_TRACKER_URL` | `eyvan/config` |
+| `EYVAN_TRACKING_STORE_URI` | `eyvan/config` |
 | `EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `eyvan/config` |
 | `EYVAN_WEBHOOK_DELIVERY_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_DEV_USER` | `eyvan/sdk` |
@@ -188,7 +193,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_BATCH_COUNT` | `eyvan/server/service/batch` |
 | `EYVAN_BATCH_INDEX` | `eyvan/server/service/batch` |
 | `EYVAN_DISTRIBUTED_PROCESS_COUNT` | `eyvan/worker` |
-| `EYVAN_DISTRIBUTED_PROCESS_ID` | `eyvan/worker` |
 | `EYVAN_JAX_CLUSTER_DETECTION` | `eyvan/worker` |
 | `EYVAN_JAX_MULTIHOST` | `eyvan/worker` |
 | `EYVAN_REPLICA_COUNT` | `eyvan/worker` |

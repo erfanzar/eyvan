@@ -93,6 +93,21 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "PUT /api/v1/organizations/{org_id}/projects/{project_id}": "create a project in another tenant",
     "POST /api/v1/grants": "grant access inside another tenant",
     "DELETE /api/v1/grants": "strip access inside another tenant",
+    "GET /api/v1/tracking/runs": "list another org's tracked training runs",
+    "GET /api/v1/tracking/runs/{run_id}": "read another org's run config, summary and attempts",
+    "GET /api/v1/tracking/runs/{run_id}/series": "read another org's metric history",
+    "GET /api/v1/tracking/runs/{run_id}/histograms": "read another org's logged distributions",
+    "GET /api/v1/tracking/runs/{run_id}/episodes": "list another org's RL episodes",
+    "GET /api/v1/tracking/runs/{run_id}/episodes/curve": "read another org's episode return curves",
+    "GET /api/v1/tracking/runs/{run_id}/episodes/breakdown": "read another org's per-actor and eval results",
+    "GET /api/v1/tracking/runs/{run_id}/rollouts": "list another org's sampled trajectories",
+    "GET /api/v1/tracking/runs/{run_id}/rollouts/{rollout_id}": "read another org's trajectory and its video",
+    "GET /api/v1/tracking/runs/{run_id}/completions": "list another org's prompts and model responses",
+    "GET /api/v1/tracking/runs/{run_id}/completions/stats": "read another org's per-step reward signal",
+    "GET /api/v1/tracking/runs/{run_id}/completions/{completion_id}": "read another org's full model responses",
+    "GET /api/v1/tracking/runs/{run_id}/tables": "read another org's logged tables",
+    "GET /api/v1/tracking/runs/{run_id}/media": "list another org's logged media",
+    "GET /api/v1/tracking/runs/{run_id}/blobs/{sha256}": "download another org's media bytes",
 }
 
 #: Routes that require fleet administration outright. A tenant principal is
@@ -166,6 +181,7 @@ EXEMPT_ROUTES: dict[str, str] = {
     "POST /api/v1/dashboard/auth/logout": "drops the caller's own session cookie; reads nothing tenant-scoped",
     "GET /api/v1/session": "authenticated self-introspection; only the caller's resolved grants and scopes",
     "GET /api/v1/health": "liveness; no tenant data",
+    "GET /api/v1/tracking/health": "authenticated tracker readiness; store root and segment count, no run data",
     "GET /api/v1/build": "what code this plane runs; authenticated because it fingerprints, but tenant-independent",
     "GET /healthz": "liveness; no tenant data",
     "GET /readyz": "readiness; reports only whether this replica can reach its store",
@@ -313,6 +329,44 @@ def test_a_tenant_cannot_see_or_touch_another_tenants_workload(plane: TestClient
     # And the owner is unaffected -- a wall that also blocks the tenant is a
     # broken plane, not a secure one.
     assert plane.get(f"/api/v1/workloads/{workload}", headers=ACME).status_code == 200
+
+
+def test_a_tenant_cannot_read_another_tenants_tracked_runs(plane: TestClient) -> None:
+    """Metric history is training data: the scope check must precede any tracker lookup.
+
+    Authorization is decided before the proxy resolves a tracker, so a refused
+    request is 403/404 whether or not a tracker is configured -- a 503 here would
+    mean the scope was never checked.
+    """
+
+    scope = {"org_id": "acme", "project_id": "research"}
+    attempts = {
+        "runs": plane.get("/api/v1/tracking/runs", params=scope, headers=RIVAL),
+        "run": plane.get("/api/v1/tracking/runs/wl_acme", params=scope, headers=RIVAL),
+        "series": plane.get(
+            "/api/v1/tracking/runs/wl_acme/series", params={**scope, "key": "loss", "x": "step"}, headers=RIVAL
+        ),
+        "histograms": plane.get(
+            "/api/v1/tracking/runs/wl_acme/histograms", params={**scope, "key": "adv"}, headers=RIVAL
+        ),
+        "episodes": plane.get("/api/v1/tracking/runs/wl_acme/episodes", params=scope, headers=RIVAL),
+        "curve": plane.get("/api/v1/tracking/runs/wl_acme/episodes/curve", params=scope, headers=RIVAL),
+        "breakdown": plane.get("/api/v1/tracking/runs/wl_acme/episodes/breakdown", params=scope, headers=RIVAL),
+        "rollouts": plane.get("/api/v1/tracking/runs/wl_acme/rollouts", params=scope, headers=RIVAL),
+        "rollout": plane.get("/api/v1/tracking/runs/wl_acme/rollouts/a1-r0-x-0-0", params=scope, headers=RIVAL),
+        "completions": plane.get("/api/v1/tracking/runs/wl_acme/completions", params=scope, headers=RIVAL),
+        "completion-stats": plane.get("/api/v1/tracking/runs/wl_acme/completions/stats", params=scope, headers=RIVAL),
+        "completion": plane.get("/api/v1/tracking/runs/wl_acme/completions/a1-r0-x-0-0", params=scope, headers=RIVAL),
+        "tables": plane.get("/api/v1/tracking/runs/wl_acme/tables", params=scope, headers=RIVAL),
+        "media": plane.get("/api/v1/tracking/runs/wl_acme/media", params=scope, headers=RIVAL),
+        "blob": plane.get(f"/api/v1/tracking/runs/wl_acme/blobs/{'a' * 64}", params=scope, headers=RIVAL),
+    }
+    for name, response in attempts.items():
+        assert response.status_code in {403, 404}, f"tracking {name} leaked across tenants: {response.status_code}"
+
+    # The owner passes authorization; without a tracker the honest answer is 503, never 403.
+    own = plane.get("/api/v1/tracking/runs", params=scope, headers=ACME)
+    assert own.status_code not in {401, 403, 404}, own.text
 
 
 def test_listing_workloads_never_returns_another_tenants(plane: TestClient) -> None:

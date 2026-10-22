@@ -204,6 +204,11 @@ def _isolated_context_file(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(fleet_commands, "ensure_loopback_control_plane", unavailable_daemon)
     monkeypatch.setattr(fleet_commands, "has_gcp_native_runtime_profile", lambda: False)
+    # ensure_local_runtime also asks whether a plane already serves a runtime
+    # profile, which reads this user's real ~/.eyvan daemon records. A plane
+    # running on the developer's machine must not change which branch these
+    # tests exercise.
+    monkeypatch.setattr(fleet_commands, "serving_runtime_profile_path", lambda *_args, **_kwargs: None)
 
     class ReadyNativeGcpRuntime:
         """Keep generic CLI tests independent from a private runtime profile."""
@@ -619,6 +624,65 @@ def test_applying_a_fleet_does_not_borrow_the_active_fleets_endpoint(monkeypatch
     stored = json.loads((tmp_path / "eyvan-config.json").read_text())
 
     assert stored["contexts"]["dev-fleet"]["base_url"] == "https://dev.example.com"
+
+
+def test_up_follows_a_fleet_to_its_own_local_plane_and_ensures_it(monkeypatch, tmp_path) -> None:
+    """Two loopback planes differ only by port; `up` must not make the operator run `eyvan use`."""
+
+    fake = FakeClient()
+    client_urls: list[str] = []
+
+    def client(url: str, **_kwargs: object) -> FakeClient:
+        client_urls.append(ControlPlaneEndpoint.parse(url).url)
+        return fake
+
+    monkeypatch.setattr(cli, "EyvanClient", client)
+    runner = CliRunner()
+    saved = runner.invoke(cli.main, ["--url", "http://127.0.0.1:8080", "use", "dev-fleet"])
+    other = runner.invoke(cli.main, ["--url", "http://127.0.0.1:18280", "use", "other-fleet"])
+    assert saved.exit_code == 0, saved.output
+    assert other.exit_code == 0, other.output
+
+    ensured: list[ControlPlaneEndpoint] = []
+
+    def ensure(endpoint: str | ControlPlaneEndpoint) -> LocalDaemonResult:
+        configured_endpoint = ControlPlaneEndpoint.parse(endpoint)
+        ensured.append(configured_endpoint)
+        return LocalDaemonResult(
+            endpoint=configured_endpoint,
+            state=LocalDaemonState.STARTED,
+            pid=1234,
+            log_path=tmp_path / "control-plane.log",
+        )
+
+    monkeypatch.setattr(fleet_commands, "ensure_loopback_control_plane", ensure)
+    client_urls.clear()
+    config = tmp_path / "fleet.yaml"
+    config.write_text(FLEET_YAML)
+    applied = CliRunner().invoke(cli.main, ["--user", "alice", "--role", "fleet_admin", "up", str(config)])
+
+    assert applied.exit_code == 0, applied.output
+    assert "lives on local plane http://127.0.0.1:8080" in applied.output
+    assert ensured == [ControlPlaneEndpoint.parse("http://127.0.0.1:8080")]
+    assert client_urls[-1] == ControlPlaneEndpoint.parse("http://127.0.0.1:8080").url
+    assert fake.calls[0][:2] == ("PUT", "/api/v1/fleets/dev-fleet")
+    stored = json.loads((tmp_path / "eyvan-config.json").read_text())
+    assert stored["active_context"] == "dev-fleet"
+    assert stored["contexts"]["dev-fleet"]["base_url"] == ControlPlaneEndpoint.parse("http://127.0.0.1:8080").url
+
+
+def test_up_still_refuses_a_loopback_session_for_a_fleet_saved_on_a_remote_plane(monkeypatch, tmp_path) -> None:
+    fake = FakeClient()
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+    runner = CliRunner()
+    assert runner.invoke(cli.main, ["--url", "https://dev.example.com", "use", "dev-fleet"]).exit_code == 0
+    assert runner.invoke(cli.main, ["--url", "http://127.0.0.1:18280", "use", "other-fleet"]).exit_code == 0
+
+    applied = _invoke(monkeypatch, tmp_path, fake, "up")
+
+    assert applied.exit_code == 1, applied.output
+    assert "different saved control-plane endpoint" in applied.output
+    assert fake.calls == []
 
 
 def test_up_applies_all_initial_cells_with_distinct_operation_keys(monkeypatch, tmp_path) -> None:
@@ -1364,6 +1428,58 @@ def test_quota_based_up_refuses_a_fully_consumed_quota_ceiling(monkeypatch, tmp_
     assert "no eligible preemptible TPU worker pools have usable live quota" in result.output
     assert "v5p-16" not in result.output
     assert AutoscaleConfigCache(cache_dir).list() == ()
+    assert fake.calls == []
+
+
+def test_quota_based_up_names_the_zone_rejection_when_warm_workers_exceed_quota(monkeypatch, tmp_path) -> None:
+    """A zone dropped for its warm-worker floor must say so, not just "no usable quota"."""
+
+    fake = FakeClient()
+
+    class Discovery:
+        def discover(self, **kwargs):
+            return (
+                TpuQuotaAvailability(
+                    zone="us-east5-a",
+                    accelerator_type="v5p-16",
+                    generation="v5p",
+                    quota_tpus=32,
+                    available_tpus=32,
+                    preemptible=True,
+                    metric="tpu.googleapis.com/tpu-v5p-preemptible",
+                ),
+            )
+
+    cache_dir = tmp_path / "autoscale"
+    AutoscaleConfigCache(cache_dir).save_defaults(
+        AutoscaleDefaults(project="project-a", fleet_prefix="research", min_workers=100)
+    )
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: fake)
+    monkeypatch.setattr(autoscale_commands, "GcpTpuQuotaDiscovery", Discovery)
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--user",
+            "alice",
+            "--role",
+            "fleet_admin",
+            "up",
+            "--quota-based",
+            "--preemptible",
+            "--dry-run",
+            "--zone",
+            "us-east5-a",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "no eligible preemptible TPU worker pools have usable live quota" in result.output
+    assert "us-east5-a:" in result.output
+    assert "min_workers" in result.output
+    assert "eyvan autoscale init" in result.output
     assert fake.calls == []
 
 

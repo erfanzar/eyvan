@@ -397,6 +397,13 @@ def test_dashboard_html_carries_a_strict_content_security_policy(client: TestCli
     assert "object-src 'none'" in policy
     assert "frame-ancestors 'none'" in policy
     assert "connect-src 'self'" in policy
+    # Tracked media is shown from authenticated object URLs; blob: is allowed for
+    # images and media only, never for scripts.
+    directives = {part.strip().split(" ", 1)[0]: part.strip() for part in policy.split(";") if part.strip()}
+    assert "blob:" in directives["img-src"]
+    assert directives["media-src"] == "media-src 'self' blob:"
+    assert "blob:" not in directives["script-src"]
+    assert "blob:" not in directives["default-src"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["X-Frame-Options"] == "DENY"
 

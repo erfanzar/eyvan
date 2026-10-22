@@ -43,6 +43,7 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.track._store import join_uri
 from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 from eyvan.worker.agent.models import (
     CheckpointRequest,
@@ -718,6 +719,23 @@ class _ControllerWorkloadCommands:
             )
             environment["EYVAN_CHILDREN_URL"] = self._children_url(workload)
         environment.update(self._secret_environment(workload))
+        # Unlike progress, direct-to-store tracking also works for command jobs
+        # and callables with unmanaged result URIs. Never give jobs the tracker token.
+        if self.settings.tracking_store_uri:
+            from eyvan.track._format import validate_run_id
+
+            try:
+                # Plane scope IDs are free-form, but tracking requires single,
+                # URI-safe components. In particular, never allow '%' aliases
+                # or decoded separators to cross an authorization boundary.
+                org_id = validate_run_id(workload.org_id)
+                project_id = validate_run_id(workload.project_id)
+            except ValueError:
+                # Tracking is optional; an unsupported scope must not prevent
+                # dispatch or expose its contents in a diagnostic.
+                pass
+            else:
+                environment["EYVAN_TRACKING_URI"] = join_uri(self.settings.tracking_store_uri, org_id, project_id)
         execution = workload.spec.execution
         if execution.kind == "command":
             # A workspace belongs to the workload, not to one execution kind, so

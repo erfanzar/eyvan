@@ -179,6 +179,7 @@ from eyvan.server.api.server_startup import (
     ServerStartupSettings,
 )
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
+from eyvan.server.api.tracking_proxy import register_tracking_routes
 from eyvan.server.controller import EyvanController
 from eyvan.server.introspection import allocations_as_json, thread_stacks_as_json
 from eyvan.server.invariants import Invariant, Violation, check_fleet, snapshot_fleet
@@ -773,6 +774,7 @@ def create_app(
     # routes self-check the OIDC configuration, so mounting them on a plane
     # without one only makes the endpoints answer 404.
     register_dashboard_auth_routes(app, settings=settings, store=dashboard_sessions)
+    register_tracking_routes(app, settings=settings, service=service)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for
@@ -848,7 +850,11 @@ def create_app(
                 "script-src 'self'; "
                 "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
                 "font-src 'self' https://fonts.gstatic.com; "
-                "img-src 'self' data:; "
+                # blob: only for images and audio/video: the Runs media views fetch
+                # tracked media with the bearer and display it from object URLs.
+                # Scripts, frames and objects stay as strict as before.
+                "img-src 'self' data: blob:; "
+                "media-src 'self' blob:; "
                 "connect-src 'self'; "
                 "object-src 'none'; "
                 "base-uri 'self'; "

@@ -11,6 +11,7 @@ import math
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
@@ -71,6 +72,10 @@ class EyvanSettings:
     auto_create_schema: bool = False
     controller_enabled: bool = True
     public_url: str = "http://127.0.0.1:8080"
+    #: Optional read-only tracker proxy and direct-to-store job tracking.
+    tracker_url: str | None = None
+    tracker_token: str | None = field(default=None, repr=False)
+    tracking_store_uri: str | None = None
     #: TLS material for the API server's listener. A network-bound bind refuses
     #: to start without both files (or an explicit insecure opt-in), because
     #: OIDC bearer tokens, bootstrap credentials, and capability tokens would
@@ -460,6 +465,21 @@ class EyvanSettings:
     def __post_init__(self) -> None:
         """Validate settings that participate in durable controller ownership."""
 
+        if self.tracker_url is not None:
+            parsed_tracker = urlsplit(self.tracker_url)
+            if (
+                parsed_tracker.scheme not in {"http", "https"}
+                or not parsed_tracker.hostname
+                or parsed_tracker.username is not None
+                or parsed_tracker.password is not None
+                or parsed_tracker.query
+                or parsed_tracker.fragment
+            ):
+                raise ValueError("tracker_url must be an http(s) URL without credentials, query or fragment")
+            try:
+                _ = parsed_tracker.port
+            except ValueError as exc:
+                raise ValueError("tracker_url must have a valid port") from exc
         if self.outbox_dispatch_concurrency <= 0:
             raise ValueError("outbox_dispatch_concurrency must be positive")
         if self.outbox_claim_ttl_s <= 0:
@@ -673,6 +693,9 @@ class EyvanSettings:
             auto_create_schema=truthy("EYVAN_AUTO_CREATE_SCHEMA"),
             controller_enabled=truthy("EYVAN_CONTROLLER_ENABLED", defaults.controller_enabled),
             public_url=os.getenv("EYVAN_PUBLIC_URL", defaults.public_url),
+            tracker_url=os.getenv("EYVAN_TRACKER_URL") or None,
+            tracker_token=os.getenv("EYVAN_TRACKER_TOKEN") or None,
+            tracking_store_uri=os.getenv("EYVAN_TRACKING_STORE_URI") or None,
             tls_cert_file=_optional_path("EYVAN_TLS_CERT_FILE"),
             tls_key_file=_optional_path("EYVAN_TLS_KEY_FILE"),
             allow_insecure_plaintext_bind=truthy(

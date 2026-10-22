@@ -56,6 +56,22 @@ class ApiClient(tp.Protocol):
 
         ...
 
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: tp.Mapping[str, str | int | float | bool | None] | None = None,
+        headers: tp.Mapping[str, str] | None = None,
+    ) -> tuple[bytes, str]:
+        """Send a request and return its raw body and media type."""
+
+        ...
+
+
+ApiClientFactory: tp.TypeAlias = tp.Callable[[str, tp.Mapping[str, str]], ApiClient]
+"""Build an API client for a control-plane URL and identity headers."""
+
 
 @dataclass(frozen=True, slots=True)
 class ContextOverrides:
@@ -112,6 +128,7 @@ class CliSession:
     org_id: str | None
     project_id: str | None
     overrides: ContextOverrides
+    client_factory: ApiClientFactory | None = None
 
     @property
     def active_context(self) -> EyvanContext | None:
@@ -190,6 +207,39 @@ class CliSession:
             # rather than swapping an equal identity underneath the client.
             return
         self.replace_identity(resolved)
+
+    def retarget_loopback_endpoint(self, base_url: str) -> bool:
+        """Point this session at another literal loopback plane, if that is safe.
+
+        Two development planes on one machine differ only by port, and a fleet
+        saved against one of them should not be refused merely because another
+        local fleet is active. Only loopback-to-loopback moves are made, never
+        over an explicit ``--url`` or with a bearer token: different local
+        listeners need not share credentials. Anything else leaves the session
+        unchanged and returns ``False`` so the caller keeps its stricter behavior.
+        """
+
+        from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+        from eyvan.sdk.client.identity import resolve_control_plane_identity
+
+        if self.client_factory is None or self.overrides.base_url is not None or self.identity.token is not None:
+            return False
+        target = ControlPlaneEndpoint.parse(base_url)
+        current = ControlPlaneEndpoint.parse(self.base_url)
+        if not (target.is_loopback and current.is_loopback):
+            return False
+        identity = resolve_control_plane_identity(
+            target,
+            token=self.identity.token,
+            dev_user=self.identity.dev_user,
+            dev_org=self.identity.dev_org,
+            dev_project=self.identity.dev_project,
+            dev_roles=self.identity.dev_roles,
+        )
+        self.client = self.client_factory(target.url, identity.headers())
+        self.identity = identity
+        self.base_url = target.url
+        return True
 
     def activate_fleet(
         self,

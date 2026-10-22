@@ -209,6 +209,20 @@ class EyvanClient:
 
         return self._response(method, path, params=params, json=None, headers=headers).text
 
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: QueryParams | None = None,
+        headers: HeaderMap | None = None,
+    ) -> tuple[bytes, str]:
+        """Send one API request and return its raw body and media type (for blob downloads)."""
+
+        response = self._response(method, path, params=params, json=None, headers=headers)
+        media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        return response.content, media_type
+
     def stream_lines(
         self,
         method: str,

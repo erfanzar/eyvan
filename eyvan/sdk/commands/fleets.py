@@ -138,6 +138,33 @@ def _print_capacity(session: CliSession, *, as_json: bool) -> None:
         )
 
 
+def _zone_skip_details(generation: JsonObject) -> str:
+    """Return the specific zone-level rejections a generation pass recorded, if any.
+
+    Ordinary catalog exclusions are grouped and uninformative here, but a zone
+    rejected as a whole (for example warm workers exceeding live quota) carries
+    the one sentence the operator needs to fix their defaults.
+    """
+
+    skipped = generation.get("skipped")
+    if not isinstance(skipped, list):
+        return ""
+    lines: list[str] = []
+    for candidate in skipped:
+        if not is_json_object(candidate) or candidate.get("scope") != "zone":
+            continue
+        detail = candidate.get("detail")
+        zone = candidate.get("zone")
+        if isinstance(detail, str) and isinstance(zone, str):
+            lines.append(f"  {zone}: {detail}")
+    if not lines:
+        return ""
+    hint = ""
+    if any("min_workers" in line for line in lines):
+        hint = "\nlower Warm workers with `eyvan autoscale init`, or narrow --zone/--tpu-generation"
+    return ":\n" + "\n".join(lines) + hint
+
+
 def _default_native_gcp_profile_availability() -> bool:
     """Resolve the current user's profile availability at local-runtime selection time."""
 
@@ -311,6 +338,16 @@ class FleetCommandService:
         saved = ControlPlaneEndpoint.parse(existing.base_url)
         current = ControlPlaneEndpoint.parse(self.session.base_url)
         if saved != current:
+            # Both planes are on this machine: follow the fleet to the plane it
+            # was applied on (the caller then starts it when it is down) rather
+            # than making the operator run `eyvan use` by hand. A remote or
+            # private address keeps the strict refusal below.
+            if self.session.retarget_loopback_endpoint(saved.url):
+                click.echo(
+                    f"fleet {fleet!r} lives on local plane {saved.url}; using it instead of {current.url}",
+                    err=True,
+                )
+                return
             raise click.ClickException(
                 f"fleet {fleet!r} has a different saved control-plane endpoint; "
                 f"run `eyvan use {fleet}` or supply an explicit --url before applying"
@@ -524,6 +561,7 @@ def up_fleet(
             if not entries:
                 raise click.ClickException(
                     "no eligible preemptible TPU worker pools have usable live quota in the requested scope"
+                    + _zone_skip_details(generation.as_dict())
                 )
         else:
             entries = cache.list_eligible()
