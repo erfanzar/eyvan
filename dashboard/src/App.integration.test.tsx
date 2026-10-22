@@ -560,6 +560,7 @@ describe("App scope and authority race guards", () => {
   });
 
   it("refreshes durable additions and revocations and reconciles the selected scope", async () => {
+    const listen = vi.spyOn(document, "addEventListener");
     const a = { orgId: "acme", projectId: "research" };
     const b = { orgId: "acme", projectId: "platform" };
     const sessions = [
@@ -573,6 +574,9 @@ describe("App scope and authority race guards", () => {
     });
     renderApp(client);
     await waitFor(() => expect(screen.getByRole("button", { name: "Submit workload" })).toBeDefined());
+    // Capability rendering precedes passive-effect subscription. Dispatch the
+    // refresh only after its listener is installed, including on a busy host.
+    await waitFor(() => expect(listen).toHaveBeenCalledWith("visibilitychange", expect.any(Function)));
 
     act(() => document.dispatchEvent(new Event("visibilitychange")));
     await waitFor(() => expect(calls.getSessionAuthority).toHaveBeenCalledTimes(2));

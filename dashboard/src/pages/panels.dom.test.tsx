@@ -163,8 +163,9 @@ describe("the warm capacity and cost panel", () => {
 
     render(<FleetPage cells={cells} leases={leases} onRefresh={async () => {}} {...fleetLoaders} />);
 
-    await waitFor(() => expect(screen.getByText("Warm capacity and cost")).toBeDefined());
-    expect(screen.getByText("research/v5p")).toBeDefined();
+    expect(screen.getByText("Warm capacity and cost")).toBeDefined();
+    // The heading is present during loading; wait for the async pool row.
+    expect(await screen.findByText("research/v5p")).toBeDefined();
     // Warm capacity is deliberately idle. Without the pairing the only safe
     // reaction to an unexplained idle figure is to delete the warm floor.
     expect(screen.getByText(/window active/)).toBeDefined();

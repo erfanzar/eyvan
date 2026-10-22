@@ -29,6 +29,8 @@ import { BudgetsPage } from "./pages/BudgetsPage";
 import { CapacityPage } from "./pages/CapacityPage";
 import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { RunsPage } from "./pages/RunsPage";
+import { RunDetailPage } from "./pages/RunDetailPage";
 import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
 import { accessibleRoute, navigate, parseRoute, type Route, type Section, type SectionAvailability } from "./routing";
@@ -40,6 +42,16 @@ import type {
   SessionAuthority,
   SessionPermission,
   SubmitWorkloadInput,
+  RunSeriesOptions,
+  RunRolloutsOptions,
+  RunCompletionsOptions,
+  CompletionStatsOptions,
+  RunTableOptions,
+  RunMediaOptions,
+  RunHistogramsOptions,
+  RunEpisodesOptions,
+  EpisodeCurveOptions,
+  EpisodeBreakdownOptions,
   WorkloadDetail,
 } from "./types";
 
@@ -616,6 +628,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
 
   const sectionAvailability: SectionAvailability = {
     workloads: canReadSelectedScope || capabilities.submitWorkloads,
+    runs: canReadSelectedScope,
     budgets: canReadSelectedScope,
     fleet: capabilities.manageFleet && (data?.access.fleetInventory ?? true),
     // Provider quota is a property of the cloud project this fleet's pools
@@ -966,6 +979,76 @@ export default function App({ client = apiClient, identityProvider = currentIden
       withAuthorityRefresh(() => client.getTpuQuota(fleetScope, signal, options)),
     [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
+  // Tracking refusals may originate from the tracker's separate credential.
+  // Keep them in Runs instead of fencing otherwise valid plane authority.
+  const loadRuns = useCallback(
+    (signal: AbortSignal) => client.listRuns({}, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRun = useCallback(
+    (id: string, signal: AbortSignal) => client.getRun(id, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRunSeries = useCallback(
+    (id: string, options: RunSeriesOptions, signal: AbortSignal) =>
+      client.getRunSeries(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRunHistograms = useCallback(
+    (id: string, options: RunHistogramsOptions, signal: AbortSignal) =>
+      client.getRunHistograms(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRunEpisodes = useCallback(
+    (id: string, options: RunEpisodesOptions, signal: AbortSignal) =>
+      client.listRunEpisodes(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadEpisodeCurve = useCallback(
+    (id: string, options: EpisodeCurveOptions, signal: AbortSignal) =>
+      client.getEpisodeCurve(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadEpisodeBreakdown = useCallback(
+    (id: string, options: EpisodeBreakdownOptions, signal: AbortSignal) =>
+      client.getEpisodeBreakdown(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRollouts = useCallback(
+    (id: string, options: RunRolloutsOptions, signal: AbortSignal) =>
+      client.listRunRollouts(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadRollout = useCallback(
+    (id: string, itemId: string, signal: AbortSignal) => client.getRunRollout(id, itemId, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadCompletions = useCallback(
+    (id: string, options: RunCompletionsOptions, signal: AbortSignal) =>
+      client.listRunCompletions(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadCompletion = useCallback(
+    (id: string, itemId: string, signal: AbortSignal) => client.getRunCompletion(id, itemId, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadCompletionStats = useCallback(
+    (id: string, options: CompletionStatsOptions, signal: AbortSignal) =>
+      client.getCompletionStats(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadTable = useCallback(
+    (id: string, options: RunTableOptions, signal: AbortSignal) => client.getRunTable(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadMedia = useCallback(
+    (id: string, options: RunMediaOptions, signal: AbortSignal) => client.listRunMedia(id, options, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadBlob = useCallback(
+    (id: string, digest: string, signal: AbortSignal) => client.fetchRunBlob(id, digest, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
   const explanationScope = selectedWorkload
     ? { orgId: selectedWorkload.org, projectId: selectedWorkload.project }
     : fleetScope;
@@ -1069,6 +1152,40 @@ export default function App({ client = apiClient, identityProvider = currentIden
     }
   } else {
     switch (activeRoute.section) {
+      case "runs":
+        content =
+          "runId" in activeRoute ? (
+            <RunDetailPage
+              key={activeRoute.runId}
+              runId={activeRoute.runId}
+              loadRun={loadRun}
+              loadSeries={loadRunSeries}
+              tab={activeRoute.tab ?? "charts"}
+              onTabChange={(tab) => navigate({ section: "runs", runId: activeRoute.runId, tab })}
+              loadHistograms={loadRunHistograms}
+              loadEpisodes={loadRunEpisodes}
+              loadEpisodeCurve={loadEpisodeCurve}
+              loadEpisodeBreakdown={loadEpisodeBreakdown}
+              loadRollouts={loadRollouts}
+              loadRollout={loadRollout}
+              loadCompletions={loadCompletions}
+              loadCompletion={loadCompletion}
+              loadCompletionStats={loadCompletionStats}
+              loadTable={loadTable}
+              loadMedia={loadMedia}
+              loadBlob={loadBlob}
+              onBack={() => goToSection("runs")}
+              onOpenWorkload={openWorkload}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          ) : (
+            <RunsPage
+              loadRuns={loadRuns}
+              onOpenRun={(runId) => navigate({ section: "runs", runId })}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          );
+        break;
       case "workloads":
         content = (
           <WorkloadsPage

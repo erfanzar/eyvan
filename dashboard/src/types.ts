@@ -3,6 +3,376 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
+
+/** Tracker wire types intentionally retain the store's snake_case field names. */
+export interface RunSummary {
+  run_id: string;
+  org_id: string;
+  project_id: string;
+  name: string;
+  group: string | null;
+  tags: string[];
+  status: RunStatus;
+  workload_id: string | null;
+  attempts: number;
+  started_at: number;
+  updated_at: number;
+  last_step: number | null;
+  keys_count: number;
+  summary: Record<string, unknown>;
+}
+
+export interface RunDetail extends RunSummary {
+  config: Record<string, unknown>;
+  keys: string[];
+  axes: string[];
+  /** Additive phase-2 fields may be absent on an older tracker. */
+  hist_keys?: string[];
+  episodes?: { train: number; eval: number };
+  episode_axes?: string[];
+  envs?: string[];
+  actors?: number;
+  /** Additive phase-3 fields may be absent on an older tracker. */
+  rollouts?: number;
+  completion_groups?: number;
+  table_keys?: string[];
+  media_keys?: string[];
+  attempt_list: Array<{
+    attempt: number;
+    started_at: number;
+    first_step: number | null;
+    last_step: number | null;
+    status: string | null;
+  }>;
+  stats: {
+    records: number;
+    dropped: { keys: number; rate: number; invalid: number; queue: number };
+    spilled: number;
+  };
+  errors: Array<{ segment: string; error: string }>;
+}
+
+export type TrackingPoint = [number, number | null, number | null, number | null];
+
+export interface RunSeries {
+  key: string;
+  rank: number;
+  points: TrackingPoint[];
+  downsampled: boolean;
+  total: number;
+  nonfinite: number;
+  attempts: Array<{ attempt: number; first_x: number }>;
+  replayed: Array<{ attempt: number; points: Array<[number, number | null]> }>;
+}
+
+export interface RunSeriesResponse {
+  run_id: string;
+  x: string;
+  series: RunSeries[];
+}
+
+export interface RunSeriesOptions {
+  keys: string[];
+  x?: string;
+  points?: number;
+  rank?: number;
+  includeReplayed?: boolean;
+}
+
+export interface RunHistogramsOptions {
+  key: string;
+  x?: string;
+  points?: number;
+  bins?: number;
+  rank?: number;
+}
+
+export interface HistogramColumn {
+  x: number;
+  step: number;
+  attempt: number;
+  counts: number[];
+  n: number;
+  under: number;
+  over: number;
+  nonfinite: number;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+  std: number | null;
+}
+
+export interface RunHistogramsResponse {
+  run_id: string;
+  key: string;
+  rank: number;
+  x: string;
+  edges: number[];
+  columns: HistogramColumn[];
+  total: number;
+  downsampled: boolean;
+}
+
+export type EpisodeKind = "train" | "eval";
+export type TrackingValue = number | "nan" | "inf" | "-inf";
+
+export interface RunEpisode {
+  t: number;
+  step: number | null;
+  ret: TrackingValue;
+  length: number | null;
+  success: boolean | null;
+  kind: EpisodeKind;
+  actor: string | null;
+  env: string | null;
+  seed: number | null;
+  policy_version: number | null;
+  learner_version: number | null;
+  checkpoint: string | null;
+  x: Record<string, number>;
+  extra: Record<string, TrackingValue>;
+  attempt: number;
+  rank: number;
+  replayed: boolean;
+}
+
+export interface RunEpisodesOptions {
+  kind?: EpisodeKind;
+  actor?: string;
+  env?: string;
+  limit?: number;
+  offset?: number;
+  includeReplayed?: boolean;
+}
+
+export interface RunEpisodesResponse {
+  episodes: RunEpisode[];
+  total: number;
+}
+
+export interface EpisodeCurveOptions {
+  metric?: "return" | "length";
+  kind?: EpisodeKind;
+  x?: string;
+  points?: number;
+  env?: string;
+  actor?: string;
+}
+
+export interface EpisodeBucket {
+  x: number;
+  x_min: number;
+  x_max: number;
+  count: number;
+  mean: number | null;
+  min: number | null;
+  max: number | null;
+  p5: number | null;
+  p25: number | null;
+  p50: number | null;
+  p75: number | null;
+  p95: number | null;
+  success_rate: number | null;
+}
+
+export interface EpisodeCurveResponse {
+  run_id: string;
+  metric: "return" | "length";
+  kind: EpisodeKind;
+  x: string;
+  buckets: EpisodeBucket[];
+  total: number;
+  nonfinite: number;
+  replayed_excluded: number;
+}
+
+export interface EpisodeActor {
+  actor: string | null;
+  count: number;
+  window: number;
+  mean_return: number | null;
+  p50_return: number | null;
+  last_return: number | null;
+  mean_length: number | null;
+  success_rate: number | null;
+  mean_lag: number | null;
+  max_lag: number | null;
+  last_t: number;
+}
+
+export interface EpisodeEval {
+  checkpoint: string | null;
+  policy_version: number | null;
+  step: number | null;
+  count: number;
+  mean_return: number | null;
+  std_return: number | null;
+  min_return: number | null;
+  max_return: number | null;
+  success_rate: number | null;
+  mean_length: number | null;
+  first_t: number;
+  best: boolean;
+}
+
+export interface EpisodeBreakdownOptions {
+  kind?: EpisodeKind;
+  last?: number;
+}
+
+export interface EpisodeBreakdownResponse {
+  actors: EpisodeActor[];
+  envs: Array<{ env: string | null; count: number; mean_return: number | null; success_rate: number | null }>;
+  lag: {
+    counts: number[];
+    over: number;
+    negative: number;
+    count: number;
+    p50: number | null;
+    p95: number | null;
+    max: number | null;
+  };
+  evals: EpisodeEval[];
+  replayed_excluded: number;
+}
+
+export interface BlobRef {
+  sha256: string;
+  content_type: string;
+  bytes: number;
+  available?: boolean;
+}
+
+export interface RunRolloutSummary {
+  id: string;
+  t: number;
+  step: number | null;
+  episode_id: string;
+  actor: string | null;
+  env: string | null;
+  kind: EpisodeKind;
+  policy_version: number | null;
+  length: number;
+  track_names: string[];
+  action_names: string[] | null;
+  ret: number | null;
+  video: BlobRef | null;
+  fps: number | null;
+  x: Record<string, number>;
+  attempt: number;
+  rank: number;
+  seq: number;
+  line: number;
+  replayed: boolean;
+}
+export interface RunRollout extends Omit<RunRolloutSummary, "track_names"> {
+  tracks: Record<string, Array<TrackingValue | null>>;
+  actions: Array<number | null> | null;
+}
+export interface RunRolloutsOptions {
+  kind?: EpisodeKind;
+  actor?: string;
+  limit?: number;
+  offset?: number;
+  includeReplayed?: boolean;
+}
+export interface RunRolloutsResponse {
+  rollouts: RunRolloutSummary[];
+  total: number;
+}
+export type CompletionSort = "recent" | "zero_variance" | "reward";
+export interface RunCompletionsOptions {
+  step?: number;
+  limit?: number;
+  offset?: number;
+  sort?: CompletionSort;
+  includeReplayed?: boolean;
+}
+export interface CompletionSummary {
+  id: string;
+  group: string;
+  step: number | null;
+  t: number;
+  prompt: string;
+  k: number;
+  mean_reward: number | null;
+  std_reward: number | null;
+  pass_rate: number | null;
+  zero_variance: boolean;
+  mean_tokens: number | null;
+  truncated: number;
+  attempt: number;
+  rank: number;
+  replayed: boolean;
+}
+export interface CompletionResponse {
+  text: string;
+  rewards: Record<string, TrackingValue>;
+  reward: TrackingValue;
+  advantage: TrackingValue;
+  tokens: number | null;
+  kl: number | null;
+  truncated: boolean | null;
+}
+export interface RunCompletion extends CompletionSummary {
+  answer: string | null;
+  policy_version: number | null;
+  responses: CompletionResponse[];
+}
+export interface RunCompletionsResponse {
+  groups: CompletionSummary[];
+  total: number;
+  steps: number[];
+}
+export interface CompletionStatsOptions {
+  points?: number;
+}
+export interface CompletionStatsResponse {
+  steps: Array<{
+    step: number;
+    groups: number;
+    mean_reward: number | null;
+    zero_variance_frac: number;
+    mean_tokens: number | null;
+    truncated_frac: number;
+    components: Record<string, number | null>;
+  }>;
+}
+export type TableCell = TrackingValue | string | boolean | null | BlobRef;
+export interface RunTableOptions {
+  key?: string;
+  step?: number;
+}
+export interface RunTable {
+  key: string;
+  step: number | null;
+  t: number;
+  columns: string[];
+  rows: TableCell[][];
+  steps: number[];
+}
+export interface RunTableKeys {
+  keys: Array<{ key: string; count: number; last_step: number | null }>;
+}
+export type RunTableResponse = RunTable | RunTableKeys;
+export interface RunMediaOptions {
+  key?: string;
+  limit?: number;
+  offset?: number;
+}
+export interface RunMediaItem {
+  key: string;
+  step: number | null;
+  t: number;
+  caption: string | null;
+  blob: BlobRef;
+}
+export interface RunMediaResponse {
+  media: RunMediaItem[];
+  total: number;
+}
+
 export type WorkloadStatus =
   | "queued"
   | "planning"

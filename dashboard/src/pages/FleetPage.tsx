@@ -550,11 +550,16 @@ export function FleetPage({
             </label>
           </div>
           <div className="cell-grid">
-            {visibleCells.map((cell) => (
+            {visibleCells.map((cell, index) => (
               <article className="cell-card" key={cell.id}>
                 <div className="cell-card-heading">
                   <div>
-                    <h3>{cell.name}</h3>
+                    <h3>
+                      <span className="cell-number" aria-hidden="true">
+                        c.{String(index + 1).padStart(2, "0")}{" "}
+                      </span>
+                      {cell.name}
+                    </h3>
                     <p>
                       {cell.backend} · {cell.zone}
                     </p>

@@ -7,6 +7,21 @@ import {
   cloneMock,
   createMockWorkload,
   getMockWorkload,
+  getMockRun,
+  getMockRunSeries,
+  getMockRunHistograms,
+  getMockRunEpisodes,
+  getMockEpisodeCurve,
+  getMockEpisodeBreakdown,
+  getMockRunRollouts,
+  getMockRunRollout,
+  getMockRunCompletions,
+  getMockRunCompletion,
+  getMockCompletionStats,
+  getMockRunTable,
+  getMockRunMedia,
+  getMockRunBlob,
+  mockRuns,
   mockAuditEvents,
   mockBudgets,
   mockAvailableShapes,
@@ -39,6 +54,31 @@ import type {
   LogEntry,
   OverviewData,
   PriorityBand,
+  RunDetail,
+  RunRollout,
+  RunRolloutsOptions,
+  RunRolloutsResponse,
+  RunCompletion,
+  RunCompletionsOptions,
+  RunCompletionsResponse,
+  CompletionStatsOptions,
+  CompletionStatsResponse,
+  RunTableOptions,
+  RunTableResponse,
+  RunMediaOptions,
+  RunMediaResponse,
+  RunHistogramsOptions,
+  RunHistogramsResponse,
+  RunEpisodesOptions,
+  RunEpisodesResponse,
+  EpisodeCurveOptions,
+  EpisodeCurveResponse,
+  EpisodeBreakdownOptions,
+  EpisodeBreakdownResponse,
+  RunSeriesOptions,
+  RunSeriesResponse,
+  RunStatus,
+  RunSummary,
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
@@ -556,6 +596,9 @@ export function computeOverview(
 /** Budget for a control-plane read that is answered from its own store. */
 const CONTROL_PLANE_TIMEOUT_MS = 3_500;
 
+/** Complete authenticated media transfers may contain up to 64 MiB. */
+const MEDIA_TRANSFER_TIMEOUT_MS = 120_000;
+
 /**
  * Budget for a read the control plane forwards to a worker.
  *
@@ -606,7 +649,23 @@ export class EyvanApiClient {
     this.activeScope = { ...scope };
   }
 
-  private async request<T>(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<T> {
+  private request<T>(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<T> {
+    return this.requestBody(path, init, timeoutMs, async (response) => (await response.json()) as T);
+  }
+
+  private requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+    return this.requestBody(path, { signal, headers: { Accept: "*/*" } }, MEDIA_TRANSFER_TIMEOUT_MS, (response) =>
+      response.blob(),
+    );
+  }
+
+  /** JSON and binary reads share authentication, cancellation and refusal handling. */
+  private async requestBody<T>(
+    path: string,
+    init: RequestInit,
+    timeoutMs: number,
+    read: (response: Response) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     const externalSignal = init.signal;
     const cancel = () => controller.abort();
@@ -632,7 +691,13 @@ export class EyvanApiClient {
         } catch {
           // The HTTP status remains actionable when an upstream returns a non-JSON error body.
         }
-        if (response.status === 401) {
+        // Tracking has a separate upstream credential. Its refusals belong to
+        // the tracking panel, never the browser's control-plane session.
+        // Compared by first path segment rather than a quoted path prefix: the
+        // route guard in tests/test_dashboard_calls_routes_that_exist.py treats
+        // every quoted absolute path in this file as a request it must serve.
+        const isTrackingRead = path.split("/")[1] === "tracking";
+        if (response.status === 401 && !isTrackingRead) {
           rejectSession();
           // A refused loopback credential retires itself here: the gate let
           // this page through on the value it held, and the plane has just
@@ -644,7 +709,7 @@ export class EyvanApiClient {
         }
         throw new ApiError(`Eyvan API request failed with ${response.status}${detail}`, response.status);
       }
-      return (await response.json()) as T;
+      return await read(response);
     } catch (error) {
       if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) throw new ApiError("Eyvan API request timed out");
@@ -695,6 +760,325 @@ export class EyvanApiClient {
   private scope(path: string, scope: AuthScope): string {
     const join = path.includes("?") ? "&" : "?";
     return `${path}${join}org_id=${encodeURIComponent(scope.orgId)}&project_id=${encodeURIComponent(scope.projectId)}`;
+  }
+
+  async listRuns(
+    options: { status?: RunStatus; limit?: number } = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunSummary[]> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      return cloneMock(mockRuns)
+        .filter((run) => !options.status || run.status === options.status)
+        .slice(0, options.limit ?? 200)
+        .map((run) => ({ ...run, org_id: immutableScope.orgId, project_id: immutableScope.projectId }));
+    }
+    const query = new URLSearchParams();
+    if (options.status) query.set("status", options.status);
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    const result = await this.request<{ runs: RunSummary[] }>(this.scope(`/tracking/runs?${query}`, immutableScope), {
+      signal,
+    });
+    return result.runs;
+  }
+
+  async getRun(runId: string, scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<RunDetail> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return { ...run, org_id: immutableScope.orgId, project_id: immutableScope.projectId };
+    }
+    return this.request<RunDetail>(this.scope(`/tracking/runs/${encodeURIComponent(runId)}`, immutableScope), {
+      signal,
+    });
+  }
+
+  /**
+   * Read one tracking resource. Callers pass the full literal path so the
+   * route guard in tests/test_dashboard_calls_routes_that_exist.py can see it.
+   */
+  private trackingRead<T>(
+    path: string,
+    options: Record<string, string | number | boolean | undefined>,
+    scope: AuthScope,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(options)) if (value !== undefined) query.set(key, String(value));
+    return this.request<T>(this.scope(`${path}?${query}`, this.scopeSnapshot(scope)), { signal });
+  }
+
+  private demoRun(runId: string): RunDetail {
+    const run = getMockRun(runId);
+    if (!run) throw new ApiError("Run not found", 404);
+    return run;
+  }
+
+  async listRunRollouts(
+    runId: string,
+    options: RunRolloutsOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunRolloutsResponse> {
+    if (this.forceDemo) return getMockRunRollouts(this.demoRun(runId), options);
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/rollouts`,
+      {
+        kind: options.kind,
+        actor: options.actor,
+        limit: options.limit ?? 50,
+        offset: options.offset ?? 0,
+        include_replayed: options.includeReplayed ?? false,
+      },
+      scope,
+      signal,
+    );
+  }
+
+  async getRunRollout(
+    runId: string,
+    rolloutId: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunRollout> {
+    if (this.forceDemo) {
+      const rollout = getMockRunRollout(this.demoRun(runId), rolloutId);
+      if (!rollout) throw new ApiError("Rollout not found", 404);
+      return rollout;
+    }
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/rollouts/${encodeURIComponent(rolloutId)}`,
+      {},
+      scope,
+      signal,
+    );
+  }
+
+  async listRunCompletions(
+    runId: string,
+    options: RunCompletionsOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunCompletionsResponse> {
+    if (this.forceDemo) return getMockRunCompletions(this.demoRun(runId), options);
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/completions`,
+      {
+        step: options.step,
+        limit: options.limit ?? 50,
+        offset: options.offset ?? 0,
+        sort: options.sort ?? "recent",
+        include_replayed: options.includeReplayed ?? false,
+      },
+      scope,
+      signal,
+    );
+  }
+
+  async getRunCompletion(
+    runId: string,
+    completionId: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunCompletion> {
+    if (this.forceDemo) {
+      const group = getMockRunCompletion(this.demoRun(runId), completionId);
+      if (!group) throw new ApiError("Completion group not found", 404);
+      return group;
+    }
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/completions/${encodeURIComponent(completionId)}`,
+      {},
+      scope,
+      signal,
+    );
+  }
+
+  async getCompletionStats(
+    runId: string,
+    options: CompletionStatsOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<CompletionStatsResponse> {
+    if (this.forceDemo) return getMockCompletionStats(this.demoRun(runId), options.points ?? 200);
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/completions/stats`,
+      { points: options.points ?? 200 },
+      scope,
+      signal,
+    );
+  }
+
+  async getRunTable(
+    runId: string,
+    options: RunTableOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunTableResponse> {
+    if (this.forceDemo) {
+      const table = getMockRunTable(this.demoRun(runId), options);
+      if (!table) throw new ApiError("Table not found", 404);
+      return table;
+    }
+    return this.trackingRead(`/tracking/runs/${encodeURIComponent(runId)}/tables`, { ...options }, scope, signal);
+  }
+
+  async listRunMedia(
+    runId: string,
+    options: RunMediaOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunMediaResponse> {
+    if (this.forceDemo) return getMockRunMedia(this.demoRun(runId), options);
+    return this.trackingRead(
+      `/tracking/runs/${encodeURIComponent(runId)}/media`,
+      { key: options.key, limit: options.limit ?? 100, offset: options.offset ?? 0 },
+      scope,
+      signal,
+    );
+  }
+
+  async fetchRunBlob(
+    runId: string,
+    digest: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<Blob> {
+    if (this.forceDemo) {
+      const blob = getMockRunBlob(this.demoRun(runId), digest);
+      if (!blob) throw new ApiError("Blob not found", 404);
+      return blob;
+    }
+    return this.requestBlob(
+      this.scope(
+        `/tracking/runs/${encodeURIComponent(runId)}/blobs/${encodeURIComponent(digest)}`,
+        this.scopeSnapshot(scope),
+      ),
+      signal,
+    );
+  }
+
+  async getRunHistograms(
+    runId: string,
+    options: RunHistogramsOptions,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunHistogramsResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return getMockRunHistograms(run, options);
+    }
+    const query = new URLSearchParams({
+      key: options.key,
+      x: options.x ?? "step",
+      points: String(options.points ?? 200),
+      bins: String(options.bins ?? 64),
+    });
+    if (options.rank !== undefined) query.set("rank", String(options.rank));
+    return this.request<RunHistogramsResponse>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}/histograms?${query}`, immutableScope),
+      { signal },
+    );
+  }
+
+  async listRunEpisodes(
+    runId: string,
+    options: RunEpisodesOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunEpisodesResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return getMockRunEpisodes(run, options);
+    }
+    const query = new URLSearchParams({
+      limit: String(options.limit ?? 100),
+      offset: String(options.offset ?? 0),
+      include_replayed: String(options.includeReplayed ?? false),
+    });
+    if (options.kind !== undefined) query.set("kind", options.kind);
+    if (options.actor !== undefined) query.set("actor", options.actor);
+    if (options.env !== undefined) query.set("env", options.env);
+    return this.request<RunEpisodesResponse>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}/episodes?${query}`, immutableScope),
+      { signal },
+    );
+  }
+
+  async getEpisodeCurve(
+    runId: string,
+    options: EpisodeCurveOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<EpisodeCurveResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return getMockEpisodeCurve(run, options);
+    }
+    const query = new URLSearchParams({
+      metric: options.metric ?? "return",
+      kind: options.kind ?? "train",
+      x: options.x ?? "step",
+      points: String(options.points ?? 200),
+    });
+    if (options.env !== undefined) query.set("env", options.env);
+    if (options.actor !== undefined) query.set("actor", options.actor);
+    return this.request<EpisodeCurveResponse>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}/episodes/curve?${query}`, immutableScope),
+      { signal },
+    );
+  }
+
+  async getEpisodeBreakdown(
+    runId: string,
+    options: EpisodeBreakdownOptions = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<EpisodeBreakdownResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return getMockEpisodeBreakdown(run, options);
+    }
+    const query = new URLSearchParams({ kind: options.kind ?? "train", last: String(options.last ?? 200) });
+    return this.request<EpisodeBreakdownResponse>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}/episodes/breakdown?${query}`, immutableScope),
+      { signal },
+    );
+  }
+
+  async getRunSeries(
+    runId: string,
+    options: RunSeriesOptions,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunSeriesResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    const x = options.x ?? "step";
+    const points = options.points ?? 1000;
+    if (options.keys.length > 32) throw new Error("Request at most 32 tracking keys at a time");
+    if (this.forceDemo) {
+      const run = getMockRun(runId);
+      if (!run) throw new ApiError("Run not found", 404);
+      return getMockRunSeries(run, options.keys, x, points);
+    }
+    const query = new URLSearchParams({ x, points: String(points) });
+    for (const key of options.keys) query.append("key", key);
+    if (options.rank !== undefined) query.set("rank", String(options.rank));
+    if (options.includeReplayed !== undefined) query.set("include_replayed", String(options.includeReplayed));
+    return this.request<RunSeriesResponse>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}/series?${query}`, immutableScope),
+      { signal },
+    );
   }
 
   async getSessionAuthority(preferred: AuthScope = this.activeScope, signal?: AbortSignal): Promise<SessionAuthority> {

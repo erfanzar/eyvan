@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  ChartNoAxesCombined,
   Boxes,
   ChevronRight,
   CircleDollarSign,
@@ -14,6 +15,8 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  Moon,
+  Sun,
   PanelLeft,
   Plus,
   Receipt,
@@ -58,6 +61,7 @@ const navigation: Array<{
 }> = [
   { section: "overview", label: "Overview", icon: LayoutDashboard },
   { section: "workloads", label: "Workloads", icon: ClipboardList },
+  { section: "runs", label: "Runs", icon: ChartNoAxesCombined },
   { section: "fleet", label: "Fleet", icon: ServerCog },
   { section: "capacity", label: "Quota & capacity", icon: Gauge },
   { section: "billing", label: "Billing", icon: Receipt },
@@ -68,6 +72,7 @@ const navigation: Array<{
 const pageMeta: Record<Section, { title: string; description: string }> = {
   overview: { title: "Operations overview", description: "Global scheduling and capacity state" },
   workloads: { title: "Workloads", description: "Queue, placement, and execution lifecycle" },
+  runs: { title: "Runs", description: "Training metrics, evaluation and attempt history" },
   fleet: { title: "Fleet", description: "Cells, topology, resources, and capacity leases" },
   capacity: {
     title: "Quota & capacity",
@@ -109,8 +114,14 @@ export function Shell({
 }: ShellProps) {
   const drawerRef = useRef<HTMLElement>(null);
   const [collapsed, setCollapsed] = useState(initialCollapsed);
+  const [theme, setTheme] = useState(() =>
+    typeof document !== "undefined" && document.documentElement.dataset.theme === "light" ? "light" : "dark",
+  );
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
   const meta = pageMeta[route.section];
-  const detailId = "workloadId" in route ? route.workloadId : undefined;
+  const detailId = "workloadId" in route ? route.workloadId : "runId" in route ? route.runId : undefined;
   const connected = health?.status === "ok";
   const initials =
     identity?.displayName
@@ -133,7 +144,7 @@ export function Shell({
       if (event.key === "Escape") onMobileNavigationChange(false);
     };
     globalThis.addEventListener("keydown", onKeyDown);
-    drawerRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    drawerRef.current?.querySelector<HTMLButtonElement>("button.sidebar-close")?.focus();
     return () => globalThis.removeEventListener("keydown", onKeyDown);
   }, [mobileNavigationOpen, onMobileNavigationChange]);
 
@@ -247,8 +258,20 @@ export function Shell({
         </nav>
 
         <div className="sidebar-footer">
-          <div className="system-health">
+          <div
+            className="system-health"
+            title={
+              live
+                ? "Live -- updating as changes commit"
+                : health
+                  ? `${health.service} reported ${health.status}`
+                  : "Awaiting health response"
+            }
+          >
             <span className={`health-indicator ${connected ? "" : "health-indicator-pending"}`} aria-hidden="true" />
+            <span className="nav-connection" aria-hidden="true">
+              {live ? "Live" : health?.status === "demo" ? "Demo" : connected ? "Connected" : "Unknown"}
+            </span>
             <span className="rail-label">
               <strong>
                 {connected
@@ -314,7 +337,7 @@ export function Shell({
               reader already has from the rail; the record ID is the one thing
               the rail cannot say, and the thing they copy into a terminal. */}
           <nav className="page-title" aria-label="Breadcrumb">
-            <h1>{detailId ? "Workload detail" : meta.title}</h1>
+            <h1>{detailId ? (route.section === "runs" ? "Run detail" : "Workload detail") : meta.title}</h1>
             {detailId && (
               <>
                 <ChevronRight size={13} strokeWidth={1.7} aria-hidden="true" />
@@ -323,14 +346,23 @@ export function Shell({
             )}
           </nav>
           <div className="topbar-actions">
+            <button
+              className="icon-button"
+              type="button"
+              aria-label="Toggle theme"
+              title="Toggle theme"
+              onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
+            >
+              {theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}
+            </button>
             {onRefresh && (
-              <button className="button button-secondary" type="button" onClick={onRefresh}>
+              <button className="button button-secondary" type="button" aria-label="Refresh" onClick={onRefresh}>
                 <RefreshCw size={14} aria-hidden="true" />
                 <span className="button-label">Refresh</span>
               </button>
             )}
             {identity?.capabilities.submitWorkloads && (
-              <button className="button button-primary" type="button" onClick={onSubmit}>
+              <button className="button button-primary" type="button" aria-label="Submit workload" onClick={onSubmit}>
                 <Plus size={14} strokeWidth={2} aria-hidden="true" />
                 <span className="button-label">Submit workload</span>
               </button>

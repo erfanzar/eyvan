@@ -160,7 +160,9 @@ describe("writer-013 responsive layout contracts", () => {
       const rail = await page.getByRole("complementary", { name: "Primary navigation" }).boundingBox();
       expect(bounds).not.toBeNull();
       expect(rail).not.toBeNull();
-      expect(rail!.width).toBe(60);
+      // Compact navigation is now a full-width, 48px top bar, not a 60px rail.
+      expect(rail!.width).toBe(1400);
+      expect(rail!.height).toBe(48);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(rail!.x + rail!.width);
       await expand.click();
       expect(await page.getByRole("combobox", { name: "Project scope" }).isVisible()).toBe(true);

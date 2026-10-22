@@ -3,9 +3,14 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-export type Section = "overview" | "workloads" | "fleet" | "capacity" | "billing" | "budgets" | "audit";
+export type Section = "overview" | "workloads" | "runs" | "fleet" | "capacity" | "billing" | "budgets" | "audit";
 
-export type Route = { section: Section } | { section: "workloads"; workloadId: string };
+export type RunTab = "charts" | "episodes" | "histograms" | "rollouts" | "completions" | "media";
+
+export type Route =
+  | { section: Section }
+  | { section: "workloads"; workloadId: string }
+  | { section: "runs"; runId: string; tab?: RunTab };
 
 export type SectionAvailability = Partial<Record<Section, boolean>>;
 
@@ -16,15 +21,27 @@ export function accessibleRoute(route: Route, availability: SectionAvailability)
 
 export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   const path = hash.replace(/^#\/?/, "");
-  const [section, id] = path.split("/");
-  if (section === "workloads" && id) {
+  const [section, id, tab] = path.split("/");
+  if ((section === "workloads" || section === "runs") && id) {
     try {
-      return { section: "workloads", workloadId: decodeURIComponent(id) };
+      return section === "runs"
+        ? {
+            section: "runs",
+            runId: decodeURIComponent(id),
+            ...(tab === "episodes" ||
+            tab === "histograms" ||
+            tab === "rollouts" ||
+            tab === "completions" ||
+            tab === "media"
+              ? { tab }
+              : {}),
+          }
+        : { section: "workloads", workloadId: decodeURIComponent(id) };
     } catch (error) {
       if (!(error instanceof URIError)) throw error;
       // Browser hashes may come from malformed external links, not routeHash.
       // Keep the list usable without requesting an invalid workload detail.
-      return { section: "workloads" };
+      return { section };
     }
   }
   // Every section the rail offers, or the rail has an item that navigates to
@@ -32,13 +49,17 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // and an availability flag -- so pressing Billing set the hash, the hash
   // parsed back to overview, and the section could only be reached by not
   // reloading.
-  if (["workloads", "fleet", "capacity", "billing", "budgets", "audit"].includes(section)) {
+  if (["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit"].includes(section)) {
     return { section: section as Section };
   }
   return { section: "overview" };
 }
 
 export function routeHash(route: Route): string {
+  if ("runId" in route) {
+    const suffix = route.tab && route.tab !== "charts" ? `/${route.tab}` : "";
+    return `#/runs/${encodeURIComponent(route.runId)}${suffix}`;
+  }
   if ("workloadId" in route) {
     return `#/workloads/${encodeURIComponent(route.workloadId)}`;
   }

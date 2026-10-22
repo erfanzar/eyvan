@@ -38,6 +38,31 @@ describe("every section the rail offers", () => {
   });
 });
 
+describe("run tracking routes", () => {
+  it("round trips the list and encoded run identifiers", () => {
+    expect(parseRoute("#/runs")).toEqual({ section: "runs" });
+    const route = { section: "runs", runId: "ppo/seed 3" } as const;
+    expect(routeHash(route)).toBe("#/runs/ppo%2Fseed%203");
+    expect(parseRoute(routeHash(route))).toEqual(route);
+    expect(parseRoute("#/runs/%E0%A4%A")).toEqual({ section: "runs" });
+  });
+
+  it("round trips episode and histogram tabs while preserving the default charts route", () => {
+    for (const tab of ["episodes", "histograms"] as const) {
+      const route = { section: "runs", runId: "ppo/seed 3", tab } as const;
+      expect(routeHash(route)).toBe(`#/runs/ppo%2Fseed%203/${tab}`);
+      expect(parseRoute(routeHash(route))).toEqual(route);
+    }
+    expect(parseRoute("#/runs/run-1/unknown")).toEqual({ section: "runs", runId: "run-1" });
+    expect(parseRoute("#/runs/run-1/charts")).toEqual({ section: "runs", runId: "run-1" });
+    expect(parseRoute("#/workloads/wl-1/episodes")).toEqual({ section: "workloads", workloadId: "wl-1" });
+  });
+
+  it("honours read availability on run deep links", () => {
+    expect(accessibleRoute(parseRoute("#/runs/run-1"), { runs: false })).toEqual({ section: "overview" });
+  });
+});
+
 describe("the quota section", () => {
   it("is a first-class route so a zone choice can be linked to", () => {
     expect(parseRoute("#/capacity")).toEqual({ section: "capacity" });
