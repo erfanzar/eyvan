@@ -696,3 +696,79 @@ def test_the_cli_rejects_a_fit_request_it_cannot_parse(monkeypatch) -> None:
 
     assert result.exit_code != 0
     assert "--fits count must be a positive integer" in result.output
+
+
+def _record_refusal(cache_dir, *, zone: str = "us-central2-b", accelerator_type: str = "v6e-8") -> None:
+    from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
+
+    AutoscaleConfigCache(cache_dir).record_queue_admission_denial(
+        project="gcp-project",
+        zone=zone,
+        accelerator_type=accelerator_type,
+        capacity_class=CapacityClass.SPOT,
+    )
+
+
+def test_the_cli_never_lists_a_queue_that_refused_us_as_free_capacity(monkeypatch, tmp_path) -> None:
+    """Quota is not access.
+
+    In example-spot-project on 2026-10-23, 1536 chips of Spot v6e quota sat in zones
+    whose queues answered every request with "User does not have permission to
+    submit requests into this queue". The provisioning path already records
+    that refusal locally; the quota view must use it rather than present the
+    limit as capacity somebody can take.
+    """
+
+    _record_refusal(tmp_path)
+    fake = FakeCliClient(_cli_payload())
+
+    result = _invoke(fake, monkeypatch, ["capacity", "quota", "--cache-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Spot queue refused this project" in result.output
+    free_section, _, refused_section = result.output.partition("Spot queue refused this project")
+    assert "us-central2-b" not in free_section
+    assert "us-central2-b" in refused_section
+    # The refusal is exact: an unrelated zone keeps its own answer.
+    assert "europe-west4-a" in free_section
+
+
+def test_a_refused_queue_never_answers_a_fit_question(monkeypatch, tmp_path) -> None:
+    _record_refusal(tmp_path)
+
+    result = _invoke(
+        FakeCliClient(_cli_payload()),
+        monkeypatch,
+        ["capacity", "quota", "--fits", "v6e-8:2", "--cache-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    fits_section, _, _ = result.output.partition("Spot queue refused this project")
+    assert "us-central2-b" not in fits_section.partition("Fits 2 x v6e-8:")[2]
+
+
+def test_a_refusal_for_another_type_or_project_changes_nothing(monkeypatch, tmp_path) -> None:
+    _record_refusal(tmp_path, accelerator_type="v6e-16")
+    from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
+
+    AutoscaleConfigCache(tmp_path).record_queue_admission_denial(
+        project="other-project",
+        zone="us-central2-b",
+        accelerator_type="v6e-8",
+        capacity_class=CapacityClass.SPOT,
+    )
+
+    result = _invoke(FakeCliClient(_cli_payload()), monkeypatch, ["capacity", "quota", "--cache-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Spot queue refused this project" not in result.output
+    assert "us-central2-b" in result.output
+
+
+def test_an_unreadable_refusal_cache_does_not_break_the_quota_view(monkeypatch, tmp_path) -> None:
+    (tmp_path / "queue-admission-denials.json").write_text("{not json", encoding="utf-8")
+
+    result = _invoke(FakeCliClient(_cli_payload()), monkeypatch, ["capacity", "quota", "--cache-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "us-central2-b" in result.output

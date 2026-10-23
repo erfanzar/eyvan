@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import json
 import typing as tp
+from pathlib import Path
 
 import click
 
 from eyvan._internal.json_types import JsonValue, is_json_object
+from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
 from eyvan.domain.accelerators import sort_accelerator_types
+from eyvan.records import CapacityClass
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
@@ -305,6 +308,30 @@ def _quota_fits(row: dict[str, object], accelerator_type: str | None, count: int
     return slices >= count
 
 
+def _refused_spot_queues(cache_dir: Path | None, project: object) -> frozenset[tuple[str, str]]:
+    """Return ``(zone, accelerator_type)`` Spot queues GCP refused for ``project``.
+
+    Quota is not access: a zone can hold 1536 chips of Spot v6e quota and still
+    answer every request with "User does not have permission to submit requests
+    into this queue" (example-spot-project, 2026-10-23). Provisioning records those
+    refusals in the local autoscale cache, which already keeps them out of
+    automatic fleet selection; this is the same record read for the quota view.
+    An unreadable cache yields no refusals rather than breaking the view.
+    """
+
+    if not isinstance(project, str) or not project:
+        return frozenset()
+    try:
+        denials = AutoscaleConfigCache(cache_dir).list_queue_admission_denials()
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(
+        (denial.key.zone, denial.key.accelerator_type)
+        for denial in denials
+        if denial.key.project == project and denial.key.capacity_class is CapacityClass.SPOT
+    )
+
+
 def _parse_fits(value: str) -> tuple[str, int]:
     """Parse ``TYPE`` or ``TYPE:COUNT`` into an explicit shape and multiplicity."""
 
@@ -334,6 +361,11 @@ def _parse_fits(value: str) -> tuple[str, int]:
 )
 @click.option("--fits", help="Only zones that fit TYPE or TYPE:COUNT, for example v6e-8:2.")
 @click.option("--refresh", is_flag=True, help="Re-read the provider instead of reusing a cached reading.")
+@click.option(
+    "--cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Autoscale cache holding recorded Spot queue refusals. Defaults to the active fleet's cache.",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def capacity_quota(
@@ -344,6 +376,7 @@ def capacity_quota(
     capacity_classes: tuple[str, ...],
     fits: str | None,
     refresh: bool,
+    cache_dir: Path | None,
     as_json: bool,
 ) -> None:
     """Show provider TPU quota, live usage, and free capacity per zone and type.
@@ -392,12 +425,32 @@ def capacity_quota(
         if (not wanted_generations or str(row.get("generation", "")).lower() in wanted_generations)
         and (not wanted_classes or str(row.get("capacity_class", "")).lower() in wanted_classes)
     ]
+    project_name = payload.get("project")
+    refused_queues = _refused_spot_queues(
+        cache_dir if cache_dir is not None else session.autoscale_cache_dir, project_name
+    )
+    # A queue GCP refused is never capacity, whatever its quota says, so it is
+    # listed on its own instead of among free or unmeasured zones.
+    refused = [
+        row
+        for row in rows
+        if str(row.get("capacity_class", "")).lower() == "spot"
+        and (row.get("zone"), row.get("accelerator_type")) in refused_queues
+        and (fits_type is None or row.get("accelerator_type") == fits_type)
+    ]
+    rows = [
+        row
+        for row in rows
+        if not (
+            str(row.get("capacity_class", "")).lower() == "spot"
+            and (row.get("zone"), row.get("accelerator_type")) in refused_queues
+        )
+    ]
     fitting = [row for row in rows if _quota_fits(row, fits_type, fits_count) is True]
     # Unknown usage is reported separately rather than filtered away. A zone
     # nobody could measure is not a zone that does not fit.
     unknown = [row for row in rows if _quota_fits(row, fits_type, fits_count) is None]
 
-    project_name = payload.get("project")
     age = _quota_age(payload.get("age_s"))
     source = "cached" if payload.get("cached") else "read now"
     click.echo(f"TPU quota for {project_name or 'the configured project'} -- provider read {age} ({source})")
@@ -409,7 +462,11 @@ def capacity_quota(
 
     _echo_quota_rows("Free capacity" if not fits else f"Fits {fits_count} x {fits_type}", fitting)
     _echo_quota_rows("Usage unknown -- not proven empty and not proven full", unknown)
-    if not fitting and not unknown:
+    _echo_quota_rows(
+        "Spot queue refused this project -- quota is not access (recorded by an earlier request; expires after 24h)",
+        refused,
+    )
+    if not fitting and not unknown and not refused:
         click.echo("  no quota rows match those filters")
 
 

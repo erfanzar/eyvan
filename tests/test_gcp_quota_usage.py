@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import subprocess
+import typing as tp
 from collections.abc import Sequence
 from datetime import datetime
 
@@ -90,6 +91,48 @@ def test_quota_usage_discovery_keeps_region_and_zone_usage_separate_and_follows_
     assert requests[0].headers["Authorization"] == "Bearer test-token"
     assert requests[0].url.params["view"] == "FULL"
     assert requests[0].url.params["filter"].endswith(f'metric.labels.quota_metric="{_METRIC}"')
+
+
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def test_an_idle_quota_keeps_its_last_usage_point_weeks_after_it_was_written() -> None:
+    """Monitoring writes a usage point when usage changes, not while it stays put.
+
+    In example-spot-project on 2026-10-23 the newest Spot v5p/v6e points were from
+    2026-10-01, all zero, because nothing had run since. A two-day window found
+    no point at all, so every zone was reported ``usage_unknown`` although the
+    provider held a valid reading. The peer below honours the requested
+    interval exactly as Cloud Monitoring does.
+    """
+
+    stored = _series(location="us-east5-b", points=[_point("0", "2026-10-01T10:28:03Z")])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start = _parse_time(request.url.params["interval.startTime"])
+        end = _parse_time(request.url.params["interval.endTime"])
+        points = [
+            point
+            for point in tp.cast(list[JsonObject], stored["points"])
+            if start <= _parse_time(tp.cast(str, tp.cast(JsonObject, point["interval"])["endTime"])) <= end
+        ]
+        return httpx.Response(200, json={"timeSeries": [{**stored, "points": points}] if points else []})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        records = GcpTpuQuotaUsageDiscovery(
+            token_runner=_token_runner,
+            client=client,
+            clock=lambda: datetime(2026, 10, 23, 12, tzinfo=UTC),
+        ).discover(project="project-a", metrics=(_METRIC,))
+    finally:
+        client.close()
+
+    # The reading keeps its real timestamp, so every caller still sees its age.
+    assert [(record.location, record.used_quota_units, record.observed_at) for record in records] == [
+        ("us-east5-b", 0, datetime(2026, 10, 1, 10, 28, 3, tzinfo=UTC)),
+    ]
 
 
 def test_quota_usage_discovery_ignores_invalid_series_instead_of_inventing_zero_usage() -> None:
