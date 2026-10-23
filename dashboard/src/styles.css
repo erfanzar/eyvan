@@ -2552,6 +2552,11 @@ code,
   font-family: var(--mono);
   font-size: var(--text-2xs);
 }
+/* Cell names are long hyphenated identifiers; break them only when the body
+   column genuinely cannot fit one. */
+.timeline-target {
+  overflow-wrap: anywhere;
+}
 
 .timeline-span {
   color: var(--text-faint);

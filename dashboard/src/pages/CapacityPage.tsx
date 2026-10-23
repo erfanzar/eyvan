@@ -668,13 +668,18 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
             <ol className="timeline-list">
               {capacityEvents.slice(0, 12).map((event) => (
                 <li key={event.id} className={`timeline-${event.severity}`}>
-                  <span className="timeline-marker" aria-hidden="true" />
-                  <div>
+                  {/* Same three cells as the workload timeline: the list is a
+                      time / rail / body grid, and a missing cell shifts the
+                      body into the 22px rail column. */}
+                  <time>{formatDateTime(event.timestamp)}</time>
+                  <span className="timeline-rail" aria-hidden="true">
+                    <span className="timeline-marker" />
+                  </span>
+                  <div className="timeline-body">
                     <span className="timeline-heading">
                       <strong>{event.action}</strong>
-                      <time>{formatDateTime(event.timestamp)}</time>
                     </span>
-                    <p className="monospace">{event.target}</p>
+                    <p className="monospace timeline-target">{event.target}</p>
                   </div>
                 </li>
               ))}

@@ -564,6 +564,35 @@ describe("what each zone has been doing", () => {
 
     expect(await screen.findByText(/No capacity has been granted or released recently/)).toBeTruthy();
   });
+
+  it("lays each capacity event out as time, rail and body, like the workload timeline", async () => {
+    // The list is a three-column grid. A row with only two cells put the
+    // marker in the time column and squeezed the whole event into the 22px
+    // rail column, one word per line.
+    const events: AuditEvent[] = [
+      {
+        id: "drain-1",
+        timestamp: "2026-08-20T13:19:00Z",
+        action: "capacity.drain",
+        actor: "controller",
+        target: "research-southamerica-west1-a-v6e-8-ca0244-0008",
+        category: "capacity",
+        severity: "warning",
+        detail: "",
+      },
+    ];
+    renderZones([cell()], events);
+
+    const target = await screen.findByText("research-southamerica-west1-a-v6e-8-ca0244-0008");
+    const row = target.closest("li");
+    expect(row).not.toBeNull();
+    const cells = Array.from(row!.children);
+    expect(cells.map((child) => child.tagName.toLowerCase())).toEqual(["time", "span", "div"]);
+    expect(cells[1].classList.contains("timeline-rail")).toBe(true);
+    expect(cells[1].querySelector(".timeline-marker")).not.toBeNull();
+    expect(cells[2].classList.contains("timeline-body")).toBe(true);
+    expect(cells[2].textContent).toContain("capacity.drain");
+  });
 });
 
 describe("one row per quota, not per slice size", () => {
