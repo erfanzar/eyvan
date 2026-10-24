@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-219 variables are currently referenced. Names set on workload
+222 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -106,7 +106,9 @@ is easier to audit when everything is in one table.
 | `EYVAN_CAPACITY_BACKEND` | `eyvan/config` |
 | `EYVAN_CAPACITY_RACE_WIDTH` | `eyvan/config` |
 | `EYVAN_CAPACITY_SUPPORTS_EXEC` | `eyvan/config` |
+| `EYVAN_CELL_AGENT_BACKOFF_MAX_S` | `eyvan/config` |
 | `EYVAN_CELL_BILLING_INTERVAL_S` | `eyvan/config` |
+| `EYVAN_CELL_HEARTBEAT_PERSIST_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_CELL_RECONCILE_CONCURRENCY` | `eyvan/config` |
 | `EYVAN_CELL_RECONCILE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_CELL_STAGE_BUDGET_BYTES` | `eyvan/config` |
@@ -153,6 +155,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_READONLY_QUERY_TIMEOUT_MS` | `eyvan/config` |
 | `EYVAN_RETENTION_BATCH_LIMIT` | `eyvan/config` |
 | `EYVAN_RETENTION_INTERVAL_S` | `eyvan/config` |
+| `EYVAN_SCHEDULER_IDLE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SCHEDULER_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SECRET_TOKEN_TTL_S` | `eyvan/config` |
 | `EYVAN_SERVICE_AUTOSCALE_INTERVAL_S` | `eyvan/config` |

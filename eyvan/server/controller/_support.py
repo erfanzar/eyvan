@@ -12,7 +12,7 @@ import logging
 import typing as tp
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
@@ -299,6 +299,65 @@ class LeaderElector(tp.Protocol):
     async def acquire(self) -> bool: ...
 
     async def release(self) -> None: ...
+
+
+class _UnreachableAgentBackoff:
+    """Space out retries to cell agents that cannot be reached at all.
+
+    An agent that refuses connections answered nothing, so the observation path
+    already writes nothing for it -- but it still asked every
+    ``cell_reconcile_interval_s`` forever and logged twice per ask. Each
+    consecutive failure doubles the wait, up to ``max_s``; one answer clears it.
+
+    Held in memory and keyed by cell *and* generation: a restart or a recreated
+    cell starts from a prompt retry, which can only make the plane notice a
+    recovery sooner. Skipping an observation changes no record, so a dead
+    agent's cell still retires on its provider timeouts exactly as before.
+    """
+
+    def __init__(self, *, base_s: float, max_s: float) -> None:
+        self._base_s = base_s
+        self._max_s = max_s
+        self._failures: dict[tuple[str, int], tuple[int, datetime]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self._base_s > 0 and self._max_s > 0
+
+    def ready(self, cell: CellRecord, now: datetime) -> bool:
+        """Return whether this cell's agent may be asked again at ``now``."""
+
+        entry = self._failures.get((cell.id, cell.generation))
+        return entry is None or not self.enabled or now >= entry[1]
+
+    def backing_off(self, cell: CellRecord) -> bool:
+        """Return whether the most recent ask of this cell's agent failed to connect."""
+
+        return (cell.id, cell.generation) in self._failures
+
+    def failed(self, cell: CellRecord, now: datetime) -> bool:
+        """Record one unreachable ask; return True only for the first in a streak."""
+
+        key = (cell.id, cell.generation)
+        count = self._failures[key][0] + 1 if key in self._failures else 1
+        # One refused connection is a blip -- an agent restarting -- so the next
+        # ordinary pass still asks. Waiting starts with the second in a row.
+        delay_s = 0.0
+        if self.enabled and count > 1:
+            delay_s = min(self._max_s, self._base_s * 2 ** min(count - 2, 30))
+        self._failures[key] = (count, now + timedelta(seconds=delay_s))
+        return count == 1
+
+    def succeeded(self, cell: CellRecord) -> bool:
+        """Clear a streak; return True when the agent had been unreachable."""
+
+        return self._failures.pop((cell.id, cell.generation), None) is not None
+
+    def retain(self, keys: tp.Collection[tuple[str, int]]) -> None:
+        """Forget cells that are no longer observed, so the map cannot grow with churn."""
+
+        for key in [key for key in self._failures if key not in keys]:
+            del self._failures[key]
 
 
 class SingleProcessLeader:

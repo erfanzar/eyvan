@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import typing as tp
 
 from eyvan._internal.observability import trace_span
+from eyvan.records import CoordinationKind, WorkloadState
 from eyvan.server.controller._support import (
+    _LIVE_WORKLOAD_STATES,
     LeaderPhase,
     logger,
 )
@@ -307,6 +310,7 @@ class _ControllerLoops:
         due: dict[str, float] = {}
         try:
             while not stop.is_set():
+                revision = self._committed_revision()
                 try:
                     if await self.leader.acquire():
                         async with self._leader_cycle_lock:
@@ -315,8 +319,75 @@ class _ControllerLoops:
                 except Exception:
                     logger.exception("global scheduling reconciliation failed")
                 await self._wait_for_next_cycle(stop)
+                if revision is not None and not stop.is_set():
+                    await self._wait_while_idle(stop, revision, due)
         finally:
             await self.leader.release()
+
+    def _committed_revision(self) -> int | None:
+        """Return the in-process committed revision, or None where it is not observable.
+
+        Only the single-process state repositories (memory and local JSON) can
+        say cheaply that nothing changed. Every other backend keeps the fixed
+        cadence, as does a zero ``scheduler_idle_interval_s``.
+        """
+
+        if self.settings.scheduler_idle_interval_s <= self.settings.scheduler_interval_s:
+            return None
+        revision = getattr(self.repository, "committed_revision", None)
+        return revision if isinstance(revision, int) else None
+
+    async def _is_quiet(self) -> bool:
+        """Return whether no workload depends on the fixed cadence right now.
+
+        A live workload holds a lease whose expiry, settlement and log archive
+        are judged by the clock, and a service is reconciled on its own 5 s
+        interval. Either keeps the ordinary cadence. Pending work is not on this
+        list: it changes only through a commit (which wakes the loop) or through
+        cell observation, which still runs on its own deadline below.
+        """
+
+        async with self.repository.transaction() as transaction:
+            if await transaction.list_workloads(states=_LIVE_WORKLOAD_STATES):
+                return False
+            pending = await transaction.list_workloads(state=WorkloadState.PENDING)
+        return not any(workload.coordination_kind is CoordinationKind.SERVICE for workload in pending)
+
+    async def _wait_while_idle(self, stop: asyncio.Event, revision: int, due: dict[str, float]) -> None:
+        """Extend the wait after a cycle that committed nothing, until any commit or deadline.
+
+        The ordinary interval has already elapsed, so the loop never runs more
+        often than before. It wakes at once on any commit -- a submit, a
+        cancellation, an outbox delivery -- and no later than the next due
+        interval phase (cell observation, by default every 15 s) or the idle
+        ceiling, whichever comes first.
+        """
+
+        repository = tp.cast(tp.Any, self.repository)
+        if repository.committed_revision != revision:
+            return
+        try:
+            if not await self._is_quiet():
+                return
+        except Exception:
+            logger.debug("idle check failed; keeping the ordinary cadence", exc_info=True)
+            return
+        loop = asyncio.get_running_loop()
+        remaining = self.settings.scheduler_idle_interval_s - self.settings.scheduler_interval_s
+        next_due = [when for name, when in due.items() if name != "reconcile-services"]
+        if next_due:
+            remaining = min(remaining, min(next_due) - loop.time())
+        if remaining <= 0:
+            return
+        stopped = asyncio.ensure_future(stop.wait())
+        committed = asyncio.ensure_future(repository.wait_for_commit(revision, timeout=remaining))
+        try:
+            await asyncio.wait({stopped, committed}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (stopped, committed):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stopped, committed, return_exceptions=True)
 
     async def _run_outbox_loop(self, stop: asyncio.Event) -> None:
         """Deliver durable mutations independently of leader reconciliation."""

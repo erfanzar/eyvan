@@ -526,6 +526,25 @@ def _topology_mismatch(frozen: WorkloadTopologyCell, current: CellRecord, observ
     return ""
 
 
+def _heartbeat_only(current: CellRecord, updated: CellRecord, now: datetime, *, interval_s: float) -> bool:
+    """Return whether an observation may skip persisting a heartbeat-only change.
+
+    True only when the two records differ in nothing but ``last_heartbeat_at``
+    and ``updated_at``, a heartbeat was already persisted, and that heartbeat is
+    younger than ``interval_s``. A zero interval never skips, which is the
+    behaviour before the interval existed.
+    """
+
+    if interval_s <= 0 or current.last_heartbeat_at is None or updated.last_heartbeat_at is None:
+        return False
+    if now - current.last_heartbeat_at >= timedelta(seconds=interval_s):
+        return False
+    stamped = current.model_copy(
+        update={"last_heartbeat_at": updated.last_heartbeat_at, "updated_at": updated.updated_at}
+    )
+    return stamped == updated
+
+
 class _ControllerObservation:
     """Reading live cell and workload state back into durable records.
 
@@ -1387,6 +1406,10 @@ class _ControllerObservation:
                     and (cell.provider_phase is None or (cell.id, cell.generation) in active_capacity_applies)
                 )
             ]
+        # An agent that refused the last asks is asked less often; skipping it
+        # writes nothing, exactly like the failed ask it replaces.
+        self._agent_backoff.retain({(cell.id, cell.generation) for cell in cells})
+        cells = [cell for cell in cells if self._agent_backoff.ready(cell, now)]
         semaphore = asyncio.Semaphore(max(1, self.settings.cell_reconcile_concurrency))
 
         async def reconcile(cell: CellRecord) -> bool:
@@ -1394,6 +1417,12 @@ class _ControllerObservation:
                 return await self._observe_cell_once(cell, now)
 
         return sum(await asyncio.gather(*(reconcile(cell) for cell in cells)))
+
+    def _note_agent_answered(self, cell: CellRecord) -> None:
+        """Clear an unreachable-agent streak, saying so once if there was one."""
+
+        if self._agent_backoff.succeeded(cell):
+            logger.info("cell %s agent is reachable again", cell.id)
 
     async def _observe_cell_once(self, cell: CellRecord, now: datetime) -> bool:
         """Fence one agent observation against its fleet and cell lifecycle changes."""
@@ -1499,9 +1528,15 @@ class _ControllerObservation:
             # dead agent still retires the cell on `queue_timeout_s` /
             # `provisioning_timeout_s` exactly as it would have. Capacity cannot
             # leak because of this branch -- it can only survive a blip.
-            logger.warning("cell %s could not be observed: %s", cell.id, exc)
+            if self._agent_backoff.failed(cell, now):
+                logger.warning("cell %s could not be observed: %s", cell.id, exc)
+            else:
+                # Said once per streak at warning level; repeating it every pass
+                # grew the local log by tens of megabytes for one dead agent.
+                logger.debug("cell %s still could not be observed: %s", cell.id, exc)
             return False
         except CellAgentCapacityProviderError as exc:
+            self._note_agent_answered(cell)
             provider_detail = redact_secret_material(str(exc))
             provider_failure_code = exc.code
             unavailable_reason = exc.code.value
@@ -1515,6 +1550,7 @@ class _ControllerObservation:
             availability = self._observe_capacity_belief(cell, ProvisionOutcome.PROVIDER_ERROR)
         else:
             agent_responded = True
+            self._note_agent_answered(cell)
             provider_detail = observation.detail or None
             remote_state = observation.state
             observed_tpu_vms = observation.observed_tpu_vms
@@ -1639,6 +1675,17 @@ class _ControllerObservation:
                     "updated_at": now,
                 }
             )
+            if provider_failure_code is not CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED and _heartbeat_only(
+                current,
+                updated,
+                now,
+                interval_s=self.settings.cell_heartbeat_persist_interval_s,
+            ):
+                # Nothing but the heartbeat moved, and the persisted one is still
+                # recent. Writing it would re-serialize the whole local state
+                # every observation interval for a timestamp only the dashboard
+                # shows; any other change to the cell is written at once.
+                return True
             await transaction.put_cell(updated)
             if provider_failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
                 await self._fail_autoscale_workload_for_queue_admission_denial(

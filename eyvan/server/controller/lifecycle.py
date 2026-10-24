@@ -35,6 +35,7 @@ from eyvan.server.controller._support import (
     StaleOutboxCommand,
     _FleetCapacityGate,
     _system_principal,
+    _UnreachableAgentBackoff,
     logger,
 )
 from eyvan.server.controller.log_archival import _LogChunkProgress
@@ -119,6 +120,10 @@ class _ControllerLifecycle:
         self.secret_capability = secret_capability
         self._stage_executor = stage_executor
         self._host_replacement_budget = host_replacement_budget or host_replacement_budget_from_settings(self.settings)
+        self._agent_backoff = _UnreachableAgentBackoff(
+            base_s=self.settings.cell_reconcile_interval_s,
+            max_s=self.settings.cell_agent_backoff_max_s,
+        )
         self._capacity_lifecycle = CapacityLifecycleLogger(logger, sink_path=capacity_audit_sink)
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:

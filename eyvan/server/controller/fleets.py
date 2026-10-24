@@ -248,6 +248,11 @@ class _ControllerFleets:
             ]
         drained = 0
         for cell in cells:
+            if self._agent_backoff.backing_off(cell):
+                # Observation found this agent unreachable and will say when it
+                # answers again; asking it here too only repeats the refusal and
+                # the log line, every interval.
+                continue
             # One cell at a time, with an unreadable agent skipped rather than
             # raised: the dispatch guard must refuse what it cannot prove, but
             # a sweep that aborted on one unreachable endpoint would hold the
@@ -495,12 +500,16 @@ class _ControllerFleets:
         refreshed_cells: list[CellRecord] = []
         for cell in cells:
             pool = pools_by_id.get(cell.pool_id or "")
+            # The state tests come first on purpose: both template checks mint a
+            # whole CellRecord, and tombstones -- kept forever as id evidence --
+            # are nearly every cell a long-lived plane holds. Every term is a pure
+            # test, so the order changes the cost, never the answer.
             if (
                 pool is not None
                 and pool.enabled
+                and cell.state not in {CellState.DRAINING, CellState.DELETING, CellState.DELETED}
                 and not cell_requires_replacement(cell, pool)
                 and not cell_matches_pool(cell, pool)
-                and cell.state not in {CellState.DRAINING, CellState.DELETING, CellState.DELETED}
             ):
                 try:
                     updated, _ = await self._autoscale_upsert_cell(
@@ -517,9 +526,9 @@ class _ControllerFleets:
             if (
                 pool is not None
                 and pool.enabled
-                and cell_matches_pool(cell, pool)
                 and cell.state is CellState.REGISTERING
                 and cell.provider_phase is None
+                and cell_matches_pool(cell, pool)
             ):
                 try:
                     repaired, _ = await self._autoscale_requeue_unprovisioned_cell(pool, cell)

@@ -880,6 +880,30 @@ class StateRepository:
         self._state = ControlPlaneState()
         self._transaction_lock = asyncio.Lock()
         self._event_condition = asyncio.Condition()
+        # Separate from the event condition on purpose: event waiters re-query
+        # on every wake, and most commits append no event.
+        self._commit_condition = asyncio.Condition()
+
+    @property
+    def committed_revision(self) -> int:
+        """Return the revision of the last committed state; it moves on every commit."""
+
+        return self._state.revision
+
+    async def wait_for_commit(self, after_revision: int, *, timeout: float) -> bool:
+        """Wait until a commit moves the revision past ``after_revision``; return whether one did."""
+
+        if self._state.revision != after_revision:
+            return True
+        try:
+            async with self._commit_condition:
+                await asyncio.wait_for(
+                    self._commit_condition.wait_for(lambda: self._state.revision != after_revision),
+                    timeout=timeout,
+                )
+        except TimeoutError:
+            return False
+        return True
 
     async def open(self) -> None:
         """Open the repository lifecycle. In-memory state is always open."""
@@ -919,6 +943,7 @@ class StateRepository:
 
         await self.open()
         committed_events = False
+        committed_any = False
         async with self._transaction_lock:
             committed = self._state
             fingerprint = _state_fingerprint(committed) if self.verify_record_immutability else None
@@ -941,7 +966,11 @@ class StateRepository:
                 working.revision += 1
                 self._persist(working)
                 self._state = working
+                committed_any = True
                 committed_events = working.next_event_sequence > start_sequence
+        if committed_any:
+            async with self._commit_condition:
+                self._commit_condition.notify_all()
         if committed_events:
             async with self._event_condition:
                 self._event_condition.notify_all()

@@ -617,6 +617,10 @@ class LocalControlPlaneStore:
     def __init__(self, path: Path | str = DEFAULT_LOCAL_CONTROL_PLANE_PATH):
         self.path = Path(path).expanduser()
         self._commit_status_ambiguous = False
+        # Identity of the non-v1 document this store itself last loaded or
+        # wrote. While the pathname still carries exactly that identity, the
+        # next save already knows what a re-read would return.
+        self._own_identity: _LocalFileIdentity | None = None
 
     @property
     def v1_backup_path(self) -> Path:
@@ -637,11 +641,14 @@ class LocalControlPlaneStore:
         the caller has reconciled its view with the pathname that survived.
         """
 
+        self._own_identity = None
         if self._existing_metadata() is None:
             state = ControlPlaneState()
         else:
-            document, _ = self._read_document()
+            document, snapshot = self._read_document()
             state = document.to_state()
+            if not isinstance(document, _LocalControlPlaneV1Document):
+                self._own_identity = snapshot.identity
         self._commit_status_ambiguous = False
         return state
 
@@ -651,11 +658,20 @@ class LocalControlPlaneStore:
         self._raise_if_ambiguous_commit()
         temporary_path: Path | None = None
         replaced = False
+        own_identity, self._own_identity = self._own_identity, None
         try:
             self._ensure_parent()
             existing_document: _LocalControlPlaneReadableDocument | None = None
             existing_snapshot: _LocalFileSnapshot | None = None
-            if self._existing_metadata() is not None:
+            existing_metadata = self._existing_metadata()
+            # Re-reading exists to find a v1 document to back up and to refuse a
+            # pathname someone else replaced. Neither can apply to the exact
+            # file this store wrote or loaded last: any outside write, rename or
+            # chmod changes its identity and takes the full read below. Skipping
+            # it saves a parse and validation of the whole state on every commit.
+            if existing_metadata is not None and (
+                own_identity is None or self._metadata_identity(existing_metadata) != own_identity
+            ):
                 existing_document, existing_snapshot = self._read_document()
 
             document = local_control_plane_document(state).model_dump(mode="json", by_alias=True)
@@ -693,6 +709,10 @@ class LocalControlPlaneStore:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+        try:
+            self._own_identity = self._metadata_identity(self.path.lstat())
+        except OSError:
+            self._own_identity = None  # the next save simply reads again
 
     def _raise_if_ambiguous_commit(self) -> None:
         if not self._commit_status_ambiguous:
@@ -873,12 +893,25 @@ class LocalControlPlaneStore:
                 os.fchmod(temporary.fileno(), 0o600)
                 encoder = json.JSONEncoder(indent=2, sort_keys=True, allow_nan=False, ensure_ascii=True)
                 written = 0
+                # The indented encoder yields one tiny string per token -- millions
+                # for a long-lived plane -- and writing each on its own cost more
+                # than encoding it. Buffer about 64 KiB per write. ``ensure_ascii``
+                # makes characters equal bytes, so the size bound is checked
+                # against the same running total before anything exceeds it.
+                pending: list[str] = []
+                pending_size = 0
                 for text in encoder.iterencode(document):
-                    if written + len(text) > LOCAL_CONTROL_PLANE_MAX_BYTES:
+                    if written + pending_size + len(text) > LOCAL_CONTROL_PLANE_MAX_BYTES:
                         self._raise_oversize_state()
-                    for offset in range(0, len(text), 65_536):
-                        chunk = text[offset : offset + 65_536].encode("ascii")
+                    pending.append(text)
+                    pending_size += len(text)
+                    if pending_size >= 65_536:
+                        chunk = "".join(pending).encode("ascii")
                         written = self._write_bounded_chunk(temporary, chunk, written=written)
+                        pending.clear()
+                        pending_size = 0
+                if pending:
+                    written = self._write_bounded_chunk(temporary, "".join(pending).encode("ascii"), written=written)
                 self._write_bounded_chunk(temporary, b"\n", written=written)
                 temporary.flush()
                 os.fsync(temporary.fileno())

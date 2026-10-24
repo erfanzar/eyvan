@@ -500,6 +500,11 @@ def cell_requires_replacement(cell: CellRecord, pool: CapacityPoolRecord) -> boo
 def cell_provides_pool_supply(cell: CellRecord, pool: CapacityPoolRecord, now: datetime) -> bool:
     """Return whether a real cell supplies or is still acquiring its worker units."""
 
+    # Only these states can ever supply. Tested before the template match, which
+    # mints a whole CellRecord, so the tombstones a long-lived plane keeps cost
+    # nothing here; the answer for them was already False.
+    if cell.state not in {CellState.READY, CellState.REGISTERING, CellState.UNAVAILABLE}:
+        return False
     if not cell_matches_pool(cell, pool):
         return False
     phase = cell.provider_phase

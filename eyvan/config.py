@@ -124,8 +124,33 @@ class EyvanSettings:
     #: cannot hold a database connection for the length of an incident.
     readonly_query_timeout_ms: int = 15_000
     scheduler_interval_s: float = 2.0
+    scheduler_idle_interval_s: float = 15.0
+    """Longest wait between leader cycles while the plane is idle.
+
+    Applies only to the single-process memory and local JSON repositories.
+    After a cycle that committed nothing, with no live workload and no
+    service to reconcile, the loop waits up to this long, waking at once on
+    any commit and no later than the next due interval phase. Any value not
+    above ``scheduler_interval_s`` (including ``0``) keeps the fixed cadence,
+    the behaviour before this setting existed.
+    """
     cell_reconcile_interval_s: float = 15.0
     cell_reconcile_concurrency: int = 8
+    cell_heartbeat_persist_interval_s: float = 300.0
+    """How often an observation that changed nothing but a cell's heartbeat is persisted.
+
+    Each such write re-serializes the whole local JSON state, every
+    ``cell_reconcile_interval_s``, for a timestamp only the dashboard shows. Any
+    other change to the cell is still written at once. ``0`` persists every
+    observation, the behaviour before this setting existed.
+    """
+    cell_agent_backoff_max_s: float = 300.0
+    """Longest wait between asks of a cell agent that cannot be reached.
+
+    Each consecutive connection failure doubles the wait from
+    ``cell_reconcile_interval_s`` up to this ceiling; any answer resets it.
+    ``0`` asks every interval, the behaviour before this setting existed.
+    """
     lease_ttl_s: int = 120
     indeterminate_execution_grace_s: int = 900
     """How long an execution status may stay unreadable before its host is replaced.
@@ -541,7 +566,10 @@ class EyvanSettings:
         # become the controller's next sleep, or silently disable a phase.
         for name in (
             "scheduler_interval_s",
+            "scheduler_idle_interval_s",
             "cell_reconcile_interval_s",
+            "cell_heartbeat_persist_interval_s",
+            "cell_agent_backoff_max_s",
             "service_reconcile_interval_s",
             "retention_interval_s",
             "metrics_export_interval_s",
@@ -728,11 +756,20 @@ class EyvanSettings:
                 os.getenv("EYVAN_ARTIFACT_MAX_WORKSPACE_BYTES", defaults.artifact_max_workspace_bytes)
             ),
             scheduler_interval_s=float(os.getenv("EYVAN_SCHEDULER_INTERVAL_S", defaults.scheduler_interval_s)),
+            scheduler_idle_interval_s=float(
+                os.getenv("EYVAN_SCHEDULER_IDLE_INTERVAL_S", defaults.scheduler_idle_interval_s)
+            ),
             cell_reconcile_interval_s=float(
                 os.getenv("EYVAN_CELL_RECONCILE_INTERVAL_S", defaults.cell_reconcile_interval_s)
             ),
             cell_reconcile_concurrency=int(
                 os.getenv("EYVAN_CELL_RECONCILE_CONCURRENCY", defaults.cell_reconcile_concurrency)
+            ),
+            cell_heartbeat_persist_interval_s=float(
+                os.getenv("EYVAN_CELL_HEARTBEAT_PERSIST_INTERVAL_S", defaults.cell_heartbeat_persist_interval_s)
+            ),
+            cell_agent_backoff_max_s=float(
+                os.getenv("EYVAN_CELL_AGENT_BACKOFF_MAX_S", defaults.cell_agent_backoff_max_s)
             ),
             lease_ttl_s=int(os.getenv("EYVAN_LEASE_TTL_S", defaults.lease_ttl_s)),
             checkpoint_grace_s=int(os.getenv("EYVAN_CHECKPOINT_GRACE_S", defaults.checkpoint_grace_s)),
