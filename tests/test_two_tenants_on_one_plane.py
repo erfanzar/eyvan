@@ -130,6 +130,10 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     # fleet-owned: it moves capacity between tenants' jobs. A tenant kicking its
     # own attempt would be reasonable and is not what this route is.
     "POST /api/v1/workloads/{workload_id}/kick": "interrupt an attempt via fleet preemption settlement",
+    "POST /api/v1/attachments/plan": "local CLI attachment preview uses the machine owner's credentials",
+    "POST /api/v1/attachments": "local CLI attachment execution uses the machine owner's credentials",
+    "GET /api/v1/attachments": "local attachment jobs are fleet-wide operational state",
+    "GET /api/v1/attachments/{attachment_id}": "local attachment progress and results are fleet-wide operational state",
     "GET /api/v1/cells": "fleet capacity inventory",
     "GET /api/v1/cells/{cell_id}": "one cell's provider state",
     "POST /api/v1/cells": "register capacity",

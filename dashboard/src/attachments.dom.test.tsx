@@ -1,0 +1,168 @@
+// Copyright (C) 2026 Erfan Zare Chavoshi
+// This file is part of Eyvan.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// @vitest-environment jsdom
+
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { AddTpuModal, type AttachmentClient } from "./components/AddTpuModal";
+import { mockAttachmentPlan } from "./api/mockData";
+import { FleetPage } from "./pages/FleetPage";
+import type { AttachmentInput, AttachmentJob } from "./types";
+
+const input: AttachmentInput = { target: "alice@203.0.113.20", kind: "ssh", fleet: null, project: null, zone: null };
+const running: AttachmentJob = {
+  id: "a".repeat(32),
+  target: input.target,
+  status: "running",
+  progress: ["Installing worker"],
+  result: null,
+  error: null,
+  started_at: "2026-10-25T10:00:00Z",
+  finished_at: null,
+};
+const succeeded: AttachmentJob = {
+  ...running,
+  status: "succeeded",
+  progress: ["Installing worker", "Opening tunnel"],
+  result: { fleet: "tpu-demo", ready: true, cells: [], submit: 'init(fleet="tpu-demo")', limitations: [] },
+  finished_at: "2026-10-25T10:01:00Z",
+};
+
+function client(): AttachmentClient {
+  return {
+    planAttachment: vi.fn(async (request) => mockAttachmentPlan(request)),
+    startAttachment: vi.fn(async () => running),
+    getAttachment: vi.fn(async () => succeeded),
+    listAttachments: vi.fn(async () => []),
+  };
+}
+
+const close = vi.fn();
+const connected = vi.fn(async () => {});
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+async function preview(api: AttachmentClient) {
+  render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
+  fireEvent.change(screen.getByLabelText("SSH host or IP"), { target: { value: input.target } });
+  fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+  await screen.findByRole("region", { name: "Attachment preview" });
+}
+
+describe("Add TPU", () => {
+  it("requires preview, shows the plan facts, and invalidates a preview on edits", async () => {
+    const api = client();
+    await preview(api);
+    expect(api.planAttachment).toHaveBeenCalledWith(input);
+    expect(screen.getByText("v5p-8")).toBeTruthy();
+    expect(screen.getByText("spot")).toBeTruthy();
+    expect(screen.getByText("tunnel")).toBeTruthy();
+    expect(screen.getByText("Install the Eyvan worker on 2 hosts")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.change(screen.getByLabelText("Fleet name (optional)"), { target: { value: "other" } });
+    expect(screen.queryByRole("region", { name: "Attachment preview" })).toBeNull();
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("accepts a TPU name with project and zone in advanced mode", async () => {
+    const api = client();
+    render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
+    fireEvent.click(screen.getByLabelText("Advanced: TPU name + project + zone"));
+    fireEvent.change(screen.getByLabelText("TPU name"), { target: { value: "existing-tpu" } });
+    fireEvent.change(screen.getByLabelText("GCP project"), { target: { value: "my-project" } });
+    fireEvent.change(screen.getByLabelText("Zone"), { target: { value: "us-east5-a" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() =>
+      expect(api.planAttachment).toHaveBeenCalledWith({
+        ...input,
+        target: "existing-tpu",
+        kind: "tpu",
+        project: "my-project",
+        zone: "us-east5-a",
+      }),
+    );
+  });
+
+  it("survives transient polling failures, then shows and copies the successful fleet", async () => {
+    const api = client();
+    vi.mocked(api.getAttachment).mockRejectedValueOnce(new Error("plane restarting"));
+    const copy = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: copy } });
+    await preview(api);
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    await act(async () => {});
+    expect(screen.getByText(/Connecting ·/)).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(screen.getByText(/Waiting for the local plane to reconnect/)).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(screen.getByText('init(fleet="tpu-demo")')).toBeTruthy();
+    expect(screen.getByRole("log").textContent).toContain("Opening tunnel");
+    fireEvent.click(screen.getByRole("button", { name: "Copy init snippet" }));
+    await act(async () => {});
+    expect(copy).toHaveBeenCalledWith('init(fleet="tpu-demo")');
+    expect(connected).toHaveBeenCalled();
+    expect(api.startAttachment).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a running job after a fresh modal and reports its final error", async () => {
+    const api = client();
+    vi.mocked(api.listAttachments).mockResolvedValue([running]);
+    vi.mocked(api.getAttachment).mockResolvedValue({ ...running, status: "failed", error: "SSH tunnel refused" });
+    vi.useFakeTimers();
+    render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
+    await act(async () => {});
+    expect(screen.getByText(/Connecting ·/)).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(screen.getByRole("alert").textContent).toContain("SSH tunnel refused");
+    expect(api.startAttachment).not.toHaveBeenCalled();
+  });
+
+  it("shows preview failures and does not enable Connect", async () => {
+    const api = client();
+    vi.mocked(api.planAttachment).mockRejectedValue(new Error("Use a local development plane"));
+    render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
+    fireEvent.change(screen.getByLabelText("SSH host or IP"), { target: { value: input.target } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Use a local development plane");
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("only exposes Add TPU when FleetPage receives fleet-admin attachment authority", async () => {
+    const props = {
+      cells: [],
+      leases: [],
+      onRefresh: async () => {},
+      loadWarmth: async () => ({ observed_at: "", pools: [] }),
+      loadBilling: async () => ({
+        observed_at: "",
+        accrued_cost: 0,
+        idle_cost: 0,
+        cells: 0,
+        billed_seconds: 0,
+        idle_seconds: 0,
+        unpriced_cells: 0,
+      }),
+      loadLaunchLatency: async () => ({ observed_at: "", pools: [] }),
+    };
+    const view = render(<FleetPage {...props} />);
+    expect(screen.queryByRole("button", { name: "Add TPU" })).toBeNull();
+    view.rerender(<FleetPage {...props} attachmentClient={client()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add TPU" }));
+    expect(screen.getByRole("dialog", { name: "Add TPU" })).toBeTruthy();
+    await act(async () => {});
+  });
+});

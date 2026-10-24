@@ -3,9 +3,10 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Cpu, Gauge, Layers, MapPin, MinusCircle, Network, RefreshCw, Timer } from "lucide-react";
+import { AlertTriangle, Cpu, Gauge, Layers, MapPin, MinusCircle, Network, Plus, RefreshCw, Timer } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
+import { AddTpuModal, type AttachmentClient } from "../components/AddTpuModal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
@@ -41,6 +42,8 @@ interface FleetPageProps {
   /** The pools registered for this scope, running or not. */
   loadPools?: (signal: AbortSignal) => Promise<CapacityPoolSummary[]>;
   refreshRevision?: number;
+  /** Only supplied to fleet administrators; the server also enforces local-only access. */
+  attachmentClient?: AttachmentClient;
 }
 
 export function FleetPage({
@@ -54,7 +57,9 @@ export function FleetPage({
   loadLaunchLatency,
   onDrainCell,
   refreshRevision = 0,
+  attachmentClient,
 }: FleetPageProps) {
+  const [addingTpu, setAddingTpu] = useState(false);
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
@@ -194,12 +199,30 @@ export function FleetPage({
     return [...grouped.values()].sort((left, right) => left.name.localeCompare(right.name));
   }, [pools]);
 
+  // Pools actually holding capacity come first (most held first), then A-Z, so
+  // the hundreds of generated zero-floor pools never bury the ones that cost money.
+  const warmPools = useMemo(
+    () =>
+      [...(warmth?.pools ?? [])].sort(
+        (left, right) =>
+          right.warm_cells - left.warm_cells || right.floor - left.floor || left.pool_id.localeCompare(right.pool_id),
+      ),
+    [warmth],
+  );
   const warmHourlyCost = (warmth?.pools ?? []).reduce((total, pool) => total + pool.hourly_cost, 0);
   const unpriced = (billing?.unpriced_cells ?? 0) > 0;
   const everyCellUnpriced = billing !== null && billing.cells > 0 && billing.unpriced_cells >= billing.cells;
 
   return (
     <div className="page-stack">
+      {attachmentClient && (
+        <AddTpuModal
+          open={addingTpu}
+          client={attachmentClient}
+          onClose={() => setAddingTpu(false)}
+          onConnected={onRefresh}
+        />
+      )}
       <section className="metric-grid metric-grid-four" aria-label="Fleet metrics">
         <MetricCard
           label="Cells online"
@@ -276,7 +299,7 @@ export function FleetPage({
         )}
         {warmth && warmth.pools.length > 0 && (
           <dl className="definition-grid">
-            {warmth.pools.map((pool) => (
+            {warmPools.map((pool) => (
               <div key={pool.pool_id}>
                 <dt className="monospace">{pool.pool_id}</dt>
                 <dd>
@@ -451,15 +474,22 @@ export function FleetPage({
             <h2>Fleet topology</h2>
             <p>Scheduling cells grouped by failure region</p>
           </div>
-          <button
-            className="button button-ghost"
-            type="button"
-            disabled={refreshing}
-            onClick={() => void refreshInventory()}
-          >
-            <RefreshCw className={refreshing ? "spin" : undefined} size={16} aria-hidden="true" />
-            {refreshing ? "Refreshing" : "Refresh inventory"}
-          </button>
+          <div className="attachment-actions">
+            {attachmentClient && (
+              <button className="button button-primary" type="button" onClick={() => setAddingTpu(true)}>
+                <Plus size={16} aria-hidden="true" /> Add TPU
+              </button>
+            )}
+            <button
+              className="button button-ghost"
+              type="button"
+              disabled={refreshing}
+              onClick={() => void refreshInventory()}
+            >
+              <RefreshCw className={refreshing ? "spin" : undefined} size={16} aria-hidden="true" />
+              {refreshing ? "Refreshing" : "Refresh inventory"}
+            </button>
+          </div>
         </div>
         {refreshError && (
           <div className="inline-error" role="alert">

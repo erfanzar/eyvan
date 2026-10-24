@@ -453,6 +453,68 @@
         "title": "ArtifactUsage",
         "type": "object"
       },
+      "AttachmentRequest": {
+        "additionalProperties": false,
+        "description": "Closed, credential-free inputs accepted by the attachment CLI.",
+        "properties": {
+          "fleet": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fleet"
+          },
+          "kind": {
+            "default": "ssh",
+            "enum": [
+              "ssh",
+              "tpu"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "target": {
+            "maxLength": 320,
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          },
+          "zone": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zone"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "title": "AttachmentRequest",
+        "type": "object"
+      },
       "AuditEvent": {
         "additionalProperties": false,
         "description": "Immutable, ordered audit event emitted by a committed transaction.",
@@ -9310,6 +9372,162 @@
         "summary": "Upload Workspace Artifact",
         "tags": [
           "artifacts"
+        ]
+      }
+    },
+    "/api/v1/attachments": {
+      "get": {
+        "description": "List recent local attachment jobs with their progress and terminal result.",
+        "operationId": "recent_attachments_api_v1_attachments_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recent Attachments Api V1 Attachments Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Recent Attachments",
+        "tags": [
+          "attachments"
+        ]
+      },
+      "post": {
+        "description": "Start a durable detached CLI job that survives local plane redeployment.",
+        "operationId": "start_attachment_api_v1_attachments_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Attachment Api V1 Attachments Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Attachment",
+        "tags": [
+          "attachments"
+        ]
+      }
+    },
+    "/api/v1/attachments/plan": {
+      "post": {
+        "description": "Preview an existing TPU/SSH attachment without mutating the host or fleet.",
+        "operationId": "attachment_plan_api_v1_attachments_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Attachment Plan Api V1 Attachments Plan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attachment Plan",
+        "tags": [
+          "attachments"
+        ]
+      }
+    },
+    "/api/v1/attachments/{attachment_id}": {
+      "get": {
+        "description": "Read durable progress even after the application process has restarted.",
+        "operationId": "get_attachment_api_v1_attachments__attachment_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attachment_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Attachment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Attachment Api V1 Attachments  Attachment Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Attachment",
+        "tags": [
+          "attachments"
         ]
       }
     },

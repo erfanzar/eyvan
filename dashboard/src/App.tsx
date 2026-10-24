@@ -1207,6 +1207,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadLaunchLatency={loadLaunchLatency}
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
             onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
+            attachmentClient={capabilities.manageFleet ? client : undefined}
             loadPools={loadPools}
             refreshRevision={auxiliaryRefreshRevision}
           />

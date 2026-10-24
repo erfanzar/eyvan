@@ -111,6 +111,7 @@ from eyvan.records import (
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.secrets import MAX_SECRET_BYTES, SecretUnavailable, read_secret
+from eyvan.server.api.attachments import register_attachment_routes
 from eyvan.server.api.auth import (
     DEFAULT_DEVELOPMENT_SCOPE,
     OIDCTokenVerifier,
@@ -775,6 +776,7 @@ def create_app(
     # without one only makes the endpoints answer 404.
     register_dashboard_auth_routes(app, settings=settings, store=dashboard_sessions)
     register_tracking_routes(app, settings=settings, service=service)
+    register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for

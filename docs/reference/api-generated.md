@@ -23,6 +23,10 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/artifacts/results/{result_id}` | Download Result Artifact | 200, 422 |
 | GET | `/api/v1/artifacts/usage` | Artifact Usage | 200, 422 |
 | PUT | `/api/v1/artifacts/workspaces/{digest}` | Upload Workspace Artifact | 200, 422 |
+| GET | `/api/v1/attachments` | Recent Attachments | 200 |
+| POST | `/api/v1/attachments` | Start Attachment | 202, 422 |
+| POST | `/api/v1/attachments/plan` | Attachment Plan | 200, 422 |
+| GET | `/api/v1/attachments/{attachment_id}` | Get Attachment | 200, 422 |
 | POST | `/api/v1/batches` | Submit Batch | 201, 422 |
 | GET | `/api/v1/budgets` | List Budgets | 200, 422 |
 | GET | `/api/v1/budgets/{org_id}/{project_id}` | Get Budget | 200, 422 |

@@ -3,6 +3,36 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+export interface AttachmentInput {
+  target: string;
+  kind: "ssh" | "tpu";
+  fleet: string | null;
+  project: string | null;
+  zone: string | null;
+}
+
+export interface AttachmentPlan {
+  dry_run: true;
+  fleet: string;
+  fleet_path: string;
+  fleet_yaml: string;
+  endpoints: string[];
+  actions: Array<{ step: string; argv: string[]; command?: string; summary: string; mutates: boolean; stdin: boolean }>;
+  limitations: string[];
+  summary: { shape: string | null; hosts: number; capacity_class: string | null; endpoint_mode: string | null };
+}
+
+export interface AttachmentJob {
+  id: string;
+  target: string;
+  status: "running" | "succeeded" | "failed";
+  progress: string[];
+  result: { fleet: string; ready: boolean; cells: unknown[]; submit: string; limitations: string[] } | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
 
 /** Tracker wire types intentionally retain the store's snake_case field names. */

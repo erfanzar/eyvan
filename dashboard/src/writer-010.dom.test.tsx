@@ -194,6 +194,30 @@ describe("Fleet pool listing states", () => {
   });
 });
 
+describe("Warm capacity ordering", () => {
+  it("lists pools holding capacity first, most held first, then A-Z", async () => {
+    const loaders = props();
+    const row = (pool_id: string, held: number, floor = held) => ({
+      pool_id,
+      floor,
+      window_active: false,
+      warm_cells: held,
+      warm_idle_cells: 0,
+      provisioning_cells: 0,
+      hourly_cost: 0,
+    });
+    loaders.loadWarmth.mockResolvedValue({
+      observed_at: "2026-10-01T12:00:00Z",
+      pools: [row("b-zero", 0), row("a-zero", 0), row("z-one", 1), row("m-two", 2), row("c-floor", 0, 1)],
+    });
+    render(<FleetPage {...loaders} />);
+    const panel = screen.getByRole("region", { name: "Warm capacity and cost" });
+    await within(panel).findByText("m-two");
+    const order = Array.from(panel.querySelectorAll("dt")).map((node) => node.textContent);
+    expect(order).toEqual(["m-two", "z-one", "c-floor", "a-zero", "b-zero"]);
+  });
+});
+
 describe("Fleet unknown-price contract", () => {
   it("shows fully unpriced capacity as not costed while retaining measured hours", async () => {
     const loaders = props();

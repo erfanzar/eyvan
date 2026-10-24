@@ -3503,6 +3503,65 @@ code,
   padding: 0 12px;
 }
 
+/* Local attachment: restrained facts, numbered steps and a durable log tail. */
+.attachment-actions,
+.attachment-snippet,
+.attachment-advanced {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.attachment-advanced {
+  margin: 14px 0;
+  font-size: var(--text-xs);
+}
+.attachment-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+.attachment-facts dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+.attachment-facts dd {
+  margin: 4px 0 0;
+  font-family: var(--mono);
+}
+.attachment-steps {
+  padding-left: 24px;
+}
+.attachment-steps li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.attachment-steps li span,
+.attachment-steps li small {
+  display: block;
+}
+.attachment-steps li small {
+  color: var(--text-muted);
+}
+.attachment-progress {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+.attachment-snippet {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 10px;
+  border: 1px solid var(--border);
+}
+
 /* Base tracks precede the tablet and phone overrides below. */
 .stage-pipeline {
   display: grid;

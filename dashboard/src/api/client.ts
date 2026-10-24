@@ -5,6 +5,9 @@
 
 import {
   cloneMock,
+  createMockAttachment,
+  mockAttachmentJobs,
+  mockAttachmentPlan,
   createMockWorkload,
   getMockWorkload,
   getMockRun,
@@ -40,6 +43,9 @@ import {
 } from "../auth/oidc";
 import { EventStreamHttpError, followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
+  AttachmentInput,
+  AttachmentJob,
+  AttachmentPlan,
   AuditEvent,
   AvailableShape,
   BillingReport,
@@ -651,6 +657,41 @@ export class EyvanApiClient {
 
   private request<T>(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<T> {
     return this.requestBody(path, init, timeoutMs, async (response) => (await response.json()) as T);
+  }
+
+  private attachmentRequest<T>(path: string, init: RequestInit = {}, timeoutMs?: number): Promise<T> {
+    // Public literal paths keep the browser route inventory auditable; the
+    // shared requester still applies the configured API base and auth headers.
+    return this.request<T>(path.replace(/^\/api\/v1/, ""), init, timeoutMs);
+  }
+
+  async planAttachment(input: AttachmentInput, signal?: AbortSignal): Promise<AttachmentPlan> {
+    if (this.forceDemo) return cloneMock(mockAttachmentPlan(input));
+    return this.attachmentRequest(
+      "/api/v1/attachments/plan",
+      { method: "POST", body: JSON.stringify(input), signal },
+      130_000,
+    );
+  }
+
+  async startAttachment(input: AttachmentInput): Promise<AttachmentJob> {
+    if (this.forceDemo) return createMockAttachment(input);
+    return this.attachmentRequest("/api/v1/attachments", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  async getAttachment(id: string, signal?: AbortSignal): Promise<AttachmentJob> {
+    if (this.forceDemo) {
+      const job = mockAttachmentJobs.find((candidate) => candidate.id === id);
+      if (!job) throw new ApiError("Attachment not found", 404);
+      return cloneMock(job);
+    }
+    return this.attachmentRequest(`/api/v1/attachments/${encodeURIComponent(id)}`, { signal });
+  }
+
+  async listAttachments(signal?: AbortSignal): Promise<AttachmentJob[]> {
+    if (this.forceDemo) return cloneMock(mockAttachmentJobs);
+    const response = await this.attachmentRequest<{ jobs: AttachmentJob[] }>("/api/v1/attachments", { signal });
+    return response.jobs;
   }
 
   private requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {

@@ -67,6 +67,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_SECRET_COUNT` | `eyvan` |
 | `EYVAN_TLS_CERT_FILE` | `eyvan` |
 | `EYVAN_TLS_KEY_FILE` | `eyvan` |
+| `EYVAN_TOKEN` | `eyvan` |
 | `EYVAN_TRACKER_TOKEN` | `eyvan` |
 | `EYVAN_TRACKING_URI` | `eyvan` |
 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | `eyvan` |
@@ -169,7 +170,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_ORG` | `eyvan/sdk` |
 | `EYVAN_PROJECT` | `eyvan/sdk` |
 | `EYVAN_ROLE` | `eyvan/sdk` |
-| `EYVAN_TOKEN` | `eyvan/sdk` |
 | `EYVAN_URL` | `eyvan/sdk` |
 | `EYVAN_SOAK_PROOF_ID` | `eyvan/sdk/commands` |
 | `EYVAN_DASHBOARD_API` | `eyvan/sdk/commands/dashboard` |

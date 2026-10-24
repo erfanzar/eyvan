@@ -57,6 +57,10 @@ BROWSER_ROUTES: dict[str, str] = {
     "GET /api/v1/dashboard/auth/callback": "the provider redirects the browser here; the server completes the exchange",
     "POST /api/v1/dashboard/auth/logout": "dashboard/src/auth/oidc.ts logout drops the HttpOnly session cookie",
     "GET /api/v1/session": "dashboard/src/api/client.ts resolves effective durable authority and project scopes",
+    "POST /api/v1/attachments/plan": "dashboard/src/components/AddTpuModal.tsx previews local CLI attachment steps",
+    "POST /api/v1/attachments": "dashboard/src/components/AddTpuModal.tsx starts a durable local attachment",
+    "GET /api/v1/attachments": "dashboard/src/components/AddTpuModal.tsx recovers recent local jobs",
+    "GET /api/v1/attachments/{}": "dashboard/src/components/AddTpuModal.tsx polls durable attachment progress",
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.
@@ -262,7 +266,7 @@ def test_a_browser_route_is_reached_by_the_dashboard(route: str, caller: str) ->
 
     source = (pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "src").rglob("*.ts*")
     path = route.split(" ", 1)[1]
-    assert any(path in file.read_text(encoding="utf-8") for file in source), (
+    assert any(path in re.sub(r"\$\{[^}]*\}", "{}", file.read_text(encoding="utf-8")) for file in source), (
         f"{route} is exempted because {caller} reaches it, and no dashboard source requests it"
     )
 

@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type {
+  AttachmentInput,
+  AttachmentJob,
+  AttachmentPlan,
   AuditEvent,
   AvailableShape,
   Budget,
@@ -42,6 +45,40 @@ import type {
   WorkloadDetail,
   WorkloadSummary,
 } from "../types";
+
+export function mockAttachmentPlan(input: AttachmentInput): AttachmentPlan {
+  return {
+    dry_run: true,
+    fleet: input.fleet || "tpu-demo",
+    fleet_path: "~/.eyvan/fleets/tpu-demo.yaml",
+    fleet_yaml: "",
+    endpoints: ["http://127.0.0.1:18001", "http://127.0.0.1:18002"],
+    actions: [
+      { step: "install", argv: [], summary: "Install the Eyvan worker on 2 hosts", mutates: true, stdin: true },
+      { step: "apply", argv: [], summary: "Register the existing TPU as a fleet", mutates: true, stdin: false },
+    ],
+    limitations: ["Demo only: no machine is contacted or changed."],
+    summary: { shape: "v5p-8", hosts: 2, capacity_class: "spot", endpoint_mode: "tunnel" },
+  };
+}
+
+export const mockAttachmentJobs: AttachmentJob[] = [];
+
+export function createMockAttachment(input: AttachmentInput): AttachmentJob {
+  const fleet = input.fleet || "tpu-demo";
+  const job: AttachmentJob = {
+    id: `demo-${Date.now()}`,
+    target: input.target,
+    status: "succeeded",
+    progress: ["Demo: worker installation simulated", "Demo: fleet registration simulated"],
+    result: { fleet, ready: true, cells: [], submit: `init(fleet="${fleet}")`, limitations: [] },
+    error: null,
+    started_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+  mockAttachmentJobs.unshift(job);
+  return cloneMock(job);
+}
 
 export const mockWorkloads: WorkloadSummary[] = [
   {
