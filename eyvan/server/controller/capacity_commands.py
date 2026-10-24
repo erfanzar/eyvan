@@ -15,6 +15,7 @@ from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
     CapacityStatus,
 )
+from eyvan.capacity.drivers.base import provision_outcome
 from eyvan.domain import (
     ProvisionOutcome,
 )
@@ -189,8 +190,13 @@ class _ControllerCapacityCommands:
             availability = cell.availability
         else:
             state = CellState.UNAVAILABLE
+            # A successful observation can still report a provider loss, notably
+            # an attached Spot TPU reclaimed between connect and the first apply.
+            # Keep the historical fallback for older agents without a typed reason.
             outcome = (
-                ProvisionOutcome.QUOTA_ERROR
+                provision_outcome(observation.failure_code, remote_state)
+                if observation.failure_code is not None
+                else ProvisionOutcome.QUOTA_ERROR
                 if remote_state is CapacityStatus.HALTED_QUOTA
                 else ProvisionOutcome.STOCKOUT
             )
@@ -218,7 +224,7 @@ class _ControllerCapacityCommands:
                         update={
                             "state": state,
                             "provider_phase": remote_state,
-                            "provider_failure_code": None,
+                            "provider_failure_code": observation.failure_code,
                             "observed_tpu_vms": observation.observed_tpu_vms,
                             "runtime_process_count": (
                                 observation.runtime_process_count

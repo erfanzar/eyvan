@@ -142,6 +142,7 @@ def test_registry_exposes_every_backend_including_manual() -> None:
         "azure",
         "azure-vm",
         "gcp",
+        "gcp-attach",
         "gcp-compute",
         "gcp-tpu",
         "k8s",

@@ -207,7 +207,9 @@ Registered capacity backends: `local` (loopback laptop fleets), `gcp-tpu`
 (generated zone fleets driving TPU queued resources, spot or on-demand),
 `gcp-compute`, the `gcp` umbrella, `aws-ec2` (the worked provider example)
 and the `aws` umbrella, `azure-vm` and the `azure` umbrella, `kubernetes`
-(`k8s`) against a real API server, `manual`, and `onprem-ssh`.
+(`k8s`) against a real API server, `manual`, `onprem-ssh`, and `gcp-attach`
+(an existing Cloud TPU VM attached with `eyvan gcp connect`; observed, never
+created or deleted).
 
 Breadth and qualification are different axes. Kubernetes runs on any
 conformant cluster but its evidence is one GKE run (P7); the on-premises

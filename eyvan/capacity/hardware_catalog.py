@@ -564,11 +564,11 @@ def validate_accelerator_write_boundary(
     normalized_provider = provider.strip().lower()
     normalized_backend = (capacity_backend or "").strip().lower().replace("_", "-")
     normalized_type = accelerator_type.strip().lower() if accelerator_type is not None else None
-    gcp_backends = {"gcp", "gcp-tpu", "tpu", "gcp-compute", "compute"}
+    gcp_backends = {"gcp", "gcp-tpu", "gcp-attach", "tpu", "gcp-compute", "compute"}
     if normalized_backend in gcp_backends and normalized_provider != "gcp":
         raise ValueError(f"{boundary} capacity_backend {capacity_backend!r} requires provider 'gcp', not {provider!r}")
     type_declares_accelerator = normalized_type not in {None, "cpu"}
-    backend_declares_tpu = normalized_backend in {"gcp-tpu", "tpu"}
+    backend_declares_tpu = normalized_backend in {"gcp-tpu", "gcp-attach", "tpu"}
     vector_declares_accelerator = any(
         amount > 0 for resources in (capacity, allocatable) for amount in (resources.gpu, resources.tpu)
     )
@@ -608,7 +608,7 @@ def validate_accelerator_write_boundary(
                 f"{boundary} accelerator_type {accelerator_type!r} is a {expected_kind} type, "
                 f"but capacity and allocatable advertise {kind}"
             )
-        if normalized_backend in {"gcp-tpu", "tpu"} and kind != "tpu":
+        if normalized_backend in {"gcp-tpu", "gcp-attach", "tpu"} and kind != "tpu":
             raise ValueError(f"{boundary} capacity_backend {capacity_backend!r} requires tpu resources, not {kind}")
         if normalized_backend in {"gcp-compute", "compute"} and kind == "tpu":
             # Compute-capable when the catalog names a single VM's machine type and

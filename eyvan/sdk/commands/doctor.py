@@ -95,6 +95,7 @@ def _pool_advertises_accelerator(pool: dict[str, JsonValue]) -> bool:
     capacity_backend = pool.get("capacity_backend")
     if isinstance(capacity_backend, str) and capacity_backend.strip().lower().replace("_", "-") in {
         "gcp-tpu",
+        "gcp-attach",
         "tpu",
     }:
         return True

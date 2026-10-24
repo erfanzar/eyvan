@@ -1022,7 +1022,14 @@ def requires_native_gcp_runtime(config: EyvanFleetConfig) -> bool:
         executor = canonical_execution_backend(node_type.executor or config.executor)
         capacity_backend = (node_type.capacity_backend or node_type.default_capacity_backend).strip().lower()
         capacity_backend = capacity_backend.replace("_", "-")
-        if executor == "eyvan-native" and capacity_backend in {"gcp", "gcp-compute", "gcp-tpu", "compute", "tpu"}:
+        if executor == "eyvan-native" and capacity_backend in {
+            "gcp",
+            "gcp-compute",
+            "gcp-tpu",
+            "gcp-attach",
+            "compute",
+            "tpu",
+        }:
             return True
     return False
 

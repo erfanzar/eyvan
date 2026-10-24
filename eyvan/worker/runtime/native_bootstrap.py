@@ -282,7 +282,8 @@ def build_native_worker_startup_script(
     package: str,
     port: int,
     state_dir: str,
-    worker_secret_resource: str,
+    worker_secret_resource: str | None = None,
+    worker_secret_file: str | None = None,
     worker_tls_secret_resource: str | None = None,
     package_sha256: str | None = None,
     package_generation: str | None = None,
@@ -306,6 +307,11 @@ def build_native_worker_startup_script(
     engine preflight intentionally runs after setup so fleet init commands can
     install or configure the engine.
 
+    ``worker_secret_file`` opts into a pre-delivered persistent root-only
+    credential file instead of Secret Manager. Each systemd start copies it
+    into the private RuntimeDirectory. The caller owns secure delivery; the
+    default Secret Manager rendering is unchanged.
+
     ``runtime_python`` builds the worker virtual environment on a named
     interpreter instead of the image's ``python3``. A serialized callable is
     pinned to the interpreter that pickled it, and a TPU image ships whatever
@@ -324,7 +330,15 @@ def build_native_worker_startup_script(
 
     package = _required(package, "package")
     state_dir = _required(state_dir, "state directory")
-    worker_secret_resource = _required(worker_secret_resource, "secret resource")
+    if (worker_secret_resource is None) == (worker_secret_file is None):
+        raise ValueError("native worker requires exactly one secret resource or secret file")
+    if worker_secret_resource is not None:
+        worker_secret_resource = _required(worker_secret_resource, "secret resource")
+    if worker_secret_file is not None:
+        worker_secret_file = _required(worker_secret_file, "secret file")
+        secret_source = PurePosixPath(worker_secret_file)
+        if not secret_source.is_absolute() or ".." in secret_source.parts or str(secret_source) == "/":
+            raise ValueError("native worker secret file must be an absolute non-root path without '..'")
     if runtime_python is not None:
         match = _DECLARED_PYTHON_MAJOR_MINOR.match(runtime_python)
         if match is not None and not (3, 11) <= tuple(map(int, match.group(0).split("."))) < (3, 14):
@@ -480,15 +494,21 @@ def build_native_worker_startup_script(
         command_parts.extend(("--container-runtime-file", shlex.quote(_WORKLOAD_CONTAINER_RUNTIME)))
     command_parts.append("--systemd-transient")
     command = " ".join(command_parts)
-    fetch_secret = " ".join(
-        (
-            "umask 077;",
-            "gcloud secrets versions access",
-            shlex.quote(worker_secret_resource),
-            ">",
-            shlex.quote(secret_path),
+    if worker_secret_file is not None:
+        # Keep a root-only persistent source across RuntimeDirectory cleanup/reboots.
+        # The caller writes it over SSH stdin; neither the unit nor argv holds a token.
+        fetch_secret = f"install -o root -g root -m 0600 {shlex.quote(worker_secret_file)} {shlex.quote(secret_path)}"
+    else:
+        assert worker_secret_resource is not None
+        fetch_secret = " ".join(
+            (
+                "umask 077;",
+                "gcloud secrets versions access",
+                shlex.quote(worker_secret_resource),
+                ">",
+                shlex.quote(secret_path),
+            )
         )
-    )
     unit = "\n".join(
         (
             "[Unit]",
@@ -530,10 +550,19 @@ def build_native_worker_startup_script(
             "",
             "export DEBIAN_FRONTEND=noninteractive",
             "mkdir -p /var/lib/eyvan/bootstrap",
-            "if ! command -v gcloud >/dev/null 2>&1; then",
-            "  echo 'Eyvan native worker requires gcloud in the VM image' >&2",
-            "  exit 1",
-            "fi",
+            *(
+                (
+                    "if ! command -v gcloud >/dev/null 2>&1; then",
+                    "  echo 'Eyvan native worker requires gcloud in the VM image' >&2",
+                    "  exit 1",
+                    "fi",
+                )
+                if worker_secret_file is None
+                or package.startswith("gs://")
+                or wheelhouse is not None
+                or worker_tls_secret_resource is not None
+                else ()
+            ),
             "if ! command -v systemd-run >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then",
             "  echo 'Eyvan native worker requires systemd-run and systemctl in the VM image' >&2",
             "  exit 1",

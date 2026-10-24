@@ -30,6 +30,7 @@ from eyvan.sdk.commands.demo import register_demo_commands
 from eyvan.sdk.commands.doctor import register_doctor_commands
 from eyvan.sdk.commands.federation import register_federation_commands
 from eyvan.sdk.commands.fleets import register_fleet_commands
+from eyvan.sdk.commands.gcp import register_gcp_commands
 from eyvan.sdk.commands.governance import register_governance_commands
 from eyvan.sdk.commands.head import register_head_commands
 from eyvan.sdk.commands.http import EyvanApiError, EyvanClient
@@ -149,6 +150,7 @@ for register_commands in (
     register_demo_commands,
     register_doctor_commands,
     register_fleet_commands,
+    register_gcp_commands,
     register_head_commands,
     register_workload_commands,
     register_operation_commands,

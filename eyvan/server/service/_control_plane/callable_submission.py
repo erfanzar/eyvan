@@ -381,7 +381,7 @@ class CallableSubmissionMixin:
     @staticmethod
     def _is_complete_tpu_pool(pool: CapacityPoolRecord) -> bool:
         kind = pool.labels.get("eyvan_resource_kind")
-        declared_tpu = kind == "tpu" if kind is not None else pool.capacity_backend == "gcp-tpu"
+        declared_tpu = kind == "tpu" if kind is not None else pool.capacity_backend in {"gcp-tpu", "gcp-attach"}
         return declared_tpu and pool.allocatable.tpu > 0 and pool.allocatable.gpu == 0
 
     @staticmethod

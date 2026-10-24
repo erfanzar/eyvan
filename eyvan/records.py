@@ -1841,7 +1841,7 @@ class CellRecord(EyvanModel):
             raise ValueError("native runtime configuration requires executor eyvan-native")
         if self.provider == "gcp" and not (self.provider_project and self.zone):
             raise ValueError("GCP cells require provider_project and zone")
-        if self.capacity_backend == "gcp-tpu" and not self.accelerator_type:
+        if self.capacity_backend in {"gcp-tpu", "gcp-attach"} and not self.accelerator_type:
             raise ValueError("GCP TPU cells require accelerator_type")
         tpu_backend = self.capacity_backend in {"gcp-tpu", "tpu"}
         if tpu_backend:

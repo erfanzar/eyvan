@@ -2007,6 +2007,8 @@ class GcpCapacityDriver:
         "tpu": "tpu",
         "gcp-compute": "compute",
         "compute": "compute",
+        "gcp-attach": "attach",
+        "attach": "attach",
     }
 
     def __init__(
@@ -2031,7 +2033,10 @@ class GcpCapacityDriver:
         native_worker_artifact_access: NativeWorkerArtifactAccessStore | None = None,
         native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
         mode: str = "auto",
+        attach_api: tp.Any = None,
     ) -> None:
+        from eyvan.capacity.drivers.gcp_attach import GcpAttachCapacityDriver
+
         settings = EyvanSettings.from_env()
         self.state = state or FleetStateStore.from_uri(settings.fleet_state_uri)
         normalized_mode = mode.strip().lower().replace("_", "-")
@@ -2079,7 +2084,12 @@ class GcpCapacityDriver:
             native_worker_artifact_access=native_worker_artifact_access,
             native_worker_public_ingress=native_worker_public_ingress,
         )
-        self.execution_backend = self.tpu.execution_backend
+        self.attach = GcpAttachCapacityDriver(
+            self.state,
+            api=attach_api,
+            native_worker_port=native_worker_port if native_worker_port is not None else settings.native_worker_port,
+        )
+        self.execution_backend = self.attach.execution_backend if self.mode == "attach" else self.tpu.execution_backend
         # Delegated rather than re-read: a router that disagreed with the
         # driver it routes to would admit exec the backend then refuses.
         self.supports_exec = self.tpu.supports_exec
@@ -2089,8 +2099,10 @@ class GcpCapacityDriver:
             return self.tpu.capabilities()
         if self.mode == "compute":
             return self.compute.capabilities()
-        # Only "auto" reaches here: both pinned modes returned above.
-        backends = ("gcp", "gcp-tpu", "gcp-compute", "tpu", "compute")
+        if self.mode == "attach":
+            return self.attach.capabilities()
+        # Only "auto" reaches here: the pinned modes returned above.
+        backends = ("gcp", "gcp-tpu", "gcp-compute", "gcp-attach", "tpu", "compute")
         return CellCapabilities(
             provider="gcp",
             executor=self.execution_backend,
@@ -2123,6 +2135,8 @@ class GcpCapacityDriver:
         requested_backend = (backend_value or "gcp").strip().lower().replace("_", "-")
         if requested_backend in {"gcp-tpu", "tpu"}:
             selected = "tpu"
+        elif requested_backend == "gcp-attach":
+            selected = "attach"
         elif requested_backend in {"gcp-compute", "compute"}:
             selected = "compute"
         elif requested_backend != "gcp":
@@ -2179,9 +2193,12 @@ class GcpCapacityDriver:
             return self.mode
         record = self.state.get(cell_id)
         if record is None:
+            tombstone = self.state.cell_tombstone(cell_id)
+            if tombstone is not None and tombstone.get("capacity_kind") == "attach":
+                return "attach"
             return "tpu"
         kind = record.metadata.get("capacity_kind")
-        if kind in {"tpu", "compute"}:
+        if kind in {"tpu", "compute", "attach"}:
             return str(kind)
         backend = record.metadata.get("capacity_backend")
         if isinstance(backend, str) and len(backend.strip()) > 0:
@@ -2190,13 +2207,17 @@ class GcpCapacityDriver:
                 return "compute"
             if normalized == "gcp-tpu":
                 return "tpu"
+            if normalized == "gcp-attach":
+                return "attach"
         if "compute_config" in record.metadata:
             return "compute"
         if "tpu_config" in record.metadata:
             return "tpu"
         return "tpu"
 
-    def _driver(self, kind: str) -> GcpTpuCapacityDriver:
+    def _driver(self, kind: str) -> tp.Any:
+        if kind == "attach":
+            return self.attach
         return self.compute if kind == "compute" else self.tpu
 
     def observe(self, cell_id: str) -> CellObservation:

@@ -60,6 +60,7 @@ def capacity_backend_agent_family(name: str) -> str:
     families = {
         "gcp": "gcp",
         "gcp-tpu": "gcp",
+        "gcp-attach": "gcp",
         "tpu": "gcp",
         "gcp-compute": "gcp",
         "compute": "gcp",
