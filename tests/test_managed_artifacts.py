@@ -1537,6 +1537,88 @@ def test_gcs_store_uses_conditional_create_and_returns_the_stable_generation() -
         store.put(uri, b"changed", org_id="acme", project_id="research")
 
 
+class _CountingTokens:
+    """An ambient credential source that hands out a new token per call."""
+
+    def __init__(self) -> None:
+        self.issued: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str:
+        with self._lock:
+            token = f"token-{len(self.issued)}"
+            self.issued.append(token)
+            return token
+
+
+def _store_with_tokens(runner: FakeGcloudRunner, tokens: _CountingTokens, seen: list[str]) -> GCSManagedArtifactStore:
+    def inventory(url: str, *, headers: tp.Mapping[str, str], **kwargs: tp.Any) -> tuple[int, bytes]:
+        seen.append(headers["Authorization"])
+        return runner.inventory(url, headers=headers, **kwargs)
+
+    return GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        runner=runner,
+        inventory_transport=inventory,
+        access_token_provider=tokens,
+    )
+
+
+def test_gcs_store_reuses_one_ambient_token_across_a_write_and_read() -> None:
+    """Each stat used to spawn `gcloud auth print-access-token`: ~4 per write."""
+
+    runner = FakeGcloudRunner()
+    tokens = _CountingTokens()
+    seen: list[str] = []
+    store = _store_with_tokens(runner, tokens, seen)
+    uri = result_uri("token-reuse")
+
+    store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+
+    assert len(seen) >= 4
+    assert tokens.issued == ["token-0"]
+    assert set(seen) == {"Bearer token-0"}
+
+
+def test_gcs_store_refreshes_a_rejected_token_once_and_retries() -> None:
+    runner = FakeGcloudRunner()
+    tokens = _CountingTokens()
+    seen: list[str] = []
+    store = _store_with_tokens(runner, tokens, seen)
+    uri = result_uri("token-refresh")
+    store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    seen.clear()
+
+    runner.inventory_failures.append((401, b'{"error":"provider-secret"}'))
+    metadata = store.stat(uri, org_id="acme", project_id="research")
+
+    assert metadata is not None and metadata.size_bytes == len(b"payload")
+    assert seen == ["Bearer token-0", "Bearer token-1"]
+    # The fresh token is what later requests reuse.
+    store.stat(uri, org_id="acme", project_id="research")
+    assert seen[-1] == "Bearer token-1"
+    assert tokens.issued == ["token-0", "token-1"]
+
+
+def test_gcs_store_reports_a_second_rejection_without_looping() -> None:
+    from eyvan.artifacts.managed import ManagedArtifactInventoryError
+
+    runner = FakeGcloudRunner()
+    tokens = _CountingTokens()
+    seen: list[str] = []
+    store = _store_with_tokens(runner, tokens, seen)
+    runner.inventory_failures.extend([(401, b'{"error":"provider-secret"}')] * 2)
+
+    with pytest.raises(ManagedArtifactInventoryError) as rejected:
+        store.stat(result_uri("token-rejected"), org_id="acme", project_id="research")
+
+    assert str(rejected.value) == "GCS inventory request failed with HTTP status 401"
+    assert "provider-secret" not in str(rejected.value)
+    assert len(seen) == 2
+    assert tokens.issued == ["token-0", "token-1"]
+
+
 def test_gcs_cp_timeout_after_commit_is_resolved_by_an_exact_digest_read() -> None:
     runner = FakeGcloudRunner()
     runner.cp_timeout_after_commit = True

@@ -21,6 +21,7 @@ import re
 import stat as stat_module
 import subprocess
 import tempfile
+import threading
 import time
 import typing as tp
 from dataclasses import dataclass, field
@@ -136,6 +137,11 @@ _GCS_INVENTORY_TIMEOUT_SECONDS = 30.0
 _GCS_ACCESS_TOKEN_TIMEOUT_SECONDS = 10.0
 _GCS_METADATA_TOKEN_TIMEOUT_SECONDS = 2.0
 _GCS_TRANSFER_TIMEOUT_SECONDS = 30.0
+#: How long one ambient access token is reused. Far inside the hour Google
+#: issues them for, and a 401 drops it sooner.
+_GCS_ACCESS_TOKEN_REUSE_SECONDS = 300.0
+#: Sentinel for a 401 answer, distinct from ``None`` (an absent object).
+_GCS_UNAUTHORIZED = object()
 _GCS_METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 _MAX_INVENTORY_CURSOR_BYTES = 512
 _MAX_GCS_ACCESS_TOKEN_BYTES = 16 * 1024
@@ -2892,6 +2898,12 @@ class GCSManagedArtifactStore:
         self._inventory_transport = inventory_transport
         self._access_token_provider = access_token_provider
         self._inventory_timeout_seconds = float(inventory_timeout_seconds)
+        # The ambient provider spawns `gcloud auth print-access-token` (~0.3 s),
+        # and one immutable write stats its object about four times -- so every
+        # archived rank paid over a second just for credentials, eight at once.
+        # A token is reused for a bounded window and dropped on the first 401.
+        self._token_lock = threading.Lock()
+        self._cached_token: tuple[str, float] | None = None
 
     def _run_gcloud(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Run one transfer command with a production deadline.
@@ -3165,6 +3177,20 @@ class GCSManagedArtifactStore:
         return url
 
     def _access_token(self) -> str:
+        with self._token_lock:
+            now = time.monotonic()
+            if self._cached_token is not None and self._cached_token[1] > now:
+                return self._cached_token[0]
+            token = self._fresh_access_token()
+            self._cached_token = (token, now + _GCS_ACCESS_TOKEN_REUSE_SECONDS)
+            return token
+
+    def _forget_access_token(self, token: str) -> None:
+        with self._token_lock:
+            if self._cached_token is not None and self._cached_token[0] == token:
+                self._cached_token = None
+
+    def _fresh_access_token(self) -> str:
         try:
             token = self._access_token_provider()
         except Exception:
@@ -3188,6 +3214,19 @@ class GCSManagedArtifactStore:
 
     def _request_inventory_json(self, url: str, *, absent_on_not_found: bool = False) -> bytes | None:
         token = self._access_token()
+        payload = self._request_inventory_json_once(url, token, absent_on_not_found=absent_on_not_found)
+        if payload is _GCS_UNAUTHORIZED:
+            # A reused token can expire or be revoked inside its window. Drop it
+            # and ask once more with a fresh one; a second 401 is the answer.
+            self._forget_access_token(token)
+            payload = self._request_inventory_json_once(
+                url, self._access_token(), absent_on_not_found=absent_on_not_found
+            )
+            if payload is _GCS_UNAUTHORIZED:
+                raise ManagedArtifactInventoryError("GCS inventory request failed with HTTP status 401")
+        return tp.cast("bytes | None", payload)
+
+    def _request_inventory_json_once(self, url: str, token: str, *, absent_on_not_found: bool) -> object:
         try:
             response = self._inventory_transport(
                 url,
@@ -3214,6 +3253,8 @@ class GCSManagedArtifactStore:
             raise ManagedArtifactInventoryError("GCS inventory response exceeded the bounded body size")
         if absent_on_not_found and status_code == 404:
             return None
+        if status_code == 401:
+            return _GCS_UNAUTHORIZED
         if status_code != 200:
             # The status is useful and bounded. Provider bodies and URLs may
             # contain secrets, tenant identifiers, or attacker-controlled text.
