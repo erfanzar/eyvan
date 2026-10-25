@@ -1777,6 +1777,183 @@ def test_a_json_upload_retries_a_rejected_token_once() -> None:
     assert _gcloud_verbs(runner) == []
 
 
+class _JsonDownloads:
+    """A generation-pinned JSON API media endpoint backed by the fake runner's objects."""
+
+    def __init__(self, runner: FakeGcloudRunner) -> None:
+        self.runner = runner
+        self.calls: list[tuple[str, str]] = []
+        self.answers: list[tuple[int, dict[str, str], bytes] | Exception] = []
+        self.drop_headers: set[str] = set()
+        self.override_headers: dict[str, str] = {}
+        self.corrupt_body = False
+
+    def __call__(
+        self, url: str, *, headers: tp.Mapping[str, str], timeout_seconds: float
+    ) -> tuple[int, dict[str, str], bytes]:
+        del timeout_seconds
+        self.calls.append((url, headers["Authorization"]))
+        if self.answers:
+            answer = self.answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query)
+        assert query["alt"] == ["media"]
+        encoded_bucket, _separator, encoded_name = parsed.path.partition("/o/")
+        uri = f"gs://{unquote(encoded_bucket.rsplit('/b/', 1)[1])}/{unquote(encoded_name)}"
+        with self.runner._lock:
+            current = self.runner.objects.get(uri)
+        if current is None:
+            return 404, {}, b'{"error":"provider-secret"}'
+        payload, generation = current
+        if query["ifGenerationMatch"] != [str(generation)]:
+            return 412, {}, b'{"error":"provider-secret"}'
+        response_headers = {
+            "x-goog-generation": str(generation),
+            "x-goog-stored-content-length": str(len(payload)),
+            "x-goog-stored-content-encoding": "identity",
+            "x-goog-hash": f"crc32c=AAAAAA==,md5={base64.b64encode(hashlib.md5(payload).digest()).decode()}",
+        }
+        for name in self.drop_headers:
+            response_headers.pop(name, None)
+        response_headers.update(self.override_headers)
+        return 200, response_headers, (payload + b"!" if self.corrupt_body else payload)
+
+
+def _json_read_store(runner: FakeGcloudRunner) -> tuple[GCSManagedArtifactStore, _JsonDownloads]:
+    downloads = _JsonDownloads(runner)
+    store = GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        runner=runner,
+        inventory_transport=runner.inventory,
+        access_token_provider=lambda: "fake-access-token",
+        download_transport=downloads,
+    )
+    return store, downloads
+
+
+def test_an_exact_read_is_one_generation_pinned_request() -> None:
+    """The stat / `gcloud storage cat` / stat sandwich cost seconds per archived rank."""
+
+    runner = FakeGcloudRunner()
+    store, downloads = _json_read_store(runner)
+    uri = result_uri("json-read")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.calls.clear()
+    runner.inventory_calls.clear()
+    downloads.calls.clear()  # the write verified itself through the same read path
+
+    read = store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+    assert read.payload == b"payload"
+    assert read.metadata == written.metadata
+    assert read.metadata.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert len(downloads.calls) == 1
+    assert _gcloud_verbs(runner) == []  # no cat
+    assert runner.inventory_calls == []  # no stats
+
+
+@pytest.mark.parametrize(
+    "disagreement",
+    ["no-md5", "wrong-md5", "no-length", "wrong-length", "wrong-generation", "gzip", "body", "error", "timeout"],
+)
+def test_an_exact_read_the_response_does_not_prove_falls_back_to_the_sandwich(disagreement: str) -> None:
+    runner = FakeGcloudRunner()
+    store, downloads = _json_read_store(runner)
+    uri = result_uri(f"json-read-{disagreement}")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.calls.clear()
+    if disagreement == "no-md5":
+        downloads.override_headers["x-goog-hash"] = "crc32c=AAAAAA=="
+    elif disagreement == "wrong-md5":
+        downloads.override_headers["x-goog-hash"] = f"md5={base64.b64encode(b'0' * 16).decode()}"
+    elif disagreement == "no-length":
+        downloads.drop_headers.add("x-goog-stored-content-length")
+    elif disagreement == "wrong-length":
+        downloads.override_headers["x-goog-stored-content-length"] = "999"
+    elif disagreement == "wrong-generation":
+        downloads.override_headers["x-goog-generation"] = "1"
+    elif disagreement == "gzip":
+        downloads.override_headers["x-goog-stored-content-encoding"] = "gzip"
+    elif disagreement == "body":
+        downloads.corrupt_body = True
+    elif disagreement == "error":
+        downloads.answers.append((503, {}, b'{"error":"provider-secret"}'))
+    else:
+        downloads.answers.append(TimeoutError())
+
+    read = store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+    assert read.payload == b"payload"
+    assert read.metadata == written.metadata
+    assert _gcloud_verbs(runner) == ["cat"]
+
+
+def test_an_exact_read_of_a_replaced_or_absent_object_keeps_its_precise_error() -> None:
+    from eyvan.artifacts.managed import ManagedArtifactVersionMismatchError
+
+    runner = FakeGcloudRunner()
+    store, _downloads = _json_read_store(runner)
+    uri = result_uri("json-replaced")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    object_uri = next(iter(runner.objects))
+    runner.replace(object_uri, b"other")
+
+    with pytest.raises(ManagedArtifactVersionMismatchError):
+        store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+    del runner.objects[object_uri]
+    with pytest.raises(FileNotFoundError):
+        store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+
+def test_an_exact_read_still_rejects_content_addressed_bytes_that_disagree() -> None:
+    runner = FakeGcloudRunner()
+    store, _downloads = _json_read_store(runner)
+    digest = hashlib.sha256(b"real").hexdigest()
+    uri = callable_uri(digest)
+    written = store.put_versioned(uri, b"real", org_id="acme", project_id="research")
+    object_uri = next(iter(runner.objects))
+    with runner._lock:
+        runner.objects[object_uri] = (b"fake", runner.objects[object_uri][1])
+
+    with pytest.raises(ManagedArtifactConflictError):
+        store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+
+def test_an_exact_read_retries_a_rejected_token_once() -> None:
+    runner = FakeGcloudRunner()
+    tokens = _CountingTokens()
+    downloads = _JsonDownloads(runner)
+    store = GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        runner=runner,
+        inventory_transport=runner.inventory,
+        access_token_provider=tokens,
+        download_transport=downloads,
+    )
+    uri = result_uri("json-read-401")
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+    runner.calls.clear()
+    downloads.calls.clear()  # the write verified itself through the same read path
+    downloads.answers.append((401, {}, b'{"error":"provider-secret"}'))
+
+    read = store.get_versioned(uri, org_id="acme", project_id="research", object_version=written.metadata.object_version)
+
+    assert read.payload == b"payload"
+    assert [authorization for _url, authorization in downloads.calls] == ["Bearer token-0", "Bearer token-1"]
+    assert _gcloud_verbs(runner) == []
+
+
+def test_the_default_gcs_store_reads_through_the_json_api() -> None:
+    from eyvan.artifacts.managed import _httpx_gcs_download_transport
+
+    assert GCSManagedArtifactStore("gs://eyvan-managed/artifacts")._download_transport is _httpx_gcs_download_transport
+    assert FakeGcloudRunner().store()._download_transport is None
+
+
 def test_the_default_gcs_store_uploads_through_the_json_api() -> None:
     from eyvan.artifacts.managed import _httpx_gcs_upload_transport
 

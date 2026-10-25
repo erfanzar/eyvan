@@ -526,6 +526,59 @@ def _httpx_gcs_upload_transport(
         raise OSError from exc
 
 
+class _GCSDownloadTransport(tp.Protocol):
+    """Injectable HTTP boundary for one conditional JSON API media read."""
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        timeout_seconds: float,
+    ) -> tuple[int, tp.Mapping[str, str], bytes]: ...
+
+
+def _httpx_gcs_download_transport(
+    url: str,
+    *,
+    headers: tp.Mapping[str, str],
+    timeout_seconds: float,
+) -> tuple[int, tp.Mapping[str, str], bytes]:
+    """GET one object's media, non-redirecting; return status, lower-cased headers and body.
+
+    The body is not capped, matching the ``gcloud storage cat`` it replaces.
+    """
+
+    timeout = httpx.Timeout(timeout_seconds)
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            with client.stream("GET", url, headers=dict(headers)) as response:
+                body = bytearray()
+                for chunk in response.iter_raw():
+                    body.extend(chunk)
+                return (
+                    response.status_code,
+                    {key.lower(): value for key, value in response.headers.items()},
+                    bytes(body),
+                )
+    except httpx.TimeoutException as exc:
+        raise TimeoutError from exc
+    except httpx.HTTPError as exc:
+        raise OSError from exc
+
+
+def _gcs_md5_header(value: str | None) -> str | None:
+    """Return the base64 MD5 from an ``x-goog-hash`` header, if it carries one."""
+
+    if not value:
+        return None
+    for part in value.split(","):
+        name, separator, digest = part.strip().partition("=")
+        if separator and name == "md5" and digest:
+            return digest
+    return None
+
+
 def _gcloud_inventory_access_token() -> str:
     """Read an ephemeral OAuth token from the ambient gcloud/workload identity."""
 
@@ -2903,6 +2956,7 @@ class GCSManagedArtifactStore:
         access_token_provider: tp.Callable[[], str] = _ambient_gcs_inventory_access_token,
         inventory_timeout_seconds: float = _GCS_INVENTORY_TIMEOUT_SECONDS,
         upload_transport: _GCSUploadTransport | None = None,
+        download_transport: _GCSDownloadTransport | None = None,
     ):
         if not isinstance(root_uri, str) or any(
             ord(character) < 0x20 or ord(character) == 0x7F for character in root_uri
@@ -2959,6 +3013,13 @@ class GCSManagedArtifactStore:
         if upload_transport is not None and not callable(upload_transport):
             raise TypeError("GCS upload transport must be callable")
         self._upload_transport = upload_transport
+        # Same rule for exact reads: one generation-pinned JSON API GET instead
+        # of a `gcloud storage cat` process between two stats.
+        if download_transport is None and runner is _default_gcloud_runner:
+            download_transport = _httpx_gcs_download_transport
+        if download_transport is not None and not callable(download_transport):
+            raise TypeError("GCS download transport must be callable")
+        self._download_transport = download_transport
 
     def _run_gcloud(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Run one transfer command with a production deadline.
@@ -2976,6 +3037,92 @@ class GCSManagedArtifactStore:
     def _object_uri(self, reference: ManagedArtifactRef, org_id: str, project_id: str) -> str:
         relative = _relative_object_path(reference, org_id, project_id).as_posix()
         return f"{self.root_uri}/{relative}"
+
+    def _send_download(self, url: str, token: str) -> tuple[int, tp.Mapping[str, str], bytes]:
+        download = tp.cast("_GCSDownloadTransport", self._download_transport)
+        response = download(
+            url,
+            headers={"Accept-Encoding": "identity", "Authorization": f"Bearer {token}"},
+            timeout_seconds=_GCS_TRANSFER_TIMEOUT_SECONDS,
+        )
+        if not isinstance(response, tuple) or len(response) != 3:
+            raise ManagedArtifactInventoryError("GCS download transport returned an invalid response")
+        status_code, headers, body = response
+        if (
+            isinstance(status_code, bool)
+            or not isinstance(status_code, int)
+            or not isinstance(headers, tp.Mapping)
+            or not isinstance(body, bytes)
+        ):
+            raise ManagedArtifactInventoryError("GCS download transport returned an invalid response")
+        return status_code, headers, body
+
+    def _download_exact(
+        self,
+        reference: ManagedArtifactRef,
+        *,
+        org_id: str,
+        project_id: str,
+        object_version: str,
+    ) -> ManagedArtifactRead | None:
+        """Read exactly ``object_version`` in one request, or return ``None``.
+
+        The stat / ``gcloud storage cat`` / stat sandwich proved that the bytes
+        came from one current generation. ``ifGenerationMatch`` on the media GET
+        makes GCS itself serve that generation or refuse, and the stored MD5 and
+        length it reports are checked against the bytes received. Anything that
+        does not prove the read -- a refusal, a missing or disagreeing checksum,
+        a transcoded object, a transport error -- returns ``None``, and the
+        caller performs the sandwich read exactly as before, which is also what
+        produces the precise mismatch or absence error.
+        """
+
+        if self._download_transport is None:
+            return None
+        try:
+            generation = str(_parse_gcs_object_version(object_version))
+            object_name = self._object_name(reference, org_id, project_id)
+            url = self._json_api_url(
+                f"b/{quote(self._bucket, safe='')}/o/{quote(object_name, safe='')}",
+                {"alt": "media", "ifGenerationMatch": generation},
+            )
+            token = self._access_token()
+            status_code, headers, body = self._send_download(url, token)
+            if status_code == 401:
+                self._forget_access_token(token)
+                status_code, headers, body = self._send_download(url, self._access_token())
+        except Exception:
+            return None
+        lowered = {str(key).lower(): str(value) for key, value in headers.items()}
+        stored_length = lowered.get("x-goog-stored-content-length", "")
+        reported_md5 = _gcs_md5_header(lowered.get("x-goog-hash"))
+        if (
+            status_code != 200
+            or lowered.get("x-goog-generation") != generation
+            or lowered.get("x-goog-stored-content-encoding", "identity") != "identity"
+            or not stored_length.isascii()
+            or not stored_length.isdigit()
+            or int(stored_length) != len(body)
+            or reported_md5 is None
+        ):
+            return None
+        expected_md5 = base64.b64encode(hashlib.md5(body, usedforsecurity=False).digest()).decode("ascii")
+        if not hmac.compare_digest(reported_md5, expected_md5):
+            return None
+        metadata = ManagedArtifactObjectMetadata(
+            uri=reference.uri,
+            size_bytes=len(body),
+            object_version=f"gcs:{generation}",
+            sha256=hashlib.sha256(body).hexdigest(),
+        )
+        try:
+            payload = _validate_loaded_payload(reference, body)
+        except ValueError as exc:
+            raise ManagedArtifactConflictError(
+                "managed artifact bytes do not match their content-addressed URI",
+                current_metadata=metadata,
+            ) from exc
+        return ManagedArtifactRead(payload=payload, metadata=metadata)
 
     def _get_object(self, object_uri: str) -> bytes:
         try:
@@ -2999,6 +3146,9 @@ class GCSManagedArtifactStore:
         reference = parse_managed_uri(uri)
         if object_version is not None:
             _parse_gcs_object_version(object_version)
+            exact = self._download_exact(reference, org_id=org_id, project_id=project_id, object_version=object_version)
+            if exact is not None:
+                return exact
         before = self.stat(reference.uri, org_id=org_id, project_id=project_id)
         if before is None:
             raise FileNotFoundError("managed artifact object is absent")
