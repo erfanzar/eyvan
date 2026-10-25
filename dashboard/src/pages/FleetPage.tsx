@@ -250,119 +250,6 @@ export function FleetPage({
         />
       </section>
 
-      {/* Warmth and billing are reported together on purpose. Warm capacity is
-          deliberately idle, and an operator reading an idle figure without the
-          warm floor beside it has exactly one safe reaction -- delete the warm
-          floor, undoing the fix that put it there. */}
-      <section className="panel data-panel" aria-label="Warm capacity and cost">
-        <div className="panel-header">
-          <div>
-            <h2>Warm capacity and cost</h2>
-            <p>Which idle cost you asked for, and which you did not</p>
-          </div>
-          <Gauge size={15} />
-        </div>
-        {costError && (
-          <div className="resource-row-detail">
-            <span>{costError}</span>
-          </div>
-        )}
-        {!costError && !billing && (
-          <div className="resource-row-detail">
-            <span>Reading the billing clock…</span>
-          </div>
-        )}
-        {billing && (
-          <div className="resource-row-detail">
-            <span>
-              {everyCellUnpriced
-                ? "Accrued: Not costed"
-                : `${formatMoney(billing.accrued_cost)} accrued${unpriced ? " (priced cells only)" : ""}`}
-            </span>
-            <span>
-              {everyCellUnpriced
-                ? "Idle: Not costed"
-                : `${formatMoney(billing.idle_cost)} idle${unpriced ? " (priced cells only)" : ""}`}
-            </span>
-            <span>
-              {formatMoney(warmHourlyCost)}/h held warm{unpriced ? " (declared prices only)" : ""}
-            </span>
-          </div>
-        )}
-        {billing && unpriced && (
-          <p className="panel-note">
-            {billing.unpriced_cells} of {billing.cells} cell(s) have no declared unit price; their cost is unknown, not
-            free. {(billing.billed_seconds / 3600).toFixed(1)}h billed, {(billing.idle_seconds / 3600).toFixed(1)}h idle
-            are measured across all cells. Declare <code>unit_prices</code>, including zero for known-free capacity, to
-            cost them.
-          </p>
-        )}
-        {warmth && warmth.pools.length > 0 && (
-          <dl className="definition-grid">
-            {warmPools.map((pool) => (
-              <div key={pool.pool_id}>
-                <dt className="monospace">{pool.pool_id}</dt>
-                <dd>
-                  {pool.warm_cells}/{pool.floor} held{pool.window_active ? ", window active" : ""}
-                  {pool.warm_idle_cells ? `, ${pool.warm_idle_cells} idle` : ""}
-                  {pool.provisioning_cells ? `, ${pool.provisioning_cells} provisioning` : ""}
-                </dd>
-              </div>
-            ))}
-          </dl>
-        )}
-        {warmth && warmth.pools.length === 0 && (
-          <div className="resource-row-detail">
-            <span>No pool declares a warm floor.</span>
-          </div>
-        )}
-      </section>
-
-      {/* The number the scheduler has ranked pools on since it existed, shown to
-          the person choosing a pool. Sample counts are rendered beside every
-          figure because a p95 over three provisions is not a p95, and a pool
-          with no samples sorts to the top of any latency table as if it were
-          the fastest thing available. */}
-      <section className="panel data-panel" aria-label="Launch latency">
-        <div className="panel-header">
-          <div>
-            <h2>Launch latency</h2>
-            <p>How long each pool takes to hand over usable capacity</p>
-          </div>
-          <Timer size={15} />
-        </div>
-        {latencyError && (
-          <div className="resource-row-detail">
-            <span>{latencyError}</span>
-          </div>
-        )}
-        {!latencyError && !latency && (
-          <div className="resource-row-detail">
-            <span>Reading provisioning history…</span>
-          </div>
-        )}
-        {latency && latency.pools.length === 0 && (
-          <div className="resource-row-detail">
-            <span>No capacity pool is configured.</span>
-          </div>
-        )}
-        {latency && latency.pools.length > 0 && (
-          <dl className="definition-grid">
-            {latency.pools.map((pool) => (
-              <div key={pool.pool_id}>
-                <dt className="monospace">{pool.pool_id}</dt>
-                <dd>
-                  {pool.samples === 0
-                    ? "never provisioned - no measurement"
-                    : `p95 ${Math.round(pool.p95_seconds ?? 0)}s over ${pool.samples} provision${pool.samples === 1 ? "" : "s"}`}
-                  {pool.cells_in_cooldown > 0 ? `, ${pool.cells_in_cooldown} in cooldown` : ""}
-                </dd>
-              </div>
-            ))}
-          </dl>
-        )}
-      </section>
-
       {loadPools && (
         <section className="panel data-panel" aria-label="Applied fleets">
           <div className="panel-header">
@@ -733,6 +620,122 @@ export function FleetPage({
           </div>
         </section>
       )}
+
+      {/* Reference panels, below the operational ones on purpose: cells, leases
+          and fleets carry what an operator must act on first; cost and launch
+          latency are read when choosing or reviewing a pool. Warmth and billing
+          are reported together on purpose. Warm capacity is deliberately idle,
+          and an operator reading an idle figure without the warm floor beside it
+          has exactly one safe reaction -- delete the warm floor, undoing the fix
+          that put it there. */}
+      <section className="panel data-panel" aria-label="Warm capacity and cost">
+        <div className="panel-header">
+          <div>
+            <h2>Warm capacity and cost</h2>
+            <p>Which idle cost you asked for, and which you did not</p>
+          </div>
+          <Gauge size={15} />
+        </div>
+        {costError && (
+          <div className="resource-row-detail">
+            <span>{costError}</span>
+          </div>
+        )}
+        {!costError && !billing && (
+          <div className="resource-row-detail">
+            <span>Reading the billing clock…</span>
+          </div>
+        )}
+        {billing && (
+          <div className="resource-row-detail">
+            <span>
+              {everyCellUnpriced
+                ? "Accrued: Not costed"
+                : `${formatMoney(billing.accrued_cost)} accrued${unpriced ? " (priced cells only)" : ""}`}
+            </span>
+            <span>
+              {everyCellUnpriced
+                ? "Idle: Not costed"
+                : `${formatMoney(billing.idle_cost)} idle${unpriced ? " (priced cells only)" : ""}`}
+            </span>
+            <span>
+              {formatMoney(warmHourlyCost)}/h held warm{unpriced ? " (declared prices only)" : ""}
+            </span>
+          </div>
+        )}
+        {billing && unpriced && (
+          <p className="panel-note">
+            {billing.unpriced_cells} of {billing.cells} cell(s) have no declared unit price; their cost is unknown, not
+            free. {(billing.billed_seconds / 3600).toFixed(1)}h billed, {(billing.idle_seconds / 3600).toFixed(1)}h idle
+            are measured across all cells. Declare <code>unit_prices</code>, including zero for known-free capacity, to
+            cost them.
+          </p>
+        )}
+        {warmth && warmth.pools.length > 0 && (
+          <dl className="definition-grid">
+            {warmPools.map((pool) => (
+              <div key={pool.pool_id}>
+                <dt className="monospace">{pool.pool_id}</dt>
+                <dd>
+                  {pool.warm_cells}/{pool.floor} held{pool.window_active ? ", window active" : ""}
+                  {pool.warm_idle_cells ? `, ${pool.warm_idle_cells} idle` : ""}
+                  {pool.provisioning_cells ? `, ${pool.provisioning_cells} provisioning` : ""}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {warmth && warmth.pools.length === 0 && (
+          <div className="resource-row-detail">
+            <span>No pool declares a warm floor.</span>
+          </div>
+        )}
+      </section>
+
+      {/* The number the scheduler has ranked pools on since it existed, shown to
+          the person choosing a pool. Sample counts are rendered beside every
+          figure because a p95 over three provisions is not a p95, and a pool
+          with no samples sorts to the top of any latency table as if it were
+          the fastest thing available. */}
+      <section className="panel data-panel" aria-label="Launch latency">
+        <div className="panel-header">
+          <div>
+            <h2>Launch latency</h2>
+            <p>How long each pool takes to hand over usable capacity</p>
+          </div>
+          <Timer size={15} />
+        </div>
+        {latencyError && (
+          <div className="resource-row-detail">
+            <span>{latencyError}</span>
+          </div>
+        )}
+        {!latencyError && !latency && (
+          <div className="resource-row-detail">
+            <span>Reading provisioning history…</span>
+          </div>
+        )}
+        {latency && latency.pools.length === 0 && (
+          <div className="resource-row-detail">
+            <span>No capacity pool is configured.</span>
+          </div>
+        )}
+        {latency && latency.pools.length > 0 && (
+          <dl className="definition-grid">
+            {latency.pools.map((pool) => (
+              <div key={pool.pool_id}>
+                <dt className="monospace">{pool.pool_id}</dt>
+                <dd>
+                  {pool.samples === 0
+                    ? "never provisioned - no measurement"
+                    : `p95 ${Math.round(pool.p95_seconds ?? 0)}s over ${pool.samples} provision${pool.samples === 1 ? "" : "s"}`}
+                  {pool.cells_in_cooldown > 0 ? `, ${pool.cells_in_cooldown} in cooldown` : ""}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </section>
 
       <ConfirmDialog
         open={draining !== null}
