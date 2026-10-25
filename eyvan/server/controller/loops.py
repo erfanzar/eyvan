@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import typing as tp
 
 from eyvan._internal.observability import trace_span
@@ -286,6 +287,7 @@ class _ControllerLoops:
             # configured tracer provider this is a null context, so it costs
             # nothing when nobody is collecting.
             with trace_span("eyvan.leader_phase", phase=phase.name):
+                started = time.monotonic()
                 try:
                     await phase.run()
                 except Exception:
@@ -302,6 +304,18 @@ class _ControllerLoops:
                     # stopped as a side effect of an unrelated failure.
                     failed.add(phase.name)
                     logger.exception("leader phase %s failed; the rest of this cycle continues", phase.name)
+                elapsed = time.monotonic() - started
+                # Slow by the plane's own definition: one phase alone outlasted
+                # the interval the whole cycle is meant to fit in, so everything
+                # after it -- scheduling included -- waited. No new threshold:
+                # the operator already chose this number.
+                if elapsed > self.settings.scheduler_interval_s:
+                    logger.warning(
+                        "leader phase %s took %.1fs, longer than the %.1fs scheduler interval",
+                        phase.name,
+                        elapsed,
+                        self.settings.scheduler_interval_s,
+                    )
         return due
 
     async def _run_scheduler_loop(self, stop: asyncio.Event) -> None:

@@ -22,6 +22,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -89,12 +91,16 @@ class _RecordingStore:
         self.put_uris: list[str] = []
         self.failures: set[str] = set()
         self.budget: int | None = None
+        # Rank objects are archived concurrently, so the budget check and the
+        # record of the attempt must be one step or two writers both pass it.
+        self._lock = threading.Lock()
 
     def put_versioned(self, uri, payload, **scope):
-        if uri in self.failures or (self.budget is not None and len(self.put_uris) >= self.budget):
+        with self._lock:
+            refused = uri in self.failures or (self.budget is not None and len(self.put_uris) >= self.budget)
             self.put_uris.append(uri)
+        if refused:
             raise OSError("managed artifact storage is unreachable")
-        self.put_uris.append(uri)
         return self.backing.put_versioned(uri, payload, **scope)
 
     def get_versioned(self, uri, **scope):
@@ -592,10 +598,13 @@ async def test_a_crash_at_any_blob_boundary_leaves_a_resumable_archive(
     manifest = await _manifest(controller)
     assert [entry["status"] for entry in manifest["ranks"]] == ["archived", "quiet", "archived"]
     assert manifest["complete"] is True
-    # Blobs that already existed were reused, not rewritten.
-    assert resumed.put_uris == [log_uri("wl-1", 1, rank) for rank in range(3) if rank not in landed] + [
-        log_manifest_uri("wl-1", 1)
-    ]
+    # Blobs that already existed were reused, not rewritten; each missing one was
+    # written exactly once, in any order (they are archived concurrently); and
+    # the manifest was written last, after every blob's fate was known.
+    rank_puts = resumed.put_uris[:-1]
+    assert sorted(rank_puts) == sorted(log_uri("wl-1", 1, rank) for rank in range(3) if rank not in landed)
+    assert len(rank_puts) == len(set(rank_puts))
+    assert resumed.put_uris[-1] == log_manifest_uri("wl-1", 1)
     for rank, row in landed.items():
         current = await _artifact_row(controller, log_uri("wl-1", 1, rank))
         assert current.record_generation == row.record_generation
@@ -1076,6 +1085,63 @@ async def test_an_archive_without_a_manifest_still_reads_through_the_embedded_in
     replayed = await controller._archived_log_page(await _workload(controller))
 
     assert [(record.rank, record.message) for record in replayed.records] == [(0, "zero"), (1, "one")]
+
+
+class _InFlightStore(_RecordingStore):
+    """Records the most rank writes that were in flight at once."""
+
+    def __init__(self, backing: LocalManagedArtifactStore, *, hold_s: float) -> None:
+        super().__init__(backing)
+        self.hold_s = hold_s
+        self.in_flight = 0
+        self.peak = 0
+
+    def put_versioned(self, uri, payload, **scope):
+        with self._lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        try:
+            time.sleep(self.hold_s)
+            return super().put_versioned(uri, payload, **scope)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+@pytest.mark.parametrize(("width", "concurrency"), [(6, 2), (5, 1), (4, 8)])
+async def test_rank_objects_archive_concurrently_within_the_configured_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    concurrency: int,
+) -> None:
+    """Settlement waits on this archive, so one-at-a-time made a wide slice look hung.
+
+    Seen live 2026-10-25: a 16-host v5p-128 spent 197 s archiving rank objects
+    one after another, and the finished job read as running for three minutes.
+    The bound is the operator's ``log_archive_concurrency``, never a constant.
+    """
+
+    import dataclasses
+
+    monkeypatch.delenv("EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED", raising=False)
+    controller = await _controller(tmp_path, width=width)
+    controller.settings = dataclasses.replace(controller.settings, log_archive_concurrency=concurrency)
+    store = _InFlightStore(LocalManagedArtifactStore(tmp_path / "artifacts"), hold_s=0.05)
+    _attach(controller, _artifact_access(tmp_path / "artifacts", store))
+    controller.workload_log_page = _scripted_page(
+        records=[{"message": f"rank {rank}", "rank": rank} for rank in range(width)],
+    )
+
+    await controller._archive_terminal_logs(await _workload(controller))
+
+    assert sorted(store.put_uris) == sorted(log_uri("wl-1", 1, rank) for rank in range(width))
+    assert store.peak <= concurrency
+    assert store.peak == min(concurrency, width)
+    replayed = await controller._archived_log_page(await _workload(controller))
+    assert sorted((record.rank, record.message) for record in replayed.records) == [
+        (rank, f"rank {rank}") for rank in range(width)
+    ]
 
 
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from

@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
+import typing as tp
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -363,13 +365,31 @@ class _ControllerSettlement:
             for rank in sorted(write_ranks | expected)
         }
 
-        outcomes: dict[int, _ArchivedRank] = {}
-        for rank in sorted(write_ranks):
+        # Concurrently, bounded by the same knob the live archiver uses. Each
+        # rank's object is independent and immutable, and this runs before the
+        # workload is settled -- inside the observe-workloads phase, which every
+        # other workload waits behind. One at a time, a 16-host v5p-128 spent
+        # 197 s here (16 x ~11 s, measured live 2026-10-25) and the job read as
+        # running for three minutes after it had finished.
+        gate = asyncio.Semaphore(max(int(self.settings.log_archive_concurrency), 1))
+
+        async def archive_rank(rank: int) -> _ArchivedRank:
             lines: list[JsonValue] = list(by_rank.get(rank, ()))
             if rank == 0:
                 lines.insert(0, manifest)
             payload = "\n".join(json.dumps(line, sort_keys=True) for line in lines).encode()
-            outcomes[rank] = await self._archive_rank_object(workload, rank, payload, intended=intended[rank])
+            async with gate:
+                return await self._archive_rank_object(workload, rank, payload, intended=intended[rank])
+
+        ordered_ranks = sorted(write_ranks)
+        results = await asyncio.gather(*(archive_rank(rank) for rank in ordered_ranks), return_exceptions=True)
+        # Every rank has finished before anything propagates: no upload is left
+        # running unowned behind a failure, and the first failure in rank order
+        # is the one reported, as the sequential walk reported it.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        outcomes: dict[int, _ArchivedRank] = dict(zip(ordered_ranks, tp.cast(list[_ArchivedRank], results), strict=True))
 
         if not manifest_v2:
             return
