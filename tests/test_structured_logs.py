@@ -331,6 +331,42 @@ def test_the_systemd_read_asks_journalctl_for_json_and_parses_it(tmp_path) -> No
     assert page.next_cursor == "c2"
 
 
+@pytest.mark.parametrize("length", [4096, 4097, 4302, 64 * 1024])
+def test_a_long_line_reaches_the_follower_whole(tmp_path, length: int) -> None:
+    """journald's JSON output nulls any field over 4096 bytes unless asked with --all.
+
+    The fake below behaves the way journalctl does rather than being told what
+    to return, so the test fails for any read that omits the flag, whatever the
+    line is. Seen live 2026-10-25: ``print(jax.devices())`` on a v5p-128 is
+    4302 characters, and the blocking wait showed ``start`` and nothing after.
+    """
+
+    import subprocess
+
+    long_line = "x" * length
+
+    def journalctl(command, **_kwargs):
+        whole = "--all" in command
+        message = long_line if whole or len(long_line.encode()) <= 4096 else None
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            _journal(
+                {"MESSAGE": "start", "PRIORITY": "6", "__CURSOR": "c1"},
+                {"MESSAGE": message, "PRIORITY": "6", "__CURSOR": "c2"},
+            ),
+            "",
+        )
+
+    executor = _systemd_executor(tmp_path, journalctl)
+    _record_unit(executor, "wl-1", "eyvan-wl-1.service")
+
+    page = executor.log_page("wl-1", limit=10)
+
+    assert [record.message for record in page.records] == ["start", long_line]
+    assert page.next_cursor == "c2"
+
+
 def test_the_systemd_read_resumes_after_a_cursor(tmp_path) -> None:
     """A follower must never re-read the line it already has.
 

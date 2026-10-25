@@ -401,7 +401,9 @@ def test_ssh_invalid_destination_refused(harness, destination):
     "package,digest",
     [
         ("eyvan", "624d99879b51881e4175ae9bb70e662e9802eb47be4586088d66e3fdc0297965"),
-        ("/tmp/eyvan-1.0-py3-none-any.whl", "ab4e7e78d45fbb3b8350d35b53705a434ca86eda0fd2e80282fda653f86e0838"),
+        # Changed 2026-10-25 on purpose: a local wheel is now force-reinstalled,
+        # because a same-version rebuild was otherwise silently kept out.
+        ("/tmp/eyvan-1.0-py3-none-any.whl", "4df6f8fb8d1aba3b51a1ebda36a69d72d6903e964d4c1d906c306f46f00f66d5"),
     ],
 )
 def test_bootstrap_default_bytes_match_pre_edit_capture(package, digest):

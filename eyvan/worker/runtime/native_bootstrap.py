@@ -253,6 +253,18 @@ def _install_command(
         )
     if package_sha256 is not None or package_generation is not None:
         raise ValueError("native worker package digest/generation requires a gs:// wheel URI")
+    if package.endswith(".whl"):
+        # A wheel file copied to the host (``eyvan gcp connect``) has the same
+        # problem as the gs:// one above: every rebuild keeps its filename and
+        # version, so ``--upgrade`` alone leaves the earlier build installed and
+        # a reconnect silently ships nothing (seen live on a v5p-128, 2026-10-25).
+        return "\n".join(
+            (
+                *wheelhouse_lines,
+                f"{python} -m pip install {pip_flags} --force-reinstall --no-deps {quoted}",
+                f"{python} -m pip install {pip_flags} {quoted}",
+            )
+        )
     return "\n".join((*wheelhouse_lines, f"{python} -m pip install {pip_flags} {quoted}"))
 
 

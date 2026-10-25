@@ -317,6 +317,42 @@ def test_native_worker_applies_fleet_runtime_environment_below_job_environment(
     assert env["WORKLOAD_ONLY"] == "set-by-job"
 
 
+@pytest.mark.parametrize(
+    ("runtime_env", "job_env", "expected"),
+    [
+        # Default: a directory the workload user owns, never the shared /tmp one.
+        ({}, {}, "/var/lib/eyvan/workload/tpu_logs"),
+        ({"TPU_LOG_DIR": "/srv/fleet-logs"}, {}, "/srv/fleet-logs"),
+        ({"TPU_LOG_DIR": "/srv/fleet-logs"}, {"TPU_LOG_DIR": "/srv/job-logs"}, "/srv/job-logs"),
+    ],
+)
+def test_native_worker_points_libtpu_logs_at_a_directory_the_workload_user_owns(
+    monkeypatch, tmp_path: Path, runtime_env: dict[str, str], job_env: dict[str, str], expected: str
+) -> None:
+    monkeypatch.delenv("TPU_LOG_DIR", raising=False)
+    monkeypatch.delenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", raising=False)
+    app = create_native_worker_app(
+        state_dir=tmp_path / "production",
+        secret="worker-secret",
+        systemd_transient=True,
+        runtime_env=runtime_env,
+    )
+    executor = app.state.executor
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> SystemdCommandResult:
+        commands.append(command)
+        return SystemdCommandResult(returncode=0)
+
+    monkeypatch.setattr(executor, "_command_runner", run)
+    executor.submit({**spec("python train.py", submission_id="tpu-logs"), "environment": job_env}, context())
+    launch = next(command for command in commands if command[0] == "systemd-run")
+    env_file_option = next(option for option in launch if option.startswith("--property=EnvironmentFile="))
+    env_path = Path(env_file_option.removeprefix("--property=EnvironmentFile="))
+    env = dict(line.split("=", 1) for line in env_path.read_text(encoding="utf-8").splitlines() if line)
+    assert env["TPU_LOG_DIR"] == expected
+
+
 def test_native_worker_rejects_invalid_fleet_runtime_environment(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="environment"):
         create_native_worker_app(

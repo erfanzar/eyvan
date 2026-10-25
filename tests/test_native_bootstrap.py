@@ -412,6 +412,35 @@ def test_a_rebuilt_wheel_replaces_the_installed_package() -> None:
     assert "--force-reinstall" in script
 
 
+def test_a_rebuilt_local_wheel_replaces_the_installed_package() -> None:
+    """The same defect for a wheel copied to the host, which `eyvan gcp connect` does.
+
+    Seen live 2026-10-25: a reconnect copied a new build to all 16 hosts of a
+    v5p-128, reported the worker installed, and left yesterday's files in place.
+    """
+
+    script = build_native_worker_startup_script(
+        package="/var/lib/eyvan/attach/eyvan-0.0.1-py3-none-any.whl",
+        port=8100,
+        state_dir="/var/lib/eyvan/native-worker",
+        worker_secret_file="/etc/eyvan-native/attached-worker-secret",
+    )
+
+    forced = [line for line in script.splitlines() if "--force-reinstall" in line]
+    assert forced and all("--no-deps" in line for line in forced)
+
+
+def test_a_package_name_is_not_force_reinstalled() -> None:
+    script = build_native_worker_startup_script(
+        package="eyvan",
+        port=8100,
+        state_dir="/var/lib/eyvan/native-worker",
+        worker_secret_file="/etc/eyvan-native/attached-worker-secret",
+    )
+
+    assert "--force-reinstall" not in script
+
+
 def test_the_forced_reinstall_does_not_rebuild_the_dependency_tree() -> None:
     """Every bootstrap pays this cost, so it must stay bounded to one package."""
 

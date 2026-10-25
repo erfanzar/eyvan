@@ -2335,7 +2335,19 @@ class SystemdTransientServiceExecutor:
             unit_name = record.get("unit_name")
             if not isinstance(unit_name, str) or not unit_name:
                 return LogPage(unavailable=True, detail="execution record has no unit")
-        arguments = ["journalctl", "--no-pager", "--output=json", f"--unit={unit_name}", f"--lines={max(1, limit)}"]
+        # ``--all``: without it journald's JSON output replaces any field over
+        # 4096 bytes with ``null``, and a long line -- ``print(jax.devices())``
+        # on a 64-chip slice is 4.3 KB -- reached the follower as nothing at
+        # all, while ``--output=cat`` reads showed it. The page is still bounded
+        # by the runner's byte limit, not by this flag.
+        arguments = [
+            "journalctl",
+            "--no-pager",
+            "--output=json",
+            "--all",
+            f"--unit={unit_name}",
+            f"--lines={max(1, limit)}",
+        ]
         if after:
             # journald resumes *after* the cursor, so a follower never re-reads
             # the line it already has.

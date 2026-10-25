@@ -170,6 +170,13 @@ def _base_environment(runtime_env: tp.Mapping[str, str]) -> dict[str, str]:
     workload_directory = os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", _DEFAULT_WORKLOAD_DIRECTORY)
     workload_user = os.getenv("EYVAN_NATIVE_WORKLOAD_USER", "eyvan-workload")
     return {
+        # libtpu logs to /tmp/tpu_logs unless told otherwise. On a shared or
+        # attached TPU VM another account usually created that directory first
+        # (mode 0700), and the workload user then gets two "Could not open the
+        # log file ... Permission denied" lines on every libtpu log call -- tens
+        # of thousands per job. The workload directory is the tree that user
+        # owns. Lowest precedence: the runtime env, then the job, override it.
+        "TPU_LOG_DIR": os.getenv("TPU_LOG_DIR", f"{workload_directory}/tpu_logs"),
         **runtime_env,
         "HOME": workload_directory,
         "LOGNAME": workload_user,
