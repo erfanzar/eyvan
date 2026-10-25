@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import io
+import random
 import typing as tp
+
+import pytest
 
 from eyvan.sdk.client.callables import _CallableProgressRenderer
 from eyvan.sdk.job_receipt import JobTerminalOutput
@@ -128,11 +131,14 @@ def test_a_page_without_rank_data_never_collapses() -> None:
     assert len(lines) == 2, "rank-less pages degrade to one line per record"
 
 
-def test_a_chorus_split_by_a_straggler_renders_as_two_honest_runs() -> None:
-    """Interleaving breaks the run, and that break is information.
+def test_a_straggler_keeps_its_own_order_and_the_chorus_stays_whole() -> None:
+    """A rank saying something else first does not split everyone else's chorus.
 
-    Two hosts, a straggler saying something else, then two more hosts: the
-    split shows the timing skew instead of burying it in one merged line.
+    The adjacency rule this replaced rendered this page as three lines -- two
+    half-choruses around the straggler -- and on a real 16-host page it chopped
+    one ``print`` into runs of 2x, 5x and single workers. What must hold is each
+    rank's own order: rank 3 said ``compiling`` before its banner, so it prints
+    first, and the banner all four ranks said is one line.
     """
 
     lines = _render(
@@ -146,9 +152,55 @@ def test_a_chorus_split_by_a_straggler_renders_as_two_honest_runs() -> None:
     )
 
     assert lines == [
-        "(2x Worker) " + BANNER,
         "(Worker pid=103, 10.0.0.4) compiling",
-        "(2x Worker) " + BANNER,
+        "(4x Worker) " + BANNER,
+    ]
+
+
+@pytest.mark.parametrize("ranks", [2, 16, 64])
+@pytest.mark.parametrize("seed", range(5))
+def test_interleaved_ranks_printing_the_same_program_render_one_line_per_print(ranks: int, seed: int) -> None:
+    """The live shape: every rank prints ``start`` then its device list, all interleaved.
+
+    The interleaving is random per seed and the width is a parameter, so this
+    pins the rule rather than one page that happened to be observed.
+    """
+
+    devices = "[TpuDevice(id=0), TpuDevice(id=1)]"
+    shuffled = random.Random(seed)
+    pending = {rank: ["start", devices] for rank in range(ranks)}
+    records = []
+    while pending:
+        rank = shuffled.choice(sorted(pending))
+        records.append({"rank": rank, "pid": 1000 + rank, "host": f"10.0.0.{rank}", "message": pending[rank].pop(0)})
+        if not pending[rank]:
+            del pending[rank]
+
+    assert _render(tuple(records)) == [f"({ranks}x Worker) start", f"({ranks}x Worker) {devices}"]
+
+
+def test_ranks_that_disagree_on_order_never_have_their_own_lines_reordered() -> None:
+    """Rank 0 says X then Y; rank 1 says Y then X. No merge may swap either rank's lines."""
+
+    lines = _render(
+        (
+            {"rank": 0, "pid": 100, "host": "10.0.0.1", "message": "X"},
+            {"rank": 1, "pid": 101, "host": "10.0.0.2", "message": "Y"},
+            {"rank": 0, "pid": 100, "host": "10.0.0.1", "message": "Y"},
+            {"rank": 1, "pid": 101, "host": "10.0.0.2", "message": "X"},
+        )
+    )
+
+    rank0 = [line.split(") ", 1)[1] for line in lines if "pid=100" in line or "x Worker" in line]
+    rank1 = [line.split(") ", 1)[1] for line in lines if "pid=101" in line or "x Worker" in line]
+    assert rank0 == ["X", "Y"]
+    assert rank1 == ["Y", "X"]
+    # The shared Y still merges: it is next for both ranks once rank 0's X is out,
+    # and merging it moves neither rank's lines. Only X has to split.
+    assert lines == [
+        "(Worker pid=100, 10.0.0.1) X",
+        "(2x Worker) Y",
+        "(Worker pid=101, 10.0.0.2) X",
     ]
 
 

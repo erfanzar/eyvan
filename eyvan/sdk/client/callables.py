@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import typing as tp
+from collections import deque
 from dataclasses import replace
 
 from pydantic import ValidationError
@@ -64,6 +65,59 @@ def _job_words(line: str) -> Text:
     """
 
     return Text.from_ansi(line) if "\x1b" in line else Text(line)
+
+
+def _chorus_groups(lines: tp.Sequence[tuple[int, str]]) -> list[tuple[int, ...]]:
+    """Group one page's ``(rank, message)`` lines into what renders as one line each.
+
+    A gang's ranks print the same program, but their lines reach the page
+    interleaved microseconds apart, so "identical and adjacent" split one
+    16-host ``print`` into runs of 2x, 5x and single workers. The unit here is
+    instead *the k-th time a rank said this exact message*: rank 3's first
+    ``start`` and rank 9's first ``start`` are one chorus however far apart they
+    landed, while a rank repeating itself is never merged with itself.
+
+    Every rank's own lines keep their order. Groups are emitted in a merge over
+    the ranks' sequences: a group is emitted once it is next for every rank in
+    it, earliest first appearance first. When ranks disagree on order (A says
+    X then Y, B says Y then X) no group is ready, and the earliest one is
+    emitted for just the ranks that have it next -- the chorus splits rather
+    than reordering anybody's output. A page without rank data is one rank,
+    so nothing in it can merge.
+
+    Returns:
+        Page indices per rendered line, in display order; every index once.
+    """
+
+    occurrences: dict[tuple[int, str], int] = {}
+    group_ids: dict[tuple[str, int], int] = {}
+    members: list[dict[int, int]] = []  # per group: rank -> page index
+    first_seen: list[int] = []
+    queues: dict[int, deque[int]] = {}
+    for index, (rank, message) in enumerate(lines):
+        nth = occurrences.get((rank, message), 0)
+        occurrences[(rank, message)] = nth + 1
+        group = group_ids.setdefault((message, nth), len(members))
+        if group == len(members):
+            members.append({})
+            first_seen.append(index)
+        members[group][rank] = index
+        queues.setdefault(rank, deque()).append(group)
+
+    ordered: list[tuple[int, ...]] = []
+    while queues:
+        holders: dict[int, list[int]] = {}
+        for rank, queue in queues.items():
+            holders.setdefault(queue[0], []).append(rank)
+        ready = [group for group, ranks in holders.items() if len(ranks) == len(members[group])]
+        chosen = min(ready or holders, key=first_seen.__getitem__)
+        ranks = holders[chosen]
+        ordered.append(tuple(sorted(members[chosen].pop(rank) for rank in ranks)))
+        for rank in ranks:
+            queues[rank].popleft()
+            if not queues[rank]:
+                del queues[rank]
+    return ordered
 
 
 def _attributed(prefix: str, line: str) -> Text:
@@ -258,17 +312,11 @@ class _CallableProgressRenderer:
         rank data cannot prove distinct voices and never collapses.
         """
 
-        index = 0
         lines = window.lines
-        while index < len(lines):
-            rank, message, _timestamp = lines[index]
-            line = message.rstrip("\n")
-            voices = {rank}
-            end = index + 1
-            while end < len(lines) and lines[end][1].rstrip("\n") == line and lines[end][0] not in voices:
-                voices.add(lines[end][0])
-                end += 1
-            if len(voices) == 1:
+        for group in _chorus_groups(tuple((rank, message.rstrip("\n")) for rank, message, _ in lines)):
+            index = group[0]
+            line = lines[index][1].rstrip("\n")
+            if len(group) == 1:
                 # Ray-style: a blocking wait decorates each line with the
                 # worker that produced it -- pid and host when the archive
                 # reports them, nothing invented when it does not.
@@ -285,8 +333,7 @@ class _CallableProgressRenderer:
                     # when a terminal renders it, plain bytes everywhere else.
                     self._output.output_line(_attributed(prefix, line))
             else:
-                self._output.output_line(_attributed(f"({len(voices)}x Worker) ", line))
-            index = end
+                self._output.output_line(_attributed(f"({len(group)}x Worker) ", line))
 
     @staticmethod
     def _required_workers(progress: WorkloadProgress) -> int:
