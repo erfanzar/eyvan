@@ -12,6 +12,7 @@ import typing as tp
 if tp.TYPE_CHECKING:
     from eyvan.capacity.fleet_config import EyvanFleetConfig
     from eyvan.config import EyvanSettings
+    from eyvan.records import CapacityClass
     from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
     from eyvan.sdk.client.jobs import CpuConfig, GpuConfig
     from eyvan.sdk.execution import (
@@ -28,6 +29,7 @@ if tp.TYPE_CHECKING:
 
 __all__ = (
     "AsyncEyvanClient",
+    "CapacityClass",
     "ClientIdentity",
     "CpuConfig",
     "EyvanCallableSubmitter",
@@ -70,6 +72,12 @@ def __getattr__(name: str):
         from eyvan.sdk import AsyncEyvanClient
 
         return _cache_export(name, AsyncEyvanClient)
+    if name == "CapacityClass":
+        # The value TpuConfig(capacity_class=...) takes. records is light: it
+        # pulls in pydantic models, not the client or its transport.
+        from eyvan.records import CapacityClass
+
+        return _cache_export(name, CapacityClass)
     if name == "ClientIdentity":
         from eyvan.sdk import ClientIdentity
 

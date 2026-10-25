@@ -114,6 +114,11 @@ def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, mult
     return accelerator_type
 
 
+#: Marks a ``TpuConfig`` whose caller did not name a capacity class. Resolved to
+#: spot in ``__post_init__``, so every reader still sees a real ``CapacityClass``.
+_UNSET_CAPACITY_CLASS: tp.Final[CapacityClass] = tp.cast(CapacityClass, object())
+
+
 @dataclass(frozen=True, slots=True)
 class TpuConfig:
     """TPU shape and purchase class requested by an Eyvan callable."""
@@ -128,7 +133,11 @@ class TpuConfig:
     #: ``max_retries`` on purpose: this is the cheap failure to retry, and a spot
     #: job that cannot outlast a handful of reclamations cannot use spot at all.
     max_preemption_retries: int = 10
-    capacity_class: CapacityClass = CapacityClass.SPOT
+    #: Spot when not given. Left unset, it is a preference rather than a demand:
+    #: a fleet whose pools for this type are reserved and offer no spot (an
+    #: attached TPU the caller already holds) runs the job on that reservation
+    #: instead of refusing it. Set explicitly, it is exact and never substituted.
+    capacity_class: CapacityClass = _UNSET_CAPACITY_CLASS
     #: Secret references, resolved at dispatch and injected as environment
     #: variables on the cell. Unlike a value passed through ``environment``, a
     #: reference is what gets persisted -- which is the whole point.
@@ -160,8 +169,14 @@ class TpuConfig:
     #: run as one lease group with one hardware world per cell, and the job's
     #: receipt states the packing it got.
     atomic: bool = False
+    #: Whether the caller named ``capacity_class``. Derived, never passed: only
+    #: an unnamed class may be substituted by a fleet's reserved capacity.
+    capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.capacity_class is _UNSET_CAPACITY_CLASS:
+            object.__setattr__(self, "capacity_class", CapacityClass.SPOT)
+            object.__setattr__(self, "capacity_class_explicit", False)
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
         object.__setattr__(self, "type", normalized)
 

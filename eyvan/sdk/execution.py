@@ -33,6 +33,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileStore,
 )
 from eyvan.capacity.providers.gcp.runtime.supervisor import ensure_gcp_native_runtime, runtime_profile_path_for
+from eyvan.records import CapacityClass
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.identity import resolve_control_plane_identity
@@ -485,12 +486,21 @@ def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorC
             "Auto-resolving a fleet from a TpuConfig requires the default Eyvan callable submitter; "
             "pass fleet= or configure a submitter that supports capacity lookup"
         )
+    explicit = getattr(tpu, "capacity_class_explicit", True)
     pools = context.submitter.client.list_capacity(
         org_id=context.org_id,
         project_id=context.project_id,
         accelerator_type=tpu.type,
-        capacity_class=tpu.capacity_class,
+        capacity_class=tpu.capacity_class if explicit else None,
     )
+    if not explicit:
+        # An unnamed class is a preference: the default class first, then
+        # reserved capacity the operator already holds, exactly as the
+        # submitter's fallback does. One listing answers both. Never on-demand,
+        # which would start billing for something nobody asked for.
+        pools = [pool for pool in pools if pool.capacity_class is tpu.capacity_class] or [
+            pool for pool in pools if pool.capacity_class is CapacityClass.RESERVED
+        ]
     if not pools:
         raise EyvanPlacementError(
             requested_accelerator_type=tpu.type,

@@ -17,6 +17,7 @@ from eyvan.artifacts import ArtifactStore
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.records import (
     CallableExecution,
+    CapacityClass,
     PlacementMode,
     WorkloadProgress,
     WorkloadProgressPhase,
@@ -574,10 +575,50 @@ class EyvanCallableSubmitter(tp.Generic[R]):
             queue_admission_recorder=recorder,
         )
 
-    def submit_callable(self, request: CallableSubmission) -> EyvanJob[R]:
-        """Create a callable workload and bind its durable result reader."""
+    def _reserved_substitute(self, request: CallableSubmission, error: EyvanHTTPError) -> CapacityClass | None:
+        """Return RESERVED when an unnamed class was refused by a reserved-only fleet.
 
-        reject_remote_callable_signature(request.artifact.signature)
+        Only an unset ``capacity_class`` qualifies: a class the caller named is
+        exact. Only RESERVED is substituted -- capacity the operator already holds
+        and pays for either way -- never on-demand, which would start billing for
+        something nobody asked for. Any doubt (another status, an unreadable
+        listing, the requested class actually present) keeps the original error.
+        """
+
+        if getattr(request.tpu, "capacity_class_explicit", True) or error.status_code != 409:
+            return None
+        try:
+            pools = self.client.list_capacity(
+                org_id=request.org_id,
+                project_id=request.project_id,
+                accelerator_type=request.tpu.type,
+            )
+        except (EyvanHTTPError, EyvanUnavailableError):
+            return None
+        offered = {pool.capacity_class for pool in pools if pool.fleet == request.fleet and pool.enabled}
+        if request.tpu.capacity_class in offered or CapacityClass.RESERVED not in offered:
+            return None
+        return CapacityClass.RESERVED
+
+    def _fleet_owning_pool(self, request: CallableSubmission) -> str | None:
+        """Return the fleet when ``request.fleet`` is actually one of its pool ids.
+
+        A pool id is the fleet name plus a suffix (``tpu-x-c56c04d2-v5p-128``),
+        printed beside the fleet in every listing, so it is the easiest wrong
+        name to copy. The match is exact and must be unique; anything else keeps
+        the original placement error.
+        """
+
+        try:
+            pools = self.client.list_capacity(org_id=request.org_id, project_id=request.project_id)
+        except (EyvanHTTPError, EyvanUnavailableError):
+            return None
+        owners = {pool.fleet for pool in pools if pool.pool == request.fleet and pool.fleet != request.fleet}
+        return owners.pop() if len(owners) == 1 else None
+
+    def _create_workload(self, request: CallableSubmission, key: str) -> WorkloadRecord:
+        """Submit once, running an unnamed class on the fleet's reservation when it has no other."""
+
         execution = CallableExecution(
             artifact_uri=request.artifact.uri,
             sha256=request.artifact.sha256,
@@ -589,15 +630,16 @@ class EyvanCallableSubmitter(tp.Generic[R]):
             workspace_sha256=request.workspace_sha256,
             workspace_signature=request.workspace_signature,
         )
-        try:
-            workload = self.client.submit_pool_callable(
+
+        def submit(capacity_class: CapacityClass, idempotency_key: str) -> WorkloadRecord:
+            return self.client.submit_pool_callable(
                 request.fleet,
                 request.tpu.type,
                 execution,
                 org_id=request.org_id,
                 project_id=request.project_id,
                 pods=request.tpu.pods,
-                capacity_class=request.tpu.capacity_class,
+                capacity_class=capacity_class,
                 name=request.callable_name[:200],
                 metadata={"eyvan_invocation_id": request.invocation_id},
                 secret_mounts=request.tpu.secret_mounts,
@@ -610,13 +652,55 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 can_submit_children=request.tpu.can_submit_children,
                 dependencies=tuple(request.tpu.dependencies),
                 atomic=getattr(request.tpu, "atomic", False),
-                idempotency_key=request.invocation_id,
+                idempotency_key=idempotency_key,
             )
+
+        try:
+            return submit(request.tpu.capacity_class, key)
+        except EyvanHTTPError as error:
+            if _placement_error(error) is not None:
+                raise
+            substitute = self._reserved_substitute(request, error)
+            if substitute is None:
+                raise
+            self._terminal_output.note(
+                f"fleet {request.fleet} offers {request.tpu.type} only as {substitute.value} capacity, "
+                f"not {request.tpu.capacity_class.value}; running there because no capacity_class was set "
+                f"(set capacity_class explicitly to require {request.tpu.capacity_class.value})"
+            )
+            # A distinct key: the plane fingerprints the class, so replaying the
+            # refused key with another class would be reported as a key reuse.
+            return submit(substitute, f"{key}:{substitute.value}")
+
+    def submit_callable(self, request: CallableSubmission) -> EyvanJob[R]:
+        """Create a callable workload and bind its durable result reader."""
+
+        reject_remote_callable_signature(request.artifact.signature)
+        try:
+            workload = self._create_workload(request, request.invocation_id)
         except EyvanHTTPError as error:
             placement_error = _placement_error(error)
             if placement_error is None:
                 raise
-            raise placement_error from None
+            # A name with pools of its own is a real fleet lacking this type,
+            # not a mistyped pool id; only an empty answer warrants the lookup.
+            owner = None if placement_error.available_accelerator_types else self._fleet_owning_pool(request)
+            if owner is None:
+                raise placement_error from None
+            self._terminal_output.note(
+                f"{request.fleet} is a pool of fleet {owner}, not a fleet; submitting to {owner} "
+                f'(use init(fleet="{owner}") to name it directly)'
+            )
+            request = replace(request, fleet=owner)
+            try:
+                # Fleet name is part of the plane's fingerprint, so the corrected
+                # request carries its own key rather than replaying the refused one.
+                workload = self._create_workload(request, f"{request.invocation_id}:fleet")
+            except EyvanHTTPError as retry_error:
+                retried = _placement_error(retry_error)
+                if retried is None:
+                    raise
+                raise retried from None
 
         self._terminal_output.submission(
             JobSubmissionReceipt(
