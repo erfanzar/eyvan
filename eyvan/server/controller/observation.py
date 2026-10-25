@@ -56,7 +56,7 @@ from eyvan.server.controller._support import (
 from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import ConflictError, LogCursorRejectedError, NotFoundError
 from eyvan.server.service.expansion import bounded_release
-from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
+from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
@@ -2179,6 +2179,14 @@ class _ControllerObservation:
             # error -- and falling back to the archive is the entire reason the
             # archive exists.
             members = ()
+        if members and not any(lease.state in ACTIVE_LEASE_STATES for lease, _cell in members):
+            # Every lease is already given back, but the cell outlived it: an
+            # attached TPU is not destroyed on release, it is re-fenced at a new
+            # generation for the next job. Its journal no longer belongs to this
+            # attempt, so reading it live was refused as a generation mismatch
+            # and the attempt's archived output became unreachable. A released
+            # attempt is read from its archive, exactly like a deleted cell's.
+            members = ()
         if not members and live_only:
             # An archive writer asking for live lines. There are none, and
             # saying so is the whole point of the flag: the fallback below would
@@ -2734,6 +2742,17 @@ class _ControllerObservation:
         ranks: dict[int, tuple[LogRecord, ...]] = {}
         truncated: set[int] = set()
         gaps: list[str] = []
+        fetched = await self._read_archive_objects(
+            workload,
+            [
+                item["uri"]
+                for item in raw_entries
+                if isinstance(item, dict)
+                and item.get("status") in _ARCHIVE_STATUS_READABLE
+                and isinstance(item.get("uri"), str)
+                and item["uri"]
+            ],
+        )
         for item in raw_entries:
             if not isinstance(item, dict):
                 continue
@@ -2756,13 +2775,8 @@ class _ControllerObservation:
                 truncated.add(rank)
                 gaps.append(f"{rank} (no object)")
                 continue
-            try:
-                blob = await self.service.read_managed_artifact(
-                    org_id=workload.org_id,
-                    project_id=workload.project_id,
-                    uri=uri,
-                )
-            except Exception:
+            blob = fetched.get(uri)
+            if not isinstance(blob, bytes):
                 truncated.add(rank)
                 gaps.append(f"{rank} (unreadable)")
                 continue
@@ -2820,14 +2834,10 @@ class _ControllerObservation:
         missing: list[int] = []
         malformed = 0
         truncated: set[int] = set()
+        fetched = await self._read_archive_objects(workload, [uri for _sequence, uri in chunks])
         for sequence, uri in chunks:
-            try:
-                payload = await self.service.read_managed_artifact(
-                    org_id=workload.org_id,
-                    project_id=workload.project_id,
-                    uri=uri,
-                )
-            except Exception:
+            payload = fetched.get(uri)
+            if not isinstance(payload, bytes):
                 missing.append(sequence)
                 continue
             entries = [entry for entry in _archived_entries(payload) if isinstance(entry, dict)]
@@ -2855,6 +2865,33 @@ class _ControllerObservation:
             detail=detail,
             unavailable=bool(missing) and not any(ranks.values()),
         )
+
+    async def _read_archive_objects(
+        self, workload: WorkloadRecord, uris: tp.Sequence[str]
+    ) -> dict[str, bytes | Exception]:
+        """Read archive objects concurrently; each answer is its bytes or the error it raised.
+
+        One at a time, a 16-rank archive in object storage took over 70 s to
+        replay -- past the SDK's request timeout, so a finished job's logs read
+        as "control plane unavailable". Bounded by ``log_archive_concurrency``,
+        the same ceiling the writer uses. Callers keep their own per-object
+        failure handling: an error is returned in place, never raised.
+        """
+
+        gate = asyncio.Semaphore(max(int(self.settings.log_archive_concurrency), 1))
+
+        async def read(uri: str) -> tuple[str, bytes | Exception]:
+            async with gate:
+                try:
+                    return uri, await self.service.read_managed_artifact(
+                        org_id=workload.org_id,
+                        project_id=workload.project_id,
+                        uri=uri,
+                    )
+                except Exception as exc:
+                    return uri, exc
+
+        return dict(await asyncio.gather(*(read(uri) for uri in dict.fromkeys(uris))))
 
     async def _indexed_archive_replay(self, workload: WorkloadRecord) -> _ArchiveReplay:
         """Read an archive that carries its index inside rank zero's own object.
@@ -2914,12 +2951,15 @@ class _ControllerObservation:
             # surviving lines they must still be replayed.
             ranks.update(truncated)
             unavailable = bool(manifest.get("unavailable"))
-            for rank in sorted(ranks - {0}):
-                try:
-                    record_entries[rank] = [
-                        entry for entry in _archived_entries(await read_rank(rank)) if isinstance(entry, dict)
-                    ]
-                except Exception:
+            others = sorted(ranks - {0})
+            fetched = await self._read_archive_objects(
+                workload, [log_uri(workload.id, workload.attempt, rank) for rank in others]
+            )
+            for rank in others:
+                blob = fetched.get(log_uri(workload.id, workload.attempt, rank))
+                if isinstance(blob, bytes):
+                    record_entries[rank] = [entry for entry in _archived_entries(blob) if isinstance(entry, dict)]
+                else:
                     # The manifest says this rank existed. Losing its object is
                     # therefore explicit truncation, not the end of a contiguous
                     # scan and not a silent empty rank.

@@ -1087,6 +1087,46 @@ async def test_an_archive_without_a_manifest_still_reads_through_the_embedded_in
     assert [(record.rank, record.message) for record in replayed.records] == [(0, "zero"), (1, "one")]
 
 
+async def test_a_released_attempt_on_a_cell_that_outlived_it_reads_its_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attached TPU is re-fenced, not destroyed, when a job releases it.
+
+    Seen live 2026-10-25: once the cell moved to its next generation, every
+    earlier job on it read as "cell ... is at generation 2, not the generation
+    1 this attempt was dispatched against" -- the archive was in storage, but
+    the reader still treated the released lease as a live member.
+    """
+
+    from eyvan.records import LeaseState
+
+    monkeypatch.delenv("EYVAN_LOG_ARCHIVE_MANIFEST_V2_ENABLED", raising=False)
+    controller = await _controller(tmp_path, width=2)
+    _attach(controller, _artifact_access(tmp_path / "artifacts"))
+    controller.workload_log_page = _scripted_page(
+        records=[{"message": "zero", "rank": 0}, {"message": "one", "rank": 1}],
+    )
+    await controller._archive_terminal_logs(await _workload(controller))
+    del controller.workload_log_page  # back to the real reader
+    async with controller.repository.transaction() as transaction:
+        lease = await transaction.get_lease("lease-1")
+        await transaction.put_lease(lease.model_copy(update={"state": LeaseState.RELEASED}))
+        cell = await transaction.get_cell("cell-a")
+        await transaction.put_cell(cell.model_copy(update={"generation": cell.generation + 1}))
+        workload = await transaction.get_workload("wl-1")
+        await transaction.put_workload(workload.model_copy(update={"state": WorkloadState.SUCCEEDED}))
+
+    page = await controller.workload_log_page("wl-1")
+
+    assert page["unavailable"] is False, page.get("detail")
+    assert sorted((record["rank"], record["message"]) for record in page["records"]) == [(0, "zero"), (1, "one")]
+    # A writer asking for live lines is still told there are none, not handed the archive.
+    live = await controller.workload_log_page("wl-1", live_only=True)
+    assert live["unavailable"] is True
+    assert live["records"] == []
+
+
 class _InFlightStore(_RecordingStore):
     """Records the most rank writes that were in flight at once."""
 
