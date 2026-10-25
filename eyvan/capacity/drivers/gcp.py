@@ -1621,10 +1621,22 @@ class GcpTpuCapacityDriver:
         """Return whether a registered native cell still needs rules for ``network``."""
 
         from eyvan.capacity.providers.gcp.native_worker_ingress import FirewallNetworkReference
+        from eyvan.capacity.providers.gcp.tpu_nodes import OPTION_ENDPOINT_MODE, OPTION_SSH_ENTRY
 
         try:
             for other in self.state.load().values():
                 if other.name == released.name or other.project != released.project:
+                    continue
+                if other.metadata.get("capacity_kind") == "attach":
+                    # An attached TPU reaches its worker through this same
+                    # profile rule (``eyvan gcp connect`` adds the tag), but its
+                    # record never carries execution_backend, so it was
+                    # invisible here: releasing the last provisioned cell
+                    # deleted the rule out from under it (seen live 2026-10-25).
+                    # Its VPC is not persisted, so a public, API-reached attach
+                    # claim in this project keeps the rule -- the safe direction.
+                    if other.metadata.get(OPTION_ENDPOINT_MODE) == "public" and not other.metadata.get(OPTION_SSH_ENTRY):
+                        return True
                     continue
                 if other.metadata.get("execution_backend") != "eyvan-native":
                     continue
@@ -2088,6 +2100,7 @@ class GcpCapacityDriver:
             self.state,
             api=attach_api,
             native_worker_port=native_worker_port if native_worker_port is not None else settings.native_worker_port,
+            native_worker_public_ingress=native_worker_public_ingress,
         )
         self.execution_backend = self.attach.execution_backend if self.mode == "attach" else self.tpu.execution_backend
         # Delegated rather than re-read: a router that disagreed with the

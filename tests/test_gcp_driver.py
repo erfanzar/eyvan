@@ -1074,6 +1074,60 @@ def test_release_keeps_an_ingress_rule_another_native_cell_still_uses(monkeypatc
     assert released_rules == []
 
 
+@pytest.mark.parametrize(
+    ("endpoint_mode", "ssh_entry", "kept"),
+    [("public", None, True), ("tunnel", "203.0.113.9", False), ("internal", None, False)],
+)
+def test_release_keeps_an_ingress_rule_a_public_attached_tpu_still_uses(
+    monkeypatch, tmp_path, endpoint_mode, ssh_entry, kept
+) -> None:
+    """Seen live 2026-10-25: releasing the last provisioned cell deleted the rule an attached v5p-8 used."""
+
+    import eyvan.capacity.providers.gcp.native_worker_ingress as ingress_module
+
+    state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
+    driver = _native_driver(
+        state, FakeProvider(), FakeNativeWorkerSecrets(), _TaggedIngress(), FakeNativeWorkerServiceAccountResolver()
+    )
+    driver.apply_capacity(
+        "cell",
+        {
+            **desired(),
+            "executor": "eyvan-native",
+            "provider_options": {"bootstrap_egress": "public-internet", "network": "default"},
+        },
+        context("create"),
+    )
+
+    def attach(record: FleetCellRecord) -> None:
+        record.project = "project-a"
+        record.state = CapacityStatus.HEALTHY
+        record.metadata["capacity_kind"] = "attach"
+        record.metadata["endpoint_mode"] = endpoint_mode
+        if ssh_entry is not None:
+            record.metadata["ssh_entry"] = ssh_entry
+
+    state.mutate_or_create_record("attached", attach, generation=1)
+    released_rules: list[str] = []
+    managed = [
+        ingress_module.ManagedIngressRule(
+            name="eyvan-nw-rule-8100",
+            network=ingress_module.FirewallNetworkReference.from_config(capacity_project="project-a", network=None),
+            network_tag="eyvan-nw-profile",
+            port=8100,
+            source_range="127.0.0.1/32",
+        )
+    ]
+    monkeypatch.setattr(ingress_module, "list_managed_ingress_rules", lambda *, project: managed)
+    monkeypatch.setattr(
+        ingress_module, "release_managed_ingress_rule", lambda *, project, rule_name: released_rules.append(rule_name)
+    )
+
+    driver.release("cell", context("release", generation=2, token="leader-2"))
+
+    assert released_rules == ([] if kept else ["eyvan-nw-rule-8100"])
+
+
 def test_release_sweeps_secrets_left_behind_by_interrupted_releases(monkeypatch, tmp_path) -> None:
     state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
     provider = FakeProvider()

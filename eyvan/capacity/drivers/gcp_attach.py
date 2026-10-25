@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import typing as tp
 from datetime import datetime
 from threading import RLock
@@ -52,6 +53,11 @@ from eyvan.capacity.providers.gcp.tpu_nodes import (
 )
 from eyvan.capacity.providers.gcp.tpu_ssh import SshTpuNodeReader, attach_tunnel_spec
 
+if tp.TYPE_CHECKING:
+    from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerPublicIngress
+
+logger = logging.getLogger(__name__)
+
 
 class TpuNodeReader(tp.Protocol):
     """Anything that reads one node with :meth:`TpuNodeApi.get_node`'s contract."""
@@ -88,6 +94,7 @@ class GcpAttachCapacityDriver:
         native_worker_port: int = 8100,
         ssh_reader_factory: tp.Callable[[SshDestination], TpuNodeReader] | None = None,
         tunnels: SshTunnelManager | None = None,
+        native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
     ) -> None:
         if not _valid_port(native_worker_port):
             raise ValueError("native_worker_port must be a TCP port between 1 and 65535")
@@ -100,6 +107,10 @@ class GcpAttachCapacityDriver:
         self.tunnels = tunnels or SshTunnelManager()
         self._ssh_readers: dict[str, TpuNodeReader] = {}
         self._mutation_lock = RLock()
+        # The profile-owned /32 rule `eyvan gcp connect` opened for a public
+        # claim. Re-ensured on every reconcile, exactly as the provisioning
+        # driver does, so a deleted rule or a changed laptop IP heals itself.
+        self.native_worker_public_ingress = native_worker_public_ingress
 
     def capabilities(self) -> CellCapabilities:
         """Declare native execution on a slice with its real purchase class."""
@@ -384,7 +395,35 @@ class GcpAttachCapacityDriver:
                 )
         return tuple(f"http://{forward.bind}:{forward.local_port}" for forward in spec.forwards), None
 
-    def _read_observation(self, record: FleetCellRecord) -> CellObservation:
+    def _refresh_public_ingress(self, record: FleetCellRecord, node: TpuNode) -> None:
+        """Re-ensure the profile's worker ingress rule for a public, API-reached claim.
+
+        Only when the node actually carries the profile tag, which is what
+        ``eyvan gcp connect`` added and what the rule targets: a node without it
+        is not reached through this rule, and creating one for it would open a
+        port nothing asked for. A failure is logged, never raised -- the
+        readiness probe is what decides whether the worker is reachable, and
+        the next reconcile tries again.
+        """
+
+        ingress = self.native_worker_public_ingress
+        tag = getattr(ingress, "network_tag", None)
+        if (
+            ingress is None
+            or not isinstance(tag, str)
+            or tag not in node.tags
+            or record.metadata.get(OPTION_ENDPOINT_MODE) != "public"
+            or record.metadata.get(OPTION_SSH_ENTRY)
+            or not isinstance(record.project, str)
+            or not record.project
+        ):
+            return
+        try:
+            ingress.ensure(project=record.project, network=node.network, port=self._worker_port(record))
+        except (CapacityProviderError, OSError, ValueError) as exc:
+            logger.warning("attached cell %s worker ingress could not be ensured: %s", record.name, exc)
+
+    def _read_observation(self, record: FleetCellRecord, *, refresh_ingress: bool = False) -> CellObservation:
         if record.desired_state == "down":
             return self._observation(record, state=CapacityStatus.DRAINING)
         try:
@@ -401,6 +440,8 @@ class GcpAttachCapacityDriver:
                 failure_code=exc.code,
                 detail=exc.diagnostic,
             )
+        if refresh_ingress and node is not None:
+            self._refresh_public_ingress(record, node)
         return self._observation(record, node)
 
     def observe(self, cell_id: str) -> CellObservation:
@@ -520,9 +561,10 @@ class GcpAttachCapacityDriver:
                 return self.observe(cell_id)
             except StaleFenceError as exc:
                 raise StaleMutationError(str(exc)) from exc
-        # Provider reads (an SSH round trip for SSH-reached nodes) and tunnel upkeep
-        # run outside the fleet-state lock; the fenced record is already persisted.
-        return self._read_observation(record)
+        # Provider reads (an SSH round trip for SSH-reached nodes), ingress and
+        # tunnel upkeep run outside the fleet-state lock; the fenced record is
+        # already persisted.
+        return self._read_observation(record, refresh_ingress=True)
 
     def drain(self, cell_id: str, context: MutationContext) -> CellObservation:
         """Keep the local claim, but make it unschedulable without provider I/O."""

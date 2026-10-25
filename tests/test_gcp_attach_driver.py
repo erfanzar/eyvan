@@ -139,6 +139,74 @@ class AttachHarness(ProviderConformanceHarness):
             substrate.status = 200
 
 
+class _RecordingIngress:
+    """The profile ingress manager's contract: ensure one rule, return its tag."""
+
+    def __init__(self, network_tag: str = "eyvan-nw-profile", error: Exception | None = None) -> None:
+        self.network_tag = network_tag
+        self.error = error
+        self.calls: list[tuple[str, str | None, int]] = []
+
+    def ensure(self, *, project: str, network: str | None, port: int) -> str:
+        self.calls.append((project, network, port))
+        if self.error is not None:
+            raise self.error
+        return self.network_tag
+
+
+@pytest.mark.parametrize(
+    ("tagged", "endpoint_mode", "expected_calls"),
+    [(True, "public", 1), (False, "public", 0), (True, "internal", 0)],
+)
+def test_reconcile_re_ensures_the_profile_ingress_rule_of_a_public_claim(
+    tmp_path, tagged, endpoint_mode, expected_calls
+):
+    """Seen live 2026-10-25: the rule was deleted and nothing ever put it back."""
+
+    substrate = Substrate()
+    substrate.document["networkConfig"] = {"network": "projects/project-a/global/networks/default"}
+    if tagged:
+        substrate.document["tags"] = ["eyvan-nw-profile", "other-tag"]
+    ingress = _RecordingIngress()
+    driver = GcpAttachCapacityDriver(
+        FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        api=substrate.api,
+        native_worker_port=8111,
+        native_worker_public_ingress=ingress,
+    )
+    desired = _desired()
+    desired["provider_options"] = {**desired["provider_options"], "endpoint_mode": endpoint_mode}
+    driver.apply_capacity("cell", desired, _context())
+    assert ingress.calls == []  # apply never touches the firewall; connect already did
+
+    observation = driver.reconcile("cell", _context("reconcile"))
+
+    assert observation.state is CapacityStatus.HEALTHY
+    assert len(ingress.calls) == expected_calls
+    if expected_calls:
+        assert ingress.calls[0] == ("project-a", "projects/project-a/global/networks/default", 8111)
+    # Still strictly read-only toward the TPU API.
+    assert all(request.method == "GET" for request in substrate.requests)
+
+
+def test_a_failing_ingress_refresh_does_not_fail_the_observation(tmp_path):
+    substrate = Substrate()
+    substrate.document["tags"] = ["eyvan-nw-profile"]
+    ingress = _RecordingIngress(
+        error=CapacityProviderError("gcloud timed out", code=CapacityProviderFailureCode.PROVIDER_UNAVAILABLE)
+    )
+    driver = GcpAttachCapacityDriver(
+        FleetStateStore(LocalBackend(tmp_path / "fleet.json")),
+        api=substrate.api,
+        native_worker_port=8111,
+        native_worker_public_ingress=ingress,
+    )
+    driver.apply_capacity("cell", _desired(), _context())
+
+    assert driver.reconcile("cell", _context("reconcile")).state is CapacityStatus.HEALTHY
+    assert len(ingress.calls) == 1
+
+
 def test_full_provider_conformance(tmp_path):
     harness = AttachHarness(tmp_path)
     report = run_conformance(harness)
