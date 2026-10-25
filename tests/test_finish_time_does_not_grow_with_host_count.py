@@ -235,6 +235,43 @@ async def test_a_background_phase_does_not_hold_the_cycle_and_never_overlaps_its
 
 
 @pytest.mark.asyncio
+async def test_one_slow_cell_observation_does_not_hold_the_observe_cells_phase() -> None:
+    """Seen live: one attached TPU whose worker port was closed cost ~6 s every cycle."""
+
+    interval = 0.05
+    controller, _service, agent, _admin, _workload = await _dispatched(interval)
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    original = agent.reconcile
+
+    def slow(cell_id: str, request: tp.Any) -> tp.Any:
+        calls.append(cell_id)
+        entered.set()
+        assert release.wait(10)
+        return original(cell_id, request)
+
+    agent.reconcile = slow
+    try:
+        started = time.monotonic()
+        assert await controller._observe_cells_once() == 0
+        # Bounded by the scheduler interval, not by the agent's answer.
+        assert time.monotonic() - started < interval + 1.0
+        assert entered.wait(5)
+        # A later pass does not start a second observation of the same cell.
+        await controller._observe_cells_once()
+        assert calls == ["cell-a"]
+    finally:
+        release.set()
+    await asyncio.gather(*list(controller._observing_cells.values()))
+    assert not controller._observing_cells
+    # Once the agent answers promptly again, the pass completes inside itself.
+    agent.reconcile = original
+    assert await controller._observe_cells_once() == 1
+    await controller.close()
+
+
+@pytest.mark.asyncio
 async def test_a_live_log_pass_waits_for_the_terminal_archive_of_the_same_attempt() -> None:
     from eyvan.records import WorkloadState
 

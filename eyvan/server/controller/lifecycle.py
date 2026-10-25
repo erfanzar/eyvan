@@ -113,6 +113,9 @@ class _ControllerLifecycle:
         # (workload, generation). In memory: a leader change cancels them, and
         # the next leader observes the still non-terminal workload and settles it.
         self._settling_workloads: dict[tuple[str, int], asyncio.Task[None]] = {}
+        # Cell observations that outlasted their observe-cells pass, keyed by
+        # (cell, generation), so a later pass does not start a second one.
+        self._observing_cells: dict[tuple[str, int], asyncio.Task[bool]] = {}
         # Leader phases running outside the cycle, by name (see LeaderPhase.background).
         self._background_phases: dict[str, asyncio.Task[bool]] = {}
         # One lock per (workload, attempt) log archive. The live-chunk pass now
@@ -200,6 +203,13 @@ class _ControllerLifecycle:
         drain_s = max(self.settings.cell_reconcile_interval_s, 1.0)
         await self._drain_background_phases(timeout_s=drain_s)
         await self._drain_settlements(timeout_s=drain_s)
+        observing = [task for task in self._observing_cells.values() if not task.done()]
+        if observing:
+            # An abandoned observation writes nothing; the next leader observes again.
+            _done, unfinished = await asyncio.wait(observing, timeout=drain_s)
+            for task in unfinished:
+                task.cancel()
+            await asyncio.gather(*unfinished, return_exceptions=True)
         if self._owns_agent_clients:
             with self._agent_clients_lock:
                 clients = list(self._live_agent_clients.values())

@@ -1456,7 +1456,41 @@ class _ControllerObservation:
             async with semaphore:
                 return await self._observe_cell_once(cell, now)
 
-        return sum(await asyncio.gather(*(reconcile(cell) for cell in cells)))
+        def finished(task: asyncio.Task[bool], key: tuple[str, int]) -> None:
+            self._observing_cells.pop(key, None)
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning("cell %s observation failed", key[0], exc_info=task.exception())
+
+        started: list[asyncio.Task[bool]] = []
+        for cell in cells:
+            key = (cell.id, cell.generation)
+            if key in self._observing_cells:
+                # Its previous observation is still waiting on the agent; a
+                # second one would only queue behind the same capacity lock.
+                continue
+            task = asyncio.ensure_future(reconcile(cell))
+            self._observing_cells[key] = task
+            task.add_done_callback(lambda done, key=key: finished(done, key))
+            started.append(task)
+        if not started:
+            return 0
+        # One cell whose worker never answers -- seen live: an attached TPU
+        # reporting READY while its worker port was closed -- costs the agent's
+        # whole readiness timeout on every observation, and waiting for it held
+        # scheduling and the next workload observation by ~6 s every cycle.
+        # Wait at most one scheduler interval; a slower observation keeps
+        # running and lands on a later cycle, and until then the cell keeps the
+        # state it was last observed in -- the same staleness the cell
+        # reconcile interval already accepts. A non-positive interval keeps the
+        # old fully synchronous pass.
+        interval = self.settings.scheduler_interval_s
+        done, _pending = await asyncio.wait(started, timeout=interval if interval > 0 else None)
+        errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
+        if errors:
+            # Same as before: an observation that raised inside the pass fails
+            # the phase, so the phases that require a fresh view are skipped.
+            raise tp.cast(BaseException, errors[0])
+        return sum(1 for task in done if not task.cancelled() and task.result())
 
     def _note_agent_answered(self, cell: CellRecord) -> None:
         """Clear an unreachable-agent streak, saying so once if there was one."""
