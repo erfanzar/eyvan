@@ -109,10 +109,38 @@ def cache_root() -> Path:
         return Path.cwd() / FALLBACK_CACHE_DIR
 
 
-def _install_commands(environment: Path, requirements: tp.Sequence[str]) -> list[list[str]]:
-    """Return the commands that build ``environment``, preferring uv."""
+#: How long a found ``uv`` gets to prove it runs before the installer falls back.
+_UV_PROBE_TIMEOUT_S = 15.0
+
+
+def _working_uv() -> str | None:
+    """Return a ``uv`` on PATH that actually runs here, or ``None``.
+
+    Found is not the same as runnable. A host whose only ``uv`` is a snap
+    (``/snap/bin/uv``) resolves it on PATH, but snap-confine refuses to start
+    inside the workload's sandboxed systemd unit ("snap-confine is packaged
+    without necessary permissions"), so every job declaring dependencies on
+    that host failed before its command ran -- seen live 2026-10-25 on an
+    attached v5p-8. One ``--version`` call decides; any failure falls back to
+    the interpreter's own ``venv`` and ``pip``, which need nothing from PATH.
+    """
 
     uv = shutil.which("uv")
+    if not uv:
+        return None
+    try:
+        probe = subprocess.run(
+            [uv, "--version"], capture_output=True, text=True, check=False, timeout=_UV_PROBE_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return uv if probe.returncode == 0 else None
+
+
+def _install_commands(environment: Path, requirements: tp.Sequence[str]) -> list[list[str]]:
+    """Return the commands that build ``environment``, preferring a uv that runs."""
+
+    uv = _working_uv()
     if uv:
         return [
             # `--system-site-packages` is not an optimization. Without it the

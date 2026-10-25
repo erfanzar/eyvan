@@ -130,6 +130,41 @@ def test_the_environment_can_see_the_host_accelerator_stack() -> None:
     assert any("--system-site-packages" in command for command in commands)
 
 
+def _fake_uv(directory: Path, *, exit_code: int) -> Path:
+    """A `uv` on PATH whose `--version` exits with ``exit_code`` (a snap refusing to start is non-zero)."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    uv = directory / "uv"
+    uv.write_text(f"#!/bin/sh\necho snap-confine refused >&2\nexit {exit_code}\n")
+    uv.chmod(0o755)
+    return uv
+
+
+@pytest.mark.parametrize(("exit_code", "uses_uv"), [(0, True), (1, False)])
+def test_a_uv_that_cannot_run_falls_back_to_the_interpreters_own_pip(tmp_path, monkeypatch, exit_code, uses_uv) -> None:
+    """Seen live: a snap-packaged uv is on PATH but cannot start inside the workload sandbox."""
+
+    uv = _fake_uv(tmp_path / "bin", exit_code=exit_code)
+    monkeypatch.setenv("PATH", str(uv.parent))
+
+    commands = dependency_entry._install_commands(Path("/tmp/env"), ["flax"])
+
+    assert (commands[0][0] == str(uv)) is uses_uv
+    if not uses_uv:
+        assert commands[0][:3] == [sys.executable, "-m", "venv"]
+        assert commands[1][1:4] == ["-m", "pip", "install"]
+    # Either path keeps the host accelerator stack visible.
+    assert any("--system-site-packages" in command for command in commands)
+
+
+def test_no_uv_on_path_uses_the_interpreters_own_pip(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+
+    commands = dependency_entry._install_commands(Path("/tmp/env"), ["flax"])
+
+    assert commands[0][:3] == [sys.executable, "-m", "venv"]
+
+
 def _fake_install(environment: Path) -> list[list[str]]:
     """Stand in for `uv venv`, which is a command that creates the directory."""
 
