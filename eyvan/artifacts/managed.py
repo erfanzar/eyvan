@@ -131,6 +131,10 @@ class ManagedArtifactDeleteInconclusiveError(ManagedArtifactOperationInconclusiv
 MAX_MANAGED_ARTIFACT_INVENTORY_PAGE_SIZE = 1000
 
 _GCS_JSON_API_ROOT = "https://storage.googleapis.com/storage/v1"
+_GCS_UPLOAD_API_ROOT = "https://storage.googleapis.com/upload/storage/v1"
+#: What a JSON API create answers with: the stat fields plus GCS's own MD5 of
+#: the bytes it stored, which is what lets a create be proven without a read.
+_GCS_UPLOAD_FIELDS = "name,size,generation,md5Hash"
 _GCS_INVENTORY_FIELDS = "items(name,size,generation),nextPageToken"
 _GCS_STAT_FIELDS = "name,size,generation"
 _GCS_INVENTORY_TIMEOUT_SECONDS = 30.0
@@ -466,6 +470,48 @@ def _httpx_gcs_inventory_transport(
                         raise _GCSInventoryResponseTooLarge
                     if int(raw_length) > maximum_response_bytes:
                         raise _GCSInventoryResponseTooLarge
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > maximum_response_bytes:
+                        raise _GCSInventoryResponseTooLarge
+                    body.extend(chunk)
+                return response.status_code, bytes(body)
+    except _GCSInventoryResponseTooLarge:
+        raise
+    except httpx.TimeoutException as exc:
+        raise TimeoutError from exc
+    except httpx.HTTPError as exc:
+        raise OSError from exc
+
+
+class _GCSUploadTransport(tp.Protocol):
+    """Injectable HTTP boundary for one conditional JSON API object create."""
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        content: bytes,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]: ...
+
+
+def _httpx_gcs_upload_transport(
+    url: str,
+    *,
+    headers: tp.Mapping[str, str],
+    content: bytes,
+    timeout_seconds: float,
+    maximum_response_bytes: int,
+) -> tuple[int, bytes]:
+    """POST one simple-media upload, non-redirecting, with a bounded response body."""
+
+    timeout = httpx.Timeout(timeout_seconds)
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            with client.stream("POST", url, headers=dict(headers), content=content) as response:
                 body = bytearray()
                 for chunk in response.iter_bytes():
                     if len(body) + len(chunk) > maximum_response_bytes:
@@ -2856,6 +2902,7 @@ class GCSManagedArtifactStore:
         inventory_transport: _GCSInventoryTransport = _httpx_gcs_inventory_transport,
         access_token_provider: tp.Callable[[], str] = _ambient_gcs_inventory_access_token,
         inventory_timeout_seconds: float = _GCS_INVENTORY_TIMEOUT_SECONDS,
+        upload_transport: _GCSUploadTransport | None = None,
     ):
         if not isinstance(root_uri, str) or any(
             ord(character) < 0x20 or ord(character) == 0x7F for character in root_uri
@@ -2904,6 +2951,14 @@ class GCSManagedArtifactStore:
         # A token is reused for a bounded window and dropped on the first 401.
         self._token_lock = threading.Lock()
         self._cached_token: tuple[str, float] | None = None
+        # Writes go through the JSON API whenever this store talks to real GCS.
+        # A caller that injected its own gcloud runner without an upload
+        # transport keeps the `gcloud storage cp` path it was written against.
+        if upload_transport is None and runner is _default_gcloud_runner:
+            upload_transport = _httpx_gcs_upload_transport
+        if upload_transport is not None and not callable(upload_transport):
+            raise TypeError("GCS upload transport must be callable")
+        self._upload_transport = upload_transport
 
     def _run_gcloud(self, args: tp.Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Run one transfer command with a production deadline.
@@ -3053,6 +3108,36 @@ class GCSManagedArtifactStore:
         if existing is not None:
             return existing
 
+        authored: ManagedArtifactWrite | None = None
+        if self._upload_transport is not None:
+            command_succeeded, authored = self._upload_object(reference, payload, org_id=org_id, project_id=project_id)
+        else:
+            command_succeeded = self._copy_object(reference, payload, org_id=org_id, project_id=project_id)
+        if authored is not None:
+            return authored
+
+        try:
+            # Anything the upload could not prove by checksum -- a failed or
+            # timed-out create, a precondition race, an absent or disagreeing
+            # checksum -- takes the exact byte read, exactly as before.
+            observed = self._matching_current_write(
+                reference.uri,
+                payload,
+                org_id=org_id,
+                project_id=project_id,
+                created=True if command_succeeded else None,
+            )
+        except ManagedArtifactConflictError:
+            raise
+        except (ManagedArtifactInventoryError, ManagedArtifactOperationInconclusiveError, OSError, ValueError):
+            raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write was inconclusive") from None
+        if observed is not None:
+            return observed
+        raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write was inconclusive")
+
+    def _copy_object(self, reference: ManagedArtifactRef, payload: bytes, *, org_id: str, project_id: str) -> bool:
+        """Conditionally create the object with ``gcloud storage cp``; return whether it answered success."""
+
         object_uri = self._object_uri(reference, org_id, project_id)
         temporary_path: Path | None = None
         command_succeeded = False
@@ -3081,22 +3166,95 @@ class GCSManagedArtifactStore:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+        return command_succeeded
 
+    def _send_upload(self, url: str, payload: bytes, token: str) -> tuple[int, bytes]:
+        upload = tp.cast("_GCSUploadTransport", self._upload_transport)
+        response = upload(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream",
+            },
+            content=payload,
+            timeout_seconds=_GCS_TRANSFER_TIMEOUT_SECONDS,
+            maximum_response_bytes=_MAX_GCS_INVENTORY_RESPONSE_BYTES,
+        )
+        if not isinstance(response, tuple) or len(response) != 2:
+            raise ManagedArtifactInventoryError("GCS upload transport returned an invalid response")
+        status_code, body = response
+        if isinstance(status_code, bool) or not isinstance(status_code, int) or not isinstance(body, bytes):
+            raise ManagedArtifactInventoryError("GCS upload transport returned an invalid response")
+        return status_code, body
+
+    def _upload_object(
+        self,
+        reference: ManagedArtifactRef,
+        payload: bytes,
+        *,
+        org_id: str,
+        project_id: str,
+    ) -> tuple[bool, ManagedArtifactWrite | None]:
+        """Conditionally create the object through the JSON API in one request.
+
+        Replaces a ``gcloud storage cp`` process (~2 s) and the full
+        ``gcloud storage cat`` that verified it (~2 s), which together made
+        every archived log rank cost seconds. Returns whether the create was
+        answered as this store's own, and the write when GCS's MD5 of the
+        object it created matches the payload exactly. A create this store
+        authored under ``ifGenerationMatch=0`` whose checksum and size agree is
+        proven without reading the bytes back; every other outcome -- an error,
+        a precondition race, a missing or disagreeing checksum -- returns no
+        write, and the caller performs the exact byte read it always has.
+        """
+
+        object_name = self._object_name(reference, org_id, project_id)
+        url = self._json_api_url(
+            f"b/{quote(self._bucket, safe='')}/o",
+            {"uploadType": "media", "name": object_name, "ifGenerationMatch": "0", "fields": _GCS_UPLOAD_FIELDS},
+            root=_GCS_UPLOAD_API_ROOT,
+        )
         try:
-            observed = self._matching_current_write(
-                reference.uri,
-                payload,
+            token = self._access_token()
+            status_code, body = self._send_upload(url, payload, token)
+            if status_code == 401:
+                # Same rule as inventory: a reused token may have lapsed. The
+                # create never happened, so retrying it once is safe.
+                self._forget_access_token(token)
+                status_code, body = self._send_upload(url, payload, self._access_token())
+        except Exception:
+            return False, None
+        if status_code != 200:
+            return False, None
+        try:
+            decoded = self._decode_gcs_json(body)
+            reported_md5 = decoded.pop("md5Hash", None)
+            _name, metadata = self._metadata_from_gcs_item(
+                decoded,
                 org_id=org_id,
                 project_id=project_id,
-                created=True if command_succeeded else None,
+                expected_name=object_name,
             )
-        except ManagedArtifactConflictError:
-            raise
-        except (ManagedArtifactInventoryError, ManagedArtifactOperationInconclusiveError, OSError, ValueError):
-            raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write was inconclusive") from None
-        if observed is not None:
-            return observed
-        raise ManagedArtifactWriteInconclusiveError("GCS managed artifact write was inconclusive")
+        except ManagedArtifactInventoryError:
+            return True, None
+        expected_md5 = base64.b64encode(hashlib.md5(payload, usedforsecurity=False).digest()).decode("ascii")
+        if (
+            not isinstance(reported_md5, str)
+            or not hmac.compare_digest(reported_md5, expected_md5)
+            or metadata.size_bytes != len(payload)
+        ):
+            return True, None
+        return True, ManagedArtifactWrite(
+            metadata=ManagedArtifactObjectMetadata(
+                uri=metadata.uri,
+                size_bytes=metadata.size_bytes,
+                object_version=metadata.object_version,
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+            created=True,
+        )
 
     def put(self, uri: str, payload: bytes, *, org_id: str, project_id: str) -> str:
         """Compatibility wrapper returning the canonical logical URI."""
@@ -3165,9 +3323,9 @@ class GCSManagedArtifactStore:
         return reference
 
     @staticmethod
-    def _json_api_url(path: str, parameters: tp.Mapping[str, str]) -> str:
+    def _json_api_url(path: str, parameters: tp.Mapping[str, str], *, root: str = _GCS_JSON_API_ROOT) -> str:
         query = urlencode(tuple(parameters.items()), doseq=False, safe="", quote_via=quote)
-        url = f"{_GCS_JSON_API_ROOT}/{path}?{query}"
+        url = f"{root}/{path}?{query}"
         try:
             url_size = len(url.encode("ascii"))
         except UnicodeEncodeError:

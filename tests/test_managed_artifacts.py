@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -1617,6 +1618,171 @@ def test_gcs_store_reports_a_second_rejection_without_looping() -> None:
     assert "provider-secret" not in str(rejected.value)
     assert len(seen) == 2
     assert tokens.issued == ["token-0", "token-1"]
+
+
+class _JsonUploads:
+    """A JSON API upload endpoint backed by the fake runner's object table."""
+
+    def __init__(self, runner: FakeGcloudRunner) -> None:
+        self.runner = runner
+        self.calls: list[tuple[str, str]] = []
+        self.answers: list[tuple[int, bytes] | Exception] = []
+        self.md5_override: str | None = None
+        self.omit_md5 = False
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        headers: tp.Mapping[str, str],
+        content: bytes,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> tuple[int, bytes]:
+        del timeout_seconds, maximum_response_bytes
+        self.calls.append((url, headers["Authorization"]))
+        if self.answers:
+            answer = self.answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        parsed = urlsplit(url)
+        assert parsed.path.startswith("/upload/storage/v1/b/") and parsed.path.endswith("/o")
+        query = dict(part.split("=", 1) for part in parsed.query.split("&"))
+        assert query["uploadType"] == "media" and query["ifGenerationMatch"] == "0"
+        bucket = unquote(parsed.path.split("/b/", 1)[1].rsplit("/o", 1)[0])
+        name = unquote(query["name"])
+        uri = f"gs://{bucket}/{name}"
+        with self.runner._lock:
+            if uri in self.runner.objects:
+                return 412, b'{"error":"provider-secret"}'
+            self.runner._next_generation += 1
+            self.runner.objects[uri] = (content, self.runner._next_generation)
+            generation = self.runner._next_generation
+        document: dict[str, str] = {"name": name, "size": str(len(content)), "generation": str(generation)}
+        if not self.omit_md5:
+            document["md5Hash"] = self.md5_override or base64.b64encode(hashlib.md5(content).digest()).decode()
+        return 200, json.dumps(document).encode()
+
+
+def _json_upload_store(runner: FakeGcloudRunner) -> tuple[GCSManagedArtifactStore, _JsonUploads]:
+    uploads = _JsonUploads(runner)
+    store = GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        runner=runner,
+        inventory_transport=runner.inventory,
+        access_token_provider=lambda: "fake-access-token",
+        upload_transport=uploads,
+    )
+    return store, uploads
+
+
+def _gcloud_verbs(runner: FakeGcloudRunner) -> list[str]:
+    return [command[2] for command in runner.calls]
+
+
+def test_a_json_upload_with_a_matching_checksum_is_not_read_back() -> None:
+    """One JSON request replaced `gcloud storage cp` and the full `cat` that verified it."""
+
+    runner = FakeGcloudRunner()
+    store, uploads = _json_upload_store(runner)
+    uri = result_uri("json-upload")
+
+    written = store.put_versioned(uri, b"payload", org_id="acme", project_id="research")
+
+    assert written.created is True
+    assert written.metadata.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert written.metadata.size_bytes == len(b"payload")
+    assert len(uploads.calls) == 1
+    assert _gcloud_verbs(runner) == []  # no cp, no cat
+    # The stored generation is the one reported, and reads still see the bytes.
+    current = store.stat(uri, org_id="acme", project_id="research")
+    assert current is not None and current.object_version == written.metadata.object_version
+    assert store.get(uri, org_id="acme", project_id="research") == b"payload"
+    # Retrying the identical write is still recognised as already present.
+    assert store.put_versioned(uri, b"payload", org_id="acme", project_id="research").created is False
+
+
+@pytest.mark.parametrize("disagreement", ["md5", "absent-md5"])
+def test_a_json_upload_whose_checksum_does_not_prove_the_bytes_falls_back_to_an_exact_read(disagreement: str) -> None:
+    runner = FakeGcloudRunner()
+    store, uploads = _json_upload_store(runner)
+    if disagreement == "md5":
+        uploads.md5_override = base64.b64encode(b"\0" * 16).decode()
+    else:
+        uploads.omit_md5 = True
+
+    written = store.put_versioned(result_uri(f"json-{disagreement}"), b"payload", org_id="acme", project_id="research")
+
+    assert written.created is True
+    assert written.metadata.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert _gcloud_verbs(runner) == ["cat"]
+
+
+def test_a_json_upload_that_lost_a_create_race_is_settled_by_the_bytes() -> None:
+    runner = FakeGcloudRunner()
+    store, uploads = _json_upload_store(runner)
+    uri = result_uri("json-race")
+    object_uri = f"gs://eyvan-managed/artifacts/scopes/{storage_scope('acme', 'research')}/results/json-race.result"
+    real_upload = uploads.__call__
+
+    def racing(url: str, **kwargs: tp.Any) -> tuple[int, bytes]:
+        # Another writer lands identical bytes just before this create.
+        runner.replace(object_uri, kwargs["content"])
+        return real_upload(url, **kwargs)
+
+    store._upload_transport = racing  # type: ignore[assignment]
+    identical = store.put_versioned(uri, b"same", org_id="acme", project_id="research")
+    assert identical.created is None
+    assert identical.metadata.sha256 == hashlib.sha256(b"same").hexdigest()
+
+    def conflicting(url: str, **kwargs: tp.Any) -> tuple[int, bytes]:
+        runner.replace(object_uri.replace("json-race", "json-race-2"), b"other")
+        return real_upload(url, **kwargs)
+
+    store._upload_transport = conflicting  # type: ignore[assignment]
+    with pytest.raises(ManagedArtifactConflictError):
+        store.put_versioned(result_uri("json-race-2"), b"mine", org_id="acme", project_id="research")
+
+
+def test_a_json_upload_transport_failure_is_inconclusive_not_trusted() -> None:
+    runner = FakeGcloudRunner()
+    store, uploads = _json_upload_store(runner)
+    uploads.answers.append(TimeoutError())
+
+    with pytest.raises(ManagedArtifactWriteInconclusiveError) as inconclusive:
+        store.put_versioned(result_uri("json-timeout"), b"payload", org_id="acme", project_id="research")
+
+    assert str(inconclusive.value) == "GCS managed artifact write was inconclusive"
+    assert not runner.objects
+
+
+def test_a_json_upload_retries_a_rejected_token_once() -> None:
+    runner = FakeGcloudRunner()
+    tokens = _CountingTokens()
+    uploads = _JsonUploads(runner)
+    store = GCSManagedArtifactStore(
+        "gs://eyvan-managed/artifacts",
+        runner=runner,
+        inventory_transport=runner.inventory,
+        access_token_provider=tokens,
+        upload_transport=uploads,
+    )
+    uploads.answers.append((401, b'{"error":"provider-secret"}'))
+
+    written = store.put_versioned(result_uri("json-401"), b"payload", org_id="acme", project_id="research")
+
+    assert written.created is True
+    assert [authorization for _url, authorization in uploads.calls] == ["Bearer token-0", "Bearer token-1"]
+    assert _gcloud_verbs(runner) == []
+
+
+def test_the_default_gcs_store_uploads_through_the_json_api() -> None:
+    from eyvan.artifacts.managed import _httpx_gcs_upload_transport
+
+    assert GCSManagedArtifactStore("gs://eyvan-managed/artifacts")._upload_transport is _httpx_gcs_upload_transport
+    # An injected gcloud runner without an upload transport keeps the cp path.
+    assert FakeGcloudRunner().store()._upload_transport is None
 
 
 def test_gcs_cp_timeout_after_commit_is_resolved_by_an_exact_digest_read() -> None:
