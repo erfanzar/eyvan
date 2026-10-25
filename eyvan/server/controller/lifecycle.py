@@ -109,6 +109,18 @@ class _ControllerLifecycle:
         # chunk it was captured with, so losing this map costs one listing per
         # attempt rather than a replayed archive.
         self._log_chunk_progress: dict[tuple[str, int], _LogChunkProgress] = {}
+        # Terminal settlements still archiving in the background, keyed by
+        # (workload, generation). In memory: a leader change cancels them, and
+        # the next leader observes the still non-terminal workload and settles it.
+        self._settling_workloads: dict[tuple[str, int], asyncio.Task[None]] = {}
+        # Leader phases running outside the cycle, by name (see LeaderPhase.background).
+        self._background_phases: dict[str, asyncio.Task[bool]] = {}
+        # One lock per (workload, attempt) log archive. The live-chunk pass now
+        # runs beside settlement, and the terminal archive resumes from the last
+        # chunk's cursor: a chunk landing mid-settlement would be archived twice.
+        self._log_archive_locks: weakref.WeakValueDictionary[tuple[str, int], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._owns_agent_clients = agent_factory is None
         self._agent_factory = agent_factory or self._default_agent
         self._leader_cycle_lock = asyncio.Lock()
@@ -139,9 +151,55 @@ class _ControllerLifecycle:
             return contextlib.nullcontext()
         return self.metrics.measure_reconcile(operation)
 
+    async def _drain_settlements(self, *, timeout_s: float) -> None:
+        """Let in-flight terminal settlements finish, then cancel any that will not.
+
+        A cancelled settlement is safe to abandon: the archive is resumable and
+        immutable per rank, and the workload is still non-terminal, so the next
+        leader observes and settles it again.
+        """
+
+        pending = list(self._settling_workloads.values())
+        if not pending:
+            return
+        _done, unfinished = await asyncio.wait(pending, timeout=timeout_s)
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+
+    def _log_archive_lock(self, workload_id: str, attempt: int) -> asyncio.Lock:
+        """Return the lock serializing every archive write for one attempt."""
+
+        key = (workload_id, attempt)
+        lock = self._log_archive_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._log_archive_locks[key] = lock
+        return lock
+
+    async def _drain_background_phases(self, *, timeout_s: float) -> None:
+        """Let background phases finish, then cancel any that will not.
+
+        Each background phase is a resumable housekeeping pass: a cancelled one
+        loses only work the next leader's pass redoes.
+        """
+
+        pending = [task for task in self._background_phases.values() if not task.done()]
+        self._background_phases.clear()
+        if not pending:
+            return
+        _done, unfinished = await asyncio.wait(pending, timeout=timeout_s)
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+
     async def close(self) -> None:
         """Release cached HTTP pools and scheduler leadership."""
 
+        # Before the agent clients go: settlements and background phases use them.
+        drain_s = max(self.settings.cell_reconcile_interval_s, 1.0)
+        await self._drain_background_phases(timeout_s=drain_s)
+        await self._drain_settlements(timeout_s=drain_s)
         if self._owns_agent_clients:
             with self._agent_clients_lock:
                 clients = list(self._live_agent_clients.values())

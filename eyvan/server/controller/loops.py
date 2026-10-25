@@ -164,11 +164,16 @@ class _ControllerLoops:
             # Its failures are isolated for the same reason settlement swallows
             # its own: a cell that will not answer about its journal is not a
             # reason to stop scheduling work.
+            #
+            # Off the cycle: it uploads to object storage, which took up to 39 s
+            # live, and observation -- what notices a job has finished -- waited.
+            # Per-attempt locks keep it from racing the terminal archive.
             LeaderPhase(
                 "archive-live-logs",
                 self.archive_running_logs_once,
                 interval_s=self.settings.log_archive_interval_s,
                 zero_interval_disables=True,
+                background=True,
             ),
             # Retention is housekeeping and must never delay placement, so it runs
             # last, on its own slow interval, and its failures are isolated.
@@ -282,41 +287,67 @@ class _ControllerLoops:
                 continue
             if not await self.leader.acquire():
                 return due
-            # One span per phase is where tracing earns its keep: a slow leader
-            # cycle is almost always one phase, and the span names it. Without a
-            # configured tracer provider this is a null context, so it costs
-            # nothing when nobody is collecting.
-            with trace_span("eyvan.leader_phase", phase=phase.name):
-                started = time.monotonic()
-                try:
-                    await phase.run()
-                except Exception:
-                    # Contained, always. A failure used to propagate out of the
-                    # whole cycle, and because the phases that release capacity
-                    # and settle billing sit in the middle of this list, one
-                    # failure upstream of them left an accelerator running that
-                    # nobody was going to stop paying for. Observed on a live
-                    # v5p-16 multislice.
-                    #
-                    # What the old behaviour protected is kept by ``requires``:
-                    # a phase that commits work against the plane's view is
-                    # skipped above when that view is stale, rather than being
-                    # stopped as a side effect of an unrelated failure.
-                    failed.add(phase.name)
-                    logger.exception("leader phase %s failed; the rest of this cycle continues", phase.name)
-                elapsed = time.monotonic() - started
-                # Slow by the plane's own definition: one phase alone outlasted
-                # the interval the whole cycle is meant to fit in, so everything
-                # after it -- scheduling included -- waited. No new threshold:
-                # the operator already chose this number.
-                if elapsed > self.settings.scheduler_interval_s:
-                    logger.warning(
-                        "leader phase %s took %.1fs, longer than the %.1fs scheduler interval",
-                        phase.name,
-                        elapsed,
-                        self.settings.scheduler_interval_s,
-                    )
+            if phase.background:
+                self._start_background_phase(phase)
+                continue
+            if not await self._run_phase(phase):
+                failed.add(phase.name)
         return due
+
+    def _start_background_phase(self, phase: LeaderPhase) -> None:
+        """Start ``phase`` off the cycle unless its previous pass is still running.
+
+        Seen live on a 16-host slice: the live-log archive spent up to 39 s
+        uploading chunks to object storage, and every phase after it -- and the
+        next cycle's observation, which is what notices a job has finished --
+        waited for it.
+        """
+
+        running = self._background_phases.get(phase.name)
+        if running is not None and not running.done():
+            return
+        self._background_phases[phase.name] = asyncio.ensure_future(self._run_phase(phase))
+
+    async def _run_phase(self, phase: LeaderPhase) -> bool:
+        """Run one phase, containing and timing its failure; return whether it succeeded."""
+
+        succeeded = True
+        # One span per phase is where tracing earns its keep: a slow leader
+        # cycle is almost always one phase, and the span names it. Without a
+        # configured tracer provider this is a null context, so it costs
+        # nothing when nobody is collecting.
+        with trace_span("eyvan.leader_phase", phase=phase.name):
+            started = time.monotonic()
+            try:
+                await phase.run()
+            except Exception:
+                # Contained, always. A failure used to propagate out of the
+                # whole cycle, and because the phases that release capacity
+                # and settle billing sit in the middle of this list, one
+                # failure upstream of them left an accelerator running that
+                # nobody was going to stop paying for. Observed on a live
+                # v5p-16 multislice.
+                #
+                # What the old behaviour protected is kept by ``requires``:
+                # a phase that commits work against the plane's view is
+                # skipped above when that view is stale, rather than being
+                # stopped as a side effect of an unrelated failure.
+                succeeded = False
+                logger.exception("leader phase %s failed; the rest of this cycle continues", phase.name)
+            elapsed = time.monotonic() - started
+            # Slow by the plane's own definition: one phase alone outlasted
+            # the interval the whole cycle is meant to fit in, so everything
+            # after it -- scheduling included -- waited. No new threshold:
+            # the operator already chose this number. A background phase is
+            # reported too: it no longer delays the cycle, but it is still slow.
+            if elapsed > self.settings.scheduler_interval_s:
+                logger.warning(
+                    "leader phase %s took %.1fs, longer than the %.1fs scheduler interval",
+                    phase.name,
+                    elapsed,
+                    self.settings.scheduler_interval_s,
+                )
+        return succeeded
 
     async def _run_scheduler_loop(self, stop: asyncio.Event) -> None:
         """Run leader-only global reconciliation without blocking outbox delivery."""

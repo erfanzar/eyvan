@@ -227,7 +227,8 @@ class _ControllerSettlement:
         # leave a finished workload holding an accelerator because its logs were
         # unreadable. Capacity is settled on every path.
         try:
-            await self._archive_terminal_logs(workload)
+            async with self._log_archive_lock(workload.id, workload.attempt):
+                await self._archive_terminal_logs(workload)
         except Exception:
             logger.warning("could not archive logs for %s before release", workload.id, exc_info=True)
         await self.service.settle_terminal_workload(

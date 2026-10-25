@@ -107,7 +107,7 @@ class _ControllerLogArchival:
         gate = asyncio.Semaphore(max(int(self.settings.log_archive_concurrency), 1))
 
         async def archive(workload: WorkloadRecord) -> bool:
-            async with gate:
+            async with gate, self._log_archive_lock(workload.id, workload.attempt):
                 try:
                     return await self._archive_log_chunk(workload, limit=limit)
                 except Exception:

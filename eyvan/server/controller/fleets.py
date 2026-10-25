@@ -246,23 +246,33 @@ class _ControllerFleets:
                 for cell in await transaction.list_cells()
                 if cell.state is CellState.READY and cell.id not in leased_ids
             ]
-        drained = 0
-        for cell in cells:
-            if self._agent_backoff.backing_off(cell):
-                # Observation found this agent unreachable and will say when it
-                # answers again; asking it here too only repeats the refusal and
-                # the log line, every interval.
-                continue
-            # One cell at a time, with an unreadable agent skipped rather than
-            # raised: the dispatch guard must refuse what it cannot prove, but
-            # a sweep that aborted on one unreachable endpoint would hold the
+        # Observation found a backing-off agent unreachable and will say when it
+        # answers again; asking it here too only repeats the refusal and the log
+        # line, every interval.
+        cells = [cell for cell in cells if not self._agent_backoff.backing_off(cell)]
+        gate = asyncio.Semaphore(max(1, self.settings.cell_reconcile_concurrency))
+
+        async def read(cell: CellRecord) -> list[tuple[CellRecord, str]] | None:
+            # Each cell on its own, with an unreadable agent skipped rather than
+            # raised: the dispatch guard must refuse what it cannot prove, but a
+            # sweep that aborted on one unreachable endpoint would hold the
             # *other* stale cells billing for a full interval. Unreadable is a
             # third state, not a mismatch, and the next pass asks again.
-            try:
-                stale = await self._stale_build_report((cell,), head_digest)
-            except Exception as exc:
-                logger.info("cell %s build could not be read; left for the next pass: %s", cell.id, exc)
-                continue
+            #
+            # Concurrently, bounded like observation: asked one at a time, this
+            # phase cost the sum of every agent and worker round trip (8.5 s live)
+            # and every phase after it -- scheduling and observation included --
+            # waited.
+            async with gate:
+                try:
+                    return await self._stale_build_report((cell,), head_digest)
+                except Exception as exc:
+                    logger.info("cell %s build could not be read; left for the next pass: %s", cell.id, exc)
+                    return None
+
+        reports = await asyncio.gather(*(read(cell) for cell in cells))
+        drained = 0
+        for cell, stale in zip(cells, reports, strict=True):
             if not stale:
                 continue
             _cell, description = stale[0]

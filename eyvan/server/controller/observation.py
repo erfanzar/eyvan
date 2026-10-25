@@ -129,6 +129,12 @@ _ARCHIVE_STATUS_UNREACHED = frozenset({"unreachable", "failed"})
 
 _ARCHIVED_RANK_SCAN_LIMIT = LOG_ARCHIVE_LEGACY_RANK_SCAN_LIMIT
 _SECRET_OUTPUT_SUPPRESSED = "output suppressed for secret-bearing execution"
+
+#: Remote outcomes whose application archives every rank's output before the
+#: lease is released. Only these leave the observation pass's critical path.
+_SETTLING_WORKLOAD_STATUSES = frozenset(
+    {ExecutionWorkloadStatus.SUCCEEDED, ExecutionWorkloadStatus.FAILED, ExecutionWorkloadStatus.STOPPED}
+)
 #: Answer to a ``live_only`` read of an attempt whose capacity is gone. Said
 #: rather than answered from the archive, so an archive writer cannot be handed
 #: its own output back and store a second copy of it.
@@ -568,7 +574,12 @@ class _ControllerObservation:
                 topic="workload.dispatch",
             )
         observed = 0
+        started: list[asyncio.Task[None]] = []
         for workload in workloads:
+            if (workload.id, workload.generation) in self._settling_workloads:
+                # Its terminal settlement is still archiving in the background;
+                # observing it again would only race that settlement.
+                continue
             lease_ids = self._workload_lease_ids(workload)
             members = tuple(leases.get(lease_id) for lease_id in lease_ids)
             concrete_leases = tuple(lease for lease in members if lease is not None)
@@ -699,21 +710,50 @@ class _ControllerObservation:
                 detail = _SECRET_OUTPUT_SUPPRESSED if workload.spec.secret_mounts else redact_secret_material(str(exc))
                 logger.warning("workload %s observation failed: %s", workload.id, detail)
                 continue
-            try:
-                if is_group:
-                    await self._recover_group_member_leases(workload, pairs, remote.status)
-                await self._apply_workload_observation(
-                    workload,
-                    lease,
-                    cell,
-                    remote.status,
-                    remote.message,
-                    observed_members=pairs,
-                )
-            except Exception as exc:
-                logger.info("workload %s observation became stale: %s", workload.id, exc)
+            apply = self._apply_observed_workload(workload, lease, cell, pairs, remote.status, remote.message)
+            if remote.status in _SETTLING_WORKLOAD_STATUSES:
+                key = (workload.id, workload.generation)
+                task = asyncio.ensure_future(apply)
+                self._settling_workloads[key] = task
+                task.add_done_callback(lambda _task, key=key: self._settling_workloads.pop(key, None))
+                started.append(task)
+            else:
+                await apply
             observed += 1
+        if started:
+            # Terminal settlement archives every rank's output before the lease
+            # is released, and against a remote store that costs seconds per
+            # rank -- 197 s on a 16-host slice, during which no other workload
+            # was observed or scheduled. Wait at most one scheduler interval:
+            # a fast settlement completes inside this pass exactly as before,
+            # and a slow one keeps running while the cycle moves on. Its key
+            # stays in ``_settling_workloads`` until it finishes, so no later
+            # pass settles the same attempt twice; every write it makes is
+            # fenced on generation and lease, so it stays safe against phases
+            # that run meanwhile.
+            # A non-positive interval keeps the fixed cadence everywhere else,
+            # so it keeps the old fully synchronous settlement here too.
+            interval = self.settings.scheduler_interval_s
+            await asyncio.wait(started, timeout=interval if interval > 0 else None)
         return observed
+
+    async def _apply_observed_workload(
+        self,
+        workload: WorkloadRecord,
+        lease: LeaseRecord,
+        cell: CellRecord,
+        pairs: tuple[tuple[LeaseRecord, CellRecord], ...],
+        status: ExecutionWorkloadStatus,
+        message: str | None,
+    ) -> None:
+        """Apply one observation, containing its failure the way the pass always has."""
+
+        try:
+            if len(pairs) > 1:
+                await self._recover_group_member_leases(workload, pairs, status)
+            await self._apply_workload_observation(workload, lease, cell, status, message, observed_members=pairs)
+        except Exception as exc:
+            logger.info("workload %s observation became stale: %s", workload.id, exc)
 
     async def _recover_group_member_leases(
         self,

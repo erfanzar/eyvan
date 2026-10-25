@@ -143,6 +143,30 @@ logger = logging.getLogger(__name__)
 # the original deadline, rather than starting a fresh budget in each wave.
 _EXEC_CONCURRENCY_LIMIT = 16
 
+_T = tp.TypeVar("_T")
+
+
+def _each_host(
+    workers: tp.Sequence[NativeRemoteExecutor],
+    read: tp.Callable[[int, NativeRemoteExecutor], _T],
+) -> list[_T]:
+    """Run one read-only call on every host at once and return the answers in rank order.
+
+    A slice is asked about by the controller's observation pass, which every
+    other workload waits behind, so a host-at-a-time walk made each poll cost
+    the *sum* of its hosts -- linear in slice width. Concurrently it costs the
+    slowest host, bounded by the same thread ceiling ``exec`` uses. Only reads
+    go through here: mutations keep their sequential, fence-checked walks.
+    """
+
+    if len(workers) <= 1:
+        return [read(rank, worker) for rank, worker in enumerate(workers)]
+    with ThreadPoolExecutor(
+        max_workers=min(len(workers), _EXEC_CONCURRENCY_LIMIT), thread_name_prefix="eyvan-read"
+    ) as pool:
+        futures = [pool.submit(copy_context().run, read, rank, worker) for rank, worker in enumerate(workers)]
+        return [future.result() for future in futures]
+
 
 def _exec_fanout(
     workers: tp.Sequence[tuple[int, str, NativeRemoteExecutor]],
@@ -1097,8 +1121,8 @@ class NativeSliceExecutor:
     def status(self, remote_id: str) -> NativeSliceWorkloadResult:
         """Aggregate typed rank observations into one durable slice state."""
 
-        workers: list[_SliceWorkerObservation] = []
-        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
+        def observe(rank: int, worker: NativeRemoteExecutor) -> _SliceWorkerObservation:
+            endpoint = self.endpoints[rank]
             try:
                 observation = _normalize_worker_observation(
                     worker.status(remote_id),
@@ -1121,13 +1145,9 @@ class NativeSliceExecutor:
                     remote_id,
                     _invalid_observation_reason(exc, endpoint=endpoint),
                 )
-            workers.append(
-                _SliceWorkerObservation(
-                    rank=rank,
-                    endpoint=endpoint,
-                    observation=observation,
-                )
-            )
+            return _SliceWorkerObservation(rank=rank, endpoint=endpoint, observation=observation)
+
+        workers = _each_host(self._workers, observe)
         status = _aggregate_status(workers)
         message = _aggregate_message(workers)
         if status is ExecutionWorkloadStatus.FAILED:
@@ -1326,13 +1346,16 @@ class NativeSliceExecutor:
             )
         _attempt = outcome.attempt if isinstance(outcome, CursorResume) else None
         cursors = outcome.cursors if isinstance(outcome, CursorResume) else {}
+
+        def read(rank: int, worker: NativeRemoteExecutor) -> LogPage:
+            try:
+                return worker.log_page(remote_id, after=cursors.get(rank, ""), limit=limit)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                return LogPage(unavailable=True, detail=f"{type(exc).__name__}: {exc}")
+
         pages: dict[int, LogPage] = {}
         next_cursors: dict[int, str] = {}
-        for rank, worker in enumerate(self._workers):
-            try:
-                page = worker.log_page(remote_id, after=cursors.get(rank, ""), limit=limit)
-            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-                page = LogPage(unavailable=True, detail=f"{type(exc).__name__}: {exc}")
+        for rank, page in enumerate(_each_host(self._workers, read)):
             pages[rank] = LogPage(
                 records=tuple(replace(record, rank=rank) for record in page.records),
                 next_cursor=page.next_cursor,

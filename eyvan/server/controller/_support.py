@@ -274,6 +274,12 @@ class LeaderPhase:
     #: capacity back names nothing, because reclaiming is safe on any view and
     #: not reclaiming is the expensive mistake.
     requires: tuple[str, ...] = ()
+    #: Run outside the cycle instead of inside it. The cycle starts the phase and
+    #: moves on; a pass still running when the phase is next due is not started
+    #: again. Only for phases no other phase ``requires`` and whose writes are
+    #: safe against the phases that run meanwhile -- the cycle cannot see their
+    #: failures in the pass that caused them.
+    background: bool = False
 
 
 @dataclass(frozen=True, slots=True)
