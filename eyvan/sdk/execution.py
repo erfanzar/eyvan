@@ -198,6 +198,112 @@ def _ensure_fleet_applied(client: tp.Any, fleet: str | None, cache_dir: Path | N
     )
 
 
+def _stderr_note(message: str) -> None:
+    import sys
+
+    print(f"Eyvan: {message}", file=sys.stderr, flush=True)
+
+
+def _fleet_exists(transport: tp.Any, fleet: str) -> bool | None:
+    """Return whether the plane has fleet ``fleet``; ``None`` when it could not say."""
+
+    try:
+        transport.request_checked("GET", f"/api/v1/fleets/{fleet}")
+    except EyvanHTTPError as error:
+        return False if error.status_code == 404 else None
+    except EyvanUnavailableError:
+        return None
+    return True
+
+
+def _run_connect(base_url: str, project: str, zone: str, name: str) -> int:
+    """Run ``eyvan gcp connect`` for one discovered TPU, its progress shown on stderr."""
+
+    import subprocess
+    import sys
+
+    from eyvan._internal.subprocess_env import provider_cli_env
+
+    argv = [
+        sys.executable,
+        "-m",
+        "eyvan.sdk.cli",
+        "--url",
+        base_url,
+        "gcp",
+        "connect",
+        "--tpu",
+        name,
+        "--project",
+        project,
+        "--zone",
+        zone,
+    ]
+    try:
+        stdout: tp.Any = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        stdout = None
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stdout, env=provider_cli_env(), check=False).returncode
+
+
+def _connect_discovered_tpu(
+    client: tp.Any,
+    fleet: str | None,
+    base_url: str,
+    *,
+    index: tp.Any = None,
+    connect: tp.Callable[[str, str, str, str], int] = _run_connect,
+    note: tp.Callable[[str], None] | None = None,
+) -> str | None:
+    """Return the fleet to submit to, connecting a discovered TPU on its first use.
+
+    ``fleet`` may be a discovered TPU's fleet name or its plain node name. Only
+    a name the plane does not know is looked up, so a fleet that already exists
+    is never re-examined and a typo costs one read. A TPU that was discovered
+    (read-only, ``eyvan gcp sync``) but never connected is connected here with
+    the same command a person would run, so its failures name the same steps.
+    """
+
+    if not fleet:
+        return fleet
+    transport = getattr(client, "_transport", None)
+    if transport is None or _fleet_exists(transport, fleet) is not False:
+        return fleet
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex
+
+    say = note if note is not None else _stderr_note
+    index = index if index is not None else DiscoveryIndex()
+    snapshot = index.load()
+    tpu = snapshot.resolve(fleet) if snapshot is not None else None
+    if tpu is None and not (snapshot is not None and snapshot.ambiguous(fleet)):
+        try:
+            snapshot = index.refresh()
+        except Exception as exc:  # discovery is best effort: the placement error still names what exists
+            say(f"could not list your GCP TPUs to look up {fleet!r}: {exc}")
+            return fleet
+        tpu = snapshot.resolve(fleet)
+    if tpu is None:
+        clashes = snapshot.ambiguous(fleet) if snapshot is not None else ()
+        if clashes:
+            names = ", ".join(f"{t.fleet} ({t.project}/{t.zone})" for t in clashes)
+            raise ValueError(f"TPU name {fleet!r} exists in more than one place; use its fleet name: {names}")
+        return fleet
+    if tpu.fleet != fleet and _fleet_exists(transport, tpu.fleet):
+        say(f"{fleet} is TPU {tpu.project}/{tpu.zone}/{tpu.name}; using its fleet {tpu.fleet}")
+        return tpu.fleet
+    say(
+        f"{fleet} is TPU {tpu.project}/{tpu.zone}/{tpu.name} ({tpu.accelerator_type}), not connected yet; "
+        "connecting it now (one time)"
+    )
+    code = connect(base_url, tpu.project, tpu.zone, tpu.name)
+    if code != 0:
+        raise RuntimeError(
+            f"could not connect TPU {tpu.project}/{tpu.zone}/{tpu.name} (see the failed step above); "
+            f"retry with: eyvan gcp connect --tpu {tpu.name} --project {tpu.project} --zone {tpu.zone}"
+        )
+    return tpu.fleet
+
+
 def _validate_native_gcp_artifact_override(
     artifact_uri: str | None,
     artifact_store: ArtifactStore | None,
@@ -420,6 +526,14 @@ def init(
     # rather than leaving it to the operator is the difference between one
     # command and four, and a fleet that is already serving is untouched.
     if client is not None and endpoint.is_loopback and in_job_context(environment) is None:
+        # A TPU in the operator's GCP account is usable by name before anyone
+        # connected it. Only with a local GCP runtime: that is what owns the
+        # credential the connect needs, and without it nothing is looked up.
+        if runtime_profile is not None:
+            from eyvan.capacity.providers.gcp.tpu_discovery import refresh_in_background
+
+            configured_fleet = _connect_discovered_tpu(client, configured_fleet, endpoint.url)
+            refresh_in_background()
         _ensure_fleet_applied(
             client,
             configured_fleet,

@@ -404,6 +404,66 @@ def connect(
         raise click.ClickException(str(exc)) from exc
 
 
+@gcp.command("sync")
+@click.option("--project", "project_ids", multiple=True, help="Only these GCP projects (repeatable); default all.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the discovery index as JSON.")
+@click.pass_obj
+def sync(session: CliSession, project_ids: tuple[str, ...], as_json: bool) -> None:
+    """List every TPU VM your gcloud account can see and give each a ready fleet name.
+
+    Read-only: nothing is installed, tagged or opened. A TPU is connected the
+    first time a job names its fleet (``init(fleet=...)``) or by ``eyvan gcp connect``.
+    """
+
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex
+
+    try:
+        snapshot = DiscoveryIndex().refresh(projects=project_ids or None)
+    except (TpuApiError, TpuNodeParseError, ValueError) as exc:
+        raise click.ClickException(f"eyvan gcp sync: could not list GCP projects: {exc}") from exc
+    connected = set(_connected_fleets(session))
+    if as_json:
+        document = snapshot.as_document()
+        for tpu in document["tpus"]:
+            tpu["connected"] = tpu["fleet"] in connected
+        click.echo(json.dumps(document, sort_keys=True, indent=2))
+        return
+    table = Table(title="TPU VMs available as fleets", pad_edge=False)
+    for column in ("Fleet", "Project", "Zone", "TPU", "Type", "Class", "State", "Connected"):
+        table.add_column(column)
+    for tpu in snapshot.tpus:
+        table.add_row(
+            tpu.fleet,
+            tpu.project,
+            tpu.zone,
+            tpu.name,
+            tpu.accelerator_type,
+            tpu.capacity_class.replace("_", "-"),
+            tpu.state,
+            "yes" if tpu.fleet in connected else "on first use",
+        )
+    print_block(autoscale_console(), table)
+    if not snapshot.tpus:
+        click.echo("No TPU VMs observed.")
+    for project, reason in sorted(snapshot.skipped.items()):
+        click.echo(f"{project}: skipped ({reason})")
+    if snapshot.tpus:
+        click.echo('Use any of them with init(fleet="<fleet or TPU name>"); it connects on first use.')
+
+
+def _connected_fleets(session: CliSession) -> list[str]:
+    """Fleet names the plane already serves; empty when it cannot be asked."""
+
+    try:
+        scope = session.workload_scope()
+        payload = session.client.request(
+            "GET", "/api/v1/fleets", params={"org_id": scope.org_id, "project_id": scope.project_id}
+        )
+    except Exception:
+        return []
+    return [name for name in payload if isinstance(name, str)] if isinstance(payload, list) else []
+
+
 def register_gcp_commands(main: click.Group) -> None:
     """Register the GCP inventory/attachment group at the composition root."""
 

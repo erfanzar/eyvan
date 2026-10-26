@@ -580,6 +580,12 @@ def up_fleet(
             service.ensure_local_runtime(config)
         except LocalDaemonError as exc:
             raise click.ClickException(str(exc)) from exc
+        if config.provider.type == "gcp":
+            # Opening Eyvan lists every TPU in the account as a ready fleet name.
+            # Read-only and off the critical path; `eyvan gcp sync` shows the result.
+            from eyvan.capacity.providers.gcp.tpu_discovery import refresh_in_background
+
+            refresh_in_background()
         endpoint = ControlPlaneEndpoint.parse(session.base_url)
         session.replace_identity(
             resolve_control_plane_identity(
