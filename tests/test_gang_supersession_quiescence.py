@@ -192,6 +192,13 @@ def test_replayed_gang_supersession_requires_relaunched_old_rank_quiescence(
         before = _stop_count(managers["cell-a"])
         managers["cell-b"].fail_stop = False
         managers["cell-a"].fail_show = indeterminate
+        # The 0.1 s retire window exists so the injected stop failure above
+        # times out quickly. Here cell-b's stop succeeds and only has to be
+        # observed; under coverage on a loaded runner that took longer than
+        # 0.1 s, so the retire reported "before its timeout" instead of the
+        # quiescence refusal this phase is about. cell-a's old-incarnation
+        # replay returns without waiting, so a longer window costs nothing.
+        monkeypatch.setenv("EYVAN_SUPERSEDE_WAIT_TIMEOUT_S", "10")
 
         errors = []
         for _ in range(2):
