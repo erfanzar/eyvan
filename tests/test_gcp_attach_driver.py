@@ -103,10 +103,16 @@ class AttachHarness(ProviderConformanceHarness):
     def __init__(self, root):
         self.root = root
         self.substrates = {}
+        # A counter, not len(substrates): substrates is keyed by id(driver),
+        # and CPython reuses the id of a collected driver, which overwrote an
+        # entry and handed the next driver an earlier driver's state directory
+        # (seen on CI: "generation 3 is older than cell 'cell-a' generation 7").
+        self._created = 0
 
     def new_driver(self):
         substrate = Substrate()
-        driver = _driver(self.root / str(len(self.substrates)), substrate)
+        self._created += 1
+        driver = _driver(self.root / str(self._created), substrate)
         self.substrates[id(driver)] = substrate
         return driver
 

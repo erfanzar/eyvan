@@ -54,7 +54,7 @@ class _InFlight:
 def _slice(hosts: int, counter: _InFlight) -> tuple[NativeSliceExecutor, list[httpx.Client]]:
     endpoints = tuple(f"http://worker-{index}:8100" for index in range(hosts))
     clients = [httpx.Client(base_url=endpoint, transport=httpx.MockTransport(counter.handler)) for endpoint in endpoints]
-    return NativeSliceExecutor(endpoints, secret="worker-secret", clients=clients), clients
+    return NativeSliceExecutor(endpoints, secret="worker-secret", clients=clients), clients  # pragma: allowlist secret
 
 
 @pytest.mark.parametrize("hosts", [2, 16, 64, 128])

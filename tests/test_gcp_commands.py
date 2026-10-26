@@ -29,7 +29,7 @@ from eyvan.sdk.commands.fleets import FleetCommandService
 from eyvan.worker.runtime.native_bootstrap import build_native_worker_startup_script, derive_native_worker_token
 
 PROJECT = "example-project"
-ROOT_SECRET = "worker-root-" + "r" * 40
+ROOT_SECRET = "worker-root-" + "r" * 40  # pragma: allowlist secret
 PROFILE = GcpNativeRuntimeProfile(PROJECT, "gs://example-bucket/eyvan", "agent-" + "a" * 40, ROOT_SECRET)
 
 
@@ -400,9 +400,12 @@ def test_ssh_invalid_destination_refused(harness, destination):
 @pytest.mark.parametrize(
     "package,digest",
     [
+        # Script digests, not credentials.
+        # pragma: allowlist nextline secret
         ("eyvan", "624d99879b51881e4175ae9bb70e662e9802eb47be4586088d66e3fdc0297965"),
         # Changed 2026-10-25 on purpose: a local wheel is now force-reinstalled,
         # because a same-version rebuild was otherwise silently kept out.
+        # pragma: allowlist nextline secret
         ("/tmp/eyvan-1.0-py3-none-any.whl", "4df6f8fb8d1aba3b51a1ebda36a69d72d6903e964d4c1d906c306f46f00f66d5"),
     ],
 )
@@ -411,7 +414,7 @@ def test_bootstrap_default_bytes_match_pre_edit_capture(package, digest):
         package=package,
         port=8100,
         state_dir="/var/lib/eyvan/native-worker",
-        worker_secret_resource="projects/example/secrets/worker/versions/1",
+        worker_secret_resource="projects/example/secrets/worker/versions/1",  # pragma: allowlist secret
     )
     assert hashlib.sha256(script.encode()).hexdigest() == digest
 
@@ -438,7 +441,7 @@ def test_bootstrap_refuses_two_secret_sources():
             package="eyvan",
             port=8100,
             state_dir="/var/lib/eyvan/native-worker",
-            worker_secret_resource="projects/example/secrets/worker/versions/1",
+            worker_secret_resource="projects/example/secrets/worker/versions/1",  # pragma: allowlist secret
             worker_secret_file="/etc/eyvan-native/worker-secret",
         )
 
