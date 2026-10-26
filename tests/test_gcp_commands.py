@@ -242,8 +242,33 @@ def test_execute_spot_yaml_real_loader_secret_only_on_stdin(harness, tmp_path):
     for secret in (ROOT_SECRET, token):
         assert secret not in result.output + path.read_text() + repr([argv for argv, _ in harness[2].calls])
     assert harness[3] == [("http://203.0.113.2:8100", token)]
-    assert any("--worker=all" in argv and "scp" in argv for argv, _ in harness[2].calls)
+    # gcloud refuses a multi-worker scp/ssh unless its key is in ssh-agent, so
+    # every command targets exactly one worker, and each worker gets the wheel.
+    assert not any("--worker=all" in argv for argv, _ in harness[2].calls)
+    scp_workers = sorted(
+        next(arg for arg in argv if arg.startswith("--worker=")) for argv, _ in harness[2].calls if "scp" in argv
+    )
+    assert scp_workers == [f"--worker={index}" for index in range(len(harness[3]))]
     assert any(method == "PUT" for method, _, _ in FakeCliClient.calls)
+
+
+def test_a_multi_host_tpu_copies_the_wheel_one_worker_at_a_time() -> None:
+    from eyvan.capacity.providers.gcp.tpu_nodes import parse_tpu_node
+    from eyvan.sdk.commands.gcp_host_access import GcloudHostAccess
+
+    node = parse_tpu_node(
+        {
+            "name": f"projects/{PROJECT}/locations/us-central1-a/nodes/big",
+            "id": "1",
+            "acceleratorType": "v5p-32",
+            "state": "READY",
+            "networkEndpoints": [{"ipAddress": f"10.0.0.{index}"} for index in range(2, 6)],
+        },
+        project=PROJECT,
+    )
+    copies = GcloudHostAccess(node, internal=False, runner=lambda *a, **k: None).copy_argvs("/w.whl", "/tmp")
+    assert [argv[-2] for argv in copies] == ["--worker=0", "--worker=1", "--worker=2", "--worker=3"]
+    assert all("--worker=all" not in argv for argv in copies)
 
 
 def test_connect_proceeds_without_yes_and_still_accepts_it(harness):

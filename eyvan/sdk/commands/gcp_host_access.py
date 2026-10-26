@@ -119,9 +119,15 @@ class GcloudHostAccess:
         return ("--zone", self.node.zone, "--project", self.node.project, *(("--internal-ip",) if self.internal else ()))
 
     def copy_argvs(self, local: str, remote_dir: str) -> tuple[tuple[str, ...], ...]:
-        # One command reaches every worker; gcloud fans the copy out itself.
+        # One command per worker, never --worker=all: gcloud refuses a multi-worker
+        # scp/ssh unless its key is loaded in ssh-agent ("SSH Key is not present in
+        # the SSH agent"), while a single-worker command reads the key file itself.
+        # The caller already runs these in parallel, exactly like exec_argv.
         target = f"{self.node.name}:{remote_dir.rstrip('/')}/"
-        return (("gcloud", "compute", "tpus", "tpu-vm", "scp", local, target, *self._args(), "--worker=all", "--quiet"),)
+        return tuple(
+            ("gcloud", "compute", "tpus", "tpu-vm", "scp", local, target, *self._args(), f"--worker={worker}", "--quiet")
+            for worker in range(self.host_count)
+        )
 
     def exec_argv(self, worker: int, command: str) -> tuple[str, ...]:
         return (
