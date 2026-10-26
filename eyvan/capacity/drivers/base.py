@@ -92,10 +92,15 @@ class BackendCapabilities:
     Attributes:
         multi_worker_cells: Whether one cell may span more than one machine.
         max_workers_per_cell: The widest such cell this backend will build.
+        existing_hardware: Whether a cell is a claim on machines that already
+            run and are billed whether or not Eyvan uses them (attached or
+            operator-owned), rather than capacity Eyvan provisions. Running on
+            such a cell starts no new spend, whatever its capacity class.
     """
 
     multi_worker_cells: bool = False
     max_workers_per_cell: int = 1
+    existing_hardware: bool = False
 
 
 #: Every backend's capabilities. A backend absent from this table hosts only
@@ -118,8 +123,11 @@ _BACKEND_CAPABILITIES: dict[str, BackendCapabilities] = {
     # Operator-owned host sets joined over SSH or declared by hand share the
     # drivers' own 512-host ceilings (onprem_ssh.MAX_HOSTS and the manual
     # driver's limit), which is why the two numbers agree.
-    "onprem-ssh": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
-    "manual": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
+    "onprem-ssh": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True),
+    "manual": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True),
+    # An already-running TPU VM adopted by ``eyvan gcp connect``: one slice per
+    # cell, never created or deleted by Eyvan.
+    "gcp-attach": BackendCapabilities(existing_hardware=True),
 }
 
 

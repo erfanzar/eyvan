@@ -49,7 +49,7 @@ from eyvan.sdk.lifecycle import (
     worker_count,
     worker_request,
 )
-from eyvan.server.api.schemas import NoMatchingCapacityPoolErrorResponse
+from eyvan.server.api.schemas import CapacityClassUnavailableErrorResponse, NoMatchingCapacityPoolErrorResponse
 from eyvan.worker.runtime.results import load_result
 
 
@@ -166,6 +166,32 @@ def _tpu_vm_count(count: int) -> str:
     """Format a GCP-observed TPU VM count without conflating it with chips."""
 
     return f"{count} TPU VM" if count == 1 else f"{count} TPU VMs"
+
+
+def _existing_hardware_class(error: EyvanHTTPError, request: CallableSubmission) -> CapacityClass | None:
+    """Return the fleet's one existing-hardware class for this shape, as the plane stated it.
+
+    An attached TPU or operator-owned host already runs and is already billed
+    whatever Eyvan does, so running there in its real class -- even on-demand --
+    starts no spend nobody asked for. Only the plane can see a pool's backend
+    for an ordinary project user, so this trusts its typed refusal and nothing
+    else: an older plane's untyped 409, a different fleet or shape, or more than
+    one candidate class all keep the original error.
+    """
+
+    try:
+        response = CapacityClassUnavailableErrorResponse.model_validate_json(error.response.content)
+    except ValidationError:
+        return None
+    context = response.context
+    if context.fleet != request.fleet or context.requested_accelerator_type != request.tpu.type:
+        return None
+    if len(context.existing_hardware_capacity_classes) != 1:
+        return None
+    try:
+        return CapacityClass(context.existing_hardware_capacity_classes[0])
+    except ValueError:
+        return None
 
 
 def _placement_error(error: EyvanHTTPError) -> EyvanPlacementError | None:
@@ -643,9 +669,11 @@ class EyvanCallableSubmitter(tp.Generic[R]):
         except (EyvanHTTPError, EyvanUnavailableError):
             return None
         offered = {pool.capacity_class for pool in pools if pool.fleet == request.fleet and pool.enabled}
-        if request.tpu.capacity_class in offered or CapacityClass.RESERVED not in offered:
+        if request.tpu.capacity_class in offered:
             return None
-        return CapacityClass.RESERVED
+        if CapacityClass.RESERVED in offered:
+            return CapacityClass.RESERVED
+        return _existing_hardware_class(error, request)
 
     def _fleet_owning_pool(self, request: CallableSubmission) -> str | None:
         """Return the fleet when ``request.fleet`` is actually one of its pool ids.

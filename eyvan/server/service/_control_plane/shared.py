@@ -163,6 +163,7 @@ from eyvan.server.service.dag import DagNode
 from eyvan.server.service.dag import validate as dag_validate
 from eyvan.server.service.errors import (
     AuthorizationError,
+    CapacityClassUnavailableError,
     ConflictError,
     InputError,
     NoMatchingCapacityPoolError,
@@ -689,6 +690,7 @@ __all__ = (
     "CallableProjectTrustPolicy",
     "CandidateZone",
     "CapacityClass",
+    "CapacityClassUnavailableError",
     "CapacityPoolRecord",
     "CarbonReport",
     "CarbonSource",

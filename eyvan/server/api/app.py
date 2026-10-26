@@ -131,6 +131,8 @@ from eyvan.server.api.schemas import (
     BudgetGrantIssueRequest,
     BudgetPutRequest,
     BuildResponse,
+    CapacityClassUnavailableErrorContext,
+    CapacityClassUnavailableErrorResponse,
     CapacityPoolResponse,
     CapacityPoolUpsertRequest,
     CapacityResponse,
@@ -214,6 +216,7 @@ from eyvan.server.service.credential_rotation import (
 from eyvan.server.service.dag import DagNode
 from eyvan.server.service.errors import (
     AuthorizationError,
+    CapacityClassUnavailableError,
     ConflictError,
     EyvanServiceError,
     InputError,
@@ -911,6 +914,18 @@ def create_app(
                 ),
             )
             return JSONResponse(status_code=status_code, content=model_json(response))
+        if isinstance(exc, CapacityClassUnavailableError):
+            class_response = CapacityClassUnavailableErrorResponse(
+                detail=str(exc),
+                context=CapacityClassUnavailableErrorContext(
+                    fleet=exc.fleet,
+                    requested_accelerator_type=exc.requested_accelerator_type,
+                    requested_capacity_class=exc.requested_capacity_class,
+                    available_capacity_classes=exc.available_capacity_classes,
+                    existing_hardware_capacity_classes=exc.existing_hardware_capacity_classes,
+                ),
+            )
+            return JSONResponse(status_code=status_code, content=model_json(class_response))
         return JSONResponse(status_code=status_code, content={"detail": str(exc)})
 
     @app.exception_handler(RequestValidationError)

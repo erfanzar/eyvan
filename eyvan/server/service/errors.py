@@ -17,6 +17,7 @@ class ServiceErrorCode(StrEnum):
     """Stable machine-readable codes for structured service failures."""
 
     NO_MATCHING_CAPACITY_POOL = "no_matching_capacity_pool"
+    CAPACITY_CLASS_UNAVAILABLE = "capacity_class_unavailable"
 
 
 class EyvanServiceError(Exception):
@@ -133,8 +134,42 @@ class NoMatchingCapacityPoolError(NotFoundError):
         )
 
 
+class CapacityClassUnavailableError(ConflictError):
+    """A fleet has pools for the shape, but none in the requested capacity class.
+
+    ``existing_hardware_capacity_classes`` names the offered classes whose every
+    pool is a claim on machines that already run and are billed whatever Eyvan
+    does (an attached TPU, operator-owned hosts). A client may move an unnamed
+    class onto those without starting spend nobody asked for; the plane states
+    it because only the plane can see a pool's backend without fleet-admin
+    rights. The message is unchanged from the untyped refusal it replaces.
+    """
+
+    code = ServiceErrorCode.CAPACITY_CLASS_UNAVAILABLE
+
+    def __init__(
+        self,
+        *,
+        fleet: str,
+        requested_accelerator_type: str,
+        requested_capacity_class: str,
+        available_capacity_classes: tp.Iterable[str],
+        existing_hardware_capacity_classes: tp.Iterable[str] = (),
+    ) -> None:
+        self.fleet = fleet
+        self.requested_accelerator_type = requested_accelerator_type
+        self.requested_capacity_class = requested_capacity_class
+        self.available_capacity_classes = tuple(sorted(set(available_capacity_classes)))
+        self.existing_hardware_capacity_classes = tuple(sorted(set(existing_hardware_capacity_classes)))
+        super().__init__(
+            f"enabled TPU pool for {requested_accelerator_type!r} in fleet {fleet!r} does not offer "
+            f"{requested_capacity_class!r} capacity; available: {', '.join(self.available_capacity_classes)}"
+        )
+
+
 __all__ = (
     "AuthorizationError",
+    "CapacityClassUnavailableError",
     "ConflictError",
     "EyvanServiceError",
     "InputError",

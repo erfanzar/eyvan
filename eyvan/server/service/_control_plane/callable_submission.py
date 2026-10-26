@@ -16,6 +16,7 @@ from eyvan.server.service._control_plane.shared import (
     WORKER_COUNT_LABEL,
     CallableExecution,
     CapacityClass,
+    CapacityClassUnavailableError,
     CapacityPoolRecord,
     CommandExecution,
     ConflictError,
@@ -35,6 +36,7 @@ from eyvan.server.service._control_plane.shared import (
     _fingerprint,
     _scope,
     _validate_idempotency_key,
+    backend_capabilities,
     managed_result_uri,
     parse_managed_uri,
     parse_tpu_accelerator_type,
@@ -200,14 +202,26 @@ class CallableSubmissionMixin:
                 pool for pool in exact_matches if _is_complete(pool) and pool.capacity_class is capacity_class
             ]
             if not tpu_matches:
-                available_capacity_classes = sorted(
-                    {pool.capacity_class.value for pool in exact_matches if _is_complete(pool)}
-                )
+                complete = [pool for pool in exact_matches if _is_complete(pool)]
+                available_capacity_classes = sorted({pool.capacity_class.value for pool in complete})
                 if available_capacity_classes:
-                    available = ", ".join(available_capacity_classes)
-                    raise ConflictError(
-                        f"enabled TPU pool for {accelerator_type!r} in fleet {fleet_name!r} does not offer "
-                        f"{capacity_class.value!r} capacity; available: {available}"
+                    # A class counts as existing hardware only when every pool
+                    # offering it is: one provisioned pool would start spend.
+                    existing_hardware = [
+                        klass
+                        for klass in available_capacity_classes
+                        if all(
+                            backend_capabilities(pool.capacity_backend).existing_hardware
+                            for pool in complete
+                            if pool.capacity_class.value == klass
+                        )
+                    ]
+                    raise CapacityClassUnavailableError(
+                        fleet=fleet_name,
+                        requested_accelerator_type=accelerator_type,
+                        requested_capacity_class=capacity_class.value,
+                        available_capacity_classes=available_capacity_classes,
+                        existing_hardware_capacity_classes=existing_hardware,
                     )
                 kind_label = "CPU" if wants_cpu else "GPU" if wants_gpu else "TPU"
                 raise ConflictError(

@@ -1099,3 +1099,26 @@ class NoMatchingCapacityPoolErrorResponse(ErrorResponse):
 
     code: tp.Literal[ServiceErrorCode.NO_MATCHING_CAPACITY_POOL] = ServiceErrorCode.NO_MATCHING_CAPACITY_POOL
     context: NoMatchingCapacityPoolErrorContext
+
+
+class CapacityClassUnavailableErrorContext(ApiModel):
+    """Classes a fleet does offer for the shape, when the requested one is absent."""
+
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+    fleet: str
+    requested_accelerator_type: str
+    requested_capacity_class: str
+    available_capacity_classes: tuple[str, ...]
+    #: Offered classes whose every pool is hardware that already runs and is
+    #: billed whatever Eyvan does (an attached TPU, operator-owned hosts).
+    existing_hardware_capacity_classes: tuple[str, ...] = ()
+
+
+class CapacityClassUnavailableErrorResponse(ErrorResponse):
+    """Structured 409 for a fleet that has the shape but not the requested class."""
+
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+    code: tp.Literal[ServiceErrorCode.CAPACITY_CLASS_UNAVAILABLE] = ServiceErrorCode.CAPACITY_CLASS_UNAVAILABLE
+    context: CapacityClassUnavailableErrorContext
