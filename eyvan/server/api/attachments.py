@@ -107,6 +107,30 @@ def register_attachment_routes(
         authorize(principal)
         return {"jobs": await asyncio.to_thread(jobs(request).recent, url=plane_url(request))}
 
+    @app.get("/api/v1/attachments/discovered", tags=["attachments"])
+    async def discovered_tpus(request: Request, principal: _Principal) -> dict[str, tp.Any]:
+        """List every TPU VM the machine owner's gcloud account can see, with its fleet name.
+
+        Served from the read-only discovery index the local plane refreshes every
+        few minutes; a stale index is refreshed in the background, never inline.
+        """
+
+        authorize(principal)
+        from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex, refresh_in_background
+
+        index: DiscoveryIndex = getattr(request.app.state, "discovery_index", None) or DiscoveryIndex()
+        snapshot = await asyncio.to_thread(index.load)
+        if getattr(request.app.state, "discovery_refresh", True):
+            await asyncio.to_thread(refresh_in_background, index)
+        connected = {pool.fleet_name for pool in await service.list_capacity_pools(principal) if pool.enabled}
+        if snapshot is None:
+            return {"discovered_at": None, "tpus": [], "skipped": {}, "projects": []}
+        document = snapshot.as_document()
+        for tpu in document["tpus"]:
+            tpu["connected"] = tpu["fleet"] in connected
+        document.pop("version", None)
+        return document
+
     @app.get("/api/v1/attachments/{attachment_id}", tags=["attachments"])
     async def get_attachment(request: Request, attachment_id: _JobId, principal: _Principal) -> dict[str, tp.Any]:
         """Read durable progress even after the application process has restarted."""

@@ -61,6 +61,7 @@ BROWSER_ROUTES: dict[str, str] = {
     "POST /api/v1/attachments": "dashboard/src/components/AddTpuModal.tsx starts a durable local attachment",
     "GET /api/v1/attachments": "dashboard/src/components/AddTpuModal.tsx recovers recent local jobs",
     "GET /api/v1/attachments/{}": "dashboard/src/components/AddTpuModal.tsx polls durable attachment progress",
+    "GET /api/v1/attachments/discovered": "dashboard/src/pages/FleetPage.tsx lists every TPU in the GCP account",
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.

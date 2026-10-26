@@ -9441,6 +9441,30 @@
         ]
       }
     },
+    "/api/v1/attachments/discovered": {
+      "get": {
+        "description": "List every TPU VM the machine owner's gcloud account can see, with its fleet name.\n\nServed from the read-only discovery index the local plane refreshes every\nfew minutes; a stale index is refreshed in the background, never inline.",
+        "operationId": "discovered_tpus_api_v1_attachments_discovered_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Discovered Tpus Api V1 Attachments Discovered Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Discovered Tpus",
+        "tags": [
+          "attachments"
+        ]
+      }
+    },
     "/api/v1/attachments/plan": {
       "post": {
         "description": "Preview an existing TPU/SSH attachment without mutating the host or fleet.",

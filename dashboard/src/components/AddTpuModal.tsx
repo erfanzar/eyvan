@@ -6,13 +6,15 @@
 import { Copy, LoaderCircle, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-import type { AttachmentInput, AttachmentJob, AttachmentPlan } from "../types";
+import type { AttachmentInput, AttachmentJob, AttachmentPlan, DiscoveredTpus } from "../types";
 
 export interface AttachmentClient {
   planAttachment: (input: AttachmentInput, signal?: AbortSignal) => Promise<AttachmentPlan>;
   startAttachment: (input: AttachmentInput) => Promise<AttachmentJob>;
   getAttachment: (id: string, signal?: AbortSignal) => Promise<AttachmentJob>;
   listAttachments: (signal?: AbortSignal) => Promise<AttachmentJob[]>;
+  /** Every TPU the plane owner's GCP account can see; absent on clients that predate discovery. */
+  listDiscoveredTpus?: (signal?: AbortSignal) => Promise<DiscoveredTpus>;
 }
 
 interface AddTpuModalProps {
@@ -20,12 +22,14 @@ interface AddTpuModalProps {
   client: AttachmentClient;
   onClose: () => void;
   onConnected: () => Promise<void>;
+  /** Pre-fills the form, for example from a discovered TPU's Connect button. */
+  initial?: AttachmentInput | null;
 }
 
 const message = (error: unknown) => (error instanceof Error ? error.message : "Unable to attach this machine.");
 
 /** Attach existing hardware through the local plane, not from the browser. */
-export function AddTpuModal({ open, client, onClose, onConnected }: AddTpuModalProps) {
+export function AddTpuModal({ open, client, onClose, onConnected, initial = null }: AddTpuModalProps) {
   const dialog = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const connectedRef = useRef(onConnected);
@@ -53,6 +57,17 @@ export function AddTpuModal({ open, client, onClose, onConnected }: AddTpuModalP
   useEffect(() => {
     connectedRef.current = onConnected;
   }, [onConnected]);
+
+  useEffect(() => {
+    if (!open || !initial) return;
+    setTarget(initial.target);
+    setAdvanced(initial.kind === "tpu");
+    setProject(initial.project ?? "");
+    setZone(initial.zone ?? "");
+    setFleet(initial.fleet ?? "");
+    setPlan(null);
+    setError(null);
+  }, [initial, open]);
 
   useEffect(() => {
     if (!open) return;

@@ -77,6 +77,7 @@ def client(*, local: bool = True, development: bool = True) -> TestClient:
         ("post", "/api/v1/attachments"),
         ("get", "/api/v1/attachments"),
         ("get", "/api/v1/attachments/" + "a" * 32),
+        ("get", "/api/v1/attachments/discovered"),
     ],
 )
 def test_auth_required(method: str, path: str) -> None:
@@ -227,6 +228,49 @@ def test_failed_job_reports_cli_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert restored["status"] == "failed"
     assert restored["error"] == "Opening an SSH tunnel failed"
     assert restored["result"] is None
+
+
+def _discovery_client(tmp_path: Path, snapshot=None) -> TestClient:
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex
+
+    http = client()
+    index = DiscoveryIndex(tmp_path / "discovered.json")
+    if snapshot is not None:
+        index.save(snapshot)
+    http.app.state.discovery_index = index
+    # The route must never reach GCP from a test; the periodic refresher owns that.
+    http.app.state.discovery_refresh = False
+    return http
+
+
+def test_discovered_tpus_before_the_first_listing(tmp_path: Path) -> None:
+    response = _discovery_client(tmp_path).get("/api/v1/attachments/discovered", headers=ADMIN)
+    assert response.status_code == 200
+    assert response.json() == {"discovered_at": None, "tpus": [], "skipped": {}, "projects": []}
+
+
+def test_discovered_tpus_mark_connected_fleets_and_keep_skips(tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveredTpu, DiscoverySnapshot
+
+    tpu = DiscoveredTpu(
+        fleet="tpu-train-a-1a2b3c4d",
+        project="demo-research",
+        zone="us-central1-a",
+        name="train-a",
+        node_id="1",
+        accelerator_type="v5p-8",
+        capacity_class="on_demand",
+        state="READY",
+        hosts=1,
+    )
+    snapshot = DiscoverySnapshot(
+        discovered_at=1000.0, tpus=(tpu,), skipped={"locked": "no permission to list TPU nodes"}, projects=("a",)
+    )
+    body = _discovery_client(tmp_path, snapshot).get("/api/v1/attachments/discovered", headers=ADMIN).json()
+    assert body["discovered_at"] == 1000.0
+    assert body["skipped"] == {"locked": "no permission to list TPU nodes"}
+    assert [(t["fleet"], t["connected"]) for t in body["tpus"]] == [("tpu-train-a-1a2b3c4d", False)]
+    assert "version" not in body
 
 
 def test_missing_job_and_path_traversal() -> None:

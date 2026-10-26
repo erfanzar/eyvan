@@ -13,6 +13,7 @@ import type {
   CapacityLease,
   Cell,
   DashboardData,
+  DiscoveredTpus,
   LogEntry,
   RunDetail,
   BlobRef,
@@ -63,6 +64,38 @@ export function mockAttachmentPlan(input: AttachmentInput): AttachmentPlan {
 }
 
 export const mockAttachmentJobs: AttachmentJob[] = [];
+
+export const mockDiscoveredTpus: DiscoveredTpus = {
+  discovered_at: Date.now() / 1000,
+  projects: ["demo-research", "demo-lab"],
+  tpus: [
+    {
+      fleet: "tpu-train-a-1a2b3c4d",
+      project: "demo-research",
+      zone: "us-central1-a",
+      name: "train-a",
+      node_id: "1",
+      accelerator_type: "v5p-8",
+      capacity_class: "on_demand",
+      state: "READY",
+      hosts: 1,
+      connected: true,
+    },
+    {
+      fleet: "tpu-spot-b-5e6f7a8b",
+      project: "demo-lab",
+      zone: "us-east5-a",
+      name: "spot-b",
+      node_id: "2",
+      accelerator_type: "v6e-16",
+      capacity_class: "spot",
+      state: "READY",
+      hosts: 4,
+      connected: false,
+    },
+  ],
+  skipped: {},
+};
 
 export function createMockAttachment(input: AttachmentInput): AttachmentJob {
   const fleet = input.fleet || "tpu-demo";

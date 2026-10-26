@@ -8,6 +8,7 @@ import {
   createMockAttachment,
   mockAttachmentJobs,
   mockAttachmentPlan,
+  mockDiscoveredTpus,
   createMockWorkload,
   getMockWorkload,
   getMockRun,
@@ -47,6 +48,7 @@ import type {
   AttachmentJob,
   AttachmentPlan,
   AuditEvent,
+  DiscoveredTpus,
   AvailableShape,
   BillingReport,
   CapacityPoolSummary,
@@ -692,6 +694,11 @@ export class EyvanApiClient {
     if (this.forceDemo) return cloneMock(mockAttachmentJobs);
     const response = await this.attachmentRequest<{ jobs: AttachmentJob[] }>("/api/v1/attachments", { signal });
     return response.jobs;
+  }
+
+  async listDiscoveredTpus(signal?: AbortSignal): Promise<DiscoveredTpus> {
+    if (this.forceDemo) return cloneMock(mockDiscoveredTpus);
+    return this.attachmentRequest<DiscoveredTpus>("/api/v1/attachments/discovered", { signal });
   }
 
   private requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {

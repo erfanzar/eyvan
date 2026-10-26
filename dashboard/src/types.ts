@@ -33,6 +33,26 @@ export interface AttachmentJob {
   finished_at: string | null;
 }
 
+export interface DiscoveredTpu {
+  fleet: string;
+  project: string;
+  zone: string;
+  name: string;
+  node_id: string;
+  accelerator_type: string;
+  capacity_class: string;
+  state: string;
+  hosts: number;
+  connected: boolean;
+}
+
+export interface DiscoveredTpus {
+  discovered_at: number | null;
+  projects: string[];
+  tpus: DiscoveredTpu[];
+  skipped: Record<string, string>;
+}
+
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
 
 /** Tracker wire types intentionally retain the store's snake_case field names. */

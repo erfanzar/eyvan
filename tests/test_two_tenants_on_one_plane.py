@@ -133,6 +133,7 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "POST /api/v1/attachments/plan": "local CLI attachment preview uses the machine owner's credentials",
     "POST /api/v1/attachments": "local CLI attachment execution uses the machine owner's credentials",
     "GET /api/v1/attachments": "local attachment jobs are fleet-wide operational state",
+    "GET /api/v1/attachments/discovered": "the machine owner's GCP TPU inventory is fleet-wide operational state",
     "GET /api/v1/attachments/{attachment_id}": "local attachment progress and results are fleet-wide operational state",
     "GET /api/v1/cells": "fleet capacity inventory",
     "GET /api/v1/cells/{cell_id}": "one cell's provider state",

@@ -13,13 +13,18 @@ import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatDateTime, formatMoney, percent, summarizeShapes } from "../lib/format";
 import type {
+  AttachmentInput,
   BillingReport,
   CapacityLease,
   CapacityPoolSummary,
   Cell,
+  DiscoveredTpus,
   LaunchLatencyReport,
   WarmthReport,
 } from "../types";
+
+/** How often the page re-reads the plane's discovery index (the plane re-lists GCP every 5 minutes). */
+const DISCOVERY_POLL_MS = 60_000;
 
 interface FleetPageProps {
   cells: Cell[];
@@ -60,6 +65,10 @@ export function FleetPage({
   attachmentClient,
 }: FleetPageProps) {
   const [addingTpu, setAddingTpu] = useState(false);
+  const [attachInitial, setAttachInitial] = useState<AttachmentInput | null>(null);
+  const [discovered, setDiscovered] = useState<DiscoveredTpus | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [discoveryRevision, setDiscoveryRevision] = useState(0);
   const [tab, setTab] = useState<"cells" | "leases">("cells");
   const [region, setRegion] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
@@ -176,6 +185,37 @@ export function FleetPage({
     return () => controller.abort();
   }, [loadPools, stopping, refreshRevision, poolRetryRevision]);
 
+  useEffect(() => {
+    const load = attachmentClient?.listDiscoveredTpus;
+    if (!load) return;
+    const controller = new AbortController();
+    const read = () => {
+      load(controller.signal)
+        .then((value) => {
+          if (controller.signal.aborted) return;
+          setDiscovered(value);
+          setDiscoveryError(null);
+        })
+        .catch((error: unknown) => {
+          // Keep the last list: an unreadable plane is unknown, not "no TPUs".
+          if (!controller.signal.aborted) {
+            setDiscoveryError(error instanceof Error ? error.message : "Could not read discovered TPUs");
+          }
+        });
+    };
+    read();
+    const timer = globalThis.setInterval(read, DISCOVERY_POLL_MS);
+    return () => {
+      controller.abort();
+      globalThis.clearInterval(timer);
+    };
+  }, [attachmentClient, refreshRevision, discoveryRevision]);
+
+  const connectDiscovered = (tpu: DiscoveredTpus["tpus"][number]) => {
+    setAttachInitial({ target: tpu.name, kind: "tpu", fleet: tpu.fleet, project: tpu.project, zone: tpu.zone });
+    setAddingTpu(true);
+  };
+
   const fleets = useMemo(() => {
     const grouped = new Map<
       string,
@@ -219,8 +259,15 @@ export function FleetPage({
         <AddTpuModal
           open={addingTpu}
           client={attachmentClient}
-          onClose={() => setAddingTpu(false)}
-          onConnected={onRefresh}
+          initial={attachInitial}
+          onClose={() => {
+            setAddingTpu(false);
+            setAttachInitial(null);
+          }}
+          onConnected={async () => {
+            await onRefresh();
+            setDiscoveryRevision((revision) => revision + 1);
+          }}
         />
       )}
       <section className="metric-grid metric-grid-four" aria-label="Fleet metrics">
@@ -513,6 +560,84 @@ export function FleetPage({
               </tbody>
             </table>
           </div>
+        </section>
+      )}
+
+      {attachmentClient?.listDiscoveredTpus && (
+        <section className="panel data-panel" aria-label="TPUs in your Google Cloud">
+          <div className="panel-header">
+            <div>
+              <h2>TPUs in your Google Cloud</h2>
+              <p>
+                Every TPU VM your gcloud account can see, refreshed every 5 minutes. Use a fleet name in{" "}
+                <span className="monospace">init(fleet=…)</span>; an unconnected TPU connects on first use.
+              </p>
+            </div>
+          </div>
+          {discoveryError && (
+            <div className="inline-error" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {discoveryError}
+            </div>
+          )}
+          {discovered === null && !discoveryError && <p className="panel-note">Reading discovered TPUs…</p>}
+          {discovered !== null && discovered.discovered_at === null && (
+            <p className="panel-note">Not listed yet; the local plane is reading your GCP projects.</p>
+          )}
+          {discovered !== null && discovered.discovered_at !== null && discovered.tpus.length === 0 && (
+            <p className="panel-note">No TPU VMs observed in {discovered.projects.length} project(s).</p>
+          )}
+          {discovered !== null && discovered.tpus.length > 0 && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Fleet</th>
+                    <th>Project</th>
+                    <th>Zone</th>
+                    <th>TPU</th>
+                    <th>Type</th>
+                    <th>Class</th>
+                    <th>State</th>
+                    <th aria-label="Connection" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {discovered.tpus.map((tpu) => (
+                    <tr key={tpu.fleet}>
+                      <td className="monospace">{tpu.fleet}</td>
+                      <td>{tpu.project}</td>
+                      <td className="monospace">{tpu.zone}</td>
+                      <td>{tpu.name}</td>
+                      <td>{tpu.accelerator_type}</td>
+                      <td>{tpu.capacity_class.replace("_", "-")}</td>
+                      <td>{tpu.state}</td>
+                      <td>
+                        {tpu.connected ? (
+                          <StatusBadge value="connected" tone="healthy" />
+                        ) : (
+                          <button
+                            className="button button-secondary"
+                            type="button"
+                            disabled={tpu.state !== "READY"}
+                            onClick={() => connectDiscovered(tpu)}
+                          >
+                            Connect
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {discovered !== null &&
+            Object.entries(discovered.skipped).map(([project, reason]) => (
+              <p className="panel-note" key={project}>
+                {project}: skipped ({reason})
+              </p>
+            ))}
         </section>
       )}
 

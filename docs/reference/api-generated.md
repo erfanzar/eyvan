@@ -25,6 +25,7 @@ static assets and compatibility aliases are not a complete part of that schema.
 | PUT | `/api/v1/artifacts/workspaces/{digest}` | Upload Workspace Artifact | 200, 422 |
 | GET | `/api/v1/attachments` | Recent Attachments | 200 |
 | POST | `/api/v1/attachments` | Start Attachment | 202, 422 |
+| GET | `/api/v1/attachments/discovered` | Discovered Tpus | 200 |
 | POST | `/api/v1/attachments/plan` | Attachment Plan | 200, 422 |
 | GET | `/api/v1/attachments/{attachment_id}` | Get Attachment | 200, 422 |
 | POST | `/api/v1/batches` | Submit Batch | 201, 422 |

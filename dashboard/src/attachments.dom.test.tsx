@@ -9,7 +9,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AddTpuModal, type AttachmentClient } from "./components/AddTpuModal";
-import { mockAttachmentPlan } from "./api/mockData";
+import { mockAttachmentPlan, mockDiscoveredTpus } from "./api/mockData";
 import { FleetPage } from "./pages/FleetPage";
 import type { AttachmentInput, AttachmentJob } from "./types";
 
@@ -164,5 +164,79 @@ describe("Add TPU", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add TPU" }));
     expect(screen.getByRole("dialog", { name: "Add TPU" })).toBeTruthy();
     await act(async () => {});
+  });
+
+  it("lists every discovered TPU and pre-fills Add TPU from an unconnected one", async () => {
+    const api: AttachmentClient = {
+      ...client(),
+      listDiscoveredTpus: vi.fn(async () => ({
+        ...mockDiscoveredTpus,
+        skipped: { "locked-project": "no permission to list TPU nodes" },
+      })),
+    };
+    render(
+      <FleetPage
+        cells={[]}
+        leases={[]}
+        onRefresh={async () => {}}
+        loadWarmth={async () => ({ observed_at: "", pools: [] })}
+        loadBilling={async () => ({
+          observed_at: "",
+          accrued_cost: 0,
+          idle_cost: 0,
+          cells: 0,
+          billed_seconds: 0,
+          idle_seconds: 0,
+          unpriced_cells: 0,
+        })}
+        loadLaunchLatency={async () => ({ observed_at: "", pools: [] })}
+        attachmentClient={api}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "TPUs in your Google Cloud" });
+    await waitFor(() => expect(panel.textContent).toContain("tpu-spot-b-5e6f7a8b"));
+    expect(panel.textContent).toContain("tpu-train-a-1a2b3c4d");
+    expect(panel.textContent).toContain("locked-project: skipped (no permission to list TPU nodes)");
+    // Only the unconnected TPU offers Connect.
+    const connects = Array.from(panel.querySelectorAll("button")).filter((b) => b.textContent === "Connect");
+    expect(connects).toHaveLength(1);
+    fireEvent.click(connects[0]);
+    expect(screen.getByRole("dialog", { name: "Add TPU" })).toBeTruthy();
+    expect((screen.getByLabelText("TPU name") as HTMLInputElement).value).toBe("spot-b");
+    expect((screen.getByLabelText("GCP project") as HTMLInputElement).value).toBe("demo-lab");
+    expect((screen.getByLabelText("Zone") as HTMLInputElement).value).toBe("us-east5-a");
+    expect((screen.getByLabelText("Fleet name (optional)") as HTMLInputElement).value).toBe("tpu-spot-b-5e6f7a8b");
+    await act(async () => {});
+  });
+
+  it("keeps the last discovered list and names the error when a refresh fails", async () => {
+    const api: AttachmentClient = {
+      ...client(),
+      listDiscoveredTpus: vi.fn(async () => {
+        throw new Error("plane unreachable");
+      }),
+    };
+    render(
+      <FleetPage
+        cells={[]}
+        leases={[]}
+        onRefresh={async () => {}}
+        loadWarmth={async () => ({ observed_at: "", pools: [] })}
+        loadBilling={async () => ({
+          observed_at: "",
+          accrued_cost: 0,
+          idle_cost: 0,
+          cells: 0,
+          billed_seconds: 0,
+          idle_seconds: 0,
+          unpriced_cells: 0,
+        })}
+        loadLaunchLatency={async () => ({ observed_at: "", pools: [] })}
+        attachmentClient={api}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "TPUs in your Google Cloud" });
+    await waitFor(() => expect(panel.textContent).toContain("plane unreachable"));
+    expect(panel.textContent).not.toContain("No TPU VMs observed");
   });
 });
