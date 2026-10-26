@@ -283,11 +283,69 @@ def refresh_in_background(
     return thread
 
 
+#: How often a running local plane re-lists the account's TPUs.
+DEFAULT_REFRESH_INTERVAL_S = 300.0
+
+
+class PeriodicDiscovery:
+    """Re-list every visible TPU on a fixed interval, for as long as a plane runs.
+
+    A daemon thread, not an event-loop task: a refresh is a few blocking HTTP
+    GETs, and neither serving requests nor shutting down should wait on them.
+    A failed pass keeps the previous index (``refresh`` only replaces it on
+    success) and is retried at the next interval.
+    """
+
+    def __init__(
+        self,
+        index: DiscoveryIndex | None = None,
+        *,
+        interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
+        on_error: tp.Callable[[Exception], None] | None = None,
+    ) -> None:
+        if not interval_s > 0:
+            raise ValueError("interval_s must be positive")
+        self.index = index if index is not None else DiscoveryIndex()
+        self.interval_s = interval_s
+        self.on_error = on_error
+        self.passes = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="eyvan-tpu-discovery-periodic", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float | None = 0.0) -> None:
+        """Ask the loop to end; never waits on an in-flight GCP request by default."""
+
+        self._stop.set()
+        if self._thread is not None and timeout:
+            self._thread.join(timeout)
+
+    def _run(self) -> None:
+        # The first pass runs at once, so a freshly started plane lists TPUs
+        # without waiting a whole interval.
+        while not self._stop.is_set():
+            try:
+                self.index.refresh()
+            except Exception as exc:  # best effort; the previous index stays
+                if self.on_error is not None:
+                    self.on_error(exc)
+            self.passes += 1
+            if self._stop.wait(self.interval_s):
+                return
+
+
 __all__ = (
     "DEFAULT_MAX_AGE_S",
+    "DEFAULT_REFRESH_INTERVAL_S",
     "DiscoveredTpu",
     "DiscoveryIndex",
     "DiscoverySnapshot",
+    "PeriodicDiscovery",
     "default_index_path",
     "discover",
     "refresh_in_background",

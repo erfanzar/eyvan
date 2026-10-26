@@ -170,6 +170,45 @@ def test_a_stale_index_is_refreshed_in_the_background_and_sync_is_idempotent(tmp
     assert {call for call, _ in api.calls} == {"list_projects", "list_nodes"}
 
 
+def test_periodic_discovery_refreshes_on_every_interval_and_survives_failures(tmp_path) -> None:
+    import threading
+
+    from eyvan.capacity.providers.gcp.tpu_discovery import PeriodicDiscovery
+
+    calls = {"n": 0}
+    third = threading.Event()
+
+    class Flaky(FakeApi):
+        def list_projects(self):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                third.set()
+            if calls["n"] == 2:
+                raise TpuApiError("HTTP 503", retryable=True, status=503)
+            return super().list_projects()
+
+    errors: list[Exception] = []
+    index = DiscoveryIndex(tmp_path / "discovered.json", api=Flaky(_account().nodes))
+    periodic = PeriodicDiscovery(index, interval_s=0.05, on_error=errors.append)
+    periodic.start()
+    try:
+        assert third.wait(10), "the refresher stopped after a failed pass"
+    finally:
+        periodic.stop(timeout=5)
+    # First pass ran at once, the failure was reported and did not end the loop,
+    # and the index still holds the last good listing.
+    assert len(errors) >= 1
+    snapshot = index.load()
+    assert snapshot is not None and len(snapshot.tpus) == 3
+
+
+def test_periodic_discovery_refuses_a_non_positive_interval() -> None:
+    from eyvan.capacity.providers.gcp.tpu_discovery import PeriodicDiscovery
+
+    with pytest.raises(ValueError):
+        PeriodicDiscovery(interval_s=0)
+
+
 def test_a_failed_background_refresh_never_raises_and_keeps_the_index(tmp_path) -> None:
     class Down(FakeApi):
         def list_projects(self):

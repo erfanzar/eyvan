@@ -4290,6 +4290,15 @@ def main() -> None:
                     source_digest=build_identity().source_digest,
                 ),
             )
+    if args.runtime_profile is not None:
+        # A local GCP plane keeps every TPU the operator's account can see listed
+        # as a ready fleet name. Read-only GETs on a daemon thread, started here
+        # rather than in the app factory so only the real process ever calls GCP.
+        from eyvan.capacity.providers.gcp.tpu_discovery import PeriodicDiscovery
+
+        PeriodicDiscovery(
+            on_error=lambda exc: logger.warning("Eyvan TPU discovery refresh failed; keeping the last list: %s", exc)
+        ).start()
     uvicorn.run(
         application,
         host=server_bind.host,
