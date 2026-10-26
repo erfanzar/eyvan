@@ -23,6 +23,10 @@ const { values } = parseArgs({
     output: { type: "string" },
   },
 });
+// Must match SESSION_COOKIE in eyvan/server/api/dashboard_sessions.py. The
+// __Host- prefix makes the browser refuse it unless it is Secure, path=/ and
+// host-only, so looking for the bare name finds nothing.
+const SESSION_COOKIE = "__Host-eyvan_session";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const python = values.python ?? path.join(root, ".venv/bin/python");
 const receiptPath = path.resolve(values.output ?? path.join(root, "browser-results/bff.json"));
@@ -114,7 +118,7 @@ try {
   await page.waitForURL(urls.plane + "/");
   await page.getByRole("button", { name: /Sign out/i }).waitFor();
   receipt.checks.push("HTTPS authorization-code/PKCE sign-in under CSP");
-  const cookie = (await context.cookies(urls.plane)).find((value) => value.name === "eyvan_session");
+  const cookie = (await context.cookies(urls.plane)).find((value) => value.name === SESSION_COOKIE);
   assert(cookie?.httpOnly && cookie?.secure && cookie?.sameSite === "Lax");
   assert(!(await page.evaluate(() => globalThis.document.cookie)).includes("eyvan_session"));
   assert.equal(await page.evaluate(() => globalThis.sessionStorage.length), 0);
@@ -132,14 +136,14 @@ try {
   const rejected = attack.waitForResponse((response) => response.url().endsWith("/api/v1/dashboard/auth/logout"));
   await attack.getByRole("button", { name: "Cross-site logout" }).click();
   assert.equal((await rejected).status(), 403);
-  assert((await context.cookies(urls.plane)).some((value) => value.name === "eyvan_session"));
+  assert((await context.cookies(urls.plane)).some((value) => value.name === SESSION_COOKIE));
   assert.equal(await page.evaluate(async () => (await globalThis.fetch("/api/v1/session")).status), 200);
   const observations = await page.evaluate(async () => (await globalThis.fetch("/qualification")).json());
   assert(observations.logout_attempts.some((value) => !value.has_cookie && value.origin === urls.issuer));
   receipt.checks.push("Actual cross-site cookieless logout POST rejected; session preserved");
   await page.getByRole("button", { name: /Sign out/i }).click();
   await page.getByRole("button", { name: /Sign in with OIDC/i }).waitFor();
-  assert(!(await context.cookies(urls.plane)).some((value) => value.name === "eyvan_session"));
+  assert(!(await context.cookies(urls.plane)).some((value) => value.name === SESSION_COOKIE));
   assert.equal(await page.evaluate(async () => (await globalThis.fetch("/api/v1/session")).status), 401);
   receipt.checks.push("Same-origin sign-out revokes session and deletes cookie");
 
@@ -152,7 +156,7 @@ try {
   await page.goto(authorization + "&deny=1");
   await page.getByText("sign-in was cancelled or denied by the identity provider", { exact: true }).waitFor();
   assert(!page.url().includes("auth_error"));
-  assert(!(await context.cookies(urls.plane)).some((value) => value.name === "eyvan_session"));
+  assert(!(await context.cookies(urls.plane)).some((value) => value.name === SESSION_COOKIE));
   assert.equal(await page.evaluate(async () => (await globalThis.fetch("/api/v1/session")).status), 401);
   receipt.checks.push("Provider denial returns a generic error and does not admit a session");
   assert.deepEqual(errors, []);
