@@ -512,7 +512,10 @@ class GcpConnector:
             },
         }
         args = self._tpu_args(node)
-        actions: list[AttachAction] = []
+        actions: list[AttachAction] = [
+            AttachAction("ssh_check", access.exec_argv(worker, "true"), f"Host {worker}: check SSH login", False)
+            for worker in range(access.host_count)
+        ]
         if endpoint_mode == "public" and ssh_entry is None:
             # Only a project the operator's own credential reads gets a firewall
             # rule; a node reached over SSH sits in somebody else's network.
@@ -887,6 +890,10 @@ class GcpConnector:
         assert node is not None and plan.access is not None
         access: HostAccess = plan.access
         runner = self.runner if self.runner is not None else _run_gcloud
+        # Prove every host accepts this machine's SSH login before anything is
+        # changed: a refused key used to surface only at wheel_scp, after the
+        # firewall rule and the TPU tag had already been modified (2026-10-27).
+        self._check_ssh_login(node.name, access)
         if plan.endpoint_mode == "public" and plan.ssh_entry is None:
             with self.progress(f"Opening worker port {self.port} to this machine"):
                 tag = self._step(
@@ -952,6 +959,30 @@ class GcpConnector:
         finally:
             self._step("wheel_build", builder.close)
 
+    def _check_ssh_login(self, name: str, access: HostAccess) -> None:
+        """Run a no-op on every host; refuse with a plain reason before any mutation."""
+
+        with self.progress(f"Checking SSH login on {access.host_count} host(s)") as phase:
+            try:
+                self._parallel(
+                    [
+                        functools.partial(self._command, "ssh_check", access.exec_argv(worker, "true"), access=access)
+                        for worker in range(access.host_count)
+                    ],
+                    phase=phase,
+                )
+            except AttachError as exc:
+                detail = str(exc).split(" failed: ", 1)[-1]
+                hint = (
+                    " The host refuses this machine's SSH key: make sure a key this machine holds is accepted "
+                    "on every host (the guest agent installs project and instance ssh-keys)."
+                    if "permission denied" in detail.casefold()
+                    else ""
+                )
+                raise AttachError(
+                    "ssh_check", f"cannot log in to {name} over SSH: {detail}. Nothing was changed.{hint}"
+                ) from exc
+
     def _parallel(self, tasks: tp.Sequence[tp.Callable[[], None]], *, phase: tp.Any = None) -> None:
         """Run per-host steps concurrently, then report the first failure in host order."""
 
@@ -1016,7 +1047,11 @@ class GcpConnector:
             )
         # Only gcloud's/ssh's own diagnostic lines are shown; other remote output is not.
         lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
-        detail = next((line for line in reversed(lines) if _TOOL_DIAGNOSTIC.match(line)), "")
+        # ssh's own refusal is the cause; gcloud's trailing "exited with return
+        # code [255]" only restates it, so the specific line wins when present.
+        detail = next((line for line in reversed(lines) if "permission denied" in line.casefold()), "") or next(
+            (line for line in reversed(lines) if _TOOL_DIAGNOSTIC.match(line)), ""
+        )
         if unchanged_ok and "no fields would change" in detail.casefold():
             return
         shown = detail[:300] if detail else "no tool diagnostic; other output withheld"

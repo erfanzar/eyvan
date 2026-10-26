@@ -252,6 +252,48 @@ def test_execute_spot_yaml_real_loader_secret_only_on_stdin(harness, tmp_path):
     assert any(method == "PUT" for method, _, _ in FakeCliClient.calls)
 
 
+def test_a_refused_ssh_login_stops_connect_before_anything_changes(monkeypatch, harness):
+    runner = harness[2]
+    ensured: list[dict] = []
+
+    class Ingress:
+        def ensure(self, **kwargs):
+            ensured.append(kwargs)
+            return "eyvan-native-test"
+
+    def refusing(args, *, stdin_text, timeout):
+        runner.calls.append((tuple(args), stdin_text))
+        if "ssh" in args and args[-1] == "true":
+            # Real gcloud order: ssh's refusal, then gcloud's generic exit line.
+            return subprocess.CompletedProcess(
+                args,
+                255,
+                "",
+                "erfan@203.0.113.2: Permission denied (publickey).\n"
+                "ERROR: (gcloud.compute.tpus.tpu-vm.ssh) [/usr/bin/ssh] exited with return code [255].\n",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(connect, "_run_gcloud", refusing)
+    monkeypatch.setattr(connect, "_public_ingress", lambda *args: Ingress())
+    result = invoke("connect", "--tpu", "existing", "--project", PROJECT, "--yes")
+    assert result.exit_code != 0
+    assert "ssh check" in result.output and "Permission denied" in result.output
+    assert "Nothing was changed" in result.output and "refuses this machine's SSH key" in result.output
+    # Only the read-only login checks ran: no firewall rule, tag, copy or install.
+    assert ensured == []
+    assert all(argv[-1] == "true" for argv, _ in runner.calls), runner.calls
+    assert not harness[3] and not any(method == "PUT" for method, _, _ in FakeCliClient.calls)
+
+
+def test_the_preview_lists_a_read_only_ssh_check_first(harness):
+    result = invoke("connect", "--tpu", "existing", "--project", PROJECT, "--dry-run", "--json")
+    assert result.exit_code == 0, result.output
+    actions = json.loads(result.output)["actions"]
+    assert actions[0]["step"] == "ssh_check" and actions[0]["mutates"] is False
+    assert not harness[2].calls
+
+
 def test_a_multi_host_tpu_copies_the_wheel_one_worker_at_a_time() -> None:
     from eyvan.capacity.providers.gcp.tpu_nodes import parse_tpu_node
     from eyvan.sdk.commands.gcp_host_access import GcloudHostAccess
