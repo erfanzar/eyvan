@@ -281,7 +281,13 @@ def test_server_options_map_the_two_modes_uvicorn_actually_sees(pki) -> None:
         "ssl_ca_certs",
         "ssl_cert_reqs",
         "ssl_version",
+        "ssl_context_factory",
     }
+    for mode, options in ((MutualTlsMode.PERMISSIVE, permissive), (MutualTlsMode.REQUIRED, required)):
+        context = options["ssl_context_factory"](None, None)
+        # Explicit, not whatever this OpenSSL build defaults SSLContext to.
+        assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+        assert context.verify_mode == (ssl.CERT_REQUIRED if mode is MutualTlsMode.REQUIRED else ssl.CERT_OPTIONAL)
 
 
 def test_a_broken_key_pair_is_reported_without_openssl_detail(tmp_path: Path, pki) -> None:

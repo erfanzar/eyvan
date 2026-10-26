@@ -64,7 +64,9 @@ def test_security_reference_keeps_internal_mtls_opt_in() -> None:
     settings = EyvanSettings()
     assert settings.mutual_tls_server_mode() is MutualTlsMode.OFF
     assert server_ssl_options(MutualTlsMode.OFF, files) == {}
-    assert server_ssl_options(MutualTlsMode.REQUIRED, files) == {
+    required = server_ssl_options(MutualTlsMode.REQUIRED, files)
+    assert callable(required.pop("ssl_context_factory"))
+    assert required == {
         "ssl_certfile": "server.pem",
         "ssl_keyfile": "server-key.pem",
         "ssl_ca_certs": "ca.pem",

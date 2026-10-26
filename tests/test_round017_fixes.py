@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 import io
-import ssl
 import tarfile
 from pathlib import Path
 
@@ -107,8 +106,9 @@ def test_server_ssl_options_use_supported_uvicorn_tls_policy(tmp_path: Path) -> 
     )
     options = server_ssl_options(MutualTlsMode.REQUIRED, files)
     inspect.signature(uvicorn.run).bind(object(), **options)
-    context = ssl.SSLContext(options["ssl_version"])
-    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    # The floor must not depend on the OpenSSL build's SSLContext default (the
+    # Ubuntu CI runner's is MINIMUM_SUPPORTED); the factory sets it explicitly.
+    assert callable(options["ssl_context_factory"])
 
 
 # ------------------------------------------------------------------ workspace

@@ -356,15 +356,24 @@ def server_ssl_options(mode: MutualTlsMode, files: MutualTlsFiles) -> dict[str, 
         raise MutualTlsConfigurationError("a mutual TLS server requires a certificate and private key")
     if not files.has_trust_anchor:
         raise MutualTlsConfigurationError("a mutual TLS server requires a trust bundle to verify its clients")
+
+    def context_factory(_config: object, _default: object) -> ssl.SSLContext:
+        # Uvicorn's own context is SSLContext(ssl_version), whose minimum is
+        # whatever the OpenSSL build defaults to: TLS 1.2 on some builds,
+        # MINIMUM_SUPPORTED (TLS 1.0) on the Ubuntu CI runner. Building the
+        # context here applies the explicit TLS 1.2 floor everywhere.
+        context = server_ssl_context(mode, files)
+        assert context is not None  # mode is not OFF
+        return context
+
     return {
         "ssl_certfile": files.certificate,
         "ssl_keyfile": files.private_key,
         "ssl_ca_certs": files.trust_bundle,
         "ssl_cert_reqs": int(ssl.CERT_REQUIRED if mode is MutualTlsMode.REQUIRED else ssl.CERT_OPTIONAL),
-        # Uvicorn builds SSLContext(ssl_version). On our supported Python >=3.11,
-        # PROTOCOL_TLS_SERVER defaults to a TLS 1.2 minimum while allowing TLS 1.3.
-        # ssl_version is supported by Uvicorn >=0.32; ssl_minimum_version is not.
         "ssl_version": int(ssl.PROTOCOL_TLS_SERVER),
+        # Requires Uvicorn >=0.48, where ssl_context_factory was added.
+        "ssl_context_factory": context_factory,
     }
 
 
