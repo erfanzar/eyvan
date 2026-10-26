@@ -260,11 +260,25 @@ async def test_concurrent_upload_reservations_cannot_both_exceed_one_quota(repos
             payload=payload,
         )
 
-    outcomes = await asyncio.gather(*(upload(payload) for payload in payloads), return_exceptions=True)
-    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+    outcomes: list[object] = list(
+        await asyncio.gather(*(upload(payload) for payload in payloads), return_exceptions=True)
+    )
+    # SERIALIZABLE may abort both racers at commit (seen on a loaded CI runner:
+    # zero winners). That is safe, and TransientRepositoryError is the
+    # documented retry signal, so retry the way a client would and then check
+    # the real invariant: the quota admits exactly one of the two uploads.
+    for index, payload in enumerate(payloads):
+        for _ in range(5):
+            if not isinstance(outcomes[index], TransientRepositoryError):
+                break
+            try:
+                outcomes[index] = await upload(payload)
+            except BaseException as exc:  # recorded, then asserted below
+                outcomes[index] = exc
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1, outcomes
     losers = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-    assert len(losers) == 1
-    assert isinstance(losers[0], (InputError, TransientRepositoryError))
+    assert len(losers) == 1, outcomes
+    assert isinstance(losers[0], InputError), outcomes
     usage = await service.artifact_usage(_principal(), org_id="acme", project_id="research")
     assert usage.stored_bytes == 6
 
