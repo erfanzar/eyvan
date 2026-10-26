@@ -250,111 +250,6 @@ export function FleetPage({
         />
       </section>
 
-      {loadPools && (
-        <section className="panel data-panel" aria-label="Applied fleets">
-          <div className="panel-header">
-            <div>
-              <h2>Applied fleets</h2>
-              <p>What this project may submit to, whether or not anything is running on it</p>
-            </div>
-            <Layers size={18} aria-hidden="true" />
-          </div>
-          {poolsLoading && <p className="panel-note">Reading capacity pools…</p>}
-          {!poolsLoading && !poolsError && fleets.length === 0 && <p className="panel-note">No fleets are applied.</p>}
-          {fleets.length > 0 && (
-            <div className="table-scroll">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Fleet</th>
-                    <th>Pools</th>
-                    <th>Shapes</th>
-                    <th>Zone</th>
-                    {onStopFleet && <th aria-label="Actions" />}
-                  </tr>
-                </thead>
-                <tbody>
-                  {fleets.map((fleet) => (
-                    <tr key={fleet.name}>
-                      <td>
-                        <span className="resource-cell">
-                          <strong>{fleet.name}</strong>
-                          {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
-                        </span>
-                      </td>
-                      <td>{fleet.pools.length}</td>
-                      <td>
-                        <span className="resource-cell">
-                          <strong>{summarizeShapes(fleet.shapes)}</strong>
-                        </span>
-                      </td>
-                      <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
-                      {onStopFleet && (
-                        <td>
-                          <button
-                            className="button button-secondary"
-                            type="button"
-                            disabled={stopping === fleet.name}
-                            onClick={() => setConfirmStop(fleet.name)}
-                          >
-                            {stopping === fleet.name ? "Stopping" : "Stop"}
-                          </button>
-                        </td>
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {poolsError && (
-            <div className="inline-error" role="alert">
-              <AlertTriangle size={16} aria-hidden="true" />
-              {poolsError}
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => setPoolRetryRevision((revision) => revision + 1)}
-              >
-                Retry pool listing
-              </button>
-            </div>
-          )}
-        </section>
-      )}
-
-      {stopError && (
-        <div className="inline-error" role="alert">
-          <AlertTriangle size={16} aria-hidden="true" />
-          {stopError}
-        </div>
-      )}
-
-      {confirmStop && onStopFleet && (
-        <ConfirmDialog
-          open
-          title={`Stop ${confirmStop}?`}
-          consequence={
-            "Every pool in this fleet is disabled and its ceiling set to zero, so the autoscaler releases what is " +
-            "running. The fleet definition survives -- re-applying the same config brings it back."
-          }
-          confirmLabel="Stop fleet"
-          destructive
-          busy={stopping === confirmStop}
-          error={stopError}
-          onCancel={() => setConfirmStop(null)}
-          onConfirm={() => {
-            const name = confirmStop;
-            setConfirmStop(null);
-            setStopping(name);
-            setStopError(null);
-            void onStopFleet(name)
-              .catch((error) => setStopError(error instanceof Error ? error.message : "Could not stop the fleet"))
-              .finally(() => setStopping(null));
-          }}
-        />
-      )}
-
       <section className="panel topology-panel">
         <div className="panel-header">
           <div>
@@ -619,6 +514,111 @@ export function FleetPage({
             </table>
           </div>
         </section>
+      )}
+
+      {loadPools && (
+        <section className="panel data-panel" aria-label="Applied fleets">
+          <div className="panel-header">
+            <div>
+              <h2>Applied fleets</h2>
+              <p>What this project may submit to, whether or not anything is running on it</p>
+            </div>
+            <Layers size={18} aria-hidden="true" />
+          </div>
+          {poolsLoading && <p className="panel-note">Reading capacity pools…</p>}
+          {!poolsLoading && !poolsError && fleets.length === 0 && <p className="panel-note">No fleets are applied.</p>}
+          {fleets.length > 0 && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Fleet</th>
+                    <th>Pools</th>
+                    <th>Shapes</th>
+                    <th>Zone</th>
+                    {onStopFleet && <th aria-label="Actions" />}
+                  </tr>
+                </thead>
+                <tbody>
+                  {fleets.map((fleet) => (
+                    <tr key={fleet.name}>
+                      <td>
+                        <span className="resource-cell">
+                          <strong>{fleet.name}</strong>
+                          {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
+                        </span>
+                      </td>
+                      <td>{fleet.pools.length}</td>
+                      <td>
+                        <span className="resource-cell">
+                          <strong>{summarizeShapes(fleet.shapes)}</strong>
+                        </span>
+                      </td>
+                      <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
+                      {onStopFleet && (
+                        <td>
+                          <button
+                            className="button button-secondary"
+                            type="button"
+                            disabled={stopping === fleet.name}
+                            onClick={() => setConfirmStop(fleet.name)}
+                          >
+                            {stopping === fleet.name ? "Stopping" : "Stop"}
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {poolsError && (
+            <div className="inline-error" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {poolsError}
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => setPoolRetryRevision((revision) => revision + 1)}
+              >
+                Retry pool listing
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {stopError && (
+        <div className="inline-error" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          {stopError}
+        </div>
+      )}
+
+      {confirmStop && onStopFleet && (
+        <ConfirmDialog
+          open
+          title={`Stop ${confirmStop}?`}
+          consequence={
+            "Every pool in this fleet is disabled and its ceiling set to zero, so the autoscaler releases what is " +
+            "running. The fleet definition survives -- re-applying the same config brings it back."
+          }
+          confirmLabel="Stop fleet"
+          destructive
+          busy={stopping === confirmStop}
+          error={stopError}
+          onCancel={() => setConfirmStop(null)}
+          onConfirm={() => {
+            const name = confirmStop;
+            setConfirmStop(null);
+            setStopping(name);
+            setStopError(null);
+            void onStopFleet(name)
+              .catch((error) => setStopError(error instanceof Error ? error.message : "Could not stop the fleet"))
+              .finally(() => setStopping(null));
+          }}
+        />
       )}
 
       {/* Reference panels, below the operational ones on purpose: cells, leases
