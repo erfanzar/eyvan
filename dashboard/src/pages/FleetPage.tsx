@@ -186,11 +186,13 @@ export function FleetPage({
   }, [loadPools, stopping, refreshRevision, poolRetryRevision]);
 
   useEffect(() => {
-    const load = attachmentClient?.listDiscoveredTpus;
-    if (!load) return;
+    // Called as a method on the client, never detached: the real client reads
+    // `this` (forceDemo, base URL, auth), and a detached call loses it.
+    const client = attachmentClient;
+    if (!client?.listDiscoveredTpus) return;
     const controller = new AbortController();
     const read = () => {
-      load(controller.signal)
+      client.listDiscoveredTpus!(controller.signal)
         .then((value) => {
           if (controller.signal.aborted) return;
           setDiscovered(value);

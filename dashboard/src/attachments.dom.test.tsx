@@ -9,6 +9,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AddTpuModal, type AttachmentClient } from "./components/AddTpuModal";
+import { EyvanApiClient } from "./api/client";
 import { mockAttachmentPlan, mockDiscoveredTpus } from "./api/mockData";
 import { FleetPage } from "./pages/FleetPage";
 import type { AttachmentInput, AttachmentJob } from "./types";
@@ -207,6 +208,35 @@ describe("Add TPU", () => {
     expect((screen.getByLabelText("Zone") as HTMLInputElement).value).toBe("us-east5-a");
     expect((screen.getByLabelText("Fleet name (optional)") as HTMLInputElement).value).toBe("tpu-spot-b-5e6f7a8b");
     await act(async () => {});
+  });
+
+  it("reads discovered TPUs through the real client class without losing its receiver", async () => {
+    // A plain object of vi.fn()s never touches `this`, so it hid a detached
+    // method call that crashed the real client with "this.forceDemo".
+    const real = new EyvanApiClient("/api/v1", true);
+    render(
+      <FleetPage
+        cells={[]}
+        leases={[]}
+        onRefresh={async () => {}}
+        loadWarmth={async () => ({ observed_at: "", pools: [] })}
+        loadBilling={async () => ({
+          observed_at: "",
+          accrued_cost: 0,
+          idle_cost: 0,
+          cells: 0,
+          billed_seconds: 0,
+          idle_seconds: 0,
+          unpriced_cells: 0,
+        })}
+        loadLaunchLatency={async () => ({ observed_at: "", pools: [] })}
+        attachmentClient={real}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "TPUs in your Google Cloud" });
+    await waitFor(() => expect(panel.textContent).toContain(mockDiscoveredTpus.tpus[0].fleet));
+    expect(panel.textContent).not.toContain("forceDemo");
+    expect(panel.querySelector('[role="alert"]')).toBeNull();
   });
 
   it("keeps the last discovered list and names the error when a refresh fails", async () => {
