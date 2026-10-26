@@ -67,7 +67,27 @@ export function AddTpuModal({ open, client, onClose, onConnected, initial = null
     setFleet(initial.fleet ?? "");
     setPlan(null);
     setError(null);
-  }, [initial, open]);
+    // Opened from a discovered TPU, every field is already known: load the
+    // read-only preview at once instead of leaving Connect disabled behind a
+    // Preview click nobody can tell is required.
+    const controller = new AbortController();
+    setBusy(true);
+    client
+      .planAttachment(initial, controller.signal)
+      .then((next) => {
+        if (!controller.signal.aborted) setPlan(next);
+      })
+      .catch((failure: unknown) => {
+        if (!controller.signal.aborted) setError(message(failure));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBusy(false);
+      });
+    return () => {
+      controller.abort();
+      setBusy(false);
+    };
+  }, [client, initial, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -395,6 +415,13 @@ export function AddTpuModal({ open, client, onClose, onConnected, initial = null
                   </button>
                 ))}
               </section>
+            )}
+            {!job && !plan && !error && (
+              <p className="muted" role="note">
+                {busy
+                  ? "Loading the read-only preview…"
+                  : "Preview first: Connect unlocks after the read-only preview shows what will change."}
+              </p>
             )}
           </div>
           <div className="modal-footer">

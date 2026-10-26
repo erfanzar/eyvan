@@ -207,6 +207,24 @@ describe("Add TPU", () => {
     expect((screen.getByLabelText("GCP project") as HTMLInputElement).value).toBe("demo-lab");
     expect((screen.getByLabelText("Zone") as HTMLInputElement).value).toBe("us-east5-a");
     expect((screen.getByLabelText("Fleet name (optional)") as HTMLInputElement).value).toBe("tpu-spot-b-5e6f7a8b");
+    // The preview loads by itself: no Preview click, and Connect unlocks.
+    await screen.findByRole("region", { name: "Attachment preview" });
+    expect(vi.mocked(api.planAttachment).mock.calls[0][0]).toEqual({
+      target: "spot-b",
+      kind: "tpu",
+      fleet: "tpu-spot-b-5e6f7a8b",
+      project: "demo-lab",
+      zone: "us-east5-a",
+    });
+    const dialog = screen.getByRole("dialog", { name: "Add TPU" });
+    const connect = Array.from(dialog.querySelectorAll("button")).find((b) => b.textContent === "Connect");
+    expect((connect as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("says why Connect is locked before a manual preview", async () => {
+    render(<AddTpuModal open client={client()} onClose={close} onConnected={connected} />);
+    expect(screen.getByRole("note").textContent).toContain("Preview first");
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => {});
   });
 
