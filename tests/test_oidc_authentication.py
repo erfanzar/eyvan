@@ -95,7 +95,9 @@ def _verifier(jwks: dict, monkeypatch: pytest.MonkeyPatch, *, discovery: bool = 
         def __exit__(self, *_exc: object) -> bool:
             return False
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: _JwksResponse())
+    # OpenerDirector.open is where every PyJWT version's fetch ends: older
+    # releases go through urlopen, 2.15+ builds its own no-redirect opener.
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda *_args, **_kwargs: _JwksResponse())
 
     if discovery:
 

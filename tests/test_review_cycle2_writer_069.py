@@ -50,11 +50,13 @@ def _local_verifier(monkeypatch, signing_key, *, issuer: str, discovered_issuer:
     public_key.update({"kid": "writer-069-key", "use": "sig", "alg": "RS256"})
     jwks_url = f"{BASE_ISSUER}/jwks"
 
-    def urlopen(request, **_kwargs):
+    def open_url(_opener, request, *_args, **_kwargs):
         assert request.full_url == jwks_url
         return io.BytesIO(json.dumps({"keys": [public_key]}).encode())
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    # OpenerDirector.open is where every PyJWT version's fetch ends: older
+    # releases go through urlopen, 2.15+ builds its own no-redirect opener.
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_url)
 
     def discover(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == f"{BASE_ISSUER}/.well-known/openid-configuration"

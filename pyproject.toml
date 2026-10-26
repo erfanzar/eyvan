@@ -29,7 +29,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "starlette>=1.5.0",
     "typing-extensions>=4.12.0",
-    "uvicorn[standard]>=0.32.0",
+    "uvicorn[standard]>=0.48.0",
 ]
 
 [project.scripts]
@@ -64,7 +64,7 @@ dev = [
     "ruff==0.15.16",
     "import-linter>=2.1",
     "pip-audit==2.10.1",
-    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-sdk==1.45.1",
 ]
 oci = ["google-cloud-storage>=2.18.0"]
 
