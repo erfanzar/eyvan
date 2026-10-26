@@ -89,11 +89,14 @@ def test_fleet_lease_serializes_remote_side_effect_window(tmp_path) -> None:
 
 def test_fleet_lease_renews_while_a_remote_side_effect_is_running(tmp_path) -> None:
     path = tmp_path / "fleet.json"
-    first = FleetStateStore(LocalBackend(path), lease_ttl_s=0.12, owner="agent-a")
-    second = FleetStateStore(LocalBackend(path), lease_ttl_s=0.12, owner="agent-b")
+    # Renewal runs every ttl/3. A 0.12 s TTL left ~80 ms of scheduling slack,
+    # which a loaded CI runner exceeded. The sleep still outlasts the TTL by
+    # 2.5x, so the lease can only survive if renewal actually ran.
+    first = FleetStateStore(LocalBackend(path), lease_ttl_s=1.0, owner="agent-a")
+    second = FleetStateStore(LocalBackend(path), lease_ttl_s=1.0, owner="agent-b")
 
     with first.exclusive():
-        time.sleep(0.3)
+        time.sleep(2.5)
         assert first.lease_holder() == "agent-a"
         assert not second.acquire_lease()
 

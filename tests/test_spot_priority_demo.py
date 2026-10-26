@@ -470,7 +470,9 @@ def test_cleanup_reports_deadline_when_owned_workload_never_becomes_terminal(mon
     )
     assert events == ["disable"]
     assert cancellations == [("wl_owned", "cancel", plan["run_id"] + "-cancel-batch")]
-    assert clock[0] - started == 120
+    # The fake clock starts at the real monotonic value, so the difference is
+    # a float subtraction and is not exactly 120 for every starting value.
+    assert clock[0] - started == pytest.approx(120)
     assert receipt["cleanup"]["errors"] == [{"operation": "cancel-batch", "type": "TimeoutError"}]
     assert receipt["cleanup"]["api_cells_deleted"] is True
     assert receipt["cleanup"]["provider_absence_verified"] is False
