@@ -51,6 +51,21 @@ def test_an_ambiguous_local_execution_is_signalled_before_retirement_gives_up(
     record["message"] = "native-local worker ownership is ambiguous; workload was not signalled"
     record_path.write_text(json.dumps(record), encoding="utf-8")
 
+    # Stub the observation as well, as the test below does. The persisted
+    # INDETERMINATE alone raced the real worker process starting up: on a
+    # loaded runner (CI, Python 3.11 under coverage) the worker rewrote the
+    # record and honoured stop_requested, so retire saw a terminal status and
+    # returned without ever reaching the ambiguity path this test is about.
+    monkeypatch.setattr(
+        LocalProcessExecutor,
+        "status",
+        lambda self, rid: ExecutionWorkloadObservation(
+            remote_id=rid,
+            status=ExecutionWorkloadStatus.INDETERMINATE,
+            message="native-local worker ownership is ambiguous; workload was not signalled",
+        ),
+    )
+
     signalled: list[int] = []
     monkeypatch.setattr(
         "eyvan.worker.runtime.local_process._signal_tracked_worker",
