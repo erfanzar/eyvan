@@ -153,6 +153,37 @@ def test_fresh_reuses_a_young_index_and_background_refresh_skips_it(tmp_path) ->
     assert refresh_in_background(index) is None
 
 
+def test_a_stale_index_is_refreshed_in_the_background_and_sync_is_idempotent(tmp_path) -> None:
+    api = _account()
+    index = DiscoveryIndex(tmp_path / "discovered.json", api=api)
+    index.save(DiscoverySnapshot(discovered_at=0.0))  # decades old
+
+    thread = refresh_in_background(index)
+    assert thread is not None
+    thread.join(timeout=10)
+    first = index.load()
+    assert first is not None and len(first.tpus) == 3
+
+    # A second pass over the same account yields the same inventory.
+    second = index.refresh()
+    assert second.tpus == first.tpus and second.skipped == first.skipped
+    assert {call for call, _ in api.calls} == {"list_projects", "list_nodes"}
+
+
+def test_a_failed_background_refresh_never_raises_and_keeps_the_index(tmp_path) -> None:
+    class Down(FakeApi):
+        def list_projects(self):
+            raise TpuApiError("HTTP 503", retryable=True, status=503)
+
+    index = DiscoveryIndex(tmp_path / "discovered.json", api=Down({}))
+    stale = DiscoverySnapshot(discovered_at=0.0)
+    index.save(stale)
+    thread = refresh_in_background(index)
+    assert thread is not None
+    thread.join(timeout=10)
+    assert index.load() == stale
+
+
 # ------------------------------------------------------------ lazy connect
 
 
