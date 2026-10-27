@@ -234,6 +234,25 @@ describe("Add TPU", () => {
     expect((connect as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("reopens a plain Add TPU blank after a discovered TPU was used", async () => {
+    const api = client();
+    const initial: AttachmentInput = {
+      target: "spot-b",
+      kind: "tpu",
+      fleet: "tpu-x",
+      project: "demo-lab",
+      zone: "us-east5-a",
+    };
+    const view = render(<AddTpuModal open client={api} initial={initial} onClose={close} onConnected={connected} />);
+    await screen.findByRole("region", { name: "Attachment preview" });
+    view.rerender(<AddTpuModal open={false} client={api} initial={null} onClose={close} onConnected={connected} />);
+    view.rerender(<AddTpuModal open client={api} initial={null} onClose={close} onConnected={connected} />);
+    // The very first render after reopening must already be the blank SSH form.
+    expect(screen.queryByLabelText("TPU name")).toBeNull();
+    expect((screen.getByLabelText("SSH host or IP") as HTMLInputElement).value).toBe("");
+    await act(async () => {});
+  });
+
   it("says Preview is optional", async () => {
     render(<AddTpuModal open client={client()} onClose={close} onConnected={connected} />);
     expect(screen.getByRole("note").textContent).toContain("Preview is optional");

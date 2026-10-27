@@ -59,7 +59,23 @@ export function AddTpuModal({ open, client, onClose, onConnected, initial = null
   }, [onConnected]);
 
   useEffect(() => {
-    if (!open || !initial) return;
+    if (!open) {
+      // The dialog stays mounted while closed. Clearing on close (not on the
+      // next open) means a plain "Add TPU" never renders even one frame of the
+      // last discovered TPU's fields. A still-running job is recovered from
+      // listAttachments when the dialog opens again.
+      setTarget("");
+      setAdvanced(false);
+      setProject("");
+      setZone("");
+      setFleet("");
+      setPlan(null);
+      setError(null);
+      setJob(null);
+      setCopied(false);
+      return;
+    }
+    if (!initial) return;
     setTarget(initial.target);
     setAdvanced(initial.kind === "tpu");
     setProject(initial.project ?? "");
