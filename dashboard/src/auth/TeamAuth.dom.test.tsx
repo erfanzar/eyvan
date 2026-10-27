@@ -82,7 +82,7 @@ describe("team sign-in", () => {
     gate();
 
     await waitFor(() => expect(screen.getByRole("form", { name: "Sign in" })).toBeTruthy());
-    expect(screen.getByLabelText("Email")).toBeTruthy();
+    expect(screen.getByLabelText("User name or email")).toBeTruthy();
     expect(screen.getByLabelText("Password")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Sign in with OIDC/ }));
     expect(assign).toHaveBeenCalledWith(LOGIN_PATH);
@@ -98,7 +98,7 @@ describe("team sign-in", () => {
 
     gate();
     await waitFor(() => expect(screen.getByRole("form", { name: "Sign in" })).toBeTruthy());
-    fireEvent.change(screen.getByLabelText("Email"), { target: { value: " alice@example.com " } });
+    fireEvent.change(screen.getByLabelText("User name or email"), { target: { value: " alice@example.com " } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "correct horse battery" } });
     fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
 
@@ -113,16 +113,16 @@ describe("team sign-in", () => {
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "");
     teamPlane({
       ...baseRoutes(NO_IDP),
-      "POST /api/v1/team/login": () => [401, { detail: "wrong email or password" }],
+      "POST /api/v1/team/login": () => [401, { detail: "wrong user name or password" }],
     });
 
     gate();
     await waitFor(() => expect(screen.getByRole("form", { name: "Sign in" })).toBeTruthy());
-    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@example.com" } });
+    fireEvent.change(screen.getByLabelText("User name or email"), { target: { value: "alice" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "not the password" } });
     fireEvent.submit(screen.getByRole("form", { name: "Sign in" }));
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("wrong email or password"));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("wrong user name or password"));
     expect(screen.queryByText("fleet")).toBeNull();
   });
 

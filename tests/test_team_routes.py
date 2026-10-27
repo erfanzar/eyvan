@@ -106,7 +106,24 @@ def test_wrong_password_is_generic_and_throttled() -> None:
     ]
     assert statuses[:5] == [401] * 5 and statuses[5] == 429
     unknown = http.post("/api/v1/team/login", json={"email": "nobody@example.com", "password": "wrong password!"})
-    assert unknown.json()["detail"] == "wrong email or password"
+    assert unknown.json()["detail"] == "wrong user name or password"
+    unknown_name = http.post("/api/v1/team/login", json={"email": "nobody", "password": "wrong password!"})
+    assert unknown_name.status_code == 401 and unknown_name.json()["detail"] == "wrong user name or password"
+
+
+def test_sign_in_accepts_the_user_name_as_well_as_the_email() -> None:
+    http = _client()
+    token = _onboard(http)["token"]
+    http.post("/api/v1/team/invites/accept", json={"token": token, "password": PASSWORD})
+    http.cookies.clear()
+    by_name = http.post("/api/v1/team/login", json={"email": "Alice", "password": PASSWORD})
+    assert by_name.status_code == 200, by_name.text
+    assert by_name.json()["user"]["subject"] == "alice"
+    http.cookies.clear()
+    by_email = http.post("/api/v1/team/login", json={"email": "alice@example.com", "password": PASSWORD})
+    assert by_email.status_code == 200
+    wrong = http.post("/api/v1/team/login", json={"email": "alice", "password": "wrong password!"})
+    assert wrong.status_code == 401
 
 
 @pytest.mark.parametrize(

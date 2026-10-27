@@ -3877,7 +3877,7 @@
         "properties": {
           "email": {
             "maxLength": 320,
-            "minLength": 3,
+            "minLength": 1,
             "title": "Email",
             "type": "string"
           },
@@ -13727,7 +13727,7 @@
     },
     "/api/v1/team/login": {
       "post": {
-        "description": "Sign in with email and password; sets an HttpOnly session cookie.",
+        "description": "Sign in with user name (or email) and password; sets an HttpOnly session cookie.",
         "operationId": "team_login_api_v1_team_login_post",
         "requestBody": {
           "content": {

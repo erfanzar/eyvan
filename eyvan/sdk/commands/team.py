@@ -174,7 +174,12 @@ def _emit(as_json: bool, payload: tp.Any, text: str) -> None:
 
 @click.command("login")
 @click.argument("url")
-@click.option("--email", help="Your account email (prompted when omitted).")
+@click.option(
+    "--username",
+    "--email",
+    "email",
+    help="Your user name or the email from your invite (prompted when omitted).",
+)
 @click.option("--password-stdin", is_flag=True, help="Read the password from stdin instead of prompting.")
 @click.option("--fleet", help="Fleet to make active when the plane has more than one.")
 @click.option(
@@ -229,7 +234,7 @@ def login(
             raise click.ClickException(
                 f"{base} does not run team accounts (EYVAN_TEAM_MODE is off); use `eyvan connect` instead"
             )
-        address = email or click.prompt("Email")
+        address = email or click.prompt("User name or email")
         if password_stdin:
             password = sys.stdin.readline().rstrip("\n")
         else:

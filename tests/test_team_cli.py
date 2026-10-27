@@ -119,8 +119,17 @@ def test_a_wrong_password_saves_nothing(plane) -> None:
     result = CliRunner().invoke(
         cli.main, ["login", PLANE, "--email", "alice@example.com", "--password-stdin"], input="wrong password!\n"
     )
-    assert result.exit_code != 0 and "wrong email or password" in result.output
+    assert result.exit_code != 0 and "wrong user name or password" in result.output
     assert TeamCredentialStore().get(PLANE) is None
+
+
+def test_login_accepts_the_user_name(plane) -> None:
+    result = CliRunner().invoke(
+        cli.main, ["login", PLANE, "--username", "alice", "--password-stdin"], input=f"{PASSWORD}\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "as alice" in result.output
+    assert TeamCredentialStore().get(PLANE) is not None
 
 
 def test_logout_revokes_the_token_on_the_plane_and_forgets_it(plane) -> None:

@@ -99,15 +99,16 @@ try {
   await a.reload();
   await a.getByRole("form", { name: "Sign in" }).waitFor({ timeout: 15000 });
   ok("sign-out ends the session, also after a reload");
-  await a.getByLabel("Email").fill("admin@example.com");
+  // Sign in with the user name, not the email: nobody is ever emailed.
+  await a.getByLabel("User name or email").fill("admin");
   await a.getByLabel("Password").fill("not the password");
   await a.getByRole("button", { name: "Sign in", exact: true }).click();
-  await a.getByRole("alert").getByText("wrong email or password").waitFor({ timeout: 10000 });
+  await a.getByRole("alert").getByText("wrong user name or password").waitFor({ timeout: 10000 });
   ok("a wrong password shows the generic refusal");
   await a.getByLabel("Password").fill(ADMIN_PW);
   await a.getByRole("button", { name: "Sign in", exact: true }).click();
   await a.getByRole("button", { name: /^Settings/ }).waitFor({ timeout: 15000 });
-  ok("password sign-in opens the dashboard");
+  ok("signing in with the user name opens the dashboard");
 
   const contextB = await browser.newContext({ viewport: { width: 1500, height: 1000 }, serviceWorkers: "block" });
   const b = await contextB.newPage();

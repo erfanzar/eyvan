@@ -218,8 +218,15 @@ class AccountsMixin:
         the caller and take the same time.
         """
 
+        # ``email`` is whatever the person typed: the address from their invite
+        # or the user name they were given. Nobody is ever emailed, so the name
+        # is often the only thing they remember.
+        identifier = email.strip().lower()
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
-            user = await tx.get_user_by_email(email.strip().lower())
+            if "@" in identifier:
+                user = await tx.get_user_by_email(identifier)
+            else:
+                user = await tx.get_user(identifier)
         stored = user.password_hash if user is not None and not user.disabled else None
         if not await asyncio.to_thread(verify_password, password, stored):
             return None

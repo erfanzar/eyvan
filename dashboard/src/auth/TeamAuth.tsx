@@ -58,16 +58,18 @@ export function TeamLoginScreen({
           <LogIn size={22} />
         </span>
         <h1>Sign in to Eyvan</h1>
-        <p>Use the email and password from your invite.</p>
+        <p>Use your user name (or the email on your invite) and your password.</p>
         {error && (
           <div className="form-error" role="alert">
             {error}
           </div>
         )}
         <label className="field">
-          <span>Email</span>
+          <span>User name or email</span>
           <input
-            type="email"
+            type="text"
+            autoCapitalize="none"
+            spellCheck={false}
             autoComplete="username"
             value={email}
             onChange={(event) => setEmail(event.target.value)}

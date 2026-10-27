@@ -48,7 +48,9 @@ class _Body(BaseModel):
 
 
 class LoginBody(_Body):
-    email: str = Field(min_length=3, max_length=320)
+    #: The invite's email address or the account's user name; the field keeps
+    #: its original wire name so existing clients still work.
+    email: str = Field(min_length=1, max_length=320)
     password: str = Field(min_length=1, max_length=1024)
     #: Set by `eyvan login`: return a named personal API token in the body
     #: instead of setting a browser session cookie.
@@ -151,7 +153,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
 
     @app.post("/api/v1/team/login", tags=["team"])
     async def team_login(body: LoginBody, response: Response, _on: _On) -> dict[str, tp.Any]:
-        """Sign in with email and password; sets an HttpOnly session cookie."""
+        """Sign in with user name (or email) and password; sets an HttpOnly session cookie."""
 
         key = body.email.strip().lower()
         if throttle.blocked(key):
@@ -163,7 +165,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         result = await service.password_login(key, body.password, session_ttl_s=ttl, token_name=body.token_name)
         if result is None:
             throttle.failed(key)
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="wrong email or password")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="wrong user name or password")
         throttle.succeeded(key)
         user, record, raw = result
         expires_at = record.expires_at.isoformat() if record.expires_at else None
