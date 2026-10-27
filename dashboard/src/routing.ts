@@ -12,6 +12,7 @@ export type Section =
   | "billing"
   | "budgets"
   | "audit"
+  | "assistant"
   | "settings";
 
 export type RunTab = "charts" | "episodes" | "histograms" | "rollouts" | "completions" | "media";
@@ -58,7 +59,9 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // and an availability flag -- so pressing Billing set the hash, the hash
   // parsed back to overview, and the section could only be reached by not
   // reloading.
-  if (["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit", "settings"].includes(section)) {
+  if (
+    ["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit", "assistant", "settings"].includes(section)
+  ) {
     return { section: section as Section };
   }
   // Team accounts first shipped as their own `#/users` section; keep those links working.

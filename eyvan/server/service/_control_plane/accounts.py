@@ -28,6 +28,7 @@ from eyvan.server.service._control_plane.shared import (
     NotFoundError,
     Permission,
     Principal,
+    Role,
     RoleGrant,
     RoleGrantRecord,
     _new_id,
@@ -36,6 +37,8 @@ from eyvan.server.service._control_plane.shared import (
 
 #: How long an unaccepted invite stays usable.
 INVITE_TTL = timedelta(days=7)
+#: ``created_by`` of invites minted by the host-side first-admin bootstrap.
+BOOTSTRAP_ACTOR = "eyvan-bootstrap"
 #: Bound on how often a successful bearer request rewrites ``last_used_at``.
 _TOUCH_INTERVAL = timedelta(minutes=1)
 
@@ -118,6 +121,62 @@ class AccountsMixin:
                     invite.id,
                     "invite.created",
                     {"email": email, "subject": subject, "roles": [grant.role.value for grant in grants]},
+                )
+            )
+        return invite, raw
+
+    async def bootstrap_admin_invite(
+        self, *, email: str, subject: str, created_by: str = BOOTSTRAP_ACTOR, ttl: timedelta = INVITE_TTL
+    ) -> tuple[InviteRecord, str]:
+        """Create the first fleet-admin invite on a plane that has no accounts yet.
+
+        Host-side only: there is no principal, because nobody can sign in yet.
+        The caller proves authority by being able to open the plane's own store
+        (its database credentials or its owner-only state file), never over HTTP.
+        Refuses once any account exists, so it cannot mint a second admin
+        behind the first one's back. An earlier bootstrap invite that was never
+        accepted is revoked and replaced: the operator who reruns it lost the link.
+        """
+
+        email = email.strip().lower()
+        raw, digest = new_secret("eyvinv_")
+        now = utcnow()
+        try:
+            invite = InviteRecord(
+                id=_id("inv"),
+                email=email,
+                subject=subject.strip().lower(),
+                grants=(RoleGrant(role=Role.FLEET_ADMIN),),
+                token_hash=digest,
+                created_by=created_by,
+                created_at=now,
+                expires_at=now + ttl,
+            )
+        except ValueError as exc:
+            raise InputError(str(exc)) from exc
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            if await tx.list_users():
+                raise ConflictError(
+                    "this plane already has team accounts; an existing fleet admin invites people from "
+                    "Settings or with `eyvan users invite`"
+                )
+            for pending in await tx.list_invites():
+                if not pending.open_at(now):
+                    continue
+                if pending.created_by != created_by:
+                    raise ConflictError(
+                        f"an open invite for {pending.email} already exists; revoke it before bootstrapping"
+                    )
+                await tx.put_invite(pending.model_copy(update={"revoked": True}))
+                await tx.append_event(_event(created_by, "invite", pending.id, "invite.revoked", {"replaced": True}))
+            await tx.put_invite(invite)
+            await tx.append_event(
+                _event(
+                    created_by,
+                    "invite",
+                    invite.id,
+                    "invite.created",
+                    {"email": email, "subject": invite.subject, "roles": [Role.FLEET_ADMIN.value], "bootstrap": True},
                 )
             )
         return invite, raw

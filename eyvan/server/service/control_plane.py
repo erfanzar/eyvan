@@ -737,6 +737,7 @@ from eyvan.server.service._control_plane.shared import (
     validate_webhook_target as validate_webhook_target,
 )
 from eyvan.server.service._control_plane.submission import SubmissionMixin
+from eyvan.server.service._control_plane.team_requests import TeamRequestsMixin
 from eyvan.server.service._control_plane.tenancy import TenancyMixin
 from eyvan.server.service._control_plane.transactions import TransactionsMixin
 from eyvan.server.service._control_plane.webhooks import WebhooksMixin
@@ -747,6 +748,7 @@ from eyvan.server.service._control_plane.workload_storage import WorkloadStorage
 
 class ControlPlaneService(
     AccountsMixin,
+    TeamRequestsMixin,
     SchedulingMixin,
     SubmissionMixin,
     CallableSubmissionMixin,

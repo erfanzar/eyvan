@@ -220,6 +220,16 @@ EXEMPT_ROUTES: dict[str, str] = {
         "each carried grant is checked with the tenancy grant-administration rule, so a project admin "
         "invites only into their own project (test_team_accounts)"
     ),
+    # Assistant: every tool call runs as the caller (test_assistant proves a non-admin's
+    # fleet read is refused through it); sizing and status read no tenant data.
+    "GET /api/v1/assistant/status": "reports only whether the assistant is configured and its model name",
+    "POST /api/v1/assistant/chat": "tools call the service with the caller's own principal (test_assistant)",
+    "POST /api/v1/assistant/size": "pure memory arithmetic over the request body; no stored data",
+    "POST /api/v1/team/requests": "files a request as the caller only",
+    "GET /api/v1/team/requests": "the caller's own requests; everyone's only for a fleet admin (test_assistant)",
+    "POST /api/v1/team/requests/{request_id}/resolve": (
+        "approve/decline needs fleet admin, withdraw only the filer's own request (test_assistant)"
+    ),
 }
 
 FLEET_ONLY_ROUTES.update(

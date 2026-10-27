@@ -871,6 +871,29 @@ class ApiTokenRecord(EyvanModel):
         return self.revoked_at is None and (self.expires_at is None or self.expires_at > moment)
 
 
+class TeamRequestRecord(EyvanModel):
+    """A user's request to the fleet admins: more capacity, or approval for a run.
+
+    Filed by a person (often through the assistant) and resolved by a fleet
+    admin. It carries no authority itself: approving one is a decision an admin
+    records, and any capacity or quota change still goes through the ordinary
+    audited routes.
+    """
+
+    id: str = Field(pattern=r"^req_[0-9a-f]{16}$")
+    kind: tp.Literal["capacity", "approval"]
+    subject: str = Field(min_length=1, max_length=256)
+    org_id: str | None = Field(default=None, max_length=128)
+    project_id: str | None = Field(default=None, max_length=128)
+    summary: str = Field(min_length=1, max_length=2000)
+    details: dict[str, tp.Any] = Field(default_factory=dict)
+    state: tp.Literal["open", "approved", "declined", "withdrawn"] = "open"
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    resolved_at: Annotated[datetime, AwareDatetime] | None = None
+    resolved_by: str | None = Field(default=None, max_length=256)
+    resolution_note: str = Field(default="", max_length=2000)
+
+
 class ResourceVector(EyvanModel):
     """Scalar resources requested by one workload replica or offered by a cell."""
 

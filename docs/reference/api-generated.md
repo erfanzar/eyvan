@@ -23,6 +23,9 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/artifacts/results/{result_id}` | Download Result Artifact | 200, 422 |
 | GET | `/api/v1/artifacts/usage` | Artifact Usage | 200, 422 |
 | PUT | `/api/v1/artifacts/workspaces/{digest}` | Upload Workspace Artifact | 200, 422 |
+| POST | `/api/v1/assistant/chat` | Assistant Chat | 200, 422 |
+| POST | `/api/v1/assistant/size` | Assistant Size | 200, 422 |
+| GET | `/api/v1/assistant/status` | Assistant Status | 200 |
 | GET | `/api/v1/attachments` | Recent Attachments | 200 |
 | POST | `/api/v1/attachments` | Start Attachment | 202, 422 |
 | GET | `/api/v1/attachments/discovered` | Discovered Tpus | 200 |
@@ -109,6 +112,9 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/team/login` | Team Login | 200, 422 |
 | POST | `/api/v1/team/logout` | Team Logout | 200 |
 | GET | `/api/v1/team/me` | Team Me | 200 |
+| GET | `/api/v1/team/requests` | List Team Requests | 200, 422 |
+| POST | `/api/v1/team/requests` | File Team Request | 201, 422 |
+| POST | `/api/v1/team/requests/{request_id}/resolve` | Resolve Team Request | 200, 422 |
 | GET | `/api/v1/team/status` | Team Status | 200 |
 | GET | `/api/v1/team/tokens` | List Team Tokens | 200 |
 | POST | `/api/v1/team/tokens` | Create Team Token | 201, 422 |

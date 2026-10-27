@@ -21,6 +21,7 @@ from click.core import ParameterSource
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.identity import resolve_control_plane_identity
 from eyvan.sdk.commands.artifacts import register_artifact_commands
+from eyvan.sdk.commands.assistant import register_assistant_commands
 from eyvan.sdk.commands.autoscale import register_autoscale_commands
 from eyvan.sdk.commands.capacity import register_capacity_commands
 from eyvan.sdk.commands.connect import register_connect_commands
@@ -165,6 +166,7 @@ for register_commands in (
     register_federation_commands,
     register_tenancy_commands,
     register_team_commands,
+    register_assistant_commands,
     register_proof_commands,
     register_query_commands,
     register_resource_commands,

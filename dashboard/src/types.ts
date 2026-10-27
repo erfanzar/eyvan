@@ -109,6 +109,46 @@ export interface TeamTokenCreated {
   record: TeamToken;
 }
 
+export interface AssistantStatus {
+  enabled: boolean;
+  model: string | null;
+}
+
+export interface AssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** A submission the assistant prepared; nothing runs until the user confirms it. */
+export interface AssistantDraft {
+  org_id: string;
+  project_id: string;
+  spec: Record<string, unknown> & { name: string };
+}
+
+export interface TeamRequest {
+  id: string;
+  kind: "capacity" | "approval";
+  subject: string;
+  org_id: string | null;
+  project_id: string | null;
+  summary: string;
+  details: Record<string, unknown>;
+  state: "open" | "approved" | "declined" | "withdrawn";
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  resolution_note: string;
+}
+
+export interface AssistantTurn {
+  reply: string;
+  steps: number;
+  tool_calls: Array<{ tool: string; ok: boolean }>;
+  drafts: AssistantDraft[];
+  requests: TeamRequest[];
+}
+
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
 
 /** Tracker wire types intentionally retain the store's snake_case field names. */

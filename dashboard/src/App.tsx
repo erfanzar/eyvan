@@ -33,6 +33,7 @@ import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
+import { AssistantPage } from "./pages/AssistantPage";
 import { UsersPage } from "./pages/UsersPage";
 import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
@@ -642,6 +643,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
     audit: canReadSelectedScope,
     // Only a team-mode plane has accounts; everywhere else the section is absent.
     settings: isTeamMode(),
+    // The page itself says when the plane has no assistant configured.
+    assistant: true,
   };
   const routed = accessibleRoute(route, sectionAvailability);
   // SUBMIT does not imply READ. A submit-only deep link must not mount the
@@ -1247,6 +1250,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
         break;
       case "audit":
         content = <AuditPage events={data.auditEvents} onAction={(message) => setToast({ message })} />;
+        break;
+      case "assistant":
+        content = <AssistantPage client={client} canAdminister={capabilities.manageFleet} teamMode={isTeamMode()} />;
         break;
       case "settings":
         content = (

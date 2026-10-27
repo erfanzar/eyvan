@@ -49,6 +49,11 @@ import type {
   AttachmentPlan,
   AuditEvent,
   DiscoveredTpus,
+  AssistantDraft,
+  AssistantMessage,
+  AssistantStatus,
+  AssistantTurn,
+  TeamRequest,
   TeamInvite,
   TeamInviteCreated,
   TeamInviteInput,
@@ -782,6 +787,61 @@ export class EyvanApiClient {
   async revokeTeamToken(tokenId: string): Promise<TeamToken> {
     return this.attachmentRequest<TeamToken>(`/api/v1/team/tokens/${encodeURIComponent(tokenId)}`, {
       method: "DELETE",
+    });
+  }
+
+  // Fleet assistant. The plane holds the provider key and runs every tool as
+  // this user; drafts come back unsubmitted.
+
+  async getAssistantStatus(signal?: AbortSignal): Promise<AssistantStatus> {
+    if (this.forceDemo) return { enabled: false, model: null };
+    return this.attachmentRequest<AssistantStatus>("/api/v1/assistant/status", { signal });
+  }
+
+  async assistantChat(messages: AssistantMessage[], scope: AuthScope = this.activeScope): Promise<AssistantTurn> {
+    return this.attachmentRequest<AssistantTurn>(
+      "/api/v1/assistant/chat",
+      {
+        method: "POST",
+        body: JSON.stringify({ messages, org_id: scope.orgId, project_id: scope.projectId }),
+      },
+      150_000,
+    );
+  }
+
+  /** Submit a draft the user confirmed: an ordinary submission under their own identity. */
+  async submitAssistantDraft(draft: AssistantDraft): Promise<{ id: string }> {
+    return this.attachmentRequest<{ id: string }>("/api/v1/workloads", {
+      method: "POST",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `assistant-${Date.now()}` },
+      body: JSON.stringify(draft),
+    });
+  }
+
+  async listTeamRequests(signal?: AbortSignal): Promise<TeamRequest[]> {
+    if (this.forceDemo) return [];
+    return (await this.attachmentRequest<{ requests: TeamRequest[] }>("/api/v1/team/requests", { signal })).requests;
+  }
+
+  async fileTeamRequest(
+    kind: TeamRequest["kind"],
+    summary: string,
+    scope: AuthScope = this.activeScope,
+  ): Promise<TeamRequest> {
+    return this.attachmentRequest<TeamRequest>("/api/v1/team/requests", {
+      method: "POST",
+      body: JSON.stringify({ kind, summary, org_id: scope.orgId, project_id: scope.projectId }),
+    });
+  }
+
+  async resolveTeamRequest(
+    requestId: string,
+    resolution: "approved" | "declined" | "withdrawn",
+    note = "",
+  ): Promise<TeamRequest> {
+    return this.attachmentRequest<TeamRequest>(`/api/v1/team/requests/${encodeURIComponent(requestId)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution, note }),
     });
   }
 

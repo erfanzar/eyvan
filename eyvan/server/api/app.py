@@ -111,6 +111,7 @@ from eyvan.records import (
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.secrets import MAX_SECRET_BYTES, SecretUnavailable, read_secret
+from eyvan.server.api.assistant import register_assistant_routes
 from eyvan.server.api.attachments import register_attachment_routes
 from eyvan.server.api.auth import (
     DEFAULT_DEVELOPMENT_SCOPE,
@@ -782,6 +783,7 @@ def create_app(
     register_tracking_routes(app, settings=settings, service=service)
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     register_team_routes(app, settings=settings, service=service)
+    register_assistant_routes(app, settings=settings, service=service)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for
@@ -4192,6 +4194,13 @@ def create_local_daemon_app(
 def main() -> None:
     """Run the development API server."""
 
+    import sys
+
+    if sys.argv[1:2] == ["bootstrap-admin"]:
+        # Host-side: create the first fleet-admin invite of a team-mode plane.
+        from eyvan.server.api.bootstrap_admin import main as bootstrap_main
+
+        raise SystemExit(bootstrap_main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description="Run the Eyvan control plane")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)

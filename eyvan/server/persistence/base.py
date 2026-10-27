@@ -35,6 +35,7 @@ from eyvan.records import (
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
+    TeamRequestRecord,
     UserProgressReport,
     UserRecord,
     WebhookRecord,
@@ -185,6 +186,14 @@ class RepositorySession(tp.Protocol):
     async def list_api_tokens(self, *, subject: str | None = None) -> list[ApiTokenRecord]: ...
 
     async def put_api_token(self, token: ApiTokenRecord) -> None: ...
+
+    async def get_team_request(self, request_id: str) -> TeamRequestRecord | None: ...
+
+    async def list_team_requests(
+        self, *, subject: str | None = None, state: str | None = None
+    ) -> list[TeamRequestRecord]: ...
+
+    async def put_team_request(self, request: TeamRequestRecord) -> None: ...
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None: ...
 

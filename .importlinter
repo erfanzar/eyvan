@@ -35,6 +35,7 @@ modules =
     eyvan.server.service._control_plane.scheduling
     eyvan.server.service._control_plane.services
     eyvan.server.service._control_plane.submission
+    eyvan.server.service._control_plane.team_requests
     eyvan.server.service._control_plane.tenancy
     eyvan.server.service._control_plane.transactions
     eyvan.server.service._control_plane.webhooks

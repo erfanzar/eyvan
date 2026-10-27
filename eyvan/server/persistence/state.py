@@ -40,6 +40,7 @@ from eyvan.records import (
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
+    TeamRequestRecord,
     UserProgressReport,
     UserRecord,
     WebhookRecord,
@@ -75,6 +76,8 @@ class ControlPlaneState:
     users: dict[str, UserRecord] = field(default_factory=dict)
     invites: dict[str, InviteRecord] = field(default_factory=dict)
     api_tokens: dict[str, ApiTokenRecord] = field(default_factory=dict)
+    #: Capacity/approval requests users filed for the fleet admins (id -> request).
+    team_requests: dict[str, TeamRequestRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -299,6 +302,22 @@ class StateSession(RepositorySession):
 
     async def put_api_token(self, token: ApiTokenRecord) -> None:
         self._state.api_tokens[token.id] = token
+
+    async def get_team_request(self, request_id: str) -> TeamRequestRecord | None:
+        return self._state.team_requests.get(request_id)
+
+    async def list_team_requests(
+        self, *, subject: str | None = None, state: str | None = None
+    ) -> list[TeamRequestRecord]:
+        items = (
+            item
+            for item in self._state.team_requests.values()
+            if (subject is None or item.subject == subject) and (state is None or item.state == state)
+        )
+        return sorted(items, key=lambda item: (item.created_at, item.id))
+
+    async def put_team_request(self, request: TeamRequestRecord) -> None:
+        self._state.team_requests[request.id] = request
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

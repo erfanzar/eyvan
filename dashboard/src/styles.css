@@ -980,6 +980,30 @@ code,
   line-height: 1.5;
 }
 
+.assistant-log {
+  display: flex;
+  max-height: 420px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  overflow-y: auto;
+}
+
+.assistant-message p {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}
+
+.assistant-message-user strong {
+  color: var(--text-muted);
+}
+
+.panel-note pre {
+  max-height: 260px;
+  overflow: auto;
+  font-size: var(--text-xs);
+}
+
 .panel-note code {
   padding: 1px 4px;
   border: 1px solid var(--border);

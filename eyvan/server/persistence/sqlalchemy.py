@@ -70,6 +70,7 @@ from eyvan.records import (
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
+    TeamRequestRecord,
     UserProgressReport,
     UserRecord,
     WebhookRecord,
@@ -87,7 +88,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0020_team_accounts"
+SCHEMA_REVISION = "0021_team_requests"
 
 
 @tp.runtime_checkable
@@ -232,6 +233,16 @@ class ApiTokenRow(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     subject: Mapped[str] = mapped_column(String(64), index=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class TeamRequestRow(Base):
+    """A capacity/approval request for the fleet admins; ``subject`` and ``state`` are filtered on."""
+
+    __tablename__ = "team_requests"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(256), index=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -936,6 +947,28 @@ class SqlAlchemySession:
     async def put_api_token(self, token: ApiTokenRecord) -> None:
         await self.session.merge(
             ApiTokenRow(id=token.id, subject=token.subject, token_hash=token.token_hash, data=_dump(token))
+        )
+
+    async def get_team_request(self, request_id: str) -> TeamRequestRecord | None:
+        row = await self._get_locked(TeamRequestRow, request_id)
+        return None if row is None else TeamRequestRecord.model_validate(row.data)
+
+    async def list_team_requests(
+        self, *, subject: str | None = None, state: str | None = None
+    ) -> list[TeamRequestRecord]:
+        statement = select(TeamRequestRow)
+        if subject is not None:
+            statement = statement.where(TeamRequestRow.subject == subject)
+        if state is not None:
+            statement = statement.where(TeamRequestRow.state == state)
+        rows = (await self.session.scalars(statement)).all()
+        return sorted(
+            _decode_rows(TeamRequestRecord, rows, table="team_requests"), key=lambda item: (item.created_at, item.id)
+        )
+
+    async def put_team_request(self, request: TeamRequestRecord) -> None:
+        await self.session.merge(
+            TeamRequestRow(id=request.id, subject=request.subject, state=request.state, data=_dump(request))
         )
 
     async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:

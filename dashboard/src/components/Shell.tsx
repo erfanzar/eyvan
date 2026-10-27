@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  Bot,
   ChartNoAxesCombined,
   Boxes,
   ChevronRight,
@@ -68,6 +69,7 @@ const navigation: Array<{
   { section: "billing", label: "Billing", icon: Receipt },
   { section: "budgets", label: "Budgets & policies", icon: CircleDollarSign },
   { section: "audit", label: "Audit events", icon: Activity },
+  { section: "assistant", label: "Assistant", icon: Bot },
   { section: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -83,6 +85,10 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   billing: { title: "Billing", description: "What the fleet has run, and what anybody can say it cost" },
   budgets: { title: "Budgets & policies", description: "Spend controls and scheduling governance" },
   audit: { title: "Audit events", description: "Durable control-plane decision history" },
+  assistant: {
+    title: "Assistant",
+    description: "Sizing, fleets and quota answered from this plane's data; requests to the fleet admins",
+  },
   settings: { title: "Settings", description: "Users & tokens: team accounts, invites and personal API tokens" },
 };
 
