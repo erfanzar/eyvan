@@ -798,6 +798,79 @@ class Principal(EyvanModel):
     grants: tuple[RoleGrant, ...] = ()
 
 
+#: A team-mode user name: short, lower-case, safe in URLs, logs and file names.
+TEAM_SUBJECT_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+_EMAIL_PATTERN = r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{1,63}$"
+
+
+class UserRecord(EyvanModel):
+    """One team-mode account on this plane.
+
+    ``password_hash`` is ``None`` for an account that signs in another way
+    (OIDC) or has not accepted its invite yet. The raw password is never stored.
+    """
+
+    subject: str = Field(pattern=TEAM_SUBJECT_PATTERN)
+    email: str = Field(max_length=320, pattern=_EMAIL_PATTERN)
+    display_name: str = Field(default="", max_length=128)
+    password_hash: str | None = Field(default=None, max_length=512, repr=False)
+    disabled: bool = False
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    updated_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_user(self) -> UserRecord:
+        if self.email != self.email.lower():
+            raise ValueError("user email must be lower-case")
+        return self
+
+
+class InviteRecord(EyvanModel):
+    """A single-use invitation; only the SHA-256 of its token is stored."""
+
+    id: str = Field(pattern=r"^inv_[0-9a-f]{16}$")
+    email: str = Field(max_length=320, pattern=_EMAIL_PATTERN)
+    subject: str = Field(pattern=TEAM_SUBJECT_PATTERN)
+    grants: tuple[RoleGrant, ...] = ()
+    token_hash: str = Field(pattern=r"^[0-9a-f]{64}$", repr=False)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    expires_at: Annotated[datetime, AwareDatetime]
+    accepted_at: Annotated[datetime, AwareDatetime] | None = None
+    revoked: bool = False
+
+    def open_at(self, moment: datetime) -> bool:
+        """Return whether this invite can still be accepted at ``moment``."""
+
+        return not self.revoked and self.accepted_at is None and self.expires_at > moment
+
+
+class ApiTokenRecord(EyvanModel):
+    """A revocable bearer credential for one user; only its SHA-256 is stored.
+
+    ``kind`` separates a long-lived token a person created for the CLI or a
+    script (``api``) from a dashboard sign-in (``session``), so listing "my
+    tokens" never shows browser sessions and logging out never revokes a CLI.
+    """
+
+    id: str = Field(pattern=r"^tok_[0-9a-f]{16}$")
+    subject: str = Field(pattern=TEAM_SUBJECT_PATTERN)
+    name: str = Field(min_length=1, max_length=64)
+    kind: tp.Literal["api", "session"] = "api"
+    token_hash: str = Field(pattern=r"^[0-9a-f]{64}$", repr=False)
+    prefix: str = Field(min_length=4, max_length=16)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    expires_at: Annotated[datetime, AwareDatetime] | None = None
+    last_used_at: Annotated[datetime, AwareDatetime] | None = None
+    revoked_at: Annotated[datetime, AwareDatetime] | None = None
+
+    def active_at(self, moment: datetime) -> bool:
+        """Return whether this token authenticates at ``moment``."""
+
+        return self.revoked_at is None and (self.expires_at is None or self.expires_at > moment)
+
+
 class ResourceVector(EyvanModel):
     """Scalar resources requested by one workload replica or offered by a cell."""
 

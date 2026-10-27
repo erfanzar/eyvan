@@ -101,6 +101,21 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/system/invariants/soak` | Proof Scoped Fleet Invariants | 200, 422 |
 | POST | `/api/v1/system/reconcile` | Reconcile Once | 200 |
 | POST | `/api/v1/system/soak-evidence` | Record Soak Evidence | 200 |
+| GET | `/api/v1/team/invites` | List Team Invites | 200 |
+| POST | `/api/v1/team/invites` | Create Team Invite | 201, 422 |
+| POST | `/api/v1/team/invites/accept` | Accept Team Invite | 200, 422 |
+| POST | `/api/v1/team/invites/preview` | Preview Team Invite | 200, 422 |
+| DELETE | `/api/v1/team/invites/{invite_id}` | Revoke Team Invite | 200, 422 |
+| POST | `/api/v1/team/login` | Team Login | 200, 422 |
+| POST | `/api/v1/team/logout` | Team Logout | 200 |
+| GET | `/api/v1/team/me` | Team Me | 200 |
+| GET | `/api/v1/team/status` | Team Status | 200 |
+| GET | `/api/v1/team/tokens` | List Team Tokens | 200 |
+| POST | `/api/v1/team/tokens` | Create Team Token | 201, 422 |
+| DELETE | `/api/v1/team/tokens/{token_id}` | Revoke Team Token | 200, 422 |
+| GET | `/api/v1/team/users` | List Team Users | 200 |
+| POST | `/api/v1/team/users/{subject}/disable` | Disable Team User | 200, 422 |
+| POST | `/api/v1/team/users/{subject}/enable` | Enable Team User | 200, 422 |
 | GET | `/api/v1/tracking/health` | Tracking Health | 200 |
 | GET | `/api/v1/tracking/runs` | Tracking Runs | 200, 422 |
 | GET | `/api/v1/tracking/runs/{run_id}` | Tracking Run | 200, 422 |

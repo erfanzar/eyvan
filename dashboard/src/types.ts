@@ -53,6 +53,62 @@ export interface DiscoveredTpus {
   skipped: Record<string, string>;
 }
 
+export interface TeamUser {
+  subject: string;
+  email: string;
+  display_name: string;
+  disabled: boolean;
+  created_at: string;
+  created_by: string;
+}
+
+export interface TeamRoleGrant {
+  role: string;
+  org_id: string | null;
+  project_id: string | null;
+}
+
+export interface TeamInvite {
+  id: string;
+  email: string;
+  subject: string;
+  roles: TeamRoleGrant[];
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  accepted_at: string | null;
+  revoked: boolean;
+}
+
+export interface TeamToken {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface TeamInviteInput {
+  email: string;
+  subject: string;
+  role: string | null;
+  org_id: string | null;
+  project_id: string | null;
+}
+
+export interface TeamInviteCreated {
+  invite: TeamInvite;
+  url: string;
+  token: string;
+}
+
+export interface TeamTokenCreated {
+  token: string;
+  record: TeamToken;
+}
+
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
 
 /** Tracker wire types intentionally retain the store's snake_case field names. */

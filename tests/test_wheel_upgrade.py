@@ -10,6 +10,7 @@ commit, not a claimed previous release; the candidate gets a scratch-only local
 version suffix. Real DDL evolution is tested separately by test_postgres_semantics.
 """
 
+import asyncio
 import io
 import json
 import os
@@ -19,6 +20,9 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 BASELINE = "49437aac72d061f198ae25df633cb4a3e85fa385"
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,9 +112,31 @@ asyncio.run(run())
 """
 
 
+def _empty_public_schema(url: str) -> None:
+    """Start from an empty schema, as the sibling PostgreSQL fixtures do.
+
+    ``postgres_url`` is one database for the whole session, and other tests
+    reset it on entry rather than on exit. Without this, the baseline wheel
+    seeds a database a previous test already stamped at a newer revision than
+    the baseline knows, and fails resolving a revision it never shipped.
+    """
+
+    async def reset() -> None:
+        engine = create_async_engine(url, poolclass=None)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+                await connection.execute(text("CREATE SCHEMA public"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reset())
+
+
 def test_a_candidate_wheel_migrates_and_preserves_baseline_data(postgres_url, tmp_path):
     uv = shutil.which("uv")
     assert uv is not None
+    _empty_public_schema(postgres_url)
     environment = {
         key: value
         for key, value in os.environ.items()

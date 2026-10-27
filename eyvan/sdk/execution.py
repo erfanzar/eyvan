@@ -60,6 +60,7 @@ from eyvan.sdk.contexts import (
     get_active_context,
 )
 from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
+from eyvan.sdk.team_credentials import team_token_or_warn
 from eyvan.server.local.daemon import ensure_loopback_control_plane
 from eyvan.worker.runtime.callables import dump_callable
 from eyvan.worker.runtime.in_job import in_job_context
@@ -482,6 +483,10 @@ def init(
             # anywhere; see ``discover_node_token``.
             token=token
             or environment.get("EYVAN_TOKEN")
+            # The personal token `eyvan login` stored for exactly this plane.
+            or team_token_or_warn(
+                endpoint.url, warn=lambda message: warnings.warn(message, RuntimeWarning, stacklevel=2)
+            )
             or discover_node_token_or_warn(
                 endpoint,
                 environment,

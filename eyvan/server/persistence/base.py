@@ -11,6 +11,7 @@ import typing as tp
 from datetime import datetime
 
 from eyvan.records import (
+    ApiTokenRecord,
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -21,6 +22,7 @@ from eyvan.records import (
     ExpansionAdmissionRecord,
     ExpansionAdmissionState,
     IdempotencyRecord,
+    InviteRecord,
     LeaseRecord,
     ManagedArtifactRecord,
     ManagedArtifactState,
@@ -34,6 +36,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    UserRecord,
     WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -158,6 +161,30 @@ class RepositorySession(tp.Protocol):
     async def put_role_grant(self, grant: RoleGrantRecord) -> None: ...
 
     async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool: ...
+
+    async def get_user(self, subject: str) -> UserRecord | None: ...
+
+    async def get_user_by_email(self, email: str) -> UserRecord | None: ...
+
+    async def list_users(self) -> list[UserRecord]: ...
+
+    async def put_user(self, user: UserRecord) -> None: ...
+
+    async def get_invite(self, invite_id: str) -> InviteRecord | None: ...
+
+    async def get_invite_by_token_hash(self, token_hash: str) -> InviteRecord | None: ...
+
+    async def list_invites(self) -> list[InviteRecord]: ...
+
+    async def put_invite(self, invite: InviteRecord) -> None: ...
+
+    async def get_api_token(self, token_id: str) -> ApiTokenRecord | None: ...
+
+    async def get_api_token_by_hash(self, token_hash: str) -> ApiTokenRecord | None: ...
+
+    async def list_api_tokens(self, *, subject: str | None = None) -> list[ApiTokenRecord]: ...
+
+    async def put_api_token(self, token: ApiTokenRecord) -> None: ...
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None: ...
 

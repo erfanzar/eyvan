@@ -67,7 +67,7 @@ export interface AuthScope {
 export interface AuthIdentity {
   displayName: string;
   detail: string;
-  mode: "oidc" | "development" | "demo";
+  mode: "oidc" | "development" | "demo" | "team";
   /** Server-resolved roles applicable to the selected dashboard scope. */
   roles: string[];
   scope: AuthScope;
@@ -257,8 +257,121 @@ function emitAuthChanged(): void {
   if ("dispatchEvent" in globalThis) globalThis.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
 }
 
+/** Ends a team password session: drops the HttpOnly `eyvan_team_session` cookie. */
+export const TEAM_LOGOUT_PATH = "/api/v1/team/logout";
+
+// Team accounts (EYVAN_TEAM_MODE). The gate records what the plane said, so
+// the app can label the session and route sign-out without asking again.
+let teamModeEnabled = false;
+let teamSessionActive = false;
+let teamDisplayName: string | undefined;
+
+export function isTeamMode(): boolean {
+  return teamModeEnabled;
+}
+
+export function isTeamSession(): boolean {
+  return teamSessionActive;
+}
+
+export function setTeamState(mode: boolean, session: boolean, displayName?: string): void {
+  teamModeEnabled = mode;
+  teamSessionActive = mode && session;
+  teamDisplayName = teamSessionActive ? displayName : undefined;
+}
+
+interface TeamUserBody {
+  subject: string;
+  email: string;
+  display_name: string;
+}
+
+async function teamError(response: Response, fallback: string): Promise<Error> {
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    if (typeof body.detail === "string" && body.detail) return new Error(body.detail);
+    if (Array.isArray(body.detail) && body.detail.length) {
+      const first = body.detail[0] as { msg?: unknown };
+      if (typeof first?.msg === "string") return new Error(first.msg.replace(/^Value error, /, ""));
+    }
+  } catch {
+    // Non-JSON error body: the fallback names the action that failed.
+  }
+  return new Error(`${fallback} (HTTP ${response.status})`);
+}
+
+/**
+ * Ask the plane whether it runs team accounts and whether this browser holds a
+ * live team session. Only the HttpOnly cookie is sent -- never the local
+ * credential -- so a plane owner's development identity is not mistaken for a
+ * team account. Never throws: an unreachable plane is "not team mode".
+ */
+export async function loadTeamState(fetchImpl: typeof fetch = fetch): Promise<void> {
+  try {
+    const status = await fetchImpl("/api/v1/team/status");
+    const body = status.ok ? ((await status.json()) as { team_mode?: boolean }) : {};
+    if (!body.team_mode) {
+      setTeamState(false, false);
+      return;
+    }
+    const me = await fetchImpl("/api/v1/team/me");
+    const account = me.ok ? ((await me.json()) as { user?: TeamUserBody | null }).user : null;
+    setTeamState(true, Boolean(account), account ? account.display_name || account.subject : undefined);
+  } catch {
+    setTeamState(false, false);
+  }
+}
+
+function enterTeamSession(user: TeamUserBody): void {
+  setTeamState(true, true, user.display_name || user.subject);
+  sessionNotice = undefined;
+  emitAuthChanged();
+}
+
+/** Sign in with a team email and password; the server sets the session cookie. */
+export async function teamLogin(email: string, password: string, fetchImpl: typeof fetch = fetch): Promise<void> {
+  const response = await fetchImpl("/api/v1/team/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!response.ok) throw await teamError(response, "Sign-in failed");
+  enterTeamSession(((await response.json()) as { user: TeamUserBody }).user);
+}
+
+/** Who an invite is for. The token travels in the body, never in a URL a server logs. */
+export async function previewTeamInvite(
+  token: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ email: string; subject: string; expires_at: string }> {
+  const response = await fetchImpl("/api/v1/team/invites/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!response.ok) throw await teamError(response, "This invite could not be read");
+  return (await response.json()) as { email: string; subject: string; expires_at: string };
+}
+
+/** Create the account from an invite, set its password, and sign in. */
+export async function acceptTeamInvite(
+  token: string,
+  password: string,
+  displayName: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const response = await fetchImpl("/api/v1/team/invites/accept", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, password, display_name: displayName }),
+  });
+  if (!response.ok) throw await teamError(response, "Could not accept the invite");
+  enterTeamSession(((await response.json()) as { user: TeamUserBody }).user);
+}
+
 function endSession(notice: string): void {
   sessionNotice = notice;
+  teamSessionActive = false;
   emitAuthChanged();
 }
 
@@ -433,6 +546,18 @@ export function currentIdentity(): AuthIdentity | undefined {
       capabilities: NO_AUTH_CAPABILITIES,
     };
   }
+  if (teamSessionActive) {
+    // The HttpOnly cookie carries the session; authority still comes from the
+    // server's own response, which the app merges over these placeholders.
+    return {
+      displayName: teamDisplayName ?? "Team member",
+      detail: "Team session",
+      mode: "team",
+      roles: [],
+      scope,
+      capabilities: NO_AUTH_CAPABILITIES,
+    };
+  }
   // OIDC is intentionally absent: the tab holds no token and no claims, so
   // there is nothing local identity can truthfully report. The gate asks
   // {@link serverIdentity} instead, and what the user sees comes from the
@@ -449,6 +574,20 @@ export async function logout(fetchImpl: typeof fetch = fetch): Promise<void> {
     const url = new URL(globalThis.location.href);
     url.searchParams.delete("demo");
     globalThis.location.assign(`${url.pathname}${url.search}${url.hash}`);
+    return;
+  }
+  if (teamSessionActive) {
+    try {
+      const response = await fetchImpl(TEAM_LOGOUT_PATH, { method: "POST" });
+      if (!response.ok) throw new Error(`Sign-out returned ${response.status}`);
+    } catch {
+      endSession(
+        "Could not confirm sign-out. Your session may still be active; retry when the control plane is reachable.",
+      );
+      return;
+    }
+    endSession("You have been signed out.");
+    globalThis.location.assign("/");
     return;
   }
   if (isOidcConfigured()) {

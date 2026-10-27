@@ -13,6 +13,7 @@ forbidden_modules =
 name = Transactional subsystems remain independent
 type = independence
 modules =
+    eyvan.server.service._control_plane.accounts
     eyvan.server.service._control_plane.artifact_admission
     eyvan.server.service._control_plane.artifact_collection
     eyvan.server.service._control_plane.artifact_inventory

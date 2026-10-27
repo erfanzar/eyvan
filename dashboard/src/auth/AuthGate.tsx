@@ -16,15 +16,21 @@ import {
   isDevelopmentAuthEnabled,
   isDemoMode,
   isOidcConfigured,
+  isTeamMode,
+  isTeamSession,
   loadRuntimeOidcConfig,
+  loadTeamState,
   localDevelopmentCredential,
   planeRequiresLocalCredential,
   serverIdentity,
 } from "./oidc";
+import { AcceptInviteScreen, TeamLoginScreen, takeInviteTokenFromLocation } from "./TeamAuth";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [checking, setChecking] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Taken (and stripped from the address bar) before anything else runs.
+  const [inviteToken, setInviteToken] = useState<string | undefined>(() => takeInviteTokenFromLocation());
   const [identity, setIdentity] = useState(() => currentIdentity());
   // The identity object can be identical before and after an auth change -- a
   // refused loopback credential leaves no identity at all -- so React would
@@ -69,10 +75,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // revision is read before the probe starts, and a result from a world
     // that has since changed is dropped -- same shape as `cancelled`.
     const startRevision = authRevision();
-    loadRuntimeOidcConfig()
+    Promise.all([loadRuntimeOidcConfig(), loadTeamState()])
       .then(() => serverIdentity())
       .then((server) => {
-        if (!cancelled && authRevision() === startRevision) setIdentity((current) => current ?? server);
+        // A team password session is its own identity (the HttpOnly cookie);
+        // the OIDC probe answers only when there is none.
+        const resolved = isTeamSession() ? currentIdentity() : server;
+        if (!cancelled && authRevision() === startRevision) setIdentity((current) => current ?? resolved);
       })
       .catch((authError) => {
         if (!cancelled) setError(authError instanceof Error ? authError.message : "Unable to complete sign-in");
@@ -87,12 +96,26 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const onAuthChanged = () => {
+      // An invite is single-use: once it signed someone in, a later sign-out
+      // must land on the sign-in form, not re-open the spent invite.
+      if (isTeamSession()) setInviteToken(undefined);
       setIdentity(currentIdentity());
       setAuthRevision((revision) => revision + 1);
       setError(consumeSessionNotice() ?? null);
     };
     globalThis.addEventListener(AUTH_CHANGED_EVENT, onAuthChanged);
     return () => globalThis.removeEventListener(AUTH_CHANGED_EVENT, onAuthChanged);
+  }, []);
+
+  // An invite link pasted into a tab that is already open changes only the
+  // fragment, which does not reload the page: pick the token up here too.
+  useEffect(() => {
+    const onHashChange = () => {
+      const token = takeInviteTokenFromLocation();
+      if (token) setInviteToken(token);
+    };
+    globalThis.addEventListener("hashchange", onHashChange);
+    return () => globalThis.removeEventListener("hashchange", onHashChange);
   }, []);
 
   if (checking) {
@@ -112,7 +135,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // a presented token is resolved before the development path is reached.
   const ownPlane = planeRequiresLocalCredential() && !isOidcConfigured();
   const ownPlaneAuthenticated = ownPlane && localDevelopmentCredential() !== undefined;
+  // An invite link wins over everything else: the person holding it has no
+  // account yet, and the accept screen is the only thing they can use.
+  // Once accepting signs them in, the session wins and the token is ignored.
+  if (inviteToken && isTeamMode() && !isTeamSession()) {
+    return <AcceptInviteScreen token={inviteToken} onCancel={() => setInviteToken(undefined)} />;
+  }
   if (identity || isDemoMode() || isDevelopmentAuthEnabled() || ownPlaneAuthenticated) return children;
+  // A team plane: everyone who is not the machine owner signs in with the
+  // email and password from their invite (an OIDC button stays available
+  // when the plane also names an identity provider, below).
+  if (isTeamMode() && !isOidcConfigured()) return <TeamLoginScreen notice={error} />;
 
   // The plane's own page, opened without the credential -- a raw URL typed by
   // hand. This is reachable and ordinary, not an error state to hide: the fix

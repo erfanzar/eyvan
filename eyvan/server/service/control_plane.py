@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from eyvan.server.service._control_plane.accounts import AccountsMixin
 from eyvan.server.service._control_plane.artifact_admission import ArtifactAdmissionMixin
 from eyvan.server.service._control_plane.artifact_collection import ArtifactCollectionMixin
 from eyvan.server.service._control_plane.artifact_inventory import ArtifactInventoryMixin
@@ -745,6 +746,7 @@ from eyvan.server.service._control_plane.workload_storage import WorkloadStorage
 
 
 class ControlPlaneService(
+    AccountsMixin,
     SchedulingMixin,
     SubmissionMixin,
     CallableSubmissionMixin,

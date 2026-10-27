@@ -182,6 +182,7 @@ from eyvan.server.api.server_startup import (
     ServerStartupSettings,
 )
 from eyvan.server.api.sse import KEEPALIVE_FRAME, sse_frame, sse_response
+from eyvan.server.api.team_routes import register_team_routes
 from eyvan.server.api.tracking_proxy import register_tracking_routes
 from eyvan.server.controller import EyvanController
 from eyvan.server.introspection import allocations_as_json, thread_stacks_as_json
@@ -780,6 +781,7 @@ def create_app(
     register_dashboard_auth_routes(app, settings=settings, store=dashboard_sessions)
     register_tracking_routes(app, settings=settings, service=service)
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
+    register_team_routes(app, settings=settings, service=service)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for

@@ -1,6 +1,35 @@
 {
   "components": {
     "schemas": {
+      "AcceptBody": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "password": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Password",
+            "type": "string"
+          },
+          "token": {
+            "maxLength": 128,
+            "minLength": 8,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "password"
+        ],
+        "title": "AcceptBody",
+        "type": "object"
+      },
       "ArtifactCollection": {
         "additionalProperties": false,
         "description": "What one collection pass reclaimed, or would reclaim in a dry run.",
@@ -3537,6 +3566,79 @@
         "title": "InfeasibilityCode",
         "type": "string"
       },
+      "InviteBody": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "org_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Role"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subject": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "subject"
+        ],
+        "title": "InviteBody",
+        "type": "object"
+      },
+      "InviteTokenBody": {
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "maxLength": 128,
+            "minLength": 8,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "InviteTokenBody",
+        "type": "object"
+      },
       "JsonValue": {},
       "LaunchLatencyReport": {
         "additionalProperties": false,
@@ -3769,6 +3871,42 @@
         ],
         "title": "LeaseState",
         "type": "string"
+      },
+      "LoginBody": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "password": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Password",
+            "type": "string"
+          },
+          "token_name": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Name"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "LoginBody",
+        "type": "object"
       },
       "ManagedArtifactRecord": {
         "additionalProperties": false,
@@ -6573,6 +6711,35 @@
           "unpriced_leases"
         ],
         "title": "SubjectUsageRecord",
+        "type": "object"
+      },
+      "TokenBody": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_in_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Days"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "TokenBody",
         "type": "object"
       },
       "TpuQuotaEntry": {
@@ -13358,6 +13525,539 @@
         "summary": "Record Soak Evidence",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/api/v1/team/invites": {
+      "get": {
+        "operationId": "list_team_invites_api_v1_team_invites_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Team Invites Api V1 Team Invites Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Team Invites",
+        "tags": [
+          "team"
+        ]
+      },
+      "post": {
+        "description": "Invite someone; the link is returned once and should be sent to them privately.",
+        "operationId": "create_team_invite_api_v1_team_invites_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Team Invite Api V1 Team Invites Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Team Invite",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/invites/accept": {
+      "post": {
+        "description": "Create the account from an invite, set its password, and sign in.",
+        "operationId": "accept_team_invite_api_v1_team_invites_accept_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Accept Team Invite Api V1 Team Invites Accept Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Team Invite",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/invites/preview": {
+      "post": {
+        "description": "Show who an invite is for (unauthenticated: the token is the authority).",
+        "operationId": "preview_team_invite_api_v1_team_invites_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteTokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Preview Team Invite Api V1 Team Invites Preview Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Team Invite",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/invites/{invite_id}": {
+      "delete": {
+        "operationId": "revoke_team_invite_api_v1_team_invites__invite_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "invite_id",
+            "required": true,
+            "schema": {
+              "title": "Invite Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Team Invite Api V1 Team Invites  Invite Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Team Invite",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/login": {
+      "post": {
+        "description": "Sign in with email and password; sets an HttpOnly session cookie.",
+        "operationId": "team_login_api_v1_team_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Team Login Api V1 Team Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Team Login",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/logout": {
+      "post": {
+        "description": "End the cookie session (and a bearer session token, if that is what was sent).",
+        "operationId": "team_logout_api_v1_team_logout_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Team Logout Api V1 Team Logout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Team Logout",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/me": {
+      "get": {
+        "description": "Return who the caller is and the grants this plane resolved for them.",
+        "operationId": "team_me_api_v1_team_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Team Me Api V1 Team Me Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Team Me",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/status": {
+      "get": {
+        "description": "Report whether this plane runs team accounts (unauthenticated).",
+        "operationId": "team_status_api_v1_team_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Team Status Api V1 Team Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Team Status",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/tokens": {
+      "get": {
+        "operationId": "list_team_tokens_api_v1_team_tokens_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Team Tokens Api V1 Team Tokens Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Team Tokens",
+        "tags": [
+          "team"
+        ]
+      },
+      "post": {
+        "description": "Mint a personal API token; the raw value is returned only here.",
+        "operationId": "create_team_token_api_v1_team_tokens_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Team Token Api V1 Team Tokens Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Team Token",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/tokens/{token_id}": {
+      "delete": {
+        "operationId": "revoke_team_token_api_v1_team_tokens__token_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "title": "Token Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Team Token Api V1 Team Tokens  Token Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Team Token",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/users": {
+      "get": {
+        "operationId": "list_team_users_api_v1_team_users_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Team Users Api V1 Team Users Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Team Users",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/users/{subject}/disable": {
+      "post": {
+        "operationId": "disable_team_user_api_v1_team_users__subject__disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "title": "Subject",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Disable Team User Api V1 Team Users  Subject  Disable Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Team User",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/users/{subject}/enable": {
+      "post": {
+        "operationId": "enable_team_user_api_v1_team_users__subject__enable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "title": "Subject",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Enable Team User Api V1 Team Users  Subject  Enable Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enable Team User",
+        "tags": [
+          "team"
         ]
       }
     },

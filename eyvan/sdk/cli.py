@@ -44,11 +44,13 @@ from eyvan.sdk.commands.soak import register_soak_commands
 from eyvan.sdk.commands.soak_monitor import register_soak_monitor_commands
 from eyvan.sdk.commands.start import register_start_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.commands.team import register_team_commands
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.track import register_track_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
 from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContextStore
 from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
+from eyvan.sdk.team_credentials import team_token_or_warn
 from eyvan.sdk.terminal import stream_is_terminal, terminal_console
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
@@ -115,6 +117,8 @@ def main(
     identity = resolve_control_plane_identity(
         endpoint,
         token=token
+        # A personal token from `eyvan login` for exactly this plane, if any.
+        or team_token_or_warn(endpoint.url, warn=lambda message: click.echo(message, err=True))
         or discover_node_token_or_warn(
             endpoint,
             warn=lambda message: click.echo(message, err=True),
@@ -160,6 +164,7 @@ for register_commands in (
     register_governance_commands,
     register_federation_commands,
     register_tenancy_commands,
+    register_team_commands,
     register_proof_commands,
     register_query_commands,
     register_resource_commands,

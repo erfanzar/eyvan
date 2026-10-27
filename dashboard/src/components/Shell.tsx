@@ -22,6 +22,7 @@ import {
   Receipt,
   RefreshCw,
   ServerCog,
+  Users,
   X,
 } from "lucide-react";
 
@@ -67,6 +68,7 @@ const navigation: Array<{
   { section: "billing", label: "Billing", icon: Receipt },
   { section: "budgets", label: "Budgets & policies", icon: CircleDollarSign },
   { section: "audit", label: "Audit events", icon: Activity },
+  { section: "users", label: "Users & tokens", icon: Users },
 ];
 
 const pageMeta: Record<Section, { title: string; description: string }> = {
@@ -81,6 +83,7 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   billing: { title: "Billing", description: "What the fleet has run, and what anybody can say it cost" },
   budgets: { title: "Budgets & policies", description: "Spend controls and scheduling governance" },
   audit: { title: "Audit events", description: "Durable control-plane decision history" },
+  users: { title: "Users & tokens", description: "Team accounts, invites and personal API tokens" },
 };
 
 /** The rail's own memory. A rail that forgets is a rail somebody re-collapses every morning. */

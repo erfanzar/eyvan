@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 
 from eyvan.records import (
+    ApiTokenRecord,
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -26,6 +27,7 @@ from eyvan.records import (
     ExpansionAdmissionRecord,
     ExpansionAdmissionState,
     IdempotencyRecord,
+    InviteRecord,
     LeaseRecord,
     ManagedArtifactRecord,
     ManagedArtifactState,
@@ -39,6 +41,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    UserRecord,
     WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -67,6 +70,11 @@ class ControlPlaneState:
     webhooks: dict[str, WebhookRecord] = field(default_factory=dict)
     #: Keyed by (subject, role, org, project) so re-issuing one overwrites it.
     role_grants: dict[tuple[str, str, str, str], RoleGrantRecord] = field(default_factory=dict)
+    #: Team-mode accounts (subject -> user), invites (id) and API tokens (id).
+    #: Only hashes of invite and token secrets are ever held.
+    users: dict[str, UserRecord] = field(default_factory=dict)
+    invites: dict[str, InviteRecord] = field(default_factory=dict)
+    api_tokens: dict[str, ApiTokenRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -254,6 +262,43 @@ class StateSession(RepositorySession):
 
     async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:
         return self._state.role_grants.pop(key, None) is not None
+
+    async def get_user(self, subject: str) -> UserRecord | None:
+        return self._state.users.get(subject)
+
+    async def get_user_by_email(self, email: str) -> UserRecord | None:
+        return next((item for item in self._state.users.values() if item.email == email.lower()), None)
+
+    async def list_users(self) -> list[UserRecord]:
+        return sorted(self._state.users.values(), key=lambda item: item.subject)
+
+    async def put_user(self, user: UserRecord) -> None:
+        self._state.users[user.subject] = user
+
+    async def get_invite(self, invite_id: str) -> InviteRecord | None:
+        return self._state.invites.get(invite_id)
+
+    async def get_invite_by_token_hash(self, token_hash: str) -> InviteRecord | None:
+        return next((item for item in self._state.invites.values() if item.token_hash == token_hash), None)
+
+    async def list_invites(self) -> list[InviteRecord]:
+        return sorted(self._state.invites.values(), key=lambda item: (item.created_at, item.id))
+
+    async def put_invite(self, invite: InviteRecord) -> None:
+        self._state.invites[invite.id] = invite
+
+    async def get_api_token(self, token_id: str) -> ApiTokenRecord | None:
+        return self._state.api_tokens.get(token_id)
+
+    async def get_api_token_by_hash(self, token_hash: str) -> ApiTokenRecord | None:
+        return next((item for item in self._state.api_tokens.values() if item.token_hash == token_hash), None)
+
+    async def list_api_tokens(self, *, subject: str | None = None) -> list[ApiTokenRecord]:
+        items = (item for item in self._state.api_tokens.values() if subject is None or item.subject == subject)
+        return sorted(items, key=lambda item: (item.created_at, item.id))
+
+    async def put_api_token(self, token: ApiTokenRecord) -> None:
+        self._state.api_tokens[token.id] = token
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

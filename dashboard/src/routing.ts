@@ -3,7 +3,16 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-export type Section = "overview" | "workloads" | "runs" | "fleet" | "capacity" | "billing" | "budgets" | "audit";
+export type Section =
+  | "overview"
+  | "workloads"
+  | "runs"
+  | "fleet"
+  | "capacity"
+  | "billing"
+  | "budgets"
+  | "audit"
+  | "users";
 
 export type RunTab = "charts" | "episodes" | "histograms" | "rollouts" | "completions" | "media";
 
@@ -49,7 +58,7 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // and an availability flag -- so pressing Billing set the hash, the hash
   // parsed back to overview, and the section could only be reached by not
   // reloading.
-  if (["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit"].includes(section)) {
+  if (["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit", "users"].includes(section)) {
     return { section: section as Section };
   }
   return { section: "overview" };

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan._internal.json_types import JsonValue
 from eyvan.config import EyvanSettings
+from eyvan.identity.team_secrets import TEAM_SESSION_COOKIE, is_team_token
 from eyvan.records import Principal, Role, RoleGrant
 from eyvan.server.api.dashboard_sessions import (
     DASHBOARD_SESSION_EXPIRED,
@@ -246,6 +247,16 @@ class RequestAuthenticator:
             scheme, _, token = authorization.partition(" ")
             if scheme.lower() != "bearer" or not token:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid Authorization header")
+            if self.settings.team_mode and is_team_token(token):
+                # A personal team token never falls through to the OIDC
+                # verifier: it is ours, so either it resolves here or it is wrong.
+                team_principal = await request.app.state.service.resolve_team_token(token)
+                if team_principal is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="this Eyvan token is invalid, expired or revoked; run `eyvan login` again",
+                    )
+                return team_principal
             if self.bootstrap_token is not None:
                 if _credential_matches(token, self.bootstrap_token):
                     return bootstrap_principal()
@@ -267,6 +278,20 @@ class RequestAuthenticator:
                 return await self.verifier.verify(token)
             except Exception as exc:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token") from exc
+        team_cookie = request.cookies.get(TEAM_SESSION_COOKIE) if self.settings.team_mode else None
+        if team_cookie:
+            if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                # Same rule as the OIDC cookie below: cookie writes only from
+                # the configured dashboard origin, never a caller-chosen Host.
+                expected_origin = str(httpx.URL(self.settings.public_url).copy_with(path="/", query=None, fragment=None))
+                if request.headers.get("origin", "") != expected_origin.rstrip("/"):
+                    raise HTTPException(status_code=403, detail="dashboard writes require a same-origin request")
+            team_principal = await request.app.state.service.resolve_team_token(team_cookie)
+            if team_principal is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail="your session has ended; sign in again"
+                )
+            return team_principal
         # Backend-for-frontend dashboard session: the browser holds an HttpOnly
         # cookie, the tokens live in the store, and the stored access token is
         # verified exactly as a presented bearer token would be. A presented

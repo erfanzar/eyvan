@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-222 variables are currently referenced. Names set on workload
+223 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -165,6 +165,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_SERVICE_RECONCILE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SERVICE_REPLICA_LIFECYCLE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SOAK_EVIDENCE_MAX_AGE_S` | `eyvan/config` |
+| `EYVAN_TEAM_MODE` | `eyvan/config` |
 | `EYVAN_TRACKER_URL` | `eyvan/config` |
 | `EYVAN_TRACKING_STORE_URI` | `eyvan/config` |
 | `EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `eyvan/config` |

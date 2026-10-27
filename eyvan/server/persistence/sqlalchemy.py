@@ -46,6 +46,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import (
+    ApiTokenRecord,
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -56,6 +57,7 @@ from eyvan.records import (
     ExpansionAdmissionRecord,
     ExpansionAdmissionState,
     IdempotencyRecord,
+    InviteRecord,
     LeaseRecord,
     ManagedArtifactRecord,
     ManagedArtifactState,
@@ -69,6 +71,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    UserRecord,
     WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -84,7 +87,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0019_webhooks"
+SCHEMA_REVISION = "0020_team_accounts"
 
 
 @tp.runtime_checkable
@@ -201,6 +204,34 @@ class RoleGrantRow(Base):
     org_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     project_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class UserRow(Base):
+    """A team-mode account. ``email`` is a real unique column: sign-in looks it up."""
+
+    __tablename__ = "users"
+    subject: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class InviteRow(Base):
+    """A single-use invite; only the SHA-256 of its token is stored, and indexed for acceptance."""
+
+    __tablename__ = "invites"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ApiTokenRow(Base):
+    """A revocable bearer token; looked up by hash on every authenticated request."""
+
+    __tablename__ = "api_tokens"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(64), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -852,6 +883,59 @@ class SqlAlchemySession:
                 expires_at=grant.expires_at,
                 data=_dump(grant),
             )
+        )
+
+    async def get_user(self, subject: str) -> UserRecord | None:
+        row = await self._get_locked(UserRow, subject)
+        return None if row is None else UserRecord.model_validate(row.data)
+
+    async def get_user_by_email(self, email: str) -> UserRecord | None:
+        row = (await self.session.scalars(select(UserRow).where(UserRow.email == email.lower()))).first()
+        return None if row is None else UserRecord.model_validate(row.data)
+
+    async def list_users(self) -> list[UserRecord]:
+        rows = (await self.session.scalars(select(UserRow))).all()
+        return sorted(_decode_rows(UserRecord, rows, table="users"), key=lambda item: item.subject)
+
+    async def put_user(self, user: UserRecord) -> None:
+        await self.session.merge(UserRow(subject=user.subject, email=user.email, data=_dump(user)))
+
+    async def get_invite(self, invite_id: str) -> InviteRecord | None:
+        row = await self._get_locked(InviteRow, invite_id)
+        return None if row is None else InviteRecord.model_validate(row.data)
+
+    async def get_invite_by_token_hash(self, token_hash: str) -> InviteRecord | None:
+        statement = select(InviteRow).where(InviteRow.token_hash == token_hash).with_for_update()
+        row = (await self.session.scalars(statement)).first()
+        return None if row is None else InviteRecord.model_validate(row.data)
+
+    async def list_invites(self) -> list[InviteRecord]:
+        rows = (await self.session.scalars(select(InviteRow))).all()
+        return sorted(_decode_rows(InviteRecord, rows, table="invites"), key=lambda item: (item.created_at, item.id))
+
+    async def put_invite(self, invite: InviteRecord) -> None:
+        await self.session.merge(InviteRow(id=invite.id, token_hash=invite.token_hash, data=_dump(invite)))
+
+    async def get_api_token(self, token_id: str) -> ApiTokenRecord | None:
+        row = await self._get_locked(ApiTokenRow, token_id)
+        return None if row is None else ApiTokenRecord.model_validate(row.data)
+
+    async def get_api_token_by_hash(self, token_hash: str) -> ApiTokenRecord | None:
+        row = (await self.session.scalars(select(ApiTokenRow).where(ApiTokenRow.token_hash == token_hash))).first()
+        return None if row is None else ApiTokenRecord.model_validate(row.data)
+
+    async def list_api_tokens(self, *, subject: str | None = None) -> list[ApiTokenRecord]:
+        statement = select(ApiTokenRow)
+        if subject is not None:
+            statement = statement.where(ApiTokenRow.subject == subject)
+        rows = (await self.session.scalars(statement)).all()
+        return sorted(
+            _decode_rows(ApiTokenRecord, rows, table="api_tokens"), key=lambda item: (item.created_at, item.id)
+        )
+
+    async def put_api_token(self, token: ApiTokenRecord) -> None:
+        await self.session.merge(
+            ApiTokenRow(id=token.id, subject=token.subject, token_hash=token.token_hash, data=_dump(token))
         )
 
     async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:

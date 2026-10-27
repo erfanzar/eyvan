@@ -205,7 +205,32 @@ EXEMPT_ROUTES: dict[str, str] = {
     "POST /api/v1/workloads/{workload_id}/children": "workload capability token, not a principal",
     "PUT /api/v1/workloads/{workload_id}/endpoint": "workload capability token, not a principal",
     "GET /api/v1/secrets/content": "secret capability token, not a principal",
+    # Team accounts (404 unless EYVAN_TEAM_MODE). Accounts are plane-wide, not
+    # per-tenant; authority still comes from the role grants an invite carries.
+    "GET /api/v1/team/status": "unauthenticated; reports only whether team mode is on",
+    "POST /api/v1/team/login": "password sign-in; the caller's own credentials, no tenant data",
+    "POST /api/v1/team/logout": "ends the caller's own session cookie",
+    "GET /api/v1/team/me": "authenticated self-introspection; only the caller's account and grants",
+    "POST /api/v1/team/tokens": "mints a token for the caller's own account only",
+    "GET /api/v1/team/tokens": "lists the caller's own tokens; another subject's needs fleet admin",
+    "DELETE /api/v1/team/tokens/{token_id}": "own token, or any token for a fleet admin (test_team_accounts)",
+    "POST /api/v1/team/invites/preview": "the invite token is the authority; returns only that invite's email",
+    "POST /api/v1/team/invites/accept": "the invite token is the authority; grants are the inviter's, checked at issue",
+    "POST /api/v1/team/invites": (
+        "each carried grant is checked with the tenancy grant-administration rule, so a project admin "
+        "invites only into their own project (test_team_accounts)"
+    ),
 }
+
+FLEET_ONLY_ROUTES.update(
+    {
+        "GET /api/v1/team/invites": "every pending invite on the plane",
+        "DELETE /api/v1/team/invites/{invite_id}": "revoke any pending invite on the plane",
+        "GET /api/v1/team/users": "the plane-wide account directory",
+        "POST /api/v1/team/users/{subject}/disable": "disable an account and revoke its tokens",
+        "POST /api/v1/team/users/{subject}/enable": "re-enable an account",
+    }
+)
 
 ROUTE_CLASSIFICATION = {**CROSS_TENANT_ROUTES, **FLEET_ONLY_ROUTES, **EXEMPT_ROUTES}
 

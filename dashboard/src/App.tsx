@@ -12,6 +12,8 @@ import {
   configuredScope,
   currentIdentity,
   isOidcConfigured,
+  isTeamMode,
+  isTeamSession,
   logout,
   NO_AUTH_CAPABILITIES,
   type AuthCapabilities,
@@ -31,6 +33,7 @@ import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
+import { UsersPage } from "./pages/UsersPage";
 import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
 import { accessibleRoute, navigate, parseRoute, type Route, type Section, type SectionAvailability } from "./routing";
@@ -637,6 +640,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
     // Billing reads fleet-wide costs, not just the selected project's usage.
     billing: capabilities.manageFleet,
     audit: canReadSelectedScope,
+    // Only a team-mode plane has accounts; everywhere else the section is absent.
+    users: isTeamMode(),
   };
   const routed = accessibleRoute(route, sectionAvailability);
   // SUBMIT does not imply READ. A submit-only deep link must not mount the
@@ -1243,6 +1248,16 @@ export default function App({ client = apiClient, identityProvider = currentIden
       case "audit":
         content = <AuditPage events={data.auditEvents} onAction={(message) => setToast({ message })} />;
         break;
+      case "users":
+        content = (
+          <UsersPage
+            client={client}
+            canAdminister={capabilities.manageFleet}
+            defaultOrg={selectedScope?.orgId ?? configuredScope().orgId}
+            defaultProject={selectedScope?.projectId ?? configuredScope().projectId}
+          />
+        );
+        break;
       default:
         content = (
           <OverviewPage
@@ -1287,7 +1302,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
         scopes={authority?.scopes ?? []}
         selectedScope={selectedScope ?? undefined}
         onScopeChange={selectScope}
-        onLogout={identity?.mode === "development" ? undefined : () => void logout()}
+        onLogout={identity?.mode === "development" && !isTeamSession() ? undefined : () => void logout()}
       >
         {/* A scope commit remounts page-local filters, pending controls, and panels. */}
         <Fragment key={selectedScopeIdentity}>

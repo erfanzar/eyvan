@@ -49,6 +49,12 @@ import type {
   AttachmentPlan,
   AuditEvent,
   DiscoveredTpus,
+  TeamInvite,
+  TeamInviteCreated,
+  TeamInviteInput,
+  TeamToken,
+  TeamTokenCreated,
+  TeamUser,
   AvailableShape,
   BillingReport,
   CapacityPoolSummary,
@@ -721,6 +727,62 @@ export class EyvanApiClient {
   async listDiscoveredTpus(signal?: AbortSignal): Promise<DiscoveredTpus> {
     if (this.forceDemo) return cloneMock(mockDiscoveredTpus);
     return this.attachmentRequest<DiscoveredTpus>("/api/v1/attachments/discovered", { signal });
+  }
+
+  // Team accounts. Full literal paths, like the attachment routes, so the
+  // browser route inventory stays auditable. Demo mode has no team accounts.
+
+  async listTeamUsers(signal?: AbortSignal): Promise<TeamUser[]> {
+    if (this.forceDemo) return [];
+    return (await this.attachmentRequest<{ users: TeamUser[] }>("/api/v1/team/users", { signal })).users;
+  }
+
+  async setTeamUserDisabled(subject: string, disabled: boolean): Promise<TeamUser> {
+    const name = encodeURIComponent(subject);
+    return this.attachmentRequest<TeamUser>(
+      disabled ? `/api/v1/team/users/${name}/disable` : `/api/v1/team/users/${name}/enable`,
+      { method: "POST" },
+    );
+  }
+
+  async listTeamInvites(signal?: AbortSignal): Promise<TeamInvite[]> {
+    if (this.forceDemo) return [];
+    return (await this.attachmentRequest<{ invites: TeamInvite[] }>("/api/v1/team/invites", { signal })).invites;
+  }
+
+  async createTeamInvite(input: TeamInviteInput): Promise<TeamInviteCreated> {
+    const body: Record<string, string> = { email: input.email, subject: input.subject };
+    if (input.role) body.role = input.role;
+    if (input.org_id) body.org_id = input.org_id;
+    if (input.project_id) body.project_id = input.project_id;
+    return this.attachmentRequest<TeamInviteCreated>("/api/v1/team/invites", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  async revokeTeamInvite(inviteId: string): Promise<TeamInvite> {
+    return this.attachmentRequest<TeamInvite>(`/api/v1/team/invites/${encodeURIComponent(inviteId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async listTeamTokens(signal?: AbortSignal): Promise<TeamToken[]> {
+    if (this.forceDemo) return [];
+    return (await this.attachmentRequest<{ tokens: TeamToken[] }>("/api/v1/team/tokens", { signal })).tokens;
+  }
+
+  async createTeamToken(name: string, expiresInDays: number | null): Promise<TeamTokenCreated> {
+    return this.attachmentRequest<TeamTokenCreated>("/api/v1/team/tokens", {
+      method: "POST",
+      body: JSON.stringify(expiresInDays ? { name, expires_in_days: expiresInDays } : { name }),
+    });
+  }
+
+  async revokeTeamToken(tokenId: string): Promise<TeamToken> {
+    return this.attachmentRequest<TeamToken>(`/api/v1/team/tokens/${encodeURIComponent(tokenId)}`, {
+      method: "DELETE",
+    });
   }
 
   private requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {

@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from eyvan._internal.json_types import is_json_object
 from eyvan._internal.workspace import create_private_directory
 from eyvan.records import (
+    ApiTokenRecord,
     ArtifactReferenceRecord,
     AuditEvent,
     BudgetRecord,
@@ -34,6 +35,7 @@ from eyvan.records import (
     CredentialRotationRecord,
     ExpansionAdmissionRecord,
     IdempotencyRecord,
+    InviteRecord,
     LeaseRecord,
     ManagedArtifactRecord,
     OrganizationRecord,
@@ -46,6 +48,7 @@ from eyvan.records import (
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
     UserProgressReport,
+    UserRecord,
     WebhookRecord,
     WorkloadAttemptTopology,
     WorkloadRecord,
@@ -93,7 +96,11 @@ LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION = 5
 #: into somebody's incident channel after one restart. A document that cannot
 #: carry them refuses them rather than silently omitting them.
 LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION = 6
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6)
+#: Emitted once a team-mode user, invite or API token exists. Dropping them on
+#: a rolled-back build would silently lock every team member out, or worse,
+#: forget that a token was revoked; refusing by version is the honest answer.
+LOCAL_CONTROL_PLANE_TEAM_SCHEMA_VERSION = 7
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -298,6 +305,8 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
             raise ValueError("credential rotations require the v4 local control-plane document")
         if state.expansion_admissions:
             raise ValueError("expansion admission ledgers require the v4 local control-plane document")
+        if state.users or state.invites or state.api_tokens:
+            raise ValueError("team users, invites and API tokens require the v7 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -571,6 +580,61 @@ class LocalControlPlaneV6Document(LocalControlPlaneV5Document):
         return state
 
 
+class LocalControlPlaneV7Document(LocalControlPlaneV6Document):
+    """Schema-v7 document: v6 plus team-mode users, invites and API tokens.
+
+    Additive, with a version of its own for the reason every version here has
+    one. A plane that never enabled team mode keeps writing v6 (or lower), which
+    an older build still reads; once an account exists, an older build refuses
+    the file by version instead of silently dropping who may sign in.
+    """
+
+    version: Literal[7] = LOCAL_CONTROL_PLANE_TEAM_SCHEMA_VERSION
+    users: tuple[UserRecord, ...] = ()
+    invites: tuple[InviteRecord, ...] = ()
+    api_tokens: tuple[ApiTokenRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v7_document(self) -> LocalControlPlaneV7Document:
+        """Reject duplicate account, invite and token identities before restoration merges them."""
+
+        if len({record.subject for record in self.users}) != len(self.users):
+            raise ValueError("local control-plane users must have unique subjects")
+        if len({record.email for record in self.users}) != len(self.users):
+            raise ValueError("local control-plane users must have unique emails")
+        if len({record.id for record in self.invites}) != len(self.invites):
+            raise ValueError("local control-plane invites must have unique IDs")
+        if len({record.id for record in self.api_tokens}) != len(self.api_tokens):
+            raise ValueError("local control-plane API tokens must have unique IDs")
+        if len({record.token_hash for record in self.api_tokens}) != len(self.api_tokens):
+            raise ValueError("local control-plane API tokens must have unique token hashes")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV7Document:
+        """Encode one snapshot including every team account, invite and token."""
+
+        users = tuple(state.users[key] for key in sorted(state.users))
+        invites = tuple(state.invites[key] for key in sorted(state.invites))
+        tokens = tuple(state.api_tokens[key] for key in sorted(state.api_tokens))
+        base = LocalControlPlaneV6Document.from_state(replace(state, users={}, invites={}, api_tokens={}))
+        return cls(
+            **base.model_dump(exclude={"version"}),
+            users=users,
+            invites=invites,
+            api_tokens=tokens,
+        )
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v6 aggregates plus every team account, invite and token."""
+
+        state = super().to_state()
+        state.users = {record.subject: record for record in self.users}
+        state.invites = {record.id: record for record in self.invites}
+        state.api_tokens = {record.id: record for record in self.api_tokens}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
@@ -578,10 +642,13 @@ def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneD
     older build still reads; the first frozen topology moves the file to v3, the
     first managed stage, credential rotation, or bounded fan-out moves it to v4,
     the first probed or scaled service moves it to v5, the first webhook
-    subscription moves it to v6, and an older build then refuses it by version
-    instead of silently discarding durable state it does not understand.
+    subscription moves it to v6, the first team account, invite or token moves
+    it to v7, and an older build then refuses it by version instead of silently
+    discarding durable state it does not understand.
     """
 
+    if state.users or state.invites or state.api_tokens:
+        return LocalControlPlaneV7Document.from_state(state)
     if state.webhooks:
         return LocalControlPlaneV6Document.from_state(state)
     if state.service_replica_health or state.service_decisions:
@@ -600,6 +667,7 @@ _LocalControlPlaneReadableDocument: tp.TypeAlias = (
     | LocalControlPlaneV4Document
     | LocalControlPlaneV5Document
     | LocalControlPlaneV6Document
+    | LocalControlPlaneV7Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -751,6 +819,7 @@ class LocalControlPlaneStore:
                 LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION: LocalControlPlaneV4Document,
                 LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION: LocalControlPlaneV5Document,
                 LOCAL_CONTROL_PLANE_WEBHOOK_SCHEMA_VERSION: LocalControlPlaneV6Document,
+                LOCAL_CONTROL_PLANE_TEAM_SCHEMA_VERSION: LocalControlPlaneV7Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -1299,6 +1368,7 @@ __all__ = (
     "LOCAL_CONTROL_PLANE_SCHEMA",
     "LOCAL_CONTROL_PLANE_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_SERVICE_OPS_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_TEAM_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_TOPOLOGY_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX",
     "LOCAL_CONTROL_PLANE_V4_SCHEMA_VERSION",
@@ -1314,6 +1384,7 @@ __all__ = (
     "LocalControlPlaneV4Document",
     "LocalControlPlaneV5Document",
     "LocalControlPlaneV6Document",
+    "LocalControlPlaneV7Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",
