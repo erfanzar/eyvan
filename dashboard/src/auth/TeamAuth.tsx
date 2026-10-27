@@ -26,7 +26,14 @@ export function takeInviteTokenFromLocation(): string | undefined {
 
 const message = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
 
-export function TeamLoginScreen({ notice }: { notice?: string | null }) {
+export function TeamLoginScreen({
+  notice,
+  onOidcSignIn,
+}: {
+  notice?: string | null;
+  /** Set when the plane also names an identity provider: offer it beside the password form. */
+  onOidcSignIn?: () => void;
+}) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -82,6 +89,14 @@ export function TeamLoginScreen({ notice }: { notice?: string | null }) {
         <button className="button button-primary" type="submit" disabled={busy || !email.trim() || !password}>
           {busy && <LoaderCircle className="spin" size={14} />}Sign in
         </button>
+        {onOidcSignIn && (
+          <>
+            <p className="muted">or</p>
+            <button className="button button-secondary" type="button" onClick={onOidcSignIn} disabled={busy}>
+              <LogIn size={17} /> Sign in with OIDC
+            </button>
+          </>
+        )}
       </form>
     </main>
   );

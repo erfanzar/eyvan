@@ -207,7 +207,7 @@ class WorkloadCommandService:
         """Use the active fleet, or infer the only submit-capable fleet."""
 
         active = self.session.active_context
-        if active is not None and active.base_url == self.session.base_url:
+        if active is not None and active.base_url == self.session.base_url and active.fleet is not None:
             return active.fleet
         fleets = self._available_fleets(scope)
         if len(fleets) == 1:

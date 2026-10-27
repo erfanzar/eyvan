@@ -143,9 +143,19 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
   if (identity || isDemoMode() || isDevelopmentAuthEnabled() || ownPlaneAuthenticated) return children;
   // A team plane: everyone who is not the machine owner signs in with the
-  // email and password from their invite (an OIDC button stays available
-  // when the plane also names an identity provider, below).
-  if (isTeamMode() && !isOidcConfigured()) return <TeamLoginScreen notice={error} />;
+  // email and password from their invite. When the plane also names an
+  // identity provider, both ways are offered on the same screen.
+  if (isTeamMode()) {
+    const startOidc = () => {
+      setError(null);
+      try {
+        beginLogin();
+      } catch (authError) {
+        setError(authError instanceof Error ? authError.message : "Unable to begin sign-in");
+      }
+    };
+    return <TeamLoginScreen notice={error} onOidcSignIn={isOidcConfigured() ? startOidc : undefined} />;
+  }
 
   // The plane's own page, opened without the credential -- a raw URL typed by
   // hand. This is reachable and ordinary, not an error state to hide: the fix

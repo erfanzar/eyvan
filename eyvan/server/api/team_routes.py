@@ -124,7 +124,9 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
     throttle = SignInThrottle()
     app.state.team_sign_in_throttle = throttle
     app.state.team_mode = settings.team_mode
-    secure_cookie = settings.public_url.lower().startswith("https://")
+    # Secure whenever the browser reaches this plane over TLS: either the
+    # advertised URL is https, or this process terminates TLS itself.
+    secure_cookie = settings.public_url.lower().startswith("https://") or settings.tls_enabled
     ttl = settings.dashboard_session_ttl_s
 
     def set_session(response: Response, raw: str) -> None:

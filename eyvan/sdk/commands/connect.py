@@ -119,8 +119,12 @@ def probe(
     base = url.rstrip("/")
     try:
         from eyvan._internal.plane_tls import control_plane_httpx_options
+        from eyvan.sdk.team_credentials import plane_trust_httpx_options
 
-        with httpx.Client(timeout=timeout_s, trust_env=False, **control_plane_httpx_options()) as client:
+        # Trust `eyvan login` stored for exactly this plane first (a private CA
+        # or a pinned certificate), else a configured head CA, else defaults.
+        verify = plane_trust_httpx_options(base) or control_plane_httpx_options()
+        with httpx.Client(timeout=timeout_s, trust_env=False, **verify) as client:
             health = client.get(f"{base}/api/v1/health", headers=headers)
             if health.status_code != 200:
                 return ConnectTarget(url, False, f"control plane answered {health.status_code} on /health")

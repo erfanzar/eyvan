@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, replace
+from urllib.parse import urlsplit
 
 from eyvan._internal.compat import StrEnum
 from eyvan.config import EyvanSettings, RepositoryBackend
@@ -52,6 +54,12 @@ NETWORK_REQUIRES_METRICS_TOKEN = (
 NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY = (
     "EYVAN_ARTIFACT_TOKEN_KEY must be set when the Eyvan repository backend is not local; an ephemeral "
     "per-process signing key would break managed-artifact token validation across replicas and restarts"
+)
+
+TEAM_MODE_REQUIRES_PUBLIC_URL = (
+    "team mode on a network bind needs EYVAN_PUBLIC_URL set to the address people actually open "
+    "(https://..., not a loopback address): invite links are built from it, and every dashboard cookie "
+    "write is refused unless its Origin matches it"
 )
 
 BOOTSTRAP_TOKEN_AND_ISSUER_CONFLICT = (
@@ -145,6 +153,8 @@ def unsatisfied_startup_requirements(
                 BOOTSTRAP_TOKEN_AND_ISSUER_CONFLICT,
             )
         )
+    if settings.team_mode and not _team_public_url_is_usable(settings):
+        requirements.append(StartupRequirement("EYVAN_PUBLIC_URL", TEAM_MODE_REQUIRES_PUBLIC_URL))
     if settings.dev_auth_enabled:
         requirements.append(StartupRequirement(_DEV_AUTH_ENVIRONMENT_VARIABLE, DEVELOPMENT_AUTH_IS_LOOPBACK_ONLY))
     if not settings.metrics_token:
@@ -157,6 +167,25 @@ def unsatisfied_startup_requirements(
             )
         )
     return tuple(requirements)
+
+
+def _team_public_url_is_usable(settings: EyvanSettings) -> bool:
+    """Return whether a network-bound team plane's public URL can carry invites and cookie writes.
+
+    It must name a non-loopback host, and use https unless plaintext was
+    explicitly accepted: a password typed into an http page crosses the network
+    in the clear even when the API listener itself has TLS in front of it.
+    """
+
+    split = urlsplit(settings.public_url.strip())
+    if split.scheme not in {"http", "https"} or not split.hostname:
+        return False
+    if split.scheme == "http" and not settings.allow_insecure_plaintext_bind:
+        return False
+    try:
+        return not ipaddress.ip_address(split.hostname).is_loopback
+    except ValueError:
+        return split.hostname.lower() != "localhost"
 
 
 def _signing_key_must_be_explicit(settings: EyvanSettings, source: StartupConfigurationSource) -> bool:
@@ -262,6 +291,7 @@ __all__ = (
     "NETWORK_REQUIRES_METRICS_TOKEN",
     "NETWORK_REQUIRES_POSTGRES",
     "NON_LOCAL_REPOSITORY_REQUIRES_ARTIFACT_TOKEN_KEY",
+    "TEAM_MODE_REQUIRES_PUBLIC_URL",
     "DevelopmentAuthMode",
     "ServerControllerMode",
     "ServerStartupSettings",

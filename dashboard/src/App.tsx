@@ -641,7 +641,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     billing: capabilities.manageFleet,
     audit: canReadSelectedScope,
     // Only a team-mode plane has accounts; everywhere else the section is absent.
-    users: isTeamMode(),
+    settings: isTeamMode(),
   };
   const routed = accessibleRoute(route, sectionAvailability);
   // SUBMIT does not imply READ. A submit-only deep link must not mount the
@@ -1248,7 +1248,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
       case "audit":
         content = <AuditPage events={data.auditEvents} onAction={(message) => setToast({ message })} />;
         break;
-      case "users":
+      case "settings":
         content = (
           <UsersPage
             client={client}

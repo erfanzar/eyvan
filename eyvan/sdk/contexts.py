@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import typing as tp
 from dataclasses import dataclass
@@ -38,7 +39,10 @@ class EyvanContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    fleet: str
+    #: None for a plane saved before any fleet was chosen (``eyvan login`` on a
+    #: plane with no fleet, or several): later commands still target the plane
+    #: and infer or ask for the fleet, exactly as with no context at all.
+    fleet: str | None
     org_id: str
     project_id: str
     base_url: str = DEFAULT_BASE_URL
@@ -46,7 +50,9 @@ class EyvanContext(BaseModel):
 
     @field_validator("fleet")
     @classmethod
-    def _valid_fleet(cls, value: str) -> str:
+    def _valid_fleet(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         try:
             return validate_fleet_name(value)
         except ValueError as exc:
@@ -120,6 +126,15 @@ class EyvanContextConfig(BaseModel):
         if self.active_context is None:
             return None
         return self.contexts[self.active_context]
+
+
+def plane_context_name(base_url: str) -> str:
+    """Return a stable context name for a plane saved without a fleet: ``plane-<host>-<port>``."""
+
+    split = urlsplit(base_url)
+    raw = f"plane-{split.hostname or 'unknown'}-{split.port or ''}"
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:63].rstrip("-")
+    return validate_fleet_name(slug)
 
 
 def context_config_path(environ: tp.Mapping[str, str] | None = None) -> Path:
@@ -200,7 +215,10 @@ class FileContextStore:
     def activate(self, context: EyvanContext, *, name: str | None = None) -> EyvanContextConfig:
         """Create or replace a named context and make it active."""
 
-        context_name = validate_fleet_name(name or context.fleet)
+        chosen = name or context.fleet
+        if chosen is None:
+            raise ValueError("a context without a fleet needs an explicit name")
+        context_name = validate_fleet_name(chosen)
         current = self.load()
         contexts = dict(current.contexts)
         contexts[context_name] = context

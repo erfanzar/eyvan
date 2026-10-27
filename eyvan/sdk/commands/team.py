@@ -14,8 +14,11 @@ stored and never accepted as a flag value, so it cannot land in shell history.
 from __future__ import annotations
 
 import socket
+import ssl
 import sys
 import typing as tp
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -26,14 +29,124 @@ from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.connect import connect as connect_plane
 from eyvan.sdk.commands.connect import resolve_url
 from eyvan.sdk.commands.state import CliSession
-from eyvan.sdk.team_credentials import TeamCredential, TeamCredentialError, TeamCredentialStore
+from eyvan.sdk.team_credentials import (
+    TRUST_CA,
+    TRUST_PINNED,
+    PlaneTrust,
+    TeamCredential,
+    TeamCredentialError,
+    TeamCredentialStore,
+    display_fingerprint,
+    normalize_fingerprint,
+    plane_trust_httpx_options,
+)
 
 
-def _http(url: str) -> httpx.Client:
+def _http(url: str, trust: PlaneTrust | None = None) -> httpx.Client:
+    """HTTP client for one plane: explicit trust, else trust stored by `eyvan login`, else the head CA."""
+
     from eyvan._internal.plane_tls import control_plane_httpx_options
 
     endpoint = ControlPlaneEndpoint.parse(url)
-    return httpx.Client(base_url=url, timeout=20.0, trust_env=not endpoint.is_loopback, **control_plane_httpx_options())
+    verify: dict[str, tp.Any] = (
+        {"verify": trust.ssl_context()}
+        if trust is not None
+        else (plane_trust_httpx_options(url) or control_plane_httpx_options())
+    )
+    return httpx.Client(base_url=url, timeout=20.0, trust_env=not endpoint.is_loopback, **verify)
+
+
+def _host_port(url: str) -> tuple[str, int]:
+    split = urlsplit(url)
+    return split.hostname or "", split.port or (443 if split.scheme == "https" else 80)
+
+
+def _verifies_with_default_trust(url: str) -> bool:
+    """Return whether system trust (plus a configured head CA) accepts this plane's certificate."""
+
+    from eyvan._internal.plane_tls import control_plane_ssl_context
+
+    host, port = _host_port(url)
+    context = control_plane_ssl_context() or ssl.create_default_context()
+    try:
+        with socket.create_connection((host, port), timeout=10) as raw, context.wrap_socket(raw, server_hostname=host):
+            return True
+    except ssl.SSLCertVerificationError:
+        return False
+    except OSError:
+        # Unreachable, or another TLS failure: the request that follows reports
+        # it with its real cause instead of this probe guessing.
+        return True
+
+
+def _resolve_trust(url: str, *, ca_file: str | None, fingerprint: str | None, can_prompt: bool) -> PlaneTrust | None:
+    """Decide how to trust ``url`` before any password is sent to it.
+
+    A private CA is taken as given. A certificate no trusted CA issued is
+    pinned only after its SHA-256 fingerprint matched ``--fingerprint`` or a
+    person confirmed it interactively; nothing is sent to an unconfirmed peer.
+    """
+
+    if ca_file is not None:
+        try:
+            return PlaneTrust.from_pem(TRUST_CA, Path(ca_file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise click.ClickException(f"--ca-file {ca_file}: {exc}") from exc
+    if not url.startswith("https://"):
+        if fingerprint is not None:
+            raise click.UsageError("--fingerprint only applies to an https:// plane")
+        return None
+    expected: str | None = None
+    if fingerprint is not None:
+        try:
+            expected = normalize_fingerprint(fingerprint)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint="--fingerprint") from exc
+    elif _verifies_with_default_trust(url):
+        return None
+    host, port = _host_port(url)
+    try:
+        trust = PlaneTrust.from_pem(TRUST_PINNED, ssl.get_server_certificate((host, port), timeout=10))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"could not read the TLS certificate of {url}: {exc}") from exc
+    shown = display_fingerprint(trust.fingerprint)
+    if expected is not None:
+        if trust.fingerprint != expected:
+            raise click.ClickException(
+                f"{url} presented certificate {shown}, which is not the --fingerprint you gave; "
+                "refusing to send a password to it"
+            )
+        return trust
+    message = (
+        f"{url} uses a certificate that no trusted CA issued (self-signed or private).\n"
+        f"  fingerprint {shown}\n"
+        "  Compare it with the one your admin gave you (they can read it with "
+        "`openssl x509 -in CERT -noout -fingerprint -sha256`)"
+    )
+    if not can_prompt:
+        raise click.ClickException(f"{message};\n  then re-run with --fingerprint {shown} (or --ca-file FILE)")
+    click.echo(message + ".", err=True)
+    if not click.confirm("Trust this certificate for this plane?", default=False, err=True):
+        raise click.ClickException("certificate not trusted; nothing was sent")
+    return trust
+
+
+def _granted_scope(me: tp.Any) -> tuple[str | None, str | None]:
+    """Return the one org/project the account was granted, so later commands submit there."""
+
+    grants = me.get("grants", []) if is_json_object(me) else []
+    pairs = {
+        (grant.get("org_id"), grant.get("project_id"))
+        for grant in grants
+        if is_json_object(grant) and grant.get("org_id") and grant.get("project_id")
+    }
+    if len(pairs) == 1:
+        org, project = next(iter(pairs))
+        return str(org), str(project)
+    orgs = {grant.get("org_id") for grant in grants if is_json_object(grant) and grant.get("org_id")}
+    if not pairs and len(orgs) == 1:
+        return str(next(iter(orgs))), None
+    return None, None
 
 
 def _detail(response: httpx.Response) -> str:
@@ -64,17 +177,35 @@ def _emit(as_json: bool, payload: tp.Any, text: str) -> None:
 @click.option("--email", help="Your account email (prompted when omitted).")
 @click.option("--password-stdin", is_flag=True, help="Read the password from stdin instead of prompting.")
 @click.option("--fleet", help="Fleet to make active when the plane has more than one.")
+@click.option(
+    "--ca-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="PEM of the private CA that issued the plane's certificate.",
+)
+@click.option(
+    "--fingerprint",
+    help="SHA-256 fingerprint of a self-signed plane certificate to pin (ask your admin for it).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit the result as JSON.")
 @click.pass_obj
 def login(
-    session: CliSession, url: str, email: str | None, password_stdin: bool, fleet: str | None, as_json: bool
+    session: CliSession,
+    url: str,
+    email: str | None,
+    password_stdin: bool,
+    fleet: str | None,
+    ca_file: str | None,
+    fingerprint: str | None,
+    as_json: bool,
 ) -> None:
     """Sign in to a team Eyvan plane and remember a personal token for it.
 
     URL may be a host, host:port or full URL. Afterwards every command and
-    init() aimed at that plane is authenticated as you.
+    init() on this machine targets that plane and is authenticated as you.
     """
 
+    if ca_file is not None and fingerprint is not None:
+        raise click.UsageError("pass --ca-file or --fingerprint, not both")
     try:
         base = resolve_url(url, None)
     except ValueError as exc:
@@ -86,7 +217,10 @@ def login(
             "Ask the admin to enable TLS.",
             err=True,
         )
-    with _http(base) as client:
+    can_prompt = not password_stdin and sys.stdin.isatty()
+    trust = _resolve_trust(endpoint.url, ca_file=ca_file, fingerprint=fingerprint, can_prompt=can_prompt)
+    me: tp.Any = None
+    with _http(base, trust) as client:
         try:
             status_response = client.get("/api/v1/team/status")
         except httpx.HTTPError as exc:
@@ -104,6 +238,10 @@ def login(
         response = client.post(
             "/api/v1/team/login", json={"email": address, "password": password, "token_name": token_name}
         )
+        if response.status_code == 200:
+            raw_token = response.json().get("token")
+            mine = client.get("/api/v1/team/me", headers={"Authorization": f"Bearer {raw_token}"})
+            me = mine.json() if mine.status_code == 200 else None
     if response.status_code != 200:
         raise click.ClickException(f"sign-in failed: {_detail(response)}")
     body = response.json()
@@ -114,27 +252,49 @@ def login(
         token_id=body["record"]["id"],
         subject=user.get("subject", ""),
         email=user.get("email", address),
+        trust=trust,
     )
     try:
         _store().put(credential)
     except (OSError, TeamCredentialError) as exc:
         raise click.ClickException(f"signed in, but could not save the token: {exc}") from exc
+    org_id, project_id = _granted_scope(me)
     outcome = connect_plane(
-        session, host=endpoint.url, port=None, fleet=fleet, token=credential.token, org_id=None, project_id=None
+        session,
+        host=endpoint.url,
+        port=None,
+        fleet=fleet,
+        token=credential.token,
+        org_id=org_id,
+        project_id=project_id,
     )
+    notes = list(outcome.notes)
+    saved_context = outcome.saved_context
+    if saved_context is None:
+        # No single fleet to pick: still make this plane the default, so later
+        # commands need no --url; the fleet is inferred or named per command.
+        saved_context, _ = session.save_plane_context(endpoint.url, org_id=org_id, project_id=project_id)
+        notes = [note for note in notes if "eyvan connect" not in note and "re-run with --fleet" not in note]
+        notes.append("later commands target this plane; pick a fleet with `eyvan use FLEET` when it has several")
     lines = [f"signed in to {endpoint.url} as {credential.subject} ({credential.email})"]
     lines.append(f"  token {credential.token_id} saved in {_store().path} (owner-only)")
-    lines.extend(f"  {note}" for note in outcome.notes)
-    if outcome.saved_context:
-        lines.append(f"  active fleet: {outcome.saved_context}")
+    if trust is not None:
+        lines.append(
+            f"  trusting {'its CA' if trust.kind == TRUST_CA else 'pinned certificate'} "
+            f"{display_fingerprint(trust.fingerprint)}"
+        )
+    lines.append(f"  active context: {saved_context} ({session.org_id}/{session.project_id})")
+    lines.extend(f"  {note}" for note in notes)
     _emit(
         as_json,
         {
             "url": endpoint.url,
             "subject": credential.subject,
             "token_id": credential.token_id,
-            "saved_context": outcome.saved_context,
-            "notes": outcome.notes,
+            "saved_context": saved_context,
+            "scope": {"org_id": session.org_id, "project_id": session.project_id},
+            "trust": None if trust is None else {"kind": trust.kind, "fingerprint": trust.fingerprint},
+            "notes": notes,
         },
         "\n".join(lines),
     )

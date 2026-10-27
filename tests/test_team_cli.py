@@ -57,7 +57,7 @@ def plane(tmp_path, monkeypatch):
     )
 
     class _NoLifespan:
-        def __init__(self, url: str) -> None:
+        def __init__(self, url: str, trust: object = None) -> None:
             self.client = TestClient(app, base_url=url)
 
         def __enter__(self) -> TestClient:
@@ -165,7 +165,7 @@ def test_a_plane_without_team_mode_is_refused_clearly(tmp_path, monkeypatch) -> 
     )
 
     class _NoLifespan:
-        def __init__(self, url: str) -> None:
+        def __init__(self, url: str, trust: object = None) -> None:
             self.client = TestClient(app, base_url=url)
 
         def __enter__(self):

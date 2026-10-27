@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import typing as tp
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,7 +25,15 @@ from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
 from eyvan.sdk.client.identity import ClientIdentity
 from eyvan.sdk.client.retry import RetryPolicy
 from eyvan.sdk.client.types import HeaderMap, QueryParams
+from eyvan.sdk.team_credentials import plane_trust_httpx_options
 from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_REQUIRED_DETAIL
+
+
+def _plane_httpx_options(url: str) -> dict[str, tp.Any]:
+    """Return TLS options for ``url``: trust `eyvan login` pinned for it, else the head CA, else defaults."""
+
+    return plane_trust_httpx_options(url) or control_plane_httpx_options()
+
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -247,7 +256,7 @@ class SyncApiTransport:
                 timeout=30,
                 trust_env=trust_env,
                 # A head's own CA, added to system trust; see eyvan._internal.plane_tls.
-                **control_plane_httpx_options(),
+                **_plane_httpx_options(self.endpoint.url),
             )
             self._own_client = True
             self._injected_headers: HeaderMap = {}
@@ -408,7 +417,7 @@ class AsyncApiTransport:
                 timeout=30,
                 trust_env=trust_env,
                 # A head's own CA, added to system trust; see eyvan._internal.plane_tls.
-                **control_plane_httpx_options(),
+                **_plane_httpx_options(self.endpoint.url),
             )
             self._own_client = True
             self._injected_headers: HeaderMap = {}

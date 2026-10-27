@@ -281,6 +281,42 @@ class CliSession:
         self.project_id = context.project_id
         return context
 
+    def save_plane_context(
+        self,
+        base_url: str,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+    ) -> tuple[str, EyvanContext]:
+        """Make a plane the active context before any fleet is chosen.
+
+        ``eyvan login`` on a plane with no fleet, or several, still has to make
+        every later command target that plane; the fleet is then inferred or
+        named per command (or chosen once with ``eyvan use FLEET``).
+        """
+
+        from eyvan.sdk.contexts import plane_context_name
+
+        name = plane_context_name(base_url)
+        existing = self.context_config.contexts.get(name)
+        context = EyvanContext(
+            fleet=None,
+            org_id=org_id
+            or self.overrides.org_id
+            or (existing.org_id if existing is not None else None)
+            or DEFAULT_ORG_ID,
+            project_id=project_id
+            or self.overrides.project_id
+            or (existing.project_id if existing is not None else None)
+            or DEFAULT_PROJECT_ID,
+            base_url=base_url,
+        )
+        self.context_config = self.context_store.activate(context, name=name)
+        self.base_url = context.base_url
+        self.org_id = context.org_id
+        self.project_id = context.project_id
+        return name, context
+
     def select_context(
         self,
         fleet: str,
