@@ -28,6 +28,7 @@ from eyvan._internal.ssh import SshDestination
 from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.fleet_config import validate_fleet_name
+from eyvan.capacity.providers.gcp.tpu_nodes import validate_node_name
 
 JOB_ID_PATTERN = r"^[0-9a-f]{32}$"
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
@@ -52,8 +53,13 @@ class AttachmentRequest(BaseModel):
             raise ValueError("target must be trimmed and contain no control characters")
         if self.kind == "ssh":
             SshDestination.parse(self.target)
-        elif not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", self.target):
-            raise ValueError("invalid TPU name")
+        else:
+            # The Cloud TPU API's own rule: real node names carry underscores
+            # (team_spot2), which a hyphen-only pattern refused with a 422.
+            try:
+                validate_node_name(self.target)
+            except ValueError:
+                raise ValueError("invalid TPU name") from None
         if self.fleet is not None:
             validate_fleet_name(self.fleet)
         if self.project is not None and not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", self.project):

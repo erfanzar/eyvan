@@ -420,7 +420,7 @@ export function AddTpuModal({ open, client, onClose, onConnected, initial = null
               <p className="muted" role="note">
                 {busy
                   ? "Loading the read-only preview…"
-                  : "Preview first: Connect unlocks after the read-only preview shows what will change."}
+                  : "Preview is optional: it lists what Connect will change without changing anything."}
               </p>
             )}
           </div>
@@ -437,7 +437,7 @@ export function AddTpuModal({ open, client, onClose, onConnected, initial = null
                   className="button button-primary"
                   type="button"
                   onClick={() => void connect()}
-                  disabled={busy || !plan}
+                  disabled={busy || !target.trim()}
                 >
                   Connect
                 </button>

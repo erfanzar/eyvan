@@ -294,6 +294,28 @@ export interface WorkloadFilters {
   priority?: string;
 }
 
+/**
+ * Render a FastAPI error `detail` as text. Validation failures (422) send a
+ * list of `{loc, msg}` objects; interpolating that printed "[object Object]".
+ */
+export function formatErrorDetail(detail: unknown): string {
+  if (detail === undefined || detail === null || detail === "") return "";
+  if (typeof detail === "string") return `: ${detail}`;
+  if (Array.isArray(detail)) {
+    const messages = detail.map((item) => {
+      if (item && typeof item === "object" && "msg" in item) {
+        const msg = String((item as { msg: unknown }).msg).replace(/^Value error, /, "");
+        const loc = (item as { loc?: unknown }).loc;
+        const field = Array.isArray(loc) ? loc.filter((part) => part !== "body").join(".") : "";
+        return field ? `${field}: ${msg}` : msg;
+      }
+      return typeof item === "string" ? item : JSON.stringify(item);
+    });
+    return messages.length ? `: ${messages.join("; ")}` : "";
+  }
+  return `: ${JSON.stringify(detail)}`;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -734,8 +756,7 @@ export class EyvanApiClient {
       if (!response.ok) {
         let detail = "";
         try {
-          const body = (await response.json()) as { detail?: string };
-          detail = body.detail ? `: ${body.detail}` : "";
+          detail = formatErrorDetail(((await response.json()) as { detail?: unknown }).detail);
         } catch {
           // The HTTP status remains actionable when an upstream returns a non-JSON error body.
         }

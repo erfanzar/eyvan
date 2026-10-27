@@ -9,7 +9,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AddTpuModal, type AttachmentClient } from "./components/AddTpuModal";
-import { EyvanApiClient } from "./api/client";
+import { EyvanApiClient, formatErrorDetail } from "./api/client";
 import { mockAttachmentPlan, mockDiscoveredTpus } from "./api/mockData";
 import { FleetPage } from "./pages/FleetPage";
 import type { AttachmentInput, AttachmentJob } from "./types";
@@ -58,7 +58,7 @@ async function preview(api: AttachmentClient) {
 }
 
 describe("Add TPU", () => {
-  it("requires preview, shows the plan facts, and invalidates a preview on edits", async () => {
+  it("shows the plan facts and drops a stale preview on edits without locking Connect", async () => {
     const api = client();
     await preview(api);
     expect(api.planAttachment).toHaveBeenCalledWith(input);
@@ -69,7 +69,20 @@ describe("Add TPU", () => {
     expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(false);
     fireEvent.change(screen.getByLabelText("Fleet name (optional)"), { target: { value: "other" } });
     expect(screen.queryByRole("region", { name: "Attachment preview" })).toBeNull();
-    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("connects in one click without a preview", async () => {
+    const api = client();
+    render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
+    const connectButton = screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement;
+    expect(connectButton.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("SSH host or IP"), { target: { value: input.target } });
+    expect(connectButton.disabled).toBe(false);
+    fireEvent.click(connectButton);
+    await screen.findByText(/Connecting ·/);
+    expect(api.startAttachment).toHaveBeenCalledWith(input);
+    expect(api.planAttachment).not.toHaveBeenCalled();
   });
 
   it("accepts a TPU name with project and zone in advanced mode", async () => {
@@ -132,14 +145,14 @@ describe("Add TPU", () => {
     expect(api.startAttachment).not.toHaveBeenCalled();
   });
 
-  it("shows preview failures and does not enable Connect", async () => {
+  it("shows preview failures and still lets Connect report its own result", async () => {
     const api = client();
     vi.mocked(api.planAttachment).mockRejectedValue(new Error("Use a local development plane"));
     render(<AddTpuModal open client={api} onClose={close} onConnected={connected} />);
     fireEvent.change(screen.getByLabelText("SSH host or IP"), { target: { value: input.target } });
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Use a local development plane");
-    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("only exposes Add TPU when FleetPage receives fleet-admin attachment authority", async () => {
@@ -221,11 +234,17 @@ describe("Add TPU", () => {
     expect((connect as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("says why Connect is locked before a manual preview", async () => {
+  it("says Preview is optional", async () => {
     render(<AddTpuModal open client={client()} onClose={close} onConnected={connected} />);
-    expect(screen.getByRole("note").textContent).toContain("Preview first");
-    expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("note").textContent).toContain("Preview is optional");
     await act(async () => {});
+  });
+
+  it("renders a FastAPI validation error as text, not [object Object]", () => {
+    const detail = [{ loc: ["body", "target"], msg: "Value error, invalid TPU name", type: "value_error" }];
+    expect(formatErrorDetail(detail)).toBe(": target: invalid TPU name");
+    expect(formatErrorDetail("plain")).toBe(": plain");
+    expect(formatErrorDetail(undefined)).toBe("");
   });
 
   it("reads discovered TPUs through the real client class without losing its receiver", async () => {

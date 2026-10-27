@@ -123,6 +123,15 @@ def test_invalid_options(fields: dict) -> None:
     assert client().post("/api/v1/attachments/plan", json={**BODY, **fields}, headers=ADMIN).status_code == 422
 
 
+@pytest.mark.parametrize("name", ["team_spot2", "lab_spot_m", "v5p-trainer-1"])
+def test_real_tpu_names_with_underscores_are_accepted(name: str) -> None:
+    # Real Cloud TPU node names carry underscores; the request model used to 422 them.
+    request = attach_job.AttachmentRequest(target=name, kind="tpu", project="example-research-project", zone="us-central2-b")
+    assert request.target == name
+    assert "--tpu" in (argv := attach_job.cli_argv({"request": request.model_dump(), "url": "http://x", "user": "u"}))
+    assert argv[argv.index("--tpu") + 1] == name
+
+
 def test_plan_success_and_explicit_plane_url(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
