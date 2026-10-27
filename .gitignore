@@ -20,6 +20,7 @@ htmlcov/
 .DS_Store
 .env
 .env.local
+env.py
 
 # Private key material, certificates, and provider credential files. Eyvan
 # generates what it needs under ~/.eyvan at runtime; nothing of the sort
