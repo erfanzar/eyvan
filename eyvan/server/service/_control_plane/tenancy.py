@@ -383,6 +383,12 @@ class TenancyMixin:
         """
 
         moment = now or utcnow()
-        async with self.repository.transaction() as tx:
+        # The committed snapshot where the store offers one: a revocation still
+        # counts from the request after it commits, but authentication no longer
+        # queues behind every in-flight commit (over a second each on a large
+        # local store, which stalled every request including assistant streams).
+        snapshot = getattr(self.repository, "snapshot", None)
+        view = snapshot() if snapshot is not None else self.repository.transaction()
+        async with view as tx:
             grants = await tx.list_role_grants(subject=subject)
         return tuple(item.grant for item in grants if item.active_at(moment))

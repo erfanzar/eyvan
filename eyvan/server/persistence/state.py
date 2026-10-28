@@ -1033,6 +1033,11 @@ class StateRepository:
 
         return None
 
+    async def _persist_async(self, state: ControlPlaneState) -> None:
+        """Commit one snapshot; a store whose write is slow overrides this to keep the event loop free."""
+
+        self._persist(state)
+
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[StateSession]:
         """Yield one serializable copy-on-write transaction."""
@@ -1060,7 +1065,7 @@ class StateRepository:
                 raise RecordMutatedInPlaceError(_IN_PLACE_MUTATION)
             if working != self._state:
                 working.revision += 1
-                self._persist(working)
+                await self._persist_async(working)
                 self._state = working
                 committed_any = True
                 committed_events = working.next_event_sequence > start_sequence
@@ -1070,6 +1075,20 @@ class StateRepository:
         if committed_events:
             async with self._event_condition:
                 self._event_condition.notify_all()
+
+    @asynccontextmanager
+    async def snapshot(self) -> tp.AsyncIterator[StateSession]:
+        """Yield a read-only view of the last committed state without waiting for the transaction lock.
+
+        Committed records are immutable and a commit publishes a whole new state
+        object at once, so reading ``self._state`` is a consistent snapshot even
+        while a slow commit is in flight. Without this, a one-row read queued
+        behind every leader commit; on a large local store each commit holds the
+        lock for over a second. Writes made through this session are discarded.
+        """
+
+        await self.open()
+        yield self.session_type(_structural_copy(self._state))
 
     async def wait_for_events(
         self,

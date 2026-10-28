@@ -39,6 +39,13 @@ MAX_ASSISTANT_PROVIDERS = 32
 _UNSET: tp.Any = object()
 
 
+def _read_view(repository: tp.Any) -> tp.AsyncContextManager[tp.Any]:
+    """A read that never queues behind a commit: the committed snapshot where the store offers one."""
+
+    snapshot = getattr(repository, "snapshot", None)
+    return tp.cast(tp.AsyncContextManager[tp.Any], snapshot() if snapshot is not None else repository.transaction())
+
+
 def _event(actor: str, provider: AssistantProviderRecord, action: str) -> AuditEvent:
     return AuditEvent(
         id=_new_id("evt"),
@@ -88,7 +95,7 @@ class AssistantProvidersMixin:
     async def list_assistant_providers(self, principal: Principal) -> list[AssistantProviderRecord]:
         """Every provider for a fleet admin; only enabled ones for everyone else."""
 
-        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+        async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             providers = await tx.list_assistant_providers()
         if self.can_manage_assistant_providers(principal):
             return providers
@@ -206,7 +213,7 @@ class AssistantProvidersMixin:
         """
 
         self._require_provider_admin(principal)
-        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+        async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             current = await tx.get_assistant_provider(provider_id)
         if current is None:
             raise NotFoundError(f"assistant provider {provider_id!r} not found")

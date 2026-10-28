@@ -43,8 +43,25 @@ def _title_from(text: str) -> str:
     return words if len(words) <= _TITLE_CHARS else words[: _TITLE_CHARS - 1].rstrip() + "…"
 
 
+def conversation_title(first_message: str) -> str:
+    """The title a new conversation gets from its first message."""
+
+    return _title_from(first_message)
+
+
 def new_message_id() -> str:
     return f"msg_{secrets.token_hex(8)}"
+
+
+def new_conversation_id() -> str:
+    return f"conv_{secrets.token_hex(8)}"
+
+
+def _read_view(repository: tp.Any) -> tp.AsyncContextManager[tp.Any]:
+    """A read that never queues behind a commit: the committed snapshot where the store offers one."""
+
+    snapshot = getattr(repository, "snapshot", None)
+    return tp.cast(tp.AsyncContextManager[tp.Any], snapshot() if snapshot is not None else repository.transaction())
 
 
 class AssistantConversationsMixin:
@@ -57,13 +74,13 @@ class AssistantConversationsMixin:
         return record
 
     async def list_assistant_conversations(self, principal: Principal) -> list[AssistantConversationRecord]:
-        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+        async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             return list(await tx.list_assistant_conversations(subject=principal.subject))
 
     async def get_assistant_conversation(
         self, principal: Principal, conversation_id: str
     ) -> AssistantConversationRecord:
-        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+        async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             return tp.cast(AssistantConversationRecord, await self._owned_conversation(tx, principal, conversation_id))
 
     async def start_assistant_conversation(
@@ -75,17 +92,24 @@ class AssistantConversationsMixin:
         project_id: str,
         provider_id: str | None,
         model: str | None,
+        messages: tp.Sequence[AssistantMessageRecord] = (),
+        conversation_id: str | None = None,
     ) -> AssistantConversationRecord:
-        """Create an empty conversation titled from the first message."""
+        """Create a conversation titled from the first message, holding ``messages`` from the start.
+
+        Passing the opening turn here makes starting a chat one commit rather
+        than two; on a large local store each commit is a whole-document write.
+        """
 
         record = AssistantConversationRecord(
-            id=f"conv_{secrets.token_hex(8)}",
+            id=conversation_id or new_conversation_id(),
             subject=principal.subject,
             title=_title_from(first_message),
             org_id=org_id,
             project_id=project_id,
             provider_id=provider_id,
             model=model,
+            messages=tuple(messages)[-MAX_CONVERSATION_MESSAGES:],
         )
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             owned = await tx.list_assistant_conversations(subject=principal.subject)
@@ -155,5 +179,7 @@ __all__ = (
     "AssistantConversationsMixin",
     "clip_message",
     "clip_trace",
+    "conversation_title",
+    "new_conversation_id",
     "new_message_id",
 )

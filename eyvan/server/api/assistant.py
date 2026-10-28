@@ -24,6 +24,7 @@ could with their own token. Acting tools do not act on their own:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import typing as tp
@@ -65,7 +66,13 @@ from eyvan.server.api.assistant_stream import (
 )
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.api.team_routes import require_team_mode
-from eyvan.server.service._control_plane.assistant_conversations import clip_message, clip_trace, new_message_id
+from eyvan.server.service._control_plane.assistant_conversations import (
+    clip_message,
+    clip_trace,
+    conversation_title,
+    new_conversation_id,
+    new_message_id,
+)
 from eyvan.server.service.errors import EyvanServiceError
 
 if tp.TYPE_CHECKING:
@@ -398,6 +405,41 @@ def size_request(
 AssistantProvider = OpenAICompatibleChat
 
 
+def _keep(request: Request, task: asyncio.Future[tp.Any]) -> asyncio.Future[tp.Any]:
+    """Hold a background save until it finishes, so a stopped stream never drops it mid-write."""
+
+    pending: set[asyncio.Future[tp.Any]] = request.app.state.__dict__.setdefault("assistant_pending_saves", set())
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+    return task
+
+
+def _conversation_saves(request: Request) -> dict[str, asyncio.Future[tp.Any]]:
+    """The newest unfinished save per conversation, so a follow-up turn reads after it lands."""
+
+    return tp.cast(
+        dict[str, asyncio.Future[tp.Any]], request.app.state.__dict__.setdefault("assistant_conversation_saves", {})
+    )
+
+
+def _track_save(request: Request, conversation_id: str, task: asyncio.Future[tp.Any]) -> None:
+    saves = _conversation_saves(request)
+    saves[conversation_id] = task
+
+    def forget(done: asyncio.Future[tp.Any]) -> None:
+        if saves.get(conversation_id) is done:
+            del saves[conversation_id]
+
+    task.add_done_callback(forget)
+
+
+async def _await_pending_save(request: Request, conversation_id: str) -> None:
+    pending = _conversation_saves(request).get(conversation_id)
+    if pending is not None:
+        # The previous turn's save; its own failure was already logged.
+        await asyncio.wait({pending})
+
+
 def system_prompt(tools: AssistantTools) -> str:
     return f"{SYSTEM_PROMPT}\nUser: {tools.principal.subject}. Scope: {tools.org_id}/{tools.project_id}."
 
@@ -679,25 +721,39 @@ def register_assistant_routes(
         record, model, key = await service.resolve_assistant_provider(
             principal, provider_id=body.provider_id, model=body.model
         )
+        user_message = AssistantMessageRecord(id=new_message_id(), role="user", content=clip_message(body.message))
+        prior: tp.Sequence[AssistantMessageRecord]
         if body.conversation_id is not None:
-            conversation = await service.get_assistant_conversation(principal, body.conversation_id)
+            # A snapshot read: refusing someone else's chat must not wait behind a commit.
+            # Only this conversation's own unfinished save is waited for, so the
+            # previous answer is in the history this turn sends.
+            await _await_pending_save(request, body.conversation_id)
+            existing = await service.get_assistant_conversation(principal, body.conversation_id)
+            conversation_id, title, prior = existing.id, existing.title, existing.messages
+            save_user = service.append_assistant_messages(principal, conversation_id, [user_message])
         else:
-            conversation = await service.start_assistant_conversation(
+            conversation_id, prior = new_conversation_id(), ()
+            title = conversation_title(body.message)
+            # One commit: the conversation is created already holding this turn.
+            save_user = service.start_assistant_conversation(
                 principal,
                 first_message=body.message,
                 org_id=body.org_id,
                 project_id=body.project_id,
                 provider_id=record.id,
                 model=model,
+                messages=[user_message],
+                conversation_id=conversation_id,
             )
+        # The user's turn is written while the model already answers: on a large
+        # local store a commit can wait seconds for the transaction lock, and
+        # the first streamed byte must not wait with it.
+        user_saved = _keep(request, asyncio.ensure_future(save_user))
+        _track_save(request, conversation_id, user_saved)
         history = [
-            {"role": item.role, "content": item.content}
-            for item in conversation.messages
-            if item.content.strip() and item.error is None
+            {"role": item.role, "content": item.content} for item in prior if item.content.strip() and item.error is None
         ][-(MAX_CLIENT_MESSAGES - 1) :]
         history.append({"role": "user", "content": body.message})
-        user_message = AssistantMessageRecord(id=new_message_id(), role="user", content=clip_message(body.message))
-        await service.append_assistant_messages(principal, conversation.id, [user_message])
         chosen = chat_model_for(record, model, key, request)
         tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
         tools.team_mode = settings.team_mode
@@ -709,16 +765,34 @@ def register_assistant_routes(
             yield line(
                 {
                     "type": "start",
-                    "conversation_id": conversation.id,
+                    "conversation_id": conversation_id,
                     "provider_id": record.id,
                     "model": model,
-                    "title": conversation.title,
+                    "title": title,
                     "user_message_id": user_message.id,
                 }
             )
             trace: list[dict[str, tp.Any]] = []
             by_id: dict[str, dict[str, tp.Any]] = {}
             message_id = new_message_id()
+
+            async def write_answer(answer: AssistantMessageRecord) -> None:
+                # After the user's turn, so the saved order is always question then answer.
+                try:
+                    await user_saved
+                except Exception:
+                    logger.warning("assistant user turn was not saved", exc_info=True)
+                    return
+                await service.append_assistant_messages(
+                    principal, conversation_id, [answer], provider_id=record.id, model=model
+                )
+
+            async def save_answer(answer: AssistantMessageRecord) -> None:
+                task = _keep(request, asyncio.ensure_future(write_answer(answer)))
+                _track_save(request, conversation_id, task)
+                # Shielded: a client that disconnects right after ``done`` must not cancel the write.
+                await asyncio.shield(task)
+
             try:
                 async for event in run_turn_stream(
                     chosen,
@@ -737,46 +811,41 @@ def register_assistant_routes(
                         item = by_id.get(str(event.get("id"))) or {"type": "tool", "name": event["name"]}
                         item.update(ok=event.get("ok"), summary=event.get("summary"))
                     elif kind == "done":
-                        await service.append_assistant_messages(
-                            principal,
-                            conversation.id,
-                            [
-                                AssistantMessageRecord(
-                                    id=message_id,
-                                    role="assistant",
-                                    content=clip_message(str(event.get("reply") or "")),
-                                    provider_id=record.id,
-                                    model=model,
-                                    trace=clip_trace(trace),
-                                    drafts=tuple(event.get("drafts") or ())[:32],
-                                    requests=tuple(event.get("requests") or ())[:32],
-                                )
-                            ],
-                            provider_id=record.id,
-                            model=model,
+                        # The client sees ``done`` at once; the save happens after
+                        # it, before the response body closes, so a client that
+                        # reads to the end still finds the turn saved.
+                        yield line({**event, "message_id": message_id})
+                        await save_answer(
+                            AssistantMessageRecord(
+                                id=message_id,
+                                role="assistant",
+                                content=clip_message(str(event.get("reply") or "")),
+                                provider_id=record.id,
+                                model=model,
+                                trace=clip_trace(trace),
+                                drafts=tuple(event.get("drafts") or ())[:32],
+                                requests=tuple(event.get("requests") or ())[:32],
+                            )
                         )
-                        event = {**event, "message_id": message_id}
+                        continue
                     yield line(event)
             except AssistantProviderError as exc:
-                await service.append_assistant_messages(
-                    principal,
-                    conversation.id,
-                    [
-                        AssistantMessageRecord(
-                            id=message_id,
-                            role="assistant",
-                            content="",
-                            provider_id=record.id,
-                            model=model,
-                            trace=clip_trace(trace),
-                            error=str(exc)[:2000],
-                        )
-                    ],
-                )
                 yield line({"type": "error", "detail": str(exc), "message_id": message_id})
+                await save_answer(
+                    AssistantMessageRecord(
+                        id=message_id,
+                        role="assistant",
+                        content="",
+                        provider_id=record.id,
+                        model=model,
+                        trace=clip_trace(trace),
+                        error=str(exc)[:2000],
+                    )
+                )
 
         # A client that stops reading (the dock's Stop button) cancels this
-        # generator; the user turn is already saved and no answer is recorded.
+        # generator; the user turn is still saved (its task is kept on the app)
+        # and no answer is recorded.
         return StreamingResponse(
             events(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
         )

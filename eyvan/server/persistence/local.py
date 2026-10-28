@@ -153,6 +153,20 @@ class LocalProgressReportDocument(BaseModel):
     report: UserProgressReport
 
 
+def _carry(document: BaseModel) -> dict[str, tp.Any]:
+    """Hand an encoded document's validated field values to the next schema version.
+
+    Each version's ``from_state`` builds on the one before it. Doing that with
+    ``model_dump()`` turned every record back into dicts and validated it all
+    again, once per version: nine full dump-and-validate passes over the whole
+    state on every commit (over three seconds for a 9 MB plane, holding the GIL
+    the whole time). The values are already validated models; passing them on
+    leaves the written bytes unchanged.
+    """
+
+    return {name: getattr(document, name) for name in type(document).model_fields if name != "version"}
+
+
 class _LocalControlPlaneDocumentBase(BaseModel):
     """Aggregates common to the v1 and v2 local document schemas."""
 
@@ -439,7 +453,7 @@ class LocalControlPlaneV3Document(LocalControlPlaneDocument):
         without_topologies = replace(state, workload_topologies={})
         base = LocalControlPlaneDocument.from_state(without_topologies)
         return cls(
-            **base.model_dump(exclude={"version"}),
+            **_carry(base),
             workload_topologies=topologies,
         )
 
@@ -492,7 +506,7 @@ class LocalControlPlaneV4Document(LocalControlPlaneV3Document):
             replace(state, cell_stages={}, credential_rotations={}, expansion_admissions={})
         )
         return cls(
-            **base.model_dump(exclude={"version"}),
+            **_carry(base),
             cell_stages=stages,
             credential_rotations=rotations,
             expansion_admissions=admissions,
@@ -544,7 +558,7 @@ class LocalControlPlaneV5Document(LocalControlPlaneV4Document):
         decisions = tuple(state.service_decisions[key] for key in sorted(state.service_decisions))
         base = LocalControlPlaneV4Document.from_state(replace(state, service_replica_health={}, service_decisions={}))
         return cls(
-            **base.model_dump(exclude={"version"}),
+            **_carry(base),
             service_replica_health=health,
             service_decisions=decisions,
         )
@@ -586,7 +600,7 @@ class LocalControlPlaneV6Document(LocalControlPlaneV5Document):
         webhooks = tuple(state.webhooks[key] for key in sorted(state.webhooks))
         base = LocalControlPlaneV5Document.from_state(replace(state, webhooks={}))
         return cls(
-            **base.model_dump(exclude={"version"}),
+            **_carry(base),
             webhooks=webhooks,
         )
 
@@ -637,7 +651,7 @@ class LocalControlPlaneV7Document(LocalControlPlaneV6Document):
         tokens = tuple(state.api_tokens[key] for key in sorted(state.api_tokens))
         base = LocalControlPlaneV6Document.from_state(replace(state, users={}, invites={}, api_tokens={}))
         return cls(
-            **base.model_dump(exclude={"version"}),
+            **_carry(base),
             users=users,
             invites=invites,
             api_tokens=tokens,
@@ -673,7 +687,7 @@ class LocalControlPlaneV8Document(LocalControlPlaneV7Document):
 
         requests = tuple(state.team_requests[key] for key in sorted(state.team_requests))
         base = LocalControlPlaneV7Document.from_state(replace(state, team_requests={}))
-        return cls(**base.model_dump(exclude={"version"}), team_requests=requests)
+        return cls(**_carry(base), team_requests=requests)
 
     def to_state(self) -> ControlPlaneState:
         """Restore v7 aggregates plus every team request."""
@@ -703,7 +717,7 @@ class LocalControlPlaneV9Document(LocalControlPlaneV8Document):
 
         providers = tuple(state.assistant_providers[key] for key in sorted(state.assistant_providers))
         base = LocalControlPlaneV8Document.from_state(replace(state, assistant_providers={}))
-        return cls(**base.model_dump(exclude={"version"}), assistant_providers=providers)
+        return cls(**_carry(base), assistant_providers=providers)
 
     def to_state(self) -> ControlPlaneState:
         """Restore v8 aggregates plus every assistant provider."""
@@ -733,7 +747,7 @@ class LocalControlPlaneV10Document(LocalControlPlaneV9Document):
 
         conversations = tuple(state.assistant_conversations[key] for key in sorted(state.assistant_conversations))
         base = LocalControlPlaneV9Document.from_state(replace(state, assistant_conversations={}))
-        return cls(**base.model_dump(exclude={"version"}), assistant_conversations=conversations)
+        return cls(**_carry(base), assistant_conversations=conversations)
 
     def to_state(self) -> ControlPlaneState:
         """Restore v9 aggregates plus every saved conversation."""
@@ -1443,6 +1457,18 @@ class LocalJsonRepository(StateRepository):
                 return
             self._opened = False
             self._lease.release()
+
+    async def _persist_async(self, state: ControlPlaneState) -> None:
+        """Write the snapshot in a worker thread so one commit never freezes the event loop.
+
+        Serializing and fsyncing a whole multi-megabyte document took over a
+        second per commit on a real plane, and on the loop that stalled every
+        request and every assistant stream for the full write. The transaction
+        lock is still held, so commits stay serial and ordered; ``state`` is a
+        private copy nobody else mutates while the thread writes it.
+        """
+
+        await asyncio.to_thread(self._persist, state)
 
     def _persist(self, state: ControlPlaneState) -> None:
         """Commit one transaction snapshot to the owner-only state document."""
