@@ -33,6 +33,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from eyvan import assistant_knowledge as easydel
 from eyvan.config import EyvanSettings
 from eyvan.domain.sizing import (
     DEFAULT_CANDIDATE_TYPES,
@@ -96,6 +97,14 @@ Use the tools to answer from real data; never invent fleets, quotas or numbers.
 Tools run with this user's own permissions; if a tool returns an error, say what is not allowed.
 To size a job, call size_job (prefer the model's HuggingFace config fields, else a parameter count),
 then compare the recommendation with what list_capacity shows the user can actually use.
+EasyDeL training: you know every EasyDeL trainer config through list_easydel_trainers and
+describe_easydel_trainer; use them instead of memory. When the user asks to train (e.g. "DPO an 8B model"),
+first describe that trainer, then ASK the user for each essential argument they have not given
+(for DPO: beta, loss_type, reference model or reference_free, max_length, max_prompt_length; plus model,
+dataset, learning_rate, total_batch_size, training length, save_directory/save_steps and sharding),
+stating the default for each so they can accept it. Do not draft until they have answered.
+Then validate_easydel_arguments, fix what it flags, and draft_workload with easydel_trainer,
+trainer_arguments and easydel_launch; size_job and list_capacity decide tpu_chips and the accelerator.
 You cannot submit anything. draft_workload prepares a submission the user must confirm themselves.
 If the user needs capacity or an approval they do not have, offer to file_request to the fleet admins;
 only file one when the user asks for it. Be brief and concrete."""
@@ -178,15 +187,71 @@ TOOL_SPECS: tuple[dict[str, tp.Any], ...] = (
         ),
     },
     {
+        "name": "list_easydel_trainers",
+        "description": "Every EasyDeL trainer (sft, dpo, grpo, ...) with a summary and the arguments to confirm.",
+        "parameters": _schema({}),
+    },
+    {
+        "name": "describe_easydel_trainer",
+        "description": (
+            "Arguments of one EasyDeL trainer config with types, defaults and docs, inherited "
+            "TrainingArguments included. query keeps fields matching any of its space-separated terms."
+        ),
+        "parameters": _schema(
+            {"trainer": _STR, "query": _STR, "include_inherited": {"type": "boolean"}},
+            ["trainer"],
+        ),
+    },
+    {
+        "name": "validate_easydel_arguments",
+        "description": (
+            "Check trainer arguments against the EasyDeL config: unknown names (with suggestions), "
+            "invalid choices, wrong types and the essential arguments still missing."
+        ),
+        "parameters": _schema({"trainer": _STR, "arguments": {"type": "object"}}, ["trainer", "arguments"]),
+    },
+    {
         "name": "draft_workload",
         "description": (
-            "Prepare (NOT submit) a workload for the user to confirm. command is the shell command to run; "
+            "Prepare (NOT submit) a workload for the user to confirm. Either command (a shell command) or "
+            "easydel_trainer + trainer_arguments + easydel_launch (renders a runnable EasyDeL eLarge launch). "
             "tpu_chips is chips per replica."
         ),
         "parameters": _schema(
             {
                 "name": _STR,
                 "command": _STR,
+                "easydel_trainer": _STR,
+                "trainer_arguments": {"type": "object"},
+                "easydel_launch": {
+                    "type": "object",
+                    "properties": {
+                        "model": _STR,
+                        "dataset": _STR,
+                        "dataset_split": _STR,
+                        "dataset_type": {
+                            "type": "string",
+                            "enum": ["huggingface", "json", "parquet", "csv", "tsv", "arrow", "text"],
+                        },
+                        "dataset_subset": _STR,
+                        "content_field": _STR,
+                        "tokenizer": _STR,
+                        "reference_model": _STR,
+                        "reward_model": _STR,
+                        "teacher_model": _STR,
+                        "target_model": _STR,
+                        "num_devices": _INT,
+                        "dtype": _STR,
+                        "sharding": {
+                            "type": "object",
+                            "properties": {
+                                "axis_dims": {"type": "array", "items": _INT},
+                                "axis_names": {"type": "array", "items": _STR},
+                            },
+                        },
+                    },
+                    "required": ["model", "dataset"],
+                },
                 "accelerator_type": _STR,
                 "capacity_class": {"type": "string", "enum": [item.value for item in CapacityClass]},
                 "tpu_chips": _INT,
@@ -195,7 +260,7 @@ TOOL_SPECS: tuple[dict[str, tp.Any], ...] = (
                 "checkpointable": {"type": "boolean"},
                 "max_preemption_retries": _INT,
             },
-            ["name", "command"],
+            ["name"],
         ),
     },
     {
@@ -323,10 +388,21 @@ class AssistantTools:
             model_config=model_config, parameters=parameters, accelerator_types=accelerator_types, **options
         )
 
+    async def _tool_list_easydel_trainers(self) -> tp.Any:
+        return {"catalog": easydel.catalog_info(), "trainers": easydel.list_trainers()}
+
+    async def _tool_describe_easydel_trainer(
+        self, trainer: str, query: str | None = None, include_inherited: bool = True
+    ) -> tp.Any:
+        return easydel.describe_trainer(trainer, query=query, include_inherited=include_inherited)
+
+    async def _tool_validate_easydel_arguments(self, trainer: str, arguments: dict[str, tp.Any]) -> tp.Any:
+        return easydel.validate_trainer_arguments(trainer, arguments)
+
     async def _tool_draft_workload(
         self,
         name: str,
-        command: str,
+        command: str | None = None,
         accelerator_type: str | None = None,
         capacity_class: str | None = None,
         tpu_chips: int | None = None,
@@ -334,7 +410,30 @@ class AssistantTools:
         priority_band: str | None = None,
         checkpointable: bool = False,
         max_preemption_retries: int | None = None,
+        easydel_trainer: str | None = None,
+        trainer_arguments: dict[str, tp.Any] | None = None,
+        easydel_launch: dict[str, tp.Any] | None = None,
     ) -> tp.Any:
+        launch: dict[str, tp.Any] | None = None
+        if easydel_trainer is not None:
+            if command:
+                raise ValueError("pass either command or easydel_trainer, not both")
+            options = dict(easydel_launch or {})
+            if not options.get("model") or not options.get("dataset"):
+                raise ValueError("easydel_launch needs model and dataset")
+            launch = easydel.render_launch(easydel_trainer, trainer_arguments or {}, **options)
+            if not launch["runnable"]:
+                # Not drafted: a launch eLarge would refuse, or silently run with
+                # dropped arguments, must go back to the user first.
+                return {
+                    "drafted": False,
+                    "blocking": launch["blocking"],
+                    "missing_essential": launch["validation"]["missing_essential"],
+                    "suggestions": launch["validation"]["suggestions"],
+                }
+            command = launch["script"].strip()
+        if not command:
+            raise ValueError("pass command, or easydel_trainer with easydel_launch")
         fields: dict[str, tp.Any] = {
             "name": name,
             "execution": CommandExecution(command=command),
@@ -355,9 +454,26 @@ class AssistantTools:
         # default, so exclude_defaults would drop it and make the draft
         # unsubmittable. Keep the execution block whole.
         document["execution"] = spec.execution.model_dump(mode="json")
-        draft = {"org_id": self.org_id, "project_id": self.project_id, "spec": document}
+        draft: dict[str, tp.Any] = {"org_id": self.org_id, "project_id": self.project_id, "spec": document}
+        outcome: dict[str, tp.Any] = {
+            "drafted": True,
+            "submitted": False,
+            "note": "the user must confirm this draft to submit it",
+        }
+        if launch is not None:
+            draft["easydel"] = {
+                "trainer": launch["trainer"],
+                "config_yaml": launch["config_yaml"],
+                "command": launch["command"],
+                "assumptions": launch["assumptions"],
+            }
+            outcome["easydel"] = {
+                "assumptions": launch["assumptions"],
+                "missing_essential": launch["validation"]["missing_essential"],
+                "config_yaml": launch["config_yaml"],
+            }
         self.drafts.append(draft)
-        return {"drafted": True, "submitted": False, "note": "the user must confirm this draft to submit it"}
+        return outcome
 
     async def _tool_list_my_requests(self, state: str | None = None) -> tp.Any:
         if not self.team_mode:
